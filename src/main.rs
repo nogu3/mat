@@ -34,6 +34,33 @@ fn main() -> ExitCode {
             setup_code,
             node_id,
         } => commands::commission::run(&store_path, target, setup_code, *node_id),
+        Command::Read {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+        } => commands::read::run(&store_path, *node_id, *endpoint, cluster, attribute),
+        Command::Write {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            value,
+        } => commands::write::run(&store_path, *node_id, *endpoint, cluster, attribute, value),
+        Command::Invoke {
+            node_id,
+            endpoint,
+            cluster,
+            command,
+            args,
+        } => commands::invoke::run(&store_path, *node_id, *endpoint, cluster, command, args),
+        Command::Describe { node_id } => commands::describe::run(&store_path, *node_id),
+        Command::On { node_id, endpoint } => {
+            commands::invoke::run_onoff(&store_path, *node_id, *endpoint, true)
+        }
+        Command::Off { node_id, endpoint } => {
+            commands::invoke::run_onoff(&store_path, *node_id, *endpoint, false)
+        }
     };
 
     match result {

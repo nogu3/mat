@@ -65,9 +65,8 @@ impl Store {
 
     /// 既存ストアを開く。存在しなければ [`ErrorKind::StoreMissing`]（exit 10）。
     ///
-    /// 認証情報必須の経路（Phase 1 の read/write/invoke 等）が使う。bootstrap して
+    /// 認証情報必須の経路（read/write/invoke/describe 等）が使う。bootstrap して
     /// よい discover/commission は [`Store::open_or_init`] を使う。
-    #[allow(dead_code)]
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, MatError> {
         let root = root.into();
         if !root.is_dir() {
@@ -144,8 +143,7 @@ impl Store {
 
     /// ノードを取得。未 commission なら [`ErrorKind::NodeNotCommissioned`]（exit 11）。
     ///
-    /// Phase 1 の read/write/invoke が node_id 解決に使う。
-    #[allow(dead_code)]
+    /// read/write/invoke/describe が node_id 解決に使う。
     pub fn require_node(&self, node_id: u64) -> Result<&NodeRecord, MatError> {
         self.ledger
             .nodes
