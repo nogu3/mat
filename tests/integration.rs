@@ -39,14 +39,18 @@ fn discover_lists_commissionable_devices() {
 }
 
 #[test]
-fn discover_with_missing_store_exits_10() {
+fn discover_with_missing_store_bootstraps_and_succeeds() {
+    // discover は認証情報不要（commissionable 探索のみ）。store 無しでも
+    // 空ストアを bootstrap して成功し、commissionable を返す。
     let store = TempDir::new().unwrap();
     let missing = store.path().join("does-not-exist");
     mat(&missing)
         .arg("discover")
         .assert()
-        .code(10)
-        .stderr(predicate::str::contains("store_missing"));
+        .success()
+        .stdout(predicate::str::contains("\"commissionable\""));
+    // 空ストアが作られている。
+    assert!(missing.is_dir());
 }
 
 #[test]

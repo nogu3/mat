@@ -2,6 +2,9 @@
 //!
 //! commissionable は `chip-tool discover commissionables` の mDNS 探索結果、
 //! commissioned は `mat` の台帳（KVS）から読む。両者を1つの `devices` 配列にまとめる。
+//!
+//! commissionable 探索は認証情報不要のため、store 無しでも動く（無ければ空ストアを
+//! bootstrap し、commissioned は空配列になる）。
 
 use std::path::Path;
 
@@ -14,7 +17,10 @@ use crate::runner::ChipTool;
 use crate::store::Store;
 
 pub fn run(store_path: &Path) -> Result<(), MatError> {
-    let store = Store::open(store_path)?; // 無ければ store_missing(exit 10)
+    // discover の commissionable 探索は認証情報不要。store 無しでも動くべきなので
+    // open ではなく open_or_init（無ければ空ストアを bootstrap）。commissioned は
+    // 台帳から読むが、空ストアなら空配列になるだけ。
+    let store = Store::open_or_init(store_path)?;
     let chip = ChipTool::new(store.root());
 
     // commissionable 探索。chip-tool は探索を時間で打ち切るため非 0 終了もあり得る。
