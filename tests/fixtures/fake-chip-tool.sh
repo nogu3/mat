@@ -1,10 +1,27 @@
 #!/bin/sh
-# テスト用ダミー chip-tool。実 chip-tool 不要で discover / commission の
-# 統合テストを回すために、固定のログ風テキストを吐く。
+# テスト用ダミー chip-tool。実 chip-tool 不要で discover / commission /
+# read / write / invoke / describe の統合テストを回すため、固定のログ風
+# テキストを吐く。
 #
 # 挙動は環境変数で制御:
 #   FAKE_CHIP_MODE = success(既定) | timeout | reject
 # mat は末尾に `--storage-directory <path>` を付けるが、ここでは無視する。
+
+mode="${FAKE_CHIP_MODE:-success}"
+
+# read/write/invoke/describe 共通の失敗注入。success 以外なら該当ログを吐いて非 0 終了。
+emit_failure() {
+  case "$mode" in
+    timeout)
+      echo "[1656][CHIP:DMG] CHIP Error 0x00000032: Timeout" >&2
+      exit 1
+      ;;
+    reject)
+      echo "[1656][CHIP:TOO] Received Command Response Status status 0x81 (Failure)"
+      exit 1
+      ;;
+  esac
+}
 
 sub="$1"
 
@@ -22,7 +39,7 @@ EOF
     exit 0
     ;;
   pairing)
-    case "${FAKE_CHIP_MODE:-success}" in
+    case "$mode" in
       success)
         echo "[1656][CHIP:CTL] Successfully finished commissioning, deviceId=1"
         echo "[1656][CHIP:TOO] Device commissioning completed with success"
@@ -38,8 +55,59 @@ EOF
         ;;
     esac
     ;;
+  descriptor)
+    # `descriptor read <list> <node> <ep> ...`
+    emit_failure
+    list="$3"
+    ep="$5"
+    case "$list" in
+      parts-list)
+        # エンドポイント 0 の子: 1 つ（ep 1）。
+        cat <<'EOF'
+[1717][CHIP:TOO]   PartsList: 1 entries
+[1717][CHIP:TOO]     [1]: 1
+EOF
+        ;;
+      server-list)
+        if [ "$ep" = "0" ]; then
+          cat <<'EOF'
+[1717][CHIP:TOO]   ServerList: 2 entries
+[1717][CHIP:TOO]     [1]: 29
+[1717][CHIP:TOO]     [2]: 31
+EOF
+        else
+          cat <<'EOF'
+[1717][CHIP:TOO]   ServerList: 2 entries
+[1717][CHIP:TOO]     [1]: 6
+[1717][CHIP:TOO]     [2]: 8
+EOF
+        fi
+        ;;
+    esac
+    exit 0
+    ;;
   *)
-    echo "fake-chip-tool: unhandled subcommand: $sub" >&2
-    exit 2
+    # クラスタ名がサブコマンド位置に来る: read / write / invoke。
+    op="$2"
+    emit_failure
+    case "$op" in
+      read)
+        # `<cluster> read <attribute> <node> <ep>`。固定で bool 値を返す。
+        echo "[1656][CHIP:DMG] ReportDataMessage ="
+        echo "[1656][CHIP:DMG]   AttributeReportIBs ="
+        echo "[1656][CHIP:DMG]     Data = true,"
+        exit 0
+        ;;
+      write)
+        echo "[1656][CHIP:DMG] AttributeStatusIB ="
+        echo "[1656][CHIP:DMG]   status = 0x00 (SUCCESS),"
+        exit 0
+        ;;
+      *)
+        # invoke（on/off 含む）: `<cluster> <command> <node> <ep>`。
+        echo "[1656][CHIP:DMG] Received Command Response Status for Endpoint=0x1 Cluster=0x0000_0006 Command=0x0000_0001 Status=0x0 (SUCCESS)"
+        exit 0
+        ;;
+    esac
     ;;
 esac

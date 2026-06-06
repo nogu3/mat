@@ -100,6 +100,141 @@ pub fn commission_succeeded(stdout: &str) -> bool {
         || hay.contains("device commissioning completed with success")
 }
 
+/// `chip-tool <cluster> read <attribute> ...` の stdout から属性値を取り出す。
+///
+/// chip-tool は読んだ値を `Data = <値>,` 行で出す（CLAUDE.md の「比較的規則的な
+/// `Data = ...` 形式」）。最後に現れた `Data =` を採用し、`mat` の JSON 値へ正規化
+/// する。1件も無ければ `None`（呼び出し側が `parse_error` にする）。
+pub fn parse_read_value(stdout: &str) -> Option<serde_json::Value> {
+    let mut last: Option<&str> = None;
+    for line in stdout.lines() {
+        if let Some(pos) = line.find("Data =") {
+            let raw = line[pos + "Data =".len()..].trim();
+            // 行末のカンマを落とす（`Data = false,`）。
+            let raw = raw.strip_suffix(',').unwrap_or(raw).trim();
+            if !raw.is_empty() {
+                last = Some(raw);
+            }
+        }
+    }
+    last.map(normalize_value)
+}
+
+/// chip-tool の生テキスト値を `mat` の JSON 値へ正規化する。
+fn normalize_value(raw: &str) -> serde_json::Value {
+    // 文字列リテラル（両端ダブルクォート）。
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        return serde_json::Value::String(raw[1..raw.len() - 1].to_string());
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        "null" => return serde_json::Value::Null,
+        _ => {}
+    }
+    if let Ok(i) = raw.parse::<i64>() {
+        return serde_json::Value::from(i);
+    }
+    if let Ok(u) = raw.parse::<u64>() {
+        return serde_json::Value::from(u);
+    }
+    if let Ok(f) = raw.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return serde_json::Value::Number(n);
+        }
+    }
+    serde_json::Value::String(raw.to_string())
+}
+
+/// `chip-tool` の write / invoke の stdout から「IM レベルで成功した」ことを判定する。
+///
+/// write は `status = 0x00 (SUCCESS)`、invoke は `... Status=0x0 (SUCCESS)` のような
+/// 行を出す。どちらかの成功シグナルがあれば真。明示シグナルが無い出力は偽。
+pub fn operation_succeeded(stdout: &str) -> bool {
+    for line in stdout.lines() {
+        let l = line.to_ascii_lowercase();
+        // write の AttributeStatusIB（`status = 0x00 (SUCCESS)`）。
+        if l.contains("status = 0x00") {
+            return true;
+        }
+        // invoke の InvokeResponse（`Status=0x0 (SUCCESS)`）。
+        if let Some(pos) = l.find("status=") {
+            let after = l[pos + "status=".len()..].trim_start();
+            if after == "0x0"
+                || after.starts_with("0x0 ")
+                || after.starts_with("0x00")
+                || after.starts_with("0x0(")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `chip-tool descriptor read <list> ...` の stdout から ID リストを取り出す。
+///
+/// chip-tool はリスト属性を `[<idx>]: <値>` 行で列挙する（PartsList / ServerList 等）。
+/// 各エントリ行の値を数値として拾う。順序保持。
+pub fn parse_id_list(stdout: &str) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for line in stdout.lines() {
+        let Some(entry) = strip_log_prefix(line) else {
+            continue;
+        };
+        let entry = entry.trim_start();
+        if !entry.starts_with('[') {
+            continue;
+        }
+        let Some(close) = entry.find(']') else {
+            continue;
+        };
+        // `[n]` の n が数値であることを確認（インデックス行のみ対象）。
+        if entry[1..close].trim().parse::<u64>().is_err() {
+            continue;
+        }
+        let rest = entry[close + 1..].trim_start();
+        let Some(val) = rest.strip_prefix(':') else {
+            continue;
+        };
+        if let Ok(id) = val.trim().parse::<u64>() {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// 行頭の chip-tool ログ接頭辞（`[..][CHIP:..]` を 0 個以上）を取り除いた残りを返す。
+/// エントリ行 `[1]: 6` の先頭 `[1]` をログ接頭辞と誤認しないよう、タイムスタンプ
+/// （数字のみ）か `CHIP:` タグを含む角括弧ブロックだけ剥がす。
+fn strip_log_prefix(line: &str) -> Option<&str> {
+    // chip-tool のログ接頭辞は `[<timestamp>][CHIP:<tag>] payload` の形。timestamp
+    // ブロック（数字のみ）は読み飛ばし、`CHIP:` タグに当たったらそれを最後の接頭辞
+    // ブロックとして剥がし、残り（payload）を返す。payload 中の `[1]` 等は剥がさない。
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with('[') {
+            return Some(trimmed);
+        }
+        let Some(close) = trimmed.find(']') else {
+            return Some(trimmed);
+        };
+        let block = &trimmed[1..close];
+        if block.contains("CHIP:") {
+            return Some(trimmed[close + 1..].trim_start());
+        }
+        // timestamp ブロック（数字のみ）は、直後にもう一つブロック `[` が続く接頭辞
+        // パターンのときだけ剥がす。素の `[1]: 6` を誤って削らないため。
+        let after = &trimmed[close + 1..];
+        if block.chars().all(|c| c.is_ascii_digit()) && after.starts_with('[') {
+            rest = after;
+            continue;
+        }
+        return Some(trimmed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +284,66 @@ mod tests {
             "[TOO] Device commissioning completed with success"
         ));
         assert!(!commission_succeeded("[TOO] Run command failure"));
+    }
+
+    #[test]
+    fn read_value_bool() {
+        let s = "[1656][CHIP:DMG]                         Data = false,";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::Bool(false)));
+        let s = "[1656][CHIP:DMG]   Data = TRUE";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn read_value_integer_and_string() {
+        let s = "[1656][CHIP:DMG] Data = 254,";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::from(254)));
+        let s = "[1656][CHIP:DMG] Data = \"living room\",";
+        assert_eq!(
+            parse_read_value(s),
+            Some(serde_json::Value::String("living room".into()))
+        );
+    }
+
+    #[test]
+    fn read_value_takes_last_data_line() {
+        // ReportData の入れ子で Data が複数出ても最後（実値）を採用。
+        let s = "Data = 0,\nData = 42,";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::from(42)));
+    }
+
+    #[test]
+    fn read_value_none_when_absent() {
+        assert_eq!(parse_read_value("no data here"), None);
+    }
+
+    #[test]
+    fn operation_success_write_and_invoke() {
+        assert!(operation_succeeded(
+            "[1656][CHIP:DMG]   status = 0x00 (SUCCESS),"
+        ));
+        assert!(operation_succeeded(
+            "[1656][CHIP:DMG] Received Command Response Status for Endpoint=0x1 Cluster=0x0000_0006 Command=0x0000_0001 Status=0x0 (SUCCESS)"
+        ));
+        assert!(!operation_succeeded(
+            "[1656][CHIP:DMG] status = 0x01 (FAILURE)"
+        ));
+        assert!(!operation_succeeded("nothing useful"));
+    }
+
+    #[test]
+    fn id_list_extracts_entries() {
+        let s = "\
+[1717][CHIP:TOO]   ServerList: 3 entries
+[1717][CHIP:TOO]     [1]: 6
+[1717][CHIP:TOO]     [2]: 29
+[1717][CHIP:TOO]     [3]: 31
+";
+        assert_eq!(parse_id_list(s), vec![6, 29, 31]);
+    }
+
+    #[test]
+    fn id_list_empty_when_no_entries() {
+        assert!(parse_id_list("[1717][CHIP:TOO]   ServerList: 0 entries").is_empty());
     }
 }

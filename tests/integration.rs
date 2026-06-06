@@ -126,3 +126,128 @@ fn commission_auto_assigns_node_id() {
         .success()
         .stdout(predicate::str::contains("\"node_id\":1"));
 }
+
+/// node 5 を commission 済みにしたストアを用意する（Phase 1 操作系の前提）。
+fn store_with_node5() -> TempDir {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args(["commission", "192.0.2.10", "MT:FAKE", "--node-id", "5"])
+        .assert()
+        .success();
+    store
+}
+
+#[test]
+fn read_parses_value() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["read", "5", "1", "onoff", "on-off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
+        .stdout(predicate::str::contains("\"attribute\":\"on-off\""))
+        .stdout(predicate::str::contains("\"value\":true"))
+        .stdout(predicate::str::contains("\"timestamp\""));
+}
+
+#[test]
+fn write_reports_success() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["write", "5", "1", "levelcontrol", "on-level", "128"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"success\""))
+        .stdout(predicate::str::contains("\"value\":\"128\""));
+}
+
+#[test]
+fn invoke_reports_success() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["invoke", "5", "1", "onoff", "toggle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"command\":\"toggle\""))
+        .stdout(predicate::str::contains("\"status\":\"success\""));
+}
+
+#[test]
+fn on_maps_to_onoff_invoke() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["on", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
+        .stdout(predicate::str::contains("\"command\":\"on\""))
+        .stdout(predicate::str::contains("\"status\":\"success\""));
+}
+
+#[test]
+fn off_maps_to_onoff_invoke() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["off", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"command\":\"off\""));
+}
+
+#[test]
+fn describe_lists_endpoints_and_clusters() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["describe", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"endpoints\""))
+        // ep0 の server-list（29,31）と ep1（6,8）。
+        .stdout(predicate::str::contains("\"endpoint\":0"))
+        .stdout(predicate::str::contains("\"endpoint\":1"))
+        .stdout(predicate::str::contains("29"))
+        .stdout(predicate::str::contains("\"clusters\":[6,8]"));
+}
+
+#[test]
+fn read_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["read", "99", "1", "onoff", "on-off"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn read_missing_store_exits_10() {
+    let store = TempDir::new().unwrap();
+    let missing = store.path().join("nope");
+    mat(&missing)
+        .args(["read", "5", "1", "onoff", "on-off"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_missing"));
+}
+
+#[test]
+fn read_timeout_exits_3() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .args(["read", "5", "1", "onoff", "on-off"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}
+
+#[test]
+fn invoke_reject_exits_4() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "reject")
+        .args(["invoke", "5", "1", "onoff", "on"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("device_rejected"));
+}

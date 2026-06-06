@@ -2,4 +2,8 @@
 //! を行い、成功なら `Ok(())`、失敗なら [`crate::error::MatError`] を返す。
 
 pub mod commission;
+pub mod describe;
 pub mod discover;
+pub mod invoke;
+pub mod read;
+pub mod write;

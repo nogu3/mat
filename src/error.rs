@@ -66,7 +66,6 @@ impl MatError {
         }
     }
 
-    #[allow(dead_code)]
     pub fn store_missing(detail: impl Into<String>) -> Self {
         MatError::new(ErrorKind::StoreMissing, detail)
     }
@@ -75,8 +74,7 @@ impl MatError {
         MatError::new(ErrorKind::StoreParse, detail)
     }
 
-    /// Phase 1 の read/write/invoke が未 commission node 参照時に使う。
-    #[allow(dead_code)]
+    /// read/write/invoke が未 commission node 参照時に使う。
     pub fn node_not_commissioned(node_id: u64) -> Self {
         MatError::new(
             ErrorKind::NodeNotCommissioned,
