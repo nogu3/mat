@@ -1,36 +1,57 @@
 # mat
 
-Matter デバイス操作 CLI。Matter コントローラ（`chip-tool`）をサブプロセスで呼び、その冗長なテキスト出力を `mat` のスキーマに正規化した **純粋な構造化 JSON** として返す。`enl`（ECHONET Lite）の兄弟 CLI。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-- stdout = 1コマンド1 JSON オブジェクト。人間装飾は混ぜない。
-- 診断は stderr に構造化ログ（`tracing`）。
-- 認証情報 KVS 以外の状態を持たない（プロセスはワンショット）。
+`mat` is a CLI for controlling Matter devices. It calls a Matter controller
+(`chip-tool`) as a subprocess and returns its long text output as **pure
+structured JSON**, normalized to `mat`'s own schema.
 
-設計の背景・三層分離（`casa`/`casad`）・非責務は [CLAUDE.md](./CLAUDE.md) を参照。
+- stdout = one JSON object per command. No human decoration.
+- diagnostics go to stderr as structured logs (`tracing`).
+- it holds no state except the credential KVS (the process is one-shot).
 
-## ステータス
+For the design background, the three-layer separation, and what `mat` does and
+does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-**Phase 0 + Phase 1 + Phase 2 実装済み**:
-- Phase 0: 雛形 + chip-tool ラッパ基盤 + commission + 認証情報 KVS + discover。
-- Phase 1: read / write / invoke + describe + on / off。
-- Phase 2: open-window（multi-admin 共有）。
+## Status
 
-group は後続フェーズ（CLAUDE.md のロードマップ参照）。
+**Phase 0 + Phase 1 + Phase 2 are implemented:**
+- Phase 0: scaffold + chip-tool wrapper + commission + credential KVS + discover.
+- Phase 1: read / write / invoke + describe + on / off.
+- Phase 2: open-window (multi-admin share).
 
-## コマンド
+Group commands come in a later phase (see the roadmap in ARCHITECTURE.md).
 
-### 探索・commissioning（Phase 0）
+## Requirements
+
+- Rust (stable) and [Task](https://taskfile.dev) to build.
+- A `chip-tool` binary on your `PATH` (or set `MAT_CHIP_TOOL_BIN` to its full
+  path). Building `chip-tool` is heavy, so a Docker image with it baked in is
+  provided (see [Backend](#backend-chip-tool)).
+- Matter uses mDNS / IPv6 multicast, so on a real network the host must be able
+  to send and receive these.
+
+## Install
 
 ```bash
-# commissionable / commissioned ノードを探索
+task build      # release build -> target/release/mat
+task install    # install into ~/.cargo/bin
+```
+
+## Commands
+
+### Discover and commissioning (Phase 0)
+
+```bash
+# Discover commissionable / commissioned nodes
 mat discover
 
-# fabric への参加（初回 commission / multi-admin join 両対応）
-# 値はすべてダミー（RFC 5737 192.0.2.0/24）
+# Join a fabric (first commission OR multi-admin join, both supported)
+# All values here are dummy (RFC 5737 192.0.2.0/24)
 mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
 ```
 
-`discover` 出力例:
+`discover` output:
 
 ```json
 {
@@ -42,57 +63,67 @@ mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
 }
 ```
 
-`commission` 出力例:
+`commission` output:
 
 ```json
 { "timestamp": "2026-06-06T12:34:56+09:00", "node_id": 5, "status": "success" }
 ```
 
-### 状態操作（Phase 1）
+### State operations (Phase 1)
 
-`<node_id>` は **commission 済みであること**が前提（未 commission なら exit `11`、ストア自体が無ければ exit `10`）。クラスタ名・属性名・コマンド名は **chip-tool 表記**で渡す（数値解決や人間向け名前は `casa` の責務）。
+`<node_id>` must be **already commissioned** (if not, exit `11`; if the store
+itself is missing, exit `10`). Cluster / attribute / command names are passed in
+**chip-tool form** (numeric resolution and human names are the upper layer's
+job).
 
 ```bash
-# 属性を読む: read <node_id> <endpoint> <cluster> <attribute>
+# Read an attribute: read <node_id> <endpoint> <cluster> <attribute>
 mat read 5 1 onoff on-off
 
-# 書き込み可能属性を設定: write <node_id> <endpoint> <cluster> <attribute> <value>
+# Set a writable attribute: write <node_id> <endpoint> <cluster> <attribute> <value>
 mat write 5 1 levelcontrol on-level 128
 
-# コマンドを実行: invoke <node_id> <endpoint> <cluster> <command> [args...]
+# Run a command: invoke <node_id> <endpoint> <cluster> <command> [args...]
 mat invoke 5 1 levelcontrol move-to-level 128 0 0 0
 
-# ノードの introspection: describe <node_id>
+# Introspect a node: describe <node_id>
 mat describe 5
 
-# 高頻度ショートカット（--endpoint 既定 1）
+# High-frequency shortcuts (--endpoint defaults to 1)
 mat on 5
 mat off 5 --endpoint 2
 ```
 
-**重要な非対称: read は属性、制御は invoke。** 照明の ON/OFF は OnOff 属性を `write` するのではなく、On/Off コマンドを `invoke` する。`mat on` / `mat off` はこのショートカットで、**OnOff クラスタの `on` / `off` コマンドを `invoke` にマップ**する（`write` ではない）。
+**Important asymmetry: read is an attribute, control is an invoke.** Turning a
+light ON/OFF is not a `write` of the OnOff attribute; it is an `invoke` of the
+On/Off command. `mat on` / `mat off` are shortcuts for this and **map to the
+`on` / `off` command of the OnOff cluster as an `invoke`** (not a write).
 
-各出力例:
+Outputs:
 
 ```json
-// read — value は chip-tool の `Data = ...` を bool/number/string/null に正規化
+// read — value is chip-tool's `Data = ...` normalized to bool/number/string/null
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "attribute": "on-off", "value": true }
 
 // write
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "levelcontrol", "attribute": "on-level", "value": "128", "status": "success" }
 
-// invoke（mat on / off も同形）
+// invoke (mat on / off have the same shape)
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "command": "on", "status": "success" }
 
-// describe — endpoint 0 の parts-list で子 endpoint を列挙し、各 endpoint の server-list を数値クラスタ ID で返す
+// describe — lists child endpoints from endpoint 0's parts-list, and each
+// endpoint's server-list as numeric cluster IDs
 { "timestamp": "...", "node_id": 5, "endpoints": [ { "endpoint": 0, "clusters": [29, 31] }, { "endpoint": 1, "clusters": [6, 8] } ] }
 ```
 
-> `describe` は chip-tool を複数回呼ぶ（parts-list + 各 endpoint の server-list）ため遅いが、ワンショットで完結する。
+> `describe` calls chip-tool several times (parts-list plus each endpoint's
+> server-list), so it is slow, but it finishes in one shot.
 
-### multi-admin 共有（Phase 2）
+### Multi-admin share (Phase 2)
 
-`mat` 所有デバイスを他コントローラ（Alexa / Apple / Google 等）へ共有するため、commissioning window を開いて一回限りの発行コードを返す。`chip-tool pairing open-commissioning-window` のラップ（ECM = option 1）。
+To share a `mat`-owned device with another controller (Alexa / Apple / Google),
+open a commissioning window and return a one-time issued code. This wraps
+`chip-tool pairing open-commissioning-window` (ECM = option 1).
 
 ```bash
 # open-window <node_id> [--timeout S] [--iteration N] [--discriminator D]
@@ -100,123 +131,164 @@ mat open-window 5
 mat open-window 5 --timeout 300
 ```
 
-出力例:
+Output:
 
 ```json
 { "timestamp": "...", "node_id": 5, "manual_code": "36217551492", "qr_payload": "MT:-24J0AFN00KA0648G00", "expires_at": "2026-06-06T12:37:56+09:00" }
 ```
 
-- `manual_code`（11桁）と `qr_payload`（`MT:...` 文字列）の**両方**を返す。
-- **QR 画像化は `mat` の責務ではない**。stdout には `qr_payload` 文字列を出すだけで、描画は上層（`casad` / ビューア）が行う。
-- `--timeout` 既定 180 秒。`expires_at` は `mat` が応答を組み立てた時刻 + `timeout`。
-- `--discriminator` 省略時は node_id から決定的に算出（12-bit に収める）。
-- **「複数機器を QR 1枚でまとめて共有」は Matter 仕様上できない**（1機器1コミッション）。それを束ねるのはブリッジ＝別プロジェクト（`casa-bridge`）の話で `mat` 外。`open-window` はネイティブ機器を1台ずつ共有する。
-- fabric 数の上限に注意。安価なノードだと対応 fabric 数が 5 程度のことがあり、Aqara + HA + Apple + Google + `mat` で枠を食い潰す機種がある。Aqara ハブ等がブリッジの構成では multi-admin する相手はハブ一台で、配下センサはブリッジドエンドポイントとして見える。
+- Returns **both** `manual_code` (11-digit) and `qr_payload` (the `MT:...`
+  string).
+- **Rendering the QR image is not `mat`'s job.** stdout emits the `qr_payload`
+  string only; drawing is the upper layer's job.
+- `--timeout` defaults to 180 seconds. `expires_at` is the time `mat` built the
+  response plus `timeout`.
+- If `--discriminator` is omitted, it is derived from the node_id
+  deterministically (kept within 12 bits).
+- **"Share many devices in one QR" is not possible in Matter** (one commission
+  per device). Fronting many devices is a bridge, a separate project, not `mat`.
+  `open-window` shares native devices one at a time.
+- Watch the fabric count limit. A cheap node may support only ~5 fabrics, so
+  several admins plus `mat` can use up the slots. When a hub acts as a bridge,
+  `mat` does multi-admin with the one hub, and its sensors appear as bridged
+  endpoints.
 
-## 認証情報ストア
+## Credential store
 
-配置の優先順位: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` > `~/.config/mat`。
-Root CA・controller 鍵/証明書・commission 済みノードの台帳（`nodes.json`）・`chip-tool` の永続ストレージを格納する。**リポジトリには含めない**（`.gitignore` で除外）。
+Resolution order: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` >
+`~/.config/mat`. It holds the Root CA, the controller's keys/cert, the
+commissioned-node ledger (`nodes.json`), and `chip-tool`'s persistent storage.
+**It is never committed** (excluded by `.gitignore`).
 
-## エラーと exit code
+## Errors and exit codes
 
-エラーは stderr に `{"error":{"kind":"...","detail":"..."}}` で出る。
+Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 
-| code | 意味 |
+| code | meaning |
 |---|---|
-| 0 | 成功 |
-| 2 | CLI 引数エラー（clap 既定） |
-| 10 | 認証情報ストアが無い / パース失敗 |
-| 11 | node_id が未 commission |
-| 12 | `chip-tool` が見つからない / 実行不可 |
+| 0 | success |
+| 2 | CLI argument error (clap default) |
+| 10 | credential store missing / parse failure |
+| 11 | node_id not commissioned |
+| 12 | `chip-tool` not found / not runnable |
 | 3 | timeout |
 | 4 | device rejected |
 | 5 | unreachable / network |
-| 1 | その他 |
+| 1 | other |
 
-`chip-tool` は失敗時の exit code が粗い（おおむね `1`）。`mat` が stdout/stderr をパースして `3`/`4`/`5` に分類する。分類できなければ exit `1`。
+`chip-tool` has coarse exit codes (mostly `1` on failure). `mat` parses
+stdout/stderr to classify into `3` / `4` / `5`. If it cannot classify, exit `1`.
 
-`kind` 値（安定。呼び出し側はこの文字列で分岐してよい）:
+`kind` values (stable; callers may branch on these strings):
 
-- `store_missing` / `store_parse` — 認証情報ストアが無い / 壊れている（exit 10）
-- `node_not_commissioned` — node_id がストアに無い（exit 11）
-- `child_not_found` — `chip-tool` バイナリが見つからない / 実行不可（exit 12）
-- `timeout`（exit 3）/ `device_rejected`（exit 4）/ `unreachable`（exit 5）— chip-tool 出力から分類
-- `child_failed` — `chip-tool` が失敗終了（分類不能、exit 1）
-- `commission_failed` — commissioning 失敗（分類不能、exit 1）
-- `parse_error` — `chip-tool` 出力をパースできない（exit 1）
-- `other` — その他（exit 1）
+- `store_missing` / `store_parse` — credential store missing / corrupt (exit 10)
+- `node_not_commissioned` — node_id not in the store (exit 11)
+- `child_not_found` — `chip-tool` binary not found / not runnable (exit 12)
+- `timeout` (exit 3) / `device_rejected` (exit 4) / `unreachable` (exit 5) —
+  classified from chip-tool output
+- `child_failed` — `chip-tool` exited with failure (unclassified, exit 1)
+- `commission_failed` — commissioning failed (unclassified, exit 1)
+- `parse_error` — could not parse `chip-tool` output (exit 1)
+- `other` — anything else (exit 1)
 
-## バックエンド（chip-tool）
+## Backend (chip-tool)
 
-ローカル実行は `chip-tool` を PATH 上に置く。フルパス上書きは `MAT_CHIP_TOOL_BIN`。
-`chip-tool` 自体のビルドは重いので、x86 UGREEN 向けには Docker イメージに同梱する（[Dockerfile](./Dockerfile)）。
+For local runs, put `chip-tool` on your `PATH`. Override the full path with
+`MAT_CHIP_TOOL_BIN`. Building `chip-tool` is heavy, so a Docker image with it
+baked in is provided for x86_64 Linux hosts (see [Dockerfile](./Dockerfile)).
 
-> Matter は mDNS / IPv6 マルチキャストを使うため、Docker 実行は **host networking 必須**（`docker run --network host`）。bridge では応答を受けられない。
+> Matter uses mDNS / IPv6 multicast, so running in Docker **requires host
+> networking** (`docker run --network host`). A bridge network cannot receive
+> the responses.
 
-## 開発
+## Development
 
-[Task](https://taskfile.dev) でタスク定義（`task` で一覧）。
+Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 
 ```bash
-task build            # リリースビルド → target/release/mat
-task install          # ~/.cargo/bin にインストール
-task run -- discover  # 実行（chip-tool が PATH 上に必要）
-task test             # テスト（ダミー chip-tool 統合テスト含む。実 chip-tool 不要）
-task clippy           # Lint（-D warnings）
-task fmt              # 整形
-task check            # CI 相当（fmt:check + clippy + test）
+task build            # release build -> target/release/mat
+task install          # install into ~/.cargo/bin
+task run -- discover  # run (needs chip-tool on PATH)
+task test             # tests (incl. fake-chip-tool integration tests; no real chip-tool)
+task clippy           # lint (-D warnings)
+task fmt              # format
+task check            # CI equivalent (fmt:check + clippy + test)
 
-task docker:build     # x86 UGREEN 向けイメージ（chip-tool 同梱）
+task docker:build     # image for x86_64 Linux (chip-tool baked in)
 task docker:run -- discover
-task docker:test      # ローカルツールチェーン不要
+task docker:test      # no local toolchain needed
 ```
 
-CI は実 `chip-tool` 不要。`tests/fixtures/fake-chip-tool.sh`（固定テキストを吐くダミー）を `MAT_CHIP_TOOL_BIN` で差して統合テストを回す。
+CI does not need a real `chip-tool`. It uses `tests/fixtures/fake-chip-tool.sh`
+(a stub that prints fixed text) via `MAT_CHIP_TOOL_BIN` to run integration tests.
 
-## 実機 E2E（手動・CI 非対象）
+## Manual E2E (with real devices; not in CI)
 
-現実の主経路は **multi-admin join**（既に Home Assistant 等に commission 済みのデバイスを `mat` にも足す）。印刷コードは使えない（commissioning モードを抜けているため）ので、既存 admin 側で commissioning window を開いて一回限りのコードを発行する。
+In practice the main path is **multi-admin join**: adding a device that is
+already commissioned by another admin (such as Home Assistant) to `mat` as well.
+The printed code does not work (the device left commissioning mode), so the
+existing admin opens a commissioning window to issue a one-time code.
 
-1. **HA 側で共有**: Home Assistant の対象デバイスで「Matter で共有 / Share」を実行し、発行される setup code（`MT:...` または 11桁）を控える。
-2. **`mat` で join**:
+1. **Share from the other admin:** on the other controller, run "Share" for the
+   target device and note the issued setup code (`MT:...` or 11-digit).
+2. **Join with `mat`:**
    ```bash
-   mat commission <device-ip-or-host> "<発行された setup code>" --node-id 5
+   mat commission <device-ip-or-host> "<issued setup code>" --node-id 5
    ```
-   `{ "node_id": 5, "status": "success" }` が返り、`~/.config/mat/nodes.json` に台帳が記録される。
-3. **確認**: `mat discover` の `devices` に `"state": "commissioned"` の node 5 が現れる。
+   It returns `{ "node_id": 5, "status": "success" }` and records the ledger in
+   `~/.config/mat/nodes.json`.
+3. **Confirm:** `mat discover` now shows node 5 with `"state": "commissioned"`.
 
-> 工場出荷/リセット直後のデバイスなら、印刷された setup code をそのまま `commission` に渡せる（初回 commission）。
+> For a factory-reset device, pass the printed setup code directly to
+> `commission` (first commission).
 
-### Phase 1 操作系の E2E
+### Phase 1 operations E2E
 
-commission 済み node（上記で node 5）に対して、read / describe / on / off を実機で確認する。
+Against a commissioned node (node 5 above), confirm read / describe / on / off
+on a real device.
 
 ```bash
-# 何を叩けるかを introspect（endpoint と数値クラスタ ID を確認）
+# Introspect what you can call (endpoints and numeric cluster IDs)
 mat describe 5
 
-# OnOff 属性を読む（照明なら現在の点灯状態）
+# Read the OnOff attribute (for a light, its current on/off state)
 mat read 5 1 onoff on-off
 
-# 点灯 → 消灯（OnOff コマンドの invoke。属性 write ではない）
+# Turn on -> off (invoke of the OnOff command, not an attribute write)
 mat on 5
 mat off 5
 
-# read-after-write での検証例（値が反映されたか確認）
-mat on 5 && mat read 5 1 onoff on-off   # → "value": true
+# Read-after-write check (confirm the value took effect)
+mat on 5 && mat read 5 1 onoff on-off   # -> "value": true
 ```
 
-### Phase 2 共有系の E2E（mat → 他 admin）
+### Phase 2 share E2E (mat -> another admin)
 
-`mat` 所有の node 5 を他コントローラへ共有する。
+Share `mat`-owned node 5 with another controller.
 
 ```bash
-# commissioning window を開く（発行コードを取得）
+# Open a commissioning window (get the issued code)
 mat open-window 5 --timeout 300
-# → { "node_id": 5, "manual_code": "...", "qr_payload": "MT:...", "expires_at": "..." }
+# -> { "node_id": 5, "manual_code": "...", "qr_payload": "MT:...", "expires_at": "..." }
 ```
 
-返った `manual_code`（11桁）か `qr_payload`（QR 画像化は受け側ツールで）を相手のコントローラ（Alexa / Apple Home / Google Home）の「デバイス追加」に入力する。`expires_at` までに完了させる。共有後も `mat` の fabric メンバシップは維持される（multi-admin）。
+Enter the returned `manual_code` (11-digit) or `qr_payload` (render the QR with
+the receiving tool) into the other controller's "Add device" flow (Alexa / Apple
+Home / Google Home). Finish before `expires_at`. After sharing, `mat` keeps its
+fabric membership (multi-admin).
 
-> ワンショット起動のたびに mDNS 解決 + CASE ハンドシェイクを払うため、一発ごとは遅い（数百ms〜秒）。速度が要るユースケースは暖かいセッションを保持する `casad` の責務（CLAUDE.md の三層分離参照）。
+> Each one-shot run pays mDNS resolution plus a CASE handshake, so a single call
+> is slow (hundreds of ms to seconds). Speed-sensitive use cases belong to a
+> resident layer that keeps warm sessions (see the three-layer separation in
+> ARCHITECTURE.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Before sending a PR, run `task check`
+(format check + clippy with `-D warnings` + tests); it needs no real `chip-tool`.
+Please keep stdout pure JSON and follow the design rules in
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+## License
+
+[MIT](./LICENSE).
