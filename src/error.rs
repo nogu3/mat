@@ -66,6 +66,7 @@ impl MatError {
         }
     }
 
+    #[allow(dead_code)]
     pub fn store_missing(detail: impl Into<String>) -> Self {
         MatError::new(ErrorKind::StoreMissing, detail)
     }
