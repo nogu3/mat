@@ -8,13 +8,17 @@
 #       （`docker run --network host ...`）。bridge では応答を受けられない。
 
 # ── Stage 1: chip-tool を connectedhomeip からビルド ───────────────────────────
-FROM ubuntu:24.04 AS chip-builder
+# base image はホスト（実行先）の glibc に合わせる。バイナリを取り出してホストで
+# 直接実行する場合、ホストの glibc がビルド時より新しい必要がある（後方互換は無い）。
+# 取り出し実行先が Ubuntu 22.04（glibc 2.35）なので 22.04 でビルドする。
+FROM ubuntu:22.04 AS chip-builder
 
-ARG CHIP_REF=master
+# master は Python ビルド venv の pip 依存が壊れることがある。安定リリースタグに固定する。
+ARG CHIP_REF=v1.4.2.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git gcc g++ pkg-config libssl-dev libdbus-1-dev libglib2.0-dev \
+        git curl gcc g++ pkg-config libssl-dev libdbus-1-dev libglib2.0-dev \
         libavahi-client-dev ninja-build python3-venv python3-dev python3-pip \
         unzip libgirepository1.0-dev libcairo2-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -27,9 +31,10 @@ WORKDIR /work/connectedhomeip
 RUN scripts/checkout_submodules.py --shallow --platform linux
 
 # pigweed ベースのビルド環境を bootstrap して chip-tool をビルド。
+# gn_gen.sh は引数なしだと out/ に gen する（out/host ではない）。
 RUN bash -c "source scripts/activate.sh && \
     scripts/build/gn_gen.sh && \
-    ninja -C out/host chip-tool"
+    ninja -C out chip-tool"
 
 # ── Stage 2: mat をビルド ─────────────────────────────────────────────────────
 FROM rust:1-bookworm AS mat-builder
@@ -44,13 +49,14 @@ FROM mat-builder AS test
 RUN cargo test --release
 
 # ── Stage 3: ランタイム（軽量。バイナリだけ載せる）────────────────────────────
-FROM ubuntu:24.04 AS runtime
+# ホスト（Ubuntu 22.04）と揃える。
+FROM ubuntu:22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=chip-builder /work/connectedhomeip/out/host/chip-tool /usr/local/bin/chip-tool
+COPY --from=chip-builder /work/connectedhomeip/out/chip-tool /usr/local/bin/chip-tool
 COPY --from=mat-builder /src/target/release/mat /usr/local/bin/mat
 
 ENV MAT_CHIP_TOOL_BIN=/usr/local/bin/chip-tool

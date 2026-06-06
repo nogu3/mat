@@ -53,6 +53,18 @@ tasks:
       - task: clippy
       - task: test
 
+  chip:extract:
+    desc: chip-tool を Docker でビルドし ./chip-tool に取り出す（Docker 経由せず直接実行用）
+    cmds:
+      - docker build --target chip-builder -t mat-chip-builder .
+      - |
+        id=$(docker create mat-chip-builder)
+        docker cp "$id:/work/connectedhomeip/out/chip-tool" ./chip-tool
+        docker rm "$id"
+      - 'echo "取り出し完了: $PWD/chip-tool"'
+      - 'echo "ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3"'
+      - 'echo "実行: export MAT_CHIP_TOOL_BIN=$PWD/chip-tool"'
+
   docker:build:
     desc: x86 UGREEN 向けイメージビルド（chip-tool 同梱）
     cmds:
