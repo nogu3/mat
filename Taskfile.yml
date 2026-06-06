@@ -1,0 +1,69 @@
+version: "3"
+
+vars:
+  BIN: mat
+  IMAGE: mat:local
+
+tasks:
+  default:
+    desc: タスク一覧
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: リリースビルド → target/release/mat
+    cmds:
+      - cargo build --release
+
+  install:
+    desc: ~/.cargo/bin にインストール
+    cmds:
+      - cargo install --path . --force
+
+  run:
+    desc: "実行（chip-tool が PATH 上に必要）。例: task run -- discover"
+    cmds:
+      - cargo run -- {{.CLI_ARGS}}
+
+  test:
+    desc: テスト（ダミー chip-tool 統合テスト含む。実 chip-tool 不要）
+    cmds:
+      - cargo test
+
+  clippy:
+    desc: Lint（-D warnings）
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  fmt:
+    desc: 整形
+    cmds:
+      - cargo fmt
+
+  fmt:check:
+    desc: 整形チェック（CI）
+    cmds:
+      - cargo fmt --check
+
+  check:
+    desc: CI 相当（fmt:check + clippy + test）
+    cmds:
+      - task: fmt:check
+      - task: clippy
+      - task: test
+
+  docker:build:
+    desc: x86 UGREEN 向けイメージビルド（chip-tool 同梱）
+    cmds:
+      - docker build -t {{.IMAGE}} .
+
+  docker:run:
+    desc: "Docker 実行（host networking 必須）。例: task docker:run -- discover"
+    cmds:
+      - docker run --rm --network host -v mat-store:/root/.config/mat {{.IMAGE}} {{.CLI_ARGS}}
+
+  docker:test:
+    desc: ローカルツールチェーン不要のテスト（ビルドステージ内で cargo test）
+    cmds:
+      - docker build --target test .
