@@ -10,11 +10,12 @@ Matter デバイス操作 CLI。Matter コントローラ（`chip-tool`）をサ
 
 ## ステータス
 
-**Phase 0 + Phase 1 実装済み**:
+**Phase 0 + Phase 1 + Phase 2 実装済み**:
 - Phase 0: 雛形 + chip-tool ラッパ基盤 + commission + 認証情報 KVS + discover。
 - Phase 1: read / write / invoke + describe + on / off。
+- Phase 2: open-window（multi-admin 共有）。
 
-open-window・group は後続フェーズ（CLAUDE.md のロードマップ参照）。
+group は後続フェーズ（CLAUDE.md のロードマップ参照）。
 
 ## コマンド
 
@@ -88,6 +89,29 @@ mat off 5 --endpoint 2
 ```
 
 > `describe` は chip-tool を複数回呼ぶ（parts-list + 各 endpoint の server-list）ため遅いが、ワンショットで完結する。
+
+### multi-admin 共有（Phase 2）
+
+`mat` 所有デバイスを他コントローラ（Alexa / Apple / Google 等）へ共有するため、commissioning window を開いて一回限りの発行コードを返す。`chip-tool pairing open-commissioning-window` のラップ（ECM = option 1）。
+
+```bash
+# open-window <node_id> [--timeout S] [--iteration N] [--discriminator D]
+mat open-window 5
+mat open-window 5 --timeout 300
+```
+
+出力例:
+
+```json
+{ "timestamp": "...", "node_id": 5, "manual_code": "36217551492", "qr_payload": "MT:-24J0AFN00KA0648G00", "expires_at": "2026-06-06T12:37:56+09:00" }
+```
+
+- `manual_code`（11桁）と `qr_payload`（`MT:...` 文字列）の**両方**を返す。
+- **QR 画像化は `mat` の責務ではない**。stdout には `qr_payload` 文字列を出すだけで、描画は上層（`casad` / ビューア）が行う。
+- `--timeout` 既定 180 秒。`expires_at` は `mat` が応答を組み立てた時刻 + `timeout`。
+- `--discriminator` 省略時は node_id から決定的に算出（12-bit に収める）。
+- **「複数機器を QR 1枚でまとめて共有」は Matter 仕様上できない**（1機器1コミッション）。それを束ねるのはブリッジ＝別プロジェクト（`casa-bridge`）の話で `mat` 外。`open-window` はネイティブ機器を1台ずつ共有する。
+- fabric 数の上限に注意。安価なノードだと対応 fabric 数が 5 程度のことがあり、Aqara + HA + Apple + Google + `mat` で枠を食い潰す機種がある。Aqara ハブ等がブリッジの構成では multi-admin する相手はハブ一台で、配下センサはブリッジドエンドポイントとして見える。
 
 ## 認証情報ストア
 
@@ -182,5 +206,17 @@ mat off 5
 # read-after-write での検証例（値が反映されたか確認）
 mat on 5 && mat read 5 1 onoff on-off   # → "value": true
 ```
+
+### Phase 2 共有系の E2E（mat → 他 admin）
+
+`mat` 所有の node 5 を他コントローラへ共有する。
+
+```bash
+# commissioning window を開く（発行コードを取得）
+mat open-window 5 --timeout 300
+# → { "node_id": 5, "manual_code": "...", "qr_payload": "MT:...", "expires_at": "..." }
+```
+
+返った `manual_code`（11桁）か `qr_payload`（QR 画像化は受け側ツールで）を相手のコントローラ（Alexa / Apple Home / Google Home）の「デバイス追加」に入力する。`expires_at` までに完了させる。共有後も `mat` の fabric メンバシップは維持される（multi-admin）。
 
 > ワンショット起動のたびに mDNS 解決 + CASE ハンドシェイクを払うため、一発ごとは遅い（数百ms〜秒）。速度が要るユースケースは暖かいセッションを保持する `casad` の責務（CLAUDE.md の三層分離参照）。

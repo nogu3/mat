@@ -1,12 +1,17 @@
 //! stdout は純粋な構造化 JSON のみ。人間装飾は混ぜない。
 //! 全レスポンスに ISO 8601 の `timestamp`（`mat` が応答を組み立てた時刻）を付ける。
 
-use chrono::Local;
+use chrono::{Duration, Local};
 use serde_json::Value;
 
 /// 現在時刻を ISO 8601（ローカルタイムゾーン、オフセット付き）で返す。
 pub fn now_iso8601() -> String {
     Local::now().to_rfc3339()
+}
+
+/// 現在時刻 + `seconds` 秒を ISO 8601 で返す（`open-window` の `expires_at` 用）。
+pub fn expires_in(seconds: i64) -> String {
+    (Local::now() + Duration::seconds(seconds)).to_rfc3339()
 }
 
 /// `timestamp` を先頭に差し込んで stdout へ1行 JSON を出す。

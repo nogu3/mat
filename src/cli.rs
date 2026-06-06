@@ -1,7 +1,7 @@
 //! clap(derive) による CLI 定義。
 //!
 //! Phase 0: `discover` / `commission`。Phase 1: `read` / `write` / `invoke` /
-//! `describe` / `on` / `off`。open-window / group は後続フェーズで追加する。
+//! `describe` / `on` / `off`。Phase 2: `open-window`。group は後続フェーズで追加する。
 
 use std::path::PathBuf;
 
@@ -101,5 +101,21 @@ pub enum Command {
         /// エンドポイント番号（既定 1）。
         #[arg(long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
+    },
+
+    /// `mat` 所有デバイスを他 admin へ共有するため commissioning window を開く。
+    /// `{ node_id, manual_code, qr_payload, expires_at }` を返す（QR 画像化は上層）。
+    OpenWindow {
+        /// commission 済みノードの node_id。
+        node_id: u64,
+        /// window を開いておく秒数（既定 180）。
+        #[arg(long, value_name = "S", default_value_t = 180)]
+        timeout: u32,
+        /// PAKE の iteration count（既定 1000）。
+        #[arg(long, value_name = "N", default_value_t = 1000)]
+        iteration: u32,
+        /// 12-bit discriminator（既定: node_id から決定的に算出）。
+        #[arg(long, value_name = "D")]
+        discriminator: Option<u16>,
     },
 }
