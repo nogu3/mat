@@ -9,3 +9,6 @@ Cargo.lock
 *.pem
 *.der
 *.chip
+
+# Docker から取り出した chip-tool バイナリ
+/chip-tool
