@@ -172,6 +172,46 @@ pub fn operation_succeeded(stdout: &str) -> bool {
     false
 }
 
+/// `mat open-window` が返す発行コード（multi-admin 共有用）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenWindowCodes {
+    /// 11桁の manual pairing code。
+    pub manual_code: Option<String>,
+    /// QR ペイロード文字列（`MT:...`）。画像化はしない（上層の責務）。
+    pub qr_payload: Option<String>,
+}
+
+/// `chip-tool pairing open-commissioning-window ...` の stdout から発行コードを拾う。
+///
+/// chip-tool は ECM（option 1）で `Manual pairing code: [<code>]` と
+/// `SetupQRCode: [MT:...]` を出す。どちらも角括弧内の値を取り出す。1つでも欠ければ
+/// 呼び出し側が `parse_error` にする。
+pub fn parse_open_window(stdout: &str) -> OpenWindowCodes {
+    let mut codes = OpenWindowCodes::default();
+    for line in stdout.lines() {
+        if let Some(v) = bracketed_after(line, "Manual pairing code:") {
+            codes.manual_code = Some(v.to_string());
+        } else if let Some(v) = bracketed_after(line, "SetupQRCode:") {
+            codes.qr_payload = Some(v.to_string());
+        }
+    }
+    codes
+}
+
+/// `<label> ... [<値>]` 行からラベル以降 最初の `[...]` の中身を返す。
+fn bracketed_after<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let pos = line.find(label)?;
+    let after = &line[pos + label.len()..];
+    let open = after.find('[')?;
+    let close = after[open + 1..].find(']')?;
+    let val = after[open + 1..open + 1 + close].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
+}
+
 /// `chip-tool descriptor read <list> ...` の stdout から ID リストを取り出す。
 ///
 /// chip-tool はリスト属性を `[<idx>]: <値>` 行で列挙する（PartsList / ServerList 等）。
@@ -329,6 +369,24 @@ mod tests {
             "[1656][CHIP:DMG] status = 0x01 (FAILURE)"
         ));
         assert!(!operation_succeeded("nothing useful"));
+    }
+
+    #[test]
+    fn open_window_extracts_both_codes() {
+        let s = "\
+[1656][CHIP:CTL] Manual pairing code: [36217551492]
+[1656][CHIP:SVR] SetupQRCode: [MT:-24J0AFN00KA0648G00]
+";
+        let codes = parse_open_window(s);
+        assert_eq!(codes.manual_code.as_deref(), Some("36217551492"));
+        assert_eq!(codes.qr_payload.as_deref(), Some("MT:-24J0AFN00KA0648G00"));
+    }
+
+    #[test]
+    fn open_window_missing_codes_are_none() {
+        let codes = parse_open_window("nothing useful here");
+        assert!(codes.manual_code.is_none());
+        assert!(codes.qr_payload.is_none());
     }
 
     #[test]

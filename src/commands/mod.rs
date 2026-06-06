@@ -5,5 +5,6 @@ pub mod commission;
 pub mod describe;
 pub mod discover;
 pub mod invoke;
+pub mod open_window;
 pub mod read;
 pub mod write;

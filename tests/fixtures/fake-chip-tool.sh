@@ -1,7 +1,7 @@
 #!/bin/sh
 # テスト用ダミー chip-tool。実 chip-tool 不要で discover / commission /
-# read / write / invoke / describe の統合テストを回すため、固定のログ風
-# テキストを吐く。
+# read / write / invoke / describe / open-window の統合テストを回すため、固定の
+# ログ風テキストを吐く。
 #
 # 挙動は環境変数で制御:
 #   FAKE_CHIP_MODE = success(既定) | timeout | reject
@@ -39,6 +39,15 @@ EOF
     exit 0
     ;;
   pairing)
+    # open-commissioning-window は同じ `pairing` サブコマンド。発行コードを吐く。
+    if [ "$2" = "open-commissioning-window" ]; then
+      emit_failure
+      cat <<'EOF'
+[1656][CHIP:CTL] Manual pairing code: [36217551492]
+[1656][CHIP:SVR] SetupQRCode: [MT:-24J0AFN00KA0648G00]
+EOF
+      exit 0
+    fi
     case "$mode" in
       success)
         echo "[1656][CHIP:CTL] Successfully finished commissioning, deviceId=1"

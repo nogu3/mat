@@ -210,6 +210,43 @@ fn describe_lists_endpoints_and_clusters() {
 }
 
 #[test]
+fn open_window_returns_codes() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["open-window", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"node_id\":5"))
+        .stdout(predicate::str::contains("\"manual_code\":\"36217551492\""))
+        .stdout(predicate::str::contains(
+            "\"qr_payload\":\"MT:-24J0AFN00KA0648G00\"",
+        ))
+        .stdout(predicate::str::contains("\"expires_at\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+}
+
+#[test]
+fn open_window_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["open-window", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn open_window_timeout_exits_3() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .args(["open-window", "5"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}
+
+#[test]
 fn read_unknown_node_exits_11() {
     let store = store_with_node5();
     mat(store.path())

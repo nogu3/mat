@@ -61,6 +61,16 @@ fn main() -> ExitCode {
         Command::Off { node_id, endpoint } => {
             commands::invoke::run_onoff(&store_path, *node_id, *endpoint, false)
         }
+        Command::OpenWindow {
+            node_id,
+            timeout,
+            iteration,
+            discriminator,
+        } => {
+            // discriminator 未指定なら node_id から決定的に算出（12-bit に収める）。
+            let disc = discriminator.unwrap_or_else(|| (*node_id % 4096) as u16);
+            commands::open_window::run(&store_path, *node_id, *timeout, *iteration, disc)
+        }
     };
 
     match result {
