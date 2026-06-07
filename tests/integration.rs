@@ -95,6 +95,38 @@ fn commission_success_updates_store_and_shows_in_discover() {
 }
 
 #[test]
+fn commission_passes_paa_trust_store_when_set() {
+    // 本番デバイスの attestation 検証用に、MAT_PAA_TRUST_STORE で指定した PAA
+    // ディレクトリが chip-tool へ `--paa-trust-store-path` で渡ること。
+    let store = TempDir::new().unwrap();
+    let paa = TempDir::new().unwrap();
+    let args_file = store.path().join("recorded-args.txt");
+
+    mat(store.path())
+        .env("MAT_PAA_TRUST_STORE", paa.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "commission",
+            "192.0.2.10",
+            "MT:FAKE-SETUP-CODE",
+            "--node-id",
+            "7",
+        ])
+        .assert()
+        .success();
+
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("--paa-trust-store-path"),
+        "args did not include PAA flag: {recorded}"
+    );
+    assert!(
+        recorded.contains(paa.path().to_str().unwrap()),
+        "args did not include PAA path: {recorded}"
+    );
+}
+
+#[test]
 fn commission_timeout_exits_3() {
     let store = TempDir::new().unwrap();
     mat(store.path())

@@ -252,6 +252,9 @@ Build a fabric, commission a device, persist its credentials, and discover nodes
   `MAT_CHIP_TOOL_BIN`.
 - Credential store (`--store` / `MAT_STORE` / default `~/.config/mat/`) with Root
   CA / controller cert bootstrap.
+- PAA trust store for attestation of production devices, resolved from
+  `MAT_PAA_TRUST_STORE` or `<store>/paa-trust-store/` and passed to `chip-tool`
+  as `--paa-trust-store-path` (no built-in certs; the operator supplies them).
 - `mat discover`, `mat commission` (first commission and join).
 - A multi-stage Docker build that bakes `chip-tool` once and ships only the binary
   in the runtime image.
