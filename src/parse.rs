@@ -120,8 +120,9 @@ pub fn parse_read_value(stdout: &str) -> Option<serde_json::Value> {
     last.map(normalize_value)
 }
 
-/// chip-tool の生テキスト値を `mat` の JSON 値へ正規化する。
-fn normalize_value(raw: &str) -> serde_json::Value {
+/// chip-tool の生テキスト値（または write の CLI 入力値）を `mat` の JSON 値へ
+/// 正規化する。read と write で同じ型付けを使い、出力 value の型を一貫させる。
+pub fn normalize_value(raw: &str) -> serde_json::Value {
     // 文字列リテラル（両端ダブルクォート）。
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         return serde_json::Value::String(raw[1..raw.len() - 1].to_string());

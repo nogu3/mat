@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::error::{ErrorKind, MatError};
 use crate::output;
-use crate::parse::operation_succeeded;
+use crate::parse::{normalize_value, operation_succeeded};
 use crate::runner::{classify_failure, ChipTool};
 use crate::store::Store;
 
@@ -52,7 +52,9 @@ pub fn run(
         "endpoint": endpoint,
         "cluster": cluster,
         "attribute": attribute,
-        "value": value,
+        // read と型を揃える（`"100"` ではなく `100`）。mat は属性の型を持たないため、
+        // CLI 入力文字列を read と同じ normalize_value で型推定する。
+        "value": normalize_value(value),
         "status": "success",
     }));
     Ok(())
