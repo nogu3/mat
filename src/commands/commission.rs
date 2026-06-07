@@ -8,7 +8,7 @@
 //! `target`（IP/DNS）は台帳のメタとして記録する。`pairing code` はコード内の
 //! discriminator から mDNS でノードを自前探索するため、chip-tool には渡さない。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
@@ -30,7 +30,21 @@ pub fn run(
 
     let node_id = node_id.unwrap_or_else(|| next_node_id(&store));
 
-    let out = chip.run(["pairing", "code", &node_id.to_string(), setup_code])?;
+    // 本番 Matter デバイスは DAC が本番 PAA で署名されており、chip-tool 既定の
+    // 開発用 PAA だけでは attestation 検証に失敗する（Failed Device Attestation）。
+    // PAA ルート証明書ディレクトリが解決できれば chip-tool に渡す。
+    let mut args: Vec<String> = vec![
+        "pairing".to_string(),
+        "code".to_string(),
+        node_id.to_string(),
+        setup_code.to_string(),
+    ];
+    if let Some(paa) = paa_trust_store_path(store.root()) {
+        args.push("--paa-trust-store-path".to_string());
+        args.push(paa.to_string_lossy().into_owned());
+    }
+
+    let out = chip.run(args)?;
 
     if out.success() && commission_succeeded(&out.stdout) {
         store.upsert_node(NodeRecord {
@@ -54,4 +68,47 @@ pub fn run(
 /// 台帳の最大 node_id + 1。空なら 1。
 fn next_node_id(store: &Store) -> u64 {
     store.nodes().map(|n| n.node_id).max().map_or(1, |m| m + 1)
+}
+
+/// PAA（Product Attestation Authority）ルート証明書ディレクトリを解決する。
+///
+/// 優先順位:
+/// 1. `MAT_PAA_TRUST_STORE`（明示指定。存在は問わず chip-tool に委ねる）
+/// 2. `<store>/paa-trust-store/`（存在すれば）
+///
+/// どちらも無ければ `None`。その場合 chip-tool は既定の開発用 PAA だけで検証する
+/// ため、本番デバイスは `device_rejected`（Failed Device Attestation）になる。
+/// 証明書は connectedhomeip の `credentials/production/paa-root-certs/` から取得する。
+fn paa_trust_store_path(store_root: &Path) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("MAT_PAA_TRUST_STORE") {
+        return Some(PathBuf::from(p));
+    }
+    let default = store_root.join("paa-trust-store");
+    default.is_dir().then_some(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paa_none_when_unset_and_no_default_dir() {
+        // 干渉を避けるため env を見ない既定パス側だけを検証する。
+        if std::env::var_os("MAT_PAA_TRUST_STORE").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(paa_trust_store_path(dir.path()), None);
+    }
+
+    #[test]
+    fn paa_uses_default_dir_when_present() {
+        if std::env::var_os("MAT_PAA_TRUST_STORE").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paa = dir.path().join("paa-trust-store");
+        std::fs::create_dir(&paa).unwrap();
+        assert_eq!(paa_trust_store_path(dir.path()), Some(paa));
+    }
 }

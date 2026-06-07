@@ -9,6 +9,11 @@
 
 mode="${FAKE_CHIP_MODE:-success}"
 
+# テスト検証用: 受け取った全引数を記録（PAA フラグ受け渡し等の確認に使う）。
+if [ -n "$FAKE_CHIP_ARGS_FILE" ]; then
+  echo "$*" > "$FAKE_CHIP_ARGS_FILE"
+fi
+
 # read/write/invoke/describe 共通の失敗注入。success 以外なら該当ログを吐いて非 0 終了。
 emit_failure() {
   case "$mode" in

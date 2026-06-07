@@ -69,6 +69,26 @@ mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
 { "timestamp": "2026-06-06T12:34:56+09:00", "node_id": 5, "status": "success" }
 ```
 
+#### Attestation / PAA trust store
+
+Production Matter devices ship a DAC signed by a **production PAA** (Product
+Attestation Authority). With only chip-tool's built-in development PAA,
+commissioning fails attestation (`device_rejected`, "Failed Device
+Attestation"). Point `mat` at a directory of PAA root certificates:
+
+```bash
+# Option 1: explicit env var
+export MAT_PAA_TRUST_STORE=/path/to/paa-root-certs
+# Option 2: drop the certs under the store, no env needed
+#   <store>/paa-trust-store/   (e.g. ~/.config/mat/paa-trust-store/)
+mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
+```
+
+Resolution order: `MAT_PAA_TRUST_STORE` > `<store>/paa-trust-store/`. If neither
+exists, `mat` passes no trust store and only chip-tool's development PAA applies
+(fine for test devices, not for retail ones). Get the certificates from
+connectedhomeip's `credentials/production/paa-root-certs/`.
+
 ### State operations (Phase 1)
 
 `<node_id>` must be **already commissioned** (if not, exit `11`; if the store
