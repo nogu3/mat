@@ -126,19 +126,23 @@ fn normalize_value(raw: &str) -> serde_json::Value {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         return serde_json::Value::String(raw[1..raw.len() - 1].to_string());
     }
-    match raw.to_ascii_lowercase().as_str() {
+    // 実機 chip-tool は数値に型注釈を付ける（`191 (unsigned)` / `-5 (signed)`）。
+    // 先頭トークンを値とみなす。注釈なし（`191`）も同じ経路で通る。bool/null は
+    // そもそも注釈が付かないが、先頭トークン基準でも同じ結果になる。
+    let head = raw.split_whitespace().next().unwrap_or(raw);
+    match head.to_ascii_lowercase().as_str() {
         "true" => return serde_json::Value::Bool(true),
         "false" => return serde_json::Value::Bool(false),
         "null" => return serde_json::Value::Null,
         _ => {}
     }
-    if let Ok(i) = raw.parse::<i64>() {
+    if let Ok(i) = head.parse::<i64>() {
         return serde_json::Value::from(i);
     }
-    if let Ok(u) = raw.parse::<u64>() {
+    if let Ok(u) = head.parse::<u64>() {
         return serde_json::Value::from(u);
     }
-    if let Ok(f) = raw.parse::<f64>() {
+    if let Ok(f) = head.parse::<f64>() {
         if let Some(n) = serde_json::Number::from_f64(f) {
             return serde_json::Value::Number(n);
         }
@@ -468,5 +472,15 @@ mod tests {
         // 実機形式の Data 行（ANSI はランナーで除去済みの前提）。
         let s = "[1780817887.948] [32231:32235] [DMG]   Data = true,";
         assert_eq!(parse_read_value(s), Some(serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn read_value_strips_type_annotation() {
+        // 実機 chip-tool は数値に型注釈を付ける（`191 (unsigned)`）。旧パーサは
+        // `191 (unsigned)` を数値 parse できず文字列にフォールバックしていた。
+        let s = "[1780817887.948] [32231:32235] [DMG]   Data = 191 (unsigned),";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::from(191)));
+        let s = "[1780817887.948] [32231:32235] [DMG]   Data = -5 (signed),";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::from(-5)));
     }
 }
