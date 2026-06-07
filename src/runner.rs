@@ -155,7 +155,8 @@ pub fn classify_failure(stdout: &str, stderr: &str) -> Option<ErrorKind> {
         || hay.contains("constraint")
         || hay.contains("rejected")
         || hay.contains("access denied")
-        || hay.contains("invalid command")
+        || hay.contains("invalid command") // 実機は `INVALID_COMMAND`（小文字化で `_`）
+        || hay.contains("invalid_command")
     {
         return Some(ErrorKind::DeviceRejected);
     }
@@ -183,6 +184,13 @@ mod tests {
     #[test]
     fn classifies_device_rejected() {
         let s = "Received Command Response Status ... status 0x81 (Failure)";
+        assert_eq!(classify_failure(s, ""), Some(ErrorKind::DeviceRejected));
+    }
+
+    #[test]
+    fn classifies_invalid_command_as_rejected() {
+        // 実機 open-window 拒否: `Status=0x85` + `INVALID_COMMAND`（アンダースコア）。
+        let s = "IM Error 0x00000585: General error: 0x85 (INVALID_COMMAND)";
         assert_eq!(classify_failure(s, ""), Some(ErrorKind::DeviceRejected));
     }
 
