@@ -76,10 +76,17 @@ impl ChipTool {
             }
         })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // chip-tool は TTY 非接続でも ANSI の色付け（SGR）を出す版がある。これが
+        // 残ると値（`true, \x1b[0m`）や discover の hostname/address を汚すため、
+        // パースに回す前にここで一括除去する（出力正規化はランナーの責務）。
+        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+        let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
 
-        // chip-tool の stderr は呑まず、少なくとも debug で残す。
+        // chip-tool の出力は呑まず、少なくとも debug で残す。診断の大半は stdout に
+        // 出るため stdout も残す（パース失敗時の切り分けに必要）。
+        if !stdout.trim().is_empty() {
+            tracing::debug!(target: "chip_tool::stdout", "{}", stdout.trim_end());
+        }
         if !stderr.trim().is_empty() {
             tracing::debug!(target: "chip_tool::stderr", "{}", stderr.trim_end());
         }
@@ -90,6 +97,34 @@ impl ChipTool {
             code: output.status.code(),
         })
     }
+}
+
+/// chip-tool 出力に混じる ANSI エスケープ列（色付け等）を除去する。
+///
+/// 対象は CSI シーケンス（`ESC [ … 終端バイト`、SGR の `m` を含む）。終端は
+/// 0x40–0x7E のバイト。ESC 単独や非 CSI シーケンスは ESC のみ落とす。これを
+/// 通さないと `Data = true,\x1b[0m` のように値末尾へ色リセットが残り、bool/数値の
+/// 正規化が崩れる。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // ESC。CSI（`[`）なら終端バイト 0x40–0x7E まで読み飛ばす。
+        if chars.clone().next() == Some('[') {
+            chars.next(); // '[' を消費
+            for d in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&d) {
+                    break;
+                }
+            }
+        }
+        // 非 CSI の ESC は単に捨てる。
+    }
+    out
 }
 
 /// `chip-tool` の失敗出力から `mat` の失敗種別を分類する。
@@ -154,5 +189,18 @@ mod tests {
     #[test]
     fn unknown_failure_is_none() {
         assert_eq!(classify_failure("some other gibberish", ""), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_sequences() {
+        // 実機 chip-tool は値末尾に色リセットを残す（read が `true, \x1b[0m` を返した）。
+        assert_eq!(strip_ansi("true, \x1b[0m"), "true, ");
+        // 行頭の色付け + リセットの両方を除去。
+        assert_eq!(
+            strip_ansi("\x1b[0;34m[1780817887.948] foo\x1b[0m"),
+            "[1780817887.948] foo"
+        );
+        // ANSI を含まない行はそのまま。
+        assert_eq!(strip_ansi("plain text"), "plain text");
     }
 }
