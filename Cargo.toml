@@ -1,6 +1,6 @@
 [package]
 name = "mat"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Matter device control CLI — normalizes chip-tool output to a structured JSON schema"
 license = "MIT"
