@@ -12,3 +12,6 @@ Cargo.lock
 
 # Docker から取り出した chip-tool バイナリ
 /chip-tool
+
+# クロスビルド成果物（実機へ scp 用）
+/dist/

@@ -61,3 +61,41 @@ COPY --from=mat-builder /src/target/release/mat /usr/local/bin/mat
 
 ENV MAT_CHIP_TOOL_BIN=/usr/local/bin/chip-tool
 ENTRYPOINT ["mat"]
+
+# ── arm64 クロスビルド（Raspberry Pi 3 B+ 等 aarch64 実機向け）────────────────────
+# QEMU エミュレーションではなく、公式クロスコンパイル環境イメージで母艦ネイティブ
+# 速度のクロスビルドを行う。chip-build-crosscompile は aarch64 sysroot を同梱し、
+# 環境変数 SYSROOT_AARCH64 を設定済み。build_examples.py の linux-arm64 ターゲットが
+# target_cpu="arm64" / sysroot=$SYSROOT_AARCH64 を自動で渡す。
+# タグ 145 は v1.4.2.0 ツリーの integrations/docker version と同世代。
+#
+# 取り出したバイナリは Pi 上で Docker 無しに直接実行する（1GB RAM で常駐 Docker は
+# 重いため）。glibc は実機 trixie(2.41) > ビルド側 → 前方互換で動作する。
+# 実機ランタイム依存: libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 avahi-daemon
+FROM ghcr.io/project-chip/chip-build-crosscompile:145 AS chip-builder-arm64
+ARG CHIP_REF=v1.4.2.0
+WORKDIR /work
+RUN git clone --depth 1 --branch ${CHIP_REF} \
+        https://github.com/project-chip/connectedhomeip.git
+WORKDIR /work/connectedhomeip
+RUN scripts/checkout_submodules.py --shallow --platform linux
+# arm64 ボードは clang 必須（gcc 単体は ONLY IF '-(clang|nodeps)' で弾かれる）。
+# clang = 通常の system 依存（avahi/glib/dbus/ssl, sysroot 同梱）を使う。
+# 出力: out/linux-arm64-chip-tool-clang/chip-tool
+RUN bash -c "source scripts/activate.sh && \
+    ./scripts/build/build_examples.py --target linux-arm64-chip-tool-clang build"
+
+# ── mat を aarch64 へクロスビルド ─────────────────────────────────────────────
+# mat は軽量なので母艦ネイティブの Rust クロス（gcc-aarch64-linux-gnu リンカ）で焼く。
+FROM rust:1-bookworm AS mat-builder-arm64
+RUN rustup target add aarch64-unknown-linux-gnu \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+WORKDIR /src
+COPY Cargo.toml ./
+COPY src ./src
+COPY tests ./tests
+# 出力: target/aarch64-unknown-linux-gnu/release/mat
+RUN cargo build --release --target aarch64-unknown-linux-gnu
