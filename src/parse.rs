@@ -244,13 +244,20 @@ pub fn parse_id_list(stdout: &str) -> Vec<u64> {
     ids
 }
 
-/// 行頭の chip-tool ログ接頭辞（`[..][CHIP:..]` を 0 個以上）を取り除いた残りを返す。
-/// エントリ行 `[1]: 6` の先頭 `[1]` をログ接頭辞と誤認しないよう、タイムスタンプ
-/// （数字のみ）か `CHIP:` タグを含む角括弧ブロックだけ剥がす。
+/// 行頭の chip-tool ログ接頭辞を取り除いた残り（payload）を返す。
+///
+/// chip-tool のログ形式はバージョンで揺れる。少なくとも次の2系統を扱う:
+/// - 旧テスト fixture: `[1717][CHIP:DIS] payload`（整数 ts + `CHIP:` タグ、隙間なし）
+/// - 実機 v1.4.2.0:   `[1780817887.948] [32231:32235] [TOO] payload`
+///   （小数点 ts + `pid:tid` + `CHIP:` 無しタグ、スペース区切り）
+///
+/// 方針: 行頭から `[...]` ブロックを見て、
+/// - 英字を含むブロック（`CHIP:DIS` / `TOO` / `DMG` 等のタグ）に当たったら、それを
+///   接頭辞の最後とみなして以降の payload を返す。
+/// - 数字・ドット・コロンのみのブロック（ts / `pid:tid`）で、直後に別ブロックが続く
+///   ものはメタ情報として読み飛ばす。
+/// - それ以外（`[1]: 6` のようなインデックス行）は剥がさない。
 fn strip_log_prefix(line: &str) -> Option<&str> {
-    // chip-tool のログ接頭辞は `[<timestamp>][CHIP:<tag>] payload` の形。timestamp
-    // ブロック（数字のみ）は読み飛ばし、`CHIP:` タグに当たったらそれを最後の接頭辞
-    // ブロックとして剥がし、残り（payload）を返す。payload 中の `[1]` 等は剥がさない。
     let mut rest = line;
     loop {
         let trimmed = rest.trim_start();
@@ -261,13 +268,20 @@ fn strip_log_prefix(line: &str) -> Option<&str> {
             return Some(trimmed);
         };
         let block = &trimmed[1..close];
-        if block.contains("CHIP:") {
-            return Some(trimmed[close + 1..].trim_start());
+        let after = trimmed[close + 1..].trim_start();
+
+        // タグブロック（英字を含む）= 接頭辞の最後。payload を返す。
+        if block.chars().any(|c| c.is_ascii_alphabetic()) {
+            return Some(after);
         }
-        // timestamp ブロック（数字のみ）は、直後にもう一つブロック `[` が続く接頭辞
-        // パターンのときだけ剥がす。素の `[1]: 6` を誤って削らないため。
-        let after = &trimmed[close + 1..];
-        if block.chars().all(|c| c.is_ascii_digit()) && after.starts_with('[') {
+        // メタブロック（ts `1780817887.948` / pid:tid `32231:32235`）は数字・ドット・
+        // コロンのみで構成され、直後に別ブロックが続く。読み飛ばして継続。素の
+        // `[1]: 6`（直後が `[` でない）はインデックス行なので剥がさない。
+        let is_meta = !block.is_empty()
+            && block
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ':');
+        if is_meta && after.starts_with('[') {
             rest = after;
             continue;
         }
@@ -403,5 +417,35 @@ mod tests {
     #[test]
     fn id_list_empty_when_no_entries() {
         assert!(parse_id_list("[1717][CHIP:TOO]   ServerList: 0 entries").is_empty());
+    }
+
+    #[test]
+    fn id_list_realworld_log_format() {
+        // 実機 chip-tool v1.4.2.0: 小数点 ts + `pid:tid` + `CHIP:` 無しタグ +
+        // スペース区切り。旧パーサはこの接頭辞を剥がせず describe が空になっていた。
+        let s = "\
+[1780817887.948] [32231:32235] [TOO]   ServerList: 3 entries
+[1780817887.948] [32231:32235] [TOO]     [1]: 6
+[1780817887.948] [32231:32235] [TOO]     [2]: 29
+[1780817887.948] [32231:32235] [TOO]     [3]: 31
+";
+        assert_eq!(parse_id_list(s), vec![6, 29, 31]);
+    }
+
+    #[test]
+    fn id_list_realworld_parts_list_single() {
+        // describe で実際に取りこぼした PartsList（endpoint 1 のみ）。
+        let s = "\
+[1780817887.948] [32231:32235] [TOO]   PartsList: 1 entries
+[1780817887.948] [32231:32235] [TOO]     [1]: 1
+";
+        assert_eq!(parse_id_list(s), vec![1]);
+    }
+
+    #[test]
+    fn read_value_realworld_log_format() {
+        // 実機形式の Data 行（ANSI はランナーで除去済みの前提）。
+        let s = "[1780817887.948] [32231:32235] [DMG]   Data = true,";
+        assert_eq!(parse_read_value(s), Some(serde_json::Value::Bool(true)));
     }
 }
