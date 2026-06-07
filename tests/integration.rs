@@ -190,7 +190,8 @@ fn write_reports_success() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\":\"success\""))
-        .stdout(predicate::str::contains("\"value\":\"128\""));
+        // write の value は read と型を揃える（文字列 "128" ではなく整数 128）。
+        .stdout(predicate::str::contains("\"value\":128"));
 }
 
 #[test]
