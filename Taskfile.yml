@@ -65,6 +65,25 @@ tasks:
       - 'echo "ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3"'
       - 'echo "実行: export MAT_CHIP_TOOL_BIN=$PWD/chip-tool"'
 
+  chip:extract:arm64:
+    desc: arm64(aarch64) 版 chip-tool + mat をクロスビルドし ./dist/arm64/ に取り出す（Pi3 等実機へ scp 用）
+    cmds:
+      - docker build --target chip-builder-arm64 -t mat-chip-builder-arm64 .
+      - docker build --target mat-builder-arm64 -t mat-mat-builder-arm64 .
+      - mkdir -p dist/arm64
+      - |
+        id=$(docker create mat-chip-builder-arm64)
+        docker cp "$id:/work/connectedhomeip/out/linux-arm64-chip-tool-clang/chip-tool" ./dist/arm64/chip-tool
+        docker rm "$id"
+      - |
+        id=$(docker create mat-mat-builder-arm64)
+        docker cp "$id:/src/target/aarch64-unknown-linux-gnu/release/mat" ./dist/arm64/mat
+        docker rm "$id"
+      - 'echo "取り出し完了: $PWD/dist/arm64/{chip-tool,mat}"'
+      - 'echo "実機へ転送: scp dist/arm64/chip-tool dist/arm64/mat jarvis:~/"'
+      - 'echo "実機ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 avahi-daemon"'
+      - 'echo "実機実行: export MAT_CHIP_TOOL_BIN=~/chip-tool && ~/mat discover"'
+
   docker:build:
     desc: x86 UGREEN 向けイメージビルド（chip-tool 同梱）
     cmds:
