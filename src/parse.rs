@@ -237,7 +237,10 @@ pub fn parse_id_list(stdout: &str) -> Vec<u64> {
         let Some(val) = rest.strip_prefix(':') else {
             continue;
         };
-        if let Ok(id) = val.trim().parse::<u64>() {
+        // 実機 chip-tool は値に名前注釈を付ける（`3 (Identify)`）。先頭トークンだけ
+        // 数値として拾う。注釈なし（`6`）も同じ経路で通る。
+        let token = val.split_whitespace().next().unwrap_or("");
+        if let Ok(id) = token.parse::<u64>() {
             ids.push(id);
         }
     }
@@ -430,6 +433,24 @@ mod tests {
 [1780817887.948] [32231:32235] [TOO]     [3]: 31
 ";
         assert_eq!(parse_id_list(s), vec![6, 29, 31]);
+    }
+
+    #[test]
+    fn id_list_strips_name_annotation() {
+        // 実機 chip-tool は ServerList の各 ID に名前注釈を付ける（`3 (Identify)`）。
+        // 旧パーサは `3 (Identify)` 全体を u64 parse して全落ち → clusters が空だった。
+        let s = "\
+[1780831029.797] [39286:39288] [TOO]   ServerList: 8 entries
+[1780831029.797] [39286:39288] [TOO]     [1]: 3 (Identify)
+[1780831029.797] [39286:39288] [TOO]     [2]: 4 (Groups)
+[1780831029.797] [39286:39288] [TOO]     [3]: 5 (Unknown)
+[1780831029.797] [39286:39288] [TOO]     [4]: 6 (OnOff)
+[1780831029.798] [39286:39288] [TOO]     [5]: 8 (LevelControl)
+[1780831029.798] [39286:39288] [TOO]     [6]: 29 (Descriptor)
+[1780831029.798] [39286:39288] [TOO]     [7]: 30 (Binding)
+[1780831029.798] [39286:39288] [TOO]     [8]: 768 (ColorControl)
+";
+        assert_eq!(parse_id_list(s), vec![3, 4, 5, 6, 8, 29, 30, 768]);
     }
 
     #[test]
