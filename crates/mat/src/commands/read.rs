@@ -9,11 +9,12 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::error::{ErrorKind, MatError};
-use crate::output;
-use crate::parse::parse_read_value;
-use crate::runner::{classify_failure, ChipTool};
-use crate::store::Store;
+use mat_core::error::{ErrorKind, MatError};
+use mat_core::output;
+use mat_core::parse::parse_read_value;
+use crate::runner::ChipTool;
+use mat_core::normalize::classify_failure;
+use mat_core::store::Store;
 
 pub fn run(
     store_path: &Path,

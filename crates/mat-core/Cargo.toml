@@ -1,0 +1,16 @@
+[package]
+name = "mat-core"
+description = "Shared core for mat/matd — chip-tool output parsing, mat's JSON schema, error/exit-code classification, credential store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
