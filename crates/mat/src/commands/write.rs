@@ -7,11 +7,11 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
+use mat_core::normalize::classify_failure;
 use mat_core::output;
 use mat_core::parse::{normalize_value, operation_succeeded};
-use crate::runner::ChipTool;
-use mat_core::normalize::classify_failure;
 use mat_core::store::Store;
 
 pub fn run(

@@ -14,11 +14,11 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
+use mat_core::normalize::classify_failure;
 use mat_core::output;
 use mat_core::parse::parse_open_window;
-use crate::runner::ChipTool;
-use mat_core::normalize::classify_failure;
 use mat_core::store::Store;
 
 /// ECM（Enhanced Commissioning Method）= 一回限りの新コードを発行する option。
