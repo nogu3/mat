@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, GroupCommand};
 use store::Store;
 
 fn main() -> ExitCode {
@@ -71,6 +71,35 @@ fn main() -> ExitCode {
             let disc = discriminator.unwrap_or_else(|| (*node_id % 4096) as u16);
             commands::open_window::run(&store_path, *node_id, *timeout, *iteration, disc)
         }
+        Command::Group { action } => match action {
+            GroupCommand::Provision {
+                group_id,
+                node_ids,
+                keyset_id,
+                name,
+                endpoint,
+                epoch_key,
+            } => {
+                // name 未指定なら group_id から決定的に補完（open-window の disc と同様）。
+                let name = name.clone().unwrap_or_else(|| format!("grp{group_id}"));
+                commands::group::provision(
+                    &store_path,
+                    *group_id,
+                    node_ids,
+                    *keyset_id,
+                    &name,
+                    *endpoint,
+                    epoch_key.as_deref(),
+                )
+            }
+            GroupCommand::Invoke {
+                group_id,
+                cluster,
+                command,
+                args,
+                endpoint,
+            } => commands::group::invoke(&store_path, *group_id, cluster, command, args, *endpoint),
+        },
     };
 
     match result {

@@ -1,7 +1,8 @@
 //! clap(derive) による CLI 定義。
 //!
 //! Phase 0: `discover` / `commission`。Phase 1: `read` / `write` / `invoke` /
-//! `describe` / `on` / `off`。Phase 2: `open-window`。group は後続フェーズで追加する。
+//! `describe` / `on` / `off`。Phase 2: `open-window`。Phase 3: `group provision` /
+//! `group invoke`（groupcast）。
 
 use std::path::PathBuf;
 
@@ -117,5 +118,54 @@ pub enum Command {
         /// 12-bit discriminator（既定: node_id から決定的に算出）。
         #[arg(long, value_name = "D")]
         discriminator: Option<u16>,
+    },
+
+    /// Matter wire group（groupcast）の操作。複数機器を multicast 1発で同期制御する。
+    /// 論理グループ名の解決は上層の責務で、ここは GroupId ベースの on-wire 操作のみ。
+    Group {
+        #[command(subcommand)]
+        action: GroupCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GroupCommand {
+    /// 各ノードへ group 鍵束とマッピングを焼く（KeySetWrite / GroupKeyMap / AddGroup）。
+    /// コントローラ側 group state（groupsettings）も併せて設定する。
+    Provision {
+        /// Matter GroupId（wire group 識別子）。
+        group_id: u16,
+        /// provision 対象の commission 済み node_id（1つ以上）。
+        #[arg(required = true, num_args = 1..)]
+        node_ids: Vec<u64>,
+        /// 鍵束 ID（GroupKeySetID）。既定 42。
+        #[arg(long, value_name = "N", default_value_t = 42)]
+        keyset_id: u16,
+        /// group 名（chip-tool groupsettings / AddGroup 用）。既定 `grp<group_id>`。
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// AddGroup を行うエンドポイント（既定 1）。
+        #[arg(long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+        /// epoch key（16バイト = 32桁 hex）。省略時は mat がランダム生成する。
+        /// 複数コントローラで同一 wire group を共有する時のみ明示指定する。
+        #[arg(long, value_name = "HEX")]
+        epoch_key: Option<String>,
+    },
+
+    /// group へ multicast でコマンドを送る（unacknowledged。"sent" のみ報告）。
+    Invoke {
+        /// Matter GroupId。
+        group_id: u16,
+        /// クラスタ名（chip-tool 表記、例: `onoff`）。
+        cluster: String,
+        /// コマンド名（chip-tool 表記、例: `on` / `off`）。
+        command: String,
+        /// コマンド引数（chip-tool にそのまま渡す）。
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+        /// 宛先エンドポイント（既定 1）。
+        #[arg(long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
     },
 }

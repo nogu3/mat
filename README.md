@@ -15,12 +15,15 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Status
 
-**Phase 0 + Phase 1 + Phase 2 are implemented:**
+**Phase 0 + Phase 1 + Phase 2 + Phase 3 are implemented:**
 - Phase 0: scaffold + chip-tool wrapper + commission + credential KVS + discover.
 - Phase 1: read / write / invoke + describe + on / off.
 - Phase 2: open-window (multi-admin share).
+- Phase 3: groupcast (`group provision` / `group invoke`).
 
-Group commands come in a later phase (see the roadmap in ARCHITECTURE.md).
+Phase 3 passes its fake-chip-tool integration tests; real-device E2E for
+groupcast is still recommended (see Manual E2E below). Phase 4 (native / backend
+replacement) is optional — see the roadmap in ARCHITECTURE.md.
 
 ## Roadmap
 
@@ -202,6 +205,52 @@ Output:
   `mat` does multi-admin with the one hub, and its sensors appear as bridged
   endpoints.
 
+### Groupcast (Phase 3)
+
+Control many devices at once with a Matter **wire group**: a GroupId plus a key
+set is burned into each device, then a single multicast send hits all of them.
+This is the original motivation (no "popcorn effect" of lights turning on one by
+one). It wraps `chip-tool`'s group path (`groupsettings` / `groupkeymanagement` /
+`groups`); `mat` holds no group state of its own (it lives in chip-tool's
+storage). Logical group names ("the living-room lights") are the upper layer's
+job — `mat` only takes a numeric GroupId.
+
+```bash
+# Provision: burn the key set + mapping into every node, and set up the
+# controller-side group state. group_id, then one or more commissioned node_ids.
+# provision <group_id> <node_id>... [--keyset-id N] [--name NAME]
+#                                   [--endpoint EP] [--epoch-key HEX]
+mat group provision 1 5 6 7 --name living
+
+# Invoke: one multicast send to the group (unacknowledged).
+# invoke <group_id> <cluster> <command> [args...] [--endpoint EP]
+mat group invoke 1 onoff on
+```
+
+Outputs:
+
+```json
+// provision — all listed nodes succeeded (provision stops at the first failure)
+{ "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7], "status": "provisioned" }
+
+// invoke — multicast is fire-and-forget; only "sent" can be reported
+{ "timestamp": "...", "group_id": 1, "cluster": "onoff", "command": "on", "endpoint": 1, "status": "sent", "note": "unacknowledged groupcast; per-device delivery not confirmed" }
+```
+
+- **Groupcast is unacknowledged.** `group invoke` reports `"sent"`, never "all 7
+  turned on." There is no per-device result and no read-after-write check at the
+  group level — confirm individual devices with `mat read` if needed.
+- **`--epoch-key` is optional.** It is the 16-byte (32-hex) AES key shared by the
+  group. Omit it and `mat` generates a random one (single-controller use); pass a
+  fixed key only when several controllers must share the same wire group. The key
+  is never printed to stdout (it is a credential; it lives in chip-tool storage).
+- `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
+- **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup on
+  every node) and **especially unstable on Thread** (multicast retransmits and
+  IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.
+- It stops at the **first failed node/step** (the error `detail` says which) so
+  stdout stays pure JSON; re-run after fixing the offending node.
+
 ## Credential store
 
 Resolution order: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` >
@@ -330,6 +379,29 @@ fabric membership (multi-admin).
 > is slow (hundreds of ms to seconds). Speed-sensitive use cases belong to a
 > resident layer that keeps warm sessions (see the three-layer separation in
 > ARCHITECTURE.md).
+
+### Phase 3 groupcast E2E (real devices)
+
+With several commissioned lights (say nodes 5, 6, 7), burn a wire group and fire
+one multicast send at it.
+
+```bash
+# Provision the group onto every node (controller-side state is set up too)
+mat group provision 1 5 6 7 --name living
+# -> { "group_id": 1, "keyset_id": 42, "nodes": [5,6,7], "status": "provisioned", ... }
+
+# One multicast send — all three should react together (no popcorn effect)
+mat group invoke 1 onoff on
+mat group invoke 1 onoff off
+```
+
+> Groupcast is **unacknowledged**, so `group invoke` only confirms the send, not
+> delivery. If a light did not react, confirm it individually (`mat read 6 1
+> onoff on-off`) and re-provision that node. Multicast is **especially weak on
+> Thread**; Wi-Fi / Ethernet lights are more reliable. The exact `key-set-write`
+> JSON, the `groupsettings add-keysets` policy value, and the group node-id form
+> are chip-tool-version dependent — if a chip-tool upgrade breaks provisioning,
+> this is the first place to check.
 
 ## Contributing
 

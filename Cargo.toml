@@ -1,6 +1,6 @@
 [package]
 name = "mat"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Matter device control CLI — normalizes chip-tool output to a structured JSON schema"
 license = "MIT"
@@ -17,6 +17,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

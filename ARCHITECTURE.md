@@ -273,7 +273,7 @@ Share a `mat`-owned device with another controller.
 - `mat open-window` (wraps `chip-tool pairing open-commissioning-window`), returns
   the issued code as JSON.
 
-### Phase 3 — groupcast  *(hardest, needs real-device testing)*
+### Phase 3 — groupcast  *(done; real-device E2E still recommended)*
 Synchronized ON/OFF of many lights via a Matter wire group. This is the original
 motivation (the "popcorn effect" of lights turning on one by one), but it is the
 most fragile, so it comes last.
