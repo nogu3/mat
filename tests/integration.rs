@@ -321,3 +321,99 @@ fn invoke_reject_exits_4() {
         .code(4)
         .stderr(predicate::str::contains("device_rejected"));
 }
+
+// ── Phase 3: groupcast ──────────────────────────────────────────────────────
+
+#[test]
+fn group_provision_succeeds() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "provision", "1", "5", "--name", "living"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":1"))
+        .stdout(predicate::str::contains("\"keyset_id\":42"))
+        .stdout(predicate::str::contains("\"name\":\"living\""))
+        .stdout(predicate::str::contains("\"status\":\"provisioned\""))
+        .stdout(predicate::str::contains("\"nodes\":[5]"))
+        .stdout(predicate::str::contains("\"timestamp\""));
+}
+
+#[test]
+fn group_provision_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "provision", "1", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn group_provision_rejects_bad_epoch_key() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "provision", "1", "5", "--epoch-key", "dead"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("epoch-key"));
+}
+
+#[test]
+fn group_provision_last_chip_call_is_add_group() {
+    // 引数ファイルは各 chip-tool 呼び出しで上書きされるため、最後の呼び出し
+    // （node 5 への groups add-group）が記録される。group 名と endpoint を確認。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "group",
+            "provision",
+            "7",
+            "5",
+            "--name",
+            "kitchen",
+            "--endpoint",
+            "2",
+        ])
+        .assert()
+        .success();
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("groups add-group 7 kitchen 5 2"),
+        "last chip-tool call was not the expected add-group: {recorded}"
+    );
+}
+
+#[test]
+fn group_invoke_reports_sent() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["group", "invoke", "1", "onoff", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":1"))
+        .stdout(predicate::str::contains("\"command\":\"on\""))
+        .stdout(predicate::str::contains("\"status\":\"sent\""))
+        .stdout(predicate::str::contains("unacknowledged"));
+    // group multicast 宛先（0xffffffffffff0001）が末尾近くに渡ること。
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("onoff on 0xffffffffffff0001 1"),
+        "group node-id was not passed as the destination: {recorded}"
+    );
+}
+
+#[test]
+fn group_invoke_timeout_exits_3() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .args(["group", "invoke", "1", "onoff", "on"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}

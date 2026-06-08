@@ -69,6 +69,25 @@ EOF
         ;;
     esac
     ;;
+  groupsettings)
+    # コントローラ側 group state（ローカル操作）。add-group / add-keysets /
+    # bind-keyset。ネットワーク不要なので timeout/reject 注入はしない。
+    echo "[1656][CHIP:TOO] $2 ok"
+    exit 0
+    ;;
+  groupkeymanagement)
+    # provision のデバイス書き込み: key-set-write / write group-key-map。
+    emit_failure
+    echo "[1656][CHIP:DMG] AttributeStatusIB ="
+    echo "[1656][CHIP:DMG]   status = 0x00 (SUCCESS),"
+    exit 0
+    ;;
+  groups)
+    # provision の AddGroup（Groups クラスタ）。成功 status 行を吐く。
+    emit_failure
+    echo "[1656][CHIP:DMG] Received Command Response Status for Endpoint=0x1 Cluster=0x0000_0004 Command=0x0000_0000 Status=0x0 (SUCCESS)"
+    exit 0
+    ;;
   descriptor)
     # `descriptor read <list> <node> <ep> ...`
     emit_failure
