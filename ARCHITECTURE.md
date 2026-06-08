@@ -353,11 +353,19 @@ Iteration status:
   session teardown on Ctrl-C). Fake-ws tests cover the idle teardown→reconnect
   path; real-binary `--port` smoke check shows the `Spawn` child being reaped
   after `--idle-timeout`.
-- **Iter 3 (next):** `describe` / `group` (these need the ws result JSON parsed —
-  parts-list / per-step success — so they wait until that shape is pinned),
-  pinning the ws result-JSON shape (currently `value` is best-effort + raw
-  `result` attached), a `matd`-routed client path from `mat` (or `casa`), and
-  real-device E2E (warm-session latency win over one-shot).
+- **Iter 3 (next):** real-device E2E (jarvis, aarch64, against a commissioned
+  node) has **pinned the ws result shape**, so the rest is concrete. The ws reply
+  is `{ "results": [...], "logs": [...] }`: `results[i]` is
+  `{ endpointId, clusterId, attributeId, dataVersion, value }`, so `results[0].value`
+  carries the structured attribute value — matd's current best-effort extraction
+  already matches it. `logs` is base64-wrapped chip-tool text (verbose); matd
+  should **drop it** from the response rather than attach it raw. Remaining work:
+  trim `logs`, implement `describe` (parts-list → per-endpoint server-list) and
+  `group` on top of `results`, confirm the error shape (unreachable / timeout),
+  and add a `matd`-routed client path from `mat` (or `casa`). The same E2E
+  confirmed the warm-session win: descriptor read **1.37s cold** (CASE handshake)
+  → **0.08s warm** (~17×), with chip-tool logging "Found an existing secure
+  session" on the second call.
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
