@@ -26,12 +26,16 @@ groupcast is still recommended (see Manual E2E below).
 
 ## Roadmap
 
-`mat` is implemented through Phase 3. Next is **Phase 4 — `matd`**: a resident
-binary in **this** repo that keeps warm CASE sessions so repeated Matter calls
-skip the handshake (same model as ssh `ControlMaster`/`ControlPersist`). **Phase
-5** (native / backend replacement) is optional. `mat` itself stays one-shot —
-design rule 4 (no daemon / cache in `mat`) still holds, and `matd` may be
-resident precisely because it is a separate binary, not `mat`.
+`mat` is implemented through Phase 3. **Phase 4 — `matd`** is in progress: a
+resident binary in **this** repo that keeps warm CASE sessions so repeated Matter
+calls skip the handshake (same model as ssh `ControlMaster`/`ControlPersist`). It
+drives `chip-tool interactive server` (websocket) and serves a unix socket
+speaking newline-delimited JSON. Iter 1 (ws bridge + socket + `read`/`invoke`/
+`on`/`off`/`ping`) has landed with fake-ws integration tests; remaining ops, idle
+timeout, and real-device E2E are next (see ARCHITECTURE.md). **Phase 5** (native /
+backend replacement) is optional. `mat` itself stays one-shot — design rule 4 (no
+daemon / cache in `mat`) still holds, and `matd` may be resident precisely because
+it is a separate binary, not `mat`.
 
 The authoritative roadmap, the phase order, and the layer split (including how
 `matd` differs from the cross-protocol `casad`) live in

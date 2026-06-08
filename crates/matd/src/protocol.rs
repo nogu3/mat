@@ -1,0 +1,145 @@
+//! 上流（`casa` / `mat` クライアント）⇔ `matd` のソケットプロトコル。
+//!
+//! newline-delimited JSON。1 行 = 1 リクエスト = 1 レスポンス。`mat` の one-shot
+//! CLI と同じ「1 操作 = 1 JSON」精神を保ち、stdout 相当（ソケット応答）は純粋な
+//! 構造化 JSON のみ。`op` で内部タグ付けし、`id` があれば応答にエコーする。
+
+use serde::Deserialize;
+use serde_json::Value;
+
+/// 上流からの 1 リクエスト。`id` は任意（応答にそのまま返す）、残りは `op` で分岐。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Request {
+    /// 呼び出し側の相関 ID（任意）。応答にエコーする。
+    #[serde(default)]
+    pub id: Option<Value>,
+    #[serde(flatten)]
+    pub op: Op,
+}
+
+/// 操作種別。chip-tool のサブコマンド体系に 1:1 で対応する。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Op {
+    /// 属性を読む。
+    Read {
+        node_id: u64,
+        endpoint: u16,
+        cluster: String,
+        attribute: String,
+    },
+    /// クラスタコマンドを実行する。
+    Invoke {
+        node_id: u64,
+        endpoint: u16,
+        cluster: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// OnOff On のショートカット。
+    On { node_id: u64, endpoint: u16 },
+    /// OnOff Off のショートカット。
+    Off { node_id: u64, endpoint: u16 },
+    /// デーモン死活確認（chip-tool には触れない）。
+    Ping,
+}
+
+impl Op {
+    /// この操作が対象とする node_id（あれば）。`require_node` 用。
+    pub fn node_id(&self) -> Option<u64> {
+        match self {
+            Op::Read { node_id, .. }
+            | Op::Invoke { node_id, .. }
+            | Op::On { node_id, .. }
+            | Op::Off { node_id, .. } => Some(*node_id),
+            Op::Ping => None,
+        }
+    }
+
+    /// chip-tool interactive server に送るコマンド行（バイナリ名を除いた argv）。
+    ///
+    /// one-shot の `chip-tool <cluster> <cmd> ... <node> <ep>` と同じ語順。chip-tool
+    /// は宛先 node_id / endpoint を**末尾**に取るので、コマンド引数はその前に置く。
+    pub fn to_cmdline(&self) -> Option<String> {
+        let line = match self {
+            Op::Read {
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+            } => format!("{cluster} read {attribute} {node_id} {endpoint}"),
+            Op::Invoke {
+                node_id,
+                endpoint,
+                cluster,
+                command,
+                args,
+            } => {
+                let mut parts = vec![cluster.clone(), command.clone()];
+                parts.extend(args.iter().cloned());
+                parts.push(node_id.to_string());
+                parts.push(endpoint.to_string());
+                parts.join(" ")
+            }
+            Op::On { node_id, endpoint } => format!("onoff on {node_id} {endpoint}"),
+            Op::Off { node_id, endpoint } => format!("onoff off {node_id} {endpoint}"),
+            Op::Ping => return None,
+        };
+        Some(line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Request {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn read_request_parses_and_builds_cmdline() {
+        let r = parse(
+            r#"{"id":7,"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}"#,
+        );
+        assert_eq!(r.id, Some(serde_json::json!(7)));
+        assert_eq!(r.op.node_id(), Some(1));
+        assert_eq!(r.op.to_cmdline().unwrap(), "onoff read on-off 1 1");
+    }
+
+    #[test]
+    fn invoke_places_args_before_destination() {
+        let r = parse(
+            r#"{"op":"invoke","node_id":2,"endpoint":1,"cluster":"levelcontrol","command":"move-to-level","args":["128","0","0","0"]}"#,
+        );
+        // 引数は node_id/endpoint の前。誤って宛先扱いされると timeout する。
+        assert_eq!(
+            r.op.to_cmdline().unwrap(),
+            "levelcontrol move-to-level 128 0 0 0 2 1"
+        );
+    }
+
+    #[test]
+    fn on_off_shortcuts() {
+        let on = parse(r#"{"op":"on","node_id":3,"endpoint":1}"#);
+        assert_eq!(on.op.to_cmdline().unwrap(), "onoff on 3 1");
+        let off = parse(r#"{"op":"off","node_id":3,"endpoint":1}"#);
+        assert_eq!(off.op.to_cmdline().unwrap(), "onoff off 3 1");
+    }
+
+    #[test]
+    fn ping_has_no_node_or_cmdline() {
+        let r = parse(r#"{"op":"ping"}"#);
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
+    }
+
+    #[test]
+    fn invoke_args_default_empty() {
+        let r = parse(
+            r#"{"op":"invoke","node_id":1,"endpoint":1,"cluster":"identify","command":"identify"}"#,
+        );
+        assert_eq!(r.op.to_cmdline().unwrap(), "identify identify 1 1");
+    }
+}

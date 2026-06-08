@@ -309,7 +309,7 @@ most fragile, so it comes last.
 > - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup on every node.
 >   This is the most breakable feature in Matter.
 
-### Phase 4 — `matd`, the resident layer for Matter  *(next)*
+### Phase 4 — `matd`, the resident layer for Matter  *(in progress)*
 Make repeated operations fast without breaking `mat`'s one-shot model. Each `mat`
 call pays mDNS resolution plus a CASE (Sigma) handshake, so a single call is slow
 (hundreds of ms to seconds). That latency is inherent to a stateless CLI and is
@@ -324,6 +324,34 @@ keeps the sessions warm.
   model). It is the resident variant of `mat`'s own layer (Matter-only), distinct
   from the cross-protocol `casad`. See "Two distinct resident layers" above.
 - Both binaries ship from this repo, so one install provides both.
+
+**Backend driver: `chip-tool interactive server` (websocket).** `chip-tool` ships
+two long-lived modes: `interactive start` (a human shell over stdin) and
+`interactive server` (a websocket another process drives). `matd` uses the
+**server** mode — it is the path the Matter SDK's own test harness drives, returns
+structured responses, and avoids re-parsing human log output / prompt boundaries
+(the fragile path CLAUDE.md warns about). `matd` spawns one `chip-tool interactive
+server --port <P>`, holds a single ws connection (warm CASE sessions), and
+serializes commands over it.
+
+**Upstream socket protocol.** `matd` listens on a unix socket and speaks
+newline-delimited JSON (one line = one request = one response), same "one op = one
+JSON object" spirit as the `mat` CLI. A request is `{ "id"?, "op", ... }`;
+`op` ∈ `read | invoke | on | off | ping`. The response is a mat-schema object
+(with `timestamp`, echoing `id`) or `{ "error": { "kind", "detail" } }`. node_id
+resolution is re-checked against the KVS per request.
+
+Iteration status:
+- **Iter 1 (done):** workspace already split (`mat-core` / `mat` / `matd`). `matd`
+  drives `chip-tool interactive server` over ws, serves the unix socket, and
+  bridges `read` / `invoke` / `on` / `off` / `ping`. Covered by fake-ws
+  integration tests (no real `chip-tool`); real-binary `--connect` smoke check
+  passes (ping + uncommissioned-node error).
+- **Iter 2 (next):** remaining ops (`write` / `describe` / `group`), idle timeout
+  (`ControlPersist`-style chip-tool teardown), graceful shutdown, and pinning the
+  ws result-JSON shape (currently `value` is best-effort + raw `result` attached).
+- **Iter 3:** a `matd`-routed client path from `mat` (or `casa`), and real-device
+  E2E (warm-session latency win over one-shot).
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
