@@ -7,10 +7,17 @@
 //!
 //! 複数ノードを束ねた「メッシュ地図」化は上位層の責務。ここは 1 ノードの生診断を
 //! `mat` スキーマへ正規化するだけ（クラスタ名/enum の名前解決はしない＝数値のまま）。
+//!
+//! **部分結果を返す**: Thread 機器は間欠的に不通になり、属性ごとに成否が割れる。
+//! 1 属性の失敗で全スナップショットを捨てると診断にならないので、読めた分だけ返し、
+//! 失敗属性は `unavailable`（attribute + kind）に記録する。読めなかったフィールドは
+//! `null`、テーブルが空（隣接ゼロ＝孤立）なら `[]` とし、**「未取得」と「真にゼロ」を
+//! 区別**する（メッシュ分析でこの差は致命的）。全属性が失敗（＝完全不達）なら最初の
+//! 失敗 kind をエラーで返し、`unreachable` / `timeout` を伝播する。
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
@@ -22,37 +29,104 @@ use mat_core::store::Store;
 /// Thread Network Diagnostics の chip-tool クラスタ名。
 const CLUSTER: &str = "threadnetworkdiagnostics";
 
+/// スカラ属性: (出力キー, chip-tool 属性名)。`extended-pan-id` / `pan-id` は
+/// 「どの Thread 網に属すか」の識別子（同値＝同じネットワーク／同じ BR 配下）。
+/// `routing-role` は中継しているか、`partition-id` はメッシュ分断の検知に使う。
+const SCALARS: &[(&str, &str)] = &[
+    ("routing_role", "routing-role"),
+    ("network_name", "network-name"),
+    ("extended_pan_id", "extended-pan-id"),
+    ("pan_id", "pan-id"),
+    ("partition_id", "partition-id"),
+    ("channel", "channel"),
+];
+
+/// list-of-struct 属性: (出力キー, chip-tool 属性名)。隣接（LQI/RSSI）と経路（cost）。
+/// メッシュ分析の本命。`mat read` のスカラ正規化では潰れる形。
+const TABLES: &[(&str, &str)] = &[
+    ("neighbor_table", "neighbor-table"),
+    ("route_table", "route-table"),
+];
+
 pub fn thread(store_path: &Path, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     store.require_node(node_id)?;
     let chip = ChipTool::new(store.root());
 
-    // スカラ属性: パース不能なら null（デバイスが当該属性を持たない場合に備える）。
-    // 到達不能/timeout 等の本物の失敗は read_attr が MatError で伝播する。
-    let routing_role = parse_read_value(&read_attr(&chip, node_id, endpoint, "routing-role")?);
-    let partition_id = parse_read_value(&read_attr(&chip, node_id, endpoint, "partition-id")?);
-    let channel = parse_read_value(&read_attr(&chip, node_id, endpoint, "channel")?);
-    let network_name = parse_read_value(&read_attr(&chip, node_id, endpoint, "network-name")?);
-    let rloc16 = parse_read_value(&read_attr(&chip, node_id, endpoint, "rloc16")?);
+    let mut thread = Map::new();
+    let mut unavailable = Vec::new();
+    let mut any_ok = false;
+    let mut first_err: Option<MatError> = None;
 
-    // list-of-struct: 隣接（LQI/RSSI）と経路（cost/hop）。メッシュ分析の本命。
-    let neighbor_table = parse_struct_list(&read_attr(&chip, node_id, endpoint, "neighbor-table")?);
-    let route_table = parse_struct_list(&read_attr(&chip, node_id, endpoint, "route-table")?);
+    for (key, attr) in SCALARS {
+        match read_attr(&chip, node_id, endpoint, attr) {
+            Ok(stdout) => {
+                any_ok = true;
+                thread.insert(
+                    key.to_string(),
+                    parse_read_value(&stdout).unwrap_or(Value::Null),
+                );
+            }
+            Err(e) => {
+                thread.insert(key.to_string(), Value::Null);
+                record_failure(attr, e, &mut unavailable, &mut first_err);
+            }
+        }
+    }
 
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "thread": {
-            "routing_role": routing_role.unwrap_or(Value::Null),
-            "partition_id": partition_id.unwrap_or(Value::Null),
-            "channel": channel.unwrap_or(Value::Null),
-            "network_name": network_name.unwrap_or(Value::Null),
-            "rloc16": rloc16.unwrap_or(Value::Null),
-            "neighbor_table": neighbor_table,
-            "route_table": route_table,
-        },
-    }));
+    for (key, attr) in TABLES {
+        match read_attr(&chip, node_id, endpoint, attr) {
+            Ok(stdout) => {
+                any_ok = true;
+                let rows: Vec<Value> = parse_struct_list(&stdout)
+                    .into_iter()
+                    .map(Value::Object)
+                    .collect();
+                thread.insert(key.to_string(), Value::Array(rows));
+            }
+            Err(e) => {
+                // null = 未取得（テーブルが空 `[]` = 真に隣接ゼロ、とは区別する）。
+                thread.insert(key.to_string(), Value::Null);
+                record_failure(attr, e, &mut unavailable, &mut first_err);
+            }
+        }
+    }
+
+    // 全属性が失敗 = ノード完全不達。診断は出さず原因 kind を伝播（unreachable/timeout）。
+    if !any_ok {
+        return Err(first_err.unwrap_or_else(|| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("diag thread: no attribute read succeeded for node {node_id}"),
+            )
+        }));
+    }
+
+    let mut body = Map::new();
+    body.insert("node_id".to_string(), json!(node_id));
+    body.insert("endpoint".to_string(), json!(endpoint));
+    body.insert("thread".to_string(), Value::Object(thread));
+    if !unavailable.is_empty() {
+        body.insert("unavailable".to_string(), Value::Array(unavailable));
+    }
+    output::emit(Value::Object(body));
     Ok(())
+}
+
+/// 失敗属性を `unavailable` に記録し、最初の失敗を保持する（全滅時の伝播用）。
+fn record_failure(
+    attr: &str,
+    err: MatError,
+    unavailable: &mut Vec<Value>,
+    first_err: &mut Option<MatError>,
+) {
+    unavailable.push(json!({
+        "attribute": attr,
+        "kind": serde_json::to_value(err.kind).unwrap_or(Value::Null),
+    }));
+    if first_err.is_none() {
+        *first_err = Some(err);
+    }
 }
 
 /// `chip-tool threadnetworkdiagnostics read <attr> <node> <ep>` を実行し stdout を返す。

@@ -192,19 +192,44 @@ fn diag_thread_returns_mesh_snapshot() {
         // スナップショット骨格と既定 endpoint 0。
         .stdout(predicate::str::contains("\"thread\""))
         .stdout(predicate::str::contains("\"endpoint\":0"))
-        // スカラ（routing-role の enum は数値のまま）。
-        .stdout(predicate::str::contains("\"routing_role\":2"))
-        .stdout(predicate::str::contains("\"network_name\":\"mat-thread\""))
+        // スカラ（routing-role の enum は数値のまま）。どの Thread 網かは extended-pan-id。
+        .stdout(predicate::str::contains("\"routing_role\":5"))
+        // 文字列の長さ注釈 `(14 chars)` は剥がれ、引用符も含まない。
+        .stdout(predicate::str::contains(
+            "\"network_name\":\"ha-thread-6562\"",
+        ))
+        .stdout(predicate::str::contains("\"pan_id\":25954"))
         // neighbor-table の struct-list が配列で出る。キーは chip-tool 表記のまま。
         .stdout(predicate::str::contains("\"neighbor_table\""))
-        .stdout(predicate::str::contains("\"AverageRssi\":-82"))
+        .stdout(predicate::str::contains("\"AverageRssi\":-95"))
+        .stdout(predicate::str::contains("\"Lqi\":3"))
         .stdout(predicate::str::contains("\"route_table\""))
+        .stdout(predicate::str::contains("\"PathCost\":1"))
+        // 全属性成功時は unavailable を出さない。
+        .stdout(predicate::str::contains("\"unavailable\"").not())
         .stdout(predicate::str::contains("\"timestamp\""));
 }
 
 #[test]
-fn diag_thread_unreachable_exits_5() {
-    // 到達不能注入時はスナップショットを諦め、unreachable を伝播する。
+fn diag_thread_partial_records_unavailable() {
+    // 間欠不通の機器を模し neighbor-table だけ失敗させる。残りは返しつつ、失敗属性は
+    // unavailable に記録、未取得テーブルは null（空配列 `[]` = 真にゼロ、とは区別）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_THREAD_FAIL_ATTR", "neighbor-table")
+        .args(["diag", "thread", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"routing_role\":5"))
+        .stdout(predicate::str::contains("\"neighbor_table\":null"))
+        .stdout(predicate::str::contains("\"unavailable\""))
+        .stdout(predicate::str::contains("\"attribute\":\"neighbor-table\""))
+        .stdout(predicate::str::contains("\"kind\":\"device_rejected\""));
+}
+
+#[test]
+fn diag_thread_fully_unreachable_exits_3() {
+    // 全属性が timeout（完全不達）なら部分結果を諦め、timeout を伝播する（exit 3）。
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
