@@ -12,5 +12,23 @@ path = "src/main.rs"
 
 [dependencies]
 mat-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "process",
+    "sync",
+    "time",
+    "signal",
+] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
