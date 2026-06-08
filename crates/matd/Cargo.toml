@@ -1,6 +1,6 @@
 [package]
 name = "matd"
-description = "Matter resident layer daemon (Phase 4) — warm CASE sessions over mat-core"
+description = "Matter resident daemon (Phase 4) — warm CASE sessions over mat-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-//! 上流（`casa` / `mat` クライアント）⇔ `matd` のソケットプロトコル。
+//! 上流クライアント（`mat --matd` など）⇔ `matd` のソケットプロトコル。
 //!
 //! newline-delimited JSON。1 行 = 1 リクエスト = 1 レスポンス。`mat` の one-shot
 //! CLI と同じ「1 操作 = 1 JSON」精神を保ち、stdout 相当（ソケット応答）は純粋な

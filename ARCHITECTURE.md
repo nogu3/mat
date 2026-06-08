@@ -13,13 +13,13 @@ clean JSON object per command.
 - diagnostics and machine-readable errors go to stderr.
 - the exit code lets the caller branch on the result.
 
+`mat` makes no assumptions about its caller. It is a standalone Matter controller
+CLI: a shell, a script, or a higher-level program can drive it. Whatever sits
+above it is not `mat`'s concern.
+
 ---
 
 ## What `mat` does and does not do
-
-`mat` sits in a three-layer system. It is the protocol-specific CLI for Matter.
-A cross-protocol client (`casa`) can dispatch to it when `protocol = "matter"`,
-the same way it dispatches to `enl` for ECHONET Lite.
 
 ### `mat` is responsible for
 - A consistent wrapper UX over a Matter controller (`chip-tool`).
@@ -29,28 +29,29 @@ the same way it dispatches to `enl` for ECHONET Lite.
 - Commissioning: joining a fabric and sharing devices with other admins.
 
 ### `mat` is NOT responsible for
-- **Resolving human names to (node_id, endpoint, cluster).** That belongs to the
-  upper layer. `mat` takes a numeric `node_id`.
+- **Resolving human names to (node_id, endpoint, cluster).** `mat` takes a
+  numeric `node_id`. Mapping human-facing names is out of scope.
 - **Scheduling, daemons, or holding state** (except the credential KVS, below).
-- **Session cache, subscriptions, freshness.** All of this belongs to a resident
-  layer (`casad`).
-- **Logical groups** ("the 7 lights in the living room"). That naming concern
-  belongs to the upper layer. See "Two kinds of groups" below.
+- **Session cache, subscriptions, freshness.** `mat` is one-shot and caches
+  nothing. Keeping sessions warm is the job of the resident binary `matd` (a
+  separate binary in this repo, see below), not `mat`.
+- **Logical groups** ("the 7 lights in the living room"). That naming concern is
+  out of scope. See "Two kinds of groups" below.
 - **Being a Matter device (a bridge).** `mat` only controls Matter devices. Re-
-  publishing non-Matter devices (ECHONET, etc.) as Matter devices for Alexa /
-  Apple / Google is a separate kind of program that *becomes* a Matter device.
-  That belongs in a separate project, not here. Mixing controller and device
-  turns the tool into a home automation hub, which is not the goal.
+  publishing non-Matter devices as Matter devices for Alexa / Apple / Google is a
+  separate kind of program that *becomes* a Matter device. That belongs in a
+  separate project, not here. Mixing controller and device turns the tool into a
+  home automation hub, which is not the goal.
 - **Scenes, automation, and voice/UI entry points.** "Set many devices to this
-  state" logic, and the triggers for it, belong to the resident layer. `mat`
-  fires one shot at one device.
+  state" logic, and the triggers for it, are out of scope. `mat` fires one shot
+  at one device.
 
 ---
 
-## Why `mat` is stateful (unlike `enl`)
+## Why `mat` is stateful
 
-A pure one-shot model works for ECHONET Lite because it is connectionless UDP,
-has no auth, and each command is independent. Matter is none of these.
+A pure one-shot, connectionless model (a single fire-and-forget UDP datagram per
+command, no auth, each command independent) is not possible for Matter.
 
 To read / write / invoke, you need: (1) to be a fabric member (Root CA + your own
 NOC), (2) a CASE session with the device (a Sigma handshake), and (3) to have
@@ -63,10 +64,10 @@ state must exist somewhere.** A pure stateless design is impossible.
 - **Only credentials live on disk.** This is the same UNIX model as `git`
   (depends on `.git`) or `ssh` (depends on `~/.ssh`) while each command is
   one-shot.
-- **The slowness is absorbed by the upper layer.** Each one-shot pays mDNS
-  resolution plus a CASE handshake, so a single call is slow (hundreds of ms to
-  seconds). Use cases that need speed are handled by a resident layer that keeps
-  warm sessions. `mat` itself is allowed to be slow. Do not break this line.
+- **A single call is allowed to be slow.** Each one-shot pays mDNS resolution
+  plus a CASE handshake (hundreds of ms to seconds). `mat` does not cache this
+  away (design rule 4). Use cases that need speed run the resident binary `matd`,
+  which keeps warm sessions. `mat` itself stays one-shot. Do not break this line.
 
 ---
 
@@ -113,8 +114,8 @@ Google), `mat` can open a commissioning window (a wrap of
 - The JSON output includes **both** `manual_code` (11-digit) and `qr_payload`
   (the `MT:...` string): `{ "node_id", "manual_code", "qr_payload", "expires_at" }`.
 - **Rendering the QR image is not `mat`'s job.** stdout stays pure JSON with the
-  `qr_payload` string only. Drawing the QR is the upper layer's job. Do not mix
-  human decoration into stdout.
+  `qr_payload` string only. Drawing the QR is out of scope. Do not mix human
+  decoration into stdout.
 - **"Share many devices in one QR" is not possible in Matter** (multi-admin is
   one commission per device). One QR showing many devices always means a
   **bridge** (one Matter node that fronts many), which is a separate project, not
@@ -144,8 +145,7 @@ own." `chip-tool` is CSA's official reference implementation.
 3. **Easy to debug.** Matter forums, issues, and official docs are all written in
    `chip-tool` commands. Sharing the backend means you do not get lost figuring
    out whether the fault is yours or the device's.
-4. **Fits the subprocess model.** Launch a native binary and exit, the same shape
-   as the sibling CLIs.
+4. **Fits the subprocess model.** Launch a native binary and exit.
 
 ### The one remaining cost: fragile output parsing
 `chip-tool` has log-style text output, which `mat` must turn into JSON. A version
@@ -159,8 +159,7 @@ change can break the parser.
 - Keep parser tests so an upstream update that breaks parsing is noticed.
 
 ### The backend is replaceable (adapter boundary)
-`mat` couples to the backend through **only `mat`'s own JSON schema** (the same
-way `casa` couples to `enl` through stdout JSON only).
+`mat` couples to the backend through **only `mat`'s own JSON schema**.
 
 - **Future candidates:** if parsing becomes too painful, a thin JS shim based on
   matter.js (structured objects from the start, no C++ build, lightweight); or, to
@@ -202,56 +201,47 @@ way `casa` couples to `enl` through stdout JSON only).
 
 ---
 
-## Three-layer separation
+## `mat` and `matd`
+
+This repo ships two binaries from one install:
 
 ```
-Web page / LLM / other client
-       |
-       v
-   casad  (resident, cross-protocol; separate repo)
-       |   cache / subscriptions / freshness across protocols
-       |   spawns one-shot CLIs, or talks to a protocol daemon over its socket
-       v
-   casa   (resolves name -> node_id, etc.; stateless; separate repo)
-       |   Command::new("mat") / "enl" / ..., or connects to matd's socket
-       v
-   ── Matter controller layer (this repo) ────────────────────────
-     mat  (one-shot; credential KVS only)   matd (resident; planned, Phase 4)
-       \   Command::new("chip-tool")          \  warm CASE sessions / unix socket
-        \                                       \  Matter-only
-         +--------------------+------------------+
-                              v
+        a shell, a script, or any higher-level caller
+                          |
+          +---------------+----------------+
+          v                                v
+   mat  (one-shot; credential KVS only)   matd (resident; Phase 4)
+       \   Command::new("chip-tool")        \  warm CASE sessions / unix socket
+        \                                     \
+         +------------------+------------------+
+                            v
    chip-tool ── real Matter devices (Thread / Wi-Fi / Ethernet)
 ```
 
-`casa` and `casad` are separate projects. `mat` works on its own as a standalone
-Matter controller CLI; every layer here is optional.
+- **`mat`** is the one-shot CLI. It spawns `chip-tool`, runs one command, and
+  exits. Design rule 4 (no daemon / cache inside `mat`) always holds.
+- **`matd`** is the resident binary (Phase 4). It keeps warm CASE (Sigma)
+  sessions so repeated Matter calls skip the handshake — the same model as ssh
+  `ControlMaster`/`ControlPersist`. `matd` is allowed to be resident precisely
+  because it is a **separate binary and layer**, not `mat`. A `mat --matd <sock>`
+  flag routes a `mat` call through `matd`'s warm session instead of spawning
+  `chip-tool` directly.
 
-### Two distinct resident layers (do not conflate)
-There are two residents at different scopes. Keep them separate:
-- **`casad`** — a *cross-protocol* resident (separate repo). It owns cache,
-  subscriptions, and freshness *across* protocols and dispatches to `mat` /
-  `enl`. It does not speak any single protocol's session itself.
-- **`matd`** — a *Matter-only* resident in **this** repo (planned, Phase 4). It
-  is the **resident variant of `mat`'s own layer**: it keeps warm CASE (Sigma)
-  sessions so repeated Matter calls skip the handshake, the same model as ssh
-  `ControlMaster`/`ControlPersist`.
-
-`mat` itself stays one-shot. Design rule 4 (no daemon / cache inside `mat`) still
-holds — `matd` is allowed to be resident precisely because it is a separate
-binary and layer, not `mat`.
+Both binaries share a library crate `mat-core` (the `parse` / `output` / `error`
+/ `group` modules: chip-tool parsing, the JSON schema, exit-code classification,
+group key logic) so the fragile parts are maintained once.
 
 ### Two kinds of groups
 There are two "groups." Do not confuse them or define them twice.
 
-- **Logical group** ("the 7 lights in the living room") = a naming concern. The
-  upper layer owns it.
+- **Logical group** ("the 7 lights in the living room") = a naming concern. Out
+  of `mat`'s scope; `mat` holds no human-facing group names.
 - **Matter wire group** (a GroupId + Key Set burned into each device, a multicast
   address) = an on-wire protocol operation. `mat` owns it
   (`mat group provision` / `mat group invoke`).
 
-The upper layer resolves a logical group and calls `mat`'s wire-group operations
-to realize it. `mat` holds no human-facing group names.
+A caller resolves a logical group to a numeric GroupId and calls `mat`'s
+wire-group operations to realize it.
 
 ---
 
@@ -292,8 +282,8 @@ Share a `mat`-owned device with another controller.
 
 ### Phase 3 — groupcast  *(done; real-device E2E still recommended)*
 Synchronized ON/OFF of many lights via a Matter wire group. This is the original
-motivation (the "popcorn effect" of lights turning on one by one), but it is the
-most fragile, so it comes last.
+motivation (lights turning on one by one instead of together), but it is the most
+fragile, so it comes last.
 - `mat group provision` (KeySetWrite / GroupKeyMap / AddGroup on every node).
 - `mat group invoke` (one multicast send).
 - The return value only reports "sent" (unacknowledged, so no per-device success).
@@ -309,7 +299,7 @@ most fragile, so it comes last.
 > - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup on every node.
 >   This is the most breakable feature in Matter.
 
-### Phase 4 — `matd`, the resident layer for Matter  *(in progress)*
+### Phase 4 — `matd`, the resident binary for Matter  *(in progress)*
 Make repeated operations fast without breaking `mat`'s one-shot model. Each `mat`
 call pays mDNS resolution plus a CASE (Sigma) handshake, so a single call is slow
 (hundreds of ms to seconds). That latency is inherent to a stateless CLI and is
@@ -321,8 +311,7 @@ keeps the sessions warm.
 - **`mat`** — the one-shot CLI, unchanged behavior; depends on `mat-core`.
 - **`matd`** — drives `chip-tool` in interactive mode and holds warm CASE
   sessions behind a local unix socket (ssh `ControlMaster`/`ControlPersist`
-  model). It is the resident variant of `mat`'s own layer (Matter-only), distinct
-  from the cross-protocol `casad`. See "Two distinct resident layers" above.
+  model). It is the resident variant of `mat`'s own layer (Matter-only).
 - Both binaries ship from this repo, so one install provides both.
 
 **Backend driver: `chip-tool interactive server` (websocket).** `chip-tool` ships
@@ -337,66 +326,35 @@ serializes commands over it.
 **Upstream socket protocol.** `matd` listens on a unix socket and speaks
 newline-delimited JSON (one line = one request = one response), same "one op = one
 JSON object" spirit as the `mat` CLI. A request is `{ "id"?, "op", ... }`;
-`op` ∈ `read | invoke | on | off | ping`. The response is a mat-schema object
-(with `timestamp`, echoing `id`) or `{ "error": { "kind", "detail" } }`. node_id
-resolution is re-checked against the KVS per request.
+`op` ∈ `read | write | invoke | on | off | describe | group | ping`. The response
+is a mat-schema object (with `timestamp`, echoing `id`) or
+`{ "error": { "kind", "detail" } }`. node_id resolution is re-checked against the
+KVS per request.
 
-Iteration status:
-- **Iter 1 (done):** workspace already split (`mat-core` / `mat` / `matd`). `matd`
-  drives `chip-tool interactive server` over ws, serves the unix socket, and
-  bridges `read` / `invoke` / `on` / `off` / `ping`. Covered by fake-ws
-  integration tests (no real `chip-tool`); real-binary `--connect` smoke check
-  passes (ping + uncommissioned-node error).
-- **Iter 2 (done):** `write` op; idle timeout (`ControlPersist`-style — an idle
-  session is torn down and lazily re-established on the next command: `Spawn`
-  respawns the child, `Connect` just reconnects); graceful shutdown (reaper +
-  session teardown on Ctrl-C). Fake-ws tests cover the idle teardown→reconnect
-  path; real-binary `--port` smoke check shows the `Spawn` child being reaped
-  after `--idle-timeout`.
-- **Iter 3 (done; real-device confirmed):** real-device E2E
-  (jarvis, aarch64) pinned the ws result shape `{ "results": [...], "logs": [...] }`
-  where `results[i]` is `{ endpointId, clusterId, attributeId, dataVersion, value }`.
-  Implemented on top of that:
-  - **`logs` dropped.** The backend strips the verbose base64 `logs` right after
-    each ws exchange (count logged at debug) so matd never carries it. Responses
-    are now the pure `mat` schema — the raw ws result is **not** attached anymore
-    (was a temporary `result` field; removed for CLAUDE.md rule 2).
-  - **`describe`** op: `parts-list` (ep 0) → per-endpoint `server-list`, reading
-    the ID arrays from `results[0].value`. Same output shape as `mat describe`.
-  - **`group`** ops: `group_provision` (controller groupsettings + per-node
-    KeySetWrite / GroupKeyMap / AddGroup) and `group_invoke` (multicast, reports
-    `sent`). The shared epoch-key / group-node-id logic moved to `mat-core::group`
-    so `mat` and `matd` use one copy.
-  - **Error classification:** a device-side error in `results[i].error` is run
-    through the existing `classify_failure` text matcher (→ unreachable / timeout /
-    device_rejected, unknown falls back to device_rejected).
-  - **`mat --matd <sock>` client path:** a global flag routes
-    read/write/invoke/on/off/describe/group through the matd unix socket (std
-    `UnixStream`, newline JSON) instead of spawning chip-tool; discover /
-    commission / open-window stay direct-only (exit 2 under `--matd`).
+The ws result shape is `{ "results": [...], "logs": [...] }` where `results[i]`
+is `{ endpointId, clusterId, attributeId, dataVersion, value }`. `matd` is built
+on top of that:
+- **`logs` dropped.** The backend strips the verbose base64 `logs` right after
+  each ws exchange (count logged at debug) so `matd` never carries it. Responses
+  are the pure `mat` schema — the raw ws result is not attached (CLAUDE.md rule 2).
+- **`describe`** op: `parts-list` (ep 0) → per-endpoint `server-list`, reading the
+  ID arrays from `results[0].value`. Same output shape as `mat describe`.
+- **`group`** ops: `group_provision` (controller groupsettings + per-node
+  KeySetWrite / GroupKeyMap / AddGroup) and `group_invoke` (multicast, reports
+  `sent`). The shared epoch-key / group-node-id logic lives in `mat-core::group`
+  so `mat` and `matd` use one copy.
+- **Error classification:** a device-side error in `results[i].error` is run
+  through the existing `classify_failure` text matcher (→ unreachable / timeout /
+  device_rejected, unknown falls back to device_rejected). The `error` value is a
+  status-name **string** (e.g. `"FAILURE"`), not numeric.
+- **`mat --matd <sock>` client path:** a global flag routes
+  read/write/invoke/on/off/describe/group through the `matd` unix socket (std
+  `UnixStream`, newline JSON) instead of spawning chip-tool; discover /
+  commission / open-window stay direct-only (exit 2 under `--matd`).
 
-  **Real-device confirmations (jarvis / node 5, 2026-06-08):**
-  - **Inline-JSON tokenization — confirmed.** `group_provision`'s key-set JSON
-    passed inline on the ws command line is taken as **one argument**: chip-tool
-    logged `Command: groupkeymanagement key-set-write {"epochKey0":...,
-    "groupKeySetID":77} 5 0` with the compact object intact (no spaces = one
-    token), then proceeded to send it to the node. The controller groupsettings
-    steps tokenize fine too (`add-keysets 77 0 1 hex:...` is the 4-arg form). The
-    `write group-key-map [{...}]` array uses the same compact form; a full
-    `200/5` provision in the prior session reached and passed every step.
-  - **ws failure-`error` shape — confirmed.** A failed key-set-write returned
-    `{ "results": [{ "error": "FAILURE" }], "logs": [...] }`. `error` is a
-    **string** status name (not numeric), key name `error`. `ensure_ok` strips
-    the quotes, runs it through `classify_failure`, and falls back to
-    `device_rejected` for unknown names like `FAILURE`. Pinned by a unit test in
-    `matd::server`.
-  - **Warm-session win — confirmed earlier:** descriptor read **1.37s cold**
-    (CASE handshake) → **0.08s warm** (~17×), chip-tool logging "Found an
-    existing secure session" on the second call.
-
-  > node 5 is intermittently unreachable (CASE Sigma1 stalls → `FAILURE`, or a
-  > 60s matd `COMMAND_TIMEOUT`). A *full* group provision + groupcast delivery
-  > check is the flaky Phase-3 device-delivery item, not a matd-path gap.
+Inline-JSON tokenization: `group_provision`'s key-set JSON is passed inline on the
+ws command line as a single compact (no-space) token, e.g. `groupkeymanagement
+key-set-write {"epochKey0":..., "groupKeySetID":77} 5 0`.
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
@@ -416,9 +374,9 @@ Only if `chip-tool` parsing or build/ship becomes a bottleneck.
 
 - Implement TLV / CASE / multicast routing inside `mat` (always delegate to
   `chip-tool`).
-- Hold human names or logical groups in `mat` (upper layer's job).
-- Add session cache, subscriptions, a daemon, or an internal scheduler
-  (resident layer's job).
+- Hold human names or logical groups in `mat` (out of scope).
+- Add session cache, subscriptions, a daemon, or an internal scheduler to `mat`
+  (that is `matd`'s role, a separate binary).
 - Bring a Matter bridge (becoming a Matter device) into `mat`.
 - Hold scenes, automation, or voice/UI entry points in `mat`.
 - Render or display QR images on stdout (emit the `qr_payload` string only).

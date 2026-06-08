@@ -6,9 +6,9 @@
 //! Commissioning Method）で一回限りの新コードを発行させ、`manual_code`（11桁）と
 //! `qr_payload`（`MT:...` 文字列）の両方を返す。
 //!
-//! QR 画像のレンダリングは `mat` の責務ではない（stdout には文字列のみ。描画は上層）。
-//! 「複数機器を QR 1枚でまとめて共有」は Matter 仕様上できない＝それはブリッジの話で
-//! `mat` 外（`casa-bridge`）。`open-window` はネイティブ機器を1台ずつ共有する。
+//! QR 画像のレンダリングは `mat` の責務ではない（stdout には文字列のみ）。
+//! 「複数機器を QR 1枚でまとめて共有」は Matter 仕様上できない＝それはブリッジ
+//! （別プロジェクト）の話で `mat` 外。`open-window` はネイティブ機器を1台ずつ共有する。
 
 use std::path::Path;
 

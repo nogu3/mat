@@ -10,7 +10,7 @@ structured JSON**, normalized to `mat`'s own schema.
 - diagnostics go to stderr as structured logs (`tracing`).
 - it holds no state except the credential KVS (the process is one-shot).
 
-For the design background, the three-layer separation, and what `mat` does and
+For the design background, the `mat` / `matd` split, and what `mat` does and
 does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Status
@@ -40,8 +40,7 @@ backend replacement) is optional. `mat` itself stays one-shot — design rule 4 
 daemon / cache in `mat`) still holds, and `matd` may be resident precisely because
 it is a separate binary, not `mat`.
 
-The authoritative roadmap, the phase order, and the layer split (including how
-`matd` differs from the cross-protocol `casad`) live in
+The authoritative roadmap, the phase order, and the `mat` / `matd` split live in
 [ARCHITECTURE.md](./ARCHITECTURE.md); this README only tracks status.
 
 ## Requirements
@@ -115,8 +114,8 @@ connectedhomeip's `credentials/production/paa-root-certs/`.
 
 `<node_id>` must be **already commissioned** (if not, exit `11`; if the store
 itself is missing, exit `10`). Cluster / attribute / command names are passed in
-**chip-tool form** (numeric resolution and human names are the upper layer's
-job).
+**chip-tool form** (`mat` works in numeric / chip-tool terms; human-name
+resolution is out of scope).
 
 ```bash
 # Read an attribute: read <node_id> <endpoint> <cluster> <attribute>
@@ -182,7 +181,7 @@ Output:
 - Returns **both** `manual_code` (11-digit) and `qr_payload` (the `MT:...`
   string).
 - **Rendering the QR image is not `mat`'s job.** stdout emits the `qr_payload`
-  string only; drawing is the upper layer's job.
+  string only; drawing is out of scope.
 - `--timeout` defaults to 180 seconds. `expires_at` is the time `mat` built the
   response plus `timeout`.
 - If `--discriminator` is omitted, it is derived from the node_id
@@ -202,8 +201,8 @@ set is burned into each device, then a single multicast send hits all of them.
 This is the original motivation (no "popcorn effect" of lights turning on one by
 one). It wraps `chip-tool`'s group path (`groupsettings` / `groupkeymanagement` /
 `groups`); `mat` holds no group state of its own (it lives in chip-tool's
-storage). Logical group names ("the living-room lights") are the upper layer's
-job — `mat` only takes a numeric GroupId.
+storage). Logical group names ("the living-room lights") are out of scope —
+`mat` only takes a numeric GroupId.
 
 ```bash
 # Provision: burn the key set + mapping into every node, and set up the
@@ -401,9 +400,8 @@ Home / Google Home). Finish before `expires_at`. After sharing, `mat` keeps its
 fabric membership (multi-admin).
 
 > Each one-shot run pays mDNS resolution plus a CASE handshake, so a single call
-> is slow (hundreds of ms to seconds). Speed-sensitive use cases belong to a
-> resident layer that keeps warm sessions (see the three-layer separation in
-> ARCHITECTURE.md).
+> is slow (hundreds of ms to seconds). Speed-sensitive use cases run `matd`,
+> which keeps warm sessions (see ARCHITECTURE.md).
 
 ### Phase 3 groupcast E2E (real devices)
 
