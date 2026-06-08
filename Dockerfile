@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# x86_64 UGREEN NAS（DXP4800 Plus / Pentium Gold 8505）向けマルチステージビルド。
+# x86_64 Linux 向けマルチステージビルド。
 # chip-tool のビルドは数 GB・長時間なので「一度焼いてランタイムにバイナリだけ載せる」。
 # クロスコンパイル不要・glibc ミスマッチなしの前提。
 #

@@ -5,7 +5,7 @@ mind on every change.
 
 `mat` is a CLI for controlling Matter devices. It calls a Matter controller
 (`chip-tool`) as a subprocess and normalizes its text output into `mat`'s JSON
-schema. For the full design, scope, three-layer separation, and roadmap, read
+schema. For the full design, scope, the `mat` / `matd` split, and roadmap, read
 [ARCHITECTURE.md](./ARCHITECTURE.md). For usage, read [README.md](./README.md).
 This file is the short list of constraints you must not break.
 
@@ -24,10 +24,13 @@ This file is the short list of constraints you must not break.
 
 ## Scope reminders (do not add these to `mat`)
 
-- Resolving human names to node_id / endpoint / cluster (upper layer's job).
-- Logical groups like "the lights in the living room" (upper layer's job).
-- Session cache, subscriptions, freshness (resident layer's job).
-- Scenes, automation, voice/UI entry points (resident layer's job).
+- Resolving human names to node_id / endpoint / cluster (out of scope; `mat`
+  takes numeric values).
+- Logical groups like "the lights in the living room" (out of scope; `mat` takes
+  a numeric GroupId).
+- Session cache, subscriptions, freshness (`mat` is one-shot; warm sessions are
+  `matd`'s role, a separate binary).
+- Scenes, automation, voice/UI entry points (out of scope).
 - Being a Matter device / a bridge (a separate project).
 - Rendering or displaying QR images (emit the `qr_payload` string only).
 
@@ -88,9 +91,8 @@ Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
 the current one is fully done (all tests pass, acceptance criteria met). Phases
 0–3 are implemented (Phase 3 = groupcast: `mat group provision` / `mat group
 invoke`); real-device E2E for groupcast is still recommended. **Phase 4** (next)
-is `matd`, the resident layer (warm CASE sessions; a separate binary in this
-repo, distinct from the cross-protocol `casad`). **Phase 5** (native / backend
-replacement) is optional.
+is `matd`, the resident binary (warm CASE sessions; a separate binary in this
+repo). **Phase 5** (native / backend replacement) is optional.
 
 ## Development commands
 

@@ -264,10 +264,10 @@ async fn descriptor_list(
 /// state も設定する（`mat group provision` 相当）。最初の失敗で停止する。
 ///
 /// NOTE: 鍵束 / GroupKeyMap は compact JSON を ws コマンド行に載せて渡す。chip-tool
-/// interactive server のトークナイザがこの JSON を 1 引数として扱うことを実機 E2E
-/// （jarvis / node 5, 2026-06-08）で確認: key-set-write の compact JSON object が
-/// chip-tool ログに `Command: groupkeymanagement key-set-write {"epochKey0":...,
-/// "groupKeySetID":77} 5 0` と丸ごと 1 トークンで渡り解釈された（空白なしが前提）。
+/// interactive server のトークナイザはこの compact JSON を 1 引数として扱う:
+/// key-set-write の compact JSON object は chip-tool ログに `Command:
+/// groupkeymanagement key-set-write {"epochKey0":..., "groupKeySetID":77} 5 0` と
+/// 丸ごと 1 トークンで渡り解釈される（空白なしが前提）。
 async fn group_provision(
     op: &Op,
     backend: &ChipToolBackend,
@@ -437,10 +437,10 @@ fn id_list(result: &Value) -> Vec<u64> {
 /// `error` 値（status 名/コード）を既存のテキスト分類 [`classify_failure`] に通し、
 /// 未知なら `device_rejected` にフォールバックする。
 ///
-/// 実機 E2E（jarvis / node 5, 2026-06-08）で失敗形状を確定: 失敗した
-/// groupkeymanagement key-set-write が `{"results":[{"error":"FAILURE"}],"logs":[...]}`
-/// を返した。`error` は status 名の**文字列**（数値ではない）、キー名は `error`。
-/// `"FAILURE"` は `classify_failure` 未一致のため `device_rejected` に落ちる。
+/// 失敗形状: 失敗した groupkeymanagement key-set-write は
+/// `{"results":[{"error":"FAILURE"}],"logs":[...]}` を返す。`error` は status 名の
+/// **文字列**（数値ではない）、キー名は `error`。`"FAILURE"` は `classify_failure`
+/// 未一致のため `device_rejected` に落ちる。
 fn ensure_ok(result: &Value) -> Result<(), MatError> {
     let Some(arr) = result.get("results").and_then(Value::as_array) else {
         return Ok(());
@@ -512,8 +512,7 @@ mod tests {
 
     #[test]
     fn ensure_ok_classifies_real_device_failure_shape() {
-        // 実機 E2E（jarvis / node 5, 2026-06-08）で確定した失敗 ws 形状:
-        // 失敗した key-set-write が `error` に status 名の**文字列**を返す。
+        // 失敗 ws 形状: 失敗した key-set-write が `error` に status 名の**文字列**を返す。
         let v = json!({ "results": [{ "error": "FAILURE" }], "logs": [] });
         let err = ensure_ok(&v).expect_err("FAILURE must be an error");
         assert_eq!(err.kind, ErrorKind::DeviceRejected);

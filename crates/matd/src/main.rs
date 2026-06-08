@@ -3,8 +3,8 @@
 //! chip-tool を `interactive server`（websocket）で常駐起動し、温かい CASE
 //! セッションを保持したまま unix socket で read/invoke 等を中継する。各呼び出しが
 //! mDNS 解決 + CASE ハンドシェイクを払う one-shot の `mat` に対し、ハンドシェイクを
-//! 省いて高速化する（ssh `ControlMaster`/`ControlPersist` モデル）。クロスプロトコルの
-//! `casad` とは別物で、Matter 専用。設計は ARCHITECTURE.md を参照。
+//! 省いて高速化する（ssh `ControlMaster`/`ControlPersist` モデル）。Matter 専用。
+//! 設計は ARCHITECTURE.md を参照。
 //!
 //! `mat` 本体の設計ルール 4（常駐・セッションキャッシュ禁止）は `mat` に効き続ける。
 //! `matd` は別バイナリ・別レイヤなので常駐してよい。
