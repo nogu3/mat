@@ -10,10 +10,10 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::runner::ChipTool;
 use mat_core::error::MatError;
 use mat_core::output;
 use mat_core::parse::parse_commissionables;
-use crate::runner::ChipTool;
 use mat_core::store::Store;
 
 pub fn run(store_path: &Path) -> Result<(), MatError> {

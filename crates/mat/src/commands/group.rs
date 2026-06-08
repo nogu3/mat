@@ -14,11 +14,11 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
+use mat_core::normalize::classify_failure;
 use mat_core::output;
 use mat_core::parse::operation_succeeded;
-use crate::runner::ChipTool;
-use mat_core::normalize::classify_failure;
 use mat_core::store::Store;
 
 /// GroupKeySecurityPolicy。0 = TrustFirst（最初に来た鍵を信頼）。
