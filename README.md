@@ -22,6 +22,35 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 Group commands come in a later phase (see the roadmap in ARCHITECTURE.md).
 
+## Roadmap
+
+### `matd` — resident layer (planned)
+
+`mat` is one-shot by design: every command spawns a fresh `chip-tool`, which
+re-establishes a CASE session (a Sigma handshake) each time, so a single call
+costs hundreds of ms to seconds. That latency is inherent to a stateless,
+idempotent CLI and will **not** be cached inside `mat` (see design rule 4: hold
+no state except the credential KVS).
+
+To make repeated operations fast, a separate resident binary `matd` will keep
+**warm CASE sessions** alive and accept commands over a local unix socket — the
+same model as ssh `ControlMaster`/`ControlPersist`, where the idempotent CLI
+stays thin and a background process owns the multiplexed connection.
+
+Both binaries will live in **this repository** so a single install ships both
+(no extra repo to pull in). Planned layout (Cargo workspace):
+
+- `mat-core` — shared library: chip-tool output parsing, the JSON schema, and
+  error/exit-code classification (`parse` / `output` / `error`). Both binaries
+  depend on it, so the fragile `Data = ...` parser is maintained once.
+- `mat` — the one-shot CLI (unchanged behavior; stays idempotent and stateless).
+- `matd` — the resident layer: drives `chip-tool` in interactive mode and holds
+  warm sessions behind a unix socket.
+
+Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
+`matd` is a distinct layer; it is allowed to be resident precisely because it is
+not `mat`. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the three-layer split.
+
 ## Requirements
 
 - Rust (stable) and [Task](https://taskfile.dev) to build.
