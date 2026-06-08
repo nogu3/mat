@@ -353,7 +353,7 @@ Iteration status:
   session teardown on Ctrl-C). Fake-ws tests cover the idle teardown→reconnect
   path; real-binary `--port` smoke check shows the `Spawn` child being reaped
   after `--idle-timeout`.
-- **Iter 3 (done; some real-device confirmations pending):** real-device E2E
+- **Iter 3 (done; real-device confirmed):** real-device E2E
   (jarvis, aarch64) pinned the ws result shape `{ "results": [...], "logs": [...] }`
   where `results[i]` is `{ endpointId, clusterId, attributeId, dataVersion, value }`.
   Implemented on top of that:
@@ -375,14 +375,28 @@ Iteration status:
     `UnixStream`, newline JSON) instead of spawning chip-tool; discover /
     commission / open-window stay direct-only (exit 2 under `--matd`).
 
-  **Pending real-device confirmation** (no jarvis in the impl session): the
-  chip-tool *interactive-server* tokenization of `group_provision`'s key-set /
-  key-map JSON passed inline on the ws command line (compact JSON = no spaces, so
-  expected to be one token), and the exact ws failure-`error` shape (string vs
-  numeric, key name) behind the best-effort classifier. The earlier E2E already
-  confirmed the warm-session win: descriptor read **1.37s cold** (CASE handshake)
-  → **0.08s warm** (~17×), chip-tool logging "Found an existing secure session"
-  on the second call.
+  **Real-device confirmations (jarvis / node 5, 2026-06-08):**
+  - **Inline-JSON tokenization — confirmed.** `group_provision`'s key-set JSON
+    passed inline on the ws command line is taken as **one argument**: chip-tool
+    logged `Command: groupkeymanagement key-set-write {"epochKey0":...,
+    "groupKeySetID":77} 5 0` with the compact object intact (no spaces = one
+    token), then proceeded to send it to the node. The controller groupsettings
+    steps tokenize fine too (`add-keysets 77 0 1 hex:...` is the 4-arg form). The
+    `write group-key-map [{...}]` array uses the same compact form; a full
+    `200/5` provision in the prior session reached and passed every step.
+  - **ws failure-`error` shape — confirmed.** A failed key-set-write returned
+    `{ "results": [{ "error": "FAILURE" }], "logs": [...] }`. `error` is a
+    **string** status name (not numeric), key name `error`. `ensure_ok` strips
+    the quotes, runs it through `classify_failure`, and falls back to
+    `device_rejected` for unknown names like `FAILURE`. Pinned by a unit test in
+    `matd::server`.
+  - **Warm-session win — confirmed earlier:** descriptor read **1.37s cold**
+    (CASE handshake) → **0.08s warm** (~17×), chip-tool logging "Found an
+    existing secure session" on the second call.
+
+  > node 5 is intermittently unreachable (CASE Sigma1 stalls → `FAILURE`, or a
+  > 60s matd `COMMAND_TIMEOUT`). A *full* group provision + groupcast delivery
+  > check is the flaky Phase-3 device-delivery item, not a matd-path gap.
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
