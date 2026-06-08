@@ -31,10 +31,11 @@ resident binary in **this** repo that keeps warm CASE sessions so repeated Matte
 calls skip the handshake (same model as ssh `ControlMaster`/`ControlPersist`). It
 drives `chip-tool interactive server` (websocket) and serves a unix socket
 speaking newline-delimited JSON. Iter 1 (ws bridge + socket + `read`/`invoke`/
-`on`/`off`/`ping`) and Iter 2 (`write`, idle timeout à la ssh `ControlPersist`,
-graceful shutdown) have landed with fake-ws integration tests; `describe`/`group`,
-the `mat`-routed client path, and real-device E2E are next (see ARCHITECTURE.md).
-**Phase 5** (native /
+`on`/`off`/`ping`), Iter 2 (`write`, idle timeout à la ssh `ControlPersist`,
+graceful shutdown), and Iter 3 (`describe`/`group` ops, `logs` dropped from
+responses, error classification, and a `mat --matd <sock>` client path) have
+landed with fake-ws integration tests; a couple of real-device confirmations for
+Iter 3 remain (see ARCHITECTURE.md). **Phase 5** (native /
 backend replacement) is optional. `mat` itself stays one-shot — design rule 4 (no
 daemon / cache in `mat`) still holds, and `matd` may be resident precisely because
 it is a separate binary, not `mat`.
@@ -239,6 +240,41 @@ Outputs:
   IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.
 - It stops at the **first failed node/step** (the error `detail` says which) so
   stdout stays pure JSON; re-run after fixing the offending node.
+
+### Routing through `matd` (Phase 4)
+
+By default each `mat` call spawns `chip-tool` and pays a fresh CASE handshake.
+With a running `matd` you can route the call through its warm session instead —
+same subcommands, same JSON on stdout, but the handshake is skipped on repeated
+calls.
+
+```bash
+# Start the resident daemon (separate binary; see ARCHITECTURE.md / matd --help).
+# With no --socket it uses the default path ($XDG_RUNTIME_DIR/matd.sock, else
+# /tmp/matd.sock) — the same default mat picks up below.
+matd &
+
+# Route through it. --matd with no value uses the default socket; pass a path to
+# override. Output is identical to the direct path.
+mat --matd read 5 1 onoff on-off
+mat --matd /run/mat/matd.sock on 5
+
+# Or skip the flag entirely: opt in via env (handy for a shell session).
+export MAT_MATD=1                       # use the default socket
+# export MAT_MATD_SOCKET=/run/mat/matd.sock   # or pin a path
+mat read 5 1 onoff on-off
+mat describe 5
+mat group invoke 1 onoff on
+```
+
+- Routing is enabled by, in precedence order: `--matd <path>` > `--matd` (default
+  socket) > `MAT_MATD_SOCKET=<path>` > `MAT_MATD=1` (default socket). Unset = the
+  direct chip-tool path as before.
+- Supported over matd: `read` / `write` / `invoke` / `on` / `off` / `describe` /
+  `group`. `discover` / `commission` / `open-window` are direct-only and exit `2`
+  if routed through matd.
+- node_id commissioning is re-checked by `matd` against the same credential store
+  per request, so the error kinds and exit codes match the direct path.
 
 ## Credential store
 

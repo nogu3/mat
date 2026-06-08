@@ -85,17 +85,11 @@ async fn run(cli: Cli) -> Result<(), MatError> {
         ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    // 既定は mat-core 共通（mat --matd の値省略時と同じパスを指す）。
+    let socket = cli
+        .socket
+        .unwrap_or_else(mat_core::socket::default_socket_path);
     server::serve(&socket, store_path, Arc::new(backend))
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
-}
-
-/// 既定のソケットパス: `$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`。
-fn default_socket() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("matd.sock")
-    } else {
-        PathBuf::from("/tmp/matd.sock")
-    }
 }

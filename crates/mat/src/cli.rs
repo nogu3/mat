@@ -19,6 +19,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub store: Option<PathBuf>,
 
+    /// matd の unix socket 経由で実行する（chip-tool を直に起動せず、常駐 matd の warm
+    /// CASE セッションを使う）。値を省略すると既定パス（`$XDG_RUNTIME_DIR/matd.sock`、
+    /// 無ければ `/tmp/matd.sock`）。フラグ自体を省いても `MAT_MATD_SOCKET=<path>` か
+    /// `MAT_MATD=1` で同じ経路に乗る。対応は read/write/invoke/on/off/describe/group のみ
+    /// （discover/commission/open-window は非対応）。
+    #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
+    pub matd: Option<Option<PathBuf>>,
+
     #[command(subcommand)]
     pub command: Command,
 }

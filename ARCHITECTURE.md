@@ -353,19 +353,36 @@ Iteration status:
   session teardown on Ctrl-C). Fake-ws tests cover the idle teardown→reconnect
   path; real-binary `--port` smoke check shows the `Spawn` child being reaped
   after `--idle-timeout`.
-- **Iter 3 (next):** real-device E2E (jarvis, aarch64, against a commissioned
-  node) has **pinned the ws result shape**, so the rest is concrete. The ws reply
-  is `{ "results": [...], "logs": [...] }`: `results[i]` is
-  `{ endpointId, clusterId, attributeId, dataVersion, value }`, so `results[0].value`
-  carries the structured attribute value — matd's current best-effort extraction
-  already matches it. `logs` is base64-wrapped chip-tool text (verbose); matd
-  should **drop it** from the response rather than attach it raw. Remaining work:
-  trim `logs`, implement `describe` (parts-list → per-endpoint server-list) and
-  `group` on top of `results`, confirm the error shape (unreachable / timeout),
-  and add a `matd`-routed client path from `mat` (or `casa`). The same E2E
+- **Iter 3 (done; some real-device confirmations pending):** real-device E2E
+  (jarvis, aarch64) pinned the ws result shape `{ "results": [...], "logs": [...] }`
+  where `results[i]` is `{ endpointId, clusterId, attributeId, dataVersion, value }`.
+  Implemented on top of that:
+  - **`logs` dropped.** The backend strips the verbose base64 `logs` right after
+    each ws exchange (count logged at debug) so matd never carries it. Responses
+    are now the pure `mat` schema — the raw ws result is **not** attached anymore
+    (was a temporary `result` field; removed for CLAUDE.md rule 2).
+  - **`describe`** op: `parts-list` (ep 0) → per-endpoint `server-list`, reading
+    the ID arrays from `results[0].value`. Same output shape as `mat describe`.
+  - **`group`** ops: `group_provision` (controller groupsettings + per-node
+    KeySetWrite / GroupKeyMap / AddGroup) and `group_invoke` (multicast, reports
+    `sent`). The shared epoch-key / group-node-id logic moved to `mat-core::group`
+    so `mat` and `matd` use one copy.
+  - **Error classification:** a device-side error in `results[i].error` is run
+    through the existing `classify_failure` text matcher (→ unreachable / timeout /
+    device_rejected, unknown falls back to device_rejected).
+  - **`mat --matd <sock>` client path:** a global flag routes
+    read/write/invoke/on/off/describe/group through the matd unix socket (std
+    `UnixStream`, newline JSON) instead of spawning chip-tool; discover /
+    commission / open-window stay direct-only (exit 2 under `--matd`).
+
+  **Pending real-device confirmation** (no jarvis in the impl session): the
+  chip-tool *interactive-server* tokenization of `group_provision`'s key-set /
+  key-map JSON passed inline on the ws command line (compact JSON = no spaces, so
+  expected to be one token), and the exact ws failure-`error` shape (string vs
+  numeric, key name) behind the best-effort classifier. The earlier E2E already
   confirmed the warm-session win: descriptor read **1.37s cold** (CASE handshake)
-  → **0.08s warm** (~17×), with chip-tool logging "Found an existing secure
-  session" on the second call.
+  → **0.08s warm** (~17×), chip-tool logging "Found an existing secure session"
+  on the second call.
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
