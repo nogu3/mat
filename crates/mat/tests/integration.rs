@@ -183,6 +183,38 @@ fn read_parses_value() {
 }
 
 #[test]
+fn diag_thread_returns_mesh_snapshot() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["diag", "thread", "5"])
+        .assert()
+        .success()
+        // スナップショット骨格と既定 endpoint 0。
+        .stdout(predicate::str::contains("\"thread\""))
+        .stdout(predicate::str::contains("\"endpoint\":0"))
+        // スカラ（routing-role の enum は数値のまま）。
+        .stdout(predicate::str::contains("\"routing_role\":2"))
+        .stdout(predicate::str::contains("\"network_name\":\"mat-thread\""))
+        // neighbor-table の struct-list が配列で出る。キーは chip-tool 表記のまま。
+        .stdout(predicate::str::contains("\"neighbor_table\""))
+        .stdout(predicate::str::contains("\"AverageRssi\":-82"))
+        .stdout(predicate::str::contains("\"route_table\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+}
+
+#[test]
+fn diag_thread_unreachable_exits_5() {
+    // 到達不能注入時はスナップショットを諦め、unreachable を伝播する。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .args(["diag", "thread", "5"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}
+
+#[test]
 fn write_reports_success() {
     let store = store_with_node5();
     mat(store.path())

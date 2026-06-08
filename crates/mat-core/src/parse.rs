@@ -263,6 +263,83 @@ pub fn parse_id_list(stdout: &str) -> Vec<u64> {
     ids
 }
 
+/// `chip-tool <cluster> read <attr> ...` が list-of-struct 属性を TOO レイヤで吐く
+/// 形をパースし、各エントリを `key -> 値` の Map として返す。
+///
+/// chip-tool（DataModelLogger）はリスト要素を次の形で列挙する:
+/// ```text
+///   NeighborTable: 2 entries
+///     [1]: {
+///       ExtAddress: 0x...
+///       LQI: 255
+///       AverageRssi: -34
+///      }
+///     [2]: { ... }
+/// ```
+/// エントリは `[i]: {` で始まり `}` で閉じ、間の `Key: Value` 行をフィールドとする。
+/// 値は `normalize_value` で bool/number/string に正規化する。**キー名は chip-tool
+/// 表記のまま**残す（Matter 仕様の field 名に対応。`mat` は名前解決をしない方針なので
+/// ここでも snake_case へ変換しない）。
+///
+/// Thread 診断の `neighbor-table` / `route-table` 等、スカラに潰せないリスト属性に使う。
+/// `parse_read_value`（スカラ）/ `parse_id_list`（数値リスト）では表現できない形を補う。
+///
+/// 注意: 実機 chip-tool のこの整形は版で揺れる可能性がある。fixture は想定形に基づく
+/// ので、実 Thread デバイス接続時に neighbor-table の実出力で検証し直すこと。
+pub fn parse_struct_list(stdout: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let mut entries: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+    let mut cur: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+    for line in stdout.lines() {
+        let Some(payload) = strip_log_prefix(line) else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+
+        // エントリ開始: `[i]: {`（i は数値インデックス）。
+        if payload.starts_with('[') {
+            if let Some(close) = payload.find(']') {
+                let idx_ok = payload[1..close].trim().parse::<u64>().is_ok();
+                let rest = payload[close + 1..].trim_start();
+                let rest = rest.strip_prefix(':').map(str::trim_start).unwrap_or(rest);
+                if idx_ok && rest.starts_with('{') {
+                    // 閉じ括弧を欠く壊れ出力でも直前エントリを取りこぼさない。
+                    if let Some(m) = cur.take() {
+                        entries.push(m);
+                    }
+                    cur = Some(serde_json::Map::new());
+                    continue;
+                }
+            }
+        }
+        // エントリ終了: `}`。
+        if payload.starts_with('}') {
+            if let Some(m) = cur.take() {
+                entries.push(m);
+            }
+            continue;
+        }
+        // フィールド行: `Key: Value`（エントリ内のみ拾う）。ヘッダ行
+        // （`NeighborTable: 2 entries`）は cur=None なので無視される。
+        if let Some(map) = cur.as_mut() {
+            if let Some(colon) = payload.find(':') {
+                let key = payload[..colon].trim();
+                let val = payload[colon + 1..].trim();
+                if !key.is_empty() && !val.is_empty() {
+                    map.insert(key.to_string(), normalize_value(val));
+                }
+            }
+        }
+    }
+    if let Some(m) = cur.take() {
+        entries.push(m);
+    }
+    entries
+}
+
 /// 行頭の chip-tool ログ接頭辞を取り除いた残り（payload）を返す。
 ///
 /// chip-tool のログ形式はバージョンで揺れる。少なくとも次の2系統を扱う:
@@ -483,6 +560,71 @@ mod tests {
 [1780817887.948] [32231:32235] [TOO]     [1]: 1
 ";
         assert_eq!(parse_id_list(s), vec![1]);
+    }
+
+    #[test]
+    fn struct_list_parses_neighbor_table() {
+        // Thread NeighborTable を想定した TOO レイヤ整形（[i]: { ... }）。
+        let s = "\
+[1656][CHIP:TOO]   NeighborTable: 2 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       ExtAddress: 0x166E0DB9
+[1656][CHIP:TOO]       Rloc16: 13312
+[1656][CHIP:TOO]       LQI: 255
+[1656][CHIP:TOO]       AverageRssi: -34
+[1656][CHIP:TOO]       LastRssi: -32
+[1656][CHIP:TOO]       RxOnWhenIdle: true
+[1656][CHIP:TOO]       IsChild: false
+[1656][CHIP:TOO]      }
+[1656][CHIP:TOO]     [2]: {
+[1656][CHIP:TOO]       ExtAddress: 0x7AB30000
+[1656][CHIP:TOO]       Rloc16: 21504
+[1656][CHIP:TOO]       LQI: 96
+[1656][CHIP:TOO]       AverageRssi: -82
+[1656][CHIP:TOO]       LastRssi: -85
+[1656][CHIP:TOO]       RxOnWhenIdle: false
+[1656][CHIP:TOO]       IsChild: true
+[1656][CHIP:TOO]      }
+";
+        let rows = parse_struct_list(s);
+        assert_eq!(rows.len(), 2);
+        // キーは chip-tool 表記のまま。値は型正規化される。
+        assert_eq!(rows[0]["LQI"], serde_json::Value::from(255));
+        assert_eq!(rows[0]["AverageRssi"], serde_json::Value::from(-34));
+        assert_eq!(rows[0]["RxOnWhenIdle"], serde_json::Value::Bool(true));
+        assert_eq!(rows[0]["IsChild"], serde_json::Value::Bool(false));
+        // 16進 ExtAddress は数値化できないので文字列のまま保持。
+        assert_eq!(
+            rows[0]["ExtAddress"],
+            serde_json::Value::String("0x166E0DB9".into())
+        );
+        // 弱い隣接（2件目）の RSSI も取れる。
+        assert_eq!(rows[1]["AverageRssi"], serde_json::Value::from(-82));
+        assert_eq!(rows[1]["IsChild"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn struct_list_realworld_log_format() {
+        // 実機 v1.4.2.0 形式（小数点 ts + pid:tid + CHIP 無しタグ）でも剥がせる。
+        let s = "\
+[1780831029.797] [39286:39288] [TOO]   RouteTable: 1 entries
+[1780831029.797] [39286:39288] [TOO]     [1]: {
+[1780831029.797] [39286:39288] [TOO]       Rloc16: 13312
+[1780831029.797] [39286:39288] [TOO]       Cost: 0
+[1780831029.797] [39286:39288] [TOO]       LinkEstablished: true
+[1780831029.797] [39286:39288] [TOO]      }
+";
+        let rows = parse_struct_list(s);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["Rloc16"], serde_json::Value::from(13312));
+        assert_eq!(rows[0]["Cost"], serde_json::Value::from(0));
+        assert_eq!(rows[0]["LinkEstablished"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn struct_list_empty_when_no_entries() {
+        assert!(parse_struct_list("[1656][CHIP:TOO]   NeighborTable: 0 entries").is_empty());
+        assert!(parse_struct_list("nothing useful").is_empty());
     }
 
     #[test]

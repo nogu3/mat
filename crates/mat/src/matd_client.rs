@@ -144,6 +144,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
         Command::Discover => return Err(unsupported("discover")),
         Command::Commission { .. } => return Err(unsupported("commission")),
         Command::OpenWindow { .. } => return Err(unsupported("open-window")),
+        Command::Diag { .. } => return Err(unsupported("diag")),
     };
     Ok(op)
 }

@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, GroupCommand};
+use cli::{Cli, Command, DiagCommand, GroupCommand};
 use mat_core::store::Store;
 
 fn main() -> ExitCode {
@@ -108,6 +108,11 @@ fn main() -> ExitCode {
                 args,
                 endpoint,
             } => commands::group::invoke(&store_path, *group_id, cluster, command, args, *endpoint),
+        },
+        Command::Diag { action } => match action {
+            DiagCommand::Thread { node_id, endpoint } => {
+                commands::diag::thread(&store_path, *node_id, *endpoint)
+            }
         },
     };
 
