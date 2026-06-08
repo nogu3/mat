@@ -154,7 +154,9 @@ pub fn normalize_value(raw: &str) -> serde_json::Value {
 /// `chip-tool` の write / invoke の stdout から「IM レベルで成功した」ことを判定する。
 ///
 /// write は `status = 0x00 (SUCCESS)`、invoke は `... Status=0x0 (SUCCESS)` のような
-/// 行を出す。どちらかの成功シグナルがあれば真。明示シグナルが無い出力は偽。
+/// 行を出す。payload を伴うコマンド応答（例: Groups の `AddGroupResponse { status: 0 }`）
+/// は構造体フィールド `status: 0`（10進）の形。いずれかの成功シグナルがあれば真。
+/// 明示シグナルが無い出力は偽。
 pub fn operation_succeeded(stdout: &str) -> bool {
     for line in stdout.lines() {
         let l = line.to_ascii_lowercase();
@@ -170,6 +172,15 @@ pub fn operation_succeeded(stdout: &str) -> bool {
                 || after.starts_with("0x00")
                 || after.starts_with("0x0(")
             {
+                return true;
+            }
+        }
+        // payload 付きコマンド応答の構造体フィールド（`status: 0`）。AddGroup など。
+        // 先頭トークンが 0（10進）/ 0x0 / 0x00 = SUCCESS。非0 ステータスは偽のまま。
+        if let Some(pos) = l.find("status:") {
+            let after = l[pos + "status:".len()..].trim_start();
+            let tok = after.split([',', ' ', '\t']).next().unwrap_or("");
+            if tok == "0" || tok == "0x0" || tok == "0x00" {
                 return true;
             }
         }
@@ -387,9 +398,15 @@ mod tests {
         assert!(operation_succeeded(
             "[1656][CHIP:DMG] Received Command Response Status for Endpoint=0x1 Cluster=0x0000_0006 Command=0x0000_0001 Status=0x0 (SUCCESS)"
         ));
+        // payload 付きコマンド応答（Groups AddGroupResponse）。実機 chip-tool の形。
+        assert!(operation_succeeded(
+            "[1656][CHIP:TOO]   AddGroupResponse: {\n[1656][CHIP:TOO]     status: 0\n[1656][CHIP:TOO]     groupID: 100\n[1656][CHIP:TOO]    }"
+        ));
         assert!(!operation_succeeded(
             "[1656][CHIP:DMG] status = 0x01 (FAILURE)"
         ));
+        // payload 応答の非0 ステータス（例: 0x88 RESOURCE_EXHAUSTED）は失敗。
+        assert!(!operation_succeeded("[1656][CHIP:TOO]     status: 137"));
         assert!(!operation_succeeded("nothing useful"));
     }
 

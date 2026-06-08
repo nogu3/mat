@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::group::{group_node_id, resolve_epoch_key, KEY_SECURITY_POLICY};
+use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
 use mat_core::output::now_iso8601;
 use mat_core::parse::normalize_value;
@@ -297,10 +297,14 @@ async fn group_provision(
         &format!("groupsettings add-group {name} {group_id}"),
     )
     .await?;
+    // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
+    // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
+    // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
+    // EPOCH_START_TIME（=デバイス側 epochStartTime0）と一致させる。実機 E2E で確定。
     group_step(
         backend,
         &format!(
-            "groupsettings add-keysets {name} {keyset_id} {KEY_SECURITY_POLICY} hex:{epoch_key}"
+            "groupsettings add-keysets {keyset_id} {KEY_SECURITY_POLICY} {EPOCH_START_TIME} hex:{epoch_key}"
         ),
     )
     .await?;
