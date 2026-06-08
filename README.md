@@ -165,9 +165,9 @@ Outputs:
 `mat diag thread <node_id>` returns a one-shot snapshot of a node's **Thread
 Network Diagnostics** (cluster 53, normally on endpoint 0) for analyzing mesh
 health — "why is this device flaky?". It bundles the scalars `routing-role` /
-`partition-id` / `channel` / `network-name` / `rloc16` with the list attributes
-`neighbor-table` and `route-table`, which the generic `mat read` can't represent
-(they are lists of structs, not a single value).
+`network-name` / `extended-pan-id` / `pan-id` / `partition-id` / `channel` with
+the list attributes `neighbor-table` and `route-table`, which the generic `mat
+read` can't represent (they are lists of structs, not a single value).
 
 ```bash
 # diag thread <node_id> [--endpoint EP]   (EP defaults to 0)
@@ -180,23 +180,39 @@ mat diag thread 5
 {
   "timestamp": "...", "node_id": 5, "endpoint": 0,
   "thread": {
-    "routing_role": 2, "partition_id": 123, "channel": 15,
-    "network_name": "mat-thread", "rloc16": 13312,
+    "routing_role": 5, "network_name": "ha-thread-6562",
+    "extended_pan_id": 14789548233599576168, "pan_id": 25954,
+    "partition_id": 597971536, "channel": 15,
     "neighbor_table": [
-      { "ExtAddress": "0x166E0DB9", "Rloc16": 13312, "LQI": 255, "AverageRssi": -34, "LastRssi": -32, "RxOnWhenIdle": true, "IsChild": false }
+      { "Age": 21, "ExtAddress": 7110405590318074745, "Rloc16": 38912, "Lqi": 3, "AverageRssi": -65, "LastRssi": -67, "FrameErrorRate": 56, "RxOnWhenIdle": true, "IsChild": false }
     ],
-    "route_table": [ { "Rloc16": 13312, "Cost": 0, "LinkEstablished": true } ]
+    "route_table": [
+      { "ExtAddress": 7110405590318074745, "Rloc16": 38912, "RouterId": 38, "NextHop": 45, "PathCost": 1, "LQIIn": 3, "LQIOut": 3, "LinkEstablished": true, "Allocated": true }
+    ]
   }
 }
 ```
+
+> Field names inside `neighbor_table` / `route_table` are kept verbatim from
+> chip-tool (note `Lqi` in neighbors but `LQIIn` / `LQIOut` in routes), and
+> `routing_role` is the numeric enum (5 = Router) — `mat` does not resolve names.
 
 > How to read it: a flaky node usually has **few `neighbor_table` entries** or a
 > weak `AverageRssi` to its only neighbor (roughly: > -70 dBm healthy, < -85 dBm
 > marginal). Only mains-powered, router-eligible devices relay (`RxOnWhenIdle:
 > true` / not `IsChild`); adding battery sleepy end devices does not extend the
-> mesh. A `partition_id` that differs across nodes means the mesh has split.
-> Like `describe`, this calls chip-tool several times but finishes in one shot.
-> `mat diag` runs only on the direct chip-tool path (not via `--matd`).
+> mesh. Devices that share the same `extended_pan_id` are on the same Thread
+> network (same border router); a `partition_id` that differs across nodes means
+> the mesh has split.
+>
+> Thread devices drop in and out, so `diag` returns **partial results**: each
+> attribute is read independently, failures are listed under `unavailable`
+> (`[{ "attribute": ..., "kind": ... }]`), and an unread field is `null` —
+> distinct from `[]`, which means a table was read and is genuinely empty (an
+> isolated node). If *every* read fails (node fully unreachable) it exits with
+> `unreachable` / `timeout` instead. Like `describe`, this calls chip-tool
+> several times but finishes in one shot. `mat diag` runs only on the direct
+> chip-tool path (not via `--matd`).
 
 ### Multi-admin share (Phase 2)
 

@@ -125,32 +125,44 @@ EOF
     # TOO レイヤの `[i]: { ... }` 形で吐く。
     emit_failure
     attr="$3"
+    # 部分結果テスト用: 指定属性だけ拒否させる（間欠不通の機器を模す）。
+    if [ -n "$FAKE_THREAD_FAIL_ATTR" ] && [ "$attr" = "$FAKE_THREAD_FAIL_ATTR" ]; then
+      echo "[1656][CHIP:TOO] Received Command Response Status status 0x81 (Failure)"
+      exit 1
+    fi
     case "$attr" in
-      routing-role)  echo "[1656][CHIP:DMG] Data = 2 (Router)," ;;
-      partition-id)  echo "[1656][CHIP:DMG] Data = 123 (unsigned)," ;;
-      channel)       echo "[1656][CHIP:DMG] Data = 15 (unsigned)," ;;
-      network-name)  echo '[1656][CHIP:DMG] Data = "mat-thread",' ;;
-      rloc16)        echo "[1656][CHIP:DMG] Data = 13312 (unsigned)," ;;
+      # 値・整形は jarvis node 5 の実機出力に合わせる（routing-role 5=Router、
+      # 文字列に長さ注釈、neighbor は `Lqi`、ExtAddress は10進、route は `PathCost`）。
+      routing-role)     echo "[1656][CHIP:DMG] Data = 5 (Router)," ;;
+      network-name)     echo '[1656][CHIP:DMG] Data = "ha-thread-6562" (14 chars),' ;;
+      extended-pan-id)  echo "[1656][CHIP:DMG] Data = 14789548233599576168 (unsigned)," ;;
+      pan-id)           echo "[1656][CHIP:DMG] Data = 25954 (unsigned)," ;;
+      partition-id)     echo "[1656][CHIP:DMG] Data = 597971536 (unsigned)," ;;
+      channel)          echo "[1656][CHIP:DMG] Data = 15 (unsigned)," ;;
       neighbor-table)
         cat <<'EOF'
 [1656][CHIP:TOO]   NeighborTable: 2 entries
 [1656][CHIP:TOO]     [1]: {
-[1656][CHIP:TOO]       ExtAddress: 0x166E0DB9
-[1656][CHIP:TOO]       Rloc16: 13312
-[1656][CHIP:TOO]       LQI: 255
-[1656][CHIP:TOO]       AverageRssi: -34
-[1656][CHIP:TOO]       LastRssi: -32
+[1656][CHIP:TOO]       Age: 21
+[1656][CHIP:TOO]       ExtAddress: 7110405590318074745
+[1656][CHIP:TOO]       Rloc16: 38912
+[1656][CHIP:TOO]       Lqi: 3
+[1656][CHIP:TOO]       AverageRssi: -65
+[1656][CHIP:TOO]       LastRssi: -67
+[1656][CHIP:TOO]       FrameErrorRate: 56
 [1656][CHIP:TOO]       RxOnWhenIdle: true
 [1656][CHIP:TOO]       IsChild: false
 [1656][CHIP:TOO]      }
 [1656][CHIP:TOO]     [2]: {
-[1656][CHIP:TOO]       ExtAddress: 0x7AB30000
-[1656][CHIP:TOO]       Rloc16: 21504
-[1656][CHIP:TOO]       LQI: 96
-[1656][CHIP:TOO]       AverageRssi: -82
-[1656][CHIP:TOO]       LastRssi: -85
-[1656][CHIP:TOO]       RxOnWhenIdle: false
-[1656][CHIP:TOO]       IsChild: true
+[1656][CHIP:TOO]       Age: 5
+[1656][CHIP:TOO]       ExtAddress: 4768252830523895510
+[1656][CHIP:TOO]       Rloc16: 13312
+[1656][CHIP:TOO]       Lqi: 1
+[1656][CHIP:TOO]       AverageRssi: -95
+[1656][CHIP:TOO]       LastRssi: -94
+[1656][CHIP:TOO]       FrameErrorRate: 0
+[1656][CHIP:TOO]       RxOnWhenIdle: true
+[1656][CHIP:TOO]       IsChild: false
 [1656][CHIP:TOO]      }
 EOF
         ;;
@@ -158,9 +170,16 @@ EOF
         cat <<'EOF'
 [1656][CHIP:TOO]   RouteTable: 1 entries
 [1656][CHIP:TOO]     [1]: {
-[1656][CHIP:TOO]       Rloc16: 13312
-[1656][CHIP:TOO]       Cost: 0
+[1656][CHIP:TOO]       Age: 32
+[1656][CHIP:TOO]       ExtAddress: 7110405590318074745
+[1656][CHIP:TOO]       Rloc16: 38912
+[1656][CHIP:TOO]       RouterId: 38
+[1656][CHIP:TOO]       NextHop: 45
+[1656][CHIP:TOO]       PathCost: 1
+[1656][CHIP:TOO]       LQIIn: 3
+[1656][CHIP:TOO]       LQIOut: 3
 [1656][CHIP:TOO]       LinkEstablished: true
+[1656][CHIP:TOO]       Allocated: true
 [1656][CHIP:TOO]      }
 EOF
         ;;

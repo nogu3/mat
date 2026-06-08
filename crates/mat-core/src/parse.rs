@@ -123,9 +123,13 @@ pub fn parse_read_value(stdout: &str) -> Option<serde_json::Value> {
 /// chip-tool の生テキスト値（または write の CLI 入力値）を `mat` の JSON 値へ
 /// 正規化する。read と write で同じ型付けを使い、出力 value の型を一貫させる。
 pub fn normalize_value(raw: &str) -> serde_json::Value {
-    // 文字列リテラル（両端ダブルクォート）。
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        return serde_json::Value::String(raw[1..raw.len() - 1].to_string());
+    // 文字列リテラル。実機 chip-tool は文字列に長さ注釈を付ける
+    // （`"ha-thread-6562" (14 chars)`）ため、最初の閉じ引用符までを値とし、後続注釈は
+    // 捨てる。注釈なし（`"living room"`）も同じ経路で通る。
+    if let Some(rest) = raw.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return serde_json::Value::String(rest[..end].to_string());
+        }
     }
     // 実機 chip-tool は数値に型注釈を付ける（`191 (unsigned)` / `-5 (signed)`）。
     // 先頭トークンを値とみなす。注釈なし（`191`）も同じ経路で通る。bool/null は
@@ -456,6 +460,17 @@ mod tests {
     }
 
     #[test]
+    fn read_value_strips_string_length_annotation() {
+        // 実機 chip-tool は文字列に長さ注釈を付ける（`"ha-thread-6562" (14 chars)`）。
+        // 旧パーサは末尾が `"` でないため注釈ごと文字列化していた。
+        let s = "[1780831029.797] [39286:39288] [DMG]   Data = \"ha-thread-6562\" (14 chars),";
+        assert_eq!(
+            parse_read_value(s),
+            Some(serde_json::Value::String("ha-thread-6562".into()))
+        );
+    }
+
+    #[test]
     fn read_value_takes_last_data_line() {
         // ReportData の入れ子で Data が複数出ても最後（実値）を採用。
         let s = "Data = 0,\nData = 42,";
@@ -564,60 +579,71 @@ mod tests {
 
     #[test]
     fn struct_list_parses_neighbor_table() {
-        // Thread NeighborTable を想定した TOO レイヤ整形（[i]: { ... }）。
+        // 実機 chip-tool v1.4.x の NeighborTable 整形（jarvis node 5 で確定）。
+        // フィールド名は `Lqi`（`LQI` ではない）、ExtAddress は 10進 u64。
         let s = "\
 [1656][CHIP:TOO]   NeighborTable: 2 entries
 [1656][CHIP:TOO]     [1]: {
-[1656][CHIP:TOO]       ExtAddress: 0x166E0DB9
-[1656][CHIP:TOO]       Rloc16: 13312
-[1656][CHIP:TOO]       LQI: 255
-[1656][CHIP:TOO]       AverageRssi: -34
-[1656][CHIP:TOO]       LastRssi: -32
+[1656][CHIP:TOO]       Age: 21
+[1656][CHIP:TOO]       ExtAddress: 7110405590318074745
+[1656][CHIP:TOO]       Rloc16: 38912
+[1656][CHIP:TOO]       Lqi: 3
+[1656][CHIP:TOO]       AverageRssi: -65
+[1656][CHIP:TOO]       LastRssi: -67
+[1656][CHIP:TOO]       FrameErrorRate: 56
 [1656][CHIP:TOO]       RxOnWhenIdle: true
 [1656][CHIP:TOO]       IsChild: false
 [1656][CHIP:TOO]      }
 [1656][CHIP:TOO]     [2]: {
-[1656][CHIP:TOO]       ExtAddress: 0x7AB30000
-[1656][CHIP:TOO]       Rloc16: 21504
-[1656][CHIP:TOO]       LQI: 96
-[1656][CHIP:TOO]       AverageRssi: -82
-[1656][CHIP:TOO]       LastRssi: -85
-[1656][CHIP:TOO]       RxOnWhenIdle: false
-[1656][CHIP:TOO]       IsChild: true
+[1656][CHIP:TOO]       Age: 5
+[1656][CHIP:TOO]       ExtAddress: 4768252830523895510
+[1656][CHIP:TOO]       Rloc16: 13312
+[1656][CHIP:TOO]       Lqi: 1
+[1656][CHIP:TOO]       AverageRssi: -95
+[1656][CHIP:TOO]       LastRssi: -94
+[1656][CHIP:TOO]       FrameErrorRate: 0
+[1656][CHIP:TOO]       RxOnWhenIdle: true
+[1656][CHIP:TOO]       IsChild: false
 [1656][CHIP:TOO]      }
 ";
         let rows = parse_struct_list(s);
         assert_eq!(rows.len(), 2);
         // キーは chip-tool 表記のまま。値は型正規化される。
-        assert_eq!(rows[0]["LQI"], serde_json::Value::from(255));
-        assert_eq!(rows[0]["AverageRssi"], serde_json::Value::from(-34));
+        assert_eq!(rows[0]["Lqi"], serde_json::Value::from(3));
+        assert_eq!(rows[0]["AverageRssi"], serde_json::Value::from(-65));
         assert_eq!(rows[0]["RxOnWhenIdle"], serde_json::Value::Bool(true));
         assert_eq!(rows[0]["IsChild"], serde_json::Value::Bool(false));
-        // 16進 ExtAddress は数値化できないので文字列のまま保持。
+        // 10進 ExtAddress は i64 を超えるが u64 として数値化される。
         assert_eq!(
             rows[0]["ExtAddress"],
-            serde_json::Value::String("0x166E0DB9".into())
+            serde_json::Value::from(7110405590318074745u64)
         );
-        // 弱い隣接（2件目）の RSSI も取れる。
-        assert_eq!(rows[1]["AverageRssi"], serde_json::Value::from(-82));
-        assert_eq!(rows[1]["IsChild"], serde_json::Value::Bool(true));
+        // 弱い隣接（2件目、-95dBm/Lqi 1）も取れる。
+        assert_eq!(rows[1]["AverageRssi"], serde_json::Value::from(-95));
+        assert_eq!(rows[1]["Lqi"], serde_json::Value::from(1));
     }
 
     #[test]
     fn struct_list_realworld_log_format() {
-        // 実機 v1.4.2.0 形式（小数点 ts + pid:tid + CHIP 無しタグ）でも剥がせる。
+        // 実機 v1.4.x の RouteTable（小数点 ts + pid:tid + CHIP 無しタグ）。
+        // route 側は `PathCost` / `LQIIn` / `LQIOut` / `NextHop` / `RouterId`。
         let s = "\
 [1780831029.797] [39286:39288] [TOO]   RouteTable: 1 entries
 [1780831029.797] [39286:39288] [TOO]     [1]: {
-[1780831029.797] [39286:39288] [TOO]       Rloc16: 13312
-[1780831029.797] [39286:39288] [TOO]       Cost: 0
+[1780831029.797] [39286:39288] [TOO]       Rloc16: 38912
+[1780831029.797] [39286:39288] [TOO]       RouterId: 38
+[1780831029.797] [39286:39288] [TOO]       NextHop: 45
+[1780831029.797] [39286:39288] [TOO]       PathCost: 1
+[1780831029.797] [39286:39288] [TOO]       LQIIn: 3
+[1780831029.797] [39286:39288] [TOO]       LQIOut: 3
 [1780831029.797] [39286:39288] [TOO]       LinkEstablished: true
 [1780831029.797] [39286:39288] [TOO]      }
 ";
         let rows = parse_struct_list(s);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["Rloc16"], serde_json::Value::from(13312));
-        assert_eq!(rows[0]["Cost"], serde_json::Value::from(0));
+        assert_eq!(rows[0]["Rloc16"], serde_json::Value::from(38912));
+        assert_eq!(rows[0]["PathCost"], serde_json::Value::from(1));
+        assert_eq!(rows[0]["LQIIn"], serde_json::Value::from(3));
         assert_eq!(rows[0]["LinkEstablished"], serde_json::Value::Bool(true));
     }
 
