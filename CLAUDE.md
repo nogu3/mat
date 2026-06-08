@@ -87,8 +87,10 @@ stdout/stderr to classify into `3`/`4`/`5`, falling back to `parse_error` + `1`.
 Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
 the current one is fully done (all tests pass, acceptance criteria met). Phases
 0–3 are implemented (Phase 3 = groupcast: `mat group provision` / `mat group
-invoke`); real-device E2E for groupcast is still recommended. Phase 4 (native /
-backend replacement) is optional.
+invoke`); real-device E2E for groupcast is still recommended. **Phase 4** (next)
+is `matd`, the resident layer (warm CASE sessions; a separate binary in this
+repo, distinct from the cross-protocol `casad`). **Phase 5** (native / backend
+replacement) is optional.
 
 ## Development commands
 
