@@ -39,6 +39,11 @@ struct Cli {
     /// 子プロセスを起動せず、既に動いている chip-tool ws（--port）へ接続する。
     #[arg(long)]
     connect: bool,
+
+    /// アイドル秒数。無アクセスがこれを超えると warm セッションを畳む
+    /// （ssh ControlPersist 相当）。次のコマンドで遅延再確立する。
+    #[arg(long, default_value_t = 300)]
+    idle_timeout: u64,
 }
 
 fn main() {
@@ -73,10 +78,11 @@ async fn run(cli: Cli) -> Result<(), MatError> {
     // 認証情報必須レイヤ。ストアが無ければ早めに exit 10（read/invoke は通せない）。
     Store::open(&store_path)?;
 
+    let idle = std::time::Duration::from_secs(cli.idle_timeout);
     let backend = if cli.connect {
-        ChipToolBackend::connect(cli.port).await?
+        ChipToolBackend::connect(cli.port, idle).await?
     } else {
-        ChipToolBackend::spawn(&store_path, cli.port).await?
+        ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
     let socket = cli.socket.unwrap_or_else(default_socket);

@@ -347,11 +347,17 @@ Iteration status:
   bridges `read` / `invoke` / `on` / `off` / `ping`. Covered by fake-ws
   integration tests (no real `chip-tool`); real-binary `--connect` smoke check
   passes (ping + uncommissioned-node error).
-- **Iter 2 (next):** remaining ops (`write` / `describe` / `group`), idle timeout
-  (`ControlPersist`-style chip-tool teardown), graceful shutdown, and pinning the
-  ws result-JSON shape (currently `value` is best-effort + raw `result` attached).
-- **Iter 3:** a `matd`-routed client path from `mat` (or `casa`), and real-device
-  E2E (warm-session latency win over one-shot).
+- **Iter 2 (done):** `write` op; idle timeout (`ControlPersist`-style — an idle
+  session is torn down and lazily re-established on the next command: `Spawn`
+  respawns the child, `Connect` just reconnects); graceful shutdown (reaper +
+  session teardown on Ctrl-C). Fake-ws tests cover the idle teardown→reconnect
+  path; real-binary `--port` smoke check shows the `Spawn` child being reaped
+  after `--idle-timeout`.
+- **Iter 3 (next):** `describe` / `group` (these need the ws result JSON parsed —
+  parts-list / per-step success — so they wait until that shape is pinned),
+  pinning the ws result-JSON shape (currently `value` is best-effort + raw
+  `result` attached), a `matd`-routed client path from `mat` (or `casa`), and
+  real-device E2E (warm-session latency win over one-shot).
 
 > Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
