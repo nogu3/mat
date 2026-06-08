@@ -94,7 +94,12 @@ async fn start_matd(store_path: PathBuf, port: u16) -> (PathBuf, tokio::task::Jo
 // 実体は matd の lib 経由で呼ぶ。
 use std::sync::Arc;
 async fn matd_backend_connect(port: u16) -> Arc<matd::backend::ChipToolBackend> {
-    Arc::new(matd::backend::ChipToolBackend::connect(port).await.unwrap())
+    // テスト中に畳まれないよう idle は長めに。
+    Arc::new(
+        matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+            .await
+            .unwrap(),
+    )
 }
 async fn matd_serve(
     socket: &std::path::Path,
@@ -123,6 +128,7 @@ async fn read_invoke_ping_and_errors() {
         &[
             json!({"id":1,"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}),
             json!({"id":2,"op":"on","node_id":1,"endpoint":1}),
+            json!({"id":3,"op":"write","node_id":1,"endpoint":1,"cluster":"levelcontrol","attribute":"on-level","value":"128"}),
             json!({"op":"ping"}),
             json!({"op":"read","node_id":99,"endpoint":1,"cluster":"onoff","attribute":"on-off"}),
         ],
@@ -145,13 +151,40 @@ async fn read_invoke_ping_and_errors() {
     assert_eq!(r["command"], "on");
     assert_eq!(r["result"]["cmd"], "onoff on 1 1");
 
+    // write: 入力 "128" を read と揃えた数値型へ正規化して返す。
+    let r = &resps[2];
+    assert_eq!(r["id"], json!(3));
+    assert_eq!(r["status"], "success");
+    assert_eq!(r["value"], json!(128));
+    assert_eq!(r["result"]["cmd"], "levelcontrol write on-level 128 1 1");
+
     // ping: chip-tool に触れず即応。
-    assert_eq!(resps[2]["pong"], json!(true));
+    assert_eq!(resps[3]["pong"], json!(true));
 
     // 未 commission node: node_not_commissioned エラー。
-    assert_eq!(resps[3]["error"]["kind"], "node_not_commissioned");
+    assert_eq!(resps[4]["error"]["kind"], "node_not_commissioned");
 
     handle.abort();
+}
+
+/// アイドル畳み込み後にコマンドが来たら ws を張り直す（Connect モードは再接続のみ）。
+#[tokio::test]
+async fn idle_teardown_then_reconnect() {
+    let port = spawn_fake_ws().await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_millis(150))
+        .await
+        .unwrap();
+
+    let v1 = backend.run_cmdline("first cmd").await.unwrap();
+    assert_eq!(v1["cmd"], "first cmd");
+
+    // アイドル基準を超えてから reaper 相当を呼ぶ → セッションが畳まれる。
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    backend.reap_if_idle().await;
+
+    // 次コマンドで遅延再接続され、fake-ws の 2 本目の接続で応答が返る。
+    let v2 = backend.run_cmdline("after reconnect").await.unwrap();
+    assert_eq!(v2["cmd"], "after reconnect");
 }
 
 #[tokio::test]

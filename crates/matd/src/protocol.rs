@@ -28,6 +28,14 @@ pub enum Op {
         cluster: String,
         attribute: String,
     },
+    /// 書き込み可能属性を設定する。
+    Write {
+        node_id: u64,
+        endpoint: u16,
+        cluster: String,
+        attribute: String,
+        value: String,
+    },
     /// クラスタコマンドを実行する。
     Invoke {
         node_id: u64,
@@ -50,6 +58,7 @@ impl Op {
     pub fn node_id(&self) -> Option<u64> {
         match self {
             Op::Read { node_id, .. }
+            | Op::Write { node_id, .. }
             | Op::Invoke { node_id, .. }
             | Op::On { node_id, .. }
             | Op::Off { node_id, .. } => Some(*node_id),
@@ -69,6 +78,13 @@ impl Op {
                 cluster,
                 attribute,
             } => format!("{cluster} read {attribute} {node_id} {endpoint}"),
+            Op::Write {
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+                value,
+            } => format!("{cluster} write {attribute} {value} {node_id} {endpoint}"),
             Op::Invoke {
                 node_id,
                 endpoint,
@@ -117,6 +133,18 @@ mod tests {
         assert_eq!(
             r.op.to_cmdline().unwrap(),
             "levelcontrol move-to-level 128 0 0 0 2 1"
+        );
+    }
+
+    #[test]
+    fn write_request_builds_cmdline() {
+        let r = parse(
+            r#"{"op":"write","node_id":4,"endpoint":1,"cluster":"levelcontrol","attribute":"on-level","value":"128"}"#,
+        );
+        assert_eq!(r.op.node_id(), Some(4));
+        assert_eq!(
+            r.op.to_cmdline().unwrap(),
+            "levelcontrol write on-level 128 4 1"
         );
     }
 

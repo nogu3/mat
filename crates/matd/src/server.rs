@@ -14,6 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use mat_core::error::MatError;
 use mat_core::output::now_iso8601;
+use mat_core::parse::normalize_value;
 use mat_core::store::Store;
 
 use crate::backend::ChipToolBackend;
@@ -31,6 +32,19 @@ pub async fn serve(
     }
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!(socket = %socket_path.display(), "matd listening");
+
+    // ControlPersist 風に、アイドルセッションを定期的に畳む reaper。チェック周期は
+    // アイドル基準の 1/4（最短 1 秒）。
+    let reaper = {
+        let backend = Arc::clone(&backend);
+        let tick = (backend.idle() / 4).max(std::time::Duration::from_secs(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                backend.reap_if_idle().await;
+            }
+        })
+    };
 
     let store_path = Arc::new(store_path);
     loop {
@@ -51,6 +65,10 @@ pub async fn serve(
             }
         }
     }
+
+    // graceful shutdown: reaper を止め、chip-tool セッションを畳み、socket を消す。
+    reaper.abort();
+    backend.shutdown().await;
     let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
@@ -135,6 +153,22 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
             "cluster": cluster,
             "attribute": attribute,
             "value": pick_read_value(&result),
+            "result": result,
+        }),
+        Op::Write {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            value,
+        } => json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "cluster": cluster,
+            "attribute": attribute,
+            // mat write と同じく、入力文字列を read と揃えた型へ正規化して返す。
+            "value": normalize_value(value),
+            "status": "success",
             "result": result,
         }),
         Op::Invoke {
