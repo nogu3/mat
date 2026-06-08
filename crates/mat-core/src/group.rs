@@ -9,6 +9,12 @@ use crate::error::{ErrorKind, MatError};
 /// GroupKeySecurityPolicy。0 = TrustFirst（最初に来た鍵を信頼）。
 pub const KEY_SECURITY_POLICY: &str = "0";
 
+/// epoch 鍵の有効開始時刻（EpochStartTime0）。コントローラ側 groupsettings の
+/// `add-keysets <keysetId> <keyPolicy> <validityTime> <EpochKey>` の validityTime と、
+/// デバイス側 KeySetWrite の epochStartTime0 はこの値で一致させる必要がある
+/// （ずれると両者が選ぶ有効 epoch 鍵が食い違い groupcast が復号できない）。
+pub const EPOCH_START_TIME: &str = "1";
+
 /// group multicast 宛先の node-id ベース。実 node-id は `BASE | group_id`。
 /// 上位48bitが全1（`0xffffffffffff....`）なら group 宛と解釈される。
 const GROUP_NODE_ID_BASE: u64 = 0xffff_ffff_ffff_0000;

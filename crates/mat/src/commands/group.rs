@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::group::{group_node_id, resolve_epoch_key, KEY_SECURITY_POLICY};
+use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
 use mat_core::output;
 use mat_core::parse::operation_succeeded;
@@ -59,12 +59,16 @@ pub fn provision(
     )?;
     run_step(
         &chip,
+        // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
+        // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
+        // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
+        // EPOCH_START_TIME（=デバイス側 epochStartTime0）と一致させる。実機 E2E で確定。
         vec![
             "groupsettings".into(),
             "add-keysets".into(),
-            name.to_string(),
             keyset_id.to_string(),
             KEY_SECURITY_POLICY.into(),
+            EPOCH_START_TIME.into(),
             format!("hex:{epoch_key}"),
         ],
         &format!("groupsettings add-keysets {keyset_id}"),
