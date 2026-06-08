@@ -134,6 +134,26 @@ pub enum Command {
         #[command(subcommand)]
         action: GroupCommand,
     },
+
+    /// ネットワーク診断スナップショット（メッシュ健全性の分析用）。
+    Diag {
+        #[command(subcommand)]
+        action: DiagCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiagCommand {
+    /// Thread Network Diagnostics (cluster 53) を 1 スナップショットで返す。
+    /// `routing-role` / `partition-id` / `channel` / `network-name` / `rloc16` と
+    /// `neighbor-table`（LQI/RSSI）/ `route-table`（cost）を集約する。
+    Thread {
+        /// commission 済みノードの node_id。
+        node_id: u64,
+        /// エンドポイント番号（既定 0 — 診断クラスタは通常 ep0）。
+        #[arg(long, value_name = "EP", default_value_t = 0)]
+        endpoint: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]

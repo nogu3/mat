@@ -3,6 +3,7 @@
 
 pub mod commission;
 pub mod describe;
+pub mod diag;
 pub mod discover;
 pub mod group;
 pub mod invoke;

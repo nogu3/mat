@@ -160,6 +160,44 @@ Outputs:
 > `describe` calls chip-tool several times (parts-list plus each endpoint's
 > server-list), so it is slow, but it finishes in one shot.
 
+### Diagnostics
+
+`mat diag thread <node_id>` returns a one-shot snapshot of a node's **Thread
+Network Diagnostics** (cluster 53, normally on endpoint 0) for analyzing mesh
+health — "why is this device flaky?". It bundles the scalars `routing-role` /
+`partition-id` / `channel` / `network-name` / `rloc16` with the list attributes
+`neighbor-table` and `route-table`, which the generic `mat read` can't represent
+(they are lists of structs, not a single value).
+
+```bash
+# diag thread <node_id> [--endpoint EP]   (EP defaults to 0)
+mat diag thread 5
+```
+
+```json
+// routing_role etc. are numeric enums (mat does not resolve names);
+// neighbor_table / route_table are arrays of objects with chip-tool field names.
+{
+  "timestamp": "...", "node_id": 5, "endpoint": 0,
+  "thread": {
+    "routing_role": 2, "partition_id": 123, "channel": 15,
+    "network_name": "mat-thread", "rloc16": 13312,
+    "neighbor_table": [
+      { "ExtAddress": "0x166E0DB9", "Rloc16": 13312, "LQI": 255, "AverageRssi": -34, "LastRssi": -32, "RxOnWhenIdle": true, "IsChild": false }
+    ],
+    "route_table": [ { "Rloc16": 13312, "Cost": 0, "LinkEstablished": true } ]
+  }
+}
+```
+
+> How to read it: a flaky node usually has **few `neighbor_table` entries** or a
+> weak `AverageRssi` to its only neighbor (roughly: > -70 dBm healthy, < -85 dBm
+> marginal). Only mains-powered, router-eligible devices relay (`RxOnWhenIdle:
+> true` / not `IsChild`); adding battery sleepy end devices does not extend the
+> mesh. A `partition_id` that differs across nodes means the mesh has split.
+> Like `describe`, this calls chip-tool several times but finishes in one shot.
+> `mat diag` runs only on the direct chip-tool path (not via `--matd`).
+
 ### Multi-admin share (Phase 2)
 
 To share a `mat`-owned device with another controller (Alexa / Apple / Google),

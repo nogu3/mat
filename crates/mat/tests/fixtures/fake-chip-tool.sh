@@ -119,6 +119,54 @@ EOF
     esac
     exit 0
     ;;
+  threadnetworkdiagnostics)
+    # Thread Network Diagnostics (cluster 53)。`... read <attr> <node> <ep>`。
+    # mat diag thread のスナップショット用。スカラは DMG の Data 行、リスト属性は
+    # TOO レイヤの `[i]: { ... }` 形で吐く。
+    emit_failure
+    attr="$3"
+    case "$attr" in
+      routing-role)  echo "[1656][CHIP:DMG] Data = 2 (Router)," ;;
+      partition-id)  echo "[1656][CHIP:DMG] Data = 123 (unsigned)," ;;
+      channel)       echo "[1656][CHIP:DMG] Data = 15 (unsigned)," ;;
+      network-name)  echo '[1656][CHIP:DMG] Data = "mat-thread",' ;;
+      rloc16)        echo "[1656][CHIP:DMG] Data = 13312 (unsigned)," ;;
+      neighbor-table)
+        cat <<'EOF'
+[1656][CHIP:TOO]   NeighborTable: 2 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       ExtAddress: 0x166E0DB9
+[1656][CHIP:TOO]       Rloc16: 13312
+[1656][CHIP:TOO]       LQI: 255
+[1656][CHIP:TOO]       AverageRssi: -34
+[1656][CHIP:TOO]       LastRssi: -32
+[1656][CHIP:TOO]       RxOnWhenIdle: true
+[1656][CHIP:TOO]       IsChild: false
+[1656][CHIP:TOO]      }
+[1656][CHIP:TOO]     [2]: {
+[1656][CHIP:TOO]       ExtAddress: 0x7AB30000
+[1656][CHIP:TOO]       Rloc16: 21504
+[1656][CHIP:TOO]       LQI: 96
+[1656][CHIP:TOO]       AverageRssi: -82
+[1656][CHIP:TOO]       LastRssi: -85
+[1656][CHIP:TOO]       RxOnWhenIdle: false
+[1656][CHIP:TOO]       IsChild: true
+[1656][CHIP:TOO]      }
+EOF
+        ;;
+      route-table)
+        cat <<'EOF'
+[1656][CHIP:TOO]   RouteTable: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Rloc16: 13312
+[1656][CHIP:TOO]       Cost: 0
+[1656][CHIP:TOO]       LinkEstablished: true
+[1656][CHIP:TOO]      }
+EOF
+        ;;
+    esac
+    exit 0
+    ;;
   *)
     # クラスタ名がサブコマンド位置に来る: read / write / invoke。
     op="$2"
