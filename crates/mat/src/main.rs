@@ -6,11 +6,7 @@
 
 mod cli;
 mod commands;
-mod error;
-mod output;
-mod parse;
 mod runner;
-mod store;
 
 use std::process::ExitCode;
 
@@ -18,7 +14,7 @@ use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Command, GroupCommand};
-use store::Store;
+use mat_core::store::Store;
 
 fn main() -> ExitCode {
     init_tracing();

@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::error::{ErrorKind, MatError};
-use crate::output;
-use crate::parse::commission_succeeded;
-use crate::runner::{classify_failure, ChipTool};
-use crate::store::{NodeRecord, Store};
+use mat_core::error::{ErrorKind, MatError};
+use mat_core::output;
+use mat_core::parse::commission_succeeded;
+use crate::runner::ChipTool;
+use mat_core::normalize::classify_failure;
+use mat_core::store::{NodeRecord, Store};
 
 pub fn run(
     store_path: &Path,
