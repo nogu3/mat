@@ -264,8 +264,10 @@ async fn descriptor_list(
 /// state も設定する（`mat group provision` 相当）。最初の失敗で停止する。
 ///
 /// NOTE: 鍵束 / GroupKeyMap は compact JSON を ws コマンド行に載せて渡す。chip-tool
-/// interactive server のトークナイザがこの JSON 引数をどう分割するかは実機 E2E で
-/// 未確定（compact = 空白なし前提で 1 トークンを期待）。要実機検証。
+/// interactive server のトークナイザがこの JSON を 1 引数として扱うことを実機 E2E
+/// （jarvis / node 5, 2026-06-08）で確認: key-set-write の compact JSON object が
+/// chip-tool ログに `Command: groupkeymanagement key-set-write {"epochKey0":...,
+/// "groupKeySetID":77} 5 0` と丸ごと 1 トークンで渡り解釈された（空白なしが前提）。
 async fn group_provision(
     op: &Op,
     backend: &ChipToolBackend,
@@ -435,8 +437,10 @@ fn id_list(result: &Value) -> Vec<u64> {
 /// `error` 値（status 名/コード）を既存のテキスト分類 [`classify_failure`] に通し、
 /// 未知なら `device_rejected` にフォールバックする。
 ///
-/// NOTE: ws の失敗 `error` 形状（文字列か数値か、キー名）は実機 E2E で未確定。確定
-/// したらこの抽出を厳密化する。
+/// 実機 E2E（jarvis / node 5, 2026-06-08）で失敗形状を確定: 失敗した
+/// groupkeymanagement key-set-write が `{"results":[{"error":"FAILURE"}],"logs":[...]}`
+/// を返した。`error` は status 名の**文字列**（数値ではない）、キー名は `error`。
+/// `"FAILURE"` は `classify_failure` 未一致のため `device_rejected` に落ちる。
 fn ensure_ok(result: &Value) -> Result<(), MatError> {
     let Some(arr) = result.get("results").and_then(Value::as_array) else {
         return Ok(());
@@ -446,7 +450,12 @@ fn ensure_ok(result: &Value) -> Result<(), MatError> {
             if is_success_status(err) {
                 continue;
             }
-            let detail = err.to_string();
+            // 文字列なら status 名そのもの（例 `FAILURE`）を detail に使う。JSON の
+            // クオートを残さないことで AI 可読性を上げる（数値等は JSON 表現のまま）。
+            let detail = err
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| err.to_string());
             let kind = classify_failure(&detail, "").unwrap_or(ErrorKind::DeviceRejected);
             return Err(MatError::new(
                 kind,
@@ -480,4 +489,39 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
         map.insert("id".into(), id);
     }
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_ok_passes_on_empty_results() {
+        // controller groupsettings 成功時の実機形（add-group/bind-keyset）。
+        let v = json!({ "results": [], "logs": [] });
+        assert!(ensure_ok(&v).is_ok());
+    }
+
+    #[test]
+    fn ensure_ok_passes_on_success_statuses() {
+        for ok in [json!(null), json!(0), json!("0x0"), json!("SUCCESS")] {
+            let v = json!({ "results": [{ "error": ok }] });
+            assert!(ensure_ok(&v).is_ok(), "expected success for {v}");
+        }
+    }
+
+    #[test]
+    fn ensure_ok_classifies_real_device_failure_shape() {
+        // 実機 E2E（jarvis / node 5, 2026-06-08）で確定した失敗 ws 形状:
+        // 失敗した key-set-write が `error` に status 名の**文字列**を返す。
+        let v = json!({ "results": [{ "error": "FAILURE" }], "logs": [] });
+        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
+        // 文字列値はクオートを剥がして detail に入れる。
+        assert!(
+            err.detail.contains("FAILURE") && !err.detail.contains("\"FAILURE\""),
+            "detail should carry bare status name, got: {}",
+            err.detail
+        );
+    }
 }

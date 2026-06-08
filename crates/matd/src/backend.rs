@@ -185,7 +185,9 @@ async fn exchange(ws: &mut Ws, line: &str) -> Result<Value, MatError> {
     };
 
     // 生 ws 応答（results / 失敗 error の実形状）を debug に残す。診断のみ stderr
-    // （CLAUDE.md ルール 3）。失敗時 `results[i].error` の形状確定に使う。
+    // （CLAUDE.md ルール 3）。失敗時 `results[i].error` の形状はこのログで実機確定済み:
+    // `{"results":[{"error":"FAILURE"}],"logs":[...]}` ― `error` は status 名の
+    // **文字列**（数値ではない）。[`super::server::ensure_ok`] がこれを分類する。
     tracing::debug!(%text, "chip-tool ws raw response");
 
     serde_json::from_str(&text).map_err(|e| {
