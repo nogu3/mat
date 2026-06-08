@@ -49,20 +49,51 @@ pub enum Op {
     On { node_id: u64, endpoint: u16 },
     /// OnOff Off のショートカット。
     Off { node_id: u64, endpoint: u16 },
+    /// ノードのエンドポイント / クラスタを introspect する（Descriptor クラスタ）。
+    /// 1 リクエストで複数の chip-tool 読み出しに展開されるため [`to_cmdline`] は持たない。
+    ///
+    /// [`to_cmdline`]: Op::to_cmdline
+    Describe { node_id: u64 },
+    /// group（groupcast）を各ノードへ provision する。`mat group provision` 相当。
+    /// 複数ステップに展開されるため [`to_cmdline`] は持たない。
+    ///
+    /// [`to_cmdline`]: Op::to_cmdline
+    GroupProvision {
+        group_id: u16,
+        node_ids: Vec<u64>,
+        keyset_id: u16,
+        name: String,
+        endpoint: u16,
+        #[serde(default)]
+        epoch_key: Option<String>,
+    },
+    /// group へ multicast でコマンドを送る。`mat group invoke` 相当。
+    GroupInvoke {
+        group_id: u16,
+        cluster: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        endpoint: u16,
+    },
     /// デーモン死活確認（chip-tool には触れない）。
     Ping,
 }
 
 impl Op {
-    /// この操作が対象とする node_id（あれば）。`require_node` 用。
+    /// この操作が対象とする単一 node_id（あれば）。`require_node` 用。
+    ///
+    /// `GroupProvision` は複数ノードを各々チェックするため、`GroupInvoke` は特定ノード
+    /// 宛でない（multicast）ため、ここでは `None`（個別に扱う）。
     pub fn node_id(&self) -> Option<u64> {
         match self {
             Op::Read { node_id, .. }
             | Op::Write { node_id, .. }
             | Op::Invoke { node_id, .. }
             | Op::On { node_id, .. }
-            | Op::Off { node_id, .. } => Some(*node_id),
-            Op::Ping => None,
+            | Op::Off { node_id, .. }
+            | Op::Describe { node_id } => Some(*node_id),
+            Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping => None,
         }
     }
 
@@ -100,7 +131,10 @@ impl Op {
             }
             Op::On { node_id, endpoint } => format!("onoff on {node_id} {endpoint}"),
             Op::Off { node_id, endpoint } => format!("onoff off {node_id} {endpoint}"),
-            Op::Ping => return None,
+            // 複合 op（複数コマンドに展開）と Ping は単一の cmdline を持たない。
+            Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping => {
+                return None
+            }
         };
         Some(line)
     }
@@ -169,5 +203,41 @@ mod tests {
             r#"{"op":"invoke","node_id":1,"endpoint":1,"cluster":"identify","command":"identify"}"#,
         );
         assert_eq!(r.op.to_cmdline().unwrap(), "identify identify 1 1");
+    }
+
+    #[test]
+    fn describe_targets_node_but_has_no_cmdline() {
+        // describe は複数コマンドに展開されるため単一 cmdline を持たない。
+        let r = parse(r#"{"op":"describe","node_id":5}"#);
+        assert_eq!(r.op.node_id(), Some(5));
+        assert!(r.op.to_cmdline().is_none());
+    }
+
+    #[test]
+    fn group_provision_parses_and_has_no_single_node_or_cmdline() {
+        let r = parse(
+            r#"{"op":"group_provision","group_id":1,"node_ids":[1,2],"keyset_id":42,"name":"living","endpoint":1}"#,
+        );
+        // 複数ノードを個別に扱うため単一 node_id は持たない。
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
+        // epoch_key は省略可。
+        assert!(matches!(
+            r.op,
+            Op::GroupProvision {
+                epoch_key: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn group_invoke_parses_with_default_args() {
+        let r = parse(
+            r#"{"op":"group_invoke","group_id":3,"cluster":"onoff","command":"on","endpoint":1}"#,
+        );
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
+        assert!(matches!(r.op, Op::GroupInvoke { ref args, .. } if args.is_empty()));
     }
 }

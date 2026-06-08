@@ -6,6 +6,7 @@
 
 mod cli;
 mod commands;
+mod matd_client;
 mod runner;
 
 use std::process::ExitCode;
@@ -21,6 +22,18 @@ fn main() -> ExitCode {
 
     // 引数エラー（exit 2）は clap が直接処理する。
     let args = Cli::parse();
+
+    // --matd 指定（または MAT_MATD_SOCKET / MAT_MATD）の時は chip-tool を直に起動せず、
+    // 常駐 matd（warm CASE セッション）経由で実行する。store の locate は不要（node 解決は
+    // matd 側が KVS で行う）。
+    if let Some(socket) = matd_client::resolve_socket(
+        &args.matd,
+        std::env::var_os("MAT_MATD_SOCKET"),
+        std::env::var_os("MAT_MATD"),
+    ) {
+        return matd_client::dispatch(&socket, &args.command);
+    }
+
     let store_path = Store::locate(args.store);
 
     let result = match &args.command {

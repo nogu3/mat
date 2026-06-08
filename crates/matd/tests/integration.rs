@@ -16,8 +16,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 use mat_core::store::{NodeRecord, Store};
 
-/// chip-tool interactive server を模した fake。受け取ったコマンド行をエコーし、
-/// `results[0].value = true` を載せた JSON を 1 メッセージで返す。
+/// chip-tool interactive server を模した fake。受け取ったコマンド行に応じて
+/// `results[0].value` を返す。冗長な `logs` も載せ、matd がそれを応答から落とすことを
+/// 検証できるようにする。
+/// - `descriptor read parts-list ...` → 子エンドポイント `[1]`
+/// - `descriptor read server-list ...` → クラスタ `[6, 8]`（onoff, levelcontrol）
+/// - それ以外 → `true`
 async fn spawn_fake_ws() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -27,7 +31,18 @@ async fn spawn_fake_ws() -> u16 {
                 let mut ws = accept_async(stream).await.unwrap();
                 while let Some(Ok(msg)) = ws.next().await {
                     if let Message::Text(line) = msg {
-                        let resp = json!({ "cmd": line, "results": [{ "value": true }] });
+                        let value = if line.contains("descriptor read parts-list") {
+                            json!([1])
+                        } else if line.contains("descriptor read server-list") {
+                            json!([6, 8])
+                        } else {
+                            json!(true)
+                        };
+                        let resp = json!({
+                            "cmd": line,
+                            "results": [{ "value": value }],
+                            "logs": ["dis9hcnt"],
+                        });
                         ws.send(Message::Text(resp.to_string())).await.unwrap();
                     }
                 }
@@ -135,28 +150,30 @@ async fn read_invoke_ping_and_errors() {
     )
     .await;
 
-    // read: value をベストエフォート抽出し、id/timestamp/result を載せる。
+    // read: results[0].value を取り出し、id/timestamp を載せる。生結果（result/logs）は
+    // 素通ししない（mat スキーマと同形）。
     let r = &resps[0];
     assert_eq!(r["id"], json!(1));
     assert_eq!(r["node_id"], json!(1));
     assert_eq!(r["cluster"], "onoff");
     assert_eq!(r["value"], json!(true));
-    assert_eq!(r["result"]["cmd"], "onoff read on-off 1 1");
+    assert!(r.get("result").is_none(), "raw ws result must not leak");
+    assert!(r.get("logs").is_none(), "chip-tool logs must be dropped");
     assert!(r["timestamp"].is_string());
 
-    // on: OnOff invoke にマップされ、cmdline は `onoff on 1 1`。
+    // on: OnOff invoke にマップされ status success（cmdline 検証は protocol unit test）。
     let r = &resps[1];
     assert_eq!(r["id"], json!(2));
     assert_eq!(r["status"], "success");
     assert_eq!(r["command"], "on");
-    assert_eq!(r["result"]["cmd"], "onoff on 1 1");
+    assert!(r.get("result").is_none());
 
     // write: 入力 "128" を read と揃えた数値型へ正規化して返す。
     let r = &resps[2];
     assert_eq!(r["id"], json!(3));
     assert_eq!(r["status"], "success");
     assert_eq!(r["value"], json!(128));
-    assert_eq!(r["result"]["cmd"], "levelcontrol write on-level 128 1 1");
+    assert!(r.get("result").is_none());
 
     // ping: chip-tool に触れず即応。
     assert_eq!(resps[3]["pong"], json!(true));
@@ -185,6 +202,101 @@ async fn idle_teardown_then_reconnect() {
     // 次コマンドで遅延再接続され、fake-ws の 2 本目の接続で応答が返る。
     let v2 = backend.run_cmdline("after reconnect").await.unwrap();
     assert_eq!(v2["cmd"], "after reconnect");
+}
+
+/// describe: parts-list → 子エンドポイント、各 ep の server-list → クラスタ ID を組む。
+#[tokio::test]
+async fn describe_builds_endpoints_from_descriptor() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(&socket, &[json!({"id":9,"op":"describe","node_id":1})]).await;
+    let r = &resps[0];
+    assert_eq!(r["id"], json!(9));
+    assert_eq!(r["node_id"], json!(1));
+
+    // fake は parts-list=[1] を返す → endpoints は 0（自身）と 1。各 ep の server-list=[6,8]。
+    let eps = r["endpoints"].as_array().unwrap();
+    assert_eq!(eps.len(), 2);
+    assert_eq!(eps[0]["endpoint"], json!(0));
+    assert_eq!(eps[0]["clusters"], json!([6, 8]));
+    assert_eq!(eps[1]["endpoint"], json!(1));
+    assert_eq!(eps[1]["clusters"], json!([6, 8]));
+    assert!(r.get("result").is_none());
+
+    handle.abort();
+}
+
+/// group invoke: unacknowledged なので応答が返れば status="sent" を報告する。
+#[tokio::test]
+async fn group_invoke_reports_sent() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({"op":"group_invoke","group_id":1,"cluster":"onoff","command":"on","endpoint":1})],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "sent");
+    assert_eq!(resps[0]["group_id"], json!(1));
+    assert_eq!(resps[0]["command"], "on");
+
+    handle.abort();
+}
+
+/// group provision: 全ステップが results にエラーを返さなければ provisioned を報告する。
+#[tokio::test]
+async fn group_provision_reports_provisioned() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision",
+            "group_id":1,
+            "node_ids":[1],
+            "keyset_id":42,
+            "name":"living",
+            "endpoint":1,
+            // 乱数を避け cmdline を決定的にするため epoch key を明示。
+            "epoch_key":"00112233445566778899aabbccddeeff"
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "provisioned");
+    assert_eq!(resps[0]["nodes"], json!([1]));
+    assert_eq!(resps[0]["keyset_id"], json!(42));
+
+    handle.abort();
+}
+
+/// group provision は未 commission node を含むと node_not_commissioned で止まる。
+#[tokio::test]
+async fn group_provision_rejects_uncommissioned_node() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision",
+            "group_id":1,
+            "node_ids":[1, 99],
+            "keyset_id":42,
+            "name":"living",
+            "endpoint":1
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
 }
 
 #[tokio::test]

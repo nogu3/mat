@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use mat_core::error::MatError;
+use mat_core::error::{ErrorKind, MatError};
+use mat_core::group::{group_node_id, resolve_epoch_key, KEY_SECURITY_POLICY};
+use mat_core::normalize::classify_failure;
 use mat_core::output::now_iso8601;
 use mat_core::parse::normalize_value;
 use mat_core::store::Store;
@@ -123,38 +125,59 @@ async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> V
     }
 }
 
-/// 操作を実行し、mat スキーマの成功ボディ（timestamp 抜き）を返す。
+/// 操作を実行し、mat スキーマの成功ボディ（timestamp 抜き）を返す。応答は `mat` の
+/// one-shot CLI と同じ純粋スキーマで、chip-tool ws の生結果（`results`/`logs`）は
+/// 添付しない（logs は backend で除去済み、CLAUDE.md ルール 2「素通し禁止」）。
 async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result<Value, MatError> {
-    // Ping は chip-tool に触れず即応。
-    if matches!(op, Op::Ping) {
-        return Ok(json!({ "pong": true }));
+    match op {
+        // Ping は chip-tool に触れず即応。
+        Op::Ping => Ok(json!({ "pong": true })),
+        Op::Describe { node_id } => {
+            require_node(store_path, *node_id)?;
+            describe(backend, *node_id).await
+        }
+        Op::GroupProvision { .. } => group_provision(op, backend, store_path).await,
+        Op::GroupInvoke { .. } => group_invoke(op, backend, store_path).await,
+        // 単一 cmdline に展開できる素の op。
+        _ => simple_op(op, backend, store_path).await,
     }
+}
 
+/// 単一 chip-tool コマンドに対応する op（read/write/invoke/on/off）を実行する。
+async fn simple_op(
+    op: &Op,
+    backend: &ChipToolBackend,
+    store_path: &Path,
+) -> Result<Value, MatError> {
     // node_id が解決できるか（= commission 済みか）を毎回 KVS で確認する。
     if let Some(node_id) = op.node_id() {
-        let store = Store::open(store_path)?;
-        store.require_node(node_id)?;
+        require_node(store_path, node_id)?;
     }
 
-    let cmdline = op.to_cmdline().expect("non-Ping ops always have a cmdline");
+    let cmdline = op.to_cmdline().expect("simple op always has a cmdline");
     let result = backend.run_cmdline(&cmdline).await?;
+    ensure_ok(&result)?;
 
-    // NOTE: chip-tool ws の結果 JSON 構造は実機 E2E で確定する。確定するまでは生結果を
-    // `result` に添付し、read の `value` はベストエフォート抽出にとどめる。
     let body = match op {
         Op::Read {
             node_id,
             endpoint,
             cluster,
             attribute,
-        } => json!({
-            "node_id": node_id,
-            "endpoint": endpoint,
-            "cluster": cluster,
-            "attribute": attribute,
-            "value": pick_read_value(&result),
-            "result": result,
-        }),
+        } => {
+            let value = read_value(&result).ok_or_else(|| {
+                MatError::parse_error(format!(
+                    "no value in chip-tool ws result for read {cluster}/{attribute}"
+                ))
+            })?;
+            json!({
+                "node_id": node_id,
+                "endpoint": endpoint,
+                "cluster": cluster,
+                "attribute": attribute,
+                "value": value,
+            })
+        }
         Op::Write {
             node_id,
             endpoint,
@@ -169,7 +192,6 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
             // mat write と同じく、入力文字列を read と揃えた型へ正規化して返す。
             "value": normalize_value(value),
             "status": "success",
-            "result": result,
         }),
         Op::Invoke {
             node_id,
@@ -183,29 +205,265 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
             "cluster": cluster,
             "command": command,
             "status": "success",
-            "result": result,
         }),
         Op::On { node_id, endpoint } => json!({
             "node_id": node_id, "endpoint": endpoint,
-            "cluster": "onoff", "command": "on", "status": "success", "result": result,
+            "cluster": "onoff", "command": "on", "status": "success",
         }),
         Op::Off { node_id, endpoint } => json!({
             "node_id": node_id, "endpoint": endpoint,
-            "cluster": "onoff", "command": "off", "status": "success", "result": result,
+            "cluster": "onoff", "command": "off", "status": "success",
         }),
-        Op::Ping => unreachable!("handled above"),
+        Op::Ping | Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } => {
+            unreachable!("handled by run_op")
+        }
     };
     Ok(body)
 }
 
-/// chip-tool ws 結果から read 値をベストエフォート抽出する（実機 E2E で確定予定）。
-fn pick_read_value(result: &Value) -> Value {
+/// `describe` — Descriptor クラスタでノードを introspect する（`mat describe` 相当）。
+///
+/// エンドポイント 0 の `parts-list` で子エンドポイントを列挙し（0 自身を先頭に足す）、
+/// 各エンドポイントの `server-list` でクラスタ ID を読む。warm session なので one-shot
+/// の `mat describe` より各読み出しが速い。
+async fn describe(backend: &ChipToolBackend, node_id: u64) -> Result<Value, MatError> {
+    let parts = descriptor_list(backend, node_id, 0, "parts-list").await?;
+    let mut endpoints: Vec<u16> = vec![0];
+    for p in parts {
+        if let Ok(ep) = u16::try_from(p) {
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+        }
+    }
+
+    let mut out_endpoints = Vec::new();
+    for ep in endpoints {
+        let clusters = descriptor_list(backend, node_id, ep, "server-list").await?;
+        out_endpoints.push(json!({ "endpoint": ep, "clusters": clusters }));
+    }
+
+    Ok(json!({ "node_id": node_id, "endpoints": out_endpoints }))
+}
+
+/// `descriptor read <list> <node> <ep>` を ws で実行し、結果 value から ID 配列を取る。
+async fn descriptor_list(
+    backend: &ChipToolBackend,
+    node_id: u64,
+    endpoint: u16,
+    list: &str,
+) -> Result<Vec<u64>, MatError> {
+    let result = backend
+        .run_cmdline(&format!("descriptor read {list} {node_id} {endpoint}"))
+        .await?;
+    ensure_ok(&result)?;
+    Ok(id_list(&result))
+}
+
+/// `group_provision` — group の鍵束・マッピングを各ノードへ焼き、コントローラ側 group
+/// state も設定する（`mat group provision` 相当）。最初の失敗で停止する。
+///
+/// NOTE: 鍵束 / GroupKeyMap は compact JSON を ws コマンド行に載せて渡す。chip-tool
+/// interactive server のトークナイザがこの JSON 引数をどう分割するかは実機 E2E で
+/// 未確定（compact = 空白なし前提で 1 トークンを期待）。要実機検証。
+async fn group_provision(
+    op: &Op,
+    backend: &ChipToolBackend,
+    store_path: &Path,
+) -> Result<Value, MatError> {
+    let Op::GroupProvision {
+        group_id,
+        node_ids,
+        keyset_id,
+        name,
+        endpoint,
+        epoch_key,
+    } = op
+    else {
+        unreachable!("group_provision called with non-GroupProvision op");
+    };
+
+    let store = Store::open(store_path)?;
+    // 全ノードが commission 済みか先に確認（1つでも未登録なら停止）。
+    for &node_id in node_ids {
+        store.require_node(node_id)?;
+    }
+
+    let epoch_key = resolve_epoch_key(epoch_key.as_deref())?;
+
+    // 1) コントローラ側 group state（ローカル操作、ネットワーク不要）。
+    group_step(
+        backend,
+        &format!("groupsettings add-group {name} {group_id}"),
+    )
+    .await?;
+    group_step(
+        backend,
+        &format!(
+            "groupsettings add-keysets {name} {keyset_id} {KEY_SECURITY_POLICY} hex:{epoch_key}"
+        ),
+    )
+    .await?;
+    group_step(
+        backend,
+        &format!("groupsettings bind-keyset {group_id} {keyset_id}"),
+    )
+    .await?;
+
+    // 2) 各デバイスへ provision（unicast, acknowledged）。
+    for &node_id in node_ids {
+        let key_set = json!({
+            "groupKeySetID": keyset_id,
+            "groupKeySecurityPolicy": 0,
+            "epochKey0": epoch_key,
+            "epochStartTime0": 1,
+            "epochKey1": null,
+            "epochStartTime1": null,
+            "epochKey2": null,
+            "epochStartTime2": null,
+        });
+        group_step(
+            backend,
+            &format!("groupkeymanagement key-set-write {key_set} {node_id} 0"),
+        )
+        .await?;
+
+        let key_map = json!([{ "groupId": group_id, "groupKeySetID": keyset_id }]);
+        group_step(
+            backend,
+            &format!("groupkeymanagement write group-key-map {key_map} {node_id} 0"),
+        )
+        .await?;
+
+        group_step(
+            backend,
+            &format!("groups add-group {group_id} {name} {node_id} {endpoint}"),
+        )
+        .await?;
+    }
+
+    Ok(json!({
+        "group_id": group_id,
+        "keyset_id": keyset_id,
+        "name": name,
+        "endpoint": endpoint,
+        "nodes": node_ids,
+        "status": "provisioned",
+    }))
+}
+
+/// group provision の 1 ステップ。失敗（results 内エラー）なら分類して返す。
+async fn group_step(backend: &ChipToolBackend, line: &str) -> Result<(), MatError> {
+    let result = backend.run_cmdline(line).await?;
+    ensure_ok(&result)
+}
+
+/// `group_invoke` — group へ multicast でコマンドを送る（`mat group invoke` 相当）。
+///
+/// groupcast は unacknowledged。応答（per-device の成否）は取れないため、ws 応答が
+/// 返れば「送った」とだけ報告する（`ensure_ok` はしない）。
+async fn group_invoke(
+    op: &Op,
+    backend: &ChipToolBackend,
+    store_path: &Path,
+) -> Result<Value, MatError> {
+    let Op::GroupInvoke {
+        group_id,
+        cluster,
+        command,
+        args,
+        endpoint,
+    } = op
+    else {
+        unreachable!("group_invoke called with non-GroupInvoke op");
+    };
+
+    // 特定 node 宛ではないが、chip-tool の永続ストレージ（焼いた group 鍵）参照のため
+    // store は必要。
+    let _store = Store::open(store_path)?;
+
+    // invoke と同じ並び: `<cluster> <command> [args...] <宛先> <endpoint>`。宛先に
+    // group node-id を置くと chip-tool が multicast 送信する。
+    let mut parts = vec![cluster.clone(), command.clone()];
+    parts.extend(args.iter().cloned());
+    parts.push(group_node_id(*group_id));
+    parts.push(endpoint.to_string());
+    let _ = backend.run_cmdline(&parts.join(" ")).await?;
+
+    Ok(json!({
+        "group_id": group_id,
+        "cluster": cluster,
+        "command": command,
+        "endpoint": endpoint,
+        "status": "sent",
+        "note": "unacknowledged groupcast; per-device delivery not confirmed",
+    }))
+}
+
+/// store を開いて node_id が commission 済みか確認する（常駐中の台帳更新を拾うよう
+/// 毎回開き直す）。
+fn require_node(store_path: &Path, node_id: u64) -> Result<(), MatError> {
+    Store::open(store_path)?.require_node(node_id)?;
+    Ok(())
+}
+
+/// chip-tool ws 結果 `results[0].value` を取り出す（実機 E2E で確定済みの形状）。
+fn read_value(result: &Value) -> Option<Value> {
     result
         .get("results")
         .and_then(|r| r.get(0))
         .and_then(|e| e.get("value"))
         .cloned()
-        .unwrap_or(Value::Null)
+}
+
+/// `results[0].value` を ID 配列（u64）として読む。descriptor の list 属性用。
+fn id_list(result: &Value) -> Vec<u64> {
+    read_value(result)
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+/// chip-tool ws 結果にデバイス側エラーが載っていれば分類して `Err` にする。
+///
+/// 成功時 `results[i]` には `error` が無いか success ステータスが入る。失敗時の
+/// `error` 値（status 名/コード）を既存のテキスト分類 [`classify_failure`] に通し、
+/// 未知なら `device_rejected` にフォールバックする。
+///
+/// NOTE: ws の失敗 `error` 形状（文字列か数値か、キー名）は実機 E2E で未確定。確定
+/// したらこの抽出を厳密化する。
+fn ensure_ok(result: &Value) -> Result<(), MatError> {
+    let Some(arr) = result.get("results").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for entry in arr {
+        if let Some(err) = entry.get("error") {
+            if is_success_status(err) {
+                continue;
+            }
+            let detail = err.to_string();
+            let kind = classify_failure(&detail, "").unwrap_or(ErrorKind::DeviceRejected);
+            return Err(MatError::new(
+                kind,
+                format!("chip-tool reported an error in the result: {detail}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `error` フィールドが「成功」を意味するか（null / 0 / "SUCCESS"）。
+fn is_success_status(err: &Value) -> bool {
+    match err {
+        Value::Null => true,
+        Value::Number(n) => n.as_u64() == Some(0),
+        Value::String(s) => {
+            let u = s.to_ascii_uppercase();
+            matches!(u.as_str(), "0" | "0X0" | "0X00" | "SUCCESS")
+        }
+        _ => false,
+    }
 }
 
 /// エラー応答 `{"error":{"kind","detail"}, "id"?, "timestamp"}`。

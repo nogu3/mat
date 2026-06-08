@@ -108,8 +108,9 @@ impl ChipToolBackend {
 
         let result = exchange(conn.ws.as_mut().expect("ensured above"), line).await;
         match result {
-            Ok(value) => {
+            Ok(mut value) => {
                 conn.last_used = Instant::now();
+                drop_logs(&mut value);
                 Ok(value)
             }
             Err(e) => {
@@ -152,6 +153,18 @@ impl ChipToolBackend {
         let ws = connect_with_retry(port, STARTUP_TIMEOUT).await?;
         conn.ws = Some(ws);
         Ok(())
+    }
+}
+
+/// chip-tool ws 応答の `logs`（base64 でくるんだ chip-tool テキストログ。冗長）を
+/// 応答から落とす。CLAUDE.md ルール 2「素通し禁止」・ルール 3「診断は debug ログ」に
+/// 従い、件数だけ debug に残して構造化結果（`results`）のみ上流へ返す。
+fn drop_logs(value: &mut Value) {
+    if let Value::Object(map) = value {
+        if let Some(logs) = map.remove("logs") {
+            let count = logs.as_array().map(|a| a.len()).unwrap_or(0);
+            tracing::debug!(count, "dropped chip-tool ws logs from response");
+        }
     }
 }
 

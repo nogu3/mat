@@ -3,10 +3,11 @@
 //! `chip-tool` は失敗時の exit code が粗い（おおむね `1`）ため、`mat` は
 //! stdout/stderr をパースして失敗種別を分類し、自身の `ErrorKind` にマップする。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// `mat` の機械可読エラー種別。stderr に `{"error":{"kind","detail"}}` で出す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `Deserialize` は matd 応答の `error.kind` を exit code へ逆引きするのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     /// 認証情報ストアが存在しない。

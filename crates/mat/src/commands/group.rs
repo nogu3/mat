@@ -16,17 +16,11 @@ use serde_json::json;
 
 use crate::runner::ChipTool;
 use mat_core::error::{ErrorKind, MatError};
+use mat_core::group::{group_node_id, resolve_epoch_key, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
 use mat_core::output;
 use mat_core::parse::operation_succeeded;
 use mat_core::store::Store;
-
-/// GroupKeySecurityPolicy。0 = TrustFirst（最初に来た鍵を信頼）。
-const KEY_SECURITY_POLICY: &str = "0";
-
-/// group multicast 宛先の node-id ベース。実 node-id は `BASE | group_id`。
-/// 上位48bitが全1（`0xffffffffffff....`）なら group 宛と解釈される。
-const GROUP_NODE_ID_BASE: u64 = 0xffff_ffff_ffff_0000;
 
 /// `mat group provision` — 各ノードへ鍵束・マッピングを焼き、コントローラ側 group
 /// state も設定する。
@@ -47,10 +41,7 @@ pub fn provision(
     }
 
     // epoch key を決定: 明示指定があれば検証して採用、無ければランダム生成。
-    let epoch_key = match epoch_key {
-        Some(k) => validate_epoch_key(k)?,
-        None => generate_epoch_key(),
-    };
+    let epoch_key = resolve_epoch_key(epoch_key)?;
 
     let chip = ChipTool::new(store.root());
 
@@ -216,11 +207,6 @@ pub fn invoke(
     Ok(())
 }
 
-/// group multicast 宛先の node-id を `0x...` 16桁 hex 文字列で組み立てる。
-fn group_node_id(group_id: u16) -> String {
-    format!("0x{:016x}", GROUP_NODE_ID_BASE | u64::from(group_id))
-}
-
 /// ローカル group state ステップ（groupsettings 系）を実行し、失敗を分類する。
 fn run_step(chip: &ChipTool, argv: Vec<String>, what: &str) -> Result<(), MatError> {
     let out = chip.run(argv)?;
@@ -261,70 +247,4 @@ fn run_node_step(
         ));
     }
     Ok(())
-}
-
-/// `--epoch-key` の妥当性検証（16バイト = 32桁 hex）。小文字へ正規化して返す。
-fn validate_epoch_key(key: &str) -> Result<String, MatError> {
-    let trimmed = key.strip_prefix("0x").unwrap_or(key);
-    if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(trimmed.to_ascii_lowercase())
-    } else {
-        Err(MatError::new(
-            ErrorKind::Other,
-            format!(
-                "invalid --epoch-key: expected 32 hex chars (16 bytes), got {} chars",
-                trimmed.len()
-            ),
-        ))
-    }
-}
-
-/// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す。
-fn generate_epoch_key() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed to fill epoch key");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn group_node_id_packs_group_into_low_bits() {
-        assert_eq!(group_node_id(1), "0xffffffffffff0001");
-        assert_eq!(group_node_id(0x1234), "0xffffffffffff1234");
-        assert_eq!(group_node_id(0), "0xffffffffffff0000");
-    }
-
-    #[test]
-    fn validate_epoch_key_accepts_32_hex() {
-        let k = "00112233445566778899aabbccddeeff";
-        assert_eq!(validate_epoch_key(k).unwrap(), k);
-        // 0x 接頭辞と大文字も受ける（小文字へ正規化）。
-        assert_eq!(
-            validate_epoch_key("0x00112233445566778899AABBCCDDEEFF").unwrap(),
-            k
-        );
-    }
-
-    #[test]
-    fn validate_epoch_key_rejects_bad_length_or_chars() {
-        assert_eq!(
-            validate_epoch_key("dead").unwrap_err().kind,
-            ErrorKind::Other
-        );
-        // 32桁だが非 hex 文字。
-        let bad = "zz112233445566778899aabbccddeeff";
-        assert_eq!(validate_epoch_key(bad).unwrap_err().kind, ErrorKind::Other);
-    }
-
-    #[test]
-    fn generated_epoch_key_is_32_hex() {
-        let k = generate_epoch_key();
-        assert_eq!(k.len(), 32);
-        assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
-        // 2回生成して異なる（乱数であること）。
-        assert_ne!(k, generate_epoch_key());
-    }
 }
