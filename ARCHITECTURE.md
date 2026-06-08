@@ -208,21 +208,38 @@ way `casa` couples to `enl` through stdout JSON only).
 Web page / LLM / other client
        |
        v
-   casad  (resident, holds state; separate repo)
-       |   warm CASE sessions / cache / subscriptions / freshness
-       |   spawns processes (calls mat / enl as CLIs)
+   casad  (resident, cross-protocol; separate repo)
+       |   cache / subscriptions / freshness across protocols
+       |   spawns one-shot CLIs, or talks to a protocol daemon over its socket
        v
-   casa   (resolves name -> node_id, etc.; stateless)
-       |   Command::new("mat") / "enl" / ...
+   casa   (resolves name -> node_id, etc.; stateless; separate repo)
+       |   Command::new("mat") / "enl" / ..., or connects to matd's socket
        v
-   mat    (one-shot; only the credential KVS is persistent)
-       |   Command::new("chip-tool")
-       v
+   ── Matter controller layer (this repo) ────────────────────────
+     mat  (one-shot; credential KVS only)   matd (resident; planned, Phase 4)
+       \   Command::new("chip-tool")          \  warm CASE sessions / unix socket
+        \                                       \  Matter-only
+         +--------------------+------------------+
+                              v
    chip-tool ── real Matter devices (Thread / Wi-Fi / Ethernet)
 ```
 
 `casa` and `casad` are separate projects. `mat` works on its own as a standalone
-Matter controller CLI; the layers above are optional.
+Matter controller CLI; every layer here is optional.
+
+### Two distinct resident layers (do not conflate)
+There are two residents at different scopes. Keep them separate:
+- **`casad`** — a *cross-protocol* resident (separate repo). It owns cache,
+  subscriptions, and freshness *across* protocols and dispatches to `mat` /
+  `enl`. It does not speak any single protocol's session itself.
+- **`matd`** — a *Matter-only* resident in **this** repo (planned, Phase 4). It
+  is the **resident variant of `mat`'s own layer**: it keeps warm CASE (Sigma)
+  sessions so repeated Matter calls skip the handshake, the same model as ssh
+  `ControlMaster`/`ControlPersist`.
+
+`mat` itself stays one-shot. Design rule 4 (no daemon / cache inside `mat`) still
+holds — `matd` is allowed to be resident precisely because it is a separate
+binary and layer, not `mat`.
 
 ### Two kinds of groups
 There are two "groups." Do not confuse them or define them twice.
@@ -292,7 +309,27 @@ most fragile, so it comes last.
 > - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup on every node.
 >   This is the most breakable feature in Matter.
 
-### Phase 4 — native / backend replacement  *(optional)*
+### Phase 4 — `matd`, the resident layer for Matter  *(next)*
+Make repeated operations fast without breaking `mat`'s one-shot model. Each `mat`
+call pays mDNS resolution plus a CASE (Sigma) handshake, so a single call is slow
+(hundreds of ms to seconds). That latency is inherent to a stateless CLI and is
+**not** cached inside `mat` (design rule 4). Instead, a separate resident binary
+keeps the sessions warm.
+- **Cargo workspace.** Split a shared library `mat-core` (the `parse` / `output`
+  / `error` modules: chip-tool parsing, the JSON schema, exit-code
+  classification) so the fragile `Data = ...` parser is maintained once.
+- **`mat`** — the one-shot CLI, unchanged behavior; depends on `mat-core`.
+- **`matd`** — drives `chip-tool` in interactive mode and holds warm CASE
+  sessions behind a local unix socket (ssh `ControlMaster`/`ControlPersist`
+  model). It is the resident variant of `mat`'s own layer (Matter-only), distinct
+  from the cross-protocol `casad`. See "Two distinct resident layers" above.
+- Both binaries ship from this repo, so one install provides both.
+
+> Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
+> `matd` is a separate binary and layer; it is allowed to be resident precisely
+> because it is not `mat`.
+
+### Phase 5 — native / backend replacement  *(optional)*
 Only if `chip-tool` parsing or build/ship becomes a bottleneck.
 - First candidate: a matter.js shim (structured output, lightweight, no C++ build).
 - Second candidate: a Rust-based controller (Rust purity, but a prototype;

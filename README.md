@@ -22,37 +22,20 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 - Phase 3: groupcast (`group provision` / `group invoke`).
 
 Phase 3 passes its fake-chip-tool integration tests; real-device E2E for
-groupcast is still recommended (see Manual E2E below). Phase 4 (native / backend
-replacement) is optional — see the roadmap in ARCHITECTURE.md.
+groupcast is still recommended (see Manual E2E below).
 
 ## Roadmap
 
-### `matd` — resident layer (planned)
+`mat` is implemented through Phase 3. Next is **Phase 4 — `matd`**: a resident
+binary in **this** repo that keeps warm CASE sessions so repeated Matter calls
+skip the handshake (same model as ssh `ControlMaster`/`ControlPersist`). **Phase
+5** (native / backend replacement) is optional. `mat` itself stays one-shot —
+design rule 4 (no daemon / cache in `mat`) still holds, and `matd` may be
+resident precisely because it is a separate binary, not `mat`.
 
-`mat` is one-shot by design: every command spawns a fresh `chip-tool`, which
-re-establishes a CASE session (a Sigma handshake) each time, so a single call
-costs hundreds of ms to seconds. That latency is inherent to a stateless,
-idempotent CLI and will **not** be cached inside `mat` (see design rule 4: hold
-no state except the credential KVS).
-
-To make repeated operations fast, a separate resident binary `matd` will keep
-**warm CASE sessions** alive and accept commands over a local unix socket — the
-same model as ssh `ControlMaster`/`ControlPersist`, where the idempotent CLI
-stays thin and a background process owns the multiplexed connection.
-
-Both binaries will live in **this repository** so a single install ships both
-(no extra repo to pull in). Planned layout (Cargo workspace):
-
-- `mat-core` — shared library: chip-tool output parsing, the JSON schema, and
-  error/exit-code classification (`parse` / `output` / `error`). Both binaries
-  depend on it, so the fragile `Data = ...` parser is maintained once.
-- `mat` — the one-shot CLI (unchanged behavior; stays idempotent and stateless).
-- `matd` — the resident layer: drives `chip-tool` in interactive mode and holds
-  warm sessions behind a unix socket.
-
-Design rule 4 (no daemon, no session cache) continues to apply to **`mat`**.
-`matd` is a distinct layer; it is allowed to be resident precisely because it is
-not `mat`. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the three-layer split.
+The authoritative roadmap, the phase order, and the layer split (including how
+`matd` differs from the cross-protocol `casad`) live in
+[ARCHITECTURE.md](./ARCHITECTURE.md); this README only tracks status.
 
 ## Requirements
 
