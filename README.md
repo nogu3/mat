@@ -15,34 +15,18 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Status
 
-**Phase 0 through Phase 4 are implemented:**
-- Phase 0: scaffold + chip-tool wrapper + commission + credential KVS + discover.
-- Phase 1: read / write / invoke + describe + on / off.
-- Phase 2: open-window (multi-admin share).
-- Phase 3: groupcast (`group provision` / `group invoke`).
-- Phase 4: `matd`, the resident binary — warm CASE sessions over `chip-tool
-  interactive server` (websocket), a unix socket speaking newline-delimited
-  JSON, and a `mat --matd` client path.
+Everything documented below is implemented: discover / commission, state
+operations (read / write / invoke / describe / on / off), multi-admin share
+(`open-window`), groupcast (`group provision` / `group invoke`), the resident
+daemon `matd` (warm CASE sessions, `mat --matd`), and `mat diag thread`. All of
+it passes the fake-chip-tool / fake-ws integration tests, and real-device E2E
+has confirmed commissioning, read/write/invoke, `matd`'s warm sessions, error
+classification, group provisioning, and `diag thread`. Group *delivery* is
+unacknowledged multicast by design, so per-device actuation cannot be confirmed
+from the controller side (see Groupcast below).
 
-Beyond the numbered phases, `mat diag thread` (a one-shot Thread diagnostics
-snapshot) is implemented; see "Thread diagnostics" below.
-
-All phases pass their fake-chip-tool / fake-ws integration tests, and
-real-device E2E has confirmed commissioning, read/write/invoke, `matd`'s warm
-sessions, error classification, group provisioning, and `diag thread`. Group
-*delivery* is unacknowledged multicast by design, so per-device actuation
-cannot be confirmed from the controller side (see Groupcast below).
-
-## Roadmap
-
-`mat` is implemented through Phase 4. **Phase 5** (native / backend replacement)
-is optional and not started: it only happens if `chip-tool` parsing or build/ship
-becomes a bottleneck. `mat` itself stays one-shot — design rule 4 (no
-daemon / cache in `mat`) still holds, and `matd` may be resident precisely because
-it is a separate binary, not `mat`.
-
-The authoritative roadmap, the phase order, and the `mat` / `matd` split live in
-[ARCHITECTURE.md](./ARCHITECTURE.md); this README only tracks status.
+The development roadmap (including the optional, not-started native-backend
+replacement) lives in [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Requirements
 
@@ -62,7 +46,7 @@ task install    # install both binaries into ~/.cargo/bin
 
 ## Commands
 
-### Discover and commissioning (Phase 0)
+### Discover and commissioning
 
 ```bash
 # Discover commissionable / commissioned nodes
@@ -111,7 +95,7 @@ exists, `mat` passes no trust store and only chip-tool's development PAA applies
 (fine for test devices, not for retail ones). Get the certificates from
 connectedhomeip's `credentials/production/paa-root-certs/`.
 
-### State operations (Phase 1)
+### State operations
 
 `<node_id>` must be **already commissioned** (if not, exit `11`; if the store
 itself is missing, exit `10`). Cluster / attribute / command names are passed in
@@ -215,7 +199,7 @@ mat diag thread 5
 > several times but finishes in one shot. `mat diag` runs only on the direct
 > chip-tool path (not via `--matd`).
 
-### Multi-admin share (Phase 2)
+### Multi-admin share
 
 To share a `mat`-owned device with another controller (Alexa / Apple / Google),
 open a commissioning window and return a one-time issued code. This wraps
@@ -249,7 +233,7 @@ Output:
   `mat` does multi-admin with the one hub, and its sensors appear as bridged
   endpoints.
 
-### Groupcast (Phase 3)
+### Groupcast
 
 Control many devices at once with a Matter **wire group**: a GroupId plus a key
 set is burned into each device, then a single multicast send hits all of them.
@@ -295,7 +279,7 @@ Outputs:
 - It stops at the **first failed node/step** (the error `detail` says which) so
   stdout stays pure JSON; re-run after fixing the offending node.
 
-### Routing through `matd` (Phase 4)
+### Routing through `matd`
 
 By default each `mat` call spawns `chip-tool` and pays a fresh CASE handshake.
 With a running `matd` you can route the call through its warm session instead —
@@ -421,7 +405,7 @@ existing admin opens a commissioning window to issue a one-time code.
 > For a factory-reset device, pass the printed setup code directly to
 > `commission` (first commission).
 
-### Phase 1 operations E2E
+### State operations E2E
 
 Against a commissioned node (node 5 above), confirm read / describe / on / off
 on a real device.
@@ -441,7 +425,7 @@ mat off 5
 mat on 5 && mat read 5 1 onoff on-off   # -> "value": true
 ```
 
-### Phase 2 share E2E (mat -> another admin)
+### Share E2E (mat -> another admin)
 
 Share `mat`-owned node 5 with another controller.
 
@@ -460,7 +444,7 @@ fabric membership (multi-admin).
 > is slow (hundreds of ms to seconds). Speed-sensitive use cases run `matd`,
 > which keeps warm sessions (see ARCHITECTURE.md).
 
-### Phase 3 groupcast E2E (real devices)
+### Groupcast E2E (real devices)
 
 With several commissioned lights (say nodes 5, 6, 7), burn a wire group and fire
 one multicast send at it.
