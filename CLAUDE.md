@@ -89,18 +89,17 @@ stdout/stderr to classify into `3`/`4`/`5`, falling back to `parse_error` + `1`.
 
 Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
 the current one is fully done (all tests pass, acceptance criteria met). Phases
-0–3 are implemented (Phase 3 = groupcast: `mat group provision` / `mat group
-invoke`); real-device E2E for groupcast is still recommended. **Phase 4** (next)
-is `matd`, the resident binary (warm CASE sessions; a separate binary in this
-repo). **Phase 5** (native / backend replacement) is optional.
+0–4 are implemented, real-device E2E included (Phase 4 = `matd`, the resident
+binary with warm CASE sessions; a separate binary in this repo). **Phase 5**
+(native / backend replacement) is optional and not started.
 
 ## Development commands
 
 Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 
 ```bash
-task build            # release build -> target/release/mat
-task install          # install into ~/.cargo/bin
+task build            # release build -> target/release/{mat,matd}
+task install          # install both binaries into ~/.cargo/bin
 task run -- discover  # run (needs chip-tool on PATH)
 task test             # tests (incl. fake-chip-tool integration tests; no real chip-tool)
 task clippy           # lint (-D warnings)
