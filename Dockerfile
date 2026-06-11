@@ -36,12 +36,11 @@ RUN bash -c "source scripts/activate.sh && \
     scripts/build/gn_gen.sh && \
     ninja -C out chip-tool"
 
-# ── Stage 2: mat をビルド ─────────────────────────────────────────────────────
+# ── Stage 2: mat / matd をビルド（ワークスペース全体）──────────────────────────
 FROM rust:1-bookworm AS mat-builder
 WORKDIR /src
-COPY Cargo.toml ./
-COPY src ./src
-COPY tests ./tests
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN cargo build --release
 
 # ── Stage 2b: テスト専用ステージ（task docker:test 用、ローカルツールチェーン不要）─
@@ -58,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=chip-builder /work/connectedhomeip/out/chip-tool /usr/local/bin/chip-tool
 COPY --from=mat-builder /src/target/release/mat /usr/local/bin/mat
+COPY --from=mat-builder /src/target/release/matd /usr/local/bin/matd
 
 ENV MAT_CHIP_TOOL_BIN=/usr/local/bin/chip-tool
 ENTRYPOINT ["mat"]
@@ -85,7 +85,7 @@ RUN scripts/checkout_submodules.py --shallow --platform linux
 RUN bash -c "source scripts/activate.sh && \
     ./scripts/build/build_examples.py --target linux-arm64-chip-tool-clang build"
 
-# ── mat を aarch64 へクロスビルド ─────────────────────────────────────────────
+# ── mat / matd を aarch64 へクロスビルド ──────────────────────────────────────
 # mat は軽量なので母艦ネイティブの Rust クロス（gcc-aarch64-linux-gnu リンカ）で焼く。
 FROM rust:1-bookworm AS mat-builder-arm64
 RUN rustup target add aarch64-unknown-linux-gnu \
@@ -94,8 +94,7 @@ RUN rustup target add aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 WORKDIR /src
-COPY Cargo.toml ./
-COPY src ./src
-COPY tests ./tests
-# 出力: target/aarch64-unknown-linux-gnu/release/mat
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# 出力: target/aarch64-unknown-linux-gnu/release/{mat,matd}
 RUN cargo build --release --target aarch64-unknown-linux-gnu
