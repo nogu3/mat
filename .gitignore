@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 
 # 認証情報ストア — リポジトリに含めない（パブリック）
 /.mat-store/
