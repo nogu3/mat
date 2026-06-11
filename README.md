@@ -15,28 +15,29 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Status
 
-**Phase 0 + Phase 1 + Phase 2 + Phase 3 are implemented:**
+**Phase 0 through Phase 4 are implemented:**
 - Phase 0: scaffold + chip-tool wrapper + commission + credential KVS + discover.
 - Phase 1: read / write / invoke + describe + on / off.
 - Phase 2: open-window (multi-admin share).
 - Phase 3: groupcast (`group provision` / `group invoke`).
+- Phase 4: `matd`, the resident binary — warm CASE sessions over `chip-tool
+  interactive server` (websocket), a unix socket speaking newline-delimited
+  JSON, and a `mat --matd` client path.
 
-Phase 3 passes its fake-chip-tool integration tests; real-device E2E for
-groupcast is still recommended (see Manual E2E below).
+Beyond the numbered phases, `mat diag thread` (a one-shot Thread diagnostics
+snapshot) is implemented; see "Thread diagnostics" below.
+
+All phases pass their fake-chip-tool / fake-ws integration tests, and
+real-device E2E has confirmed commissioning, read/write/invoke, `matd`'s warm
+sessions, error classification, group provisioning, and `diag thread`. Group
+*delivery* is unacknowledged multicast by design, so per-device actuation
+cannot be confirmed from the controller side (see Groupcast below).
 
 ## Roadmap
 
-`mat` is implemented through Phase 3. **Phase 4 — `matd`** is in progress: a
-resident binary in **this** repo that keeps warm CASE sessions so repeated Matter
-calls skip the handshake (same model as ssh `ControlMaster`/`ControlPersist`). It
-drives `chip-tool interactive server` (websocket) and serves a unix socket
-speaking newline-delimited JSON. Iter 1 (ws bridge + socket + `read`/`invoke`/
-`on`/`off`/`ping`), Iter 2 (`write`, idle timeout à la ssh `ControlPersist`,
-graceful shutdown), and Iter 3 (`describe`/`group` ops, `logs` dropped from
-responses, error classification, and a `mat --matd <sock>` client path) have
-landed with fake-ws integration tests; a couple of real-device confirmations for
-Iter 3 remain (see ARCHITECTURE.md). **Phase 5** (native /
-backend replacement) is optional. `mat` itself stays one-shot — design rule 4 (no
+`mat` is implemented through Phase 4. **Phase 5** (native / backend replacement)
+is optional and not started: it only happens if `chip-tool` parsing or build/ship
+becomes a bottleneck. `mat` itself stays one-shot — design rule 4 (no
 daemon / cache in `mat`) still holds, and `matd` may be resident precisely because
 it is a separate binary, not `mat`.
 
@@ -55,8 +56,8 @@ The authoritative roadmap, the phase order, and the `mat` / `matd` split live in
 ## Install
 
 ```bash
-task build      # release build -> target/release/mat
-task install    # install into ~/.cargo/bin
+task build      # release build -> target/release/{mat,matd}
+task install    # install both binaries into ~/.cargo/bin
 ```
 
 ## Commands
@@ -382,8 +383,8 @@ baked in is provided for x86_64 Linux hosts (see [Dockerfile](./Dockerfile)).
 Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 
 ```bash
-task build            # release build -> target/release/mat
-task install          # install into ~/.cargo/bin
+task build            # release build -> target/release/{mat,matd}
+task install          # install both binaries into ~/.cargo/bin
 task run -- discover  # run (needs chip-tool on PATH)
 task test             # tests (incl. fake-chip-tool integration tests; no real chip-tool)
 task clippy           # lint (-D warnings)
@@ -395,8 +396,10 @@ task docker:run -- discover
 task docker:test      # no local toolchain needed
 ```
 
-CI does not need a real `chip-tool`. It uses `tests/fixtures/fake-chip-tool.sh`
-(a stub that prints fixed text) via `MAT_CHIP_TOOL_BIN` to run integration tests.
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs the same fmt / clippy /
+test sequence as `task check` and does not need a real `chip-tool`. The tests
+use `crates/mat/tests/fixtures/fake-chip-tool.sh` (a stub that prints fixed
+text) via `MAT_CHIP_TOOL_BIN`, and `matd`'s tests use a fake websocket backend.
 
 ## Manual E2E (with real devices; not in CI)
 

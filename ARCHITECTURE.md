@@ -84,6 +84,17 @@ talk to a device with Matter.
 - Managing the Thread network itself (Border Router dataset, etc.) is **out of
   scope**. Leave it to the OS / Border Router.
 
+### Thread diagnostics (`mat diag thread`)
+
+The one place Thread shows up in the command set is read-only diagnostics:
+`mat diag thread <node_id>` reads the Thread Network Diagnostics cluster
+(0x0035) from one node several times and returns a single snapshot (role,
+routing, neighbor/route tables, counters). This stays inside the rules above —
+it is plain Matter attribute reads against one device, not Thread network
+management, and there is no Border Router access. It is one-shot like every
+other `mat` command and runs only on the direct chip-tool path (not via
+`--matd`).
+
 ---
 
 ## Fabric ownership (multi-admin)
@@ -280,7 +291,7 @@ Share a `mat`-owned device with another controller.
 - `mat open-window` (wraps `chip-tool pairing open-commissioning-window`), returns
   the issued code as JSON.
 
-### Phase 3 — groupcast  *(done; real-device E2E still recommended)*
+### Phase 3 — groupcast  *(done)*
 Synchronized ON/OFF of many lights via a Matter wire group. This is the original
 motivation (lights turning on one by one instead of together), but it is the most
 fragile, so it comes last.
@@ -299,7 +310,7 @@ fragile, so it comes last.
 > - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup on every node.
 >   This is the most breakable feature in Matter.
 
-### Phase 4 — `matd`, the resident binary for Matter  *(in progress)*
+### Phase 4 — `matd`, the resident binary for Matter  *(done)*
 Make repeated operations fast without breaking `mat`'s one-shot model. Each `mat`
 call pays mDNS resolution plus a CASE (Sigma) handshake, so a single call is slow
 (hundreds of ms to seconds). That latency is inherent to a stateless CLI and is
