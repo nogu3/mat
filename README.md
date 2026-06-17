@@ -54,7 +54,7 @@ mat discover
 
 # Join a fabric (first commission OR multi-admin join, both supported)
 # All values here are dummy (RFC 5737 192.0.2.0/24)
-mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node 5
+mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 `discover` output:
@@ -87,7 +87,7 @@ Attestation"). Point `mat` at a directory of PAA root certificates:
 export MAT_PAA_TRUST_STORE=/path/to/paa-root-certs
 # Option 2: drop the certs under the store, no env needed
 #   <store>/paa-trust-store/   (e.g. ~/.config/mat/paa-trust-store/)
-mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node 5
+mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 Resolution order: `MAT_PAA_TRUST_STORE` > `<store>/paa-trust-store/`. If neither
@@ -252,14 +252,15 @@ storage). Logical group names ("the living-room lights") are out of scope —
 
 ```bash
 # Provision: burn the key set + mapping into every node, and set up the
-# controller-side group state. group_id, then one or more commissioned node_ids.
-# provision <group_id> <node_id>... [--keyset-id N] [--name NAME]
-#                                   [--endpoint EP] [--epoch-key HEX]
-mat group provision 1 5 6 7 --name living
+# controller-side group state. --group is the GroupId, --nodes one or more
+# commissioned node_ids.
+# provision --group <ID> --nodes <N>... [--keyset-id N] [--name NAME]
+#                                       [--endpoint EP] [--epoch-key HEX]
+mat group provision --group 1 --nodes 5 6 7 --name living
 
 # Invoke: one multicast send to the group (unacknowledged).
-# invoke <group_id> <cluster> <command> [args...] [--endpoint EP]
-mat group invoke 1 onoff on
+# invoke --group <ID> --cluster <NAME> --command <NAME> [args...] [--endpoint EP]
+mat group invoke --group 1 --cluster onoff --command on
 ```
 
 Outputs:
@@ -309,7 +310,7 @@ export MAT_MATD=1                       # use the default socket
 # export MAT_MATD_SOCKET=/run/mat/matd.sock   # or pin a path
 mat read --node 5 --cluster onoff --attribute on-off
 mat describe --node 5
-mat group invoke 1 onoff on
+mat group invoke --group 1 --cluster onoff --command on
 ```
 
 - Routing is enabled by, in precedence order: `--matd <path>` > `--matd` (default
@@ -408,7 +409,7 @@ existing admin opens a commissioning window to issue a one-time code.
    target device and note the issued setup code (`MT:...` or 11-digit).
 2. **Join with `mat`:**
    ```bash
-   mat commission <device-ip-or-host> "<issued setup code>" --node 5
+   mat commission --target <device-ip-or-host> --setup-code "<issued setup code>" --node 5
    ```
    It returns `{ "node_id": 5, "status": "success" }` and records the ledger in
    `~/.config/mat/nodes.json`.
@@ -463,12 +464,12 @@ one multicast send at it.
 
 ```bash
 # Provision the group onto every node (controller-side state is set up too)
-mat group provision 1 5 6 7 --name living
+mat group provision --group 1 --nodes 5 6 7 --name living
 # -> { "group_id": 1, "keyset_id": 42, "nodes": [5,6,7], "status": "provisioned", ... }
 
 # One multicast send — all three should react together (no popcorn effect)
-mat group invoke 1 onoff on
-mat group invoke 1 onoff off
+mat group invoke --group 1 --cluster onoff --command on
+mat group invoke --group 1 --cluster onoff --command off
 ```
 
 > Groupcast is **unacknowledged**, so `group invoke` only confirms the send, not

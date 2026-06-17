@@ -39,8 +39,10 @@ pub enum Command {
     /// fabric への参加（初回 commission / multi-admin join 両対応）。
     Commission {
         /// 対象の IP アドレスまたは DNS-SD ホスト名。
+        #[arg(long, value_name = "HOST")]
         target: String,
         /// setup code（QR ペイロード `MT:...` または 11/21桁の manual code）。
+        #[arg(long = "setup-code", value_name = "CODE")]
         setup_code: String,
         /// 割り当てる node_id（省略時は台帳の最大値+1 を自動採番）。
         #[arg(short = 'n', long = "node", value_name = "N")]
@@ -180,9 +182,10 @@ pub enum GroupCommand {
     /// コントローラ側 group state（groupsettings）も併せて設定する。
     Provision {
         /// Matter GroupId（wire group 識別子）。
+        #[arg(short = 'g', long = "group", value_name = "ID")]
         group_id: u16,
         /// provision 対象の commission 済み node_id（1つ以上）。
-        #[arg(required = true, num_args = 1..)]
+        #[arg(long = "nodes", required = true, num_args = 1..)]
         node_ids: Vec<u64>,
         /// 鍵束 ID（GroupKeySetID）。既定 42。
         #[arg(long, value_name = "N", default_value_t = 42)]
@@ -202,10 +205,13 @@ pub enum GroupCommand {
     /// group へ multicast でコマンドを送る（unacknowledged。"sent" のみ報告）。
     Invoke {
         /// Matter GroupId。
+        #[arg(short = 'g', long = "group", value_name = "ID")]
         group_id: u16,
         /// クラスタ名（chip-tool 表記、例: `onoff`）。
+        #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
         /// コマンド名（chip-tool 表記、例: `on` / `off`）。
+        #[arg(long, value_name = "NAME")]
         command: String,
         /// コマンド引数（chip-tool にそのまま渡す）。
         #[arg(trailing_var_arg = true)]
