@@ -26,6 +26,10 @@ pub enum ErrorKind {
     Timeout,
     /// ノードに到達できない / ネットワーク不達。
     Unreachable,
+    /// IP は届くが CASE（運用セキュアセッション）確立に失敗。
+    /// Sigma 交換段階で落ちる間欠失敗など。`unreachable`（IP 不達）とも
+    /// `device_rejected`（デバイス拒否）とも異なる、リトライ可能なセッション失敗。
+    SessionFailed,
     /// デバイスが要求を拒否。
     DeviceRejected,
     /// `chip-tool` 出力をパースできない。
@@ -44,6 +48,7 @@ impl ErrorKind {
             ErrorKind::Timeout => 3,
             ErrorKind::DeviceRejected => 4,
             ErrorKind::Unreachable => 5,
+            ErrorKind::SessionFailed => 6,
             ErrorKind::ChildFailed
             | ErrorKind::CommissionFailed
             | ErrorKind::ParseError
@@ -121,6 +126,7 @@ mod tests {
         assert_eq!(ErrorKind::Timeout.exit_code(), 3);
         assert_eq!(ErrorKind::DeviceRejected.exit_code(), 4);
         assert_eq!(ErrorKind::Unreachable.exit_code(), 5);
+        assert_eq!(ErrorKind::SessionFailed.exit_code(), 6);
         assert_eq!(ErrorKind::ChildFailed.exit_code(), 1);
         assert_eq!(ErrorKind::CommissionFailed.exit_code(), 1);
         assert_eq!(ErrorKind::ParseError.exit_code(), 1);
