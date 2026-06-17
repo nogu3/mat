@@ -43,45 +43,58 @@ pub enum Command {
         /// setup code（QR ペイロード `MT:...` または 11/21桁の manual code）。
         setup_code: String,
         /// 割り当てる node_id（省略時は台帳の最大値+1 を自動採番）。
-        #[arg(long, value_name = "N")]
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: Option<u64>,
     },
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
     Read {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
-        /// エンドポイント番号。
+        /// エンドポイント番号（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
         /// クラスタ名（chip-tool 表記、例: `onoff` / `levelcontrol`）。
+        #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
         /// 属性名（chip-tool 表記、例: `on-off` / `current-level`）。
+        #[arg(short = 'a', long, value_name = "NAME")]
         attribute: String,
     },
 
     /// 書き込み可能属性を設定する。
     Write {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
-        /// エンドポイント番号。
+        /// エンドポイント番号（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
         /// クラスタ名（chip-tool 表記）。
+        #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
         /// 属性名（chip-tool 表記）。
+        #[arg(short = 'a', long, value_name = "NAME")]
         attribute: String,
         /// 書き込む値（chip-tool にそのまま渡す）。
+        #[arg(long, value_name = "VALUE")]
         value: String,
     },
 
     /// コマンドを実行する。照明 ON/OFF 等の「制御」はここ（属性 write ではない）。
     Invoke {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
-        /// エンドポイント番号。
+        /// エンドポイント番号（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
         /// クラスタ名（chip-tool 表記）。
+        #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
         /// コマンド名（chip-tool 表記、例: `on` / `off` / `move-to-level`）。
+        #[arg(long, value_name = "NAME")]
         command: String,
         /// コマンド引数（chip-tool にそのまま渡す）。
         #[arg(trailing_var_arg = true)]
@@ -91,24 +104,27 @@ pub enum Command {
     /// ノードのエンドポイント / クラスタを introspect する。
     Describe {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
     },
 
     /// OnOff クラスタの On コマンドを invoke する高頻度ショートカット。
     On {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
         /// エンドポイント番号（既定 1）。
-        #[arg(long, value_name = "EP", default_value_t = 1)]
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
     },
 
     /// OnOff クラスタの Off コマンドを invoke する高頻度ショートカット。
     Off {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
         /// エンドポイント番号（既定 1）。
-        #[arg(long, value_name = "EP", default_value_t = 1)]
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
     },
 
@@ -116,6 +132,7 @@ pub enum Command {
     /// `{ node_id, manual_code, qr_payload, expires_at }` を返す（QR 画像化は上層）。
     OpenWindow {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
         /// window を開いておく秒数（既定 180）。
         #[arg(long, value_name = "S", default_value_t = 180)]
@@ -149,9 +166,10 @@ pub enum DiagCommand {
     /// `neighbor-table`（LQI/RSSI）/ `route-table`（cost）を集約する。
     Thread {
         /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: u64,
         /// エンドポイント番号（既定 0 — 診断クラスタは通常 ep0）。
-        #[arg(long, value_name = "EP", default_value_t = 0)]
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 0)]
         endpoint: u16,
     },
 }
@@ -173,7 +191,7 @@ pub enum GroupCommand {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// AddGroup を行うエンドポイント（既定 1）。
-        #[arg(long, value_name = "EP", default_value_t = 1)]
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
         /// epoch key（16バイト = 32桁 hex）。省略時は mat がランダム生成する。
         /// 複数コントローラで同一 wire group を共有する時のみ明示指定する。
@@ -193,7 +211,7 @@ pub enum GroupCommand {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         /// 宛先エンドポイント（既定 1）。
-        #[arg(long, value_name = "EP", default_value_t = 1)]
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
     },
 }

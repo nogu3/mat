@@ -77,7 +77,7 @@ fn commission_success_updates_store_and_shows_in_discover() {
             "commission",
             "192.0.2.10",
             "MT:FAKE-SETUP-CODE",
-            "--node-id",
+            "--node",
             "5",
         ])
         .assert()
@@ -109,7 +109,7 @@ fn commission_passes_paa_trust_store_when_set() {
             "commission",
             "192.0.2.10",
             "MT:FAKE-SETUP-CODE",
-            "--node-id",
+            "--node",
             "7",
         ])
         .assert()
@@ -163,7 +163,7 @@ fn commission_auto_assigns_node_id() {
 fn store_with_node5() -> TempDir {
     let store = TempDir::new().unwrap();
     mat(store.path())
-        .args(["commission", "192.0.2.10", "MT:FAKE", "--node-id", "5"])
+        .args(["commission", "192.0.2.10", "MT:FAKE", "--node", "5"])
         .assert()
         .success();
     store
@@ -173,7 +173,15 @@ fn store_with_node5() -> TempDir {
 fn read_parses_value() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["read", "5", "1", "onoff", "on-off"])
+        .args([
+            "read",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
@@ -186,7 +194,7 @@ fn read_parses_value() {
 fn diag_thread_returns_mesh_snapshot() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["diag", "thread", "5"])
+        .args(["diag", "thread", "--node", "5"])
         .assert()
         .success()
         // スナップショット骨格と既定 endpoint 0。
@@ -217,7 +225,7 @@ fn diag_thread_partial_records_unavailable() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_THREAD_FAIL_ATTR", "neighbor-table")
-        .args(["diag", "thread", "5"])
+        .args(["diag", "thread", "--node", "5"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"routing_role\":5"))
@@ -233,7 +241,7 @@ fn diag_thread_fully_unreachable_exits_3() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
-        .args(["diag", "thread", "5"])
+        .args(["diag", "thread", "--node", "5"])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("timeout"));
@@ -243,7 +251,17 @@ fn diag_thread_fully_unreachable_exits_3() {
 fn write_reports_success() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["write", "5", "1", "levelcontrol", "on-level", "128"])
+        .args([
+            "write",
+            "--node",
+            "5",
+            "--cluster",
+            "levelcontrol",
+            "--attribute",
+            "on-level",
+            "--value",
+            "128",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\":\"success\""))
@@ -255,7 +273,15 @@ fn write_reports_success() {
 fn invoke_reports_success() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["invoke", "5", "1", "onoff", "toggle"])
+        .args([
+            "invoke",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--command",
+            "toggle",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"command\":\"toggle\""))
@@ -266,7 +292,7 @@ fn invoke_reports_success() {
 fn on_maps_to_onoff_invoke() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["on", "5"])
+        .args(["on", "--node", "5"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
@@ -278,7 +304,7 @@ fn on_maps_to_onoff_invoke() {
 fn off_maps_to_onoff_invoke() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["off", "5"])
+        .args(["off", "--node", "5"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"command\":\"off\""));
@@ -288,7 +314,7 @@ fn off_maps_to_onoff_invoke() {
 fn describe_lists_endpoints_and_clusters() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["describe", "5"])
+        .args(["describe", "--node", "5"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"endpoints\""))
@@ -303,7 +329,7 @@ fn describe_lists_endpoints_and_clusters() {
 fn open_window_returns_codes() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["open-window", "5"])
+        .args(["open-window", "--node", "5"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"node_id\":5"))
@@ -319,7 +345,7 @@ fn open_window_returns_codes() {
 fn open_window_unknown_node_exits_11() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["open-window", "99"])
+        .args(["open-window", "--node", "99"])
         .assert()
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
@@ -330,7 +356,7 @@ fn open_window_timeout_exits_3() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
-        .args(["open-window", "5"])
+        .args(["open-window", "--node", "5"])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("timeout"));
@@ -340,7 +366,15 @@ fn open_window_timeout_exits_3() {
 fn read_unknown_node_exits_11() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["read", "99", "1", "onoff", "on-off"])
+        .args([
+            "read",
+            "--node",
+            "99",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
         .assert()
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
@@ -351,7 +385,15 @@ fn read_missing_store_exits_10() {
     let store = TempDir::new().unwrap();
     let missing = store.path().join("nope");
     mat(&missing)
-        .args(["read", "5", "1", "onoff", "on-off"])
+        .args([
+            "read",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
         .assert()
         .code(10)
         .stderr(predicate::str::contains("store_missing"));
@@ -362,7 +404,15 @@ fn read_timeout_exits_3() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
-        .args(["read", "5", "1", "onoff", "on-off"])
+        .args([
+            "read",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("timeout"));
@@ -373,7 +423,15 @@ fn invoke_reject_exits_4() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "reject")
-        .args(["invoke", "5", "1", "onoff", "on"])
+        .args([
+            "invoke",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+        ])
         .assert()
         .code(4)
         .stderr(predicate::str::contains("device_rejected"));
