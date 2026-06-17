@@ -54,7 +54,7 @@ mat discover
 
 # Join a fabric (first commission OR multi-admin join, both supported)
 # All values here are dummy (RFC 5737 192.0.2.0/24)
-mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
+mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 `discover` output:
@@ -87,7 +87,7 @@ Attestation"). Point `mat` at a directory of PAA root certificates:
 export MAT_PAA_TRUST_STORE=/path/to/paa-root-certs
 # Option 2: drop the certs under the store, no env needed
 #   <store>/paa-trust-store/   (e.g. ~/.config/mat/paa-trust-store/)
-mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node-id 5
+mat commission 192.0.2.10 "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 Resolution order: `MAT_PAA_TRUST_STORE` > `<store>/paa-trust-store/`. If neither
@@ -102,22 +102,29 @@ itself is missing, exit `10`). Cluster / attribute / command names are passed in
 **chip-tool form** (`mat` works in numeric / chip-tool terms; human-name
 resolution is out of scope).
 
+All device-addressing commands take named flags: `--node` (required),
+`--endpoint` (defaults to 1), `--cluster`, `--attribute`, each with a short alias
+(`-n` / `-e` / `-c` / `-a`) for terser typing. The node_id is the Matter
+operational node identifier (not a local nickname), so it stays a required
+number — human-name resolution is out of scope (see CLAUDE.md).
+
 ```bash
-# Read an attribute: read <node_id> <endpoint> <cluster> <attribute>
-mat read 5 1 onoff on-off
+# Read an attribute (--endpoint defaults to 1)
+mat read --node 5 --cluster onoff --attribute on-off
+mat read -n 5 -c onoff -a on-off                 # same, short aliases
 
-# Set a writable attribute: write <node_id> <endpoint> <cluster> <attribute> <value>
-mat write 5 1 levelcontrol on-level 128
+# Set a writable attribute
+mat write --node 5 --cluster levelcontrol --attribute on-level --value 128
 
-# Run a command: invoke <node_id> <endpoint> <cluster> <command> [args...]
-mat invoke 5 1 levelcontrol move-to-level 128 0 0 0
+# Run a command: --command plus trailing chip-tool args
+mat invoke --node 5 --cluster levelcontrol --command move-to-level 128 0 0 0
 
-# Introspect a node: describe <node_id>
-mat describe 5
+# Introspect a node
+mat describe --node 5
 
 # High-frequency shortcuts (--endpoint defaults to 1)
-mat on 5
-mat off 5 --endpoint 2
+mat on --node 5
+mat off --node 5 --endpoint 2
 ```
 
 **Important asymmetry: read is an attribute, control is an invoke.** Turning a
@@ -147,7 +154,7 @@ Outputs:
 
 ### Diagnostics
 
-`mat diag thread <node_id>` returns a one-shot snapshot of a node's **Thread
+`mat diag thread --node <node_id>` returns a one-shot snapshot of a node's **Thread
 Network Diagnostics** (cluster 53, normally on endpoint 0) for analyzing mesh
 health — "why is this device flaky?". It bundles the scalars `routing-role` /
 `network-name` / `extended-pan-id` / `pan-id` / `partition-id` / `channel` with
@@ -155,8 +162,8 @@ the list attributes `neighbor-table` and `route-table`, which the generic `mat
 read` can't represent (they are lists of structs, not a single value).
 
 ```bash
-# diag thread <node_id> [--endpoint EP]   (EP defaults to 0)
-mat diag thread 5
+# diag thread --node <node_id> [--endpoint EP]   (EP defaults to 0)
+mat diag thread --node 5
 ```
 
 ```json
@@ -206,9 +213,9 @@ open a commissioning window and return a one-time issued code. This wraps
 `chip-tool pairing open-commissioning-window` (ECM = option 1).
 
 ```bash
-# open-window <node_id> [--timeout S] [--iteration N] [--discriminator D]
-mat open-window 5
-mat open-window 5 --timeout 300
+# open-window --node <node_id> [--timeout S] [--iteration N] [--discriminator D]
+mat open-window --node 5
+mat open-window --node 5 --timeout 300
 ```
 
 Output:
@@ -294,14 +301,14 @@ matd &
 
 # Route through it. --matd with no value uses the default socket; pass a path to
 # override. Output is identical to the direct path.
-mat --matd read 5 1 onoff on-off
-mat --matd /run/mat/matd.sock on 5
+mat --matd read --node 5 --cluster onoff --attribute on-off
+mat --matd /run/mat/matd.sock on --node 5
 
 # Or skip the flag entirely: opt in via env (handy for a shell session).
 export MAT_MATD=1                       # use the default socket
 # export MAT_MATD_SOCKET=/run/mat/matd.sock   # or pin a path
-mat read 5 1 onoff on-off
-mat describe 5
+mat read --node 5 --cluster onoff --attribute on-off
+mat describe --node 5
 mat group invoke 1 onoff on
 ```
 
@@ -401,7 +408,7 @@ existing admin opens a commissioning window to issue a one-time code.
    target device and note the issued setup code (`MT:...` or 11-digit).
 2. **Join with `mat`:**
    ```bash
-   mat commission <device-ip-or-host> "<issued setup code>" --node-id 5
+   mat commission <device-ip-or-host> "<issued setup code>" --node 5
    ```
    It returns `{ "node_id": 5, "status": "success" }` and records the ledger in
    `~/.config/mat/nodes.json`.
@@ -417,17 +424,17 @@ on a real device.
 
 ```bash
 # Introspect what you can call (endpoints and numeric cluster IDs)
-mat describe 5
+mat describe --node 5
 
 # Read the OnOff attribute (for a light, its current on/off state)
-mat read 5 1 onoff on-off
+mat read --node 5 --cluster onoff --attribute on-off
 
 # Turn on -> off (invoke of the OnOff command, not an attribute write)
-mat on 5
-mat off 5
+mat on --node 5
+mat off --node 5
 
 # Read-after-write check (confirm the value took effect)
-mat on 5 && mat read 5 1 onoff on-off   # -> "value": true
+mat on --node 5 && mat read --node 5 --cluster onoff --attribute on-off   # -> "value": true
 ```
 
 ### Share E2E (mat -> another admin)
@@ -436,7 +443,7 @@ Share `mat`-owned node 5 with another controller.
 
 ```bash
 # Open a commissioning window (get the issued code)
-mat open-window 5 --timeout 300
+mat open-window --node 5 --timeout 300
 # -> { "node_id": 5, "manual_code": "...", "qr_payload": "MT:...", "expires_at": "..." }
 ```
 
@@ -465,8 +472,8 @@ mat group invoke 1 onoff off
 ```
 
 > Groupcast is **unacknowledged**, so `group invoke` only confirms the send, not
-> delivery. If a light did not react, confirm it individually (`mat read 6 1
-> onoff on-off`) and re-provision that node. Multicast is **especially weak on
+> delivery. If a light did not react, confirm it individually (`mat read --node 6 -c
+> onoff --attribute on-off`) and re-provision that node. Multicast is **especially weak on
 > Thread**; Wi-Fi / Ethernet lights are more reliable. The exact `key-set-write`
 > JSON, the `groupsettings add-keysets` policy value, and the group node-id form
 > are chip-tool-version dependent — if a chip-tool upgrade breaks provisioning,
