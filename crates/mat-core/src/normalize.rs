@@ -57,6 +57,18 @@ pub fn classify_failure(stdout: &str, stderr: &str) -> Option<ErrorKind> {
     {
         return Some(ErrorKind::Unreachable);
     }
+    // CASE（運用セキュアセッション）確立の失敗。IP は届いて Sigma 交換まで行くが
+    // パラメータ段階で落ちる間欠失敗（実機 node で観測: `0x00000054 Invalid CASE
+    // parameter`）。unreachable（IP 不達）とも device_rejected（IM レベル拒否）とも
+    // 区別し、上位（HA 等）がリトライ判断できるようにする。device_rejected の
+    // 汎用語（"failure" 等）より先に、CASE 固有のシグナルで確定させる。
+    if hay.contains("invalid case parameter")
+        || hay.contains("chip error 0x00000054")
+        || hay.contains("error establishing case session")
+        || hay.contains("failed to establish case")
+    {
+        return Some(ErrorKind::SessionFailed);
+    }
     if hay.contains("status 0x81") // IM Status: Failure
         || hay.contains("unsupported")
         || hay.contains("constraint")
@@ -86,6 +98,23 @@ mod tests {
             classify_failure("", "connect: No route to host"),
             Some(ErrorKind::Unreachable)
         );
+    }
+
+    #[test]
+    fn classifies_case_failure_as_session_failed() {
+        // 実機 node で観測した間欠 CASE 失敗の生ログ（Sigma2 受信後にパラメータで落ちる）。
+        let s = "[SC] Received error (protocol code 2) during pairing process: \
+                 src/protocols/secure_channel/CASESession.cpp:2375: \
+                 CHIP Error 0x00000054: Invalid CASE parameter";
+        assert_eq!(classify_failure(s, ""), Some(ErrorKind::SessionFailed));
+    }
+
+    #[test]
+    fn case_failure_takes_priority_over_generic_rejection() {
+        // CASE 失敗ログに "Run command failure" が混ざっても device_rejected ではなく
+        // session_failed に確定する（CASE 固有シグナルを先に見る）。
+        let s = "[TOO] Run command failure: CHIP Error 0x00000054: Invalid CASE parameter";
+        assert_eq!(classify_failure(s, ""), Some(ErrorKind::SessionFailed));
     }
 
     #[test]

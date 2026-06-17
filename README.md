@@ -335,10 +335,11 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 3 | timeout |
 | 4 | device rejected |
 | 5 | unreachable / network |
+| 6 | CASE session establishment failed |
 | 1 | other |
 
 `chip-tool` has coarse exit codes (mostly `1` on failure). `mat` parses
-stdout/stderr to classify into `3` / `4` / `5`. If it cannot classify, exit `1`.
+stdout/stderr to classify into `3` / `4` / `5` / `6`. If it cannot classify, exit `1`.
 
 `kind` values (stable; callers may branch on these strings):
 
@@ -347,6 +348,10 @@ stdout/stderr to classify into `3` / `4` / `5`. If it cannot classify, exit `1`.
 - `child_not_found` — `chip-tool` binary not found / not runnable (exit 12)
 - `timeout` (exit 3) / `device_rejected` (exit 4) / `unreachable` (exit 5) —
   classified from chip-tool output
+- `session_failed` — IP reachable but CASE (operational secure session) could not
+  be established, e.g. an intermittent `CHIP Error 0x54 (Invalid CASE parameter)`
+  during the Sigma exchange (exit 6). Distinct from `unreachable` (no IP route)
+  and `device_rejected` (the device answered and refused); typically retryable.
 - `child_failed` — `chip-tool` exited with failure (unclassified, exit 1)
 - `commission_failed` — commissioning failed (unclassified, exit 1)
 - `parse_error` — could not parse `chip-tool` output (exit 1)

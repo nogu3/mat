@@ -60,14 +60,15 @@ This file is the short list of constraints you must not break.
 - `kind` values are stable and documented in README ("Errors and exit codes").
   Examples: `store_missing` / `store_parse` / `node_not_commissioned` /
   `child_not_found` / `child_failed` / `commission_failed` / `timeout` /
-  `unreachable` / `device_rejected` / `parse_error` / `other`.
+  `unreachable` / `session_failed` / `device_rejected` / `parse_error` / `other`.
 
 ### exit codes
 See the table in [README.md](./README.md#errors-and-exit-codes). In short:
 `0` success, `2` CLI arg error, `10` store missing/parse, `11` not commissioned,
 `12` chip-tool not found, `3` timeout, `4` device rejected, `5` unreachable,
-`1` other. `chip-tool` exit codes are coarse (mostly `1`); `mat` parses
-stdout/stderr to classify into `3`/`4`/`5`, falling back to `parse_error` + `1`.
+`6` CASE session establishment failed, `1` other. `chip-tool` exit codes are
+coarse (mostly `1`); `mat` parses stdout/stderr to classify into `3`/`4`/`5`/`6`,
+falling back to `parse_error` + `1`.
 
 ## Backend (chip-tool)
 
