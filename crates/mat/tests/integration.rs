@@ -75,7 +75,9 @@ fn commission_success_updates_store_and_shows_in_discover() {
     mat(store.path())
         .args([
             "commission",
+            "--target",
             "192.0.2.10",
+            "--setup-code",
             "MT:FAKE-SETUP-CODE",
             "--node",
             "5",
@@ -107,7 +109,9 @@ fn commission_passes_paa_trust_store_when_set() {
         .env("FAKE_CHIP_ARGS_FILE", &args_file)
         .args([
             "commission",
+            "--target",
             "192.0.2.10",
+            "--setup-code",
             "MT:FAKE-SETUP-CODE",
             "--node",
             "7",
@@ -131,7 +135,13 @@ fn commission_timeout_exits_3() {
     let store = TempDir::new().unwrap();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
-        .args(["commission", "192.0.2.10", "MT:FAKE"])
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+        ])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("timeout"));
@@ -142,7 +152,13 @@ fn commission_reject_exits_4() {
     let store = TempDir::new().unwrap();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "reject")
-        .args(["commission", "192.0.2.10", "MT:FAKE"])
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+        ])
         .assert()
         .code(4)
         .stderr(predicate::str::contains("device_rejected"));
@@ -153,7 +169,13 @@ fn commission_auto_assigns_node_id() {
     let store = TempDir::new().unwrap();
     // node-id 指定なし → 空台帳なので 1 が振られる。
     mat(store.path())
-        .args(["commission", "192.0.2.10", "MT:FAKE"])
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"node_id\":1"));
@@ -163,7 +185,15 @@ fn commission_auto_assigns_node_id() {
 fn store_with_node5() -> TempDir {
     let store = TempDir::new().unwrap();
     mat(store.path())
-        .args(["commission", "192.0.2.10", "MT:FAKE", "--node", "5"])
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+            "--node",
+            "5",
+        ])
         .assert()
         .success();
     store
@@ -443,7 +473,16 @@ fn invoke_reject_exits_4() {
 fn group_provision_succeeds() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["group", "provision", "1", "5", "--name", "living"])
+        .args([
+            "group",
+            "provision",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+            "--name",
+            "living",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"group_id\":1"))
@@ -458,7 +497,7 @@ fn group_provision_succeeds() {
 fn group_provision_unknown_node_exits_11() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["group", "provision", "1", "99"])
+        .args(["group", "provision", "--group", "1", "--nodes", "99"])
         .assert()
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
@@ -468,7 +507,16 @@ fn group_provision_unknown_node_exits_11() {
 fn group_provision_rejects_bad_epoch_key() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["group", "provision", "1", "5", "--epoch-key", "dead"])
+        .args([
+            "group",
+            "provision",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+            "--epoch-key",
+            "dead",
+        ])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("epoch-key"));
@@ -485,7 +533,9 @@ fn group_provision_last_chip_call_is_add_group() {
         .args([
             "group",
             "provision",
+            "--group",
             "7",
+            "--nodes",
             "5",
             "--name",
             "kitchen",
@@ -507,7 +557,16 @@ fn group_invoke_reports_sent() {
     let args_file = store.path().join("recorded-args.txt");
     mat(store.path())
         .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["group", "invoke", "1", "onoff", "on"])
+        .args([
+            "group",
+            "invoke",
+            "--group",
+            "1",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"group_id\":1"))
@@ -527,7 +586,16 @@ fn group_invoke_timeout_exits_3() {
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
-        .args(["group", "invoke", "1", "onoff", "on"])
+        .args([
+            "group",
+            "invoke",
+            "--group",
+            "1",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+        ])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("timeout"));
