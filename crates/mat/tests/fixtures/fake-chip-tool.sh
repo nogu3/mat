@@ -14,6 +14,9 @@ if [ -n "$FAKE_CHIP_ARGS_FILE" ]; then
   echo "$*" > "$FAKE_CHIP_ARGS_FILE"
 fi
 
+# parse_compressed_fabric_id が自 fabric CFID を拾えるようにダミー行を出す。
+echo "[FP] Compressed FabricId 0x00AABB1122CC3344, FabricId 0x1" >&2
+
 # read/write/invoke/describe 共通の失敗注入。success 以外なら該当ログを吐いて非 0 終了。
 emit_failure() {
   case "$mode" in
