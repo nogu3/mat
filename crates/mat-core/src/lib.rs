@@ -10,5 +10,6 @@ pub mod group;
 pub mod normalize;
 pub mod output;
 pub mod parse;
+pub mod reachability;
 pub mod socket;
 pub mod store;
