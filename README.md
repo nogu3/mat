@@ -87,7 +87,8 @@ With `--probe`, each `commissioned` node is checked against live mDNS
   "timestamp": "2026-06-06T12:34:56+09:00",
   "devices": [
     { "state": "commissioned", "node_id": 5, "address": "192.0.2.99", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": true },
-    { "state": "commissioned", "node_id": 7, "address": "192.0.2.10", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": false, "stale": true }
+    { "state": "commissioned", "node_id": 7, "address": "192.0.2.10", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": false, "stale": true },
+    { "state": "commissioned", "node_id": 9, "address": "192.0.2.20", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": null }
   ]
 }
 ```
