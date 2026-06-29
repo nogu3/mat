@@ -306,16 +306,18 @@ mat --matd read --node 5 --cluster onoff --attribute on-off
 mat --matd /run/mat/matd.sock on --node 5
 
 # Or skip the flag entirely: opt in via env (handy for a shell session).
-export MAT_MATD=1                       # use the default socket
-# export MAT_MATD_SOCKET=/run/mat/matd.sock   # or pin a path
+export MAT_MATD=1                       # enable routing (uses the default socket)
+# export MAT_MATD_SOCKET=/run/mat/matd.sock   # pins the socket path when enabled
 mat read --node 5 --cluster onoff --attribute on-off
 mat describe --node 5
 mat group invoke --group 1 --cluster onoff --command on
 ```
 
-- Routing is enabled by, in precedence order: `--matd <path>` > `--matd` (default
-  socket) > `MAT_MATD_SOCKET=<path>` > `MAT_MATD=1` (default socket). Unset = the
-  direct chip-tool path as before.
+- Routing is **enabled** only by `--matd` (the flag) or `MAT_MATD=<truthy>`.
+  `MAT_MATD_SOCKET` just selects *which* socket — on its own it does **not** route
+  through matd, even when set. Unset/disabled = the direct chip-tool path as before.
+- Socket path precedence (once enabled): `--matd <path>` > `MAT_MATD_SOCKET=<path>`
+  > default socket (`$XDG_RUNTIME_DIR/matd.sock`, else `/tmp/matd.sock`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` / `describe` /
   `group`. `discover` / `commission` / `open-window` are direct-only and exit `2`
   if routed through matd.
