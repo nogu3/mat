@@ -12,11 +12,16 @@ pub const LQI_WEAK: u8 = 20;
 pub const LOSS_WEAK: u8 = 30;
 
 /// mDNS に見えた `_matter._tcp` の1インスタンス（`<CFID>-<nodeid>`）。
+/// `+` 行（announce）と `=` 行（resolved）は同じ (compressed_fabric, node_id) を持つため
+/// マージして1件にまとめる。`addresses` は resolved ブロックの `address = [<addr>]` から
+/// 抽出した IP アドレスリスト（dedup 済み）。announce のみの場合は空。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatterInstance {
     /// compressed fabric id（16桁 hex、大文字正規化）。
     pub compressed_fabric: String,
     pub node_id: u64,
+    /// resolved された IP アドレス（`address = [<addr>]` 行から抽出、dedup 済み）。
+    pub addresses: Vec<String>,
 }
 
 /// ping6 統計。
@@ -116,26 +121,54 @@ pub fn parse_ping6(stdout: &str) -> Option<Ping6Stats> {
 }
 
 /// `avahi-browse -rt _matter._tcp` 出力から `<CFID>-<nodeid>` インスタンスを抽出。
-/// 人間形式（空白区切り）と `-p` 形式（`;` 区切り）の両方に対応。dedup する。
+/// 人間形式（空白区切り）と `-p` 形式（`;` 区切り）の両方に対応。
+///
+/// ステートフルに処理し、`announce`（`+`）行と `resolve`（`=`）行を同一 (CFID, node_id) で
+/// マージして1件にまとめる。`address = [<addr>]` 行は直前のインスタンスに付ける（dedup）。
 pub fn parse_avahi_matter(stdout: &str) -> Vec<MatterInstance> {
     let mut out: Vec<MatterInstance> = Vec::new();
+    let mut current_idx: Option<usize> = None;
+
     for line in stdout.lines() {
+        // address = [...] 行: 現在インスタンスに付与。
+        let trimmed = line.trim();
+        if trimmed.starts_with("address = [") && trimmed.ends_with(']') {
+            if let Some(idx) = current_idx {
+                let addr = &trimmed["address = [".len()..trimmed.len() - 1];
+                if !addr.is_empty() && !out[idx].addresses.contains(&addr.to_string()) {
+                    out[idx].addresses.push(addr.to_string());
+                }
+            }
+            continue;
+        }
+
         if !line.contains("_matter._tcp") {
             continue;
         }
+
+        // `<CFID>-<nodeid>` トークンを探す（空白・`;` で区切り）。
         for tok in line.split(|c: char| c.is_whitespace() || c == ';') {
             if let Some((fab, node)) = tok.split_once('-') {
                 let fab_ok = fab.len() == 16 && fab.bytes().all(|b| b.is_ascii_hexdigit());
                 let node_ok = !node.is_empty() && node.bytes().all(|b| b.is_ascii_hexdigit());
                 if fab_ok && node_ok {
                     if let Ok(node_id) = u64::from_str_radix(node, 16) {
-                        let inst = MatterInstance {
-                            compressed_fabric: fab.to_ascii_uppercase(),
-                            node_id,
-                        };
-                        if !out.contains(&inst) {
-                            out.push(inst);
+                        let cfid = fab.to_ascii_uppercase();
+                        // 同じ (CFID, node_id) が既にあればそこを current にしてマージ。
+                        if let Some(pos) = out
+                            .iter()
+                            .position(|i| i.compressed_fabric == cfid && i.node_id == node_id)
+                        {
+                            current_idx = Some(pos);
+                        } else {
+                            out.push(MatterInstance {
+                                compressed_fabric: cfid,
+                                node_id,
+                                addresses: vec![],
+                            });
+                            current_idx = Some(out.len() - 1);
                         }
+                        break; // トークン見つかったのでこの行の残りは不要。
                     }
                 }
             }
@@ -187,9 +220,13 @@ pub fn derive_verdict(checks: &Checks) -> Verdict {
     // IP 不達（--deep 時のみ判定可能）。
     if let Some(ip) = &checks.ip {
         if !ip.ok {
+            let summary = format!(
+                "The node does not respond to ping ({}% packet loss); it is off the network at the IP layer.",
+                ip.loss_pct
+            );
             return verdict(
                 VerdictKind::IpUnreachable,
-                "The node does not respond to ping; it is off the network at the IP layer.",
+                &summary,
                 "Check power, the Thread Border Router, and network routing.",
             );
         }
@@ -209,9 +246,22 @@ pub fn derive_verdict(checks: &Checks) -> Verdict {
                 }
                 // any 広告ありだが自 fabric 不明 → 解決失敗の一般原因へ委ねる。
             } else if weak_link(checks) {
+                let loss_pct = checks.ip.as_ref().map(|ip| ip.loss_pct);
+                let best_lqi = checks.thread.as_ref().and_then(|t| t.best_lqi);
+                let detail = match (loss_pct, best_lqi) {
+                    (Some(loss), Some(lqi)) => format!("loss {}%, best LQI {}", loss, lqi),
+                    (Some(loss), None) => format!("loss {}%", loss),
+                    (None, Some(lqi)) => format!("best LQI {}", lqi),
+                    (None, None) => String::new(),
+                };
+                let summary = if detail.is_empty() {
+                    "IP reachable but not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.".to_string()
+                } else {
+                    format!("IP reachable but not advertising Matter on any fabric; weak Thread link ({detail}) — SRP registration likely incomplete.")
+                };
                 return verdict(
                     VerdictKind::LinkStarved,
-                    "IP reachable but not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.",
+                    &summary,
                     "Improve the Thread link (move the device near a router) or wait; do NOT factory reset — the fabric is intact.",
                 );
             } else {
@@ -257,7 +307,15 @@ mod tests {
     fn smoke_types_construct() {
         let c = Checks::default();
         assert!(c.operational.is_none());
-        assert_eq!(LQI_WEAK, 20);
+        // Meaningful: a fully resolved node always yields verdict Ok.
+        let c_ok = Checks {
+            operational: Some(OperationalCheck {
+                resolved: true,
+                kind: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(derive_verdict(&c_ok).verdict, VerdictKind::Ok);
     }
 
     #[test]
@@ -292,7 +350,9 @@ mod tests {
         assert_eq!(v.len(), 2); // dedup の =/+ 重複は1件
         assert_eq!(v[0].compressed_fabric, "00AABB1122CC3344");
         assert_eq!(v[0].node_id, 5);
+        assert_eq!(v[0].addresses, Vec::<String>::new());
         assert_eq!(v[1].node_id, 0x4F);
+        assert_eq!(v[1].addresses, Vec::<String>::new());
     }
 
     #[test]
@@ -301,12 +361,45 @@ mod tests {
         let v = parse_avahi_matter(s);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].node_id, 5);
+        assert_eq!(v[0].addresses, Vec::<String>::new());
     }
 
     #[test]
     fn avahi_empty_or_noise_is_empty() {
         assert!(parse_avahi_matter("").is_empty());
         assert!(parse_avahi_matter("avahi-browse: command not found\n").is_empty());
+    }
+
+    #[test]
+    fn avahi_resolved_block_attaches_address() {
+        // announce (+) と resolve (=) が同一インスタンスにマージされ、
+        // address = [...] 行のアドレスが付く。
+        let s = "+   eth0 IPv6 00AABB1122CC3344-0000000000000005   _matter._tcp   local\n\
+                 =   eth0 IPv6 00AABB1122CC3344-0000000000000005   _matter._tcp   local\n\
+                    hostname = [dummy.local]\n\
+                    address = [fd00::1]\n\
+                    port = [5540]\n";
+        let v = parse_avahi_matter(s);
+        assert_eq!(
+            v.len(),
+            1,
+            "announce + resolve should merge into one instance"
+        );
+        assert_eq!(v[0].compressed_fabric, "00AABB1122CC3344");
+        assert_eq!(v[0].node_id, 5);
+        assert_eq!(v[0].addresses, vec!["fd00::1".to_string()]);
+    }
+
+    #[test]
+    fn avahi_resolved_block_dedup_addresses() {
+        // 同じアドレスが複数の resolve ブロックに現れても dedup される。
+        let s = "=   eth0 IPv6 00AABB1122CC3344-0000000000000005   _matter._tcp   local\n\
+                    address = [fd00::1]\n\
+                 =   eth0 IPv6 00AABB1122CC3344-0000000000000005   _matter._tcp   local\n\
+                    address = [fd00::1]\n";
+        let v = parse_avahi_matter(s);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].addresses, vec!["fd00::1".to_string()]);
     }
 
     #[test]
