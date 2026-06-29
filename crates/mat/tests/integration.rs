@@ -647,6 +647,9 @@ fn fake_avahi() -> PathBuf {
 #[test]
 fn diag_node_deep_link_starved() {
     // operational timeout + ip 生存(50%ロス) + mDNS に node5 広告なし → link_starved。
+    // self_cfid = 00AABB1122CC3344 (fake-chip-tool CFID)。
+    // avahi デフォルト出力: node 0xFF under 0011223344556677（アドレス付きでない）。
+    // → advertised_any_fabric=false → weak_link(loss 50%) → link_starved。
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
@@ -658,4 +661,52 @@ fn diag_node_deep_link_starved() {
         .stdout(predicate::str::contains("\"verdict\":\"link_starved\""))
         .stdout(predicate::str::contains("\"ip\""))
         .stdout(predicate::str::contains("\"loss_pct\":50"));
+}
+
+#[test]
+fn diag_node_deep_ip_unreachable() {
+    // operational timeout + ping 100% loss → ip_unreachable。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("FAKE_PING_LOSS", "100")
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"ip_unreachable\""));
+}
+
+#[test]
+fn diag_node_deep_fabric_missing() {
+    // operational timeout + ip ok (50%ロス) + avahi: 192.0.2.10 が他 fabric 下に広告
+    // (FAKE_AVAHI_FABRIC=0011223344556677 != fake-chip-tool CFID 00AABB1122CC3344)
+    // → advertised_any_fabric=true, advertised_self_fabric=Some(false) → fabric_missing。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
+        .env("FAKE_AVAHI_FABRIC", "0011223344556677")
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"fabric_missing\""));
+}
+
+#[test]
+fn diag_node_deep_missing_probe_binary() {
+    // ping6 バイナリが存在しない → unavailable に tool_missing、verdict は出る、exit 0。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("MAT_PING6_BIN", "/nonexistent/ping6")
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool_missing\""))
+        .stdout(predicate::str::contains("\"verdict\""));
 }
