@@ -726,7 +726,8 @@ fn discover_probe_reports_reachable_with_live_address() {
         .success()
         .stdout(predicate::str::contains("\"state\":\"commissioned\""))
         .stdout(predicate::str::contains("\"reachable\":true"))
-        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""));
+        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""))
+        .stdout(predicate::str::contains("\"address\":\"192.0.2.10\"").not());
 }
 
 #[test]
