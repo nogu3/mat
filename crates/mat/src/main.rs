@@ -113,6 +113,11 @@ fn main() -> ExitCode {
             DiagCommand::Thread { node_id, endpoint } => {
                 commands::diag::thread(&store_path, *node_id, *endpoint)
             }
+            DiagCommand::Node {
+                node_id,
+                endpoint,
+                deep,
+            } => commands::diag::node(&store_path, *node_id, *endpoint, *deep),
         },
     };
 

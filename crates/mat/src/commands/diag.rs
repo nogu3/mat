@@ -20,6 +20,9 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::runner::ChipTool;
+use mat_core::diag::{
+    derive_verdict, parse_compressed_fabric_id, Checks, OperationalCheck, ThreadCheck,
+};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
 use mat_core::output;
@@ -127,6 +130,109 @@ fn record_failure(
     if first_err.is_none() {
         *first_err = Some(err);
     }
+}
+
+/// `mat diag node` — 到達不能の根本原因を層別チェックで分類する。
+pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Result<(), MatError> {
+    let store = Store::open(store_path)?;
+    let rec = store.require_node(node_id)?;
+    let address = rec.address.clone();
+    let chip = ChipTool::new(store.root());
+
+    let mut checks = Checks::default();
+    let mut unavailable: Vec<Value> = Vec::new();
+    let mut self_cfid: Option<String> = None;
+
+    // operational: 軽量な descriptor read（ep0、全ノード共通）で解決を試す。
+    let op_out = chip.run([
+        "descriptor".to_string(),
+        "read".to_string(),
+        "parts-list".to_string(),
+        node_id.to_string(),
+        "0".to_string(),
+    ])?; // ChildNotFound はここで伝播（診断不能）。
+    if let Some(cfid) = parse_compressed_fabric_id(&op_out.stderr) {
+        self_cfid = Some(cfid);
+    }
+    let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
+    let resolved = op_kind.is_none() && op_out.success();
+    checks.operational = Some(OperationalCheck {
+        resolved,
+        kind: op_kind,
+    });
+
+    // thread: neighbor-table の LQI と routing-role（部分結果可）。
+    match read_thread_signal(&chip, node_id, endpoint) {
+        Ok(tc) => checks.thread = Some(tc),
+        Err(e) => unavailable.push(json!({ "check": "thread", "kind": e.kind })),
+    }
+
+    if deep {
+        deep_probes(&mut checks, &mut unavailable, node_id, address, self_cfid);
+    } else {
+        unavailable.push(json!({ "check": "ip", "reason": "skipped_no_deep" }));
+        unavailable.push(json!({ "check": "mdns", "reason": "skipped_no_deep" }));
+    }
+
+    let v = derive_verdict(&checks);
+
+    let mut body = Map::new();
+    body.insert("node_id".to_string(), json!(node_id));
+    body.insert("endpoint".to_string(), json!(endpoint));
+    body.insert(
+        "verdict".to_string(),
+        serde_json::to_value(v.verdict).unwrap_or(Value::Null),
+    );
+    body.insert("summary".to_string(), json!(v.summary));
+    body.insert(
+        "checks".to_string(),
+        serde_json::to_value(&checks)
+            .map_err(|e| MatError::parse_error(format!("serialize checks: {e}")))?,
+    );
+    if !unavailable.is_empty() {
+        body.insert("unavailable".to_string(), Value::Array(unavailable));
+    }
+    body.insert("recommendation".to_string(), json!(v.recommendation));
+    output::emit(Value::Object(body));
+    Ok(())
+}
+
+/// neighbor-table（LQI/隣接数）＋ routing-role を読む。neighbor-table が読めなければ Err。
+fn read_thread_signal(
+    chip: &ChipTool,
+    node_id: u64,
+    endpoint: u16,
+) -> Result<ThreadCheck, MatError> {
+    let nt = read_attr(chip, node_id, endpoint, "neighbor-table")?;
+    let rows = parse_struct_list(&nt);
+    let neighbor_count = rows.len();
+    let best_lqi = rows
+        .iter()
+        .filter_map(|r| r.get("Lqi").and_then(Value::as_u64))
+        .map(|v| v as u8)
+        .max();
+    // routing-role は best-effort（失敗しても thread シグナルは返す）。
+    let routing_role = read_attr(chip, node_id, endpoint, "routing-role")
+        .ok()
+        .and_then(|s| parse_read_value(&s))
+        .and_then(|v| v.as_i64());
+    Ok(ThreadCheck {
+        neighbor_count,
+        best_lqi,
+        routing_role,
+    })
+}
+
+/// `--deep` の補助プローブ（ping6 / mDNS）。Task 7 で実装。
+fn deep_probes(
+    _checks: &mut Checks,
+    unavailable: &mut Vec<Value>,
+    _node_id: u64,
+    _address: Option<String>,
+    _self_cfid: Option<String>,
+) {
+    unavailable.push(json!({ "check": "ip", "reason": "deep_not_implemented" }));
+    unavailable.push(json!({ "check": "mdns", "reason": "deep_not_implemented" }));
 }
 
 /// `chip-tool threadnetworkdiagnostics read <attr> <node> <ep>` を実行し stdout を返す。

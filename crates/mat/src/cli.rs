@@ -174,6 +174,21 @@ pub enum DiagCommand {
         #[arg(short = 'e', long, value_name = "EP", default_value_t = 0)]
         endpoint: u16,
     },
+
+    /// commissioned ノードが「なぜ制御できないか」を層別チェックして verdict で返す。
+    /// 既定は chip-tool 完結。`--deep` で ping6 / mDNS ブラウズも実施し、
+    /// link_starved（弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
+    Node {
+        /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
+        node_id: u64,
+        /// エンドポイント番号（既定 0 — 診断は通常 ep0）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 0)]
+        endpoint: u16,
+        /// 補助プローブ（ping6 / avahi-browse）も実施して深掘りする。
+        #[arg(long)]
+        deep: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
