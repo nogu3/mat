@@ -600,3 +600,39 @@ fn group_invoke_timeout_exits_3() {
         .code(3)
         .stderr(predicate::str::contains("timeout"));
 }
+
+// ── diag node ──────────────────────────────────────────────────────────────
+
+#[test]
+fn diag_node_success_verdict_ok() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["diag", "node", "--node", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"ok\""))
+        .stdout(predicate::str::contains("\"checks\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+}
+
+#[test]
+fn diag_node_timeout_is_unresolvable_exit0() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .args(["diag", "node", "--node", "5"])
+        .assert()
+        .success() // 診断は落ちない
+        .stdout(predicate::str::contains("\"verdict\":\"unresolvable\""));
+}
+
+#[test]
+fn diag_node_reject_is_device_rejected_exit0() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "reject")
+        .args(["diag", "node", "--node", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"device_rejected\""));
+}
