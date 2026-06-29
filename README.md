@@ -49,8 +49,11 @@ task install    # install both binaries into ~/.cargo/bin
 ### Discover and commissioning
 
 ```bash
-# Discover commissionable / commissioned nodes
+# Discover commissionable / commissioned nodes (ledger only, fast)
 mat discover
+
+# Also probe live reachability of commissioned nodes via mDNS
+mat discover --probe
 
 # Join a fabric (first commission OR multi-admin join, both supported)
 # All values here are dummy (RFC 5737 192.0.2.0/24)
@@ -68,6 +71,31 @@ mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 
   ]
 }
 ```
+
+With `--probe`, each `commissioned` node is checked against live mDNS
+(`avahi-browse _matter._tcp`, one browse for all nodes) and annotated:
+
+- `reachable: true` — advertising now; `address` is the live-resolved value
+  (may differ from the ledger).
+- `reachable: false` — not advertising; `address` is the last-known ledger
+  value with `stale: true`.
+- `reachable: null` — the mDNS probe could not run (e.g. `avahi-browse`
+  missing); reachability is unknown. A diagnostic is logged to stderr.
+
+```json
+{
+  "timestamp": "2026-06-06T12:34:56+09:00",
+  "devices": [
+    { "state": "commissioned", "node_id": 5, "address": "192.0.2.99", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": true },
+    { "state": "commissioned", "node_id": 7, "address": "192.0.2.10", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": false, "stale": true }
+  ]
+}
+```
+
+Without `--probe` the output is unchanged (no `reachable` / `stale`); the
+ledger is reported as-is and reflects no live reachability. Node-id matching
+is best-effort (a cross-fabric node_id collision could false-positive); for a
+deeper single-node check use `mat diag node --deep`.
 
 `commission` output:
 
