@@ -159,13 +159,55 @@ impl ChipToolBackend {
 /// chip-tool ws 応答の `logs`（base64 でくるんだ chip-tool テキストログ。冗長）を
 /// 応答から落とす。CLAUDE.md ルール 2「素通し禁止」・ルール 3「診断は debug ログ」に
 /// 従い、件数だけ debug に残して構造化結果（`results`）のみ上流へ返す。
+///
+/// ただし `results[i].error` の汎用 `FAILURE` だけでは timeout/unreachable を判別
+/// できず、その分類シグナル（例 discovery timeout の `CHIP Error 0x00000032`）は
+/// この logs にしか出ない（one-shot 経路は chip-tool の stdout/stderr 全体を分類器に
+/// 通すので拾える）。経路で分類が割れるのを防ぐため（#1）、落とす前に logs を
+/// デコードして 1 本のテキストにまとめ、分類専用フィールド `diag` として残す。`diag`
+/// は [`super::server::ensure_ok`] の分類入力にのみ使い、上流の mat スキーマ応答
+/// （server が組み直す body）には載らない。
 fn drop_logs(value: &mut Value) {
     if let Value::Object(map) = value {
         if let Some(logs) = map.remove("logs") {
             let count = logs.as_array().map(|a| a.len()).unwrap_or(0);
             tracing::debug!(count, "dropped chip-tool ws logs from response");
+            let diag = decode_logs(&logs);
+            if !diag.is_empty() {
+                map.insert("diag".into(), Value::String(diag));
+            }
         }
     }
+}
+
+/// ws `logs` 配列を分類用の 1 本のテキストへデコードする。
+///
+/// 実機 chip-tool のエントリは base64 文字列（または `{module,category,message}` で
+/// `message` が base64）。base64 として解せない／非 UTF-8 のエントリは生文字列を
+/// そのまま使う（古い fixture や非 base64 ログにも耐える）。
+fn decode_logs(logs: &Value) -> String {
+    use base64::Engine as _;
+    let Some(arr) = logs.as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for entry in arr {
+        let raw = match entry {
+            Value::String(s) => s.as_str(),
+            Value::Object(_) => entry.get("message").and_then(Value::as_str).unwrap_or(""),
+            _ => "",
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let line = match base64::engine::general_purpose::STANDARD.decode(raw) {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| raw.to_string()),
+            Err(_) => raw.to_string(),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// 確立済みの ws で 1 往復する。
@@ -286,5 +328,64 @@ async fn connect_with_retry(port: u16, within: Duration) -> Result<Ws, MatError>
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use serde_json::json;
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn drop_logs_removes_logs_and_extracts_decoded_diag() {
+        // 実機 chip-tool interactive server の logs は base64 でくるんだテキストログ。
+        // discovery timeout シグナルはここにしか出ない（#1）。落とす前にデコードして
+        // 分類用の `diag` として残し、`logs` 自体は応答から消す。
+        let mut v = json!({
+            "results": [{ "error": "FAILURE" }],
+            "logs": [
+                b64("[DIS] Timeout waiting for mDNS resolution."),
+                b64("[DIS] operational discovery failed: CHIP Error 0x00000032: Timeout"),
+            ],
+        });
+        drop_logs(&mut v);
+        assert!(v.get("logs").is_none(), "verbose logs must be removed");
+        let diag = v
+            .get("diag")
+            .and_then(Value::as_str)
+            .expect("diag attached");
+        assert!(
+            diag.contains("0x00000032") && diag.contains("Timeout waiting for mDNS"),
+            "decoded diag should carry discovery timeout signal, got: {diag}"
+        );
+    }
+
+    #[test]
+    fn drop_logs_tolerates_non_base64_string_entries() {
+        // base64 として解せない素の文字列エントリ（古い fixture 等）でも落ちない。
+        let mut v = json!({ "results": [], "logs": ["dis9hcnt"] });
+        drop_logs(&mut v);
+        assert!(v.get("logs").is_none());
+    }
+
+    #[test]
+    fn drop_logs_handles_object_message_entries() {
+        // logs エントリがオブジェクト {module,category,message(base64)} 形式でも message を拾う。
+        let mut v = json!({
+            "results": [{ "error": "FAILURE" }],
+            "logs": [{ "module": "DIS", "category": "Error",
+                       "message": b64("CHIP Error 0x00000032: Timeout") }],
+        });
+        drop_logs(&mut v);
+        let diag = v
+            .get("diag")
+            .and_then(Value::as_str)
+            .expect("diag attached");
+        assert!(diag.contains("0x00000032"), "got: {diag}");
     }
 }
