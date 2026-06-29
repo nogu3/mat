@@ -36,7 +36,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// commissionable / commissioned ノードを mDNS で探索する。
-    Discover,
+    Discover {
+        /// commissioned ノードのライブ到達性を mDNS で確認し reachable を付与する。
+        #[arg(long)]
+        probe: bool,
+    },
 
     /// fabric への参加（初回 commission / multi-admin join 両対応）。
     Commission {
