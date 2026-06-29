@@ -52,6 +52,38 @@ async fn spawn_fake_ws() -> u16 {
     port
 }
 
+/// オペレーショナル探索の timeout を模した fake。実機 chip-tool 同様、結果は汎用
+/// `{"error":"FAILURE"}` だが、discovery timeout シグナルは base64 でくるんだ `logs`
+/// にしか出ない（#1 の再現形状）。matd がこの logs を分類に活かせるか検証する。
+async fn spawn_fake_ws_discovery_timeout() -> u16 {
+    use base64::Engine as _;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(_line) = msg {
+                        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+                        let resp = json!({
+                            "results": [{ "error": "FAILURE" }],
+                            "logs": [
+                                b64("[DIS] Timeout waiting for mDNS resolution."),
+                                b64("[DIS] operational discovery failed: \
+                                     AddressResolve_DefaultImpl.cpp:124: \
+                                     CHIP Error 0x00000032: Timeout"),
+                            ],
+                        });
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// store を tempdir に作り、node 1 を commission 済みにして path を返す。
 fn make_store() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -180,6 +212,36 @@ async fn read_invoke_ping_and_errors() {
 
     // 未 commission node: node_not_commissioned エラー。
     assert_eq!(resps[4]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
+}
+
+/// #1: matd 経由でも、汎用 `FAILURE` の正体が discovery timeout なら（logs に
+/// `CHIP Error 0x00000032`）`timeout` に分類する。直叩き経路と一致させ、device_rejected
+/// への誤分類を防ぐ。
+#[tokio::test]
+async fn discovery_timeout_failure_is_classified_as_timeout() {
+    let port = spawn_fake_ws_discovery_timeout().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({"id":1,"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"})],
+    )
+    .await;
+
+    assert_eq!(
+        resps[0]["error"]["kind"], "timeout",
+        "discovery timeout must not be misclassified as device_rejected: {}",
+        resps[0]
+    );
+    // logs は応答に素通ししない（CLAUDE.md ルール2）。
+    assert!(resps[0].get("logs").is_none());
+    assert!(
+        resps[0].get("diag").is_none(),
+        "internal diag must not leak"
+    );
 
     handle.abort();
 }

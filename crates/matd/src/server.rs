@@ -441,10 +441,17 @@ fn id_list(result: &Value) -> Vec<u64> {
 /// `{"results":[{"error":"FAILURE"}],"logs":[...]}` を返す。`error` は status 名の
 /// **文字列**（数値ではない）、キー名は `error`。`"FAILURE"` は `classify_failure`
 /// 未一致のため `device_rejected` に落ちる。
+///
+/// `FAILURE` の正体が discovery/resolution timeout のことがある（実体は探索段階で
+/// 落ちている）。そのシグナル（`CHIP Error 0x00000032` 等）は results ではなく ws の
+/// `logs` にしか出ないため、backend が落とす前にデコードして添えた `diag` を
+/// 分類器の stderr 側へ合流させ、直叩き経路と分類を一致させる（#1）。
 fn ensure_ok(result: &Value) -> Result<(), MatError> {
     let Some(arr) = result.get("results").and_then(Value::as_array) else {
         return Ok(());
     };
+    // backend が logs から抽出した分類用テキスト（無ければ空）。
+    let diag = result.get("diag").and_then(Value::as_str).unwrap_or("");
     for entry in arr {
         if let Some(err) = entry.get("error") {
             if is_success_status(err) {
@@ -456,7 +463,7 @@ fn ensure_ok(result: &Value) -> Result<(), MatError> {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| err.to_string());
-            let kind = classify_failure(&detail, "").unwrap_or(ErrorKind::DeviceRejected);
+            let kind = classify_failure(&detail, diag).unwrap_or(ErrorKind::DeviceRejected);
             return Err(MatError::new(
                 kind,
                 format!("chip-tool reported an error in the result: {detail}"),
@@ -522,5 +529,30 @@ mod tests {
             "detail should carry bare status name, got: {}",
             err.detail
         );
+    }
+
+    #[test]
+    fn ensure_ok_reclassifies_failure_with_discovery_timeout_diag() {
+        // #1: matd 経由でも、results の `error` が汎用 `FAILURE` のときは backend が
+        // logs から抽出した分類用テキスト `diag` を参照し、discovery timeout を
+        // device_rejected ではなく timeout に分類する（直叩きと一致させる）。
+        let v = json!({
+            "results": [{ "error": "FAILURE" }],
+            "diag": "[DIS] operational discovery failed: \
+                     AddressResolve_DefaultImpl.cpp:124: CHIP Error 0x00000032: Timeout",
+        });
+        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn ensure_ok_keeps_device_rejected_without_diag_signal() {
+        // diag があっても探索/解決の失敗シグナルが無ければ従来どおり device_rejected。
+        let v = json!({
+            "results": [{ "error": "FAILURE" }],
+            "diag": "[IM] some unrelated chatter",
+        });
+        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
     }
 }
