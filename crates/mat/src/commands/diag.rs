@@ -173,8 +173,8 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
     if deep {
         deep_probes(&mut checks, &mut unavailable, node_id, address, self_cfid);
     } else {
-        unavailable.push(json!({ "check": "ip", "reason": "skipped_no_deep" }));
-        unavailable.push(json!({ "check": "mdns", "reason": "skipped_no_deep" }));
+        unavailable.push(json!({ "check": "ip", "kind": "skipped_no_deep" }));
+        unavailable.push(json!({ "check": "mdns", "kind": "skipped_no_deep" }));
     }
 
     let v = derive_verdict(&checks);
@@ -246,44 +246,72 @@ fn deep_probes(
                 })
             }
             Err(e) => {
-                unavailable.push(json!({ "check": "ip", "kind": e.kind, "detail": e.detail }))
+                let kind_val = probe_error_kind(&e);
+                unavailable.push(json!({ "check": "ip", "kind": kind_val, "detail": e.detail }))
             }
         },
-        None => unavailable.push(json!({ "check": "ip", "reason": "no_address_in_store" })),
+        None => unavailable.push(json!({ "check": "ip", "kind": "no_address_in_store" })),
     }
 
     // mdns: avahi-browse
     match probe_mdns() {
         Ok(instances) => {
-            let any = instances.iter().any(|i| i.node_id == node_id);
-            let self_fabric = self_cfid.as_ref().map(|cfid| {
-                instances
-                    .iter()
-                    .any(|i| i.node_id == node_id && &i.compressed_fabric == cfid)
-            });
+            // アドレスベースで照合（ストアの address が Some の場合）。
+            // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。
+            let addr = address.as_deref();
+            let advertised_any_fabric = match addr {
+                Some(a) => instances.iter().any(|i| i.addresses.iter().any(|x| x == a)),
+                None => instances.iter().any(|i| i.node_id == node_id),
+            };
+            let advertised_self_fabric =
+                match (self_cfid.as_ref(), addr) {
+                    (Some(cfid), Some(a)) => Some(instances.iter().any(|i| {
+                        &i.compressed_fabric == cfid && i.addresses.iter().any(|x| x == a)
+                    })),
+                    _ => None,
+                };
             checks.mdns = Some(MdnsCheck {
-                advertised_self_fabric: self_fabric,
-                advertised_any_fabric: any,
+                advertised_self_fabric,
+                advertised_any_fabric,
             });
         }
-        Err(e) => unavailable.push(json!({ "check": "mdns", "kind": e.kind, "detail": e.detail })),
+        Err(e) => {
+            let kind_val = probe_error_kind(&e);
+            unavailable.push(json!({ "check": "mdns", "kind": kind_val, "detail": e.detail }))
+        }
     }
 }
 
-/// `ping6 -c3 -W2 <addr>` を実行して統計をパース。バイナリは `MAT_PING6_BIN` で上書き可。
+/// プローブエラーの kind を JSON 値に変換。
+/// バイナリが見つからない場合は `"tool_missing"`、その他はエラーの ErrorKind の snake_case。
+fn probe_error_kind(e: &MatError) -> Value {
+    if e.kind == ErrorKind::ChildNotFound {
+        Value::String("tool_missing".to_string())
+    } else {
+        serde_json::to_value(e.kind).unwrap_or(Value::Null)
+    }
+}
+
+/// `ping6 -c 3 -W 2 <addr>` を実行して統計をパース。バイナリは `MAT_PING6_BIN` で上書き可。
 fn probe_ping6(addr: &str) -> Result<mat_core::diag::Ping6Stats, MatError> {
     let bin = std::env::var_os("MAT_PING6_BIN").unwrap_or_else(|| OsString::from("ping6"));
     let out = StdCommand::new(&bin)
         .args(["-c", "3", "-W", "2", addr])
         .output()
         .map_err(|e| {
-            MatError::new(
-                ErrorKind::Other,
-                format!("ping6 spawn failed ({bin:?}): {e}"),
-            )
+            if e.kind() == std::io::ErrorKind::NotFound {
+                MatError::child_not_found(format!("ping6 not found ({bin:?})"))
+            } else {
+                MatError::new(
+                    ErrorKind::Other,
+                    format!("ping6 spawn failed ({bin:?}): {e}"),
+                )
+            }
         })?;
     let text = String::from_utf8_lossy(&out.stdout);
-    tracing::debug!(%text, "ping6 output");
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    tracing::debug!(%text, "ping6 stdout");
+    tracing::debug!(%stderr_text, "ping6 stderr");
     parse_ping6(&text).ok_or_else(|| MatError::parse_error("ping6 output unparseable"))
 }
 
@@ -296,13 +324,19 @@ fn probe_mdns() -> Result<Vec<mat_core::diag::MatterInstance>, MatError> {
         .args(["-rt", "_matter._tcp"])
         .output()
         .map_err(|e| {
-            MatError::new(
-                ErrorKind::Other,
-                format!("avahi-browse spawn failed ({bin:?}): {e}"),
-            )
+            if e.kind() == std::io::ErrorKind::NotFound {
+                MatError::child_not_found(format!("avahi-browse not found ({bin:?})"))
+            } else {
+                MatError::new(
+                    ErrorKind::Other,
+                    format!("avahi-browse spawn failed ({bin:?}): {e}"),
+                )
+            }
         })?;
     let text = String::from_utf8_lossy(&out.stdout);
-    tracing::debug!(%text, "avahi-browse output");
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    tracing::debug!(%text, "avahi-browse stdout");
+    tracing::debug!(%stderr_text, "avahi-browse stderr");
     Ok(parse_avahi_matter(&text))
 }
 
