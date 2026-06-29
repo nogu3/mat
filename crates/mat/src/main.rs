@@ -7,6 +7,7 @@
 mod cli;
 mod commands;
 mod matd_client;
+mod probe;
 mod runner;
 
 use std::process::ExitCode;
