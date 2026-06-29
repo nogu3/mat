@@ -206,6 +206,43 @@ mat diag thread --node 5
 > several times but finishes in one shot. `mat diag` runs only on the direct
 > chip-tool path (not via `--matd`).
 
+`mat diag node --node <node_id>` answers a different question: **why can't I
+control this commissioned node?** It runs layered checks and classifies the
+result into a single `verdict` with the evidence and a recommended action —
+where `mat invoke` would only return a bare `timeout` / `session_failed`.
+
+```bash
+# diag node --node <node_id> [--endpoint EP] [--deep]   (EP defaults to 0)
+mat diag node --node 5            # chip-tool only (fast)
+mat diag node --node 5 --deep     # also probe ping6 + mDNS (avahi-browse)
+```
+
+```json
+{
+  "timestamp": "...", "node_id": 5, "endpoint": 0,
+  "verdict": "link_starved",
+  "summary": "IP reachable but not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.",
+  "checks": {
+    "ip":   { "ok": true, "loss_pct": 50, "rtt_ms": 168.0, "method": "ping6" },
+    "mdns": { "advertised_self_fabric": false, "advertised_any_fabric": false },
+    "operational": { "resolved": false, "kind": "timeout" },
+    "thread": { "neighbor_count": 1, "best_lqi": 3, "routing_role": 2 }
+  },
+  "recommendation": "Improve the Thread link (move the device near a router) or wait; do NOT factory reset — the fabric is intact."
+}
+```
+
+> `verdict` is one of `ok`, `ip_unreachable`, `link_starved`, `fabric_missing`,
+> `not_advertised`, `unresolvable`, `session_failed`, `device_rejected`,
+> `unknown`. The default (chip-tool only) path can't tell `link_starved` (weak
+> Thread link, SRP not registered — **the fabric is intact**) apart from
+> `fabric_missing` (the device dropped our fabric); `--deep` adds the ping6 and
+> mDNS evidence that distinguishes them. Like `diag thread` it returns **partial
+> results** (skipped/failed checks go under `unavailable`) and **always exits
+> `0`** with a verdict, even when the node is fully unreachable — the value is in
+> the classification, not an exit code. `--deep` shells out to `ping6` and
+> `avahi-browse` (override with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
+
 ### Multi-admin share
 
 To share a `mat`-owned device with another controller (Alexa / Apple / Google),
