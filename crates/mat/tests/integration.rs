@@ -710,3 +710,62 @@ fn diag_node_deep_missing_probe_binary() {
         .stdout(predicate::str::contains("\"tool_missing\""))
         .stdout(predicate::str::contains("\"verdict\""));
 }
+
+// ── discover --probe ────────────────────────────────────────────────────────
+
+#[test]
+fn discover_probe_reports_reachable_with_live_address() {
+    // node 5 を commission 済み（台帳 address = 192.0.2.10）。avahi が node 5 を
+    // 別アドレス 192.0.2.99 で広告 → reachable:true、address はライブ値に更新。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.99")
+        .args(["discover", "--probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"commissioned\""))
+        .stdout(predicate::str::contains("\"reachable\":true"))
+        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""));
+}
+
+#[test]
+fn discover_probe_reports_unreachable_and_stale() {
+    // avahi に node 5 の広告なし（既定出力は node FF のみ）→ reachable:false、
+    // stale:true、address は台帳の据え置き値 192.0.2.10。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .args(["discover", "--probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"reachable\":false"))
+        .stdout(predicate::str::contains("\"stale\":true"))
+        .stdout(predicate::str::contains("\"address\":\"192.0.2.10\""));
+}
+
+#[test]
+fn discover_without_probe_omits_reachable() {
+    // --probe 無しは従来出力（reachable/stale を付与しない）。後方互換。
+    let store = store_with_node5();
+    mat(store.path())
+        .arg("discover")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"commissioned\""))
+        .stdout(predicate::str::contains("\"reachable\"").not())
+        .stdout(predicate::str::contains("\"stale\"").not());
+}
+
+#[test]
+fn discover_probe_with_missing_avahi_reports_reachable_null() {
+    // avahi-browse バイナリ不在 → プローブ不能。reachable:null、stdout は純 JSON、
+    // discover 全体は成功（commissionable 探索は別経路で有効なため）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_AVAHI_BROWSE_BIN", "/nonexistent/avahi-browse-binary")
+        .args(["discover", "--probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"reachable\":null"));
+}
