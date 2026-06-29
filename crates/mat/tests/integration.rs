@@ -636,3 +636,26 @@ fn diag_node_reject_is_device_rejected_exit0() {
         .success()
         .stdout(predicate::str::contains("\"verdict\":\"device_rejected\""));
 }
+
+fn fake_ping6() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ping6.sh")
+}
+fn fake_avahi() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-avahi-browse.sh")
+}
+
+#[test]
+fn diag_node_deep_link_starved() {
+    // operational timeout + ip 生存(50%ロス) + mDNS に node5 広告なし → link_starved。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"link_starved\""))
+        .stdout(predicate::str::contains("\"ip\""))
+        .stdout(predicate::str::contains("\"loss_pct\":50"));
+}

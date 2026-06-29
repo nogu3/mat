@@ -15,13 +15,16 @@
 //! 区別**する（メッシュ分析でこの差は致命的）。全属性が失敗（＝完全不達）なら最初の
 //! 失敗 kind をエラーで返し、`unreachable` / `timeout` を伝播する。
 
+use std::ffi::OsString;
 use std::path::Path;
+use std::process::Command as StdCommand;
 
 use serde_json::{json, Map, Value};
 
 use crate::runner::ChipTool;
 use mat_core::diag::{
-    derive_verdict, parse_compressed_fabric_id, Checks, OperationalCheck, ThreadCheck,
+    derive_verdict, parse_avahi_matter, parse_compressed_fabric_id, parse_ping6, Checks, IpCheck,
+    MdnsCheck, OperationalCheck, ThreadCheck,
 };
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
@@ -223,16 +226,84 @@ fn read_thread_signal(
     })
 }
 
-/// `--deep` の補助プローブ（ping6 / mDNS）。Task 7 で実装。
+/// `--deep` の補助プローブ。ping6（IP生存）と avahi-browse（mDNS広告）を実施。
 fn deep_probes(
-    _checks: &mut Checks,
+    checks: &mut Checks,
     unavailable: &mut Vec<Value>,
-    _node_id: u64,
-    _address: Option<String>,
-    _self_cfid: Option<String>,
+    node_id: u64,
+    address: Option<String>,
+    self_cfid: Option<String>,
 ) {
-    unavailable.push(json!({ "check": "ip", "reason": "deep_not_implemented" }));
-    unavailable.push(json!({ "check": "mdns", "reason": "deep_not_implemented" }));
+    // ip: ping6
+    match address.as_deref() {
+        Some(addr) => match probe_ping6(addr) {
+            Ok(stats) => {
+                checks.ip = Some(IpCheck {
+                    ok: stats.loss_pct < 100,
+                    loss_pct: stats.loss_pct,
+                    rtt_ms: stats.rtt_ms,
+                    method: "ping6",
+                })
+            }
+            Err(e) => {
+                unavailable.push(json!({ "check": "ip", "kind": e.kind, "detail": e.detail }))
+            }
+        },
+        None => unavailable.push(json!({ "check": "ip", "reason": "no_address_in_store" })),
+    }
+
+    // mdns: avahi-browse
+    match probe_mdns() {
+        Ok(instances) => {
+            let any = instances.iter().any(|i| i.node_id == node_id);
+            let self_fabric = self_cfid.as_ref().map(|cfid| {
+                instances
+                    .iter()
+                    .any(|i| i.node_id == node_id && &i.compressed_fabric == cfid)
+            });
+            checks.mdns = Some(MdnsCheck {
+                advertised_self_fabric: self_fabric,
+                advertised_any_fabric: any,
+            });
+        }
+        Err(e) => unavailable.push(json!({ "check": "mdns", "kind": e.kind, "detail": e.detail })),
+    }
+}
+
+/// `ping6 -c3 -W2 <addr>` を実行して統計をパース。バイナリは `MAT_PING6_BIN` で上書き可。
+fn probe_ping6(addr: &str) -> Result<mat_core::diag::Ping6Stats, MatError> {
+    let bin = std::env::var_os("MAT_PING6_BIN").unwrap_or_else(|| OsString::from("ping6"));
+    let out = StdCommand::new(&bin)
+        .args(["-c", "3", "-W", "2", addr])
+        .output()
+        .map_err(|e| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("ping6 spawn failed ({bin:?}): {e}"),
+            )
+        })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    tracing::debug!(%text, "ping6 output");
+    parse_ping6(&text).ok_or_else(|| MatError::parse_error("ping6 output unparseable"))
+}
+
+/// `avahi-browse -rt _matter._tcp` を実行して `_matter._tcp` インスタンスを得る。
+/// バイナリは `MAT_AVAHI_BROWSE_BIN` で上書き可。
+fn probe_mdns() -> Result<Vec<mat_core::diag::MatterInstance>, MatError> {
+    let bin =
+        std::env::var_os("MAT_AVAHI_BROWSE_BIN").unwrap_or_else(|| OsString::from("avahi-browse"));
+    let out = StdCommand::new(&bin)
+        .args(["-rt", "_matter._tcp"])
+        .output()
+        .map_err(|e| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("avahi-browse spawn failed ({bin:?}): {e}"),
+            )
+        })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    tracing::debug!(%text, "avahi-browse output");
+    Ok(parse_avahi_matter(&text))
 }
 
 /// `chip-tool threadnetworkdiagnostics read <attr> <node> <ep>` を実行し stdout を返す。
