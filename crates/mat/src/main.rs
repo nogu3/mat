@@ -38,7 +38,7 @@ fn main() -> ExitCode {
     let store_path = Store::locate(args.store);
 
     let result = match &args.command {
-        Command::Discover => commands::discover::run(&store_path),
+        Command::Discover { probe } => commands::discover::run(&store_path, *probe),
         Command::Commission {
             target,
             setup_code,

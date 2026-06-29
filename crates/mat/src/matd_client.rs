@@ -153,7 +153,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             }),
         },
         // matd は warm CASE セッション層。これらは chip-tool 直経路でしか実行できない。
-        Command::Discover => return Err(unsupported("discover")),
+        Command::Discover { .. } => return Err(unsupported("discover")),
         Command::Commission { .. } => return Err(unsupported("commission")),
         Command::OpenWindow { .. } => return Err(unsupported("open-window")),
         Command::Diag { .. } => return Err(unsupported("diag")),
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn discover_and_commission_are_unsupported() {
-        assert!(to_op(&Command::Discover).is_err());
+        assert!(to_op(&Command::Discover { probe: false }).is_err());
         assert!(to_op(&Command::Commission {
             target: "192.0.2.1".into(),
             setup_code: "MT:DUMMY".into(),
