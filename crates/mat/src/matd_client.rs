@@ -1,4 +1,5 @@
-//! mat → matd クライアント経路（`--matd` / `MAT_MATD_SOCKET` / `MAT_MATD` 指定時）。
+//! mat → matd クライアント経路（`--matd` フラグ or `MAT_MATD=truthy` で有効化。
+//! `MAT_MATD_SOCKET` は socket パス指定のみで単独では乗らない）。
 //!
 //! matd は unix socket 上で newline-delimited JSON を喋る（1 行 = 1 リクエスト = 1
 //! レスポンス）。ここはサブコマンドを matd の op JSON に変換して 1 行送り、返ってきた
@@ -21,29 +22,40 @@ use mat_core::socket::default_socket_path;
 
 /// matd 経由で実行するか、するならどの socket かを決める（純粋関数; env は注入）。
 ///
-/// 優先順: `--matd <path>` > `--matd`（既定パス）> `MAT_MATD_SOCKET=<path>` >
-/// `MAT_MATD=<truthy>`（既定パス）> どれも無し（= 直 chip-tool 経路、`None`）。
+/// 有効化（matd 経路に乗せるか）と socket パスの選択は別軸。
+/// - 有効化トリガーは `--matd` フラグ or `MAT_MATD=<truthy>` の**どちらか**のみ。
+/// - `MAT_MATD_SOCKET` は「どの socket か」を指定するだけで、**単独では何も起こさない**
+///   （値が設定されていても、有効化されていなければ直 chip-tool 経路 `None`）。
+///
+/// socket パスの優先順: `--matd <path>`（明示パス）> `MAT_MATD_SOCKET=<path>` >
+/// 既定パス。
 pub fn resolve_socket(
     flag: &Option<Option<PathBuf>>,
     env_socket: Option<OsString>,
     env_enable: Option<OsString>,
 ) -> Option<PathBuf> {
     match flag {
-        // --matd <path>
+        // --matd <path> → 明示パスが最優先。
         Some(Some(path)) => Some(path.clone()),
-        // --matd（値省略）→ 既定パス
-        Some(None) => Some(default_socket_path()),
-        // フラグ無し → env で opt-in
+        // --matd（値省略）→ 有効化。パスは MAT_MATD_SOCKET があればそれ、無ければ既定。
+        Some(None) => Some(socket_from_env_or_default(env_socket)),
+        // フラグ無し → MAT_MATD が truthy のときだけ有効化。MAT_MATD_SOCKET 単独では乗らない。
         None => {
-            if let Some(s) = env_socket.filter(|s| !s.is_empty()) {
-                return Some(PathBuf::from(s));
-            }
             if env_enable.as_deref().is_some_and(is_truthy) {
-                return Some(default_socket_path());
+                Some(socket_from_env_or_default(env_socket))
+            } else {
+                None
             }
-            None
         }
     }
+}
+
+/// 有効化済みのときに使う socket パスを決める: `MAT_MATD_SOCKET`（非空）> 既定パス。
+fn socket_from_env_or_default(env_socket: Option<OsString>) -> PathBuf {
+    env_socket
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path)
 }
 
 /// `MAT_MATD` の真偽判定。`1` / `true` / `yes` / `on`（大小無視）を有効とみなす。
@@ -254,7 +266,7 @@ mod tests {
         let some_path = PathBuf::from("/x/y.sock");
         let dflt = default_socket_path();
 
-        // --matd <path> が最優先。
+        // --matd <path> が最優先（MAT_MATD_SOCKET より明示パス）。
         assert_eq!(
             resolve_socket(
                 &Some(Some(some_path.clone())),
@@ -263,27 +275,29 @@ mod tests {
             ),
             Some(some_path)
         );
-        // --matd（値省略）→ 既定パス。
+        // --matd（値省略）→ 有効化。MAT_MATD_SOCKET が無ければ既定パス。
         assert_eq!(resolve_socket(&Some(None), None, None), Some(dflt.clone()));
-        // フラグ無し + MAT_MATD_SOCKET → そのパス。
+        // --matd（値省略）+ MAT_MATD_SOCKET → そのパスで有効化。
         assert_eq!(
-            resolve_socket(&None, Some("/env.sock".into()), None),
+            resolve_socket(&Some(None), Some("/env.sock".into()), None),
             Some(PathBuf::from("/env.sock"))
         );
-        // フラグ無し + MAT_MATD=1 → 既定パス。
+        // フラグ無し + MAT_MATD=1 → 既定パスで有効化。
         assert_eq!(
             resolve_socket(&None, None, Some("1".into())),
             Some(dflt.clone())
         );
-        // MAT_MATD_SOCKET は MAT_MATD より優先。
+        // フラグ無し + MAT_MATD=1 + MAT_MATD_SOCKET → そのパスで有効化。
         assert_eq!(
             resolve_socket(&None, Some("/env.sock".into()), Some("1".into())),
             Some(PathBuf::from("/env.sock"))
         );
-        // 何も無し → 直経路（None）。空文字 socket / falsy enable も無効。
+        // ★ MAT_MATD_SOCKET 単独（有効化トリガー無し）→ 直経路（None）。値があっても乗らない。
+        assert_eq!(resolve_socket(&None, Some("/env.sock".into()), None), None);
+        // 何も無し → 直経路（None）。falsy enable も無効。
         assert_eq!(resolve_socket(&None, None, None), None);
         assert_eq!(
-            resolve_socket(&None, Some("".into()), Some("0".into())),
+            resolve_socket(&None, Some("/env.sock".into()), Some("0".into())),
             None
         );
     }
