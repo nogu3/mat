@@ -23,8 +23,8 @@ use serde_json::{json, Map, Value};
 
 use crate::runner::ChipTool;
 use mat_core::diag::{
-    derive_verdict, parse_avahi_matter, parse_compressed_fabric_id, parse_ping6, Checks, IpCheck,
-    MdnsCheck, OperationalCheck, ThreadCheck,
+    derive_verdict, parse_compressed_fabric_id, parse_ping6, Checks, IpCheck, MdnsCheck,
+    OperationalCheck, ThreadCheck,
 };
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
@@ -254,7 +254,7 @@ fn deep_probes(
     }
 
     // mdns: avahi-browse
-    match probe_mdns() {
+    match crate::probe::mdns() {
         Ok(instances) => {
             // アドレスベースで照合（ストアの address が Some の場合）。
             // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。
@@ -313,31 +313,6 @@ fn probe_ping6(addr: &str) -> Result<mat_core::diag::Ping6Stats, MatError> {
     tracing::debug!(%text, "ping6 stdout");
     tracing::debug!(%stderr_text, "ping6 stderr");
     parse_ping6(&text).ok_or_else(|| MatError::parse_error("ping6 output unparseable"))
-}
-
-/// `avahi-browse -rt _matter._tcp` を実行して `_matter._tcp` インスタンスを得る。
-/// バイナリは `MAT_AVAHI_BROWSE_BIN` で上書き可。
-fn probe_mdns() -> Result<Vec<mat_core::diag::MatterInstance>, MatError> {
-    let bin =
-        std::env::var_os("MAT_AVAHI_BROWSE_BIN").unwrap_or_else(|| OsString::from("avahi-browse"));
-    let out = StdCommand::new(&bin)
-        .args(["-rt", "_matter._tcp"])
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                MatError::child_not_found(format!("avahi-browse not found ({bin:?})"))
-            } else {
-                MatError::new(
-                    ErrorKind::Other,
-                    format!("avahi-browse spawn failed ({bin:?}): {e}"),
-                )
-            }
-        })?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let stderr_text = String::from_utf8_lossy(&out.stderr);
-    tracing::debug!(%text, "avahi-browse stdout");
-    tracing::debug!(%stderr_text, "avahi-browse stderr");
-    Ok(parse_avahi_matter(&text))
 }
 
 /// `chip-tool threadnetworkdiagnostics read <attr> <node> <ep>` を実行し stdout を返す。
