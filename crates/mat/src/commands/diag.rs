@@ -153,10 +153,12 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
         node_id.to_string(),
         "0".to_string(),
     ])?; // ChildNotFound はここで伝播（診断不能）。
-         // 自 fabric CFID: 第1候補 = operational discovery のインスタンス名 `<CFID>-<NodeId>`、
-         // 第2候補 = `Compressed FabricId 0x...` 行。どちらも op read の stderr から拾う。
-    let self_cfid = parse_operational_instance_cfid(&op_out.stderr, node_id)
-        .or_else(|| parse_compressed_fabric_id(&op_out.stderr));
+         // chip-tool は CFID シグナル（[FP] Compressed FabricId 行 / [DIS] の <CFID>-<NodeId>
+         // インスタンス名）を stdout に出す（実機実測; stderr は空のことがある）。fake は stderr
+         // に出すため、両ストリームを結合して走査しバックエンド差に頑健化する。
+    let op_logs = format!("{}\n{}", op_out.stdout, op_out.stderr);
+    let self_cfid = parse_operational_instance_cfid(&op_logs, node_id)
+        .or_else(|| parse_compressed_fabric_id(&op_logs));
     let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
     let resolved = op_kind.is_none() && op_out.success();
     checks.operational = Some(OperationalCheck {
