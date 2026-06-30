@@ -751,6 +751,26 @@ fn diag_node_deep_cfid_unavailable_when_no_cfid_logs() {
         .stdout(predicate::str::contains("\"advertised_self_fabric\"").not());
 }
 
+#[test]
+fn diag_node_deep_self_fabric_via_stdout_logs() {
+    // 実 chip-tool は CFID シグナルを stdout に出す（stderr ではなく）。
+    // FAKE_CHIP_CFID_STDOUT=1 でその実機条件を再現。mat が stdout も走査することを保証
+    // （stderr だけを見ていた旧コードでは self_cfid=None になり advertised_self_fabric が
+    // 出ず、このテストは失敗する → 実機バグの回帰ガード）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("FAKE_CHIP_CFID_STDOUT", "1")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
+        .env("FAKE_AVAHI_FABRIC", "00AABB1122CC3344")
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"advertised_self_fabric\":true"));
+}
+
 // ── discover --probe ────────────────────────────────────────────────────────
 
 #[test]

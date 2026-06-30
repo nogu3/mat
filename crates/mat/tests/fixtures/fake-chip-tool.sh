@@ -16,15 +16,18 @@ fi
 
 # 自 fabric CFID のダミー出力。第1候補 = operational discovery のインスタンス名
 # `<CFID>-<NodeId>`、第2候補 = `Compressed FabricId 0x...` 行。テストで個別に抑止可能。
-#   FAKE_CHIP_NO_DIS_CFID=1 → インスタンス名行のみ抑止（第2候補の回帰テスト用）
-#   FAKE_CHIP_NO_FP_CFID=1  → [FP] 行のみ抑止（[DIS] 第1候補経路の分離テスト用）
-#   FAKE_CHIP_NO_CFID=1     → 両方抑止（cfid_unavailable のテスト用）
+#   FAKE_CHIP_NO_DIS_CFID=1  → インスタンス名行のみ抑止（第2候補の回帰テスト用）
+#   FAKE_CHIP_NO_FP_CFID=1   → [FP] 行のみ抑止（[DIS] 第1候補経路の分離テスト用）
+#   FAKE_CHIP_NO_CFID=1      → 両方抑止（cfid_unavailable のテスト用）
+#   FAKE_CHIP_CFID_STDOUT=1  → CFID 行を stdout に出す（実 chip-tool 同様; 既定は stderr）
+# CFID 行の出力先: 既定 stderr。FAKE_CHIP_CFID_STDOUT=1 で stdout（実 chip-tool 同様）。
+emit_cfid() { if [ -n "$FAKE_CHIP_CFID_STDOUT" ]; then echo "$1"; else echo "$1" >&2; fi; }
 if [ -z "$FAKE_CHIP_NO_CFID" ]; then
   if [ -z "$FAKE_CHIP_NO_DIS_CFID" ]; then
-    echo "[DIS] OperationalSessionSetup[1:0000000000000005]: resolved instance 00AABB1122CC3344-0000000000000005._matter._tcp.local." >&2
+    emit_cfid "[DIS] OperationalSessionSetup[1:0000000000000005]: resolved instance 00AABB1122CC3344-0000000000000005._matter._tcp.local."
   fi
   if [ -z "$FAKE_CHIP_NO_FP_CFID" ]; then
-    echo "[FP] Compressed FabricId 0x00AABB1122CC3344, FabricId 0x1" >&2
+    emit_cfid "[FP] Compressed FabricId 0x00AABB1122CC3344, FabricId 0x1"
   fi
 fi
 
