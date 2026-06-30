@@ -153,8 +153,8 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
         node_id.to_string(),
         "0".to_string(),
     ])?; // ChildNotFound はここで伝播（診断不能）。
-    // 自 fabric CFID: 第1候補 = operational discovery のインスタンス名 `<CFID>-<NodeId>`、
-    // 第2候補 = `Compressed FabricId 0x...` 行。どちらも op read の stderr から拾う。
+         // 自 fabric CFID: 第1候補 = operational discovery のインスタンス名 `<CFID>-<NodeId>`、
+         // 第2候補 = `Compressed FabricId 0x...` 行。どちらも op read の stderr から拾う。
     let self_cfid = parse_operational_instance_cfid(&op_out.stderr, node_id)
         .or_else(|| parse_compressed_fabric_id(&op_out.stderr));
     let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
