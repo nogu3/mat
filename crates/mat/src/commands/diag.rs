@@ -270,6 +270,13 @@ fn deep_probes(
                     })),
                     _ => None,
                 };
+            if self_cfid.is_none() {
+                unavailable.push(json!({
+                    "check": "mdns_self_fabric",
+                    "kind": "cfid_unavailable",
+                    "detail": "could not obtain self compressed-fabric-id from chip-tool operational logs"
+                }));
+            }
             checks.mdns = Some(MdnsCheck {
                 advertised_self_fabric,
                 advertised_any_fabric,
