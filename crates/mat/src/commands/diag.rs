@@ -23,8 +23,8 @@ use serde_json::{json, Map, Value};
 
 use crate::runner::ChipTool;
 use mat_core::diag::{
-    derive_verdict, parse_compressed_fabric_id, parse_ping6, Checks, IpCheck, MdnsCheck,
-    OperationalCheck, ThreadCheck,
+    derive_verdict, parse_compressed_fabric_id, parse_operational_instance_cfid, parse_ping6,
+    Checks, IpCheck, MdnsCheck, OperationalCheck, ThreadCheck,
 };
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
@@ -144,7 +144,6 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
 
     let mut checks = Checks::default();
     let mut unavailable: Vec<Value> = Vec::new();
-    let mut self_cfid: Option<String> = None;
 
     // operational: 軽量な descriptor read（ep0、全ノード共通）で解決を試す。
     let op_out = chip.run([
@@ -154,9 +153,10 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
         node_id.to_string(),
         "0".to_string(),
     ])?; // ChildNotFound はここで伝播（診断不能）。
-    if let Some(cfid) = parse_compressed_fabric_id(&op_out.stderr) {
-        self_cfid = Some(cfid);
-    }
+    // 自 fabric CFID: 第1候補 = operational discovery のインスタンス名 `<CFID>-<NodeId>`、
+    // 第2候補 = `Compressed FabricId 0x...` 行。どちらも op read の stderr から拾う。
+    let self_cfid = parse_operational_instance_cfid(&op_out.stderr, node_id)
+        .or_else(|| parse_compressed_fabric_id(&op_out.stderr));
     let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
     let resolved = op_kind.is_none() && op_out.success();
     checks.operational = Some(OperationalCheck {
