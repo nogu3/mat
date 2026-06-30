@@ -14,8 +14,16 @@ if [ -n "$FAKE_CHIP_ARGS_FILE" ]; then
   echo "$*" > "$FAKE_CHIP_ARGS_FILE"
 fi
 
-# parse_compressed_fabric_id が自 fabric CFID を拾えるようにダミー行を出す。
-echo "[FP] Compressed FabricId 0x00AABB1122CC3344, FabricId 0x1" >&2
+# 自 fabric CFID のダミー出力。第1候補 = operational discovery のインスタンス名
+# `<CFID>-<NodeId>`、第2候補 = `Compressed FabricId 0x...` 行。テストで個別に抑止可能。
+#   FAKE_CHIP_NO_DIS_CFID=1 → インスタンス名行のみ抑止（第2候補の回帰テスト用）
+#   FAKE_CHIP_NO_CFID=1     → 両方抑止（cfid_unavailable のテスト用）
+if [ -z "$FAKE_CHIP_NO_CFID" ]; then
+  if [ -z "$FAKE_CHIP_NO_DIS_CFID" ]; then
+    echo "[DIS] OperationalSessionSetup[1:0000000000000005]: resolved instance 00AABB1122CC3344-0000000000000005._matter._tcp.local." >&2
+  fi
+  echo "[FP] Compressed FabricId 0x00AABB1122CC3344, FabricId 0x1" >&2
+fi
 
 # read/write/invoke/describe 共通の失敗注入。success 以外なら該当ログを吐いて非 0 終了。
 emit_failure() {

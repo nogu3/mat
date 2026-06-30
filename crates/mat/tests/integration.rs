@@ -711,6 +711,43 @@ fn diag_node_deep_missing_probe_binary() {
         .stdout(predicate::str::contains("\"verdict\""));
 }
 
+#[test]
+fn diag_node_deep_self_fabric_via_instance_name() {
+    // fake-chip-tool は [DIS] インスタンス名 00AABB1122CC3344-0000000000000005 を出す。
+    // avahi も同 CFID・192.0.2.10 で広告 → advertised_self_fabric=true。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
+        .env("FAKE_AVAHI_FABRIC", "00AABB1122CC3344")
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"advertised_self_fabric\":true"));
+}
+
+#[test]
+fn diag_node_deep_cfid_unavailable_when_no_cfid_logs() {
+    // CFID 行を両方とも抑止 → self_cfid 取得不能。advertised_any_fabric は出るが
+    // advertised_self_fabric は省略、unavailable に cfid_unavailable が出る。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_CHIP_MODE", "timeout")
+        .env("FAKE_CHIP_NO_CFID", "1")
+        .env("MAT_PING6_BIN", fake_ping6())
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
+        .env("FAKE_AVAHI_FABRIC", "0011223344556677")
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cfid_unavailable\""))
+        .stdout(predicate::str::contains("\"advertised_any_fabric\":true"))
+        .stdout(predicate::str::contains("\"advertised_self_fabric\"").not());
+}
+
 // ── discover --probe ────────────────────────────────────────────────────────
 
 #[test]
