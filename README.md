@@ -271,6 +271,15 @@ mat diag node --node 5 --deep     # also probe ping6 + mDNS (avahi-browse)
 > `0`** with a verdict, even when the node is fully unreachable — the value is in
 > the classification, not an exit code. `--deep` shells out to `ping6` and
 > `avahi-browse` (override with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
+>
+> `mdns.advertised_self_fabric` is whether the node advertises on **our** fabric
+> specifically (vs. `advertised_any_fabric`, which is any fabric). It needs our
+> compressed-fabric-id, which `mat` reads from the operational read's `chip-tool`
+> logs — preferring the resolved `<cfid>-<node>` instance name, falling back to
+> the `Compressed FabricId` line (both streams are scanned, since `chip-tool`
+> logs to stdout). When neither is available the field is omitted and a
+> `{"check": "mdns_self_fabric", "kind": "cfid_unavailable"}` entry appears under
+> `unavailable`.
 
 ### Multi-admin share
 
