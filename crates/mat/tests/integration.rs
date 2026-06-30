@@ -713,11 +713,14 @@ fn diag_node_deep_missing_probe_binary() {
 
 #[test]
 fn diag_node_deep_self_fabric_via_instance_name() {
-    // fake-chip-tool は [DIS] インスタンス名 00AABB1122CC3344-0000000000000005 を出す。
+    // [DIS] インスタンス名経路の分離テスト。FAKE_CHIP_NO_FP_CFID=1 で [FP] 行を抑止し、
+    // CFID の唯一のソースを [DIS] インスタンス名 00AABB1122CC3344-0000000000000005 に固定。
     // avahi も同 CFID・192.0.2.10 で広告 → advertised_self_fabric=true。
+    // [FP] フォールバックが有効では [DIS] パーサ削除でもテストが通ってしまうため、この分離が必須。
     let store = store_with_node5();
     mat(store.path())
         .env("FAKE_CHIP_MODE", "timeout")
+        .env("FAKE_CHIP_NO_FP_CFID", "1")
         .env("MAT_PING6_BIN", fake_ping6())
         .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
         .env("FAKE_AVAHI_ADDR", "192.0.2.10")
