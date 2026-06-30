@@ -188,6 +188,34 @@ pub fn parse_compressed_fabric_id(stderr: &str) -> Option<String> {
     (hex.len() >= 8).then(|| hex.to_ascii_uppercase())
 }
 
+/// chip-tool の operational discovery ログ（`[DIS]` 行など）から、対象 `node_id` 向けに
+/// 解決されたインスタンス名 `<CFID>-<NodeId>` を探して自 fabric の compressed id を返す。
+///
+/// stderr 全体を走査し、空白 / `;` / `,` 区切りの各 token の先頭（`.` より前）が
+/// `<16hex>-<16hex>` 形で、後半（NodeId）が `node_id` に一致するものの前半（CFID、
+/// 大文字正規化）を返す。複数あれば最初の一致。無ければ `None`。
+/// 第1候補として使う理由: operational read 自体が必ず通る解決経路のログで、
+/// fabric init の `Compressed FabricId` 行より出やすい。
+pub fn parse_operational_instance_cfid(stderr: &str, node_id: u64) -> Option<String> {
+    for line in stderr.lines() {
+        for tok in line.split(|c: char| c.is_whitespace() || c == ';' || c == ',') {
+            let head = tok.split('.').next().unwrap_or(tok);
+            if let Some((fab, node)) = head.split_once('-') {
+                let fab_ok = fab.len() == 16 && fab.bytes().all(|b| b.is_ascii_hexdigit());
+                let node_ok = node.len() == 16 && node.bytes().all(|b| b.is_ascii_hexdigit());
+                if fab_ok && node_ok {
+                    if let Ok(n) = u64::from_str_radix(node, 16) {
+                        if n == node_id {
+                            return Some(fab.to_ascii_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// thread 診断 or ip loss から「弱リンク」か判定。
 fn weak_link(checks: &Checks) -> bool {
     let thread_weak = checks
@@ -560,5 +588,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(derive_verdict(&c).verdict, VerdictKind::Unknown);
+    }
+
+    #[test]
+    fn operational_instance_cfid_matches_node() {
+        let stderr = "[DIS] OperationalSessionSetup[1:0000000000000005]: resolved instance \
+                      00AABB1122CC3344-0000000000000005._matter._tcp.local.\n";
+        assert_eq!(
+            parse_operational_instance_cfid(stderr, 5),
+            Some("00AABB1122CC3344".to_string())
+        );
+    }
+
+    #[test]
+    fn operational_instance_cfid_lowercase_is_normalized() {
+        let stderr = "00aabb1122cc3344-0000000000000005._matter._tcp\n";
+        assert_eq!(
+            parse_operational_instance_cfid(stderr, 5),
+            Some("00AABB1122CC3344".to_string())
+        );
+    }
+
+    #[test]
+    fn operational_instance_cfid_ignores_other_node() {
+        let stderr = "[DIS] ... 00AABB1122CC3344-0000000000000009._matter._tcp ...\n";
+        assert_eq!(parse_operational_instance_cfid(stderr, 5), None);
+    }
+
+    #[test]
+    fn operational_instance_cfid_absent_returns_none() {
+        // fabricIndex:nodeid（コロン区切り、16桁hexでない左辺）は誤マッチしない。
+        let stderr = "[DIS] OperationalSessionSetup[1:0000000000000005]: looking up\n";
+        assert_eq!(parse_operational_instance_cfid(stderr, 5), None);
     }
 }
