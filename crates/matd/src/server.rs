@@ -238,7 +238,11 @@ async fn simple_op(
             "node_id": node_id, "endpoint": endpoint,
             "cluster": "onoff", "command": "off", "status": "success",
         }),
-        Op::Ping | Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Shutdown => {
+        Op::Ping
+        | Op::Describe { .. }
+        | Op::GroupProvision { .. }
+        | Op::GroupInvoke { .. }
+        | Op::Shutdown => {
             unreachable!("handled by run_op")
         }
     };
