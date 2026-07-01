@@ -388,6 +388,20 @@ mat describe --node 5
 mat group invoke --group 1 --cluster onoff --command on
 ```
 
+Stop the daemon with `matd stop` — do **not** `kill` it, which orphans the child
+`chip-tool` holding the ws port. `matd stop` sends a shutdown request over the
+same socket and triggers a graceful teardown (child `chip-tool` killed, socket
+removed):
+
+```bash
+matd stop                             # default socket
+matd stop --socket /run/mat/matd.sock
+```
+
+Only one `matd` runs per socket: startup takes an exclusive `flock` on
+`<socket>.lock`, so a second launch exits `1` with `matd already running (lock
+held at ...)` instead of hijacking the socket or spawning a rival `chip-tool`.
+
 - Routing is **enabled** only by `--matd` (the flag) or `MAT_MATD=<truthy>`.
   `MAT_MATD_SOCKET` just selects *which* socket — on its own it does **not** route
   through matd, even when set. Unset/disabled = the direct chip-tool path as before.
