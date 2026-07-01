@@ -25,6 +25,7 @@ pub fn acquire(socket_path: &Path) -> Result<File, MatError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| {
             MatError::new(

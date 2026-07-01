@@ -4,6 +4,6 @@
 //! テストから見えないため、ロジックはここに公開し `main.rs` は薄い起動層に保つ。
 
 pub mod backend;
+pub mod lock;
 pub mod protocol;
 pub mod server;
-pub mod lock;
