@@ -34,3 +34,5 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
