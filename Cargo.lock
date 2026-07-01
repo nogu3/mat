@@ -551,6 +551,7 @@ dependencies = [
  "clap",
  "futures-util",
  "mat-core",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
