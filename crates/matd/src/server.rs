@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Notify;
 
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
@@ -48,6 +49,9 @@ pub async fn serve(
         })
     };
 
+    // shutdown op（`matd stop`）で serve ループを抜けるための通知。
+    let shutdown = Arc::new(Notify::new());
+
     let store_path = Arc::new(store_path);
     loop {
         tokio::select! {
@@ -55,14 +59,19 @@ pub async fn serve(
                 let (stream, _addr) = accepted?;
                 let backend = Arc::clone(&backend);
                 let store_path = Arc::clone(&store_path);
+                let shutdown = Arc::clone(&shutdown);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, backend, store_path).await {
+                    if let Err(e) = handle_conn(stream, backend, store_path, shutdown).await {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
                 });
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received Ctrl-C, shutting down");
+                break;
+            }
+            _ = shutdown.notified() => {
+                tracing::info!("received shutdown op, shutting down");
                 break;
             }
         }
@@ -72,6 +81,7 @@ pub async fn serve(
     reaper.abort();
     backend.shutdown().await;
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(crate::lock::lock_path(socket_path));
     Ok(())
 }
 
@@ -80,6 +90,7 @@ async fn handle_conn(
     stream: UnixStream,
     backend: Arc<ChipToolBackend>,
     store_path: Arc<PathBuf>,
+    shutdown: Arc<Notify>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -88,28 +99,38 @@ async fn handle_conn(
         if line.trim().is_empty() {
             continue;
         }
-        let response = dispatch(&line, &backend, &store_path).await;
+        let (response, is_shutdown) = dispatch(&line, &backend, &store_path).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
+        // 応答をワイヤに出し切ってから停止を発火する（クライアントが確実に受け取る）。
+        write_half.flush().await?;
+        if is_shutdown {
+            shutdown.notify_one();
+            break;
+        }
     }
     Ok(())
 }
 
-/// 1 リクエスト行を処理して応答 JSON を組み立てる。
-async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> Value {
+/// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
+async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> (Value, bool) {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
-            return error_response(
-                None,
-                &MatError::parse_error(format!("invalid request JSON: {e}")),
+            return (
+                error_response(
+                    None,
+                    &MatError::parse_error(format!("invalid request JSON: {e}")),
+                ),
+                false,
             )
         }
     };
     let id = req.id.clone();
+    let is_shutdown = matches!(req.op, Op::Shutdown);
 
-    match run_op(&req.op, backend, store_path).await {
+    let body = match run_op(&req.op, backend, store_path).await {
         Ok(mut body) => {
             // id をエコーし、timestamp を必ず付ける（mat スキーマ規約）。
             if let Value::Object(map) = &mut body {
@@ -122,7 +143,8 @@ async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> V
             body
         }
         Err(e) => error_response(id, &e),
-    }
+    };
+    (body, is_shutdown)
 }
 
 /// 操作を実行し、mat スキーマの成功ボディ（timestamp 抜き）を返す。応答は `mat` の
@@ -132,8 +154,8 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
     match op {
         // Ping は chip-tool に触れず即応。
         Op::Ping => Ok(json!({ "pong": true })),
-        // Shutdown は chip-tool に触れず即応。
-        Op::Shutdown => Ok(json!({ "shutdown": true })),
+        // Shutdown は chip-tool に触れず即応。serve ループの終了は handle_conn が発火する。
+        Op::Shutdown => Ok(json!({ "stopping": true })),
         Op::Describe { node_id } => {
             require_node(store_path, *node_id)?;
             describe(backend, *node_id).await
