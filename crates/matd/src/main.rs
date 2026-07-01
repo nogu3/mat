@@ -9,10 +9,12 @@
 //! `mat` 本体の設計ルール 4（常駐・セッションキャッシュ禁止）は `mat` に効き続ける。
 //! `matd` は別バイナリ・別レイヤなので常駐してよい。
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use serde_json::Value;
 
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
@@ -29,7 +31,8 @@ struct Cli {
     store: Option<PathBuf>,
 
     /// 上流 unix socket のパス。未指定なら $XDG_RUNTIME_DIR/matd.sock（無ければ /tmp）。
-    #[arg(long)]
+    /// serve / stop 両方が使う。
+    #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
     /// chip-tool interactive server の ws ポート。
@@ -44,6 +47,16 @@ struct Cli {
     /// （ssh ControlPersist 相当）。次のコマンドで遅延再確立する。
     #[arg(long, default_value_t = 300)]
     idle_timeout: u64,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// matd のサブコマンド。無指定は serve（従来どおり）。
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// 稼働中の matd を停止する（socket 経由で graceful shutdown）。
+    Stop,
 }
 
 fn main() {
@@ -74,8 +87,25 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), MatError> {
+    match cli.command {
+        Some(Command::Stop) => stop(cli.socket).await,
+        None => serve_daemon(cli).await,
+    }
+}
+
+/// serve: 単一インスタンスロックを取ってから chip-tool を起こし、socket を bind する。
+async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
+    let socket = cli
+        .socket
+        .clone()
+        .unwrap_or_else(mat_core::socket::default_socket_path);
+
+    // 二重起動ガード。chip-tool 起動・socket bind より前に取る（rival chip-tool を
+    // 起こさない）。_lock はプロセス生存中保持する（Drop でロック解放）。
+    let _lock = matd::lock::acquire(&socket)?;
+
     let store_path = Store::locate(cli.store);
-    // 認証情報必須レイヤ。ストアが無ければ早めに exit 10（read/invoke は通せない）。
+    // 認証情報必須レイヤ。ストアが無ければ早めに exit 10。
     Store::open(&store_path)?;
 
     let idle = std::time::Duration::from_secs(cli.idle_timeout);
@@ -85,11 +115,53 @@ async fn run(cli: Cli) -> Result<(), MatError> {
         ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
-    // 既定は mat-core 共通（mat --matd の値省略時と同じパスを指す）。
-    let socket = cli
-        .socket
-        .unwrap_or_else(mat_core::socket::default_socket_path);
     server::serve(&socket, store_path, Arc::new(backend))
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
+}
+
+/// stop: 稼働中 matd の socket に shutdown op を送る。居なければ「not running」で exit 1。
+async fn stop(socket: Option<PathBuf>) -> Result<(), MatError> {
+    let socket = socket.unwrap_or_else(mat_core::socket::default_socket_path);
+    let resp = send_shutdown(&socket).await?;
+    // 成功応答は stdout（純粋 JSON）。
+    println!("{resp}");
+    Ok(())
+}
+
+/// socket に `{"op":"shutdown"}` を送り応答 1 行を読む。接続不能は「not running」。
+async fn send_shutdown(socket: &Path) -> Result<Value, MatError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(socket).await.map_err(|e| {
+        // 応答なしで拒否 = stale socket が残っているだけのことがある。掃除する。
+        if e.kind() == std::io::ErrorKind::ConnectionRefused {
+            let _ = std::fs::remove_file(socket);
+        }
+        MatError::new(
+            ErrorKind::Other,
+            format!("matd not running at {} ({e})", socket.display()),
+        )
+    })?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"op\":\"shutdown\"}\n")
+        .await
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to send shutdown: {e}")))?;
+
+    let mut lines = BufReader::new(read_half).lines();
+    let line = lines
+        .next_line()
+        .await
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to read response: {e}")))?
+        .ok_or_else(|| {
+            MatError::new(
+                ErrorKind::Other,
+                "matd closed the connection without responding".to_string(),
+            )
+        })?;
+    serde_json::from_str(&line)
+        .map_err(|e| MatError::parse_error(format!("matd response was not JSON: {e}; body={line}")))
 }
