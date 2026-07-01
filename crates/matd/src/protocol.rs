@@ -78,6 +78,9 @@ pub enum Op {
     },
     /// デーモン死活確認（chip-tool には触れない）。
     Ping,
+    /// デーモンを停止する admin op（chip-tool には触れない）。`matd stop` が送る。
+    /// Ping と同じく node も cmdline も持たない。
+    Shutdown,
 }
 
 impl Op {
@@ -93,7 +96,7 @@ impl Op {
             | Op::On { node_id, .. }
             | Op::Off { node_id, .. }
             | Op::Describe { node_id } => Some(*node_id),
-            Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping => None,
+            Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping | Op::Shutdown => None,
         }
     }
 
@@ -132,9 +135,11 @@ impl Op {
             Op::On { node_id, endpoint } => format!("onoff on {node_id} {endpoint}"),
             Op::Off { node_id, endpoint } => format!("onoff off {node_id} {endpoint}"),
             // 複合 op（複数コマンドに展開）と Ping は単一の cmdline を持たない。
-            Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping => {
-                return None
-            }
+            Op::Describe { .. }
+            | Op::GroupProvision { .. }
+            | Op::GroupInvoke { .. }
+            | Op::Ping
+            | Op::Shutdown => return None,
         };
         Some(line)
     }
@@ -239,5 +244,14 @@ mod tests {
         assert_eq!(r.op.node_id(), None);
         assert!(r.op.to_cmdline().is_none());
         assert!(matches!(r.op, Op::GroupInvoke { ref args, .. } if args.is_empty()));
+    }
+
+    #[test]
+    fn shutdown_has_no_node_or_cmdline() {
+        // admin op。chip-tool には触れないので node_id も cmdline も持たない。
+        let r = parse(r#"{"op":"shutdown"}"#);
+        assert!(matches!(r.op, Op::Shutdown));
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
     }
 }

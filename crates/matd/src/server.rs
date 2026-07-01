@@ -132,6 +132,8 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
     match op {
         // Ping は chip-tool に触れず即応。
         Op::Ping => Ok(json!({ "pong": true })),
+        // Shutdown は chip-tool に触れず即応。
+        Op::Shutdown => Ok(json!({ "shutdown": true })),
         Op::Describe { node_id } => {
             require_node(store_path, *node_id)?;
             describe(backend, *node_id).await
@@ -214,7 +216,7 @@ async fn simple_op(
             "node_id": node_id, "endpoint": endpoint,
             "cluster": "onoff", "command": "off", "status": "success",
         }),
-        Op::Ping | Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } => {
+        Op::Ping | Op::Describe { .. } | Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Shutdown => {
             unreachable!("handled by run_op")
         }
     };
