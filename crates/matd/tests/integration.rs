@@ -387,3 +387,20 @@ async fn invalid_request_json_is_parse_error() {
 
     handle.abort();
 }
+
+/// `matd stop` 相当: shutdown op を送ると `{"stopping":true}` が返り、serve ループが
+/// 自然終了する（abort ではなく JoinHandle が完了する）。
+#[tokio::test]
+async fn shutdown_op_stops_server() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(&socket, &[json!({"id":1,"op":"shutdown"})]).await;
+    assert_eq!(resps[0]["stopping"], json!(true));
+    assert_eq!(resps[0]["id"], json!(1));
+
+    // serve ループが break して JoinHandle が完了する。
+    let ended = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(ended.is_ok(), "serve did not shut down after shutdown op");
+}
