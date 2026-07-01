@@ -399,8 +399,8 @@ matd stop --socket /run/mat/matd.sock
 ```
 
 Only one `matd` runs per socket: startup takes an exclusive `flock` on
-`<socket>.lock`, so a second launch exits `1` with `matd already running (lock
-held at ...)` instead of hijacking the socket or spawning a rival `chip-tool`.
+`<socket>.lock`, so a second launch on the same socket exits `1` with `matd
+already running (lock held at ...)` instead of silently hijacking it.
 
 - Routing is **enabled** only by `--matd` (the flag) or `MAT_MATD=<truthy>`.
   `MAT_MATD_SOCKET` just selects *which* socket — on its own it does **not** route

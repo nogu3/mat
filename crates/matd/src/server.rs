@@ -81,7 +81,6 @@ pub async fn serve(
     reaper.abort();
     backend.shutdown().await;
     let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file(crate::lock::lock_path(socket_path));
     Ok(())
 }
 
