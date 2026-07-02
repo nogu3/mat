@@ -62,6 +62,7 @@ fn discover_with_missing_chip_tool_exits_12() {
     Command::cargo_bin("mat")
         .unwrap()
         .env("MAT_CHIP_TOOL_BIN", "/nonexistent/chip-tool-binary")
+        .env("MAT_MATD", "0")
         .arg("--store")
         .arg(store.path())
         .arg("discover")

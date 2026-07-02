@@ -234,9 +234,10 @@ This repo ships two binaries from one install:
 - **`matd`** is the resident binary (Phase 4). It keeps warm CASE (Sigma)
   sessions so repeated Matter calls skip the handshake — the same model as ssh
   `ControlMaster`/`ControlPersist`. `matd` is allowed to be resident precisely
-  because it is a **separate binary and layer**, not `mat`. A `mat --matd <sock>`
-  flag routes a `mat` call through `matd`'s warm session instead of spawning
-  `chip-tool` directly.
+  because it is a **separate binary and layer**, not `mat`. `mat` **auto-detects**
+  a running `matd` by default (a connect probe on the default socket, falling
+  back to spawning `chip-tool` directly when nothing answers); `--matd`/
+  `MAT_MATD=1` force the matd path, `MAT_MATD=0` disables probing entirely.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` / `error`
 / `group` modules: chip-tool parsing, the JSON schema, exit-code classification,
@@ -358,10 +359,15 @@ on top of that:
   through the existing `classify_failure` text matcher (→ unreachable / timeout /
   device_rejected, unknown falls back to device_rejected). The `error` value is a
   status-name **string** (e.g. `"FAILURE"`), not numeric.
-- **`mat --matd <sock>` client path:** a global flag routes
-  read/write/invoke/on/off/describe/group through the `matd` unix socket (std
-  `UnixStream`, newline JSON) instead of spawning chip-tool; discover /
-  commission / open-window stay direct-only (exit 2 under `--matd`).
+- **`mat` client path — auto-detected by default:** for
+  read/write/invoke/on/off/describe/group, `mat` probes the default `matd`
+  socket with a connect and, when something answers, routes the call through
+  it (std `UnixStream`, newline JSON) instead of spawning chip-tool; on no
+  answer it falls back to the direct chip-tool path. `--matd`/`MAT_MATD=1`
+  force the matd path (no fallback on connection failure); `MAT_MATD=0`
+  disables probing and always goes direct. discover / commission /
+  open-window / diag stay direct-only (exit 2 under forced `--matd`; auto
+  mode skips probing for them silently).
 
 Inline-JSON tokenization: `group_provision`'s key-set JSON is passed inline on the
 ws command line as a single compact (no-space) token, e.g. `groupkeymanagement
