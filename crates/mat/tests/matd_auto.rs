@@ -176,7 +176,7 @@ fn auto_keeps_unsupported_ops_on_direct_path() {
     let dir = TempDir::new().unwrap();
     let socket = dir.path().join("matd.sock");
     // 生きた listener。自動モードでも discover は probe されず直経路のはず
-    // （probe されると accept されないまま exit 2 側の経路に落ちてテストが失敗する）。
+    // （probe されると backlog に接続だけ成功し応答待ちでハングしてテストが失敗する）。
     let _listener = UnixListener::bind(&socket).unwrap();
 
     mat_auto(store.path(), &socket)

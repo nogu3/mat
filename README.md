@@ -385,7 +385,11 @@ mat group invoke --group 1 --cluster onoff --command on
 
 # Force the matd path (connection failure becomes an error instead of a
 # fallback); pass a path to use a non-default socket.
-mat --matd read --node 5 --cluster onoff --attribute on-off
+# Caution: `--matd` takes an optional value (num_args = 0..=1), so a
+# value-less `--matd` placed *before* the subcommand swallows the
+# subcommand name as the socket path and fails to parse. Put it after the
+# subcommand instead (or give it a value, e.g. `--matd=<path>`).
+mat read --node 5 --cluster onoff --attribute on-off --matd
 mat --matd /run/mat/matd.sock on --node 5
 export MAT_MATD=1                       # same, for a whole shell session
 
@@ -414,7 +418,7 @@ already running (lock held at ...)` instead of silently hijacking it.
   (default) `mat` **auto-detects**: it probes the socket with a connect and
   falls back to the direct path when nobody answers. `MAT_MATD_SOCKET` just
   selects *which* socket in every mode.
-- Socket path precedence (once enabled): `--matd <path>` > `MAT_MATD_SOCKET=<path>`
+- Socket path precedence (all modes): `--matd <path>` > `MAT_MATD_SOCKET=<path>`
   > default socket (`$XDG_RUNTIME_DIR/matd.sock`, else `/tmp/matd.sock`).
 - Once connected, errors are reported from the matd path as-is — `mat` never
   re-runs the command on the direct path (no double execution of writes).
