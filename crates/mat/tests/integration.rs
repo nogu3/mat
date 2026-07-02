@@ -17,9 +17,12 @@ fn fake_chip_tool() -> PathBuf {
 }
 
 /// fake chip-tool を使う `mat` コマンド。store は与えられた dir。
+/// MAT_MATD=0 で直経路に固定する（matd 自動検出が既定のため、開発機で実 matd が
+/// 動いていても拾わない）。
 fn mat(store: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("mat").unwrap();
     c.env("MAT_CHIP_TOOL_BIN", fake_chip_tool())
+        .env("MAT_MATD", "0")
         .arg("--store")
         .arg(store);
     c
