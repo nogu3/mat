@@ -365,27 +365,33 @@ Outputs:
 ### Routing through `matd`
 
 By default each `mat` call spawns `chip-tool` and pays a fresh CASE handshake.
-With a running `matd` you can route the call through its warm session instead —
+With a running `matd` the call is routed through its warm session instead —
 same subcommands, same JSON on stdout, but the handshake is skipped on repeated
-calls.
+calls. `mat` **auto-detects** `matd`: for supported subcommands it tries a
+connect on the default socket, uses `matd` when something answers, and silently
+falls back to the direct chip-tool path when nothing does (missing and stale
+sockets alike).
 
 ```bash
 # Start the resident daemon (separate binary; see ARCHITECTURE.md / matd --help).
 # With no --socket it uses the default path ($XDG_RUNTIME_DIR/matd.sock, else
-# /tmp/matd.sock) — the same default mat picks up below.
+# /tmp/matd.sock) — the same default mat probes below.
 matd &
 
-# Route through it. --matd with no value uses the default socket; pass a path to
-# override. Output is identical to the direct path.
-mat --matd read --node 5 --cluster onoff --attribute on-off
-mat --matd /run/mat/matd.sock on --node 5
-
-# Or skip the flag entirely: opt in via env (handy for a shell session).
-export MAT_MATD=1                       # enable routing (uses the default socket)
-# export MAT_MATD_SOCKET=/run/mat/matd.sock   # pins the socket path when enabled
+# No flag needed: mat finds the running matd on the default socket by itself.
 mat read --node 5 --cluster onoff --attribute on-off
 mat describe --node 5
 mat group invoke --group 1 --cluster onoff --command on
+
+# Force the matd path (connection failure becomes an error instead of a
+# fallback); pass a path to use a non-default socket.
+mat --matd read --node 5 --cluster onoff --attribute on-off
+mat --matd /run/mat/matd.sock on --node 5
+export MAT_MATD=1                       # same, for a whole shell session
+
+# Opt out (always direct chip-tool, no probing):
+MAT_MATD=0 mat read --node 5 --cluster onoff --attribute on-off
+# export MAT_MATD_SOCKET=/run/mat/matd.sock   # pins which socket to probe/use
 ```
 
 Stop the daemon with `matd stop` — do **not** `kill` it, which orphans the child
@@ -402,14 +408,20 @@ Only one `matd` runs per socket: startup takes an exclusive `flock` on
 `<socket>.lock`, so a second launch on the same socket exits `1` with `matd
 already running (lock held at ...)` instead of silently hijacking it.
 
-- Routing is **enabled** only by `--matd` (the flag) or `MAT_MATD=<truthy>`.
-  `MAT_MATD_SOCKET` just selects *which* socket — on its own it does **not** route
-  through matd, even when set. Unset/disabled = the direct chip-tool path as before.
+- Route selection: `--matd` / `MAT_MATD=<truthy>` **force** the matd path
+  (connection failure is an error, no fallback). `MAT_MATD=<falsy>`
+  (`0`/`false`/`no`/`off`) forces the direct path, no probing. Otherwise
+  (default) `mat` **auto-detects**: it probes the socket with a connect and
+  falls back to the direct path when nobody answers. `MAT_MATD_SOCKET` just
+  selects *which* socket in every mode.
 - Socket path precedence (once enabled): `--matd <path>` > `MAT_MATD_SOCKET=<path>`
   > default socket (`$XDG_RUNTIME_DIR/matd.sock`, else `/tmp/matd.sock`).
+- Once connected, errors are reported from the matd path as-is — `mat` never
+  re-runs the command on the direct path (no double execution of writes).
+  Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` / `describe` /
-  `group`. `discover` / `commission` / `open-window` are direct-only and exit `2`
-  if routed through matd.
+  `group`. `discover` / `commission` / `open-window` / `diag` are direct-only:
+  auto-detection skips them silently; explicit `--matd` exits `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
