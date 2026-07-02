@@ -1,5 +1,10 @@
-//! mat → matd クライアント経路（`--matd` フラグ or `MAT_MATD=truthy` で有効化。
-//! `MAT_MATD_SOCKET` は socket パス指定のみで単独では乗らない）。
+//! mat → matd クライアント経路。
+//!
+//! 経路は 3 状態: `--matd` / `MAT_MATD=truthy` で**強制 matd**（接続失敗はエラー、
+//! フォールバック無し）、`MAT_MATD=falsy` で**強制直 chip-tool**、どちらも無ければ
+//! **自動検出**（既定ソケットへ connect を試み、matd がいればそちら、いなければ
+//! 直経路にフォールバック）。`MAT_MATD_SOCKET` は「どのソケットか」の指定のみで
+//! 経路は変えない。
 //!
 //! matd は unix socket 上で newline-delimited JSON を喋る（1 行 = 1 リクエスト = 1
 //! レスポンス）。ここはサブコマンドを matd の op JSON に変換して 1 行送り、返ってきた
@@ -20,33 +25,43 @@ use crate::cli::{Command, GroupCommand};
 use mat_core::error::ErrorKind;
 use mat_core::socket::default_socket_path;
 
-/// matd 経由で実行するか、するならどの socket かを決める（純粋関数; env は注入）。
+/// mat の実行経路。`resolve_route` が決める。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Route {
+    /// 明示有効化（`--matd` / `MAT_MATD=truthy`）: matd 固定。接続失敗はエラー、
+    /// 非対応 op は exit 2。フォールバックしない。
+    Forced(PathBuf),
+    /// 既定（どちらも未設定）: socket へ connect を試み、成功なら matd、
+    /// 失敗なら直 chip-tool にフォールバック。
+    Auto(PathBuf),
+    /// 明示無効化（`MAT_MATD=falsy`）: 常に直 chip-tool。probe もしない。
+    Direct,
+}
+
+/// 経路と socket パスを決める（純粋関数; env は注入）。
 ///
-/// 有効化（matd 経路に乗せるか）と socket パスの選択は別軸。
-/// - 有効化トリガーは `--matd` フラグ or `MAT_MATD=<truthy>` の**どちらか**のみ。
-/// - `MAT_MATD_SOCKET` は「どの socket か」を指定するだけで、**単独では何も起こさない**
-///   （値が設定されていても、有効化されていなければ直 chip-tool 経路 `None`）。
+/// - `--matd [<path>]` or `MAT_MATD=truthy` → `Forced`
+/// - `MAT_MATD=falsy`（`0`/`false`/`no`/`off`） → `Direct`
+/// - どちらも無し（truthy/falsy どちらでもない値も同じ） → `Auto`
 ///
-/// socket パスの優先順: `--matd <path>`（明示パス）> `MAT_MATD_SOCKET=<path>` >
-/// 既定パス。
-pub fn resolve_socket(
+/// socket パスの優先順: `--matd <path>`（明示）> `MAT_MATD_SOCKET=<path>`（非空）>
+/// 既定パス。`MAT_MATD_SOCKET` はパス指定のみで経路は変えない。
+pub fn resolve_route(
     flag: &Option<Option<PathBuf>>,
     env_socket: Option<OsString>,
     env_enable: Option<OsString>,
-) -> Option<PathBuf> {
+) -> Route {
     match flag {
-        // --matd <path> → 明示パスが最優先。
-        Some(Some(path)) => Some(path.clone()),
-        // --matd（値省略）→ 有効化。パスは MAT_MATD_SOCKET があればそれ、無ければ既定。
-        Some(None) => Some(socket_from_env_or_default(env_socket)),
-        // フラグ無し → MAT_MATD が truthy のときだけ有効化。MAT_MATD_SOCKET 単独では乗らない。
-        None => {
-            if env_enable.as_deref().is_some_and(is_truthy) {
-                Some(socket_from_env_or_default(env_socket))
-            } else {
-                None
-            }
-        }
+        // --matd <path> → 明示パスで強制 matd。
+        Some(Some(path)) => Route::Forced(path.clone()),
+        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET > 既定。
+        Some(None) => Route::Forced(socket_from_env_or_default(env_socket)),
+        None => match env_enable.as_deref() {
+            Some(v) if is_truthy(v) => Route::Forced(socket_from_env_or_default(env_socket)),
+            Some(v) if is_falsy(v) => Route::Direct,
+            // 未設定（or 解釈不能な値）→ 自動検出。
+            _ => Route::Auto(socket_from_env_or_default(env_socket)),
+        },
     }
 }
 
@@ -63,6 +78,15 @@ fn is_truthy(v: &OsStr) -> bool {
     matches!(
         v.to_str().map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// `MAT_MATD` の否定判定。`0` / `false` / `no` / `off`（大小無視）を無効化とみなす。
+/// truthy とも falsy とも解釈できない値は「未設定」と同じ（自動検出）。
+fn is_falsy(v: &OsStr) -> bool {
+    matches!(
+        v.to_str().map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
     )
 }
 
@@ -83,6 +107,38 @@ pub fn dispatch(socket: &Path, command: &Command) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// 自動検出モードのディスパッチ。matd 経路で完結した場合のみ `Some(exit code)`。
+/// `None` = 呼び出し側が直 chip-tool 経路で実行すべき（matd 非対応 op / connect 失敗）。
+///
+/// connect した stream をそのまま本リクエストに使う（probe 後の再接続はしない）ので、
+/// フォールバックが起きるのは 1 バイトも送る前だけ。接続後のエラーは matd 経路の
+/// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
+pub fn dispatch_auto(socket: &Path, command: &Command) -> Option<ExitCode> {
+    // matd 非対応 op（discover / commission / open-window / diag）は probe せず直経路。
+    let op = to_op(command).ok()?;
+
+    let stream = match UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                socket = %socket.display(),
+                error = %e,
+                "matd not reachable, falling back to direct chip-tool"
+            );
+            return None;
+        }
+    };
+    tracing::info!(socket = %socket.display(), "using matd (auto-detected)");
+
+    Some(match exchange_on_stream(stream, &op) {
+        Ok(resp) => emit_response(resp),
+        Err(detail) => {
+            emit_error(ErrorKind::Other, &detail);
+            ExitCode::FAILURE
+        }
+    })
 }
 
 /// サブコマンドを matd の op JSON に変換する。matd 非対応のものは `Err`。
@@ -165,11 +221,15 @@ fn unsupported(name: &str) -> String {
     format!("`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct chip-tool path)")
 }
 
-/// matd へ 1 行送り 1 行受け取る。接続/送受信の失敗は detail 文字列で返す。
+/// matd へ接続して 1 行送り 1 行受け取る。接続/送受信の失敗は detail 文字列で返す。
 fn exchange(socket: &Path, op: &Value) -> Result<Value, String> {
-    let mut stream = UnixStream::connect(socket)
+    let stream = UnixStream::connect(socket)
         .map_err(|e| format!("could not connect to matd at {}: {e}", socket.display()))?;
+    exchange_on_stream(stream, op)
+}
 
+/// 接続済み stream で 1 行送り 1 行受け取る（自動検出は probe した接続を使い回す）。
+fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, String> {
     let mut line = serde_json::to_vec(op).map_err(|e| format!("failed to encode request: {e}"))?;
     line.push(b'\n');
     stream
@@ -262,43 +322,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_socket_precedence() {
+    fn resolve_route_three_states() {
         let some_path = PathBuf::from("/x/y.sock");
         let dflt = default_socket_path();
 
-        // --matd <path> が最優先（MAT_MATD_SOCKET より明示パス）。
+        // --matd <path> → 強制 matd（明示パスが MAT_MATD_SOCKET より優先）。
         assert_eq!(
-            resolve_socket(
+            resolve_route(
                 &Some(Some(some_path.clone())),
                 Some("/env.sock".into()),
                 None
             ),
-            Some(some_path)
+            Route::Forced(some_path)
         );
-        // --matd（値省略）→ 有効化。MAT_MATD_SOCKET が無ければ既定パス。
-        assert_eq!(resolve_socket(&Some(None), None, None), Some(dflt.clone()));
-        // --matd（値省略）+ MAT_MATD_SOCKET → そのパスで有効化。
+        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET > 既定。
         assert_eq!(
-            resolve_socket(&Some(None), Some("/env.sock".into()), None),
-            Some(PathBuf::from("/env.sock"))
+            resolve_route(&Some(None), None, None),
+            Route::Forced(dflt.clone())
         );
-        // フラグ無し + MAT_MATD=1 → 既定パスで有効化。
         assert_eq!(
-            resolve_socket(&None, None, Some("1".into())),
-            Some(dflt.clone())
+            resolve_route(&Some(None), Some("/env.sock".into()), None),
+            Route::Forced(PathBuf::from("/env.sock"))
         );
-        // フラグ無し + MAT_MATD=1 + MAT_MATD_SOCKET → そのパスで有効化。
+        // MAT_MATD=truthy → 強制 matd。
         assert_eq!(
-            resolve_socket(&None, Some("/env.sock".into()), Some("1".into())),
-            Some(PathBuf::from("/env.sock"))
+            resolve_route(&None, None, Some("1".into())),
+            Route::Forced(dflt.clone())
         );
-        // ★ MAT_MATD_SOCKET 単独（有効化トリガー無し）→ 直経路（None）。値があっても乗らない。
-        assert_eq!(resolve_socket(&None, Some("/env.sock".into()), None), None);
-        // 何も無し → 直経路（None）。falsy enable も無効。
-        assert_eq!(resolve_socket(&None, None, None), None);
+        // MAT_MATD=falsy → 強制直。socket env が設定されていても probe しない。
+        assert_eq!(resolve_route(&None, None, Some("0".into())), Route::Direct);
         assert_eq!(
-            resolve_socket(&None, Some("/env.sock".into()), Some("0".into())),
-            None
+            resolve_route(&None, Some("/env.sock".into()), Some("off".into())),
+            Route::Direct
+        );
+        // 未設定 → 自動。probe 先は MAT_MATD_SOCKET（非空）> 既定。
+        assert_eq!(resolve_route(&None, None, None), Route::Auto(dflt.clone()));
+        assert_eq!(
+            resolve_route(&None, Some("/env.sock".into()), None),
+            Route::Auto(PathBuf::from("/env.sock"))
+        );
+        // truthy でも falsy でもない値 → 未設定と同じ（自動）。
+        assert_eq!(
+            resolve_route(&None, None, Some("abc".into())),
+            Route::Auto(dflt)
         );
     }
 
