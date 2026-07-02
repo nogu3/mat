@@ -24,15 +24,22 @@ fn main() -> ExitCode {
     // 引数エラー（exit 2）は clap が直接処理する。
     let args = Cli::parse();
 
-    // --matd フラグ（または MAT_MATD=truthy）で有効化された時は chip-tool を直に起動せず、
-    // 常駐 matd（warm CASE セッション）経由で実行する。MAT_MATD_SOCKET は socket パスの
-    // 指定のみで単独では有効化しない。store の locate は不要（node 解決は matd 側が KVS で行う）。
-    if let Some(socket) = matd_client::resolve_socket(
+    // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
+    // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
+    // 失敗時と非対応 op は下の直 chip-tool 経路へフォールスルー）。store の locate は
+    // 不要（node 解決は matd 側が KVS で行う）。
+    match matd_client::resolve_route(
         &args.matd,
         std::env::var_os("MAT_MATD_SOCKET"),
         std::env::var_os("MAT_MATD"),
     ) {
-        return matd_client::dispatch(&socket, &args.command);
+        matd_client::Route::Forced(socket) => return matd_client::dispatch(&socket, &args.command),
+        matd_client::Route::Auto(socket) => {
+            if let Some(code) = matd_client::dispatch_auto(&socket, &args.command) {
+                return code;
+            }
+        }
+        matd_client::Route::Direct => {}
     }
 
     let store_path = Store::locate(args.store);
