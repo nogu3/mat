@@ -24,6 +24,26 @@ pub fn run(
     command: &str,
     args: &[String],
 ) -> Result<(), MatError> {
+    execute(store_path, node_id, endpoint, cluster, command, args)?;
+    output::emit(json!({
+        "node_id": node_id,
+        "endpoint": endpoint,
+        "cluster": cluster,
+        "command": command,
+        "status": "success",
+    }));
+    Ok(())
+}
+
+/// invoke の実行部（出力なし）。成功判定までを行い、emit は呼び出し側の責務。
+fn execute(
+    store_path: &Path,
+    node_id: u64,
+    endpoint: u16,
+    cluster: &str,
+    command: &str,
+    args: &[String],
+) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     store.require_node(node_id)?;
     let chip = ChipTool::new(store.root());
@@ -50,14 +70,6 @@ pub fn run(
             format!("invoke {cluster}/{command} on node {node_id} did not report success"),
         ));
     }
-
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": cluster,
-        "command": command,
-        "status": "success",
-    }));
     Ok(())
 }
 
@@ -65,4 +77,84 @@ pub fn run(
 pub fn run_onoff(store_path: &Path, node_id: u64, endpoint: u16, on: bool) -> Result<(), MatError> {
     let command = if on { "on" } else { "off" };
     run(store_path, node_id, endpoint, "onoff", command, &[])
+}
+
+/// `mat color-temp` の実体。ColorControl の MoveToColorTemperature を invoke する。
+/// 出力には入力の kelvin と換算後の mireds を両方載せ、`color-temperature-mireds`
+/// の読み返しと突合しやすくする。
+pub fn run_color_temp(
+    store_path: &Path,
+    node_id: u64,
+    endpoint: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+) -> Result<(), MatError> {
+    // MoveToColorTemperature の引数は <mireds> <transition> <optionsMask> <optionsOverride>。
+    let args = [
+        mireds.to_string(),
+        transition.to_string(),
+        "0".to_string(),
+        "0".to_string(),
+    ];
+    execute(
+        store_path,
+        node_id,
+        endpoint,
+        "colorcontrol",
+        "move-to-color-temperature",
+        &args,
+    )?;
+    output::emit(json!({
+        "node_id": node_id,
+        "endpoint": endpoint,
+        "cluster": "colorcontrol",
+        "command": "move-to-color-temperature",
+        "kelvin": kelvin,
+        "mireds": mireds,
+        "transition": transition,
+        "status": "success",
+    }));
+    Ok(())
+}
+
+/// `mat color-temp` の `--kelvin` / `--mireds`（排他・どちらか必須）を
+/// `(mireds, kelvin)` に解決する。与えられなかった側は `round(1_000_000 / x)` で
+/// 補完し、出力 JSON へのエコー（読み返し突合用）に使う。決定的な数値換算のみで、
+/// デバイス対応範囲（color-temp-physical-min/max-mireds）の検証はしない
+/// （範囲外はデバイス側が clamp する）。
+pub fn resolve_color_temp(kelvin: Option<u32>, mireds: Option<u16>) -> (u16, u32) {
+    // round(1_000_000 / v)。K→mireds も mireds→K も同じ逆数換算。
+    fn recip(v: u32) -> u32 {
+        (1_000_000 + v / 2) / v
+    }
+    match (kelvin, mireds) {
+        // CLI 側の値域制約（16..=1_000_000 K）により mireds は 1..=62500 で u16 に収まる。
+        (Some(k), None) => (recip(k) as u16, k),
+        (None, Some(m)) => (m, recip(u32::from(m))),
+        // clap がどちらか一方のみを強制する。
+        _ => unreachable!("clap enforces exactly one of --kelvin / --mireds"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kelvin_2700_converts_to_370_mireds() {
+        assert_eq!(resolve_color_temp(Some(2700), None), (370, 2700));
+    }
+
+    #[test]
+    fn kelvin_6500_rounds_to_154_mireds() {
+        // 1_000_000 / 6500 = 153.85 → round = 154。
+        assert_eq!(resolve_color_temp(Some(6500), None), (154, 6500));
+    }
+
+    #[test]
+    fn mireds_direct_computes_kelvin_echo() {
+        // 1_000_000 / 370 = 2702.7 → round = 2703（エコー用の逆換算）。
+        assert_eq!(resolve_color_temp(None, Some(370)), (370, 2703));
+    }
 }

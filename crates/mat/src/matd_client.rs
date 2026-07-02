@@ -180,6 +180,21 @@ fn to_op(command: &Command) -> Result<Value, String> {
         Command::Off { node_id, endpoint } => {
             json!({ "op": "off", "node_id": node_id, "endpoint": endpoint })
         }
+        Command::ColorTemp {
+            node_id,
+            endpoint,
+            kelvin,
+            mireds,
+            transition,
+        } => {
+            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み mireds を
+            // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
+            let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+            json!({
+                "op": "color_temp", "node_id": node_id, "endpoint": endpoint,
+                "mireds": mireds, "kelvin": kelvin, "transition": transition,
+            })
+        }
         Command::Group { action } => match action {
             GroupCommand::Provision {
                 group_id,
@@ -296,6 +311,37 @@ mod tests {
         assert_eq!(
             to_op(&cmd).unwrap(),
             json!({"op":"on","node_id":3,"endpoint":1})
+        );
+    }
+
+    #[test]
+    fn color_temp_kelvin_maps_to_color_temp_op_with_converted_mireds() {
+        let cmd = Command::ColorTemp {
+            node_id: 6,
+            endpoint: 1,
+            kelvin: Some(2700),
+            mireds: None,
+            transition: 30,
+        };
+        // 換算（2700K → 370 mireds）は mat 側で行い、kelvin はエコー用に併送する。
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2700,"transition":30})
+        );
+    }
+
+    #[test]
+    fn color_temp_mireds_maps_with_computed_kelvin_echo() {
+        let cmd = Command::ColorTemp {
+            node_id: 6,
+            endpoint: 1,
+            kelvin: None,
+            mireds: Some(370),
+            transition: 0,
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2703,"transition":0})
         );
     }
 

@@ -345,6 +345,109 @@ fn off_maps_to_onoff_invoke() {
 }
 
 #[test]
+fn color_temp_kelvin_expands_to_move_to_color_temperature() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color-temp", "--node", "5", "--kelvin", "2700"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cluster\":\"colorcontrol\""))
+        .stdout(predicate::str::contains(
+            "\"command\":\"move-to-color-temperature\"",
+        ))
+        // 入力の kelvin と換算後の mireds を両方エコーする（読み返し突合用）。
+        .stdout(predicate::str::contains("\"kelvin\":2700"))
+        .stdout(predicate::str::contains("\"mireds\":370"))
+        .stdout(predicate::str::contains("\"status\":\"success\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+    // chip-tool へは mireds + transition + optionsMask/Override、宛先は末尾。
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 5 1"),
+        "expected converted mireds invoke argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_temp_mireds_passes_through_and_echoes_kelvin() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color-temp", "--node", "5", "--mireds", "370"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mireds\":370"))
+        // 1_000_000 / 370 = 2702.7 → 2703（エコー用の逆換算）。
+        .stdout(predicate::str::contains("\"kelvin\":2703"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 5 1"),
+        "expected mireds passed through: {recorded}"
+    );
+}
+
+#[test]
+fn color_temp_transition_is_passed_to_chip_tool() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "color-temp",
+            "--node",
+            "5",
+            "--kelvin",
+            "2700",
+            "--transition",
+            "30",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"transition\":30"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-color-temperature 370 30 0 0 5 1"),
+        "expected transition time in argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_temp_requires_exactly_one_of_kelvin_or_mireds() {
+    let store = store_with_node5();
+    // どちらも無し → CLI 引数エラー（exit 2）。
+    mat(store.path())
+        .args(["color-temp", "--node", "5"])
+        .assert()
+        .code(2);
+    // 両方指定 → 排他違反（exit 2）。
+    mat(store.path())
+        .args([
+            "color-temp",
+            "--node",
+            "5",
+            "--kelvin",
+            "2700",
+            "--mireds",
+            "370",
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn color_temp_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["color-temp", "--node", "99", "--kelvin", "2700"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
 fn describe_lists_endpoints_and_clusters() {
     let store = store_with_node5();
     mat(store.path())

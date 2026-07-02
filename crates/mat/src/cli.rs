@@ -1,8 +1,8 @@
 //! clap(derive) による CLI 定義。
 //!
 //! Phase 0: `discover` / `commission`。Phase 1: `read` / `write` / `invoke` /
-//! `describe` / `on` / `off`。Phase 2: `open-window`。Phase 3: `group provision` /
-//! `group invoke`（groupcast）。
+//! `describe` / `on` / `off`（後追いの高頻度ショートカットとして `color-temp` も）。
+//! Phase 2: `open-window`。Phase 3: `group provision` / `group invoke`（groupcast）。
 
 use std::path::PathBuf;
 
@@ -26,7 +26,7 @@ pub struct Cli {
     /// 試み、matd がいればそちら、いなければ直 chip-tool にフォールバック。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
-    /// matd 対応は read/write/invoke/on/off/describe/group のみ
+    /// matd 対応は read/write/invoke/on/off/color-temp/describe/group のみ
     /// （discover/commission/open-window/diag は常に直経路; 本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
@@ -136,6 +136,34 @@ pub enum Command {
         /// エンドポイント番号（既定 1）。
         #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
+    },
+
+    /// ColorControl の MoveToColorTemperature を invoke する高頻度ショートカット。
+    /// 色温度は `--kelvin`（`mireds = round(1_000_000 / kelvin)` に換算）か
+    /// `--mireds`（直指定）のどちらか一方で与える。デバイス対応範囲外の値は
+    /// デバイス側が clamp する（mat は事前 read / 検証をしない）。
+    ColorTemp {
+        /// commission 済みノードの node_id。
+        #[arg(short = 'n', long = "node", value_name = "N")]
+        node_id: u64,
+        /// エンドポイント番号（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+        /// 色温度（ケルビン）。値域は mireds が u16 に収まる 16..=1000000。
+        #[arg(
+            long,
+            value_name = "K",
+            conflicts_with = "mireds",
+            required_unless_present = "mireds",
+            value_parser = clap::value_parser!(u32).range(16..=1_000_000)
+        )]
+        kelvin: Option<u32>,
+        /// 色温度（mireds）。`--kelvin` と排他。
+        #[arg(long, value_name = "M", value_parser = clap::value_parser!(u16).range(1..))]
+        mireds: Option<u16>,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
     },
 
     /// `mat` 所有デバイスを他 admin へ共有するため commissioning window を開く。
