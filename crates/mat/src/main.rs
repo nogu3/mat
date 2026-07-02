@@ -78,6 +78,24 @@ fn main() -> ExitCode {
         Command::Off { node_id, endpoint } => {
             commands::invoke::run_onoff(&store_path, *node_id, *endpoint, false)
         }
+        Command::ColorTemp {
+            node_id,
+            endpoint,
+            kelvin,
+            mireds,
+            transition,
+        } => {
+            // --kelvin / --mireds を (mireds, kelvin) に解決（欠けた側は逆数換算で補完）。
+            let (mireds, kelvin) = commands::invoke::resolve_color_temp(*kelvin, *mireds);
+            commands::invoke::run_color_temp(
+                &store_path,
+                *node_id,
+                *endpoint,
+                kelvin,
+                mireds,
+                *transition,
+            )
+        }
         Command::OpenWindow {
             node_id,
             timeout,

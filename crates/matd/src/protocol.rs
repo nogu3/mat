@@ -49,6 +49,17 @@ pub enum Op {
     On { node_id: u64, endpoint: u16 },
     /// OnOff Off のショートカット。
     Off { node_id: u64, endpoint: u16 },
+    /// ColorControl MoveToColorTemperature のショートカット（`mat color-temp` 相当）。
+    /// `mireds` は mat 側で換算済みの値を受け取る。`kelvin` は応答へのエコー用
+    /// （matd 側で逆算すると丸めで入力とずれるため、換算は mat の 1 箇所に置く）。
+    ColorTemp {
+        node_id: u64,
+        endpoint: u16,
+        mireds: u16,
+        kelvin: u32,
+        #[serde(default)]
+        transition: u16,
+    },
     /// ノードのエンドポイント / クラスタを introspect する（Descriptor クラスタ）。
     /// 1 リクエストで複数の chip-tool 読み出しに展開されるため [`to_cmdline`] は持たない。
     ///
@@ -95,6 +106,7 @@ impl Op {
             | Op::Invoke { node_id, .. }
             | Op::On { node_id, .. }
             | Op::Off { node_id, .. }
+            | Op::ColorTemp { node_id, .. }
             | Op::Describe { node_id } => Some(*node_id),
             Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping | Op::Shutdown => None,
         }
@@ -134,6 +146,16 @@ impl Op {
             }
             Op::On { node_id, endpoint } => format!("onoff on {node_id} {endpoint}"),
             Op::Off { node_id, endpoint } => format!("onoff off {node_id} {endpoint}"),
+            // 引数は <mireds> <transition> <optionsMask> <optionsOverride>、宛先は末尾。
+            Op::ColorTemp {
+                node_id,
+                endpoint,
+                mireds,
+                transition,
+                ..
+            } => format!(
+                "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {node_id} {endpoint}"
+            ),
             // 複合 op（複数コマンドに展開）と Ping は単一の cmdline を持たない。
             Op::Describe { .. }
             | Op::GroupProvision { .. }
@@ -193,6 +215,19 @@ mod tests {
         assert_eq!(on.op.to_cmdline().unwrap(), "onoff on 3 1");
         let off = parse(r#"{"op":"off","node_id":3,"endpoint":1}"#);
         assert_eq!(off.op.to_cmdline().unwrap(), "onoff off 3 1");
+    }
+
+    #[test]
+    fn color_temp_shortcut_builds_move_to_color_temperature_cmdline() {
+        // mireds は mat 側で換算済み。kelvin は応答エコー用で cmdline には乗らない。
+        let r = parse(
+            r#"{"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2700,"transition":30}"#,
+        );
+        assert_eq!(r.op.node_id(), Some(6));
+        assert_eq!(
+            r.op.to_cmdline().unwrap(),
+            "colorcontrol move-to-color-temperature 370 30 0 0 6 1"
+        );
     }
 
     #[test]

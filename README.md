@@ -154,6 +154,15 @@ mat describe --node 5
 # High-frequency shortcuts (--endpoint defaults to 1)
 mat on --node 5
 mat off --node 5 --endpoint 2
+
+# Color temperature (ColorControl MoveToColorTemperature): give Kelvin and mat
+# converts to mireds (round(1,000,000 / K)), or pass mireds directly. The two
+# flags are mutually exclusive and one is required. --transition is in tenths
+# of a second (30 = 3 s, default 0). Values outside the device's supported
+# range are clamped by the device itself (mat does not pre-read or validate).
+mat color-temp --node 5 --kelvin 2700
+mat color-temp --node 5 --kelvin 2700 --transition 30
+mat color-temp --node 5 --mireds 370
 ```
 
 **Important asymmetry: read is an attribute, control is an invoke.** Turning a
@@ -172,6 +181,11 @@ Outputs:
 
 // invoke (mat on / off have the same shape)
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "command": "on", "status": "success" }
+
+// color-temp — echoes both the input kelvin and the converted mireds so the
+// result can be cross-checked against a `color-temperature-mireds` read
+// (when --mireds is given, kelvin is back-computed the same way for the echo)
+{ "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-color-temperature", "kelvin": 2700, "mireds": 370, "transition": 0, "status": "success" }
 
 // describe — lists child endpoints from endpoint 0's parts-list, and each
 // endpoint's server-list as numeric cluster IDs
@@ -423,8 +437,9 @@ already running (lock held at ...)` instead of silently hijacking it.
 - Once connected, errors are reported from the matd path as-is — `mat` never
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
-- Supported over matd: `read` / `write` / `invoke` / `on` / `off` / `describe` /
-  `group`. `discover` / `commission` / `open-window` / `diag` are direct-only:
+- Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
+  `color-temp` / `describe` / `group`. `discover` / `commission` /
+  `open-window` / `diag` are direct-only:
   auto-detection skips them silently; explicit `--matd` exits `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.

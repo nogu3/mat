@@ -101,6 +101,26 @@ fn auto_routes_to_live_matd() {
 }
 
 #[test]
+fn auto_routes_color_temp_with_converted_mireds() {
+    let store = store_with_node5();
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    let matd = spawn_fake_matd(socket.clone());
+
+    mat_auto(store.path(), &socket)
+        .args(["color-temp", "--node", "5", "--kelvin", "2700"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"via\":\"fake-matd\""));
+
+    // 換算（2700K → 370 mireds）は mat 側で済んだ状態で matd に届く。
+    let req = matd.join().unwrap();
+    assert!(req.contains("\"op\":\"color_temp\""), "request line: {req}");
+    assert!(req.contains("\"mireds\":370"), "request line: {req}");
+    assert!(req.contains("\"kelvin\":2700"), "request line: {req}");
+}
+
+#[test]
 fn auto_falls_back_when_socket_missing() {
     let store = store_with_node5();
     let dir = TempDir::new().unwrap();

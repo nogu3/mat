@@ -237,6 +237,19 @@ async fn simple_op(
             "node_id": node_id, "endpoint": endpoint,
             "cluster": "onoff", "command": "off", "status": "success",
         }),
+        Op::ColorTemp {
+            node_id,
+            endpoint,
+            mireds,
+            kelvin,
+            transition,
+        } => json!({
+            "node_id": node_id, "endpoint": endpoint,
+            "cluster": "colorcontrol", "command": "move-to-color-temperature",
+            // 換算後 mireds と入力 kelvin を両方エコー（読み返し突合用; 直経路と同形）。
+            "kelvin": kelvin, "mireds": mireds, "transition": transition,
+            "status": "success",
+        }),
         Op::Ping
         | Op::Describe { .. }
         | Op::GroupProvision { .. }
