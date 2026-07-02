@@ -19,13 +19,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub store: Option<PathBuf>,
 
-    /// matd の unix socket 経由で実行する（chip-tool を直に起動せず、常駐 matd の warm
-    /// CASE セッションを使う）。値を省略すると socket は `MAT_MATD_SOCKET` があればそれ、
-    /// 無ければ既定パス（`$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`）。
-    /// フラグを省く場合は `MAT_MATD=1` で有効化する。`MAT_MATD_SOCKET` は socket パスの
-    /// 指定のみで、**単独では matd 経路に乗らない**（有効化は本フラグか `MAT_MATD` が必要）。
-    /// 対応は read/write/invoke/on/off/describe/group のみ
-    /// （discover/commission/open-window は非対応）。
+    /// matd の unix socket 経由での実行を強制する（接続失敗はエラー、フォールバック無し）。
+    /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ、無ければ既定パス
+    /// （`$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`）。
+    /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記の socket へ接続を
+    /// 試み、matd がいればそちら、いなければ直 chip-tool にフォールバック。
+    /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
+    /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
+    /// matd 対応は read/write/invoke/on/off/describe/group のみ
+    /// （discover/commission/open-window/diag は常に直経路; 本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
