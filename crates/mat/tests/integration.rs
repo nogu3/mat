@@ -937,3 +937,133 @@ fn discover_probe_with_missing_avahi_reports_reachable_null() {
         .success()
         .stdout(predicate::str::contains("\"reachable\":null"));
 }
+
+// ---- alias 解決（aliases.json） ----
+
+/// node 5 commission 済み + aliases.json を置いたストア。
+fn store_with_node5_and_aliases() -> TempDir {
+    let store = store_with_node5();
+    std::fs::write(
+        store.path().join("aliases.json"),
+        r#"{
+            "nodes":  { "living-light": 5 },
+            "groups": { "all-lights": 1 },
+            "endpoints": { "living-light": { "main": 1, "night": 2 } }
+        }"#,
+    )
+    .unwrap();
+    store
+}
+
+#[test]
+fn read_resolves_node_alias_to_numeric_id() {
+    let store = store_with_node5_and_aliases();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "read",
+            "--node",
+            "living-light",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
+        .assert()
+        .success()
+        // stdout スキーマは数値のまま（alias エコーバック無し）。
+        .stdout(predicate::str::contains("\"node_id\":5"))
+        .stdout(predicate::str::contains("living-light").not());
+    // chip-tool には数値 node_id が渡る。
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("onoff read on-off 5 1"),
+        "alias was not resolved before chip-tool: {recorded}"
+    );
+}
+
+#[test]
+fn endpoint_alias_resolves_with_numeric_node() {
+    // -n 5 -e night: endpoints の外側キーが alias 表記でも解決後 node で照合。
+    let store = store_with_node5_and_aliases();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["on", "--node", "5", "--endpoint", "night"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"endpoint\":2"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("onoff on 5 2"),
+        "endpoint alias was not resolved: {recorded}"
+    );
+}
+
+#[test]
+fn group_invoke_resolves_group_alias() {
+    let store = store_with_node5_and_aliases();
+    mat(store.path())
+        .args([
+            "group",
+            "invoke",
+            "--group",
+            "all-lights",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":1"))
+        .stdout(predicate::str::contains("\"status\":\"sent\""));
+}
+
+#[test]
+fn unknown_alias_exits_2_and_lists_known() {
+    let store = store_with_node5_and_aliases();
+    mat(store.path())
+        .args(["describe", "--node", "bogus"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown node alias 'bogus'"))
+        .stderr(predicate::str::contains("living-light"));
+}
+
+#[test]
+fn alias_without_aliases_file_exits_2() {
+    let store = store_with_node5(); // aliases.json 無し
+    mat(store.path())
+        .args(["describe", "--node", "living-light"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no aliases.json"));
+}
+
+#[test]
+fn corrupt_aliases_file_exits_10() {
+    let store = store_with_node5();
+    std::fs::write(store.path().join("aliases.json"), "{ not json").unwrap();
+    mat(store.path())
+        .args(["describe", "--node", "5"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_parse"));
+}
+
+#[test]
+fn all_digit_alias_name_in_file_exits_10() {
+    let store = store_with_node5();
+    std::fs::write(
+        store.path().join("aliases.json"),
+        r#"{ "nodes": { "42": 5 } }"#,
+    )
+    .unwrap();
+    mat(store.path())
+        .args(["describe", "--node", "5"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("invalid alias name"));
+}
