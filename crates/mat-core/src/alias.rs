@@ -455,6 +455,19 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_key_in_table_yields_store_parse() {
+        // TOML は同一テーブル内のキー重複をパースエラーにする（JSON 時代の
+        // last-wins と違う、本移行で唯一の意味的差分）。toml crate の挙動に
+        // 依存する契約なので回帰テストで固定する。
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), "[nodes]\na = 1\na = 2\n");
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
+    }
+
+    #[test]
     fn insert_node_alias_creates_file_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let mut book = AliasBook::load(dir.path()).unwrap(); // ファイル無し
