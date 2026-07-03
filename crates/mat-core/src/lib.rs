@@ -4,6 +4,7 @@
 //! `timestamp` 付与、エラー種別と exit code 分類、認証情報ストア（KVS）を一箇所で
 //! 保守する。バージョン更新で chip-tool の出力が変わってもここのテストで気づける。
 
+pub mod alias;
 pub mod diag;
 pub mod error;
 pub mod group;
