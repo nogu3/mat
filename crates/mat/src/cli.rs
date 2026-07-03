@@ -56,6 +56,10 @@ pub enum Command {
         /// 割り当てる node_id（省略時は台帳の最大値+1 を自動採番）。
         #[arg(short = 'n', long = "node", value_name = "N")]
         node_id: Option<u64>,
+        /// commission 成功時に aliases.json へ登録する node alias（任意）。
+        /// 純数字・使用済みの名前は commission 開始前に exit 2。
+        #[arg(long, value_name = "NAME")]
+        alias: Option<String>,
     },
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
