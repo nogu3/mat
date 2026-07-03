@@ -74,7 +74,7 @@ use crate::error::{ErrorKind, MatError};
 pub const ALIASES_FILE: &str = "aliases.json";
 
 /// aliases.json のスキーマ。全セクション optional（無い = 定義なし）。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AliasFile {
     #[serde(default = "alias_version")]
     version: u32,
@@ -85,6 +85,19 @@ struct AliasFile {
     /// 外側キー = ノード alias または node_id の数字文字列、内側 = alias → endpoint。
     #[serde(default)]
     endpoints: BTreeMap<String, BTreeMap<String, u16>>,
+}
+
+impl Default for AliasFile {
+    /// serde の `default = "alias_version"` は deserialize 時のみ効くため、
+    /// 手動 impl で version 既定値を揃える（derive だと 0 になる）。
+    fn default() -> Self {
+        AliasFile {
+            version: alias_version(),
+            nodes: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }
+    }
 }
 
 fn alias_version() -> u32 {
@@ -435,6 +448,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut book = AliasBook::load(dir.path()).unwrap(); // ファイル無し
         book.insert_node_alias("new-light", 9, dir.path()).unwrap();
+        // 新規作成されたファイルの version はスキーマ既定の 1。
+        let text = std::fs::read_to_string(dir.path().join(ALIASES_FILE)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["version"], 1);
         // 再ロードで永続を確認。
         let book = AliasBook::load(dir.path()).unwrap();
         assert_eq!(
