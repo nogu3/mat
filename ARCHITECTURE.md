@@ -30,7 +30,13 @@ above it is not `mat`'s concern.
 
 ### `mat` is NOT responsible for
 - **Resolving human names to (node_id, endpoint, cluster).** `mat` takes a
-  numeric `node_id`. Mapping human-facing names is out of scope.
+  numeric `node_id`. Mapping human-facing names is out of scope — with one
+  narrow exception: if an optional `<store>/aliases.json` exists, the CLI
+  layer resolves node / group / endpoint aliases to numbers right after arg
+  parsing, before dispatch. The wire and the backend (`chip-tool` / `matd`)
+  always see numbers; a missing file is exactly the traditional behavior.
+  Cluster / command / attribute names are unaffected (chip-tool notation
+  only, no aliasing).
 - **Scheduling, daemons, or holding state** (except the credential KVS, below).
 - **Session cache, subscriptions, freshness.** `mat` is one-shot and caches
   nothing. Keeping sessions warm is the job of the resident binary `matd` (a
@@ -391,7 +397,9 @@ Only if `chip-tool` parsing or build/ship becomes a bottleneck.
 
 - Implement TLV / CASE / multicast routing inside `mat` (always delegate to
   `chip-tool`).
-- Hold human names or logical groups in `mat` (out of scope).
+- Hold human names or logical groups in `mat` (out of scope; exception: the
+  optional `aliases.json` name→number map for node / group / endpoint, see
+  above — it resolves to numbers before anything reaches chip-tool/matd).
 - Add session cache, subscriptions, a daemon, or an internal scheduler to `mat`
   (that is `matd`'s role, a separate binary).
 - Bring a Matter bridge (becoming a Matter device) into `mat`.
