@@ -2,7 +2,7 @@
 //!
 //! ここを通った後の `Command` は NodeRef / GroupRef / EndpointRef が全て `Id` に
 //! 確定している（matd 経路・直経路の両方がこの後段）。exit code 規約: 壊れた
-//! aliases.json は `store_parse`（10）、未知 alias / 不正 alias 名は CLI 引数
+//! aliases.toml は `store_parse`（10）、未知 alias / 不正 alias 名は CLI 引数
 //! エラー（2）— main が `kind` で振り分ける。
 
 use std::path::Path;
@@ -12,7 +12,7 @@ use mat_core::alias::{AliasBook, EndpointRef, GroupRef, NodeRef};
 use mat_core::error::MatError;
 
 /// command 内の alias を全て数値（`Id`）へ確定した `Command` を返す。
-/// aliases.json が無ければ数値はパススルー（従来動作）。
+/// aliases.toml が無ければ数値はパススルー（従来動作）。
 ///
 /// match は網羅（`_` 無し）: 新しいサブコマンドを足すとここがコンパイルエラーに
 /// なり、alias 解決の考慮漏れを防ぐ。
@@ -202,17 +202,22 @@ mod tests {
     use super::*;
     use mat_core::error::ErrorKind;
 
-    fn store_with(json: &str) -> tempfile::TempDir {
+    fn store_with(toml: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("aliases.json"), json).unwrap();
+        std::fs::write(dir.path().join("aliases.toml"), toml).unwrap();
         dir
     }
 
-    const SAMPLE: &str = r#"{
-        "nodes":  { "living-light": 5 },
-        "groups": { "all-lights": 258 },
-        "endpoints": { "living-light": { "night": 2 } }
-    }"#;
+    const SAMPLE: &str = r#"
+        [nodes]
+        living-light = 5
+
+        [groups]
+        all-lights = 258
+
+        [endpoints.living-light]
+        night = 2
+    "#;
 
     #[test]
     fn read_alias_resolves_node_then_endpoint() {

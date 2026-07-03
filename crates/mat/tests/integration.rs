@@ -938,18 +938,24 @@ fn discover_probe_with_missing_avahi_reports_reachable_null() {
         .stdout(predicate::str::contains("\"reachable\":null"));
 }
 
-// ---- alias 解決（aliases.json） ----
+// ---- alias 解決（aliases.toml） ----
 
-/// node 5 commission 済み + aliases.json を置いたストア。
+/// node 5 commission 済み + aliases.toml を置いたストア。
 fn store_with_node5_and_aliases() -> TempDir {
     let store = store_with_node5();
     std::fs::write(
-        store.path().join("aliases.json"),
-        r#"{
-            "nodes":  { "living-light": 5 },
-            "groups": { "all-lights": 1 },
-            "endpoints": { "living-light": { "main": 1, "night": 2 } }
-        }"#,
+        store.path().join("aliases.toml"),
+        r#"
+            [nodes]
+            living-light = 5
+
+            [groups]
+            all-lights = 1
+
+            [endpoints.living-light]
+            main = 1
+            night = 2
+        "#,
     )
     .unwrap();
     store
@@ -1034,18 +1040,18 @@ fn unknown_alias_exits_2_and_lists_known() {
 
 #[test]
 fn alias_without_aliases_file_exits_2() {
-    let store = store_with_node5(); // aliases.json 無し
+    let store = store_with_node5(); // aliases.toml 無し
     mat(store.path())
         .args(["describe", "--node", "living-light"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("no aliases.json"));
+        .stderr(predicate::str::contains("no aliases.toml"));
 }
 
 #[test]
 fn corrupt_aliases_file_exits_10() {
     let store = store_with_node5();
-    std::fs::write(store.path().join("aliases.json"), "{ not json").unwrap();
+    std::fs::write(store.path().join("aliases.toml"), "not = = toml").unwrap();
     mat(store.path())
         .args(["describe", "--node", "5"])
         .assert()
@@ -1056,11 +1062,7 @@ fn corrupt_aliases_file_exits_10() {
 #[test]
 fn all_digit_alias_name_in_file_exits_10() {
     let store = store_with_node5();
-    std::fs::write(
-        store.path().join("aliases.json"),
-        r#"{ "nodes": { "42": 5 } }"#,
-    )
-    .unwrap();
+    std::fs::write(store.path().join("aliases.toml"), "[nodes]\n42 = 5\n").unwrap();
     mat(store.path())
         .args(["describe", "--node", "5"])
         .assert()
@@ -1069,7 +1071,7 @@ fn all_digit_alias_name_in_file_exits_10() {
 }
 
 #[test]
-fn commission_with_alias_writes_aliases_json() {
+fn commission_with_alias_writes_aliases_toml() {
     let store = TempDir::new().unwrap();
     mat(store.path())
         .args([
@@ -1086,7 +1088,7 @@ fn commission_with_alias_writes_aliases_json() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"node_id\":5"));
-    // aliases.json が作られ、以後 alias で参照できる。
+    // aliases.toml が作られ、以後 alias で参照できる。
     mat(store.path())
         .args(["describe", "--node", "living-light"])
         .assert()

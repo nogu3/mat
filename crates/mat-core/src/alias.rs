@@ -1,6 +1,6 @@
-//! optional な alias 解決（aliases.json）。
+//! optional な alias 解決（aliases.toml）。
 //!
-//! store 配下の `aliases.json` が**あれば** node / group / endpoint の名前→数値
+//! store 配下の `aliases.toml` が**あれば** node / group / endpoint の名前→数値
 //! 解決を行い、無ければ完全に従来動作（数値のみ）。ワイヤ・chip-tool / matd に
 //! 渡る値は常に数値で、解決は CLI 層の前処理に閉じる。
 //!
@@ -71,9 +71,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorKind, MatError};
 
 /// store 配下の alias 定義ファイル名。
-pub const ALIASES_FILE: &str = "aliases.json";
+pub const ALIASES_FILE: &str = "aliases.toml";
 
-/// aliases.json のスキーマ。全セクション optional（無い = 定義なし）。
+/// aliases.toml のスキーマ。全セクション optional（無い = 定義なし）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AliasFile {
     #[serde(default = "alias_version")]
@@ -113,12 +113,12 @@ fn is_valid_alias_name(name: &str) -> bool {
 #[derive(Debug)]
 pub struct AliasBook {
     file: AliasFile,
-    /// aliases.json が実在したか（エラーメッセージの出し分け用）。
+    /// aliases.toml が実在したか（エラーメッセージの出し分け用）。
     present: bool,
 }
 
 impl AliasBook {
-    /// aliases.json を読む。無ければ空の book（正常）。壊れていれば `store_parse`。
+    /// aliases.toml を読む。無ければ空の book（正常）。壊れていれば `store_parse`。
     pub fn load(store_root: &Path) -> Result<Self, MatError> {
         let path = store_root.join(ALIASES_FILE);
         if !path.exists() {
@@ -129,7 +129,7 @@ impl AliasBook {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| MatError::store_parse(format!("cannot read {}: {e}", path.display())))?;
-        let file: AliasFile = serde_json::from_str(&text)
+        let file: AliasFile = toml::from_str(&text)
             .map_err(|e| MatError::store_parse(format!("cannot parse {}: {e}", path.display())))?;
         Self::validate(&file, &path)?;
         Ok(AliasBook {
@@ -232,12 +232,12 @@ impl AliasBook {
         known: impl Iterator<Item = &'a String>,
     ) -> String {
         if !self.present {
-            return format!("unknown {section} alias '{name}' (no aliases.json in store)");
+            return format!("unknown {section} alias '{name}' (no aliases.toml in store)");
         }
         let known: Vec<&str> = known.map(String::as_str).collect();
         if known.is_empty() {
             format!(
-                "unknown {section} alias '{name}' (no {section} aliases defined in aliases.json)"
+                "unknown {section} alias '{name}' (no {section} aliases defined in aliases.toml)"
             )
         } else {
             format!(
@@ -260,13 +260,13 @@ impl AliasBook {
         if self.file.nodes.contains_key(name) {
             return Err(MatError::new(
                 ErrorKind::Other,
-                format!("node alias '{name}' already exists in aliases.json (edit the file to reassign)"),
+                format!("node alias '{name}' already exists in aliases.toml (edit the file to reassign)"),
             ));
         }
         Ok(())
     }
 
-    /// node alias を追加して aliases.json へ保存する（無ければ作成）。
+    /// node alias を追加して aliases.toml へ保存する（無ければ作成）。
     pub fn insert_node_alias(
         &mut self,
         name: &str,
@@ -276,7 +276,7 @@ impl AliasBook {
         self.validate_new_node_alias(name)?;
         self.file.nodes.insert(name.to_string(), node_id);
         let path = store_root.join(ALIASES_FILE);
-        let text = serde_json::to_string_pretty(&self.file).map_err(|e| {
+        let text = toml::to_string_pretty(&self.file).map_err(|e| {
             MatError::new(ErrorKind::Other, format!("cannot serialize aliases: {e}"))
         })?;
         std::fs::write(&path, text).map_err(|e| {
@@ -296,16 +296,27 @@ mod tests {
     use crate::error::ErrorKind;
     use std::path::Path;
 
-    fn write_aliases(dir: &Path, json: &str) {
-        std::fs::write(dir.join(ALIASES_FILE), json).unwrap();
+    fn write_aliases(dir: &Path, toml: &str) {
+        std::fs::write(dir.join(ALIASES_FILE), toml).unwrap();
     }
 
-    const SAMPLE: &str = r#"{
-        "version": 1,
-        "nodes":  { "living-light": 5, "hall-sensor": 12 },
-        "groups": { "all-lights": 258 },
-        "endpoints": { "living-light": { "main": 1, "night": 2 }, "12": { "pir": 3 } }
-    }"#;
+    const SAMPLE: &str = r#"
+        version = 1
+
+        [nodes]
+        living-light = 5
+        hall-sensor = 12
+
+        [groups]
+        all-lights = 258
+
+        [endpoints.living-light]
+        main = 1
+        night = 2
+
+        [endpoints.12]
+        pir = 3
+    "#;
 
     #[test]
     fn numeric_parses_to_id() {
@@ -351,7 +362,7 @@ mod tests {
         assert_eq!(book.resolve_node(&NodeRef::Id(5)).unwrap(), 5);
         let err = book.resolve_node(&NodeRef::Alias("x".into())).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Other);
-        assert!(err.detail.contains("no aliases.json"), "{}", err.detail);
+        assert!(err.detail.contains("no aliases.toml"), "{}", err.detail);
     }
 
     #[test]
@@ -412,9 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_json_yields_store_parse() {
+    fn corrupt_toml_yields_store_parse() {
         let dir = tempfile::tempdir().unwrap();
-        write_aliases(dir.path(), "{ not json");
+        write_aliases(dir.path(), "not = = toml");
         let err = AliasBook::load(dir.path()).unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreParse);
     }
@@ -422,24 +433,24 @@ mod tests {
     #[test]
     fn all_digit_or_empty_alias_name_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        write_aliases(dir.path(), r#"{ "nodes": { "42": 5 } }"#);
+        write_aliases(dir.path(), "[nodes]\n42 = 5\n");
         assert_eq!(
             AliasBook::load(dir.path()).unwrap_err().kind,
             ErrorKind::StoreParse
         );
-        write_aliases(dir.path(), r#"{ "groups": { "": 1 } }"#);
+        write_aliases(dir.path(), "[groups]\n\"\" = 1\n");
         assert_eq!(
             AliasBook::load(dir.path()).unwrap_err().kind,
             ErrorKind::StoreParse
         );
         // endpoints の内側キーも alias 名なので純数字は拒否。
-        write_aliases(dir.path(), r#"{ "endpoints": { "living": { "1": 2 } } }"#);
+        write_aliases(dir.path(), "[endpoints.living]\n1 = 2\n");
         assert_eq!(
             AliasBook::load(dir.path()).unwrap_err().kind,
             ErrorKind::StoreParse
         );
         // endpoints の外側キーは node_id の数字文字列を許可。
-        write_aliases(dir.path(), r#"{ "endpoints": { "5": { "main": 1 } } }"#);
+        write_aliases(dir.path(), "[endpoints.5]\nmain = 1\n");
         assert!(AliasBook::load(dir.path()).is_ok());
     }
 
@@ -450,8 +461,8 @@ mod tests {
         book.insert_node_alias("new-light", 9, dir.path()).unwrap();
         // 新規作成されたファイルの version はスキーマ既定の 1。
         let text = std::fs::read_to_string(dir.path().join(ALIASES_FILE)).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(json["version"], 1);
+        let value: toml::Table = text.parse().unwrap();
+        assert_eq!(value["version"].as_integer(), Some(1));
         // 再ロードで永続を確認。
         let book = AliasBook::load(dir.path()).unwrap();
         assert_eq!(
