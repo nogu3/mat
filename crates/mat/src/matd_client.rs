@@ -425,6 +425,7 @@ mod tests {
             target: "192.0.2.1".into(),
             setup_code: "MT:DUMMY".into(),
             node_id: None,
+            alias: None,
         })
         .is_err());
     }

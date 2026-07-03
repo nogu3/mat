@@ -67,7 +67,8 @@ fn main() -> ExitCode {
             target,
             setup_code,
             node_id,
-        } => commands::commission::run(&store_path, target, setup_code, *node_id),
+            alias,
+        } => commands::commission::run(&store_path, target, setup_code, *node_id, alias.as_deref()),
         Command::Read {
             node_id,
             endpoint,

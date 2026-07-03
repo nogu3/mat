@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 use crate::runner::ChipTool;
+use mat_core::alias::AliasBook;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
 use mat_core::output;
@@ -24,6 +25,7 @@ pub fn run(
     target: &str,
     setup_code: &str,
     node_id: Option<u64>,
+    alias: Option<&str>,
 ) -> Result<(), MatError> {
     // commission はストアを bootstrap してよい経路（初回 fabric 作成を含む）。
     let mut store = Store::open_or_init(store_path)?;
@@ -53,6 +55,21 @@ pub fn run(
             address: Some(target.to_string()),
             commissioned_at: output::now_iso8601(),
         })?;
+        if let Some(name) = alias {
+            // 名前の妥当性・重複は resolve 層で事前検証済み。ここで失敗するのは
+            // 書き込みエラー等のみ（commission 自体は成功しているので detail に明記）。
+            let mut book = AliasBook::load(store.root())?;
+            book.insert_node_alias(name, node_id, store.root())
+                .map_err(|e| {
+                    MatError::new(
+                        e.kind,
+                        format!(
+                        "node {node_id} was commissioned, but writing alias '{name}' failed: {}",
+                        e.detail
+                    ),
+                    )
+                })?;
+        }
         output::emit(json!({ "node_id": node_id, "status": "success" }));
         return Ok(());
     }

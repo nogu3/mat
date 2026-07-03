@@ -24,11 +24,20 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             target,
             setup_code,
             node_id,
-        } => Command::Commission {
-            target,
-            setup_code,
-            node_id,
-        },
+            alias,
+        } => {
+            // 名前の妥当性・重複は commission 開始前に検証する（開始後に alias
+            // 書き込みだけ失敗する中途半端な状態を作らない）。
+            if let Some(name) = &alias {
+                book.validate_new_node_alias(name)?;
+            }
+            Command::Commission {
+                target,
+                setup_code,
+                node_id,
+                alias,
+            }
+        }
         Command::Read {
             node_id,
             endpoint,

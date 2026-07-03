@@ -1067,3 +1067,72 @@ fn all_digit_alias_name_in_file_exits_10() {
         .code(10)
         .stderr(predicate::str::contains("invalid alias name"));
 }
+
+#[test]
+fn commission_with_alias_writes_aliases_json() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+            "--node",
+            "5",
+            "--alias",
+            "living-light",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"node_id\":5"));
+    // aliases.json が作られ、以後 alias で参照できる。
+    mat(store.path())
+        .args(["describe", "--node", "living-light"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"node_id\":5"));
+}
+
+#[test]
+fn commission_with_duplicate_alias_exits_2_before_running() {
+    let store = store_with_node5_and_aliases(); // living-light 定義済み
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+            "--alias",
+            "living-light",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("already exists"));
+    // 事前検証なので chip-tool は呼ばれていない。
+    assert!(
+        !args_file.exists(),
+        "chip-tool was invoked despite invalid alias"
+    );
+}
+
+#[test]
+fn commission_with_all_digit_alias_exits_2() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:FAKE",
+            "--alias",
+            "42",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid alias name"));
+}
