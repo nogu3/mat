@@ -233,6 +233,48 @@ impl AliasBook {
             )
         }
     }
+
+    /// commission --alias の事前検証: 形式 NG / 使用済みはエラー（kind=Other、
+    /// main が exit 2 に写す）。commission 開始前に呼び、成功後に alias 書き込み
+    /// だけ失敗する中途半端な状態を作らない。
+    pub fn validate_new_node_alias(&self, name: &str) -> Result<(), MatError> {
+        if !is_valid_alias_name(name) {
+            return Err(MatError::new(
+                ErrorKind::Other,
+                format!("invalid alias name '{name}' (must be non-empty and not all digits)"),
+            ));
+        }
+        if self.file.nodes.contains_key(name) {
+            return Err(MatError::new(
+                ErrorKind::Other,
+                format!("node alias '{name}' already exists in aliases.json (edit the file to reassign)"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// node alias を追加して aliases.json へ保存する（無ければ作成）。
+    pub fn insert_node_alias(
+        &mut self,
+        name: &str,
+        node_id: u64,
+        store_root: &Path,
+    ) -> Result<(), MatError> {
+        self.validate_new_node_alias(name)?;
+        self.file.nodes.insert(name.to_string(), node_id);
+        let path = store_root.join(ALIASES_FILE);
+        let text = serde_json::to_string_pretty(&self.file).map_err(|e| {
+            MatError::new(ErrorKind::Other, format!("cannot serialize aliases: {e}"))
+        })?;
+        std::fs::write(&path, text).map_err(|e| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("cannot write {}: {e}", path.display()),
+            )
+        })?;
+        self.present = true;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +428,54 @@ mod tests {
         // endpoints の外側キーは node_id の数字文字列を許可。
         write_aliases(dir.path(), r#"{ "endpoints": { "5": { "main": 1 } } }"#);
         assert!(AliasBook::load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn insert_node_alias_creates_file_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = AliasBook::load(dir.path()).unwrap(); // ファイル無し
+        book.insert_node_alias("new-light", 9, dir.path()).unwrap();
+        // 再ロードで永続を確認。
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(
+            book.resolve_node(&NodeRef::Alias("new-light".into()))
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn insert_preserves_existing_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let mut book = AliasBook::load(dir.path()).unwrap();
+        book.insert_node_alias("new-light", 9, dir.path()).unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(
+            book.resolve_group(&GroupRef::Alias("all-lights".into()))
+                .unwrap(),
+            258
+        );
+        assert_eq!(
+            book.resolve_node(&NodeRef::Alias("living-light".into()))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn validate_new_node_alias_rejects_dup_and_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let book = AliasBook::load(dir.path()).unwrap();
+        // 使用済み。
+        let err = book.validate_new_node_alias("living-light").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("already"), "{}", err.detail);
+        // 純数字 / 空。
+        assert!(book.validate_new_node_alias("42").is_err());
+        assert!(book.validate_new_node_alias("").is_err());
+        // 未使用の妥当な名前。
+        assert!(book.validate_new_node_alias("new-light").is_ok());
     }
 }
