@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 
 use crate::cli::{Command, GroupCommand};
+use mat_core::alias::NodeRef;
 use mat_core::error::ErrorKind;
 use mat_core::socket::default_socket_path;
 
@@ -150,7 +151,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             cluster,
             attribute,
         } => json!({
-            "op": "read", "node_id": node_id, "endpoint": endpoint,
+            "op": "read", "node_id": node_id.id(), "endpoint": endpoint.id(),
             "cluster": cluster, "attribute": attribute,
         }),
         Command::Write {
@@ -160,7 +161,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             attribute,
             value,
         } => json!({
-            "op": "write", "node_id": node_id, "endpoint": endpoint,
+            "op": "write", "node_id": node_id.id(), "endpoint": endpoint.id(),
             "cluster": cluster, "attribute": attribute, "value": value,
         }),
         Command::Invoke {
@@ -170,15 +171,15 @@ fn to_op(command: &Command) -> Result<Value, String> {
             command,
             args,
         } => json!({
-            "op": "invoke", "node_id": node_id, "endpoint": endpoint,
+            "op": "invoke", "node_id": node_id.id(), "endpoint": endpoint.id(),
             "cluster": cluster, "command": command, "args": args,
         }),
-        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id }),
+        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id() }),
         Command::On { node_id, endpoint } => {
-            json!({ "op": "on", "node_id": node_id, "endpoint": endpoint })
+            json!({ "op": "on", "node_id": node_id.id(), "endpoint": endpoint.id() })
         }
         Command::Off { node_id, endpoint } => {
-            json!({ "op": "off", "node_id": node_id, "endpoint": endpoint })
+            json!({ "op": "off", "node_id": node_id.id(), "endpoint": endpoint.id() })
         }
         Command::ColorTemp {
             node_id,
@@ -191,7 +192,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
             let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
             json!({
-                "op": "color_temp", "node_id": node_id, "endpoint": endpoint,
+                "op": "color_temp", "node_id": node_id.id(), "endpoint": endpoint.id(),
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
@@ -205,9 +206,11 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 epoch_key,
             } => {
                 // name 未指定なら group_id から決定的に補完（main の直接経路と同じ規則）。
-                let name = name.clone().unwrap_or_else(|| format!("grp{group_id}"));
+                let gid = group_id.id();
+                let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
+                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
                 json!({
-                    "op": "group_provision", "group_id": group_id, "node_ids": node_ids,
+                    "op": "group_provision", "group_id": gid, "node_ids": ids,
                     "keyset_id": keyset_id, "name": name, "endpoint": endpoint,
                     "epoch_key": epoch_key,
                 })
@@ -219,7 +222,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 args,
                 endpoint,
             } => json!({
-                "op": "group_invoke", "group_id": group_id, "cluster": cluster,
+                "op": "group_invoke", "group_id": group_id.id(), "cluster": cluster,
                 "command": command, "args": args, "endpoint": endpoint,
             }),
         },
@@ -287,12 +290,13 @@ fn emit_error(kind: ErrorKind, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
 
     #[test]
     fn read_maps_to_read_op() {
         let cmd = Command::Read {
-            node_id: 1,
-            endpoint: 2,
+            node_id: NodeRef::Id(1),
+            endpoint: EndpointRef::Id(2),
             cluster: "onoff".into(),
             attribute: "on-off".into(),
         };
@@ -305,8 +309,8 @@ mod tests {
     #[test]
     fn on_maps_to_on_op_with_endpoint() {
         let cmd = Command::On {
-            node_id: 3,
-            endpoint: 1,
+            node_id: NodeRef::Id(3),
+            endpoint: EndpointRef::Id(1),
         };
         assert_eq!(
             to_op(&cmd).unwrap(),
@@ -317,8 +321,8 @@ mod tests {
     #[test]
     fn color_temp_kelvin_maps_to_color_temp_op_with_converted_mireds() {
         let cmd = Command::ColorTemp {
-            node_id: 6,
-            endpoint: 1,
+            node_id: NodeRef::Id(6),
+            endpoint: EndpointRef::Id(1),
             kelvin: Some(2700),
             mireds: None,
             transition: 30,
@@ -333,8 +337,8 @@ mod tests {
     #[test]
     fn color_temp_mireds_maps_with_computed_kelvin_echo() {
         let cmd = Command::ColorTemp {
-            node_id: 6,
-            endpoint: 1,
+            node_id: NodeRef::Id(6),
+            endpoint: EndpointRef::Id(1),
             kelvin: None,
             mireds: Some(370),
             transition: 0,
@@ -349,8 +353,8 @@ mod tests {
     fn group_provision_fills_default_name_and_keeps_null_epoch() {
         let cmd = Command::Group {
             action: GroupCommand::Provision {
-                group_id: 7,
-                node_ids: vec![1, 2],
+                group_id: GroupRef::Id(7),
+                node_ids: vec![NodeRef::Id(1), NodeRef::Id(2)],
                 keyset_id: 42,
                 name: None,
                 endpoint: 1,

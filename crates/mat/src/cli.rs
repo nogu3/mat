@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,12 +60,12 @@ pub enum Command {
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
     Read {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
         /// クラスタ名（chip-tool 表記、例: `onoff` / `levelcontrol`）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
@@ -75,12 +76,12 @@ pub enum Command {
 
     /// 書き込み可能属性を設定する。
     Write {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
         /// クラスタ名（chip-tool 表記）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
@@ -94,12 +95,12 @@ pub enum Command {
 
     /// コマンドを実行する。照明 ON/OFF 等の「制御」はここ（属性 write ではない）。
     Invoke {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
         /// クラスタ名（chip-tool 表記）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
@@ -113,29 +114,29 @@ pub enum Command {
 
     /// ノードのエンドポイント / クラスタを introspect する。
     Describe {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
     },
 
     /// OnOff クラスタの On コマンドを invoke する高頻度ショートカット。
     On {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
     },
 
     /// OnOff クラスタの Off コマンドを invoke する高頻度ショートカット。
     Off {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
     },
 
     /// ColorControl の MoveToColorTemperature を invoke する高頻度ショートカット。
@@ -143,12 +144,12 @@ pub enum Command {
     /// `--mireds`（直指定）のどちらか一方で与える。デバイス対応範囲外の値は
     /// デバイス側が clamp する（mat は事前 read / 検証をしない）。
     ColorTemp {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 1）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
         /// 色温度（ケルビン）。値域は mireds が u16 に収まる 16..=1000000。
         #[arg(
             long,
@@ -169,9 +170,9 @@ pub enum Command {
     /// `mat` 所有デバイスを他 admin へ共有するため commissioning window を開く。
     /// `{ node_id, manual_code, qr_payload, expires_at }` を返す（QR 画像化は上層）。
     OpenWindow {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
         /// window を開いておく秒数（既定 180）。
         #[arg(long, value_name = "S", default_value_t = 180)]
         timeout: u32,
@@ -203,24 +204,24 @@ pub enum DiagCommand {
     /// `routing-role` / `partition-id` / `channel` / `network-name` / `rloc16` と
     /// `neighbor-table`（LQI/RSSI）/ `route-table`（cost）を集約する。
     Thread {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 0 — 診断クラスタは通常 ep0）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 0)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 0 — 診断クラスタは通常 ep0）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "0")]
+        endpoint: EndpointRef,
     },
 
     /// commissioned ノードが「なぜ制御できないか」を層別チェックして verdict で返す。
     /// 既定は chip-tool 完結。`--deep` で ping6 / mDNS ブラウズも実施し、
     /// link_starved（弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
     Node {
-        /// commission 済みノードの node_id。
-        #[arg(short = 'n', long = "node", value_name = "N")]
-        node_id: u64,
-        /// エンドポイント番号（既定 0 — 診断は通常 ep0）。
-        #[arg(short = 'e', long, value_name = "EP", default_value_t = 0)]
-        endpoint: u16,
+        /// commission 済みノードの node_id、または aliases.json の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.json の endpoint alias（既定 0 — 診断は通常 ep0）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "0")]
+        endpoint: EndpointRef,
         /// 補助プローブ（ping6 / avahi-browse）も実施して深掘りする。
         #[arg(long)]
         deep: bool,
@@ -232,19 +233,19 @@ pub enum GroupCommand {
     /// 各ノードへ group 鍵束とマッピングを焼く（KeySetWrite / GroupKeyMap / AddGroup）。
     /// コントローラ側 group state（groupsettings）も併せて設定する。
     Provision {
-        /// Matter GroupId（wire group 識別子）。
-        #[arg(short = 'g', long = "group", value_name = "ID")]
-        group_id: u16,
-        /// provision 対象の commission 済み node_id（1つ以上）。
+        /// Matter GroupId、または aliases.json の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// provision 対象の commission 済み node_id または node alias（1つ以上）。
         #[arg(long = "nodes", required = true, num_args = 1..)]
-        node_ids: Vec<u64>,
+        node_ids: Vec<NodeRef>,
         /// 鍵束 ID（GroupKeySetID）。既定 42。
         #[arg(long, value_name = "N", default_value_t = 42)]
         keyset_id: u16,
         /// group 名（chip-tool groupsettings / AddGroup 用）。既定 `grp<group_id>`。
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// AddGroup を行うエンドポイント（既定 1）。
+        /// AddGroup を行うエンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。
         #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
         /// epoch key（16バイト = 32桁 hex）。省略時は mat がランダム生成する。
@@ -255,9 +256,9 @@ pub enum GroupCommand {
 
     /// group へ multicast でコマンドを送る（unacknowledged。"sent" のみ報告）。
     Invoke {
-        /// Matter GroupId。
-        #[arg(short = 'g', long = "group", value_name = "ID")]
-        group_id: u16,
+        /// Matter GroupId、または aliases.json の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
         /// クラスタ名（chip-tool 表記、例: `onoff`）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
@@ -267,7 +268,7 @@ pub enum GroupCommand {
         /// コマンド引数（chip-tool にそのまま渡す）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
-        /// 宛先エンドポイント（既定 1）。
+        /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。
         #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
     },

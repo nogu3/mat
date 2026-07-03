@@ -8,6 +8,7 @@ mod cli;
 mod commands;
 mod matd_client;
 mod probe;
+mod resolve;
 mod runner;
 
 use std::process::ExitCode;
@@ -16,6 +17,8 @@ use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Command, DiagCommand, GroupCommand};
+use mat_core::alias::NodeRef;
+use mat_core::error::ErrorKind;
 use mat_core::store::Store;
 
 fn main() -> ExitCode {
@@ -23,6 +26,22 @@ fn main() -> ExitCode {
 
     // 引数エラー（exit 2）は clap が直接処理する。
     let args = Cli::parse();
+
+    let store_path = Store::locate(args.store);
+
+    // alias 一括解決（aliases.json が無ければ数値パススルー）。matd 経路も数値しか
+    // 受けないため、経路解決より前に行う。未知 alias / 不正 alias 名は CLI 引数
+    // エラー（exit 2）、壊れた aliases.json は store_parse（exit 10）。
+    let command = match resolve::resolve_command(args.command, &store_path) {
+        Ok(c) => c,
+        Err(e) => {
+            e.emit();
+            return match e.kind {
+                ErrorKind::StoreParse => ExitCode::from(e.kind.exit_code()),
+                _ => ExitCode::from(2),
+            };
+        }
+    };
 
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
@@ -33,18 +52,16 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD_SOCKET"),
         std::env::var_os("MAT_MATD"),
     ) {
-        matd_client::Route::Forced(socket) => return matd_client::dispatch(&socket, &args.command),
+        matd_client::Route::Forced(socket) => return matd_client::dispatch(&socket, &command),
         matd_client::Route::Auto(socket) => {
-            if let Some(code) = matd_client::dispatch_auto(&socket, &args.command) {
+            if let Some(code) = matd_client::dispatch_auto(&socket, &command) {
                 return code;
             }
         }
         matd_client::Route::Direct => {}
     }
 
-    let store_path = Store::locate(args.store);
-
-    let result = match &args.command {
+    let result = match &command {
         Command::Discover { probe } => commands::discover::run(&store_path, *probe),
         Command::Commission {
             target,
@@ -56,27 +73,41 @@ fn main() -> ExitCode {
             endpoint,
             cluster,
             attribute,
-        } => commands::read::run(&store_path, *node_id, *endpoint, cluster, attribute),
+        } => commands::read::run(&store_path, node_id.id(), endpoint.id(), cluster, attribute),
         Command::Write {
             node_id,
             endpoint,
             cluster,
             attribute,
             value,
-        } => commands::write::run(&store_path, *node_id, *endpoint, cluster, attribute, value),
+        } => commands::write::run(
+            &store_path,
+            node_id.id(),
+            endpoint.id(),
+            cluster,
+            attribute,
+            value,
+        ),
         Command::Invoke {
             node_id,
             endpoint,
             cluster,
             command,
             args,
-        } => commands::invoke::run(&store_path, *node_id, *endpoint, cluster, command, args),
-        Command::Describe { node_id } => commands::describe::run(&store_path, *node_id),
+        } => commands::invoke::run(
+            &store_path,
+            node_id.id(),
+            endpoint.id(),
+            cluster,
+            command,
+            args,
+        ),
+        Command::Describe { node_id } => commands::describe::run(&store_path, node_id.id()),
         Command::On { node_id, endpoint } => {
-            commands::invoke::run_onoff(&store_path, *node_id, *endpoint, true)
+            commands::invoke::run_onoff(&store_path, node_id.id(), endpoint.id(), true)
         }
         Command::Off { node_id, endpoint } => {
-            commands::invoke::run_onoff(&store_path, *node_id, *endpoint, false)
+            commands::invoke::run_onoff(&store_path, node_id.id(), endpoint.id(), false)
         }
         Command::ColorTemp {
             node_id,
@@ -89,8 +120,8 @@ fn main() -> ExitCode {
             let (mireds, kelvin) = commands::invoke::resolve_color_temp(*kelvin, *mireds);
             commands::invoke::run_color_temp(
                 &store_path,
-                *node_id,
-                *endpoint,
+                node_id.id(),
+                endpoint.id(),
                 kelvin,
                 mireds,
                 *transition,
@@ -103,8 +134,8 @@ fn main() -> ExitCode {
             discriminator,
         } => {
             // discriminator 未指定なら node_id から決定的に算出（12-bit に収める）。
-            let disc = discriminator.unwrap_or_else(|| (*node_id % 4096) as u16);
-            commands::open_window::run(&store_path, *node_id, *timeout, *iteration, disc)
+            let disc = discriminator.unwrap_or_else(|| (node_id.id() % 4096) as u16);
+            commands::open_window::run(&store_path, node_id.id(), *timeout, *iteration, disc)
         }
         Command::Group { action } => match action {
             GroupCommand::Provision {
@@ -116,11 +147,13 @@ fn main() -> ExitCode {
                 epoch_key,
             } => {
                 // name 未指定なら group_id から決定的に補完（open-window の disc と同様）。
-                let name = name.clone().unwrap_or_else(|| format!("grp{group_id}"));
+                let gid = group_id.id();
+                let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
+                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
                 commands::group::provision(
                     &store_path,
-                    *group_id,
-                    node_ids,
+                    gid,
+                    &ids,
                     *keyset_id,
                     &name,
                     *endpoint,
@@ -133,17 +166,24 @@ fn main() -> ExitCode {
                 command,
                 args,
                 endpoint,
-            } => commands::group::invoke(&store_path, *group_id, cluster, command, args, *endpoint),
+            } => commands::group::invoke(
+                &store_path,
+                group_id.id(),
+                cluster,
+                command,
+                args,
+                *endpoint,
+            ),
         },
         Command::Diag { action } => match action {
             DiagCommand::Thread { node_id, endpoint } => {
-                commands::diag::thread(&store_path, *node_id, *endpoint)
+                commands::diag::thread(&store_path, node_id.id(), endpoint.id())
             }
             DiagCommand::Node {
                 node_id,
                 endpoint,
                 deep,
-            } => commands::diag::node(&store_path, *node_id, *endpoint, *deep),
+            } => commands::diag::node(&store_path, node_id.id(), endpoint.id(), *deep),
         },
     };
 
