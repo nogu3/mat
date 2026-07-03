@@ -63,9 +63,194 @@ impl_ref!(NodeRef, u64, "node");
 impl_ref!(GroupRef, u16, "group");
 impl_ref!(EndpointRef, u16, "endpoint");
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ErrorKind, MatError};
+
+/// store 配下の alias 定義ファイル名。
+pub const ALIASES_FILE: &str = "aliases.json";
+
+/// aliases.json のスキーマ。全セクション optional（無い = 定義なし）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AliasFile {
+    #[serde(default = "alias_version")]
+    version: u32,
+    #[serde(default)]
+    nodes: BTreeMap<String, u64>,
+    #[serde(default)]
+    groups: BTreeMap<String, u16>,
+    /// 外側キー = ノード alias または node_id の数字文字列、内側 = alias → endpoint。
+    #[serde(default)]
+    endpoints: BTreeMap<String, BTreeMap<String, u16>>,
+}
+
+fn alias_version() -> u32 {
+    1
+}
+
+/// alias 名の妥当性: 空でなく、純数字でない（数値指定とのシャドーイング禁止）。
+fn is_valid_alias_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 読み込み済み alias 定義。ファイルが無ければ空（present = false）。
+#[derive(Debug)]
+pub struct AliasBook {
+    file: AliasFile,
+    /// aliases.json が実在したか（エラーメッセージの出し分け用）。
+    present: bool,
+}
+
+impl AliasBook {
+    /// aliases.json を読む。無ければ空の book（正常）。壊れていれば `store_parse`。
+    pub fn load(store_root: &Path) -> Result<Self, MatError> {
+        let path = store_root.join(ALIASES_FILE);
+        if !path.exists() {
+            return Ok(AliasBook {
+                file: AliasFile::default(),
+                present: false,
+            });
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| MatError::store_parse(format!("cannot read {}: {e}", path.display())))?;
+        let file: AliasFile = serde_json::from_str(&text)
+            .map_err(|e| MatError::store_parse(format!("cannot parse {}: {e}", path.display())))?;
+        Self::validate(&file, &path)?;
+        Ok(AliasBook {
+            file,
+            present: true,
+        })
+    }
+
+    /// alias 名の検証。純数字・空文字は `store_parse`（ファイル自体の不備）。
+    /// `endpoints` の外側キーだけは node_id の数字文字列を許可（空は不可）。
+    fn validate(file: &AliasFile, path: &Path) -> Result<(), MatError> {
+        let alias_names = file
+            .nodes
+            .keys()
+            .chain(file.groups.keys())
+            .chain(file.endpoints.values().flat_map(|eps| eps.keys()));
+        for name in alias_names {
+            if !is_valid_alias_name(name) {
+                return Err(MatError::store_parse(format!(
+                    "invalid alias name '{name}' in {} (must be non-empty and not all digits)",
+                    path.display()
+                )));
+            }
+        }
+        if file.endpoints.keys().any(|k| k.is_empty()) {
+            return Err(MatError::store_parse(format!(
+                "invalid empty node key in endpoints section of {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// node 参照を数値へ確定する（`Id` はパススルー）。未知 alias は kind=Other
+    /// （main が exit 2 に写す）。
+    pub fn resolve_node(&self, r: &NodeRef) -> Result<u64, MatError> {
+        match r {
+            NodeRef::Id(n) => Ok(*n),
+            NodeRef::Alias(name) => self.file.nodes.get(name).copied().ok_or_else(|| {
+                MatError::new(
+                    ErrorKind::Other,
+                    self.unknown_alias("node", name, self.file.nodes.keys()),
+                )
+            }),
+        }
+    }
+
+    /// group 参照を数値へ確定する。
+    pub fn resolve_group(&self, r: &GroupRef) -> Result<u16, MatError> {
+        match r {
+            GroupRef::Id(n) => Ok(*n),
+            GroupRef::Alias(name) => self.file.groups.get(name).copied().ok_or_else(|| {
+                MatError::new(
+                    ErrorKind::Other,
+                    self.unknown_alias("group", name, self.file.groups.keys()),
+                )
+            }),
+        }
+    }
+
+    /// endpoint 参照を数値へ確定する。alias は「解決後の node」の定義だけを見る:
+    /// 外側キー（ノード alias / 数字文字列）を node_id に正規化して照合するので、
+    /// `-n 5 -e main` でも `-n living-light -e main` でも同じ結果になる。
+    pub fn resolve_endpoint(&self, node_id: u64, r: &EndpointRef) -> Result<u16, MatError> {
+        let name = match r {
+            EndpointRef::Id(n) => return Ok(*n),
+            EndpointRef::Alias(name) => name,
+        };
+        let mut known: Vec<&str> = Vec::new();
+        for (outer, eps) in &self.file.endpoints {
+            let outer_id = outer
+                .parse::<u64>()
+                .ok()
+                .or_else(|| self.file.nodes.get(outer).copied());
+            if outer_id == Some(node_id) {
+                if let Some(ep) = eps.get(name) {
+                    return Ok(*ep);
+                }
+                known.extend(eps.keys().map(String::as_str));
+            }
+        }
+        let detail = if known.is_empty() {
+            format!(
+                "unknown endpoint alias '{name}' for node {node_id} (no endpoint aliases defined for this node)"
+            )
+        } else {
+            format!(
+                "unknown endpoint alias '{name}' for node {node_id} (known: {})",
+                known.join(", ")
+            )
+        };
+        Err(MatError::new(ErrorKind::Other, detail))
+    }
+
+    /// 未知 alias の detail 文。AI が自己修復できるよう既知 alias を列挙する。
+    fn unknown_alias<'a>(
+        &self,
+        section: &str,
+        name: &str,
+        known: impl Iterator<Item = &'a String>,
+    ) -> String {
+        if !self.present {
+            return format!("unknown {section} alias '{name}' (no aliases.json in store)");
+        }
+        let known: Vec<&str> = known.map(String::as_str).collect();
+        if known.is_empty() {
+            format!(
+                "unknown {section} alias '{name}' (no {section} aliases defined in aliases.json)"
+            )
+        } else {
+            format!(
+                "unknown {section} alias '{name}' (known: {})",
+                known.join(", ")
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
+    use std::path::Path;
+
+    fn write_aliases(dir: &Path, json: &str) {
+        std::fs::write(dir.join(ALIASES_FILE), json).unwrap();
+    }
+
+    const SAMPLE: &str = r#"{
+        "version": 1,
+        "nodes":  { "living-light": 5, "hall-sensor": 12 },
+        "groups": { "all-lights": 258 },
+        "endpoints": { "living-light": { "main": 1, "night": 2 }, "12": { "pir": 3 } }
+    }"#;
 
     #[test]
     fn numeric_parses_to_id() {
@@ -102,5 +287,104 @@ mod tests {
         assert_eq!(NodeRef::Id(7).id(), 7);
         assert_eq!(GroupRef::Id(258).id(), 258);
         assert_eq!(EndpointRef::Id(2).id(), 2);
+    }
+
+    #[test]
+    fn missing_file_yields_empty_book_and_numeric_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(book.resolve_node(&NodeRef::Id(5)).unwrap(), 5);
+        let err = book.resolve_node(&NodeRef::Alias("x".into())).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("no aliases.json"), "{}", err.detail);
+    }
+
+    #[test]
+    fn resolves_node_group_and_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(
+            book.resolve_node(&NodeRef::Alias("living-light".into()))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            book.resolve_group(&GroupRef::Alias("all-lights".into()))
+                .unwrap(),
+            258
+        );
+        // 外側キーがノード alias。
+        assert_eq!(
+            book.resolve_endpoint(5, &EndpointRef::Alias("night".into()))
+                .unwrap(),
+            2
+        );
+        // 外側キーが node_id の数字文字列。
+        assert_eq!(
+            book.resolve_endpoint(12, &EndpointRef::Alias("pir".into()))
+                .unwrap(),
+            3
+        );
+        // 数値パススルー。
+        assert_eq!(book.resolve_endpoint(5, &EndpointRef::Id(9)).unwrap(), 9);
+    }
+
+    #[test]
+    fn unknown_alias_lists_known_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let book = AliasBook::load(dir.path()).unwrap();
+        let err = book
+            .resolve_node(&NodeRef::Alias("bogus".into()))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("hall-sensor"), "{}", err.detail);
+        assert!(err.detail.contains("living-light"), "{}", err.detail);
+    }
+
+    #[test]
+    fn endpoint_alias_of_other_node_is_not_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let book = AliasBook::load(dir.path()).unwrap();
+        // "pir" は node 12 の定義。node 5 からは見えない。
+        let err = book
+            .resolve_endpoint(5, &EndpointRef::Alias("pir".into()))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("node 5"), "{}", err.detail);
+    }
+
+    #[test]
+    fn corrupt_json_yields_store_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), "{ not json");
+        let err = AliasBook::load(dir.path()).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreParse);
+    }
+
+    #[test]
+    fn all_digit_or_empty_alias_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), r#"{ "nodes": { "42": 5 } }"#);
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
+        write_aliases(dir.path(), r#"{ "groups": { "": 1 } }"#);
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
+        // endpoints の内側キーも alias 名なので純数字は拒否。
+        write_aliases(dir.path(), r#"{ "endpoints": { "living": { "1": 2 } } }"#);
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
+        // endpoints の外側キーは node_id の数字文字列を許可。
+        write_aliases(dir.path(), r#"{ "endpoints": { "5": { "main": 1 } } }"#);
+        assert!(AliasBook::load(dir.path()).is_ok());
     }
 }
