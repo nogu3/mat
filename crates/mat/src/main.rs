@@ -29,9 +29,9 @@ fn main() -> ExitCode {
 
     let store_path = Store::locate(args.store);
 
-    // alias 一括解決（aliases.json が無ければ数値パススルー）。matd 経路も数値しか
+    // alias 一括解決（aliases.toml が無ければ数値パススルー）。matd 経路も数値しか
     // 受けないため、経路解決より前に行う。未知 alias / 不正 alias 名は CLI 引数
-    // エラー（exit 2）、壊れた aliases.json は store_parse（exit 10）。
+    // エラー（exit 2）、壊れた aliases.toml は store_parse（exit 10）。
     let command = match resolve::resolve_command(args.command, &store_path) {
         Ok(c) => c,
         Err(e) => {
