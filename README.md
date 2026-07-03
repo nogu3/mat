@@ -128,14 +128,16 @@ connectedhomeip's `credentials/production/paa-root-certs/`.
 
 `<node_id>` must be **already commissioned** (if not, exit `11`; if the store
 itself is missing, exit `10`). Cluster / attribute / command names are passed in
-**chip-tool form** (`mat` works in numeric / chip-tool terms; human-name
-resolution is out of scope).
+**chip-tool form** (`mat` works in numeric / chip-tool terms; cluster /
+attribute / command names are never aliased).
 
 All device-addressing commands take named flags: `--node` (required),
-`--endpoint` (defaults to 1), `--cluster`, `--attribute`, each with a short alias
-(`-n` / `-e` / `-c` / `-a`) for terser typing. The node_id is the Matter
-operational node identifier (not a local nickname), so it stays a required
-number — human-name resolution is out of scope (see CLAUDE.md).
+`--endpoint` (defaults to 1), `--cluster`, `--attribute`, each with a short flag
+(`-n` / `-e` / `-c` / `-a`) for terser typing. `--node` / `--endpoint` take the
+numeric Matter identifiers; optionally, if `<store>/aliases.json` exists, they
+also accept a locally defined name that `mat` resolves to the number right after
+arg parsing (see [Aliases](#aliases-aliasesjson-optional)). Without that file,
+numbers are the only form, exactly as before.
 
 ```bash
 # Read an attribute (--endpoint defaults to 1)
@@ -337,7 +339,9 @@ This is the original motivation (no "popcorn effect" of lights turning on one by
 one). It wraps `chip-tool`'s group path (`groupsettings` / `groupkeymanagement` /
 `groups`); `mat` holds no group state of its own (it lives in chip-tool's
 storage). Logical group names ("the living-room lights") are out of scope —
-`mat` only takes a numeric GroupId.
+`mat` takes a numeric GroupId (`-g/--group` and `--nodes` also accept an
+alias from the optional `aliases.json`, which is just a local nickname for the
+number; see [Aliases](#aliases-aliasesjson-optional)).
 
 ```bash
 # Provision: burn the key set + mapping into every node, and set up the
@@ -448,8 +452,76 @@ already running (lock held at ...)` instead of silently hijacking it.
 
 Resolution order: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` >
 `~/.config/mat`. It holds the Root CA, the controller's keys/cert, the
-commissioned-node ledger (`nodes.json`), and `chip-tool`'s persistent storage.
+commissioned-node ledger (`nodes.json`), the optional alias map
+(`aliases.json`, below), and `chip-tool`'s persistent storage.
 **It is never committed** (excluded by `.gitignore`).
+
+## Aliases (`aliases.json`, optional)
+
+Numeric node / group / endpoint ids are easy to get wrong. If the file
+`<store>/aliases.json` exists, `mat` resolves locally defined names to those
+numbers right after arg parsing — a purely local convenience. **Without the
+file, behavior is exactly the traditional numeric-only one.** The wire and the
+backend (`chip-tool` / `matd`) always receive numbers, and stdout keeps the
+numeric schema (no alias echo-back).
+
+```json
+{
+  "version": 1,
+  "nodes":  { "living-light": 5, "hall-sensor": 12 },
+  "groups": { "all-lights": 258 },
+  "endpoints": { "living-light": { "main": 1, "night": 2 } }
+}
+```
+
+- `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
+  describe / on / off / color-temp / open-window / diag thread / diag node) and
+  by `--nodes` in `group provision` (each element resolved independently).
+- `groups`: alias → GroupId. Accepted by `-g/--group` (`group provision` /
+  `group invoke`).
+- `endpoints`: defined **per node** — the outer key is a node alias or a
+  node_id digit string, the inner map is alias → endpoint number (endpoint
+  numbers mean different things on different nodes, so there is no global
+  endpoint dictionary). Accepted by `-e/--endpoint` on node-taking commands;
+  the lookup uses the *resolved* node, so `-n 5 -e main` and
+  `-n living-light -e main` give the same result. The `-e` of `group
+  provision` / `group invoke` is **numeric only** (no node context to resolve
+  against).
+
+```bash
+# With the aliases.json above, these are equivalent:
+mat on -n living-light
+mat on -n 5
+```
+
+Resolution rules:
+
+- A value that parses as a number is used as-is (numbers win; full backward
+  compatibility). Only non-numeric values are looked up in `aliases.json`.
+- Alias names must be non-empty and not all digits (this shadowing is rejected
+  when the file is loaded: `store_parse`, exit `10`).
+- An unknown alias — or any alias given when there is no `aliases.json` in the
+  store — is a CLI argument error (exit `2`); the stderr `detail` lists the
+  known aliases (or says `no aliases.json in store`) so the caller can
+  self-correct.
+- A corrupt `aliases.json` is `store_parse` (exit `10`).
+- Cluster / attribute / command names are **never** aliased (chip-tool
+  notation only).
+
+These map onto the existing exit codes (`2` / `10`); the
+[Errors and exit codes](#errors-and-exit-codes) table is unchanged.
+
+To register an alias while commissioning, add `--alias`:
+
+```bash
+mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5 --alias living-light
+```
+
+The name is validated **before** commissioning starts (all-digits / empty /
+already taken → exit `2`, before chip-tool is even launched), and it is written
+to `aliases.json` only on success (the file is created if absent). Without
+`--alias`, `commission` never touches `aliases.json`. Deleting or renaming an
+alias is a hand edit of the file — there is no management subcommand.
 
 ## Errors and exit codes
 
