@@ -25,7 +25,7 @@ This file is the short list of constraints you must not break.
 ## Scope reminders (do not add these to `mat`)
 
 - Resolving human names on the wire or in the backend (chip-tool / matd always
-  receive numeric values). The only exception: if `<store>/aliases.json`
+  receive numeric values). The only exception: if `<store>/aliases.toml`
   exists, the CLI layer resolves node / group / endpoint aliases to numbers
   right after arg parsing — optional, local, and absent-file = no behavior
   change. Cluster / attribute names stay chip-tool notation (no aliasing).
