@@ -35,6 +35,9 @@ async fn spawn_fake_ws() -> u16 {
                             json!([1])
                         } else if line.contains("descriptor read server-list") {
                             json!([6, 8])
+                        } else if line.contains("accesscontrol read acl") {
+                            // 実機の数値キー形式（admin エントリのみ = ACL 未設定）。
+                            json!([{"1":5,"2":2,"3":[112233],"4":null,"254":1}])
                         } else {
                             json!(true)
                         };
@@ -82,6 +85,39 @@ async fn spawn_fake_ws_discovery_timeout() -> u16 {
         }
     });
     port
+}
+
+/// コマンド行を記録する fake ws。`accesscontrol read acl` には `acl_value` を返し、
+/// それ以外は `true`。group_provision の ACL ステップ（read → 条件付き write）の
+/// コマンド列を検証する。
+async fn spawn_fake_ws_recording(acl_value: Value) -> (u16, Arc<tokio::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines_log: Arc<tokio::sync::Mutex<Vec<String>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&lines_log);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            let acl_value = acl_value.clone();
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(line) = msg {
+                        log.lock().await.push(line.clone());
+                        let value = if line.contains("accesscontrol read acl") {
+                            acl_value.clone()
+                        } else {
+                            json!(true)
+                        };
+                        let resp = json!({ "results": [{ "value": value }], "logs": [] });
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    (port, lines_log)
 }
 
 /// store を tempdir に作り、node 1 を commission 済みにして path を返す。
@@ -425,6 +461,114 @@ async fn group_provision_rejects_uncommissioned_node() {
     )
     .await;
     assert_eq!(resps[0]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
+}
+
+/// group provision の step 4: ACL read → 既存リスト + group エントリの全置換 write。
+#[tokio::test]
+async fn group_provision_appends_group_acl_entry() {
+    let (port, log) =
+        spawn_fake_ws_recording(json!([{"1":5,"2":2,"3":[112233],"4":null,"254":1}])).await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision",
+            "group_id":1,
+            "node_ids":[1],
+            "keyset_id":42,
+            "name":"living",
+            "endpoint":1,
+            "epoch_key":"00112233445566778899aabbccddeeff"
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "provisioned", "{}", resps[0]);
+
+    let lines = log.lock().await;
+    assert!(
+        lines.iter().any(|l| l == "accesscontrol read acl 1 0"),
+        "acl read missing: {lines:?}"
+    );
+    let write = lines
+        .iter()
+        .find(|l| l.starts_with("accesscontrol write acl "))
+        .expect("acl write missing");
+    // compact JSON 1 引数 + 宛先。admin エントリ保全 + group 1 の Operate/Group。
+    assert!(write.ends_with(" 1 0"), "{write}");
+    assert!(write.contains("\"subjects\":[112233]"), "{write}");
+    assert!(write.contains("\"authMode\":3"), "{write}");
+    assert!(write.contains("\"subjects\":[1]"), "{write}");
+
+    handle.abort();
+}
+
+/// 既に Group エントリがある → 冪等: write は送らない。
+#[tokio::test]
+async fn group_provision_skips_acl_write_when_entry_exists() {
+    let (port, log) = spawn_fake_ws_recording(json!([
+        {"1":5,"2":2,"3":[112233],"4":null,"254":1},
+        {"1":3,"2":3,"3":[1],"4":null,"254":1}
+    ]))
+    .await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision",
+            "group_id":1,
+            "node_ids":[1],
+            "keyset_id":42,
+            "name":"living",
+            "endpoint":1,
+            "epoch_key":"00112233445566778899aabbccddeeff"
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "provisioned", "{}", resps[0]);
+
+    let lines = log.lock().await;
+    assert!(lines.iter().any(|l| l == "accesscontrol read acl 1 0"));
+    assert!(
+        !lines.iter().any(|l| l.contains("accesscontrol write acl")),
+        "must not write when the entry already exists: {lines:?}"
+    );
+
+    handle.abort();
+}
+
+/// ACL read の値が解釈不能 → parse_error で停止し、絶対に write しない。
+#[tokio::test]
+async fn group_provision_unparseable_acl_stops_with_parse_error() {
+    let (port, log) = spawn_fake_ws_recording(json!(true)).await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision",
+            "group_id":1,
+            "node_ids":[1],
+            "keyset_id":42,
+            "name":"living",
+            "endpoint":1,
+            "epoch_key":"00112233445566778899aabbccddeeff"
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["error"]["kind"], "parse_error", "{}", resps[0]);
+
+    let lines = log.lock().await;
+    assert!(
+        !lines.iter().any(|l| l.contains("accesscontrol write acl")),
+        "must never write after an unparseable read: {lines:?}"
+    );
 
     handle.abort();
 }
