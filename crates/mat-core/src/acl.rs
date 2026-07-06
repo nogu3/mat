@@ -11,6 +11,7 @@
 //! 不能になるため、失敗側に倒す）。
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::MatError;
 use crate::parse::strip_log_prefix;
@@ -253,6 +254,94 @@ pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> 
     Ok(entries)
 }
 
+/// matd（ws）経路の `accesscontrol read acl` 応答 `results[0].value` を解釈する。
+///
+/// ws 値は数値フィールド ID キーのオブジェクト配列（実機で確定済みの形）:
+/// `[{"1":5,"2":2,"3":[112233],"4":null,"254":4}]`
+/// （`"1"`=privilege, `"2"`=authMode, `"3"`=subjects, `"4"`=targets,
+/// `"254"`=fabricIndex。targets 内は `"0"`=cluster, `"1"`=endpoint,
+/// `"2"`=deviceType）。解釈不能は `ParseError`（write を止める）。
+pub fn acl_entries_from_ws_value(value: &Value) -> Result<Vec<AclEntry>, MatError> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| MatError::parse_error(format!("ACL ws value is not an array: {value}")))?;
+    arr.iter().map(ws_entry).collect()
+}
+
+fn ws_entry(v: &Value) -> Result<AclEntry, MatError> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| MatError::parse_error(format!("ACL ws entry is not an object: {v}")))?;
+    let subjects = match obj.get("3") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|s| {
+                s.as_u64().ok_or_else(|| {
+                    MatError::parse_error(format!("ACL ws subject is not an integer: {s}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(other) => {
+            return Err(MatError::parse_error(format!(
+                "ACL ws subjects (field 3) is not an array: {other}"
+            )))
+        }
+    };
+    let targets = match obj.get("4") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(a)) => Some(a.iter().map(ws_target).collect::<Result<Vec<_>, _>>()?),
+        Some(other) => {
+            return Err(MatError::parse_error(format!(
+                "ACL ws targets (field 4) is not an array: {other}"
+            )))
+        }
+    };
+    Ok(AclEntry {
+        privilege: ws_u8(obj, "1", "privilege")?,
+        auth_mode: ws_u8(obj, "2", "authMode")?,
+        subjects,
+        targets,
+        fabric_index: ws_u8(obj, "254", "fabricIndex")?,
+    })
+}
+
+fn ws_u8(obj: &serde_json::Map<String, Value>, key: &str, what: &str) -> Result<u8, MatError> {
+    obj.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|v| u8::try_from(v).ok())
+        .ok_or_else(|| {
+            MatError::parse_error(format!("ACL ws entry missing/invalid {what} (field {key})"))
+        })
+}
+
+fn ws_target(v: &Value) -> Result<AclTarget, MatError> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| MatError::parse_error(format!("ACL ws target is not an object: {v}")))?;
+    Ok(AclTarget {
+        cluster: ws_opt_num(obj, "0")?,
+        endpoint: ws_opt_num(obj, "1")?,
+        device_type: ws_opt_num(obj, "2")?,
+    })
+}
+
+fn ws_opt_num<T: TryFrom<u64>>(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<T>, MatError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| T::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                MatError::parse_error(format!("ACL ws target field {key} is invalid: {v}"))
+            }),
+    }
+}
+
 /// パーサ内部: 構築途中のエントリ。
 #[derive(Default)]
 struct EntryBuilder {
@@ -439,6 +528,55 @@ mod tests {
     }
 
     use crate::error::ErrorKind;
+    use serde_json::json;
+
+    #[test]
+    fn ws_value_numeric_keys_parse() {
+        // 実機で確定済みの ws 応答形: 数値フィールド ID がキー
+        // （"1"=privilege, "2"=authMode, "3"=subjects, "4"=targets, "254"=fabricIndex）。
+        let v = json!([{"1":5,"2":2,"3":[112233],"4":null,"254":4}]);
+        assert_eq!(acl_entries_from_ws_value(&v).unwrap(), vec![admin()]);
+    }
+
+    #[test]
+    fn ws_value_parses_admin_and_group() {
+        let v = json!([
+            {"1":5,"2":2,"3":[112233],"4":null,"254":4},
+            {"1":3,"2":3,"3":[10],"4":null,"254":4}
+        ]);
+        assert_eq!(
+            acl_entries_from_ws_value(&v).unwrap(),
+            vec![admin(), group_acl_entry(10, 4)]
+        );
+    }
+
+    #[test]
+    fn ws_value_targets_non_null() {
+        // targets 内は "0"=cluster, "1"=endpoint, "2"=deviceType。
+        let v = json!([{"1":3,"2":2,"3":[112233],"4":[{"0":6,"1":1,"2":null}],"254":4}]);
+        let entries = acl_entries_from_ws_value(&v).unwrap();
+        assert_eq!(
+            entries[0].targets,
+            Some(vec![AclTarget {
+                cluster: Some(6),
+                endpoint: Some(1),
+                device_type: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn ws_value_bad_shape_is_parse_error() {
+        for v in [
+            json!(true),                            // 配列ですらない
+            json!([42]),                            // 要素がオブジェクトでない
+            json!([{"2":2,"254":1}]),               // privilege（"1"）欠け
+            json!([{"1":5,"2":2,"3":"x","254":1}]), // subjects が配列でない
+        ] {
+            let err = acl_entries_from_ws_value(&v).expect_err(&format!("must fail: {v}"));
+            assert_eq!(err.kind, ErrorKind::ParseError, "input: {v}");
+        }
+    }
 
     /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。
     /// この形式は 2026-07-06 の実機デバッグ（jarvis）に基づく想定形。upstream の
