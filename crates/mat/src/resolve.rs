@@ -123,6 +123,23 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 transition,
             }
         }
+        Command::Color {
+            node_id,
+            endpoint,
+            hue,
+            sat,
+            transition,
+        } => {
+            let node = book.resolve_node(&node_id)?;
+            let ep = book.resolve_endpoint(node, &endpoint)?;
+            Command::Color {
+                node_id: NodeRef::Id(node),
+                endpoint: EndpointRef::Id(ep),
+                hue,
+                sat,
+                transition,
+            }
+        }
         Command::OpenWindow {
             node_id,
             timeout,

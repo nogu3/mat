@@ -121,6 +121,29 @@ fn auto_routes_color_temp_with_converted_mireds() {
 }
 
 #[test]
+fn auto_routes_color_with_converted_values() {
+    let store = store_with_node5();
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    let matd = spawn_fake_matd(socket.clone());
+
+    mat_auto(store.path(), &socket)
+        .args(["color", "--node", "5", "--hue", "330", "--sat", "80"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"via\":\"fake-matd\""));
+
+    // 換算（330° → 233、80% → 203）は mat 側で済んだ状態で matd に届く。
+    let req = matd.join().unwrap();
+    assert!(req.contains("\"op\":\"color\""), "request line: {req}");
+    assert!(req.contains("\"hue_raw\":233"), "request line: {req}");
+    assert!(
+        req.contains("\"saturation_raw\":203"),
+        "request line: {req}"
+    );
+}
+
+#[test]
 fn auto_falls_back_when_socket_missing() {
     let store = store_with_node5();
     let dir = TempDir::new().unwrap();

@@ -196,6 +196,22 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
+        Command::Color {
+            node_id,
+            endpoint,
+            hue,
+            sat,
+            transition,
+        } => {
+            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み 0–254 値を
+            // 渡し、度 / % は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
+            let (hue_raw, sat_raw) = crate::commands::invoke::resolve_color(*hue, *sat);
+            json!({
+                "op": "color", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "hue_raw": hue_raw, "saturation_raw": sat_raw,
+                "hue": hue, "saturation": sat, "transition": transition,
+            })
+        }
         Command::Group { action } => match action {
             GroupCommand::Provision {
                 group_id,
@@ -346,6 +362,26 @@ mod tests {
         assert_eq!(
             to_op(&cmd).unwrap(),
             json!({"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2703,"transition":0})
+        );
+    }
+
+    #[test]
+    fn color_maps_to_color_op_with_converted_values() {
+        let cmd = Command::Color {
+            node_id: NodeRef::Id(6),
+            endpoint: EndpointRef::Id(1),
+            hue: 330,
+            sat: 80,
+            transition: 30,
+        };
+        // 換算（330° → 233、80% → 203）は mat 側で行い、度 / % はエコー用に併送する。
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"color","node_id":6,"endpoint":1,
+                "hue_raw":233,"saturation_raw":203,
+                "hue":330,"saturation":80,"transition":30
+            })
         );
     }
 

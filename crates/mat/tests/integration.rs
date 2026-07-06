@@ -448,6 +448,100 @@ fn color_temp_unknown_node_exits_11() {
 }
 
 #[test]
+fn color_expands_to_move_to_hue_and_saturation() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color", "--node", "5", "--hue", "330", "--sat", "80"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cluster\":\"colorcontrol\""))
+        .stdout(predicate::str::contains(
+            "\"command\":\"move-to-hue-and-saturation\"",
+        ))
+        // 入力の度 / % と換算後の 0–254 生値を両方エコーする（読み返し突合用）。
+        .stdout(predicate::str::contains("\"hue\":330"))
+        .stdout(predicate::str::contains("\"saturation\":80"))
+        .stdout(predicate::str::contains("\"hue_raw\":233"))
+        .stdout(predicate::str::contains("\"saturation_raw\":203"))
+        .stdout(predicate::str::contains("\"status\":\"success\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+    // chip-tool へは hue/sat 生値 + transition + optionsMask/Override、宛先は末尾。
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 233 203 0 0 0 5 1"),
+        "expected converted hue/sat invoke argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_transition_is_passed_to_chip_tool() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "color",
+            "--node",
+            "5",
+            "--hue",
+            "330",
+            "--sat",
+            "80",
+            "--transition",
+            "30",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"transition\":30"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 233 203 30 0 0 5 1"),
+        "expected transition time in argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_requires_both_hue_and_sat() {
+    let store = store_with_node5();
+    // --sat 欠け → CLI 引数エラー（exit 2）。
+    mat(store.path())
+        .args(["color", "--node", "5", "--hue", "330"])
+        .assert()
+        .code(2);
+    // --hue 欠け → 同じく exit 2。
+    mat(store.path())
+        .args(["color", "--node", "5", "--sat", "80"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn color_rejects_out_of_range_values() {
+    let store = store_with_node5();
+    // hue は 0–360 度、sat は 0–100 %。超過は clap の値域検証で exit 2。
+    mat(store.path())
+        .args(["color", "--node", "5", "--hue", "361", "--sat", "80"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args(["color", "--node", "5", "--hue", "330", "--sat", "101"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn color_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["color", "--node", "99", "--hue", "330", "--sat", "80"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
 fn describe_lists_endpoints_and_clusters() {
     let store = store_with_node5();
     mat(store.path())
