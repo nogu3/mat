@@ -216,6 +216,37 @@ pub fn invoke(
     Ok(())
 }
 
+/// `mat group grant` — provision 済みグループの ACL 欠落を修復する。各ノードへ
+/// ACL の read-merge-write（provision の step 4 と同じ処理）だけを実行する。
+/// ノードごとに fail-fast（provision と同じ方針。部分結果は stdout に出さない）。
+pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), MatError> {
+    let store = Store::open(store_path)?;
+    // 全ノードが commission 済みであることを先に確認（1つでも未登録なら exit 11）。
+    for &node_id in node_ids {
+        store.require_node(node_id)?;
+    }
+    let chip = ChipTool::new(store.root());
+
+    let mut updated: Vec<u64> = Vec::new();
+    let mut unchanged: Vec<u64> = Vec::new();
+    for &node_id in node_ids {
+        if ensure_group_acl(&chip, node_id, group_id)? {
+            updated.push(node_id);
+        } else {
+            unchanged.push(node_id);
+        }
+    }
+
+    output::emit(json!({
+        "group_id": group_id,
+        "nodes": node_ids,
+        "updated": updated,
+        "unchanged": unchanged,
+        "status": "granted",
+    }));
+    Ok(())
+}
+
 /// ローカル group state ステップ（groupsettings 系）を実行し、失敗を分類する。
 fn run_step(chip: &ChipTool, argv: Vec<String>, what: &str) -> Result<(), MatError> {
     let out = chip.run(argv)?;
