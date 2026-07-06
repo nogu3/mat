@@ -357,7 +357,7 @@ pub fn parse_struct_list(stdout: &str) -> Vec<serde_json::Map<String, serde_json
 /// - 数字・ドット・コロンのみのブロック（ts / `pid:tid`）で、直後に別ブロックが続く
 ///   ものはメタ情報として読み飛ばす。
 /// - それ以外（`[1]: 6` のようなインデックス行）は剥がさない。
-fn strip_log_prefix(line: &str) -> Option<&str> {
+pub(crate) fn strip_log_prefix(line: &str) -> Option<&str> {
     let mut rest = line;
     loop {
         let trimmed = rest.trim_start();

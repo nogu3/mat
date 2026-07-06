@@ -12,6 +12,9 @@
 
 use serde::Serialize;
 
+use crate::error::MatError;
+use crate::parse::strip_log_prefix;
+
 /// Matter AccessControl の privilege。3 = Operate（Administer は authMode=Group と
 /// 組み合わせ不可のため、group エントリは Operate 固定）。
 pub const PRIVILEGE_OPERATE: u8 = 3;
@@ -76,6 +79,229 @@ pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclE
 /// 引数区切りのため、空白なしであることが必須（serde_json の to_string は compact）。
 pub fn to_chip_write_json(entries: &[AclEntry]) -> String {
     serde_json::to_string(entries).expect("AclEntry serialization cannot fail")
+}
+
+/// chip-tool 直経路の `accesscontrol read acl <node> 0` stdout（TOO ログ形式）を
+/// 解釈する。
+///
+/// 想定形（NeighborTable 等と同じ DataModelLogger の list-of-struct 整形。ただし
+/// Subjects / Targets の**ネストしたリスト**を含むため `parse_struct_list` では
+/// 表現できず専用パーサとする）:
+/// ```text
+///   ACL: 2 entries
+///     [1]: {
+///       Privilege: 5
+///       AuthMode: 2
+///       Subjects: 1 entries
+///         [1]: 112233
+///       Targets: null
+///       FabricIndex: 4
+///      }
+///     [2]: { ... }
+/// ```
+/// 安全弁（いずれも `ParseError`）: `ACL: n entries` ヘッダが無い / パースできた
+/// エントリ数がヘッダと合わない（途中で切れた出力）/ 必須フィールド欠け /
+/// 予期しない行。ACL write は全置換なので、部分的にしか読めていないリストで
+/// write すると読み落としたエントリを消してしまう — 迷ったら失敗させる。
+pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> {
+    let mut declared: Option<usize> = None;
+    let mut entries: Vec<AclEntry> = Vec::new();
+    let mut cur: Option<EntryBuilder> = None;
+    let mut cur_target: Option<TargetBuilder> = None;
+    let mut section = Section::Fields;
+
+    for line in stdout.lines() {
+        let Some(payload) = strip_log_prefix(line) else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+
+        // ヘッダ `ACL: n entries`（エントリ外でのみ現れる）。
+        if cur.is_none() {
+            if let Some(rest) = payload.strip_prefix("ACL:") {
+                let n = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|t| t.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        MatError::parse_error(format!("unparseable ACL header: {payload}"))
+                    })?;
+                declared = Some(n);
+                continue;
+            }
+        }
+
+        // インデックス行 `[i]: ...`（エントリ開始 / subject / target 開始）。
+        if let Some(rest) = index_line(payload) {
+            match (&mut cur, &section) {
+                (None, _) if rest.starts_with('{') => {
+                    cur = Some(EntryBuilder::default());
+                    section = Section::Fields;
+                }
+                (Some(b), Section::Subjects) => {
+                    let head = rest.split_whitespace().next().unwrap_or(rest);
+                    let v = head.trim_end_matches(',').parse::<u64>().map_err(|_| {
+                        MatError::parse_error(format!("unparseable ACL subject: {payload}"))
+                    })?;
+                    b.subjects.push(v);
+                }
+                (Some(_), Section::Targets) if rest.starts_with('{') => {
+                    cur_target = Some(TargetBuilder::default());
+                }
+                _ => {
+                    return Err(MatError::parse_error(format!(
+                        "unexpected line in ACL output: {payload}"
+                    )))
+                }
+            }
+            continue;
+        }
+
+        // 閉じ括弧: target → entry の順で内側から閉じる。
+        if payload.starts_with('}') {
+            if let Some(t) = cur_target.take() {
+                let Some(b) = cur.as_mut() else {
+                    return Err(MatError::parse_error("ACL target outside an entry"));
+                };
+                b.targets.get_or_insert_with(Vec::new).push(AclTarget {
+                    cluster: t.cluster,
+                    endpoint: t.endpoint,
+                    device_type: t.device_type,
+                });
+            } else if let Some(b) = cur.take() {
+                entries.push(b.build()?);
+                section = Section::Fields;
+            }
+            continue;
+        }
+
+        // フィールド行 `Key: Value`。エントリ外の無関係行は無視する。
+        let Some(colon) = payload.find(':') else {
+            continue;
+        };
+        let key = payload[..colon].trim();
+        let val = payload[colon + 1..].trim().trim_end_matches(',').trim();
+
+        if let Some(t) = cur_target.as_mut() {
+            match key {
+                "Cluster" => t.cluster = field_opt_num(val, "target Cluster")?,
+                "Endpoint" => t.endpoint = field_opt_num(val, "target Endpoint")?,
+                "DeviceType" => t.device_type = field_opt_num(val, "target DeviceType")?,
+                _ => {}
+            }
+            continue;
+        }
+        let Some(b) = cur.as_mut() else { continue };
+        match key {
+            "Privilege" => b.privilege = Some(field_num(val, "Privilege")?),
+            "AuthMode" => b.auth_mode = Some(field_num(val, "AuthMode")?),
+            "FabricIndex" => {
+                b.fabric_index = Some(field_num(val, "FabricIndex")?);
+                section = Section::Fields;
+            }
+            "Subjects" => {
+                section = if val.starts_with("null") {
+                    Section::Fields
+                } else {
+                    Section::Subjects
+                };
+            }
+            "Targets" => {
+                if val.starts_with("null") {
+                    b.targets = None;
+                    section = Section::Fields;
+                } else {
+                    b.targets = Some(Vec::new());
+                    section = Section::Targets;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let declared = declared
+        .ok_or_else(|| MatError::parse_error("no `ACL: n entries` header in chip-tool output"))?;
+    if entries.len() != declared || cur.is_some() || cur_target.is_some() {
+        return Err(MatError::parse_error(format!(
+            "ACL parse mismatch: header declared {declared} entries, parsed {} (refusing to write a possibly truncated list)",
+            entries.len()
+        )));
+    }
+    Ok(entries)
+}
+
+/// パーサ内部: 構築途中のエントリ。
+#[derive(Default)]
+struct EntryBuilder {
+    privilege: Option<u8>,
+    auth_mode: Option<u8>,
+    subjects: Vec<u64>,
+    targets: Option<Vec<AclTarget>>,
+    fabric_index: Option<u8>,
+}
+
+impl EntryBuilder {
+    fn build(self) -> Result<AclEntry, MatError> {
+        Ok(AclEntry {
+            privilege: self
+                .privilege
+                .ok_or_else(|| MatError::parse_error("ACL entry missing Privilege"))?,
+            auth_mode: self
+                .auth_mode
+                .ok_or_else(|| MatError::parse_error("ACL entry missing AuthMode"))?,
+            subjects: self.subjects,
+            targets: self.targets,
+            fabric_index: self
+                .fabric_index
+                .ok_or_else(|| MatError::parse_error("ACL entry missing FabricIndex"))?,
+        })
+    }
+}
+
+/// パーサ内部: 構築途中の target。
+#[derive(Default)]
+struct TargetBuilder {
+    cluster: Option<u32>,
+    endpoint: Option<u16>,
+    device_type: Option<u32>,
+}
+
+/// 現エントリ内でインデックス行（`[i]: ...`）が属するリスト。
+enum Section {
+    Fields,
+    Subjects,
+    Targets,
+}
+
+/// `[i]: <rest>` 形（i は数値）の行なら `<rest>` を返す。
+fn index_line(payload: &str) -> Option<&str> {
+    let inner = payload.strip_prefix('[')?;
+    let close = inner.find(']')?;
+    inner[..close].trim().parse::<u64>().ok()?;
+    inner[close + 1..]
+        .trim_start()
+        .strip_prefix(':')
+        .map(str::trim)
+}
+
+/// フィールド値の数値解釈。実機の名前注釈付き（`5 (Administer)`）も先頭トークンで読む。
+fn field_num<T: TryFrom<u64>>(val: &str, what: &str) -> Result<T, MatError> {
+    let head = val.split_whitespace().next().unwrap_or(val);
+    head.parse::<u64>()
+        .ok()
+        .and_then(|v| T::try_from(v).ok())
+        .ok_or_else(|| MatError::parse_error(format!("unparseable ACL {what}: {val}")))
+}
+
+/// `null` 許容の数値フィールド。
+fn field_opt_num<T: TryFrom<u64>>(val: &str, what: &str) -> Result<Option<T>, MatError> {
+    if val.starts_with("null") {
+        return Ok(None);
+    }
+    field_num(val, what).map(Some)
 }
 
 #[cfg(test)]
@@ -169,5 +395,135 @@ mod tests {
         assert_eq!(v[0]["targets"][0]["cluster"], serde_json::json!(6));
         assert_eq!(v[0]["targets"][0]["endpoint"], serde_json::Value::Null);
         assert_eq!(v[0]["targets"][0]["deviceType"], serde_json::Value::Null);
+    }
+
+    use crate::error::ErrorKind;
+
+    /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。
+    /// この形式は 2026-07-06 の実機デバッグ（jarvis）に基づく想定形。upstream の
+    /// バージョン変化はこのテストで検知する（CLAUDE.md の fragile-parse ルール）。
+    const ACL_ADMIN_ONLY: &str = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+
+    const ACL_ADMIN_AND_GROUP: &str = "\
+[1656][CHIP:TOO]   ACL: 2 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+[1656][CHIP:TOO]     [2]: {
+[1656][CHIP:TOO]       Privilege: 3
+[1656][CHIP:TOO]       AuthMode: 3
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 10
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+
+    #[test]
+    fn too_log_parses_admin_only() {
+        let entries = parse_acl_from_chip_log(ACL_ADMIN_ONLY).unwrap();
+        assert_eq!(entries, vec![admin()]);
+    }
+
+    #[test]
+    fn too_log_parses_admin_and_group() {
+        let entries = parse_acl_from_chip_log(ACL_ADMIN_AND_GROUP).unwrap();
+        assert_eq!(entries, vec![admin(), group_acl_entry(10, 4)]);
+    }
+
+    #[test]
+    fn too_log_parses_non_null_targets() {
+        // 他 admin が書いた targets 限定エントリも保全のため解釈できること。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 3
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: 1 entries
+[1656][CHIP:TOO]         [1]: {
+[1656][CHIP:TOO]           Cluster: 6
+[1656][CHIP:TOO]           Endpoint: null
+[1656][CHIP:TOO]           DeviceType: null
+[1656][CHIP:TOO]          }
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let entries = parse_acl_from_chip_log(s).unwrap();
+        assert_eq!(
+            entries[0].targets,
+            Some(vec![AclTarget {
+                cluster: Some(6),
+                endpoint: None,
+                device_type: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn too_log_zero_entries_is_ok_empty() {
+        let entries = parse_acl_from_chip_log("[1656][CHIP:TOO]   ACL: 0 entries\n").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn too_log_realworld_prefix_format() {
+        // 実機 v1.4.2.0 のログ接頭辞（小数点 ts + pid:tid + CHIP: 無しタグ）。
+        let s = "\
+[1780817887.948] [32231:32235] [TOO]   ACL: 1 entries
+[1780817887.948] [32231:32235] [TOO]     [1]: {
+[1780817887.948] [32231:32235] [TOO]       Privilege: 5
+[1780817887.948] [32231:32235] [TOO]       AuthMode: 2
+[1780817887.948] [32231:32235] [TOO]       Subjects: 1 entries
+[1780817887.948] [32231:32235] [TOO]         [1]: 112233
+[1780817887.948] [32231:32235] [TOO]       Targets: null
+[1780817887.948] [32231:32235] [TOO]       FabricIndex: 4
+[1780817887.948] [32231:32235] [TOO]      }
+";
+        assert_eq!(parse_acl_from_chip_log(s).unwrap(), vec![admin()]);
+    }
+
+    #[test]
+    fn too_log_broken_output_is_parse_error() {
+        // ヘッダ無し / エントリ数不一致（途中で切れた出力）はどちらも ParseError。
+        // 解釈できないまま write すると管理者エントリを失いかねないため、失敗側に倒す。
+        for s in [
+            "no acl here",
+            "[1656][CHIP:TOO] something unparseable",
+            // ヘッダは 2 entries だが 1 つしか無い（truncated）。
+            "[1656][CHIP:TOO]   ACL: 2 entries\n\
+             [1656][CHIP:TOO]     [1]: {\n\
+             [1656][CHIP:TOO]       Privilege: 5\n\
+             [1656][CHIP:TOO]       AuthMode: 2\n\
+             [1656][CHIP:TOO]       Targets: null\n\
+             [1656][CHIP:TOO]       FabricIndex: 4\n\
+             [1656][CHIP:TOO]      }\n",
+            // 必須フィールド欠け（Privilege 無し）。
+            "[1656][CHIP:TOO]   ACL: 1 entries\n\
+             [1656][CHIP:TOO]     [1]: {\n\
+             [1656][CHIP:TOO]       AuthMode: 2\n\
+             [1656][CHIP:TOO]       Targets: null\n\
+             [1656][CHIP:TOO]       FabricIndex: 4\n\
+             [1656][CHIP:TOO]      }\n",
+        ] {
+            let err = parse_acl_from_chip_log(s).expect_err(&format!("must fail: {s}"));
+            assert_eq!(err.kind, ErrorKind::ParseError, "input: {s}");
+        }
     }
 }
