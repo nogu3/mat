@@ -241,6 +241,9 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 "op": "group_invoke", "group_id": group_id.id(), "cluster": cluster,
                 "command": command, "args": args, "endpoint": endpoint,
             }),
+            // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
+            // バージョンスキューにも安全なため直経路のみ（matd に op を足さない）。
+            GroupCommand::Grant { .. } => return Err(unsupported("group grant")),
         },
         // matd は warm CASE セッション層。これらは chip-tool 直経路でしか実行できない。
         Command::Discover { .. } => return Err(unsupported("discover")),
@@ -452,6 +455,19 @@ mod tests {
             resolve_route(&None, None, Some("abc".into())),
             Route::Auto(dflt)
         );
+    }
+
+    #[test]
+    fn group_grant_is_unsupported_via_matd() {
+        // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd バージョン
+        // スキューにも安全なため直経路のみ（matd プロトコルに op を足さない）。
+        let cmd = Command::Group {
+            action: GroupCommand::Grant {
+                group_id: GroupRef::Id(1),
+                node_ids: vec![NodeRef::Id(5)],
+            },
+        };
+        assert!(to_op(&cmd).is_err());
     }
 
     #[test]

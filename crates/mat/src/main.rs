@@ -189,6 +189,10 @@ fn main() -> ExitCode {
                 args,
                 *endpoint,
             ),
+            GroupCommand::Grant { group_id, node_ids } => {
+                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
+                commands::group::grant(&store_path, group_id.id(), &ids)
+            }
         },
         Command::Diag { action } => match action {
             DiagCommand::Thread { node_id, endpoint } => {

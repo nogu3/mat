@@ -872,6 +872,102 @@ fn group_invoke_timeout_exits_3() {
         .stderr(predicate::str::contains("timeout"));
 }
 
+#[test]
+fn group_grant_appends_acl_entry_and_reports_updated() {
+    // provision 済みで ACL だけ欠けたグループの修復（grant の主目的。実機 jarvis の
+    // group 10 相当: fake の既定 ACL は admin エントリのみ = ACL 欠落状態）。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["group", "grant", "--group", "10", "--nodes", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":10"))
+        .stdout(predicate::str::contains("\"nodes\":[5]"))
+        .stdout(predicate::str::contains("\"updated\":[5]"))
+        .stdout(predicate::str::contains("\"unchanged\":[]"))
+        .stdout(predicate::str::contains("\"status\":\"granted\""))
+        .stdout(predicate::str::contains("\"timestamp\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(recorded.contains("accesscontrol read acl 5 0"));
+    let write_line = recorded
+        .lines()
+        .find(|l| l.contains("accesscontrol write acl"))
+        .expect("acl write call missing");
+    // 既存 admin エントリを保全した全置換 + group 10 の Operate/Group エントリ。
+    assert!(write_line.contains("\"subjects\":[112233]"), "{write_line}");
+    assert!(write_line.contains("\"subjects\":[10]"), "{write_line}");
+    assert!(write_line.contains("\"privilege\":3"), "{write_line}");
+    assert!(write_line.contains("\"authMode\":3"), "{write_line}");
+}
+
+#[test]
+fn group_grant_reports_unchanged_when_entry_exists() {
+    // 既にエントリがある → 冪等: write せず unchanged に載せる。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .env("FAKE_ACL_HAS_GROUP", "1")
+        .args(["group", "grant", "--group", "1", "--nodes", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"updated\":[]"))
+        .stdout(predicate::str::contains("\"unchanged\":[5]"))
+        .stdout(predicate::str::contains("\"status\":\"granted\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        !recorded.contains("accesscontrol write acl"),
+        "must not write when the entry already exists: {recorded}"
+    );
+}
+
+#[test]
+fn group_grant_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "grant", "--group", "1", "--nodes", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn group_grant_broken_acl_read_is_parse_error_without_write() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .env("FAKE_ACL_BROKEN", "1")
+        .args(["group", "grant", "--group", "1", "--nodes", "5"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("parse_error"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(!recorded.contains("accesscontrol write acl"), "{recorded}");
+}
+
+#[test]
+fn group_grant_with_forced_matd_exits_2() {
+    // grant は直経路のみ（matd プロトコルに op を追加しない）。--matd 明示は
+    // discover / commission と同じ「非対応サブコマンド」扱いで exit 2。
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "--matd",
+            "/nonexistent/matd.sock",
+            "group",
+            "grant",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+        ])
+        .assert()
+        .code(2);
+}
+
 // ── diag node ──────────────────────────────────────────────────────────────
 
 #[test]

@@ -298,4 +298,18 @@ pub enum GroupCommand {
         #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
         endpoint: u16,
     },
+
+    /// provision 済みグループの ACL 修復: 各ノードの ACL に Group エントリ
+    /// （privilege=Operate, authMode=Group, subjects=[GroupId]）を read-merge-write
+    /// で追記する。既にあれば何もしない（冪等）。provision の 4 ステップ目と同じ
+    /// 処理を単独実行する（controller 側 groupsettings が非冪等で provision を
+    /// 再実行できない既存グループの救済用）。常に直経路（--matd 明示時は exit 2）。
+    Grant {
+        /// Matter GroupId、または aliases.toml の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// 対象の commission 済み node_id または node alias（1つ以上）。
+        #[arg(long = "nodes", required = true, num_args = 1..)]
+        node_ids: Vec<NodeRef>,
+    },
 }

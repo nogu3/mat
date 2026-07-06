@@ -184,6 +184,13 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                     args,
                     endpoint,
                 },
+                GroupCommand::Grant { group_id, node_ids } => GroupCommand::Grant {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    node_ids: node_ids
+                        .iter()
+                        .map(|n| book.resolve_node(n).map(NodeRef::Id))
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
             },
         },
         Command::Diag { action } => Command::Diag {
