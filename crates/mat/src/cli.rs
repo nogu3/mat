@@ -1,7 +1,7 @@
 //! clap(derive) による CLI 定義。
 //!
 //! Phase 0: `discover` / `commission`。Phase 1: `read` / `write` / `invoke` /
-//! `describe` / `on` / `off`（後追いの高頻度ショートカットとして `color-temp` も）。
+//! `describe` / `on` / `off`（後追いの高頻度ショートカットとして `color-temp` / `color` も）。
 //! Phase 2: `open-window`。Phase 3: `group provision` / `group invoke`（groupcast）。
 
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ pub struct Cli {
     /// 試み、matd がいればそちら、いなければ直 chip-tool にフォールバック。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
-    /// matd 対応は read/write/invoke/on/off/color-temp/describe/group のみ
+    /// matd 対応は read/write/invoke/on/off/color-temp/color/describe/group のみ
     /// （discover/commission/open-window/diag は常に直経路; 本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
@@ -166,6 +166,28 @@ pub enum Command {
         /// 色温度（mireds）。`--kelvin` と排他。
         #[arg(long, value_name = "M", value_parser = clap::value_parser!(u16).range(1..))]
         mireds: Option<u16>,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
+    },
+
+    /// ColorControl の MoveToHueAndSaturation を invoke する高頻度ショートカット。
+    /// `--hue`（0–360 度）と `--sat`（0–100 %）は両方必須で、mat が Matter の
+    /// 0–254 値（`round(v / full * 254)`、255 は予約値）へ換算する。デバイス対応
+    /// 範囲外の値はデバイス側が clamp する（mat は事前 read / 検証をしない）。
+    Color {
+        /// commission 済みノードの node_id、または aliases.toml の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.toml の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
+        /// 色相（度、0–360）。例: 330 = ピンク。
+        #[arg(long, value_name = "DEG", value_parser = clap::value_parser!(u16).range(0..=360))]
+        hue: u16,
+        /// 彩度（%、0–100）。
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        sat: u8,
         /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
         #[arg(long, value_name = "DS", default_value_t = 0)]
         transition: u16,

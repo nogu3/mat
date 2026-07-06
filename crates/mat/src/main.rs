@@ -128,6 +128,20 @@ fn main() -> ExitCode {
                 *transition,
             )
         }
+        Command::Color {
+            node_id,
+            endpoint,
+            hue,
+            sat,
+            transition,
+        } => commands::invoke::run_color(
+            &store_path,
+            node_id.id(),
+            endpoint.id(),
+            *hue,
+            *sat,
+            *transition,
+        ),
         Command::OpenWindow {
             node_id,
             timeout,
