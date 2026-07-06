@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
+use mat_core::acl::{acl_entries_from_ws_value, merge_group_entry, to_chip_write_json};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
@@ -403,6 +404,32 @@ async fn group_provision(
             &format!("groups add-group {group_id} {name} {node_id} {endpoint}"),
         )
         .await?;
+
+        // 4) ACL: groupcast は authMode=Group で届くため、Group エントリが無いと
+        //    デバイスが黙って捨てる。read-merge-write（write は全置換なので
+        //    「read できたリスト + 追記」のみ。read 解釈不能なら write しない）。
+        let result = backend
+            .run_cmdline(&format!("accesscontrol read acl {node_id} 0"))
+            .await?;
+        ensure_ok(&result)?;
+        let value = read_value(&result).ok_or_else(|| {
+            MatError::parse_error(format!(
+                "no value in chip-tool ws result for acl read on node {node_id}"
+            ))
+        })?;
+        let entries = acl_entries_from_ws_value(&value).map_err(|e| {
+            MatError::new(e.kind, format!("acl read on node {node_id}: {}", e.detail))
+        })?;
+        if let Some(merged) = merge_group_entry(&entries, *group_id) {
+            group_step(
+                backend,
+                &format!(
+                    "accesscontrol write acl {} {node_id} 0",
+                    to_chip_write_json(&merged)
+                ),
+            )
+            .await?;
+        }
     }
 
     Ok(json!({
