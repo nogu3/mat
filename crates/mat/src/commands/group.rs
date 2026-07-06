@@ -15,6 +15,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::runner::ChipTool;
+use mat_core::acl::{merge_group_entry, parse_acl_from_chip_log, to_chip_write_json};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
@@ -144,6 +145,10 @@ pub fn provision(
             node_id,
             "groups add-group",
         )?;
+
+        // ACL: groupcast は authMode=Group で届くため、Group エントリが無いと
+        // デバイスが黙って捨てる（commissioning が作るのは CASE 管理者エントリだけ）。
+        ensure_group_acl(&chip, node_id, group_id)?;
     }
 
     output::emit(json!({
@@ -251,4 +256,54 @@ fn run_node_step(
         ));
     }
     Ok(())
+}
+
+/// ACL の read-merge-write（provision の step 4 / `mat group grant` の本体）。
+/// 戻り値: write した = true / 既に Group エントリがあり skip = false（冪等）。
+///
+/// ACL の attribute write は**全置換**なので、write は必ず「read できたリスト +
+/// 追記」のみ。read が失敗・解釈不能なら絶対に write しない（管理者エントリを
+/// 失うとデバイスが管理不能になり工場リセット行きのため）。
+fn ensure_group_acl(chip: &ChipTool, node_id: u64, group_id: u16) -> Result<bool, MatError> {
+    // read。属性 read は成功時に status 行を出さない（operation_succeeded が偽に
+    // なる）ため run_node_step は使わず、分類 + パースで成否を判定する。
+    let out = chip.run(vec![
+        "accesscontrol".to_string(),
+        "read".into(),
+        "acl".into(),
+        node_id.to_string(),
+        "0".into(),
+    ])?;
+    if let Some(kind) = classify_failure(&out.stdout, &out.stderr) {
+        return Err(MatError::new(
+            kind,
+            format!("provision step 'acl read' failed on node {node_id}"),
+        ));
+    }
+    if !out.success() {
+        return Err(MatError::new(
+            ErrorKind::ChildFailed,
+            format!("provision step 'acl read' on node {node_id} did not succeed"),
+        ));
+    }
+    let entries = parse_acl_from_chip_log(&out.stdout)
+        .map_err(|e| MatError::new(e.kind, format!("acl read on node {node_id}: {}", e.detail)))?;
+
+    let Some(merged) = merge_group_entry(&entries, group_id) else {
+        return Ok(false); // 既に Group エントリがある。write 不要（冪等）。
+    };
+    run_node_step(
+        chip,
+        vec![
+            "accesscontrol".to_string(),
+            "write".into(),
+            "acl".into(),
+            to_chip_write_json(&merged),
+            node_id.to_string(),
+            "0".into(),
+        ],
+        node_id,
+        "acl write",
+    )?;
+    Ok(true)
 }

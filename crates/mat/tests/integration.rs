@@ -724,9 +724,9 @@ fn group_provision_rejects_bad_epoch_key() {
 }
 
 #[test]
-fn group_provision_last_chip_call_is_add_group() {
-    // 引数ファイルは各 chip-tool 呼び出しで上書きされるため、最後の呼び出し
-    // （node 5 への groups add-group）が記録される。group 名と endpoint を確認。
+fn group_provision_runs_acl_read_merge_write_after_add_group() {
+    // provision の 4 ステップ目: add-group の後に acl read → （エントリが無いので）
+    // 全リスト + group エントリの write が走る。ステップ列を固定する。
     let store = store_with_node5();
     let args_file = store.path().join("recorded-args.txt");
     mat(store.path())
@@ -744,11 +744,81 @@ fn group_provision_last_chip_call_is_add_group() {
             "2",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    let add = recorded
+        .find("groups add-group 7 kitchen 5 2")
+        .expect("add-group call missing");
+    let read = recorded
+        .find("accesscontrol read acl 5 0")
+        .expect("acl read call missing");
+    let write = recorded
+        .find("accesscontrol write acl ")
+        .expect("acl write call missing");
+    assert!(
+        add < read && read < write,
+        "acl steps out of order: {recorded}"
+    );
+    // write は「read できたリスト + 追記」の全置換: admin エントリ保全 + group 7。
+    let write_line = recorded
+        .lines()
+        .find(|l| l.contains("accesscontrol write acl"))
+        .unwrap();
+    assert!(write_line.contains("\"subjects\":[112233]"), "{write_line}");
+    assert!(write_line.contains("\"authMode\":3"), "{write_line}");
+    assert!(write_line.contains("\"subjects\":[7]"), "{write_line}");
+    // JSON は空白なし 1 引数（`acl ` と ` 5 0` の間に空白が無い）。
+    let json_part = write_line
+        .split("accesscontrol write acl ")
+        .nth(1)
+        .unwrap()
+        .split(" 5 0")
+        .next()
+        .unwrap();
+    assert!(
+        !json_part.contains(' '),
+        "write JSON must be compact: {json_part}"
+    );
+}
+
+#[test]
+fn group_provision_skips_acl_write_when_entry_exists() {
+    // 既に group 1 のエントリがある → 冪等: write は飛ばない。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .env("FAKE_ACL_HAS_GROUP", "1")
+        .args(["group", "provision", "--group", "1", "--nodes", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(recorded.contains("accesscontrol read acl 5 0"));
+    assert!(
+        !recorded.contains("accesscontrol write acl"),
+        "must not write when the group entry already exists: {recorded}"
+    );
+}
+
+#[test]
+fn group_provision_broken_acl_read_is_parse_error_without_write() {
+    // ACL read が解釈不能 → parse_error（exit 1）で停止し、絶対に write しない
+    // （write は全置換。解釈できないまま書くと管理者エントリを失う）。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .env("FAKE_ACL_BROKEN", "1")
+        .args(["group", "provision", "--group", "1", "--nodes", "5"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("parse_error"));
     let recorded = std::fs::read_to_string(&args_file).unwrap();
     assert!(
-        recorded.contains("groups add-group 7 kitchen 5 2"),
-        "last chip-tool call was not the expected add-group: {recorded}"
+        !recorded.contains("accesscontrol write acl"),
+        "must never write after an unparseable read: {recorded}"
     );
 }
 
