@@ -396,8 +396,8 @@ Outputs:
   fixed key only when several controllers must share the same wire group. The key
   is never printed to stdout (it is a credential; it lives in chip-tool storage).
 - `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
-- **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup on
-  every node) and **especially unstable on Thread** (multicast retransmits and
+- **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup / ACL
+  write on every node) and **especially unstable on Thread** (multicast retransmits and
   IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.
 - It stops at the **first failed node/step** (the error `detail` says which) so
   stdout stays pure JSON; re-run after fixing the offending node.
