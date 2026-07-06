@@ -59,15 +59,20 @@ pub fn group_acl_entry(group_id: u16, fabric_index: u8) -> AclEntry {
     }
 }
 
-/// 既存 ACL に group エントリを追記した全リストを返す。既にあれば `None`（冪等、
-/// write 不要）。fabricIndex は既存エントリの先頭から引き継ぐ（read 値をそのまま
-/// 渡す方針。エントリ 0 件は起きない想定だが、その場合は 0 — サーバ側で置換される）。
+/// 既存 ACL に group エントリを追記した全リストを返す。既に authMode=Group かつ
+/// privilege が Operate 以上のエントリがあれば `None`（冪等、write 不要）。
+/// privilege が Operate 未満（例: View）の Group エントリは groupcast をまだ拒否
+/// するため「付与済み」とみなさず、Operate エントリを追記する（ACL は加算的な
+/// ので、弱いエントリの隣に強いエントリを足すのは正当な修復）。fabricIndex は
+/// 既存エントリの先頭から引き継ぐ（read 値をそのまま渡す方針。エントリ 0 件は
+/// 起きない想定だが、その場合は 0 — サーバ側で置換される）。
 pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {
     let gid = u64::from(group_id);
-    if entries
-        .iter()
-        .any(|e| e.auth_mode == AUTH_MODE_GROUP && e.subjects.contains(&gid))
-    {
+    if entries.iter().any(|e| {
+        e.auth_mode == AUTH_MODE_GROUP
+            && e.subjects.contains(&gid)
+            && e.privilege >= PRIVILEGE_OPERATE
+    }) {
         return None;
     }
     let fabric_index = entries.first().map(|e| e.fabric_index).unwrap_or(0);
@@ -268,10 +273,30 @@ pub fn acl_entries_from_ws_value(value: &Value) -> Result<Vec<AclEntry>, MatErro
     arr.iter().map(ws_entry).collect()
 }
 
+/// TOO ログパーサ（`too_log_unknown_key_inside_entry_is_parse_error` 等）と同じ
+/// fail-closed を ws 変換にも適用する: 既知キー以外が 1 つでもあれば `ParseError`。
+/// 黙って落とすと、chip-tool が将来フィールドを追加したときに劣化したエントリを
+/// 全置換 write してしまうため。
+fn reject_unknown_keys(
+    obj: &serde_json::Map<String, Value>,
+    known: &[&str],
+    what: &str,
+) -> Result<(), MatError> {
+    for key in obj.keys() {
+        if !known.iter().any(|k| k == key) {
+            return Err(MatError::parse_error(format!(
+                "ACL ws {what} has unexpected field {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ws_entry(v: &Value) -> Result<AclEntry, MatError> {
     let obj = v
         .as_object()
         .ok_or_else(|| MatError::parse_error(format!("ACL ws entry is not an object: {v}")))?;
+    reject_unknown_keys(obj, &["1", "2", "3", "4", "254"], "entry")?;
     let subjects = match obj.get("3") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a
@@ -319,6 +344,7 @@ fn ws_target(v: &Value) -> Result<AclTarget, MatError> {
     let obj = v
         .as_object()
         .ok_or_else(|| MatError::parse_error(format!("ACL ws target is not an object: {v}")))?;
+    reject_unknown_keys(obj, &["0", "1", "2"], "target")?;
     Ok(AclTarget {
         cluster: ws_opt_num(obj, "0")?,
         endpoint: ws_opt_num(obj, "1")?,
@@ -495,6 +521,25 @@ mod tests {
     }
 
     #[test]
+    fn merge_appends_operate_entry_when_existing_group_entry_is_view_only() {
+        // 既存の Group エントリが View（1）しか無い場合、groupcast はまだ拒否される
+        // ため「付与済み」とみなさず Operate エントリを追記する（ACL は加算的なので
+        // 弱い既存エントリの隣に強いエントリを足すのは正当な修復）。
+        let view_only_group = AclEntry {
+            privilege: 1, // View
+            auth_mode: AUTH_MODE_GROUP,
+            subjects: vec![10],
+            targets: None,
+            fabric_index: 4,
+        };
+        let merged = merge_group_entry(std::slice::from_ref(&view_only_group), 10)
+            .expect("must repair with Operate");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], view_only_group);
+        assert_eq!(merged[1], group_acl_entry(10, 4));
+    }
+
+    #[test]
     fn write_json_is_compact_named_keys() {
         let s = to_chip_write_json(&[admin(), group_acl_entry(10, 4)]);
         // ws コマンド行で 1 引数として渡すため空白なしが必須。
@@ -576,6 +621,23 @@ mod tests {
             let err = acl_entries_from_ws_value(&v).expect_err(&format!("must fail: {v}"));
             assert_eq!(err.kind, ErrorKind::ParseError, "input: {v}");
         }
+    }
+
+    #[test]
+    fn ws_value_unknown_entry_field_is_parse_error() {
+        // TOO ログ側（too_log_unknown_key_inside_entry_is_parse_error）と同じ
+        // fail-closed を ws 変換にも要求する。未知フィールドを黙って落とすと
+        // 全置換 write で劣化したエントリを書き込んでしまう。
+        let v = json!([{"1":5,"2":2,"3":[1],"4":null,"254":1,"99":7}]);
+        let err = acl_entries_from_ws_value(&v).expect_err("unknown entry field must fail closed");
+        assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn ws_value_unknown_target_field_is_parse_error() {
+        let v = json!([{"1":5,"2":2,"3":[1],"4":[{"0":6,"1":1,"2":null,"9":1}],"254":1}]);
+        let err = acl_entries_from_ws_value(&v).expect_err("unknown target field must fail closed");
+        assert_eq!(err.kind, ErrorKind::ParseError);
     }
 
     /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。
