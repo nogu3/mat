@@ -250,6 +250,23 @@ async fn simple_op(
             "kelvin": kelvin, "mireds": mireds, "transition": transition,
             "status": "success",
         }),
+        Op::Color {
+            node_id,
+            endpoint,
+            hue_raw,
+            saturation_raw,
+            hue,
+            saturation,
+            transition,
+        } => json!({
+            "node_id": node_id, "endpoint": endpoint,
+            "cluster": "colorcontrol", "command": "move-to-hue-and-saturation",
+            // 入力の度 / % と換算後 0–254 生値を両方エコー（読み返し突合用; 直経路と同形）。
+            "hue": hue, "saturation": saturation,
+            "hue_raw": hue_raw, "saturation_raw": saturation_raw,
+            "transition": transition,
+            "status": "success",
+        }),
         Op::Ping
         | Op::Describe { .. }
         | Op::GroupProvision { .. }

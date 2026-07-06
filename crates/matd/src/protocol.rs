@@ -60,6 +60,20 @@ pub enum Op {
         #[serde(default)]
         transition: u16,
     },
+    /// ColorControl MoveToHueAndSaturation のショートカット（`mat color` 相当）。
+    /// `hue_raw` / `saturation_raw` は mat 側で換算済みの 0–254 値を受け取る。
+    /// `hue`（度）/ `saturation`（%）は応答へのエコー用
+    /// （matd 側で逆算すると丸めで入力とずれるため、換算は mat の 1 箇所に置く）。
+    Color {
+        node_id: u64,
+        endpoint: u16,
+        hue_raw: u8,
+        saturation_raw: u8,
+        hue: u16,
+        saturation: u8,
+        #[serde(default)]
+        transition: u16,
+    },
     /// ノードのエンドポイント / クラスタを introspect する（Descriptor クラスタ）。
     /// 1 リクエストで複数の chip-tool 読み出しに展開されるため [`to_cmdline`] は持たない。
     ///
@@ -107,6 +121,7 @@ impl Op {
             | Op::On { node_id, .. }
             | Op::Off { node_id, .. }
             | Op::ColorTemp { node_id, .. }
+            | Op::Color { node_id, .. }
             | Op::Describe { node_id } => Some(*node_id),
             Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping | Op::Shutdown => None,
         }
@@ -155,6 +170,17 @@ impl Op {
                 ..
             } => format!(
                 "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {node_id} {endpoint}"
+            ),
+            // 引数は <hue> <saturation> <transition> <optionsMask> <optionsOverride>、宛先は末尾。
+            Op::Color {
+                node_id,
+                endpoint,
+                hue_raw,
+                saturation_raw,
+                transition,
+                ..
+            } => format!(
+                "colorcontrol move-to-hue-and-saturation {hue_raw} {saturation_raw} {transition} 0 0 {node_id} {endpoint}"
             ),
             // 複合 op（複数コマンドに展開）と Ping は単一の cmdline を持たない。
             Op::Describe { .. }
@@ -227,6 +253,20 @@ mod tests {
         assert_eq!(
             r.op.to_cmdline().unwrap(),
             "colorcontrol move-to-color-temperature 370 30 0 0 6 1"
+        );
+    }
+
+    #[test]
+    fn color_shortcut_builds_move_to_hue_and_saturation_cmdline() {
+        // hue_raw / saturation_raw は mat 側で換算済みの 0–254 値。hue / saturation
+        // （度・%）は応答エコー用で cmdline には乗らない。
+        let r = parse(
+            r#"{"op":"color","node_id":6,"endpoint":1,"hue_raw":233,"saturation_raw":203,"hue":330,"saturation":80,"transition":30}"#,
+        );
+        assert_eq!(r.op.node_id(), Some(6));
+        assert_eq!(
+            r.op.to_cmdline().unwrap(),
+            "colorcontrol move-to-hue-and-saturation 233 203 30 0 0 6 1"
         );
     }
 
