@@ -165,6 +165,14 @@ mat off --node 5 --endpoint 2
 mat color-temp --node 5 --kelvin 2700
 mat color-temp --node 5 --kelvin 2700 --transition 30
 mat color-temp --node 5 --mireds 370
+
+# Hue / saturation (ColorControl MoveToHueAndSaturation): --hue in degrees
+# (0-360) and --sat in percent (0-100), both required. mat converts each to
+# Matter's 0-254 scale (round(v / full * 254); 255 is reserved so full scale
+# tops out at 254). --transition is in tenths of a second (default 0). Values
+# outside the device's supported range are clamped by the device itself.
+mat color --node 5 --hue 330 --sat 80
+mat color --node 5 --hue 330 --sat 80 --transition 30
 ```
 
 **Important asymmetry: read is an attribute, control is an invoke.** Turning a
@@ -188,6 +196,11 @@ Outputs:
 // result can be cross-checked against a `color-temperature-mireds` read
 // (when --mireds is given, kelvin is back-computed the same way for the echo)
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-color-temperature", "kelvin": 2700, "mireds": 370, "transition": 0, "status": "success" }
+
+// color — echoes the input degrees/percent plus the converted 0-254 raw
+// values so the result can be cross-checked against `current-hue` /
+// `current-saturation` reads
+{ "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-hue-and-saturation", "hue": 330, "saturation": 80, "hue_raw": 233, "saturation_raw": 203, "transition": 0, "status": "success" }
 
 // describe — lists child endpoints from endpoint 0's parts-list, and each
 // endpoint's server-list as numeric cluster IDs
@@ -442,7 +455,7 @@ already running (lock held at ...)` instead of silently hijacking it.
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
-  `color-temp` / `describe` / `group`. `discover` / `commission` /
+  `color-temp` / `color` / `describe` / `group`. `discover` / `commission` /
   `open-window` / `diag` are direct-only:
   auto-detection skips them silently; explicit `--matd` exits `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
@@ -484,7 +497,7 @@ pir = 3
 ```
 
 - `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
-  describe / on / off / color-temp / open-window / diag thread / diag node) and
+  describe / on / off / color-temp / color / open-window / diag thread / diag node) and
   by `--nodes` in `group provision` (each element resolved independently).
 - `groups`: alias → GroupId. Accepted by `-g/--group` (`group provision` /
   `group invoke`).
