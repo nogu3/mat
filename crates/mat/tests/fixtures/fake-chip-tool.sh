@@ -9,9 +9,10 @@
 
 mode="${FAKE_CHIP_MODE:-success}"
 
-# テスト検証用: 受け取った全引数を記録（PAA フラグ受け渡し等の確認に使う）。
+# テスト検証用: 受け取った全引数を記録（1 呼び出し = 1 行、追記式。mat 1 回の
+# 実行内の複数 chip-tool 呼び出しのステップ列を検証できる）。
 if [ -n "$FAKE_CHIP_ARGS_FILE" ]; then
-  echo "$*" > "$FAKE_CHIP_ARGS_FILE"
+  echo "$*" >> "$FAKE_CHIP_ARGS_FILE"
 fi
 
 # 自 fabric CFID のダミー出力。第1候補 = operational discovery のインスタンス名
@@ -103,6 +104,58 @@ EOF
     # provision の AddGroup（Groups クラスタ）。成功 status 行を吐く。
     emit_failure
     echo "[1656][CHIP:DMG] Received Command Response Status for Endpoint=0x1 Cluster=0x0000_0004 Command=0x0000_0000 Status=0x0 (SUCCESS)"
+    exit 0
+    ;;
+  accesscontrol)
+    # provision step 4 / grant の ACL read-merge-write。read は TOO ログ形式で
+    # エントリ列を吐く（実機 v1.4.x 相当）。
+    #   FAKE_ACL_HAS_GROUP=1 → group 1 のエントリ入り（write スキップのテスト用）
+    #   FAKE_ACL_BROKEN=1    → 解釈不能出力（parse_error で write しないテスト用）
+    op="$2"
+    emit_failure
+    if [ "$op" = "read" ]; then
+      if [ -n "$FAKE_ACL_BROKEN" ]; then
+        echo "[1656][CHIP:TOO] something unparseable"
+        exit 0
+      fi
+      if [ -n "$FAKE_ACL_HAS_GROUP" ]; then
+        cat <<'EOF'
+[1656][CHIP:TOO]   ACL: 2 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 1
+[1656][CHIP:TOO]      }
+[1656][CHIP:TOO]     [2]: {
+[1656][CHIP:TOO]       Privilege: 3
+[1656][CHIP:TOO]       AuthMode: 3
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 1
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 1
+[1656][CHIP:TOO]      }
+EOF
+      else
+        cat <<'EOF'
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 1
+[1656][CHIP:TOO]      }
+EOF
+      fi
+      exit 0
+    fi
+    # write: attribute write の成功形（既存 write と同じ status 行）。
+    echo "[1656][CHIP:DMG] AttributeStatusIB ="
+    echo "[1656][CHIP:DMG]   status = 0x00 (SUCCESS),"
     exit 0
     ;;
   descriptor)
