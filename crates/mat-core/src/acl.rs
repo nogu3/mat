@@ -101,8 +101,16 @@ pub fn to_chip_write_json(entries: &[AclEntry]) -> String {
 /// ```
 /// 安全弁（いずれも `ParseError`）: `ACL: n entries` ヘッダが無い / パースできた
 /// エントリ数がヘッダと合わない（途中で切れた出力）/ 必須フィールド欠け /
-/// 予期しない行。ACL write は全置換なので、部分的にしか読めていないリストで
-/// write すると読み落としたエントリを消してしまう — 迷ったら失敗させる。
+/// ネストした `Subjects: n entries` / `Targets: n entries` の宣言件数と実際の
+/// 件数が合わない（サブリストが途中で切れた出力）。ACL write は全置換なので、
+/// 部分的にしか読めていないリストで write すると読み落としたエントリ（または
+/// target 限定が外れて広がった権限）を書き込んでしまう — 迷ったら失敗させる。
+///
+/// **境界**: エントリ内（`{ ... }` の中、target の中も含む）の未知のキーや
+/// colon の無い行は garbled なデータとみなし `ParseError` にする。一方で
+/// エントリ外（まだどのエントリにも入っていない状態）のログ雑音は無視する
+/// （実 chip-tool の出力は TOO ブロックの前後に無関係な DMG/log 行が混ざる
+/// ため、この範囲のリニエンシーは意図的）。
 pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> {
     let mut declared: Option<usize> = None;
     let mut entries: Vec<AclEntry> = Vec::new();
@@ -142,11 +150,7 @@ pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> 
                     section = Section::Fields;
                 }
                 (Some(b), Section::Subjects) => {
-                    let head = rest.split_whitespace().next().unwrap_or(rest);
-                    let v = head.trim_end_matches(',').parse::<u64>().map_err(|_| {
-                        MatError::parse_error(format!("unparseable ACL subject: {payload}"))
-                    })?;
-                    b.subjects.push(v);
+                    b.subjects.push(field_num::<u64>(rest, "subject")?);
                 }
                 (Some(_), Section::Targets) if rest.starts_with('{') => {
                     cur_target = Some(TargetBuilder::default());
@@ -178,9 +182,15 @@ pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> 
             continue;
         }
 
-        // フィールド行 `Key: Value`。エントリ外の無関係行は無視する。
+        // フィールド行 `Key: Value`。エントリ外（cur が None）の無関係行は無視するが、
+        // エントリ内の colon 無し行は garbled データとして fail-closed にする。
         let Some(colon) = payload.find(':') else {
-            continue;
+            if cur.is_none() {
+                continue;
+            }
+            return Err(MatError::parse_error(format!(
+                "unexpected line in ACL entry: {payload}"
+            )));
         };
         let key = payload[..colon].trim();
         let val = payload[colon + 1..].trim().trim_end_matches(',').trim();
@@ -190,7 +200,11 @@ pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> 
                 "Cluster" => t.cluster = field_opt_num(val, "target Cluster")?,
                 "Endpoint" => t.endpoint = field_opt_num(val, "target Endpoint")?,
                 "DeviceType" => t.device_type = field_opt_num(val, "target DeviceType")?,
-                _ => {}
+                _ => {
+                    return Err(MatError::parse_error(format!(
+                        "unexpected line in ACL entry: {payload}"
+                    )))
+                }
             }
             continue;
         }
@@ -203,22 +217,28 @@ pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError> 
                 section = Section::Fields;
             }
             "Subjects" => {
-                section = if val.starts_with("null") {
-                    Section::Fields
+                if val.starts_with("null") {
+                    section = Section::Fields;
                 } else {
-                    Section::Subjects
-                };
+                    b.expected_subjects = Some(field_num::<usize>(val, "Subjects")?);
+                    section = Section::Subjects;
+                }
             }
             "Targets" => {
                 if val.starts_with("null") {
                     b.targets = None;
                     section = Section::Fields;
                 } else {
+                    b.expected_targets = Some(field_num::<usize>(val, "Targets")?);
                     b.targets = Some(Vec::new());
                     section = Section::Targets;
                 }
             }
-            _ => {}
+            _ => {
+                return Err(MatError::parse_error(format!(
+                    "unexpected line in ACL entry: {payload}"
+                )))
+            }
         }
     }
 
@@ -241,10 +261,31 @@ struct EntryBuilder {
     subjects: Vec<u64>,
     targets: Option<Vec<AclTarget>>,
     fabric_index: Option<u8>,
+    /// `Subjects: n entries` で宣言された件数。実際に読めた `subjects.len()` と
+    /// 一致しなければ途中で切れた出力とみなし `ParseError`（build 時に検証）。
+    expected_subjects: Option<usize>,
+    /// `Targets: n entries` で宣言された件数。`expected_subjects` と同様に検証する。
+    expected_targets: Option<usize>,
 }
 
 impl EntryBuilder {
     fn build(self) -> Result<AclEntry, MatError> {
+        if let Some(expected) = self.expected_subjects {
+            let actual = self.subjects.len();
+            if actual != expected {
+                return Err(MatError::parse_error(format!(
+                    "ACL entry Subjects count mismatch: declared {expected} entries, parsed {actual}"
+                )));
+            }
+        }
+        if let Some(expected) = self.expected_targets {
+            let actual = self.targets.as_ref().map_or(0, Vec::len);
+            if actual != expected {
+                return Err(MatError::parse_error(format!(
+                    "ACL entry Targets count mismatch: declared {expected} entries, parsed {actual}"
+                )));
+            }
+        }
         Ok(AclEntry {
             privilege: self
                 .privilege
@@ -497,6 +538,112 @@ mod tests {
 [1780817887.948] [32231:32235] [TOO]      }
 ";
         assert_eq!(parse_acl_from_chip_log(s).unwrap(), vec![admin()]);
+    }
+
+    #[test]
+    fn too_log_subjects_count_mismatch_is_parse_error() {
+        // Subjects: 2 entries と宣言しつつ実際は 1 件しか無い（途中で切れた出力）。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 2 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let err = parse_acl_from_chip_log(s).expect_err("declared 2 subjects but only 1 present");
+        assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn too_log_targets_count_mismatch_is_parse_error() {
+        // Targets: 2 entries と宣言しつつ実際は 1 件しか無い。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 3
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: 2 entries
+[1656][CHIP:TOO]         [1]: {
+[1656][CHIP:TOO]           Cluster: 6
+[1656][CHIP:TOO]           Endpoint: null
+[1656][CHIP:TOO]           DeviceType: null
+[1656][CHIP:TOO]          }
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let err = parse_acl_from_chip_log(s).expect_err("declared 2 targets but only 1 present");
+        assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn too_log_unknown_key_inside_entry_is_parse_error() {
+        // エントリ内の未知キーは黙殺せず fail-closed。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Wibble: 3
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let err =
+            parse_acl_from_chip_log(s).expect_err("unknown key inside entry must fail closed");
+        assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn too_log_unknown_key_inside_target_is_parse_error() {
+        // target 内の未知キー（garbled な Cluster 相当）も fail-closed。黙って
+        // target が None（全許可）に劣化するのを防ぐ。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 3
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: 1 entries
+[1656][CHIP:TOO]         [1]: {
+[1656][CHIP:TOO]           Clusterz: 6
+[1656][CHIP:TOO]           Endpoint: null
+[1656][CHIP:TOO]           DeviceType: null
+[1656][CHIP:TOO]          }
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let err =
+            parse_acl_from_chip_log(s).expect_err("unknown key inside target must fail closed");
+        assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn too_log_colonless_garbage_inside_entry_is_parse_error() {
+        // エントリ内の colon 無し行はログ雑音ではなく garbled データとして扱う。
+        let s = "\
+[1656][CHIP:TOO]   ACL: 1 entries
+[1656][CHIP:TOO]     [1]: {
+[1656][CHIP:TOO]       Privilege: 5
+[1656][CHIP:TOO]       garbage line no colon
+[1656][CHIP:TOO]       AuthMode: 2
+[1656][CHIP:TOO]       Subjects: 1 entries
+[1656][CHIP:TOO]         [1]: 112233
+[1656][CHIP:TOO]       Targets: null
+[1656][CHIP:TOO]       FabricIndex: 4
+[1656][CHIP:TOO]      }
+";
+        let err =
+            parse_acl_from_chip_log(s).expect_err("colon-less line inside entry must fail closed");
+        assert_eq!(err.kind, ErrorKind::ParseError);
     }
 
     #[test]
