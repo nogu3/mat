@@ -357,9 +357,9 @@ alias from the optional `aliases.toml`, which is just a local nickname for the
 number; see [Aliases](#aliases-aliasestoml-optional)).
 
 ```bash
-# Provision: burn the key set + mapping into every node, and set up the
-# controller-side group state. --group is the GroupId, --nodes one or more
-# commissioned node_ids.
+# Provision: burn the key set + mapping + ACL group entry into every node, and
+# set up the controller-side group state. --group is the GroupId, --nodes one
+# or more commissioned node_ids.
 # provision --group <ID> --nodes <N>... [--keyset-id N] [--name NAME]
 #                                       [--endpoint EP] [--epoch-key HEX]
 mat group provision --group 1 --nodes 5 6 7 --name living
@@ -367,6 +367,12 @@ mat group provision --group 1 --nodes 5 6 7 --name living
 # Invoke: one multicast send to the group (unacknowledged).
 # invoke --group <ID> --cluster <NAME> --command <NAME> [args...] [--endpoint EP]
 mat group invoke --group 1 --cluster onoff --command on
+
+# Grant (repair): run just the ACL step on already-provisioned nodes. Use it for
+# groups provisioned before the ACL step existed (or through an old matd).
+# Idempotent: nodes that already have the entry are reported as "unchanged".
+# grant --group <ID> --nodes <N>...
+mat group grant --group 1 --nodes 5 6 7
 ```
 
 Outputs:
@@ -377,6 +383,9 @@ Outputs:
 
 // invoke — multicast is fire-and-forget; only "sent" can be reported
 { "timestamp": "...", "group_id": 1, "cluster": "onoff", "command": "on", "endpoint": 1, "status": "sent", "note": "unacknowledged groupcast; per-device delivery not confirmed" }
+
+// grant — per-node repair result (ACL updated vs already had the entry)
+{ "timestamp": "...", "group_id": 1, "nodes": [5, 6, 7], "updated": [5, 7], "unchanged": [6], "status": "granted" }
 ```
 
 - **Groupcast is unacknowledged.** `group invoke` reports `"sent"`, never "all 7
@@ -392,6 +401,23 @@ Outputs:
   IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.
 - It stops at the **first failed node/step** (the error `detail` says which) so
   stdout stays pure JSON; re-run after fixing the offending node.
+- **Provision also writes the device ACL (its 4th per-node step).** Group
+  commands arrive with authMode=Group, so each device needs an ACL entry
+  `{privilege: Operate, authMode: Group, subjects: [GroupId]}` — commissioning
+  only creates the CASE admin entry, and without the group entry every device
+  **silently drops** the groupcast (it is unacknowledged, so nothing fails
+  visibly). The step is a read-merge-write: `mat` reads the current ACL, appends
+  the entry only when missing (idempotent, existing entries — including other
+  groups' — are preserved), and writes the full list back. If the ACL read
+  cannot be parsed, `mat` stops with `parse_error` and **never writes** (an ACL
+  write replaces the whole list; a blind write could drop the admin entry and
+  make the device unmanageable).
+- **`mat group grant` repairs older groups.** Groups provisioned before this
+  step existed — including any provision routed through a `matd` ≤ 0.12, which
+  does not run the ACL step — lack the entry and their groupcast is silently
+  ignored. The controller-side `groupsettings` state is not idempotent, so
+  provision cannot simply be re-run; `grant` runs just the ACL step instead.
+  It is always direct chip-tool (`--matd` exits 2).
 
 ### Routing through `matd`
 
@@ -695,6 +721,12 @@ mat group invoke --group 1 --cluster onoff --command off
 > JSON, the `groupsettings add-keysets` policy value, and the group node-id form
 > are chip-tool-version dependent — if a chip-tool upgrade breaks provisioning,
 > this is the first place to check.
+>
+> If **no** device reacts although provision reported success, suspect the
+> device ACL first: provisions made before the ACL step (or through an old
+> `matd` ≤ 0.12) never granted the group permission, and devices silently drop
+> unauthorized groupcast. `mat group grant --group 1 --nodes 5 6 7` adds the
+> missing entries idempotently.
 
 ## Contributing
 

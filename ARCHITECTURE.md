@@ -302,7 +302,10 @@ Share a `mat`-owned device with another controller.
 Synchronized ON/OFF of many lights via a Matter wire group. This is the original
 motivation (lights turning on one by one instead of together), but it is the most
 fragile, so it comes last.
-- `mat group provision` (KeySetWrite / GroupKeyMap / AddGroup on every node).
+- `mat group provision` (KeySetWrite / GroupKeyMap / AddGroup / ACL
+  read-merge-write on every node).
+- `mat group grant` (repair: just the ACL step, for groups provisioned before
+  the ACL step existed; direct chip-tool only).
 - `mat group invoke` (one multicast send).
 - The return value only reports "sent" (unacknowledged, so no per-device success).
 
@@ -314,8 +317,8 @@ fragile, so it comes last.
 > - **Especially unstable on Thread:** multicast retransmits eat airtime, and IPv6
 >   multicast packet drops lower delivery. "Full sync" depends on the transport
 >   and is weak on Thread lights. Wi-Fi/Ethernet Matter lights are better.
-> - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup on every node.
->   This is the most breakable feature in Matter.
+> - **Heavy pre-provisioning:** KeySetWrite / GroupKeyMap / AddGroup / ACL write
+>   on every node. This is the most breakable feature in Matter.
 
 ### Phase 4 — `matd`, the resident binary for Matter  *(done)*
 Make repeated operations fast without breaking `mat`'s one-shot model. Each `mat`
@@ -358,9 +361,13 @@ on top of that:
 - **`describe`** op: `parts-list` (ep 0) → per-endpoint `server-list`, reading the
   ID arrays from `results[0].value`. Same output shape as `mat describe`.
 - **`group`** ops: `group_provision` (controller groupsettings + per-node
-  KeySetWrite / GroupKeyMap / AddGroup) and `group_invoke` (multicast, reports
-  `sent`). The shared epoch-key / group-node-id logic lives in `mat-core::group`
-  so `mat` and `matd` use one copy.
+  KeySetWrite / GroupKeyMap / AddGroup / ACL read-merge-write) and
+  `group_invoke` (multicast, reports `sent`). The shared epoch-key /
+  group-node-id logic lives in `mat-core::group`, and the ACL
+  interpretation/merge logic in `mat-core::acl`, so `mat` and `matd` use one
+  copy. `group grant` (ACL repair) is deliberately **not** a matd op: it is a
+  rare repair operation with little warm-session benefit, and keeping it
+  direct-only avoids mat/matd version-skew hazards.
 - **Error classification:** a device-side error in `results[i].error` is run
   through the existing `classify_failure` text matcher (→ unreachable / timeout /
   device_rejected, unknown falls back to device_rejected). The `error` value is a
