@@ -299,6 +299,41 @@ async fn color_temp_echoes_kelvin_and_mireds() {
     handle.abort();
 }
 
+/// color: ColorControl MoveToHueAndSaturation にマップされ、hue / saturation
+/// （度・% と換算済み 0–254 生値）を応答へエコーする（直経路 `mat color` と同形）。
+#[tokio::test]
+async fn color_echoes_hue_and_saturation() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[
+            json!({"id":1,"op":"color","node_id":1,"endpoint":1,"hue_raw":233,"saturation_raw":203,"hue":330,"saturation":80,"transition":30}),
+            json!({"op":"color","node_id":99,"endpoint":1,"hue_raw":233,"saturation_raw":203,"hue":330,"saturation":80}),
+        ],
+    )
+    .await;
+
+    let r = &resps[0];
+    assert_eq!(r["id"], json!(1));
+    assert_eq!(r["cluster"], "colorcontrol");
+    assert_eq!(r["command"], "move-to-hue-and-saturation");
+    assert_eq!(r["hue"], json!(330));
+    assert_eq!(r["saturation"], json!(80));
+    assert_eq!(r["hue_raw"], json!(233));
+    assert_eq!(r["saturation_raw"], json!(203));
+    assert_eq!(r["transition"], json!(30));
+    assert_eq!(r["status"], "success");
+    assert!(r.get("result").is_none(), "raw ws result must not leak");
+
+    // 未 commission node は他 op 同様 node_not_commissioned。
+    assert_eq!(resps[1]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
+}
+
 /// describe: parts-list → 子エンドポイント、各 ep の server-list → クラスタ ID を組む。
 #[tokio::test]
 async fn describe_builds_endpoints_from_descriptor() {
