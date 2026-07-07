@@ -1,5 +1,7 @@
 # group provision への ACL 書き込みステップ追加 — 実装計画
 
+> **✅ 完了（2026-07-07）:** 全 Task 実装済み・main にコミット済み（b270b5e〜3f354a7、v0.13.0）。実機 6/6 グループキャスト動作確認済み。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `mat group provision`（直経路・matd 経由の両方）にデバイス ACL の read-merge-write ステップを追加し、修復コマンド `mat group grant` を新設する。
@@ -63,7 +65,7 @@
   - `pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>>`（`None` = 既に存在 = write 不要）
   - `pub fn to_chip_write_json(entries: &[AclEntry]) -> String`（空白なし compact、名前付きキー）
 
-- [ ] **Step 1: モジュール骨格 + 失敗するテストを書く**
+- [x] **Step 1: モジュール骨格 + 失敗するテストを書く**
 
 `crates/mat-core/src/lib.rs` の `pub mod alias;` の直後に追加:
 
@@ -239,12 +241,12 @@ mod tests {
 
 NOTE: この時点では `use crate::parse::strip_log_prefix;` と `use serde_json::Value;` が未使用（Task 2 で使う）。コンパイルを通すため Task 1 の間はこの 2 行を**入れない**こと（Task 2 で追加する）。
 
-- [ ] **Step 2: テストが失敗（todo! で panic）することを確認**
+- [x] **Step 2: テストが失敗（todo! で panic）することを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: FAIL（`not yet implemented` panic）
 
-- [ ] **Step 3: 最小実装**
+- [x] **Step 3: 最小実装**
 
 `todo!()` を実装で置き換える:
 
@@ -278,12 +280,12 @@ pub fn to_chip_write_json(entries: &[AclEntry]) -> String {
 }
 ```
 
-- [ ] **Step 4: テストが通ることを確認**
+- [x] **Step 4: テストが通ることを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: PASS（7 tests）
 
-- [ ] **Step 5: task check + コミット**
+- [x] **Step 5: task check + コミット**
 
 Run: `task check`
 Expected: fmt / clippy / 全テスト PASS
@@ -311,7 +313,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: `AclEntry` / `AclTarget`（Task 1）、`crate::parse::strip_log_prefix`（本 Task で `pub(crate)` 化）
 - Produces: `pub fn parse_acl_from_chip_log(stdout: &str) -> Result<Vec<AclEntry>, MatError>` — 解釈不能は `ErrorKind::ParseError`。Task 4/5（mat 直経路）が使う。
 
-- [ ] **Step 1: `strip_log_prefix` を pub(crate) 化**
+- [x] **Step 1: `strip_log_prefix` を pub(crate) 化**
 
 `crates/mat-core/src/parse.rs` の 360 行付近:
 
@@ -325,7 +327,7 @@ fn strip_log_prefix(line: &str) -> Option<&str> {
 pub(crate) fn strip_log_prefix(line: &str) -> Option<&str> {
 ```
 
-- [ ] **Step 2: 失敗するテストを書く**
+- [x] **Step 2: 失敗するテストを書く**
 
 `crates/mat-core/src/acl.rs` の `tests` モジュールに追加:
 
@@ -462,12 +464,12 @@ pub(crate) fn strip_log_prefix(line: &str) -> Option<&str> {
     }
 ```
 
-- [ ] **Step 3: テストが失敗することを確認**
+- [x] **Step 3: テストが失敗することを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: FAIL（`parse_acl_from_chip_log` 未定義のコンパイルエラー）
 
-- [ ] **Step 4: パーサを実装**
+- [x] **Step 4: パーサを実装**
 
 `crates/mat-core/src/acl.rs` の import に追加:
 
@@ -700,12 +702,12 @@ fn field_opt_num<T: TryFrom<u64>>(val: &str, what: &str) -> Result<Option<T>, Ma
 }
 ```
 
-- [ ] **Step 5: テストが通ることを確認**
+- [x] **Step 5: テストが通ることを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: PASS（Task 1 の 7 本 + 本 Task の 6 本）
 
-- [ ] **Step 6: task check + コミット**
+- [x] **Step 6: task check + コミット**
 
 Run: `task check`
 Expected: PASS
@@ -733,7 +735,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: `AclEntry` / `AclTarget`（Task 1）
 - Produces: `pub fn acl_entries_from_ws_value(value: &serde_json::Value) -> Result<Vec<AclEntry>, MatError>` — Task 6（matd）が `results[0].value` を渡す。
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `tests` モジュールに追加:
 
@@ -789,12 +791,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
     }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: FAIL（`acl_entries_from_ws_value` 未定義のコンパイルエラー）
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 import に `use serde_json::Value;` を追加し、`parse_acl_from_chip_log` の下に:
 
@@ -892,12 +894,12 @@ fn ws_opt_num<T: TryFrom<u64>>(
 }
 ```
 
-- [ ] **Step 4: テストが通ることを確認**
+- [x] **Step 4: テストが通ることを確認**
 
 Run: `cargo test -p mat-core acl::`
 Expected: PASS（累計 17 本）
 
-- [ ] **Step 5: task check + コミット**
+- [x] **Step 5: task check + コミット**
 
 Run: `task check`
 Expected: PASS
@@ -925,7 +927,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: `mat_core::acl::{merge_group_entry, parse_acl_from_chip_log, to_chip_write_json}`（Task 1–2）、既存 `ChipTool::run` / `classify_failure` / `run_node_step`
 - Produces: `fn ensure_group_acl(chip: &ChipTool, node_id: u64, group_id: u16) -> Result<bool, MatError>`（group.rs 内 private。戻り値 true = write した / false = 既存で skip。Task 5 の `grant` も使う）。fake-chip-tool の `accesscontrol` ブランチと制御 env `FAKE_ACL_HAS_GROUP` / `FAKE_ACL_BROKEN`、および `FAKE_CHIP_ARGS_FILE` の**追記式**記録（Task 5–6 のテストも前提にする）。
 
-- [ ] **Step 1: fake-chip-tool を更新（記録を追記式に + accesscontrol ブランチ）**
+- [x] **Step 1: fake-chip-tool を更新（記録を追記式に + accesscontrol ブランチ）**
 
 `crates/mat/tests/fixtures/fake-chip-tool.sh` の記録部分（13–15 行目）:
 
@@ -1044,7 +1046,7 @@ EOF
     ;;
 ```
 
-- [ ] **Step 2: 失敗する統合テストを書く**
+- [x] **Step 2: 失敗する統合テストを書く**
 
 `crates/mat/tests/integration.rs` の既存テスト `group_provision_last_chip_call_is_add_group`（727–753 行）を次で**置き換え**、さらに 2 本追加:
 
@@ -1146,12 +1148,12 @@ fn group_provision_broken_acl_read_is_parse_error_without_write() {
 }
 ```
 
-- [ ] **Step 3: テストが失敗することを確認**
+- [x] **Step 3: テストが失敗することを確認**
 
 Run: `cargo test -p mat --test integration group_provision`
 Expected: 新 3 本が FAIL（acl read の呼び出しが無い / exit 0 のまま）。既存 `group_provision_succeeds` 等は PASS のまま。
 
-- [ ] **Step 4: `ensure_group_acl` を実装し provision に組み込む**
+- [x] **Step 4: `ensure_group_acl` を実装し provision に組み込む**
 
 `crates/mat/src/commands/group.rs` の import を更新:
 
@@ -1222,12 +1224,12 @@ fn ensure_group_acl(chip: &ChipTool, node_id: u64, group_id: u16) -> Result<bool
 }
 ```
 
-- [ ] **Step 5: テストが通ることを確認**
+- [x] **Step 5: テストが通ることを確認**
 
 Run: `cargo test -p mat --test integration`
 Expected: 全 PASS（既存 fixture 変更の影響も含めて確認。`>>` 化で落ちるテストは無い想定 — 落ちたら該当 assert を確認）
 
-- [ ] **Step 6: task check + コミット**
+- [x] **Step 6: task check + コミット**
 
 Run: `task check`
 Expected: PASS
@@ -1263,7 +1265,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
   - `pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), MatError>`（commands::group）
   - stdout: `{"timestamp": ..., "group_id": 10, "nodes": [5,7,8], "updated": [5,7], "unchanged": [8], "status": "granted"}`
 
-- [ ] **Step 1: 失敗する統合テストを書く**
+- [x] **Step 1: 失敗する統合テストを書く**
 
 `crates/mat/tests/integration.rs` の groupcast 節に追加:
 
@@ -1382,12 +1384,12 @@ fn group_grant_with_forced_matd_exits_2() {
     }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `cargo test -p mat`
 Expected: FAIL（`GroupCommand::Grant` 未定義のコンパイルエラー）
 
-- [ ] **Step 3: CLI・解決・ディスパッチ・実装を追加**
+- [x] **Step 3: CLI・解決・ディスパッチ・実装を追加**
 
 (a) `crates/mat/src/cli.rs` — `GroupCommand` の `Invoke` バリアントの後に追加:
 
@@ -1472,12 +1474,12 @@ pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), M
 }
 ```
 
-- [ ] **Step 4: テストが通ることを確認**
+- [x] **Step 4: テストが通ることを確認**
 
 Run: `cargo test -p mat`
 Expected: 全 PASS（grant 統合 5 本 + matd_client 単体 1 本を含む）
 
-- [ ] **Step 5: task check + コミット**
+- [x] **Step 5: task check + コミット**
 
 Run: `task check`
 Expected: PASS
@@ -1505,7 +1507,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: `mat_core::acl::{acl_entries_from_ws_value, merge_group_entry, to_chip_write_json}`（Task 1, 3）、既存 `backend.run_cmdline` / `ensure_ok` / `read_value` / `group_step`
 - Produces: matd の `group_provision` op が各ノードで `accesscontrol read acl {node} 0` →（必要時）`accesscontrol write acl {compact_json} {node} 0` を実行する。protocol.rs は変更なし。
 
-- [ ] **Step 1: fake-ws を更新し、失敗するテストを書く**
+- [x] **Step 1: fake-ws を更新し、失敗するテストを書く**
 
 (a) `crates/matd/tests/integration.rs` の `spawn_fake_ws`（25–53 行）の value 分岐に ACL 応答を追加（既存テスト `group_provision_reports_provisioned` が新ステップ込みで通るようにする）:
 
@@ -1673,12 +1675,12 @@ async fn group_provision_unparseable_acl_stops_with_parse_error() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `cargo test -p matd --test integration`
 Expected: 新 3 本が FAIL（acl read が呼ばれない）。既存テストは PASS。
 
-- [ ] **Step 3: server.rs に step 4 を実装**
+- [x] **Step 3: server.rs に step 4 を実装**
 
 `crates/matd/src/server.rs` の import に追加:
 
@@ -1716,12 +1718,12 @@ use mat_core::acl::{acl_entries_from_ws_value, merge_group_entry, to_chip_write_
         }
 ```
 
-- [ ] **Step 4: テストが通ることを確認**
+- [x] **Step 4: テストが通ることを確認**
 
 Run: `cargo test -p matd`
 Expected: 全 PASS（既存 `group_provision_reports_provisioned` も fake-ws の ACL 応答追加で通る）
 
-- [ ] **Step 5: task check + コミット**
+- [x] **Step 5: task check + コミット**
 
 Run: `task check`
 Expected: PASS
@@ -1750,7 +1752,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: Task 4–6 で確定した CLI・出力スキーマ
 - Produces: なし（ドキュメントのみ）
 
-- [ ] **Step 1: workspace バージョンを 0.13.0 に**
+- [x] **Step 1: workspace バージョンを 0.13.0 に**
 
 ルート `Cargo.toml` の 6 行目:
 
@@ -1760,7 +1762,7 @@ version = "0.13.0"
 
 （挙動変更: matd の group_provision に ACL ステップが加わったため。spec の「matd 0.10.0」はバージョンが workspace 共有である現状に合わせて 0.13.0 に読み替え。）
 
-- [ ] **Step 2: README の Groupcast 節を更新**
+- [x] **Step 2: README の Groupcast 節を更新**
 
 (a) bash ブロック（README.md 359 行付近）の provision コメントと直後に grant を追加。既存:
 
@@ -1820,7 +1822,7 @@ mat group grant --group 1 --nodes 5 6 7
   It is always direct chip-tool (`--matd` exits 2).
 ```
 
-- [ ] **Step 3: README の Groupcast E2E 節にトラブルシュートを追記**
+- [x] **Step 3: README の Groupcast E2E 節にトラブルシュートを追記**
 
 `### Groupcast E2E (real devices)` の blockquote（`> Groupcast is **unacknowledged** ...`）に続けて追加:
 
@@ -1832,7 +1834,7 @@ mat group grant --group 1 --nodes 5 6 7
 > missing entries idempotently.
 ```
 
-- [ ] **Step 4: ARCHITECTURE.md を更新**
+- [x] **Step 4: ARCHITECTURE.md を更新**
 
 (a) Phase 3 節（305 行付近）:
 
@@ -1869,7 +1871,7 @@ mat group grant --group 1 --nodes 5 6 7
 
 (c) Phase 3 の「Heavy pre-provisioning」注記（317 行付近）の `KeySetWrite / GroupKeyMap / AddGroup on every node.` も `KeySetWrite / GroupKeyMap / AddGroup / ACL write on every node.` に更新。
 
-- [ ] **Step 5: 受け入れ基準の最終確認**
+- [x] **Step 5: 受け入れ基準の最終確認**
 
 Run: `task check`
 Expected: PASS（fmt:check + clippy -D warnings + 全テスト）
@@ -1880,7 +1882,7 @@ Expected: PASS（fmt:check + clippy -D warnings + 全テスト）
 3. grant が ACL 欠落を修復（jarvis group 10 相当の fake 再現） → `group_grant_appends_acl_entry_and_reports_updated`。
 4. ACL read 解釈不能時に write せず parse_error 停止 → `group_provision_broken_acl_read_is_parse_error_without_write`（mat）/ `group_grant_broken_acl_read_is_parse_error_without_write`（mat）/ `group_provision_unparseable_acl_stops_with_parse_error`（matd）。
 
-- [ ] **Step 6: コミット**
+- [x] **Step 6: コミット**
 
 ```bash
 git add Cargo.toml Cargo.lock README.md ARCHITECTURE.md
