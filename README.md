@@ -173,6 +173,18 @@ mat color-temp --node 5 --mireds 370
 # outside the device's supported range are clamped by the device itself.
 mat color --node 5 --hue 330 --sat 80
 mat color --node 5 --hue 330 --sat 80 --transition 30
+
+# Named colors and RGB: --name looks up a built-in table (red / pink / orange /
+# purple / cyan / green / blue / yellow / magenta / white; extend or override
+# via [colors] in aliases.toml), --rgb takes #rrggbb / rrggbb / R,G,B. Both are
+# converted RGB -> HSV -> hue/sat; the V (brightness) component is discarded,
+# so these set the color only and never change brightness (use LevelControl
+# for that). `--name white` naturally lands on sat=0 (desaturate); color-temp
+# can also produce white but through a different pipeline — both are kept.
+# The three spec systems (--name / --rgb / --hue+--sat) are mutually exclusive.
+mat color --node 5 --name pink
+mat color --node 5 --rgb "#ff00aa"
+mat color --node 5 --rgb 255,0,170
 ```
 
 **Important asymmetry: read is an attribute, control is an invoke.** Turning a
@@ -201,6 +213,10 @@ Outputs:
 // values so the result can be cross-checked against `current-hue` /
 // `current-saturation` reads
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-hue-and-saturation", "hue": 330, "saturation": 80, "hue_raw": 233, "saturation_raw": 203, "transition": 0, "status": "success" }
+
+// color with --name / --rgb — additionally echoes the input name and the
+// normalized #rrggbb so the conversion can be audited
+{ "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-hue-and-saturation", "hue": 350, "saturation": 25, "hue_raw": 247, "saturation_raw": 63, "transition": 0, "name": "pink", "rgb": "#ffc0cb", "status": "success" }
 
 // describe — lists child endpoints from endpoint 0's parts-list, and each
 // endpoint's server-list as numeric cluster IDs
@@ -419,6 +435,19 @@ Outputs:
   provision cannot simply be re-run; `grant` runs just the ACL step instead.
   It is always direct chip-tool (`--matd` exits 2).
 
+Color shortcuts for groups (same conversions as the single-node `mat
+color-temp` / `mat color`, delivered as an unacknowledged groupcast — the
+result is `"status": "sent"` only; per-device delivery is not confirmed).
+Like all ColorControl commands sent with optionsMask=0, they only take effect
+on devices that are currently on:
+
+```bash
+mat group color-temp --group 1 --kelvin 2700
+mat group color --group 1 --name pink
+mat group color --group 1 --rgb "#ff00aa" --transition 30
+mat group color --group 1 --hue 330 --sat 80
+```
+
 ### Routing through `matd`
 
 By default each `mat` call spawns `chip-tool` and pays a fresh CASE handshake.
@@ -481,8 +510,9 @@ already running (lock held at ...)` instead of silently hijacking it.
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
-  `color-temp` / `color` / `describe` / `group`. `discover` / `commission` /
-  `open-window` / `diag` are direct-only:
+  `color-temp` / `color` / `describe` / `group` (`provision` / `invoke` /
+  `color-temp` / `color`; `group grant` is always direct — see Groupcast
+  above). `discover` / `commission` / `open-window` / `diag` are direct-only:
   auto-detection skips them silently; explicit `--matd` exits `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
@@ -520,21 +550,32 @@ night = 2
 
 [endpoints.12]
 pir = 3
+
+[colors]
+warm = "#ff8c00"
+mypink = "255,182,193"
 ```
 
 - `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
   describe / on / off / color-temp / color / open-window / diag thread / diag node) and
   by `--nodes` in `group provision` (each element resolved independently).
-- `groups`: alias → GroupId. Accepted by `-g/--group` (`group provision` /
-  `group invoke`).
+- `groups`: alias → GroupId. Accepted by `-g/--group` in every `group`
+  subcommand (`provision` / `invoke` / `grant` / `color-temp` / `color`).
 - `endpoints`: defined **per node** — the outer key is a node alias or a
   node_id digit string, the inner map is alias → endpoint number (endpoint
   numbers mean different things on different nodes, so there is no global
   endpoint dictionary). Accepted by `-e/--endpoint` on node-taking commands;
   the lookup uses the *resolved* node, so `-n 5 -e main` and
   `-n living-light -e main` give the same result. The `-e` of `group
-  provision` / `group invoke` is **numeric only** (no node context to resolve
-  against).
+  provision` / `group invoke` / `group color-temp` / `group color` is
+  **numeric only** (no node context to resolve against).
+- `colors`: custom color name → RGB value (`#rrggbb` / `rrggbb` / `R,G,B`),
+  used by `--name` in `color` / `group color`. Entries are defined as RGB and
+  go through the same RGB → HSV pipeline as `--rgb`. A user-defined name
+  **overrides** the built-in color table (you can redefine `red`). Without the
+  file the built-in table still works. A value that does not parse as RGB is
+  `store_parse` (exit `10`); an unknown color name is a CLI argument error
+  (exit `2`) listing the known names.
 
 ```bash
 # With the aliases.toml above, these are equivalent:

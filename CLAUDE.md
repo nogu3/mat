@@ -26,9 +26,11 @@ This file is the short list of constraints you must not break.
 
 - Resolving human names on the wire or in the backend (chip-tool / matd always
   receive numeric values). The only exception: if `<store>/aliases.toml`
-  exists, the CLI layer resolves node / group / endpoint aliases to numbers
-  right after arg parsing — optional, local, and absent-file = no behavior
-  change. Cluster / attribute names stay chip-tool notation (no aliasing).
+  exists, the CLI layer resolves node / group / endpoint aliases — and color
+  names via `[colors]` (RGB-defined, overriding the built-in color table in
+  `mat-core`) — to numbers right after arg parsing — optional, local, and
+  absent-file = no behavior change (built-in color names still work without
+  the file). Cluster / attribute names stay chip-tool notation (no aliasing).
 - Logical groups like "the lights in the living room" (out of scope; `mat` takes
   a numeric GroupId).
 - Session cache, subscriptions, freshness (`mat` is one-shot; warm sessions are
