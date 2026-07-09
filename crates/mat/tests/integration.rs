@@ -542,6 +542,167 @@ fn color_unknown_node_exits_11() {
 }
 
 #[test]
+fn color_name_red_converts_via_rgb_hsv() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color", "--node", "5", "--name", "red"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"red\""))
+        .stdout(predicate::str::contains("\"rgb\":\"#ff0000\""))
+        .stdout(predicate::str::contains("\"hue_raw\":0"))
+        .stdout(predicate::str::contains("\"saturation_raw\":254"))
+        .stdout(predicate::str::contains("\"status\":\"success\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 0 254 0 0 0 5 1"),
+        "expected red converted argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_name_white_collapses_to_sat_zero() {
+    // white = #ffffff は RGB→HSV で自然に sat=0（無彩色）。特別扱い無し。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color", "--node", "5", "--name", "white"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"saturation_raw\":0"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 0 0 0 0 0 5 1"),
+        "expected white sat=0 argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_rgb_hex_and_decimal_forms_are_equivalent() {
+    let store = store_with_node5();
+    for rgb in ["#ff00aa", "ff00aa", "255,0,170"] {
+        let args_file = store.path().join("recorded-args.txt");
+        mat(store.path())
+            .env("FAKE_CHIP_ARGS_FILE", &args_file)
+            .args(["color", "--node", "5", "--rgb", rgb])
+            .assert()
+            .success()
+            // 入力表記によらず正規形 #rrggbb でエコーする。
+            .stdout(predicate::str::contains("\"rgb\":\"#ff00aa\""))
+            .stdout(predicate::str::contains("\"hue\":320"))
+            .stdout(predicate::str::contains("\"hue_raw\":226"))
+            .stdout(predicate::str::contains("\"saturation_raw\":254"));
+        let recorded = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            recorded.contains("colorcontrol move-to-hue-and-saturation 226 254 0 0 0 5 1"),
+            "expected #ff00aa argv for input {rgb}: {recorded}"
+        );
+    }
+}
+
+#[test]
+fn color_spec_systems_are_mutually_exclusive() {
+    let store = store_with_node5();
+    // 複数系統の同時指定は exit 2。
+    mat(store.path())
+        .args(["color", "--node", "5", "--name", "red", "--rgb", "#ff0000"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args([
+            "color", "--node", "5", "--name", "red", "--hue", "0", "--sat", "100",
+        ])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args([
+            "color", "--node", "5", "--rgb", "#ff0000", "--hue", "0", "--sat", "100",
+        ])
+        .assert()
+        .code(2);
+    // どの系統も無し / hue・sat の片割れも exit 2（既存挙動の維持）。
+    mat(store.path())
+        .args(["color", "--node", "5"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args(["color", "--node", "5", "--hue", "330"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn color_custom_name_from_aliases_colors_overrides_builtin() {
+    let store = store_with_node5();
+    std::fs::write(
+        store.path().join("aliases.toml"),
+        "[colors]\nwarm = \"#ff8c00\"\nred = \"0,0,255\"\n",
+    )
+    .unwrap();
+    let args_file = store.path().join("recorded-args.txt");
+    // ユーザー定義色。#ff8c00 → hue_raw 23, sat_raw 254。
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color", "--node", "5", "--name", "warm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"warm\""))
+        .stdout(predicate::str::contains("\"rgb\":\"#ff8c00\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 23 254 0 0 0 5 1"),
+        "expected warm argv: {recorded}"
+    );
+    // 組み込み red をユーザー定義（青）が上書き → hue_raw 169。
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["color", "--node", "5", "--name", "red"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"rgb\":\"#0000ff\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-hue-and-saturation 169 254 0 0 0 5 1"),
+        "expected overridden red (=blue) argv: {recorded}"
+    );
+}
+
+#[test]
+fn color_unknown_name_exits_2_and_broken_colors_exits_10() {
+    let store = store_with_node5();
+    // 未知の色名は CLI 引数エラー（exit 2）。既知名を列挙する。
+    mat(store.path())
+        .args(["color", "--node", "5", "--name", "sakura"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown color name"));
+    // 壊れた [colors]（RGB パース不能）は store_parse（exit 10）。
+    std::fs::write(
+        store.path().join("aliases.toml"),
+        "[colors]\nbad = \"zzz\"\n",
+    )
+    .unwrap();
+    mat(store.path())
+        .args(["color", "--node", "5", "--name", "red"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_parse"));
+}
+
+#[test]
+fn color_invalid_rgb_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["color", "--node", "5", "--rgb", "zzz"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid RGB"));
+}
+
+#[test]
 fn describe_lists_endpoints_and_clusters() {
     let store = store_with_node5();
     mat(store.path())

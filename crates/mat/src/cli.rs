@@ -172,8 +172,10 @@ pub enum Command {
     },
 
     /// ColorControl の MoveToHueAndSaturation を invoke する高頻度ショートカット。
-    /// `--hue`（0–360 度）と `--sat`（0–100 %）は両方必須で、mat が Matter の
-    /// 0–254 値（`round(v / full * 254)`、255 は予約値）へ換算する。デバイス対応
+    /// 色は `--name`（色名）/ `--rgb`（HEX or R,G,B）/ `--hue`+`--sat`（生指定、両方
+    /// 必須）の 3 系統から 1 つで指定する。名前・RGB は RGB→HSV で hue/sat へ換算
+    /// し、mat が Matter の 0–254 値（`round(v / full * 254)`、255 は予約値）へ
+    /// 更に落とす。名前・RGB は色だけ設定し明度（明るさ）は変えない。デバイス対応
     /// 範囲外の値はデバイス側が clamp する（mat は事前 read / 検証をしない）。
     Color {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
@@ -182,12 +184,8 @@ pub enum Command {
         /// エンドポイント番号、または aliases.toml の endpoint alias（既定 1）。
         #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
         endpoint: EndpointRef,
-        /// 色相（度、0–360）。例: 330 = ピンク。
-        #[arg(long, value_name = "DEG", value_parser = clap::value_parser!(u16).range(0..=360))]
-        hue: u16,
-        /// 彩度（%、0–100）。
-        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
-        sat: u8,
+        #[command(flatten)]
+        spec: ColorSpecArgs,
         /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
         #[arg(long, value_name = "DS", default_value_t = 0)]
         transition: u16,
@@ -222,6 +220,30 @@ pub enum Command {
         #[command(subcommand)]
         action: DiagCommand,
     },
+}
+
+/// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/
+/// `--hue`+`--sat`（生指定、両方必須）。名前・RGB は RGB→HSV で hue/sat へ換算し、
+/// V（明度）は捨てる — **色だけ設定し、明るさは変えない**（明るさは LevelControl
+/// の領分）。点灯中でないと反映されない（ExecuteIfOff は立てない）。
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+#[group(id = "color_spec", required = true, multiple = true)]
+pub struct ColorSpecArgs {
+    /// 色名。組み込み: red / pink / orange / purple / cyan / green / blue /
+    /// yellow / magenta / white。aliases.toml の `[colors]` で追加・上書き可
+    /// （RGB 値で定義）。色だけ設定し、明るさ（明度）は変えない。
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["rgb", "hue", "sat"])]
+    pub name: Option<String>,
+    /// RGB 値（`#ff0000` / `ff0000` / `255,0,0`）。RGB→HSV で hue/sat へ換算し、
+    /// 明度（V）は捨てる（明るさは変えない）。
+    #[arg(long, value_name = "HEX|R,G,B", conflicts_with_all = ["hue", "sat"])]
+    pub rgb: Option<String>,
+    /// 色相（度、0–360）。例: 330 = ピンク。`--sat` と併用必須。
+    #[arg(long, value_name = "DEG", requires = "sat", value_parser = clap::value_parser!(u16).range(0..=360))]
+    pub hue: Option<u16>,
+    /// 彩度（%、0–100）。`--hue` と併用必須。
+    #[arg(long, value_name = "PCT", requires = "hue", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub sat: Option<u8>,
 }
 
 #[derive(Subcommand, Debug)]

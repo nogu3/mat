@@ -131,17 +131,17 @@ fn main() -> ExitCode {
         Command::Color {
             node_id,
             endpoint,
-            hue,
-            sat,
+            spec,
             transition,
-        } => commands::invoke::run_color(
-            &store_path,
-            node_id.id(),
-            endpoint.id(),
-            *hue,
-            *sat,
-            *transition,
-        ),
+        } => mat_core::color::resolve_spec(
+            spec.name.as_deref(),
+            spec.rgb.as_deref(),
+            spec.hue,
+            spec.sat,
+        )
+        .and_then(|c| {
+            commands::invoke::run_color(&store_path, node_id.id(), endpoint.id(), &c, *transition)
+        }),
         Command::OpenWindow {
             node_id,
             timeout,

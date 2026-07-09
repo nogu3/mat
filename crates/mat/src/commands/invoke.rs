@@ -10,6 +10,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::runner::ChipTool;
+use mat_core::color::ResolvedColor;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::normalize::classify_failure;
 use mat_core::output;
@@ -138,22 +139,20 @@ pub fn resolve_color_temp(kelvin: Option<u32>, mireds: Option<u16>) -> (u16, u32
 }
 
 /// `mat color` の実体。ColorControl の MoveToHueAndSaturation を invoke する。
-/// 入力の度 / % と換算後の 0–254 生値を両方エコーし、`current-hue` /
+/// 入力（name / rgb / 度・%）と換算後の 0–254 生値を両方エコーし、`current-hue` /
 /// `current-saturation` の読み返しと突合しやすくする。
 pub fn run_color(
     store_path: &Path,
     node_id: u64,
     endpoint: u16,
-    hue_deg: u16,
-    sat_pct: u8,
+    color: &ResolvedColor,
     transition: u16,
 ) -> Result<(), MatError> {
-    let (hue_raw, sat_raw) = resolve_color(hue_deg, sat_pct);
     // MoveToHueAndSaturation の引数は <hue> <saturation> <transition>
     // <optionsMask> <optionsOverride>。
     let args = [
-        hue_raw.to_string(),
-        sat_raw.to_string(),
+        color.hue_raw.to_string(),
+        color.sat_raw.to_string(),
         transition.to_string(),
         "0".to_string(),
         "0".to_string(),
@@ -166,34 +165,26 @@ pub fn run_color(
         "move-to-hue-and-saturation",
         &args,
     )?;
-    output::emit(json!({
+    let mut body = json!({
         "node_id": node_id,
         "endpoint": endpoint,
         "cluster": "colorcontrol",
         "command": "move-to-hue-and-saturation",
-        "hue": hue_deg,
-        "saturation": sat_pct,
-        "hue_raw": hue_raw,
-        "saturation_raw": sat_raw,
+        "hue": color.hue,
+        "saturation": color.sat,
+        "hue_raw": color.hue_raw,
+        "saturation_raw": color.sat_raw,
         "transition": transition,
         "status": "success",
-    }));
-    Ok(())
-}
-
-/// `mat color` の `--hue`（0–360 度）/ `--sat`（0–100 %）を Matter の 0–254 値へ
-/// 換算する（255 は予約値、フルスケールは 254.5 → 254 に丸まる）。値域は clap が
-/// 保証する。決定的な数値換算のみで、デバイス対応範囲の検証はしない
-/// （範囲外はデバイス側が clamp する）。
-pub fn resolve_color(hue_deg: u16, sat_pct: u8) -> (u8, u8) {
-    // round(v / full * 254) を整数演算で（+full/2 で四捨五入）。
-    fn scale(v: u32, full: u32) -> u8 {
-        ((v * 254 + full / 2) / full) as u8
+    });
+    if let Some(name) = &color.name {
+        body["name"] = json!(name);
     }
-    (
-        scale(u32::from(hue_deg), 360),
-        scale(u32::from(sat_pct), 100),
-    )
+    if let Some(rgb) = &color.rgb {
+        body["rgb"] = json!(rgb);
+    }
+    output::emit(body);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -215,24 +206,5 @@ mod tests {
     fn mireds_direct_computes_kelvin_echo() {
         // 1_000_000 / 370 = 2702.7 → round = 2703（エコー用の逆換算）。
         assert_eq!(resolve_color_temp(None, Some(370)), (370, 2703));
-    }
-
-    #[test]
-    fn hue_330_sat_80_convert_to_233_203() {
-        // round(330 / 360 * 254) = 233、round(80 / 100 * 254) = 203。
-        assert_eq!(resolve_color(330, 80), (233, 203));
-    }
-
-    #[test]
-    fn hue_sat_full_scale_caps_at_254() {
-        // 255 は Matter の予約値。360° / 100% は 254.5 → 254 に丸まり超えない。
-        assert_eq!(resolve_color(0, 0), (0, 0));
-        assert_eq!(resolve_color(360, 100), (254, 254));
-    }
-
-    #[test]
-    fn sat_50_rounds_to_127() {
-        // round(50 / 100 * 254) = 127（パステル系の中間彩度）。
-        assert_eq!(resolve_color(330, 50), (233, 127));
     }
 }

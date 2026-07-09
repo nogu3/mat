@@ -7,9 +7,10 @@
 
 use std::path::Path;
 
-use crate::cli::{Command, DiagCommand, GroupCommand};
+use crate::cli::{ColorSpecArgs, Command, DiagCommand, GroupCommand};
 use mat_core::alias::{AliasBook, EndpointRef, GroupRef, NodeRef};
-use mat_core::error::MatError;
+use mat_core::color;
+use mat_core::error::{ErrorKind, MatError};
 
 /// command 内の alias を全て数値（`Id`）へ確定した `Command` を返す。
 /// aliases.toml が無ければ数値はパススルー（従来動作）。
@@ -126,8 +127,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
         Command::Color {
             node_id,
             endpoint,
-            hue,
-            sat,
+            spec,
             transition,
         } => {
             let node = book.resolve_node(&node_id)?;
@@ -135,8 +135,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             Command::Color {
                 node_id: NodeRef::Id(node),
                 endpoint: EndpointRef::Id(ep),
-                hue,
-                sat,
+                spec: resolve_color_spec(&book, spec)?,
                 transition,
             }
         }
@@ -221,10 +220,35 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
     })
 }
 
+/// 色指定の name / rgb を正規化済み RGB（`#rrggbb`）へ確定する。hue/sat 生指定は
+/// パススルー。色名解決は node/group/endpoint alias と同じレイヤ（ここ）で行い、
+/// 以降の経路（直 / matd）には数値換算可能な形だけが流れる。未知の色名・不正な
+/// `--rgb` は kind=Other（main が exit 2 に写す）。
+fn resolve_color_spec(book: &AliasBook, spec: ColorSpecArgs) -> Result<ColorSpecArgs, MatError> {
+    if let Some(name) = &spec.name {
+        let rgb = book.resolve_color_name(name)?;
+        return Ok(ColorSpecArgs {
+            name: spec.name.clone(),
+            rgb: Some(color::hex_string(rgb)),
+            hue: None,
+            sat: None,
+        });
+    }
+    if let Some(rgb) = &spec.rgb {
+        let parsed = color::parse_rgb(rgb).map_err(|e| MatError::new(ErrorKind::Other, e))?;
+        return Ok(ColorSpecArgs {
+            name: None,
+            rgb: Some(color::hex_string(parsed)),
+            hue: None,
+            sat: None,
+        });
+    }
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mat_core::error::ErrorKind;
 
     fn store_with(toml: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -323,6 +347,29 @@ mod tests {
         };
         match resolve_command(cmd, dir.path()).unwrap() {
             Command::Describe { node_id } => assert_eq!(node_id, NodeRef::Id(5)),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn color_name_resolves_to_normalized_rgb() {
+        let dir = store_with("[colors]\nwarm = \"255,140,0\"\n");
+        let cmd = Command::Color {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            spec: crate::cli::ColorSpecArgs {
+                name: Some("warm".into()),
+                rgb: None,
+                hue: None,
+                sat: None,
+            },
+            transition: 0,
+        };
+        match resolve_command(cmd, dir.path()).unwrap() {
+            Command::Color { spec, .. } => {
+                assert_eq!(spec.name.as_deref(), Some("warm"));
+                assert_eq!(spec.rgb.as_deref(), Some("#ff8c00"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
