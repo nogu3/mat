@@ -6,6 +6,7 @@
 
 pub mod acl;
 pub mod alias;
+pub mod color;
 pub mod diag;
 pub mod error;
 pub mod group;
