@@ -89,7 +89,30 @@ EOF
     ;;
   groupsettings)
     # コントローラ側 group state（ローカル操作）。add-group / add-keysets /
-    # bind-keyset。ネットワーク不要なので timeout/reject 注入はしない。
+    # bind-keyset / unbind-keyset。ネットワーク不要なので timeout/reject 注入はしない。
+    #   FAKE_GROUP_BOUND=1 → keyset が bind 済みの controller を模す:
+    #     bind-keyset は Duplicate key id で失敗する。ただし同一 FAKE_CHIP_ARGS_FILE 内に
+    #     unbind-keyset の実行記録が既にあれば「bind し直し」として成功する。
+    #     unbind-keyset は成功。
+    #   未設定（未 bind）→ unbind-keyset は「未 bind」風エラーで exit 1（mat は
+    #     best-effort で無視する）、その他は成功。
+    gop="$2"
+    if [ "$gop" = "unbind-keyset" ]; then
+      if [ -n "$FAKE_GROUP_BOUND" ]; then
+        echo "[1656][CHIP:TOO] unbind-keyset ok"
+        exit 0
+      fi
+      echo "[1656][CHIP:DMG] CHIP Error 0x000000C9: keyset not bound"
+      exit 1
+    fi
+    if [ "$gop" = "bind-keyset" ] && [ -n "$FAKE_GROUP_BOUND" ]; then
+      if [ -n "$FAKE_CHIP_ARGS_FILE" ] && grep -q "unbind-keyset" "$FAKE_CHIP_ARGS_FILE" 2>/dev/null; then
+        echo "[1656][CHIP:TOO] bind-keyset ok"
+        exit 0
+      fi
+      echo "[1656][CHIP:DMG] src/credentials/GroupDataProviderImpl.cpp:1362: CHIP Error 0x0000001A: Duplicate key id"
+      exit 1
+    fi
     echo "[1656][CHIP:TOO] $2 ok"
     exit 0
     ;;

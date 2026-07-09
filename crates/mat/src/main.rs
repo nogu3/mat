@@ -160,6 +160,7 @@ fn main() -> ExitCode {
                 name,
                 endpoint,
                 epoch_key,
+                rebind,
             } => {
                 // name 未指定なら group_id から決定的に補完（open-window の disc と同様）。
                 let gid = group_id.id();
@@ -173,6 +174,7 @@ fn main() -> ExitCode {
                     &name,
                     *endpoint,
                     epoch_key.as_deref(),
+                    *rebind,
                 )
             }
             GroupCommand::Invoke {

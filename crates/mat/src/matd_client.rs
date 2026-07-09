@@ -232,6 +232,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 name,
                 endpoint,
                 epoch_key,
+                rebind,
             } => {
                 // name 未指定なら group_id から決定的に補完（main の直接経路と同じ規則）。
                 let gid = group_id.id();
@@ -240,7 +241,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 json!({
                     "op": "group_provision", "group_id": gid, "node_ids": ids,
                     "keyset_id": keyset_id, "name": name, "endpoint": endpoint,
-                    "epoch_key": epoch_key,
+                    "epoch_key": epoch_key, "rebind": rebind,
                 })
             }
             GroupCommand::Invoke {
@@ -483,6 +484,7 @@ mod tests {
                 name: None,
                 endpoint: 1,
                 epoch_key: None,
+                rebind: false,
             },
         };
         // name 未指定は grp<group_id> に補完。epoch_key は null のまま（matd 側で生成）。
@@ -490,7 +492,8 @@ mod tests {
             to_op(&cmd).unwrap(),
             json!({
                 "op":"group_provision","group_id":7,"node_ids":[1,2],
-                "keyset_id":42,"name":"grp7","endpoint":1,"epoch_key":null
+                "keyset_id":42,"name":"grp7","endpoint":1,"epoch_key":null,
+                "rebind":false
             })
         );
     }

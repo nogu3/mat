@@ -984,6 +984,72 @@ fn group_provision_broken_acl_read_is_parse_error_without_write() {
 }
 
 #[test]
+fn group_provision_rebind_unbinds_before_bind() {
+    // bind 済み controller（FAKE_GROUP_BOUND=1）でも --rebind なら
+    // unbind-keyset → bind-keyset の順で成功する（issue #5: 既存グループへの
+    // ノード追加）。直経路の rebind は matd 再起動が必要なので note が出る。
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .env("FAKE_GROUP_BOUND", "1")
+        .args([
+            "group",
+            "provision",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+            "--rebind",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"provisioned\""))
+        .stdout(predicate::str::contains("restart"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    let unbind = recorded
+        .find("groupsettings unbind-keyset 1 42")
+        .expect("unbind-keyset call missing");
+    let bind = recorded
+        .find("groupsettings bind-keyset 1 42")
+        .expect("bind-keyset call missing");
+    assert!(unbind < bind, "unbind must run before bind: {recorded}");
+}
+
+#[test]
+fn group_provision_rebind_on_unbound_group_succeeds() {
+    // 未 bind（新規グループ）でも --rebind 付きで成功する: unbind の失敗は
+    // best-effort で無視される（冪等）。
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "group",
+            "provision",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+            "--rebind",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
+}
+
+#[test]
+fn group_provision_without_rebind_still_fails_on_bound_group() {
+    // --rebind 無しの既存挙動は不変: bind 済みなら bind-keyset の Duplicate で
+    // 失敗する（誤って鍵を回す事故の防護）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("FAKE_GROUP_BOUND", "1")
+        .args(["group", "provision", "--group", "1", "--nodes", "5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bind-keyset"));
+}
+
+#[test]
 fn group_invoke_reports_sent() {
     let store = store_with_node5();
     let args_file = store.path().join("recorded-args.txt");

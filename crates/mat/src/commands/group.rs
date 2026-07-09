@@ -35,6 +35,7 @@ pub fn provision(
     name: &str,
     endpoint: u16,
     epoch_key: Option<&str>,
+    rebind: bool,
 ) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     // 全ノードが commission 済みであることを先に確認（1つでも未登録なら exit 11）。
@@ -75,6 +76,27 @@ pub fn provision(
         ],
         &format!("groupsettings add-keysets {keyset_id}"),
     )?;
+    if rebind {
+        // 既存グループの keyset binding を解除してから bind し直す（issue #5:
+        // controller 側 groupsettings は永続化されており、bind 済みだと bind-keyset
+        // が Duplicate key id で落ちる）。unbind は best-effort: 「未 bind なのに
+        // unbind」を区別せず失敗を無視する（unbind が本当に必要で失敗したケースは
+        // 直後の bind-keyset が従来どおり落ちるので、検知はそちらに委ねる）。
+        let out = chip.run(vec![
+            "groupsettings".into(),
+            "unbind-keyset".into(),
+            group_id.to_string(),
+            keyset_id.to_string(),
+        ])?;
+        if !out.success() {
+            tracing::debug!(
+                group_id,
+                keyset_id,
+                code = ?out.code,
+                "groupsettings unbind-keyset failed; ignored (best-effort rebind)"
+            );
+        }
+    }
     run_step(
         &chip,
         vec![
@@ -152,14 +174,21 @@ pub fn provision(
         ensure_group_acl(&chip, node_id, group_id)?;
     }
 
-    output::emit(json!({
+    let mut body = json!({
         "group_id": group_id,
         "keyset_id": keyset_id,
         "name": name,
         "endpoint": endpoint,
         "nodes": node_ids,
         "status": "provisioned",
-    }));
+    });
+    if rebind {
+        // 直経路の rebind は matd の warm chip-tool が旧 group 状態をメモリに
+        // 持ったままになるため、稼働中なら再起動が要る（storage は更新済み）。
+        body["note"] =
+            json!("rebound keyset binding; if matd is running, restart it to reload group state");
+    }
+    output::emit(body);
     Ok(())
 }
 
