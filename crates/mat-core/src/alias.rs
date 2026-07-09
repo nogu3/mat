@@ -85,6 +85,10 @@ struct AliasFile {
     /// 外側キー = ノード alias または node_id の数字文字列、内側 = alias → endpoint。
     #[serde(default)]
     endpoints: BTreeMap<String, BTreeMap<String, u16>>,
+    /// カスタム色名 → RGB 値（`#rrggbb` / `rrggbb` / `R,G,B`）。組み込みテーブル
+    /// （mat-core::color::BUILTIN_COLORS）の同名を上書きする。
+    #[serde(default)]
+    colors: BTreeMap<String, String>,
 }
 
 impl Default for AliasFile {
@@ -96,6 +100,7 @@ impl Default for AliasFile {
             nodes: BTreeMap::new(),
             groups: BTreeMap::new(),
             endpoints: BTreeMap::new(),
+            colors: BTreeMap::new(),
         }
     }
 }
@@ -145,7 +150,8 @@ impl AliasBook {
             .nodes
             .keys()
             .chain(file.groups.keys())
-            .chain(file.endpoints.values().flat_map(|eps| eps.keys()));
+            .chain(file.endpoints.values().flat_map(|eps| eps.keys()))
+            .chain(file.colors.keys());
         for name in alias_names {
             if !is_valid_alias_name(name) {
                 return Err(MatError::store_parse(format!(
@@ -159,6 +165,14 @@ impl AliasBook {
                 "invalid empty node key in endpoints section of {}",
                 path.display()
             )));
+        }
+        for (name, value) in &file.colors {
+            if let Err(e) = crate::color::parse_rgb(value) {
+                return Err(MatError::store_parse(format!(
+                    "invalid RGB value for color '{name}' in {}: {e}",
+                    path.display()
+                )));
+            }
         }
         Ok(())
     }
@@ -222,6 +236,29 @@ impl AliasBook {
             )
         };
         Err(MatError::new(ErrorKind::Other, detail))
+    }
+
+    /// 色名を RGB へ確定する。`[colors]`（ユーザー定義）が組み込みテーブルを
+    /// 上書きする。未知の名前は kind=Other（main が exit 2 に写す）で、既知の
+    /// 名前（組み込み + ユーザー定義）を列挙して自己修復を助ける。
+    pub fn resolve_color_name(&self, name: &str) -> Result<[u8; 3], MatError> {
+        if let Some(value) = self.file.colors.get(name) {
+            // 値は load 時に検証済み。ここでの失敗はロジックエラーのみ。
+            return crate::color::parse_rgb(value).map_err(MatError::store_parse);
+        }
+        crate::color::builtin_color(name).ok_or_else(|| {
+            let mut known: Vec<&str> = crate::color::BUILTIN_COLORS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect();
+            known.extend(self.file.colors.keys().map(String::as_str));
+            known.sort_unstable();
+            known.dedup();
+            MatError::new(
+                ErrorKind::Other,
+                format!("unknown color name '{name}' (known: {})", known.join(", ")),
+            )
+        })
     }
 
     /// 未知 alias の detail 文。AI が自己修復できるよう既知 alias を列挙する。
@@ -518,5 +555,58 @@ mod tests {
         assert!(book.validate_new_node_alias("").is_err());
         // 未使用の妥当な名前。
         assert!(book.validate_new_node_alias("new-light").is_ok());
+    }
+
+    #[test]
+    fn colors_section_resolves_and_overrides_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(
+            dir.path(),
+            "[colors]\nwarm = \"#ff8c00\"\nmypink = \"255,182,193\"\nred = \"0,0,255\"\n",
+        );
+        let book = AliasBook::load(dir.path()).unwrap();
+        // ユーザー定義。
+        assert_eq!(book.resolve_color_name("warm").unwrap(), [255, 140, 0]);
+        assert_eq!(book.resolve_color_name("mypink").unwrap(), [255, 182, 193]);
+        // 同名のユーザー定義が組み込み（red = #ff0000）を上書きする。
+        assert_eq!(book.resolve_color_name("red").unwrap(), [0, 0, 255]);
+        // 組み込みへのフォールバック。
+        assert_eq!(book.resolve_color_name("blue").unwrap(), [0, 0, 255]);
+    }
+
+    #[test]
+    fn builtin_colors_work_without_aliases_file() {
+        // ファイル無し = 組み込みのみで挙動不変。
+        let dir = tempfile::tempdir().unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(book.resolve_color_name("red").unwrap(), [255, 0, 0]);
+    }
+
+    #[test]
+    fn unknown_color_name_lists_known_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), "[colors]\nwarm = \"#ff8c00\"\n");
+        let book = AliasBook::load(dir.path()).unwrap();
+        let err = book.resolve_color_name("sakura").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("warm"), "{}", err.detail);
+        assert!(err.detail.contains("red"), "{}", err.detail); // 組み込みも列挙
+    }
+
+    #[test]
+    fn corrupt_color_value_or_name_is_store_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        // RGB としてパース不能な値は load 時に store_parse（exit 10）。
+        write_aliases(dir.path(), "[colors]\nbad = \"zzz\"\n");
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
+        // 色名も既存 alias と同じ検証（純数字・空は NG）。
+        write_aliases(dir.path(), "[colors]\n42 = \"#ff0000\"\n");
+        assert_eq!(
+            AliasBook::load(dir.path()).unwrap_err().kind,
+            ErrorKind::StoreParse
+        );
     }
 }
