@@ -514,6 +514,9 @@ already running (lock held at ...)` instead of silently hijacking it.
   `color-temp` / `color`; `group grant` is always direct — see Groupcast
   above). `discover` / `commission` / `open-window` / `diag` are direct-only:
   auto-detection skips them silently; explicit `--matd` exits `2`.
+  The group color shortcuts (`group color-temp` and `group color`) require
+  matd ≥ 0.14; an older matd rejects the unknown op with a `parse_error`
+  (exit 1) and `mat` does not fall back to the direct path (no double execution).
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 

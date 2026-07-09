@@ -7,7 +7,7 @@
 //! ストレージ（store 配下）と `groupsettings` に委ねる（設計ルール4: credential KVS
 //! 以外の state を持たない）。
 //!
-//! groupcast は **unacknowledged**。`invoke` は応答を受け取れないため "sent" しか
+//! groupcast は **unacknowledged**。`invoke` / `color-temp` / `color` は応答を受け取れないため "sent" しか
 //! 報告できない（per-device の配信成否は原理的に取れない）。
 
 use std::path::Path;
