@@ -413,6 +413,69 @@ async fn group_invoke_reports_sent() {
     handle.abort();
 }
 
+/// group_color_temp: 換算済み mireds で groupcast し、kelvin / mireds をエコー、
+/// status="sent"（unacknowledged; 直経路 `mat group color-temp` と同形）。
+#[tokio::test]
+async fn group_color_temp_reports_sent_with_echo() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({"id":1,"op":"group_color_temp","group_id":1,"mireds":370,"kelvin":2700,"transition":0,"endpoint":1})],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "sent");
+    assert_eq!(resps[0]["kelvin"], 2700);
+    assert_eq!(resps[0]["mireds"], 370);
+    assert_eq!(resps[0]["command"], "move-to-color-temperature");
+    assert!(resps[0]["timestamp"].is_string());
+
+    handle.abort();
+}
+
+/// group_color: 換算済み raw で groupcast し、name / rgb / 度・% をエコー、
+/// status="sent"（直経路 `mat group color` と同形）。
+#[tokio::test]
+async fn group_color_reports_sent_with_echo() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({"id":1,"op":"group_color","group_id":1,"hue_raw":169,"saturation_raw":254,"hue":240,"saturation":100,"name":"blue","rgb":"#0000ff","transition":0,"endpoint":1})],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "sent");
+    assert_eq!(resps[0]["name"], "blue");
+    assert_eq!(resps[0]["rgb"], "#0000ff");
+    assert_eq!(resps[0]["hue_raw"], 169);
+    assert_eq!(resps[0]["command"], "move-to-hue-and-saturation");
+
+    handle.abort();
+}
+
+/// 単体 color の name / rgb エコー（op に載せた任意フィールドが応答へ返る）。
+#[tokio::test]
+async fn color_echoes_optional_name_and_rgb() {
+    let port = spawn_fake_ws().await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({"id":1,"op":"color","node_id":1,"endpoint":1,"hue_raw":0,"saturation_raw":254,"hue":0,"saturation":100,"name":"red","rgb":"#ff0000","transition":0})],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "success");
+    assert_eq!(resps[0]["name"], "red");
+    assert_eq!(resps[0]["rgb"], "#ff0000");
+
+    handle.abort();
+}
+
 /// group provision: 全ステップが results にエラーを返さなければ provisioned を報告する。
 #[tokio::test]
 async fn group_provision_reports_provisioned() {
