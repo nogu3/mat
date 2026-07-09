@@ -64,6 +64,7 @@ pub enum Op {
     /// `hue_raw` / `saturation_raw` は mat 側で換算済みの 0–254 値を受け取る。
     /// `hue`（度）/ `saturation`（%）は応答へのエコー用
     /// （matd 側で逆算すると丸めで入力とずれるため、換算は mat の 1 箇所に置く）。
+    /// `name` / `rgb` は name / RGB 指定時の応答エコー用（任意）。
     Color {
         node_id: u64,
         endpoint: u16,
@@ -71,6 +72,10 @@ pub enum Op {
         saturation_raw: u8,
         hue: u16,
         saturation: u8,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        rgb: Option<String>,
         #[serde(default)]
         transition: u16,
     },
@@ -101,6 +106,34 @@ pub enum Op {
         args: Vec<String>,
         endpoint: u16,
     },
+    /// ColorControl MoveToColorTemperature の group ショートカット
+    /// （`mat group color-temp` 相当、groupcast）。`mireds` は mat 側で換算済み、
+    /// `kelvin` は応答エコー用。unacknowledged なので "sent" のみ報告する。
+    GroupColorTemp {
+        group_id: u16,
+        mireds: u16,
+        kelvin: u32,
+        #[serde(default)]
+        transition: u16,
+        endpoint: u16,
+    },
+    /// ColorControl MoveToHueAndSaturation の group ショートカット
+    /// （`mat group color` 相当、groupcast）。raw は mat 側で換算済み、
+    /// 度・%・name・rgb は応答エコー用。unacknowledged なので "sent" のみ報告する。
+    GroupColor {
+        group_id: u16,
+        hue_raw: u8,
+        saturation_raw: u8,
+        hue: u16,
+        saturation: u8,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        rgb: Option<String>,
+        #[serde(default)]
+        transition: u16,
+        endpoint: u16,
+    },
     /// デーモン死活確認（chip-tool には触れない）。
     Ping,
     /// デーモンを停止する admin op（chip-tool には触れない）。`matd stop` が送る。
@@ -123,7 +156,12 @@ impl Op {
             | Op::ColorTemp { node_id, .. }
             | Op::Color { node_id, .. }
             | Op::Describe { node_id } => Some(*node_id),
-            Op::GroupProvision { .. } | Op::GroupInvoke { .. } | Op::Ping | Op::Shutdown => None,
+            Op::GroupProvision { .. }
+            | Op::GroupInvoke { .. }
+            | Op::GroupColorTemp { .. }
+            | Op::GroupColor { .. }
+            | Op::Ping
+            | Op::Shutdown => None,
         }
     }
 
@@ -186,6 +224,8 @@ impl Op {
             Op::Describe { .. }
             | Op::GroupProvision { .. }
             | Op::GroupInvoke { .. }
+            | Op::GroupColorTemp { .. }
+            | Op::GroupColor { .. }
             | Op::Ping
             | Op::Shutdown => return None,
         };
@@ -328,5 +368,49 @@ mod tests {
         assert!(matches!(r.op, Op::Shutdown));
         assert_eq!(r.op.node_id(), None);
         assert!(r.op.to_cmdline().is_none());
+    }
+
+    #[test]
+    fn group_color_temp_parses_with_no_node_or_cmdline() {
+        let r = parse(
+            r#"{"op":"group_color_temp","group_id":1,"mireds":370,"kelvin":2700,"transition":0,"endpoint":1}"#,
+        );
+        // multicast 宛で単一 node を持たず、group_invoke と同じく専用ハンドラで捌く。
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
+    }
+
+    #[test]
+    fn group_color_parses_with_optional_name_and_rgb() {
+        let r = parse(
+            r##"{"op":"group_color","group_id":1,"hue_raw":169,"saturation_raw":254,"hue":240,"saturation":100,"name":"blue","rgb":"#0000ff","endpoint":1}"##,
+        );
+        assert_eq!(r.op.node_id(), None);
+        assert!(r.op.to_cmdline().is_none());
+        assert!(matches!(r.op, Op::GroupColor { name: Some(_), .. }));
+        // name / rgb は省略可（--hue/--sat 生指定のとき）。
+        let r = parse(
+            r#"{"op":"group_color","group_id":1,"hue_raw":233,"saturation_raw":203,"hue":330,"saturation":80,"endpoint":1}"#,
+        );
+        assert!(matches!(
+            r.op,
+            Op::GroupColor {
+                name: None,
+                rgb: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn color_accepts_optional_name_and_rgb_echo() {
+        // 単体 color も name / rgb エコーを受ける（cmdline には乗らない）。
+        let r = parse(
+            r##"{"op":"color","node_id":6,"endpoint":1,"hue_raw":0,"saturation_raw":254,"hue":0,"saturation":100,"name":"red","rgb":"#ff0000"}"##,
+        );
+        assert_eq!(
+            r.op.to_cmdline().unwrap(),
+            "colorcontrol move-to-hue-and-saturation 0 254 0 0 0 6 1"
+        );
     }
 }

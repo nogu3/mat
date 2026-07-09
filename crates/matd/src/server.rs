@@ -162,6 +162,9 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
         }
         Op::GroupProvision { .. } => group_provision(op, backend, store_path).await,
         Op::GroupInvoke { .. } => group_invoke(op, backend, store_path).await,
+        Op::GroupColorTemp { .. } | Op::GroupColor { .. } => {
+            group_color_op(op, backend, store_path).await
+        }
         // 単一 cmdline に展開できる素の op。
         _ => simple_op(op, backend, store_path).await,
     }
@@ -258,20 +261,33 @@ async fn simple_op(
             saturation_raw,
             hue,
             saturation,
+            name,
+            rgb,
             transition,
-        } => json!({
-            "node_id": node_id, "endpoint": endpoint,
-            "cluster": "colorcontrol", "command": "move-to-hue-and-saturation",
-            // 入力の度 / % と換算後 0–254 生値を両方エコー（読み返し突合用; 直経路と同形）。
-            "hue": hue, "saturation": saturation,
-            "hue_raw": hue_raw, "saturation_raw": saturation_raw,
-            "transition": transition,
-            "status": "success",
-        }),
+        } => {
+            let mut body = json!({
+                "node_id": node_id, "endpoint": endpoint,
+                "cluster": "colorcontrol", "command": "move-to-hue-and-saturation",
+                // 入力の度 / % と換算後 0–254 生値を両方エコー（読み返し突合用; 直経路と同形）。
+                "hue": hue, "saturation": saturation,
+                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
+                "transition": transition,
+                "status": "success",
+            });
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(r) = rgb {
+                body["rgb"] = json!(r);
+            }
+            body
+        }
         Op::Ping
         | Op::Describe { .. }
         | Op::GroupProvision { .. }
         | Op::GroupInvoke { .. }
+        | Op::GroupColorTemp { .. }
+        | Op::GroupColor { .. }
         | Op::Shutdown => {
             unreachable!("handled by run_op")
         }
@@ -488,6 +504,75 @@ async fn group_invoke(
         "status": "sent",
         "note": "unacknowledged groupcast; per-device delivery not confirmed",
     }))
+}
+
+/// group 版 color-temp / color ショートカット（`mat group color-temp` / `mat group
+/// color` 相当）。groupcast なので group_invoke と同じく unacknowledged（ws 応答が
+/// 返れば "sent"）。換算は mat 側で済んでおり、ここは送信とエコーのみ。
+async fn group_color_op(
+    op: &Op,
+    backend: &ChipToolBackend,
+    store_path: &Path,
+) -> Result<Value, MatError> {
+    // 特定 node 宛ではないが、chip-tool の永続ストレージ（焼いた group 鍵）参照の
+    // ため store は必要。
+    let _store = Store::open(store_path)?;
+    match op {
+        Op::GroupColorTemp {
+            group_id,
+            mireds,
+            kelvin,
+            transition,
+            endpoint,
+        } => {
+            let line = format!(
+                "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {} {endpoint}",
+                group_node_id(*group_id)
+            );
+            let _ = backend.run_cmdline(&line).await?;
+            Ok(json!({
+                "group_id": group_id, "cluster": "colorcontrol",
+                "command": "move-to-color-temperature",
+                "kelvin": kelvin, "mireds": mireds, "transition": transition,
+                "endpoint": endpoint, "status": "sent",
+                "note": "unacknowledged groupcast; per-device delivery not confirmed",
+            }))
+        }
+        Op::GroupColor {
+            group_id,
+            hue_raw,
+            saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
+            transition,
+            endpoint,
+        } => {
+            let line = format!(
+                "colorcontrol move-to-hue-and-saturation {hue_raw} {saturation_raw} {transition} 0 0 {} {endpoint}",
+                group_node_id(*group_id)
+            );
+            let _ = backend.run_cmdline(&line).await?;
+            let mut body = json!({
+                "group_id": group_id, "cluster": "colorcontrol",
+                "command": "move-to-hue-and-saturation",
+                "hue": hue, "saturation": saturation,
+                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
+                "transition": transition, "endpoint": endpoint,
+                "status": "sent",
+                "note": "unacknowledged groupcast; per-device delivery not confirmed",
+            });
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(r) = rgb {
+                body["rgb"] = json!(r);
+            }
+            Ok(body)
+        }
+        _ => unreachable!("group_color_op called with non group color op"),
+    }
 }
 
 /// store を開いて node_id が commission 済みか確認する（常駐中の台帳更新を拾うよう
