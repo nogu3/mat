@@ -96,6 +96,10 @@ pub enum Op {
         endpoint: u16,
         #[serde(default)]
         epoch_key: Option<String>,
+        /// 既存グループの keyset binding を unbind してから bind し直す（issue #5）。
+        /// 旧 mat からの op には無いフィールドなので default = false。
+        #[serde(default)]
+        rebind: bool,
     },
     /// group へ multicast でコマンドを送る。`mat group invoke` 相当。
     GroupInvoke {
@@ -349,6 +353,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn group_provision_rebind_defaults_false_and_parses_true() {
+        // 旧 mat からの op（rebind フィールド無し）は false に落ちる（後方互換）。
+        let r = parse(
+            r#"{"op":"group_provision","group_id":1,"node_ids":[1],"keyset_id":42,"name":"g","endpoint":1}"#,
+        );
+        assert!(matches!(r.op, Op::GroupProvision { rebind: false, .. }));
+
+        let r = parse(
+            r#"{"op":"group_provision","group_id":1,"node_ids":[1],"keyset_id":42,"name":"g","endpoint":1,"rebind":true}"#,
+        );
+        assert!(matches!(r.op, Op::GroupProvision { rebind: true, .. }));
     }
 
     #[test]

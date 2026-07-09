@@ -354,6 +354,7 @@ async fn group_provision(
         name,
         endpoint,
         epoch_key,
+        rebind,
     } = op
     else {
         unreachable!("group_provision called with non-GroupProvision op");
@@ -384,6 +385,25 @@ async fn group_provision(
         ),
     )
     .await?;
+    if *rebind {
+        // 既存グループの keyset binding を解除してから bind し直す（issue #5）。
+        // best-effort: 「未 bind なのに unbind」を区別せず失敗を無視する（unbind が
+        // 本当に必要で失敗したケースは直後の bind-keyset が従来どおり落ちるので、
+        // 検知はそちらに委ねる）。
+        if let Err(e) = group_step(
+            backend,
+            &format!("groupsettings unbind-keyset {group_id} {keyset_id}"),
+        )
+        .await
+        {
+            tracing::debug!(
+                group_id,
+                keyset_id,
+                error = %e.detail,
+                "groupsettings unbind-keyset failed; ignored (best-effort rebind)"
+            );
+        }
+    }
     group_step(
         backend,
         &format!("groupsettings bind-keyset {group_id} {keyset_id}"),

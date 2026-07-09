@@ -120,6 +120,51 @@ async fn spawn_fake_ws_recording(acl_value: Value) -> (u16, Arc<tokio::sync::Mut
     (port, lines_log)
 }
 
+/// group の bind 状態を模した fake ws（issue #5 rebind 用）。コマンド行を記録しつつ:
+/// - `groupsettings unbind-keyset`: bound なら成功（以後 unbound）、unbound なら FAILURE
+/// - `groupsettings bind-keyset`: bound かつ未 unbind なら FAILURE（Duplicate 相当）、
+///   それ以外は成功
+/// - `accesscontrol read acl`: admin エントリのみの実機数値キー形式
+/// - それ以外: 成功（value: true）
+async fn spawn_fake_ws_group(bound: bool) -> (u16, Arc<tokio::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines_log: Arc<tokio::sync::Mutex<Vec<String>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&lines_log);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                let mut bound = bound;
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(line) = msg {
+                        log.lock().await.push(line.clone());
+                        let resp = if line.contains("groupsettings unbind-keyset") {
+                            if bound {
+                                bound = false;
+                                json!({ "results": [{ "value": true }], "logs": [] })
+                            } else {
+                                json!({ "results": [{ "error": "FAILURE" }], "logs": [] })
+                            }
+                        } else if line.contains("groupsettings bind-keyset") && bound {
+                            // bind 済みのまま bind → Duplicate key id 相当の失敗。
+                            json!({ "results": [{ "error": "FAILURE" }], "logs": [] })
+                        } else if line.contains("accesscontrol read acl") {
+                            json!({ "results": [{ "value": [{"1":5,"2":2,"3":[112233],"4":null,"254":1}] }], "logs": [] })
+                        } else {
+                            json!({ "results": [{ "value": true }], "logs": [] })
+                        };
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    (port, lines_log)
+}
+
 /// store を tempdir に作り、node 1 を commission 済みにして path を返す。
 fn make_store() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -633,6 +678,80 @@ async fn group_provision_unparseable_acl_stops_with_parse_error() {
         "must never write after an unparseable read: {lines:?}"
     );
 
+    handle.abort();
+}
+
+/// bind 済み controller でも rebind:true なら unbind → bind の順で成功する（issue #5）。
+#[tokio::test]
+async fn group_provision_rebind_unbinds_before_bind() {
+    let (port, lines) = spawn_fake_ws_group(true).await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision","group_id":1,"node_ids":[1],"keyset_id":42,
+            "name":"living","endpoint":1,"rebind":true,
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "provisioned", "{}", resps[0]);
+    // matd 経路は warm chip-tool 自身が状態更新するので再起動 note は出ない。
+    assert!(resps[0].get("note").is_none(), "{}", resps[0]);
+
+    let recorded = lines.lock().await.clone();
+    let unbind = recorded
+        .iter()
+        .position(|l| l.contains("groupsettings unbind-keyset 1 42"))
+        .expect("unbind-keyset line missing");
+    let bind = recorded
+        .iter()
+        .position(|l| l.contains("groupsettings bind-keyset 1 42"))
+        .expect("bind-keyset line missing");
+    assert!(unbind < bind, "unbind must run before bind: {recorded:?}");
+    handle.abort();
+}
+
+/// 未 bind（新規グループ）でも rebind:true は成功する（unbind の失敗を無視 = 冪等）。
+#[tokio::test]
+async fn group_provision_rebind_on_unbound_group_succeeds() {
+    let (port, _lines) = spawn_fake_ws_group(false).await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision","group_id":1,"node_ids":[1],"keyset_id":42,
+            "name":"living","endpoint":1,"rebind":true,
+        })],
+    )
+    .await;
+    assert_eq!(resps[0]["status"], "provisioned", "{}", resps[0]);
+    handle.abort();
+}
+
+/// rebind 無しの既存挙動は不変: bind 済みなら bind-keyset の失敗で止まる。
+#[tokio::test]
+async fn group_provision_without_rebind_fails_on_bound_group() {
+    let (port, _lines) = spawn_fake_ws_group(true).await;
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd(store_path, port).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[json!({
+            "op":"group_provision","group_id":1,"node_ids":[1],"keyset_id":42,
+            "name":"living","endpoint":1,
+        })],
+    )
+    .await;
+    assert!(
+        resps[0]["error"]["kind"].is_string(),
+        "must fail on bound group without rebind: {}",
+        resps[0]
+    );
     handle.abort();
 }
 
