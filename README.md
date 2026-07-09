@@ -380,6 +380,10 @@ number; see [Aliases](#aliases-aliasestoml-optional)).
 #                                       [--endpoint EP] [--epoch-key HEX]
 mat group provision --group 1 --nodes 5 6 7 --name living
 
+# Add a node to an existing group: pass --rebind with ALL existing members plus
+# the new one, and the SAME --keyset-id the group already uses.
+mat group provision --group 1 --nodes 5 6 7 8 --name living --rebind
+
 # Invoke: one multicast send to the group (unacknowledged).
 # invoke --group <ID> --cluster <NAME> --command <NAME> [args...] [--endpoint EP]
 mat group invoke --group 1 --cluster onoff --command on
@@ -396,6 +400,9 @@ Outputs:
 ```json
 // provision — all listed nodes succeeded (provision stops at the first failure)
 { "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7], "status": "provisioned" }
+
+// provision --rebind via the direct path also notes the matd restart caveat
+{ "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7, 8], "status": "provisioned", "note": "rebound keyset binding; if matd is running, restart it to reload group state" }
 
 // invoke — multicast is fire-and-forget; only "sent" can be reported
 { "timestamp": "...", "group_id": 1, "cluster": "onoff", "command": "on", "endpoint": 1, "status": "sent", "note": "unacknowledged groupcast; per-device delivery not confirmed" }
@@ -428,12 +435,28 @@ Outputs:
   cannot be parsed, `mat` stops with `parse_error` and **never writes** (an ACL
   write replaces the whole list; a blind write could drop the admin entry and
   make the device unmanageable).
+- **Adding a node to an existing group: `--rebind`.** The controller-side
+  `groupsettings` state persists across chip-tool runs, so re-running provision
+  on an existing group fails at `bind-keyset` with `Duplicate key id` — worse,
+  the earlier `add-keysets` step has already rotated the controller's epoch key,
+  leaving it out of sync with the devices (groupcast silently breaks). Without
+  `--rebind` this failure is intentional (it stops you from rotating keys by
+  accident). With `--rebind`, provision unbinds the keyset binding first
+  (best-effort; also safe on a brand-new group) and re-provisions cleanly. Three
+  rules: pass **all existing members plus the new node** to `--nodes` (a fresh
+  epoch key is generated, so nodes left out stop receiving groupcasts), keep the
+  **same `--keyset-id`** (the device keyset table holds max 3 entries and the
+  IPK uses one), and confirm membership per node with
+  `mat read -e 0 -c groupkeymanagement -a group-key-map`. After a direct-path
+  `--rebind`, restart `matd` if it is running (its warm chip-tool still holds
+  the old group state in memory; storage is already updated).
 - **`mat group grant` repairs older groups.** Groups provisioned before this
   step existed — including any provision routed through a `matd` ≤ 0.12, which
   does not run the ACL step — lack the entry and their groupcast is silently
   ignored. The controller-side `groupsettings` state is not idempotent, so
-  provision cannot simply be re-run; `grant` runs just the ACL step instead.
-  It is always direct chip-tool (`--matd` exits 2).
+  provision cannot simply be re-run — use `provision --rebind` to re-run it on
+  an existing group; `grant` runs just the ACL step instead. It is always
+  direct chip-tool (`--matd` exits 2).
 
 Color shortcuts for groups (same conversions as the single-node `mat
 color-temp` / `mat color`, delivered as an unacknowledged groupcast — the
@@ -517,6 +540,9 @@ already running (lock held at ...)` instead of silently hijacking it.
   The group color shortcuts (`group color-temp` and `group color`) require
   matd ≥ 0.14; an older matd rejects the unknown op with a `parse_error`
   (exit 1) and `mat` does not fall back to the direct path (no double execution).
+  `group provision --rebind` through matd needs matd ≥ 0.15: an older matd
+  silently ignores the unknown `rebind` field and fails at `bind-keyset`
+  (`Duplicate key id`) — same as running provision without the flag.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
