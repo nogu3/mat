@@ -193,6 +193,38 @@ fn main() -> ExitCode {
                 let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
                 commands::group::grant(&store_path, group_id.id(), &ids)
             }
+            GroupCommand::ColorTemp {
+                group_id,
+                kelvin,
+                mireds,
+                transition,
+                endpoint,
+            } => {
+                // --kelvin / --mireds を (mireds, kelvin) に解決（単体 color-temp と同じ規則）。
+                let (mireds, kelvin) = commands::invoke::resolve_color_temp(*kelvin, *mireds);
+                commands::group::color_temp(
+                    &store_path,
+                    group_id.id(),
+                    kelvin,
+                    mireds,
+                    *transition,
+                    *endpoint,
+                )
+            }
+            GroupCommand::Color {
+                group_id,
+                spec,
+                transition,
+                endpoint,
+            } => mat_core::color::resolve_spec(
+                spec.name.as_deref(),
+                spec.rgb.as_deref(),
+                spec.hue,
+                spec.sat,
+            )
+            .and_then(|c| {
+                commands::group::color(&store_path, group_id.id(), &c, *transition, *endpoint)
+            }),
         },
         Command::Diag { action } => match action {
             DiagCommand::Thread { node_id, endpoint } => {

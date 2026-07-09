@@ -1129,6 +1129,138 @@ fn group_grant_with_forced_matd_exits_2() {
         .code(2);
 }
 
+#[test]
+fn group_color_temp_converts_kelvin_and_reports_sent() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["group", "color-temp", "--group", "1", "--kelvin", "2700"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":1"))
+        .stdout(predicate::str::contains(
+            "\"command\":\"move-to-color-temperature\"",
+        ))
+        .stdout(predicate::str::contains("\"kelvin\":2700"))
+        .stdout(predicate::str::contains("\"mireds\":370"))
+        .stdout(predicate::str::contains("\"status\":\"sent\""))
+        .stdout(predicate::str::contains("unacknowledged"));
+    // 換算済み mireds + group multicast 宛先（0xffffffffffff0001）。
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 0xffffffffffff0001 1"),
+        "expected groupcast color-temp argv: {recorded}"
+    );
+}
+
+#[test]
+fn group_color_temp_requires_exactly_one_of_kelvin_or_mireds() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "color-temp", "--group", "1"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args([
+            "group",
+            "color-temp",
+            "--group",
+            "1",
+            "--kelvin",
+            "2700",
+            "--mireds",
+            "370",
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn group_color_name_converts_and_reports_sent() {
+    let store = store_with_node5();
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["group", "color", "--group", "1", "--name", "blue"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"group_id\":1"))
+        .stdout(predicate::str::contains(
+            "\"command\":\"move-to-hue-and-saturation\"",
+        ))
+        .stdout(predicate::str::contains("\"name\":\"blue\""))
+        .stdout(predicate::str::contains("\"rgb\":\"#0000ff\""))
+        .stdout(predicate::str::contains("\"hue_raw\":169"))
+        .stdout(predicate::str::contains("\"saturation_raw\":254"))
+        .stdout(predicate::str::contains("\"status\":\"sent\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded
+            .contains("colorcontrol move-to-hue-and-saturation 169 254 0 0 0 0xffffffffffff0001 1"),
+        "expected groupcast color argv: {recorded}"
+    );
+}
+
+#[test]
+fn group_color_hue_sat_and_rgb_forms_work() {
+    let store = store_with_node5();
+    // 生指定（既存単体 color と同じ換算）。
+    let args_file = store.path().join("recorded-args.txt");
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args([
+            "group",
+            "color",
+            "--group",
+            "1",
+            "--hue",
+            "330",
+            "--sat",
+            "80",
+            "--transition",
+            "30",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"transition\":30"));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded.contains(
+            "colorcontrol move-to-hue-and-saturation 233 203 30 0 0 0xffffffffffff0001 1"
+        ),
+        "expected raw hue/sat groupcast argv: {recorded}"
+    );
+    // RGB 指定。
+    mat(store.path())
+        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+        .args(["group", "color", "--group", "1", "--rgb", "255,0,170"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"rgb\":\"#ff00aa\""));
+    let recorded = std::fs::read_to_string(&args_file).unwrap();
+    assert!(
+        recorded
+            .contains("colorcontrol move-to-hue-and-saturation 226 254 0 0 0 0xffffffffffff0001 1"),
+        "expected rgb groupcast argv: {recorded}"
+    );
+}
+
+#[test]
+fn group_color_spec_systems_are_mutually_exclusive() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "group", "color", "--group", "1", "--name", "red", "--hue", "0", "--sat", "100",
+        ])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args(["group", "color", "--group", "1"])
+        .assert()
+        .code(2);
+}
+
 // ── diag node ──────────────────────────────────────────────────────────────
 
 #[test]

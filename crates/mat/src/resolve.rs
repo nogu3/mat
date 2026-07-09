@@ -190,6 +190,30 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                         .map(|n| book.resolve_node(n).map(NodeRef::Id))
                         .collect::<Result<Vec<_>, _>>()?,
                 },
+                GroupCommand::ColorTemp {
+                    group_id,
+                    kelvin,
+                    mireds,
+                    transition,
+                    endpoint,
+                } => GroupCommand::ColorTemp {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    kelvin,
+                    mireds,
+                    transition,
+                    endpoint,
+                },
+                GroupCommand::Color {
+                    group_id,
+                    spec,
+                    transition,
+                    endpoint,
+                } => GroupCommand::Color {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    spec: resolve_color_spec(&book, spec)?,
+                    transition,
+                    endpoint,
+                },
             },
         },
         Command::Diag { action } => Command::Diag {
