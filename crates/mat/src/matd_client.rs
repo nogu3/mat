@@ -256,6 +256,50 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
             // バージョンスキューにも安全なため直経路のみ（matd に op を足さない）。
             GroupCommand::Grant { .. } => return Err(unsupported("group grant")),
+            GroupCommand::ColorTemp {
+                group_id,
+                kelvin,
+                mireds,
+                transition,
+                endpoint,
+            } => {
+                // 換算は mat 側で 1 箇所（直経路と同じ規則）。kelvin はエコー用。
+                let (mireds, kelvin) =
+                    crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+                json!({
+                    "op": "group_color_temp", "group_id": group_id.id(),
+                    "mireds": mireds, "kelvin": kelvin,
+                    "transition": transition, "endpoint": endpoint,
+                })
+            }
+            GroupCommand::Color {
+                group_id,
+                spec,
+                transition,
+                endpoint,
+            } => {
+                // 換算は mat 側で 1 箇所。度 / % / name / rgb は応答エコー用。
+                let c = mat_core::color::resolve_spec(
+                    spec.name.as_deref(),
+                    spec.rgb.as_deref(),
+                    spec.hue,
+                    spec.sat,
+                )
+                .map_err(|e| e.detail)?;
+                let mut op = json!({
+                    "op": "group_color", "group_id": group_id.id(),
+                    "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
+                    "hue": c.hue, "saturation": c.sat,
+                    "transition": transition, "endpoint": endpoint,
+                });
+                if let Some(name) = &c.name {
+                    op["name"] = json!(name);
+                }
+                if let Some(rgb) = &c.rgb {
+                    op["rgb"] = json!(rgb);
+                }
+                op
+            }
         },
         // matd は warm CASE セッション層。これらは chip-tool 直経路でしか実行できない。
         Command::Discover { .. } => return Err(unsupported("discover")),
@@ -509,6 +553,52 @@ mod tests {
             },
         };
         assert!(to_op(&cmd).is_err());
+    }
+
+    #[test]
+    fn group_color_temp_maps_to_group_color_temp_op() {
+        let cmd = Command::Group {
+            action: GroupCommand::ColorTemp {
+                group_id: GroupRef::Id(1),
+                kelvin: Some(2700),
+                mireds: None,
+                transition: 0,
+                endpoint: 1,
+            },
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"group_color_temp","group_id":1,
+                "mireds":370,"kelvin":2700,"transition":0,"endpoint":1
+            })
+        );
+    }
+
+    #[test]
+    fn group_color_maps_to_group_color_op_with_echo() {
+        let cmd = Command::Group {
+            action: GroupCommand::Color {
+                group_id: GroupRef::Id(1),
+                spec: crate::cli::ColorSpecArgs {
+                    name: Some("blue".into()),
+                    rgb: Some("#0000ff".into()),
+                    hue: None,
+                    sat: None,
+                },
+                transition: 0,
+                endpoint: 1,
+            },
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"group_color","group_id":1,
+                "hue_raw":169,"saturation_raw":254,
+                "hue":240,"saturation":100,"transition":0,"endpoint":1,
+                "name":"blue","rgb":"#0000ff"
+            })
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::runner::ChipTool;
 use mat_core::acl::{merge_group_entry, parse_acl_from_chip_log, to_chip_write_json};
+use mat_core::color::ResolvedColor;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
 use mat_core::normalize::classify_failure;
@@ -162,8 +163,10 @@ pub fn provision(
     Ok(())
 }
 
-/// `mat group invoke` — group へ multicast でコマンドを送る。
-pub fn invoke(
+/// groupcast の送信部（出力なし）。invoke / color-temp / color ショートカットで共有。
+/// groupcast は unacknowledged で応答（SUCCESS 行）は返らないため operation_succeeded
+/// は見ない。送信プロセスが正常終了したかだけで「送った」と判断する。
+fn send(
     store_path: &Path,
     group_id: u16,
     cluster: &str,
@@ -193,8 +196,6 @@ pub fn invoke(
             format!("group invoke {cluster}/{command} to group {group_id} failed"),
         ));
     }
-    // groupcast は unacknowledged。応答（SUCCESS 行）は返らないため operation_succeeded
-    // は見ない。送信プロセスが正常終了したかだけで「送った」と判断する。
     if !out.success() {
         return Err(MatError::new(
             ErrorKind::ChildFailed,
@@ -204,7 +205,19 @@ pub fn invoke(
             ),
         ));
     }
+    Ok(())
+}
 
+/// `mat group invoke` — group へ multicast でコマンドを送る。
+pub fn invoke(
+    store_path: &Path,
+    group_id: u16,
+    cluster: &str,
+    command: &str,
+    args: &[String],
+    endpoint: u16,
+) -> Result<(), MatError> {
+    send(store_path, group_id, cluster, command, args, endpoint)?;
     output::emit(json!({
         "group_id": group_id,
         "cluster": cluster,
@@ -213,6 +226,94 @@ pub fn invoke(
         "status": "sent",
         "note": "unacknowledged groupcast; per-device delivery not confirmed",
     }));
+    Ok(())
+}
+
+/// `mat group color-temp` — MoveToColorTemperature を groupcast する
+/// （`mat color-temp` の group 版）。入力 kelvin と換算後 mireds を両方エコーする。
+pub fn color_temp(
+    store_path: &Path,
+    group_id: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    // MoveToColorTemperature の引数は <mireds> <transition> <optionsMask> <optionsOverride>。
+    let args = [
+        mireds.to_string(),
+        transition.to_string(),
+        "0".to_string(),
+        "0".to_string(),
+    ];
+    send(
+        store_path,
+        group_id,
+        "colorcontrol",
+        "move-to-color-temperature",
+        &args,
+        endpoint,
+    )?;
+    output::emit(json!({
+        "group_id": group_id,
+        "cluster": "colorcontrol",
+        "command": "move-to-color-temperature",
+        "kelvin": kelvin,
+        "mireds": mireds,
+        "transition": transition,
+        "endpoint": endpoint,
+        "status": "sent",
+        "note": "unacknowledged groupcast; per-device delivery not confirmed",
+    }));
+    Ok(())
+}
+
+/// `mat group color` — MoveToHueAndSaturation を groupcast する（`mat color` の
+/// group 版）。入力（name / rgb / 度・%）と換算後の 0–254 生値を両方エコーする。
+pub fn color(
+    store_path: &Path,
+    group_id: u16,
+    color: &ResolvedColor,
+    transition: u16,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    // MoveToHueAndSaturation の引数は <hue> <saturation> <transition>
+    // <optionsMask> <optionsOverride>。
+    let args = [
+        color.hue_raw.to_string(),
+        color.sat_raw.to_string(),
+        transition.to_string(),
+        "0".to_string(),
+        "0".to_string(),
+    ];
+    send(
+        store_path,
+        group_id,
+        "colorcontrol",
+        "move-to-hue-and-saturation",
+        &args,
+        endpoint,
+    )?;
+    let mut body = json!({
+        "group_id": group_id,
+        "cluster": "colorcontrol",
+        "command": "move-to-hue-and-saturation",
+        "hue": color.hue,
+        "saturation": color.sat,
+        "hue_raw": color.hue_raw,
+        "saturation_raw": color.sat_raw,
+        "transition": transition,
+        "endpoint": endpoint,
+        "status": "sent",
+        "note": "unacknowledged groupcast; per-device delivery not confirmed",
+    });
+    if let Some(name) = &color.name {
+        body["name"] = json!(name);
+    }
+    if let Some(rgb) = &color.rgb {
+        body["rgb"] = json!(rgb);
+    }
+    output::emit(body);
     Ok(())
 }
 
