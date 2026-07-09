@@ -159,6 +159,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                     name,
                     endpoint,
                     epoch_key,
+                    rebind,
                 } => GroupCommand::Provision {
                     group_id: GroupRef::Id(book.resolve_group(&group_id)?),
                     node_ids: node_ids
@@ -169,6 +170,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                     name,
                     endpoint,
                     epoch_key,
+                    rebind,
                 },
                 GroupCommand::Invoke {
                     group_id,
@@ -337,6 +339,7 @@ mod tests {
                 name: None,
                 endpoint: 1,
                 epoch_key: None,
+                rebind: false,
             },
         };
         match resolve_command(cmd, dir.path()).unwrap() {

@@ -300,6 +300,12 @@ pub enum GroupCommand {
         /// 複数コントローラで同一 wire group を共有する時のみ明示指定する。
         #[arg(long, value_name = "HEX")]
         epoch_key: Option<String>,
+        /// 既存グループの keyset binding を unbind してから bind し直す（既存グループ
+        /// へのノード追加用）。--nodes には既存メンバー全員 + 新規を渡し、--keyset-id
+        /// は既存と同じ値にすること（新規だけ渡すと epoch key が既存メンバーと食い違い
+        /// 届かなくなる）。未 bind の新規グループに付けても安全（冪等）。
+        #[arg(long)]
+        rebind: bool,
     },
 
     /// group へ multicast でコマンドを送る（unacknowledged。"sent" のみ報告）。
