@@ -199,18 +199,30 @@ fn to_op(command: &Command) -> Result<Value, String> {
         Command::Color {
             node_id,
             endpoint,
-            hue,
-            sat,
+            spec,
             transition,
         } => {
             // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み 0–254 値を
-            // 渡し、度 / % は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
-            let (hue_raw, sat_raw) = crate::commands::invoke::resolve_color(*hue, *sat);
-            json!({
+            // 渡し、度 / % / name / rgb は応答エコー用。
+            let c = mat_core::color::resolve_spec(
+                spec.name.as_deref(),
+                spec.rgb.as_deref(),
+                spec.hue,
+                spec.sat,
+            )
+            .map_err(|e| e.detail)?;
+            let mut op = json!({
                 "op": "color", "node_id": node_id.id(), "endpoint": endpoint.id(),
-                "hue_raw": hue_raw, "saturation_raw": sat_raw,
-                "hue": hue, "saturation": sat, "transition": transition,
-            })
+                "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
+                "hue": c.hue, "saturation": c.sat, "transition": transition,
+            });
+            if let Some(name) = &c.name {
+                op["name"] = json!(name);
+            }
+            if let Some(rgb) = &c.rgb {
+                op["rgb"] = json!(rgb);
+            }
+            op
         }
         Command::Group { action } => match action {
             GroupCommand::Provision {
@@ -373,8 +385,12 @@ mod tests {
         let cmd = Command::Color {
             node_id: NodeRef::Id(6),
             endpoint: EndpointRef::Id(1),
-            hue: 330,
-            sat: 80,
+            spec: crate::cli::ColorSpecArgs {
+                name: None,
+                rgb: None,
+                hue: Some(330),
+                sat: Some(80),
+            },
             transition: 30,
         };
         // 換算（330° → 233、80% → 203）は mat 側で行い、度 / % はエコー用に併送する。
@@ -384,6 +400,31 @@ mod tests {
                 "op":"color","node_id":6,"endpoint":1,
                 "hue_raw":233,"saturation_raw":203,
                 "hue":330,"saturation":80,"transition":30
+            })
+        );
+    }
+
+    #[test]
+    fn color_name_op_includes_name_and_rgb_echo() {
+        // resolve 層通過後の形（name あり + 正規化済み rgb）。
+        let cmd = Command::Color {
+            node_id: NodeRef::Id(6),
+            endpoint: EndpointRef::Id(1),
+            spec: crate::cli::ColorSpecArgs {
+                name: Some("red".into()),
+                rgb: Some("#ff0000".into()),
+                hue: None,
+                sat: None,
+            },
+            transition: 0,
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"color","node_id":6,"endpoint":1,
+                "hue_raw":0,"saturation_raw":254,
+                "hue":0,"saturation":100,"transition":0,
+                "name":"red","rgb":"#ff0000"
             })
         );
     }
