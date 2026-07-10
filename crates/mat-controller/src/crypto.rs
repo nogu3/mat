@@ -12,14 +12,24 @@ type Aes128Ccm = Ccm<Aes128, U16, U13>;
 /// MIC (auth tag) length for Matter secured messages.
 pub const MIC_LEN: usize = 16;
 
+/// CCM with a 13-byte nonce (L = 2) caps a single payload at 2^16 - 1 bytes.
+const MAX_CCM_PAYLOAD: usize = 65535;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     AuthFailed,
+    PayloadTooLarge,
 }
 
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "message authentication failed")
+        match self {
+            CryptoError::AuthFailed => write!(f, "message authentication failed"),
+            CryptoError::PayloadTooLarge => write!(
+                f,
+                "payload exceeds AES-CCM limit of {MAX_CCM_PAYLOAD} bytes"
+            ),
+        }
     }
 }
 
@@ -63,7 +73,15 @@ pub fn build_nonce(security_flags: u8, message_counter: u32, source_node_id: u64
     n
 }
 
-pub fn encrypt_payload(key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt_payload(
+    key: &[u8; 16],
+    nonce: &[u8; 13],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    if plaintext.len() > MAX_CCM_PAYLOAD {
+        return Err(CryptoError::PayloadTooLarge);
+    }
     Aes128Ccm::new(key.into())
         .encrypt(
             nonce.into(),
@@ -72,7 +90,7 @@ pub fn encrypt_payload(key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], plaintext: 
                 aad,
             },
         )
-        .expect("ccm encrypt cannot fail for in-memory sizes")
+        .map_err(|_| CryptoError::PayloadTooLarge)
 }
 
 pub fn decrypt_payload(
@@ -81,6 +99,9 @@ pub fn decrypt_payload(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    if ciphertext.len() > MAX_CCM_PAYLOAD + MIC_LEN {
+        return Err(CryptoError::PayloadTooLarge);
+    }
     Aes128Ccm::new(key.into())
         .decrypt(
             nonce.into(),
@@ -99,17 +120,17 @@ pub fn seal_message(
     proto: &ProtocolHeader,
     payload: &[u8],
     session_source_node_id: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, CryptoError> {
     let header_bytes = header.encoded();
     let nonce_node = header.source_node_id.unwrap_or(session_source_node_id);
     let nonce = build_nonce(header.security_flags, header.message_counter, nonce_node);
     let mut plaintext = Vec::with_capacity(payload.len() + 12);
     proto.encode(&mut plaintext);
     plaintext.extend_from_slice(payload);
-    let ct = encrypt_payload(key, &nonce, &header_bytes, &plaintext);
+    let ct = encrypt_payload(key, &nonce, &header_bytes, &plaintext)?;
     let mut out = header_bytes;
     out.extend_from_slice(&ct);
-    out
+    Ok(out)
 }
 
 /// Opens a secured datagram; returns headers and the decrypted app payload.
@@ -150,7 +171,7 @@ mod tests {
     fn roundtrips_payload() {
         let nonce = build_nonce(0, 1, 42);
         let aad = b"header-bytes";
-        let ct = encrypt_payload(&KEY, &nonce, aad, b"hello matter");
+        let ct = encrypt_payload(&KEY, &nonce, aad, b"hello matter").unwrap();
         assert_eq!(ct.len(), b"hello matter".len() + MIC_LEN);
         let pt = decrypt_payload(&KEY, &nonce, aad, &ct).unwrap();
         assert_eq!(pt, b"hello matter");
@@ -159,10 +180,10 @@ mod tests {
     #[test]
     fn rejects_tampered_ciphertext_and_aad() {
         let nonce = build_nonce(0, 1, 42);
-        let mut ct = encrypt_payload(&KEY, &nonce, b"aad", b"payload");
+        let mut ct = encrypt_payload(&KEY, &nonce, b"aad", b"payload").unwrap();
         ct[0] ^= 0x01;
         assert!(decrypt_payload(&KEY, &nonce, b"aad", &ct).is_err());
-        let ct = encrypt_payload(&KEY, &nonce, b"aad", b"payload");
+        let ct = encrypt_payload(&KEY, &nonce, b"aad", b"payload").unwrap();
         assert!(decrypt_payload(&KEY, &nonce, b"AAD", &ct).is_err());
     }
 
@@ -184,7 +205,7 @@ mod tests {
             protocol_id: crate::message::PROTOCOL_ID_INTERACTION_MODEL,
             vendor_id: None,
         };
-        let datagram = seal_message(&KEY, &header, &proto, b"im-payload", 0xAAAA);
+        let datagram = seal_message(&KEY, &header, &proto, b"im-payload", 0xAAAA).unwrap();
         // ヘッダ 8B は平文のまま先頭に載る
         assert_eq!(&datagram[..8], header.encoded().as_slice());
         let (h2, p2, body) = open_message(&KEY, &datagram, 0xAAAA).unwrap();
@@ -193,5 +214,15 @@ mod tests {
         assert_eq!(body, b"im-payload");
         // nonce の node id が違えば開かない
         assert!(open_message(&KEY, &datagram, 0xBBBB).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        let nonce = build_nonce(0, 1, 42);
+        let big = vec![0u8; 65536];
+        assert_eq!(
+            encrypt_payload(&KEY, &nonce, b"", &big),
+            Err(CryptoError::PayloadTooLarge)
+        );
     }
 }
