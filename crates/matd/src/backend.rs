@@ -48,6 +48,9 @@ struct Conn {
     ws: Option<Ws>,
     child: Option<Child>,
     last_used: Instant,
+    /// 連続コマンド失敗数。成功で 0 に戻る。2 に達したら子ごと畳む
+    /// （wedge した chip-tool を温存し続けて永久に timeout し続けるのを防ぐ保険）。
+    failures: u8,
 }
 
 /// 常駐 chip-tool への接続。ws 1 本を Mutex で直列化する（chip-tool は単一接続で
@@ -85,6 +88,7 @@ impl ChipToolBackend {
                 ws: None,
                 child: None,
                 last_used: Instant::now(),
+                failures: 0,
             }),
         };
         // 早期接続。失敗すれば matd 起動を失敗させる。
@@ -104,7 +108,10 @@ impl ChipToolBackend {
     /// chip-tool ws はコマンド完了時に結果メッセージを 1 つ返す。送信自体の失敗は
     /// 「ソケットが送信前から死んでいた」ことを意味する（chip-tool には届いていない）
     /// ので、ws だけ張り直して 1 回だけ透過リトライする — 子プロセスは温存し warm CASE
-    /// セッションを守る（issue #7）。
+    /// セッションを守る（issue #7）。送信後の失敗（受信 timeout・切断・parse）は
+    /// コマンドが実行された可能性があるので再送しない（二重実行防止）。この場合は
+    /// 古い ws を捨てて遅延応答の混線を断つが、子プロセスは温存して warm CASE
+    /// セッションを守る。ただし連続 2 回失敗したら wedge を疑って子ごと畳む（#7）。
     pub async fn run_cmdline(&self, line: &str) -> Result<Value, MatError> {
         let mut conn = self.conn.lock().await;
         self.ensure_connected(&mut conn).await?;
@@ -121,22 +128,41 @@ impl ChipToolBackend {
         match result {
             Ok(mut value) => {
                 conn.last_used = Instant::now();
+                conn.failures = 0;
                 drop_logs(&mut value);
                 Ok(value)
             }
-            Err(e) => {
-                // 接続が壊れた可能性。畳んで次回フル再確立に委ねる。
-                // （Task 2 で受信失敗の温存経路に置き換える）
+            Err(ExchangeError::Send(e)) => {
+                // リトライも送信で失敗。子ごと畳んで次回フル再確立に委ねる。
                 teardown(&mut conn).await;
-                Err(e.into_mat())
+                Err(e)
+            }
+            Err(ExchangeError::AfterSend(e)) => {
+                // 実行された可能性がありリトライしない（二重実行防止）。古い ws は捨てて
+                // 遅延応答の混線を断ち、子は温存して warm CASE を守る。ただし連続 2 回
+                // 失敗したら従来どおり子ごと畳む（wedge からの回復経路）。
+                conn.failures = conn.failures.saturating_add(1);
+                if conn.failures >= 2 {
+                    tracing::warn!(
+                        failures = conn.failures,
+                        "consecutive command failures; tearing down chip-tool session"
+                    );
+                    teardown(&mut conn).await;
+                } else {
+                    conn.ws = None;
+                }
+                Err(e)
             }
         }
     }
 
     /// アイドルが `idle` を超えていればセッションを畳む。reaper から定期的に呼ぶ。
+    /// ws だけ捨てて子を温存した状態（受信失敗後など）でも、子が残っていれば畳む —
+    /// chip-tool は生きている限り CPU を焼き続ける（上流 #29971）ため、reap だけが
+    /// 焼きを止める手段（issue #8）。
     pub async fn reap_if_idle(&self) {
         let mut conn = self.conn.lock().await;
-        if conn.ws.is_some() && conn.last_used.elapsed() >= self.idle {
+        if (conn.ws.is_some() || conn.child.is_some()) && conn.last_used.elapsed() >= self.idle {
             tracing::info!(idle = ?self.idle, "tearing down idle chip-tool session");
             teardown(&mut conn).await;
         }
@@ -233,14 +259,6 @@ enum ExchangeError {
     AfterSend(MatError),
 }
 
-impl ExchangeError {
-    fn into_mat(self) -> MatError {
-        match self {
-            ExchangeError::Send(e) | ExchangeError::AfterSend(e) => e,
-        }
-    }
-}
-
 /// 確立済みの ws で 1 往復する。
 async fn exchange<S>(ws: &mut WebSocketStream<S>, line: &str) -> Result<Value, ExchangeError>
 where
@@ -286,6 +304,7 @@ async fn teardown(conn: &mut Conn) {
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
+    conn.failures = 0;
 }
 
 /// chip-tool を `interactive server` で起動する。

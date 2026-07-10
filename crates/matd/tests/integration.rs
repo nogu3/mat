@@ -820,6 +820,83 @@ async fn spawn_fake_ws_close_after_reply() -> u16 {
     port
 }
 
+/// 受け取ったコマンド行を記録し、`fail_first` 回までは応答せずに接続を閉じる fake ws。
+/// それ以降の接続では普通に応答する。受信失敗（実行されたかもしれない）の再現用。
+async fn spawn_fake_ws_no_reply_then_ok(
+    fail_first: usize,
+) -> (u16, Arc<tokio::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines_log: Arc<tokio::sync::Mutex<Vec<String>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&lines_log);
+    tokio::spawn(async move {
+        let mut conn_no = 0usize;
+        while let Ok((stream, _)) = listener.accept().await {
+            conn_no += 1;
+            // 1 本目は new() の早期接続だが、最初のコマンドはその接続上で走るので
+            // 「接続 n 本目まで失敗」= 「コマンド n 回目まで失敗」に一致する。
+            let fail = conn_no <= fail_first;
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(line) = msg {
+                        log.lock().await.push(line.clone());
+                        if fail {
+                            let _ = ws.close(None).await;
+                            return;
+                        }
+                        let resp =
+                            json!({ "cmd": line, "results": [{ "value": true }], "logs": [] });
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    (port, lines_log)
+}
+
+/// 受信失敗（応答なしで切断）はコマンドを再送しない（toggle 二重実行防止）。
+/// エラーは 1 回返り、次のコマンドは遅延再接続で成功する。
+#[tokio::test]
+async fn recv_failure_is_not_retried_and_recovers_lazily() {
+    let (port, log) = spawn_fake_ws_no_reply_then_ok(1).await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    // 1 回目: fake は受信を記録して応答せず切断 → エラーが返る。
+    let err = backend.run_cmdline("onoff toggle 5 1").await.unwrap_err();
+    assert_eq!(err.kind, mat_core::error::ErrorKind::ChildFailed);
+    // 着信は正確に 1 回 = 再送していない。
+    assert_eq!(log.lock().await.len(), 1);
+
+    // 2 回目: 遅延再接続で成功する。
+    let v = backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert_eq!(v["results"][0]["value"], json!(true));
+    assert_eq!(log.lock().await.len(), 2);
+}
+
+/// 受信失敗で ws だけ捨てた状態でも、アイドル超過の reap はセッションを畳む
+/// （子温存化で「ws=None・子生存」が常態化するため、reap が ws の有無に依存すると
+/// chip-tool の busy-loop（#8）が止まらなくなる）。
+#[tokio::test]
+async fn reap_fires_even_when_ws_already_dropped() {
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_millis(100))
+        .await
+        .unwrap();
+    // 受信失敗 → ws=None（Connect モードなので子は元々無い）。
+    let _ = backend.run_cmdline("onoff on 5 1").await.unwrap_err();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    backend.reap_if_idle().await; // ws=None でも panic せず normally 完走すること
+                                  // reap 後もフル再確立で次のコマンドが通る。
+    let v = backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert_eq!(v["results"][0]["value"], json!(true));
+}
+
 /// サーバ側切断のあと、失敗はあっても 1 回で、次のコマンドは必ず成功する。
 /// 送信失敗として観測されれば透過リトライで 0 回、受信失敗として観測されれば
 /// リトライなしの 1 回（二重実行防止）— どちらのタイミングでも 2 連続失敗はしない。
