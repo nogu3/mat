@@ -13,6 +13,7 @@ use crate::message::{
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
 
 /// MRP retransmission parameters (spec 4.12; defaults follow chip defaults).
+#[derive(Debug, Clone)]
 pub struct MrpConfig {
     pub initial_interval: Duration,
     pub max_retries: u32,
@@ -139,8 +140,9 @@ impl<'t> UnsecuredExchange<'t> {
     }
 
     /// Decodes a datagram and screens it for this exchange. Returns `None`
-    /// for foreign/duplicate/ack-only traffic that the caller should skip
-    /// (duplicates are re-acked here).
+    /// for foreign or duplicate traffic the caller should skip (duplicates
+    /// are re-acked here). Standalone acks pass screening and are returned
+    /// as `Some`; callers filter them by opcode.
     async fn screen(
         &mut self,
         buf: &[u8],

@@ -178,9 +178,9 @@ change can break the parser.
 ### The backend is replaceable (adapter boundary)
 `mat` couples to the backend through **only `mat`'s own JSON schema**.
 
-- **Future candidates:** if parsing becomes too painful, a thin JS shim based on
-  matter.js (structured objects from the start, no C++ build, lightweight); or, to
-  stay pure Rust, a Rust-based controller prototype.
+- Decided (2026-07-10): a from-scratch Rust controller library, crate
+  `mat-controller` in this workspace — see "Phase 5" below for the decision
+  record and milestones.
 - A replacement must be one adapter in the child-runner, with `mat`'s JSON schema
   as the contract. Subcommands and output schema do not change.
 
