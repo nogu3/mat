@@ -521,6 +521,16 @@ Only one `matd` runs per socket: startup takes an exclusive `flock` on
 `<socket>.lock`, so a second launch on the same socket exits `1` with `matd
 already running (lock held at ...)` instead of silently hijacking it.
 
+`matd`'s child `chip-tool interactive server` burns ~100% of one CPU core the
+whole time it is alive — a busy-loop in its websocket service loop (upstream
+[project-chip/connectedhomeip#29971](https://github.com/project-chip/connectedhomeip/issues/29971),
+open since 2023). `matd` keeps the websocket alive with a periodic keepalive
+ping and preserves the warm child across transient socket errors, but the only
+way to stop the CPU burn is to let the idle reaper kill the child. Keep
+`--idle-timeout` moderate (default 300 s; 600–900 s is a reasonable ceiling) —
+do **not** raise it to "practically forever" unless you are happy trading a
+permanently hot core for never paying a cold start.
+
 - Route selection: `--matd` / `MAT_MATD=<truthy>` **force** the matd path
   (connection failure is an error, no fallback). `MAT_MATD=<falsy>`
   (`0`/`false`/`no`/`off`) forces the direct path, no probing. Otherwise
