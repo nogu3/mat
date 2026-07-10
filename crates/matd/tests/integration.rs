@@ -1067,3 +1067,112 @@ async fn server_close_costs_at_most_one_failure() {
         }
     }
 }
+
+/// 受信した ws 制御フレーム（Ping）を記録する fake ws。コマンドには通常応答する。
+async fn spawn_fake_ws_recording_pings() -> (u16, Arc<tokio::sync::Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let pings: Arc<tokio::sync::Mutex<usize>> = Arc::new(tokio::sync::Mutex::new(0));
+    let count = Arc::clone(&pings);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let count = Arc::clone(&count);
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(Ok(msg)) = ws.next().await {
+                    match msg {
+                        Message::Ping(_) => *count.lock().await += 1,
+                        Message::Text(line) => {
+                            let resp =
+                                json!({ "cmd": line, "results": [{ "value": true }], "logs": [] });
+                            ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    (port, pings)
+}
+
+/// keepalive_tick は matd 側から Ping を送って生存トラフィックを作る
+/// （chip-tool の 180 秒無トラフィック PING をそもそも発火させない）。
+#[tokio::test]
+async fn keepalive_tick_sends_ping() {
+    let (port, pings) = spawn_fake_ws_recording_pings().await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    backend.keepalive_tick().await;
+    backend.keepalive_tick().await;
+
+    // fake 側の受信は非同期なので少しだけ待って集計する。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(*pings.lock().await >= 2, "each tick must emit a ws ping");
+    assert!(backend.ws_connected().await);
+}
+
+/// keepalive_tick は切断を先回りで検知し、ws を捨てる（子は Task 3 で温存を担保済み）。
+/// 次のコマンドは遅延再接続で成功する。
+#[tokio::test]
+async fn keepalive_tick_detects_close_and_drops_ws() {
+    // 応答直後に閉じる fake（Task 1 のものを流用）。
+    let port = spawn_fake_ws_close_after_reply().await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    backend.run_cmdline("onoff on 5 1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await; // close がワイヤに乗るのを待つ
+
+    backend.keepalive_tick().await;
+    assert!(
+        !backend.ws_connected().await,
+        "keepalive must detect the close and drop the ws"
+    );
+
+    // 遅延再接続で次のコマンドは成功。
+    let v = backend.run_cmdline("onoff off 5 1").await.unwrap();
+    assert!(v["cmd"].as_str().unwrap().contains("onoff off"));
+}
+
+/// アイドル中に届いた想定外の遅延応答は keepalive_tick がドレインして捨て、
+/// 次のコマンドの応答と混線しない。
+#[tokio::test]
+async fn keepalive_tick_drains_stale_messages() {
+    // 接続直後に応答を勝手に 1 個送る fake。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                let stale = json!({ "cmd": "STALE", "results": [{ "value": false }], "logs": [] });
+                ws.send(Message::Text(stale.to_string())).await.unwrap();
+                // keepalive の Ping など Text 以外の制御フレームは無視して読み続ける
+                // （Text だけに絞ると Ping 受信時に while let が抜けて誤切断してしまう）。
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(line) = msg {
+                        let resp =
+                            json!({ "cmd": line, "results": [{ "value": true }], "logs": [] });
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await; // stale がバッファに届くのを待つ
+    backend.keepalive_tick().await;
+
+    // ドレイン済みなので、次の応答は自分のコマンドのエコーになる。
+    let v = backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert!(
+        v["cmd"].as_str().unwrap().contains("onoff on"),
+        "stale response must not leak"
+    );
+}
