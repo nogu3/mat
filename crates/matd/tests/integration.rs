@@ -1176,3 +1176,41 @@ async fn keepalive_tick_drains_stale_messages() {
         "stale response must not leak"
     );
 }
+
+/// wedge した相手が延々フレームを流し続けても、keepalive_tick はドレイン総量上限で
+/// 打ち切って戻る（Mutex を握り続けて後続コマンドを飢えさせない）。
+#[tokio::test]
+async fn keepalive_tick_bounds_drain_under_sustained_traffic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                loop {
+                    if ws
+                        .send(Message::Text("{\"spam\":true}".to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        }
+    });
+
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(3), backend.keepalive_tick()).await;
+    assert!(
+        done.is_ok(),
+        "keepalive_tick must bound its drain and return"
+    );
+    assert!(
+        backend.ws_connected().await,
+        "sustained traffic is not a disconnect"
+    );
+}
