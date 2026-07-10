@@ -23,6 +23,14 @@
 
 ### Task 1: exchange の送信/受信エラー型分離と送信失敗の透過リトライ
 
+> **実行時訂正（2026-07-10）:** Step 1 の統合テスト `send_failure_is_retried_transparently` は
+> 実測で成立しないことが判明した。サーバ側 close 後の送信は TCP 半クローズのため「成功」し、
+> エラーは受信側（`next_text` の `closed before responding`）で出る — issue #7 の実機エラーが
+> receive 側だったことと整合する。送信失敗の分類は `exchange`/`next_text` をトランスポート
+> generic 化して `tokio::io::duplex`（相手側 drop）で決定論的にユニットテストし、統合側は
+> 「サーバ close 後の失敗は最大 1 回・次は必ず成功」の性質テスト
+> `server_close_costs_at_most_one_failure` に差し替えた。
+
 **Files:**
 - Modify: `crates/matd/src/backend.rs`（`exchange` / `run_cmdline`）
 - Test: `crates/matd/tests/integration.rs`
