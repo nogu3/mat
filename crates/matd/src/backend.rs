@@ -103,6 +103,22 @@ impl ChipToolBackend {
         self.idle
     }
 
+    /// 現在保持している子プロセスの PID。子が居なければ None（Connect モードは常に None）。
+    /// 統合テストが「子が温存されたか / respawn されたか」を PID で検証するのに使う。
+    pub async fn child_pid(&self) -> Option<u32> {
+        self.conn.lock().await.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// ws が確立されているか。統合テストが keepalive の切断検知を検証するのに使う。
+    pub async fn ws_connected(&self) -> bool {
+        self.conn.lock().await.ws.is_some()
+    }
+
+    /// テスト用: ws だけ捨てる（子は触らない）。次のコマンドで遅延再接続される。
+    pub async fn shutdown_ws_for_test(&self) {
+        self.conn.lock().await.ws = None;
+    }
+
     /// コマンド行を送り、最初に返る Text メッセージ（= 実行結果 JSON）を返す。
     ///
     /// chip-tool ws はコマンド完了時に結果メッセージを 1 つ返す。送信自体の失敗は
@@ -181,6 +197,14 @@ impl ChipToolBackend {
         }
         let port = match &self.mode {
             Mode::Spawn { store, port } => {
+                // 子が既に死んでいれば respawn（死んだ子の ws ポートへ STARTUP_TIMEOUT
+                // いっぱい粘って無駄に待つのを防ぐ）。
+                if let Some(child) = conn.child.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        tracing::warn!(%status, "chip-tool child exited; will respawn");
+                        conn.child = None;
+                    }
+                }
                 if conn.child.is_none() {
                     conn.child = Some(spawn_child(store, *port)?);
                 }
