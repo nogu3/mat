@@ -1214,3 +1214,26 @@ async fn keepalive_tick_bounds_drain_under_sustained_traffic() {
         "sustained traffic is not a disconnect"
     );
 }
+
+/// keepalive は last_used を更新しない: tick を繰り返してもアイドル判定は進み、
+/// reap は予定どおりセッションを畳む（#8 の CPU 焼き有限化の前提）。
+#[tokio::test]
+async fn keepalive_does_not_extend_idle_reap() {
+    let port = spawn_fake_ws().await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_millis(200))
+        .await
+        .unwrap();
+    backend.run_cmdline("onoff on 5 1").await.unwrap();
+
+    // アイドル期間中 keepalive を回し続ける。
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        backend.keepalive_tick().await;
+    }
+
+    backend.reap_if_idle().await;
+    assert!(
+        !backend.ws_connected().await,
+        "keepalive must not extend the idle window"
+    );
+}

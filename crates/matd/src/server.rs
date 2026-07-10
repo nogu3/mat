@@ -50,6 +50,20 @@ pub async fn serve(
         })
     };
 
+    // アイドル中も ws を生かす keepalive。chip-tool interactive server は 180 秒
+    // 無トラフィックで ws PING を送り、20 秒で PONG が無いと切断する（issue #7）。
+    // matd はコマンド実行中しか ws を poll しないため、アイドル中はこちらから定期的に
+    // 生存トラフィックを作る。reap とは独立（last_used は更新しない）。
+    let keepalive = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::backend::KEEPALIVE_INTERVAL).await;
+                backend.keepalive_tick().await;
+            }
+        })
+    };
+
     // shutdown op（`matd stop`）で serve ループを抜けるための通知。
     let shutdown = Arc::new(Notify::new());
 
@@ -78,8 +92,9 @@ pub async fn serve(
         }
     }
 
-    // graceful shutdown: reaper を止め、chip-tool セッションを畳み、socket を消す。
+    // graceful shutdown: reaper/keepalive を止め、chip-tool セッションを畳み、socket を消す。
     reaper.abort();
+    keepalive.abort();
     backend.shutdown().await;
     let _ = std::fs::remove_file(socket_path);
     Ok(())

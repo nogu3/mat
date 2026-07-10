@@ -38,8 +38,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// keepalive の周期。chip-tool（libwebsockets）は最終トラフィックの 180 秒後に
 /// 生存確認 PING を送り、20 秒で PONG が無いと切断する（issue #7）。45 秒ごとに
 /// こちらから送信トラフィックを作れば、その 180 秒タイマー自体が発火しない。
-/// serve への配線は Task 5（ここではまだ未使用のため dead_code を抑止）。
-#[allow(dead_code)]
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 /// keepalive_tick の受信ドレイン待ち時間。静かなら即抜ける正常系。
