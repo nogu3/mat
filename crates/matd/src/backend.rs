@@ -100,13 +100,23 @@ impl ChipToolBackend {
 
     /// コマンド行を送り、最初に返る Text メッセージ（= 実行結果 JSON）を返す。
     ///
-    /// chip-tool ws はコマンド完了時に結果メッセージを 1 つ返す。通信に失敗したら
-    /// 壊れた接続を畳み、次回コマンドで再確立する（遅延応答の混線を断つ）。
+    /// chip-tool ws はコマンド完了時に結果メッセージを 1 つ返す。送信自体の失敗は
+    /// 「ソケットが送信前から死んでいた」ことを意味する（chip-tool には届いていない）
+    /// ので、ws だけ張り直して 1 回だけ透過リトライする — 子プロセスは温存し warm CASE
+    /// セッションを守る（issue #7）。
     pub async fn run_cmdline(&self, line: &str) -> Result<Value, MatError> {
         let mut conn = self.conn.lock().await;
         self.ensure_connected(&mut conn).await?;
 
-        let result = exchange(conn.ws.as_mut().expect("ensured above"), line).await;
+        let mut result = exchange(conn.ws.as_mut().expect("ensured above"), line).await;
+
+        if let Err(ExchangeError::Send(e)) = &result {
+            tracing::info!(error = %e.detail, "ws send failed; reconnecting and retrying once");
+            conn.ws = None;
+            self.ensure_connected(&mut conn).await?;
+            result = exchange(conn.ws.as_mut().expect("ensured above"), line).await;
+        }
+
         match result {
             Ok(mut value) => {
                 conn.last_used = Instant::now();
@@ -115,8 +125,9 @@ impl ChipToolBackend {
             }
             Err(e) => {
                 // 接続が壊れた可能性。畳んで次回フル再確立に委ねる。
+                // （Task 2 で受信失敗の温存経路に置き換える）
                 teardown(&mut conn).await;
-                Err(e)
+                Err(e.into_mat())
             }
         }
     }
@@ -210,19 +221,44 @@ fn decode_logs(logs: &Value) -> String {
     out
 }
 
+/// exchange の失敗を送信/受信で区別する。送信失敗はコマンドが chip-tool に届いて
+/// いないことが確定しているので安全に再試行できる。送信後の失敗（timeout・切断・
+/// parse）はコマンドが実行された可能性を排除できない（toggle 等は再送で二重実行に
+/// なる）。
+enum ExchangeError {
+    /// 送信自体が失敗した（chip-tool には届いていない）。
+    Send(MatError),
+    /// 送信後に失敗した（実行された可能性がある）。
+    AfterSend(MatError),
+}
+
+impl ExchangeError {
+    fn into_mat(self) -> MatError {
+        match self {
+            ExchangeError::Send(e) | ExchangeError::AfterSend(e) => e,
+        }
+    }
+}
+
 /// 確立済みの ws で 1 往復する。
-async fn exchange(ws: &mut Ws, line: &str) -> Result<Value, MatError> {
+async fn exchange(ws: &mut Ws, line: &str) -> Result<Value, ExchangeError> {
     ws.send(Message::Text(line.to_string()))
         .await
-        .map_err(|e| MatError::new(ErrorKind::ChildFailed, format!("ws send failed: {e}")))?;
+        .map_err(|e| {
+            ExchangeError::Send(MatError::new(
+                ErrorKind::ChildFailed,
+                format!("ws send failed: {e}"),
+            ))
+        })?;
 
     let text = match tokio::time::timeout(COMMAND_TIMEOUT, next_text(ws)).await {
-        Ok(r) => r?,
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(ExchangeError::AfterSend(e)),
         Err(_) => {
-            return Err(MatError::new(
+            return Err(ExchangeError::AfterSend(MatError::new(
                 ErrorKind::Timeout,
                 format!("no response from chip-tool within {COMMAND_TIMEOUT:?} for: {line}"),
-            ))
+            )))
         }
     };
 
@@ -233,9 +269,9 @@ async fn exchange(ws: &mut Ws, line: &str) -> Result<Value, MatError> {
     tracing::debug!(%text, "chip-tool ws raw response");
 
     serde_json::from_str(&text).map_err(|e| {
-        MatError::parse_error(format!(
+        ExchangeError::AfterSend(MatError::parse_error(format!(
             "chip-tool ws response was not JSON: {e}; body={text}"
-        ))
+        )))
     })
 }
 

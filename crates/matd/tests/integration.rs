@@ -798,3 +798,47 @@ async fn shutdown_op_stops_server() {
     let ended = tokio::time::timeout(Duration::from_secs(5), handle).await;
     assert!(ended.is_ok(), "serve did not shut down after shutdown op");
 }
+
+/// 各コマンドへ応答した直後に接続を閉じる fake ws。matd 側から見ると「次の送信時には
+/// ソケットが死んでいる」状況を毎回作る（issue #7 の決定論的再現形状）。
+/// accept ループは生きているので、張り直せば次のコマンドは通る。
+async fn spawn_fake_ws_close_after_reply() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                if let Some(Ok(Message::Text(line))) = ws.next().await {
+                    let resp = json!({ "cmd": line, "results": [{ "value": true }], "logs": [] });
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    let _ = ws.close(None).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+/// issue #7: ソケットが死んでいても、送信失敗は ws を張り直して透過リトライされ、
+/// 呼び出し側にはエラーが見えない。
+#[tokio::test]
+async fn send_failure_is_retried_transparently() {
+    let port = spawn_fake_ws_close_after_reply().await;
+    let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    // 1 回目は普通に成功し、直後に fake が接続を閉じる。
+    let v1 = backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert_eq!(v1["results"][0]["value"], json!(true));
+
+    // fake の close がワイヤに乗るまで少し待つ（send をエラーにさせるため）。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2 回目: 死んだソケットへの送信 → 内部で張り直して透過リトライ → 成功。
+    let v2 = backend.run_cmdline("onoff off 5 1").await.unwrap();
+    assert_eq!(v2["results"][0]["value"], json!(true));
+    // 応答の混線がないこと（fake は cmd をエコーする）。
+    assert!(v2["cmd"].as_str().unwrap().contains("onoff off"));
+}
