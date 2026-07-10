@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -241,7 +242,10 @@ impl ExchangeError {
 }
 
 /// 確立済みの ws で 1 往復する。
-async fn exchange(ws: &mut Ws, line: &str) -> Result<Value, ExchangeError> {
+async fn exchange<S>(ws: &mut WebSocketStream<S>, line: &str) -> Result<Value, ExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     ws.send(Message::Text(line.to_string()))
         .await
         .map_err(|e| {
@@ -312,7 +316,10 @@ fn spawn_child(store: &Path, port: u16) -> Result<Child, MatError> {
 }
 
 /// 次の Text メッセージを読む。制御フレームは読み飛ばし、Close/切断は ChildFailed。
-async fn next_text(ws: &mut Ws) -> Result<String, MatError> {
+async fn next_text<S>(ws: &mut WebSocketStream<S>) -> Result<String, MatError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(t))) => return Ok(t),
@@ -407,6 +414,22 @@ mod tests {
         let mut v = json!({ "results": [], "logs": ["dis9hcnt"] });
         drop_logs(&mut v);
         assert!(v.get("logs").is_none());
+    }
+
+    #[tokio::test]
+    async fn exchange_classifies_transport_write_failure_as_send() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        // 相手側を先に落とした in-memory ストリーム → write が確実に失敗する。
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        drop(server_io);
+        let mut ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        let result = exchange(&mut ws, "onoff on 5 1").await;
+        let Err(ExchangeError::Send(e)) = result else {
+            panic!("expected ExchangeError::Send for transport write failure");
+        };
+        assert_eq!(e.kind, ErrorKind::ChildFailed);
+        assert!(e.detail.contains("ws send failed"), "got: {}", e.detail);
     }
 
     #[test]

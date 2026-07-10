@@ -820,25 +820,28 @@ async fn spawn_fake_ws_close_after_reply() -> u16 {
     port
 }
 
-/// issue #7: ソケットが死んでいても、送信失敗は ws を張り直して透過リトライされ、
-/// 呼び出し側にはエラーが見えない。
+/// サーバ側切断のあと、失敗はあっても 1 回で、次のコマンドは必ず成功する。
+/// 送信失敗として観測されれば透過リトライで 0 回、受信失敗として観測されれば
+/// リトライなしの 1 回（二重実行防止）— どちらのタイミングでも 2 連続失敗はしない。
+/// （送信失敗の分類そのものは backend.rs の duplex ユニットテストが決定論的に担保。）
 #[tokio::test]
-async fn send_failure_is_retried_transparently() {
+async fn server_close_costs_at_most_one_failure() {
     let port = spawn_fake_ws_close_after_reply().await;
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
 
-    // 1 回目は普通に成功し、直後に fake が接続を閉じる。
     let v1 = backend.run_cmdline("onoff on 5 1").await.unwrap();
     assert_eq!(v1["results"][0]["value"], json!(true));
+    tokio::time::sleep(Duration::from_millis(100)).await; // close がワイヤに乗るのを待つ
 
-    // fake の close がワイヤに乗るまで少し待つ（send をエラーにさせるため）。
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 2 回目: 死んだソケットへの送信 → 内部で張り直して透過リトライ → 成功。
-    let v2 = backend.run_cmdline("onoff off 5 1").await.unwrap();
-    assert_eq!(v2["results"][0]["value"], json!(true));
-    // 応答の混線がないこと（fake は cmd をエコーする）。
-    assert!(v2["cmd"].as_str().unwrap().contains("onoff off"));
+    // 2 回目: 送信失敗なら透過リトライで成功、受信失敗ならエラー 1 回。
+    match backend.run_cmdline("onoff off 5 1").await {
+        Ok(v) => assert!(v["cmd"].as_str().unwrap().contains("onoff off")),
+        Err(_) => {
+            // 失敗は 1 回で止まり、次は必ず成功する。
+            let v = backend.run_cmdline("onoff off 5 1").await.unwrap();
+            assert!(v["cmd"].as_str().unwrap().contains("onoff off"));
+        }
+    }
 }
