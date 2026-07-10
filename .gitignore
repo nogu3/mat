@@ -12,6 +12,9 @@
 # Docker から取り出した chip-tool バイナリ
 /chip-tool
 
+# Docker から取り出した example device バイナリ（Phase 5 開発用）
+/chip-all-clusters-app
+
 # クロスビルド成果物（実機へ scp 用）
 /dist/
 
