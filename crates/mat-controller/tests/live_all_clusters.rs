@@ -4,6 +4,11 @@
 //!   task chip:extract:app
 //!   ./chip-all-clusters-app          # udp/5540 で待ち受け
 //!   task e2e:m1                      # または cargo test ... -- --ignored
+//!
+//! 宛先は `MAT_E2E_PEER`（例: `[fd00::1]:5540`）で差し替え可能。未設定なら
+//! ローカルの `[::1]:5540`。実機（Thread 上の Matter デバイス）にも同じ
+//! テストを向けられる — unsecured の reliable メッセージなので fabric や
+//! 既存セッションには触れない。
 
 use std::time::Duration;
 
@@ -15,10 +20,14 @@ use mat_controller::transport::UdpTransport;
 const OPCODE_CASE_SIGMA1: u8 = 0x30;
 
 #[tokio::test]
-#[ignore = "requires local chip-all-clusters-app on udp/5540"]
+#[ignore = "requires a Matter device on udp/5540 (local chip-all-clusters-app or MAT_E2E_PEER)"]
 async fn reliable_message_gets_acked_by_real_device() {
     let transport = UdpTransport::bind().await.unwrap();
-    let peer = format!("[::1]:{MATTER_PORT}").parse().unwrap();
+    let peer = std::env::var("MAT_E2E_PEER")
+        .unwrap_or_else(|_| format!("[::1]:{MATTER_PORT}"))
+        .parse()
+        .expect("MAT_E2E_PEER must be a socket address like [fd00::1]:5540");
+    eprintln!("peer: {peer}");
     let mut ex = UnsecuredExchange::new(&transport, peer);
 
     // 中身が TLV として不正な Sigma1。デバイスの CASE ハンドラはパースに失敗して
