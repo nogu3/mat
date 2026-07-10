@@ -11,3 +11,6 @@ tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
 ccm = "0.5"
 aes = "0.8"
 getrandom = { workspace = true }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
