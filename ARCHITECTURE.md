@@ -188,10 +188,11 @@ change can break the parser.
 
 ## Design rules (must follow)
 
-1. **Do not speak the protocol directly.** No building TLV, no opening CASE
-   yourself, no multicast routing. Delegate everything to `chip-tool`. If you
-   want to bring this in, that is a backend-replacement discussion, not a change
-   to `mat` itself.
+1. **Protocol code lives only in the backend crate.** TLV, CASE, session
+   crypto, multicast routing — all of it belongs to `mat-controller`
+   (Phase 5) and nowhere else. The `mat` CLI and `matd` command layers
+   never speak the protocol; until Phase 5 lands they delegate everything
+   to `chip-tool`, which remains the production path.
 2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
    it in `mat`'s schema. No human decoration (color, progress, interactive
    prompts).
@@ -390,20 +391,27 @@ key-set-write {"epochKey0":..., "groupKeySetID":77} 5 0`.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
 > because it is not `mat`.
 
-### Phase 5 — native / backend replacement  *(optional)*
-Only if `chip-tool` parsing or build/ship becomes a bottleneck.
-- First candidate: a matter.js shim (structured output, lightweight, no C++ build).
-- Second candidate: a Rust-based controller (Rust purity, but a prototype;
-  groupcast etc. would need our own work).
-- The replacement must be one adapter in the child-runner, with `mat`'s JSON
-  schema as the contract. Subcommands and output schema do not change.
+### Phase 5 — native backend (from-scratch Rust controller)  *(decided 2026-07-10, in progress)*
+Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md`.
+- A from-scratch Rust Matter controller library, crate `mat-controller` in
+  this workspace. First stage is operational-only (CASE initiator, IM
+  read/invoke, group sessions) riding the existing fabric by reading
+  chip-tool's KVS; commissioning stays on chip-tool one-shot. Second stage
+  (PASE / BTP / attestation) removes chip-tool entirely.
+- rust-matc (tom-code/rust-matc, BSD-2) is a reference to read, never to
+  copy.
+- Milestones M1–M6 with independent acceptance criteria; the chip-tool
+  path stays untouched until M4 swaps matd's adapter in-process.
+- The replacement is still one adapter with `mat`'s JSON schema as the
+  contract. Subcommands and output schema do not change.
 
 ---
 
 ## Things we never do
 
-- Implement TLV / CASE / multicast routing inside `mat` (always delegate to
-  `chip-tool`).
+- Implement TLV / CASE / multicast routing inside `mat` or `matd` command
+  layers (protocol code lives only in the `mat-controller` crate; the
+  chip-tool delegation path remains until Phase 5 lands).
 - Hold human names or logical groups in `mat` (out of scope; exception: the
   optional `aliases.toml` name→number map for node / group / endpoint, see
   above — it resolves to numbers before anything reaches chip-tool/matd).

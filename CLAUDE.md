@@ -11,9 +11,10 @@ This file is the short list of constraints you must not break.
 
 ## Design rules (never break)
 
-1. **Do not speak the protocol directly.** No TLV, no CASE, no multicast routing
-   inside `mat`. Delegate everything to `chip-tool`. Wanting to add this is a
-   backend-replacement discussion, not a change to `mat` itself.
+1. **Protocol code lives only in the backend crate.** No TLV, no CASE, no
+   multicast routing inside `mat` / `matd` command layers — that all
+   belongs to the `mat-controller` crate (Phase 5, in progress). Until
+   Phase 5 lands, the production path delegates everything to `chip-tool`.
 2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
    it in `mat`'s schema. No human decoration (color, progress, prompts). Never
    pass `chip-tool` output through unchanged.
@@ -97,7 +98,9 @@ Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
 the current one is fully done (all tests pass, acceptance criteria met). Phases
 0–4 are implemented, real-device E2E included (Phase 4 = `matd`, the resident
 binary with warm CASE sessions; a separate binary in this repo). **Phase 5**
-(native / backend replacement) is optional and not started.
+(native backend: from-scratch Rust controller, crate
+`mat-controller`) is decided and in progress — see
+`docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md`.
 
 ## Development commands
 
