@@ -879,9 +879,139 @@ async fn recv_failure_is_not_retried_and_recovers_lazily() {
     assert_eq!(log.lock().await.len(), 2);
 }
 
-/// 受信失敗で ws だけ捨てた状態でも、アイドル超過の reap はセッションを畳む
-/// （子温存化で「ws=None・子生存」が常態化するため、reap が ws の有無に依存すると
-/// chip-tool の busy-loop（#8）が止まらなくなる）。
+/// Spawn モード検証用の fake chip-tool（寝るだけのシェルスクリプト）を用意し、
+/// MAT_CHIP_TOOL_BIN に設定する。ws は fake サーバが別途待ち受けるので、子は引数を
+/// 無視して寝ていればよい。
+///
+/// env はプロセスグローバルなので、パスは**固定**（temp_dir 直下）・内容は全テスト共通・
+/// 削除しない。これで Spawn モードの複数テストが並行しても互いに無害（同じ値を
+/// set_var し合うだけ）。
+///
+/// `exec` 必須: sh の子として sleep を残すと、子（sh）を kill したとき orphan の
+/// sleep がテストバイナリの stdout パイプを掴んだまま 300 秒生き残り、
+/// `cargo test | ...` のパイプ読み手が EOF を貰えず固まる。
+fn setup_fake_child_bin() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join("matd-test-fake-chip-tool.sh");
+    std::fs::write(&path, "#!/bin/sh\nexec sleep 300\n").unwrap();
+    let mut perm = std::fs::metadata(&path).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&path, perm).unwrap();
+    std::env::set_var("MAT_CHIP_TOOL_BIN", &path);
+    path
+}
+
+/// 受信失敗 1 回では子プロセスを殺さない（warm CASE 温存）。連続 2 回で子ごと畳み、
+/// 子が死んでいたら次の ensure で respawn する。
+///
+/// MAT_CHIP_TOOL_BIN はプロセスグローバルなので、Spawn モードを使うテストはこの 1 本に
+/// まとめる（並行テストとの env 競合を避ける）。
+#[tokio::test]
+async fn spawn_mode_preserves_child_and_respawns_dead_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_fake_child_bin();
+
+    // 1 回だけ応答なし切断 → 以降正常、の fake（Task 2 のものを流用）。
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    let pid1 = backend.child_pid().await.expect("child spawned");
+
+    // 受信失敗 1 回: エラーは返るが子は温存される。
+    let _ = backend.run_cmdline("onoff toggle 5 1").await.unwrap_err();
+    assert_eq!(
+        backend.child_pid().await,
+        Some(pid1),
+        "receive failure must not kill the healthy child"
+    );
+    assert!(!backend.ws_connected().await, "broken ws must be dropped");
+
+    // 次のコマンドは遅延再接続で成功し、失敗カウンタが 0 に戻る。
+    backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert_eq!(backend.child_pid().await, Some(pid1));
+
+    // 子を外から殺す → 次の ensure（ws を落としてから）で respawn される。
+    let kill = std::process::Command::new("kill")
+        .arg(pid1.to_string())
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    tokio::time::sleep(Duration::from_millis(100)).await; // 子の exit を待つ
+    backend.shutdown_ws_for_test().await; // ws だけ落とすヘルパ
+    backend.run_cmdline("onoff on 5 1").await.unwrap();
+    let pid2 = backend.child_pid().await.expect("respawned");
+    assert_ne!(pid2, pid1, "dead child must be respawned");
+}
+
+/// 保険の検証: 受信失敗が 2 連続したら従来どおり子ごと畳む（wedge した chip-tool を
+/// 温存し続けて永久に timeout し続けるのを防ぐ）。
+#[tokio::test]
+async fn two_consecutive_recv_failures_tear_down_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_fake_child_bin();
+
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(2).await;
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    let pid1 = backend.child_pid().await.expect("child spawned");
+
+    // 1 回目の受信失敗: 子は温存。
+    let _ = backend.run_cmdline("onoff on 5 1").await.unwrap_err();
+    assert_eq!(backend.child_pid().await, Some(pid1));
+
+    // 2 回目の受信失敗: 連続 2 回で子ごと teardown。
+    let _ = backend.run_cmdline("onoff on 5 1").await.unwrap_err();
+    assert_eq!(
+        backend.child_pid().await,
+        None,
+        "2nd consecutive failure tears down"
+    );
+
+    // 3 回目: フル再確立（respawn）で成功し、カウンタも 0 に戻っている。
+    backend.run_cmdline("onoff on 5 1").await.unwrap();
+    assert!(backend.child_pid().await.is_some());
+}
+
+/// 受信失敗で ws だけ捨てた「ws=None・子生存」の状態でも、アイドル超過の reap は
+/// 子ごと畳む（chip-tool は生きている限り CPU を焼き続けるため、reap が ws の有無に
+/// 依存すると #8 の焼きが止まらない）。
+#[tokio::test]
+async fn reap_kills_child_even_without_ws() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_fake_child_bin();
+
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_millis(100))
+        .await
+        .unwrap();
+    let pid1 = backend.child_pid().await.expect("child spawned");
+
+    // 受信失敗 → ws=None・子は温存。
+    let _ = backend.run_cmdline("onoff on 5 1").await.unwrap_err();
+    assert_eq!(backend.child_pid().await, Some(pid1));
+    assert!(!backend.ws_connected().await);
+
+    // アイドル超過の reap が子を畳む。
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    backend.reap_if_idle().await;
+    assert_eq!(
+        backend.child_pid().await,
+        None,
+        "idle reap must kill the preserved child"
+    );
+}
+
+/// Connect モードでは ws=None なら reap は何もしない（無害）。子ごと畳む実測は
+/// `reap_kills_child_even_without_ws` が担う。
 #[tokio::test]
 async fn reap_fires_even_when_ws_already_dropped() {
     let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
