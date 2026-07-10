@@ -86,6 +86,22 @@ tasks:
       - 'echo "実機ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 avahi-daemon"'
       - 'echo "実機実行: export MAT_CHIP_TOOL_BIN=~/chip-tool && ~/mat discover"'
 
+  chip:extract:app:
+    desc: chip-all-clusters-app（Phase 5 開発用の相手役デバイス）を Docker でビルドし ./chip-all-clusters-app に取り出す
+    cmds:
+      - docker build --target all-clusters-builder -t mat-all-clusters-builder .
+      - |
+        id=$(docker create mat-all-clusters-builder)
+        docker cp "$id:/work/connectedhomeip/out/all-clusters/chip-all-clusters-app" ./chip-all-clusters-app
+        docker rm "$id"
+      - 'echo "取り出し完了: $PWD/chip-all-clusters-app"'
+      - 'echo "起動: ./chip-all-clusters-app  （udp/5540 で待ち受け。KVS は /tmp/chip_kvs）"'
+
+  e2e:m1:
+    desc: M1 ライブ E2E（先に ./chip-all-clusters-app を起動しておく）
+    cmds:
+      - cargo test -p mat-controller --test live_all_clusters -- --ignored --nocapture
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
