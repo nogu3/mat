@@ -8,6 +8,7 @@ pub mod counter;
 pub mod crypto;
 pub mod exchange;
 pub mod fabric;
+pub mod kvs;
 pub mod message;
 pub mod tlv;
 pub mod transport;

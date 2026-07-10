@@ -10,6 +10,7 @@ description = "From-scratch Matter controller library (Phase 5 backend)"
 tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
 ccm = "0.5"
 aes = "0.8"
+base64ct = { version = "1", features = ["alloc"] }
 getrandom = { workspace = true }
 sha2 = "0.10"
 hkdf = "0.12"
