@@ -90,6 +90,7 @@ pub fn encrypt_payload(
                 aad,
             },
         )
+        // 事前チェック後は到達不能（ccm 0.5 の唯一の失敗はサイズ超過）。保険として残す。
         .map_err(|_| CryptoError::PayloadTooLarge)
 }
 
@@ -114,6 +115,8 @@ pub fn decrypt_payload(
 }
 
 /// Builds a complete secured datagram: plain header || CCM(protocol header || payload).
+/// The `session_source_node_id` is the sender's node id, used in the nonce only when
+/// the header carries no source node id (header wins).
 pub fn seal_message(
     key: &[u8; 16],
     header: &MessageHeader,
@@ -134,6 +137,8 @@ pub fn seal_message(
 }
 
 /// Opens a secured datagram; returns headers and the decrypted app payload.
+/// The `session_source_node_id` is the peer's (sender's) node id, used in the nonce only when
+/// the header carries no source node id (header wins).
 pub fn open_message(
     key: &[u8; 16],
     datagram: &[u8],
@@ -224,5 +229,32 @@ mod tests {
             encrypt_payload(&KEY, &nonce, b"", &big),
             Err(CryptoError::PayloadTooLarge)
         );
+    }
+
+    #[test]
+    fn nonce_prefers_header_source_node_id() {
+        let header = MessageHeader {
+            session_id: 1,
+            security_flags: 0,
+            message_counter: 42,
+            source_node_id: Some(0x1111),
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: 0x01,
+            exchange_id: 2,
+            protocol_id: crate::message::PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        };
+        // seal 側の session 引数と食い違っていても、ヘッダの source node id が
+        // nonce に使われるため、open 側も（別の session 引数で）開ける。
+        let datagram = seal_message(&KEY, &header, &proto, b"payload", 0x2222).unwrap();
+        let (h2, p2, body) = open_message(&KEY, &datagram, 0x3333).unwrap();
+        assert_eq!(h2, header);
+        assert_eq!(p2, proto);
+        assert_eq!(body, b"payload");
     }
 }
