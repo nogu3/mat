@@ -1,0 +1,13 @@
+[package]
+name = "mat-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "From-scratch Matter controller library (Phase 5 backend)"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
+ccm = "0.5"
+aes = "0.8"
+getrandom = { workspace = true }
