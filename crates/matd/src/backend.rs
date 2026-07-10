@@ -35,6 +35,16 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// 子プロセスの ws ポートが開くまで待つ上限（chip-tool 初期化 + mDNS 起動分）。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// keepalive の周期。chip-tool（libwebsockets）は最終トラフィックの 180 秒後に
+/// 生存確認 PING を送り、20 秒で PONG が無いと切断する（issue #7）。45 秒ごとに
+/// こちらから送信トラフィックを作れば、その 180 秒タイマー自体が発火しない。
+/// serve への配線は Task 5（ここではまだ未使用のため dead_code を抑止）。
+#[allow(dead_code)]
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
+
+/// keepalive_tick の受信ドレイン待ち時間。静かなら即抜ける正常系。
+const KEEPALIVE_DRAIN: Duration = Duration::from_millis(100);
+
 /// 接続の張り方。`ControlPersist` 的なアイドル畳み込みの後、再確立の手段が異なる。
 enum Mode {
     /// 子プロセスを起こして繋ぐ。アイドル畳み込み後は起こし直す。
@@ -190,6 +200,26 @@ impl ChipToolBackend {
         teardown(&mut conn).await;
     }
 
+    /// アイドル中の ws 生存維持。matd から Ping を送って生存トラフィックを作り、
+    /// 受信をドレインして切断を先回りで検知する。コマンド実行中（lock 保持中）は
+    /// 何もしない — その間 ws は poll されており tungstenite が PING に自動応答する。
+    ///
+    /// `last_used` は更新しない: keepalive で reap を延命すると chip-tool の
+    /// busy-loop（issue #8）が焼き続けてしまう。切断検知時は ws だけ捨てる
+    /// （子は温存、次コマンドで遅延再接続）。
+    pub async fn keepalive_tick(&self) {
+        let Ok(mut conn) = self.conn.try_lock() else {
+            return; // コマンド実行中。ws は poll されている。
+        };
+        let Some(ws) = conn.ws.as_mut() else {
+            return;
+        };
+        if !ping_and_drain(ws).await {
+            tracing::info!("ws died while idle; dropping ws for lazy reconnect (child kept)");
+            conn.ws = None;
+        }
+    }
+
     /// ws 未確立なら確立する。Spawn は子が無ければ起こしてから繋ぐ。
     async fn ensure_connected(&self, conn: &mut Conn) -> Result<(), MatError> {
         if conn.ws.is_some() {
@@ -319,6 +349,29 @@ where
             "chip-tool ws response was not JSON: {e}; body={text}"
         )))
     })
+}
+
+/// Ping を送り、短時間受信をドレインする。ws がまだ生きていれば true。
+/// ドレインは (a) サーバ側 Ping への Pong 自動返送を tungstenite に行わせる、
+/// (b) アイドル中に届いた想定外の遅延応答を捨てて次コマンドとの混線を断つ、
+/// (c) Close/EOF を先回りで検知する、の 3 役。
+async fn ping_and_drain(ws: &mut Ws) -> bool {
+    if ws.send(Message::Ping(Vec::new())).await.is_err() {
+        return false;
+    }
+    loop {
+        match tokio::time::timeout(KEEPALIVE_DRAIN, ws.next()).await {
+            Err(_) => return true, // 静か = 正常
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => continue,
+            Ok(Some(Ok(Message::Text(t)))) => {
+                tracing::debug!(%t, "dropped unexpected ws message while idle");
+            }
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                tracing::debug!(len = b.len(), "dropped unexpected ws binary while idle");
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => return false,
+        }
+    }
 }
 
 /// セッションを畳む。ws を閉じ、子プロセスがあれば落として待つ。
