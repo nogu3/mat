@@ -1389,6 +1389,13 @@ pub fn open_message(
 
 実装注意: 相互運用の最終検証は M2 の実デバイス CASE で行う（round-trip テストは自己整合のみを保証する）。既知値ベクタは M2 で `chip-all-clusters-app` のログ／実キャプチャから採取して追加する。この前提は plan 末尾の「M1 の既知の限界」にも記載。
 
+> **実行時訂正（2026-07-10 レビュー指摘）**: 上記コードの `encrypt_payload` の
+> `expect("ccm encrypt cannot fail...")` は誤り — ccm 0.5 は 13B nonce（L=2）で
+> payload 65535B 超に `Err` を返す。実装は `encrypt_payload` / `seal_message` を
+> `Result<Vec<u8>, CryptoError>`（`PayloadTooLarge` variant 追加、
+> `MAX_CCM_PAYLOAD = 65535` を文書化）へ変更済み（commit 732d11e）。
+> M2 以降の計画はこのシグネチャを前提にすること。
+
 - [ ] **Step 4: テストが通ることを確認**
 
 Run: `cargo test -p mat-controller crypto`
