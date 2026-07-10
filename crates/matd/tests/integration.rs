@@ -940,7 +940,22 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
         .status()
         .unwrap();
     assert!(kill.success());
-    tokio::time::sleep(Duration::from_millis(100)).await; // 子の exit を待つ
+    // 子の exit を待つ。kill(2) は送出成功しか保証しない。子はこのプロセスの子なので
+    // reap（backend 側の try_wait）までは zombie として残る — /proc の状態が Z になるか
+    // エントリが消えた時点で try_wait が exit を拾える。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid1}/stat")).unwrap_or_default();
+        let dead = stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z");
+        if dead {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid1} did not exit within 5s after kill"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     backend.shutdown_ws_for_test().await; // ws だけ落とすヘルパ
     backend.run_cmdline("onoff on 5 1").await.unwrap();
     let pid2 = backend.child_pid().await.expect("respawned");
