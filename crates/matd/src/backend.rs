@@ -45,6 +45,10 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 /// keepalive_tick の受信ドレイン待ち時間。静かなら即抜ける正常系。
 const KEEPALIVE_DRAIN: Duration = Duration::from_millis(100);
 
+/// keepalive ドレインの総量上限。相手が延々フレームを流し続けても（wedge した
+/// chip-tool 等）ここで打ち切って Mutex を手放す — keepalive がコマンドを飢えさせない。
+const KEEPALIVE_DRAIN_TOTAL: Duration = Duration::from_secs(1);
+
 /// 接続の張り方。`ControlPersist` 的なアイドル畳み込みの後、再確立の手段が異なる。
 enum Mode {
     /// 子プロセスを起こして繋ぐ。アイドル畳み込み後は起こし直す。
@@ -359,8 +363,14 @@ async fn ping_and_drain(ws: &mut Ws) -> bool {
     if ws.send(Message::Ping(Vec::new())).await.is_err() {
         return false;
     }
+    let deadline = Instant::now() + KEEPALIVE_DRAIN_TOTAL;
     loop {
-        match tokio::time::timeout(KEEPALIVE_DRAIN, ws.next()).await {
+        let now = Instant::now();
+        if now >= deadline {
+            return true; // ドレインしきれないほど流れてくる = 接続自体は生きている
+        }
+        let window = KEEPALIVE_DRAIN.min(deadline - now);
+        match tokio::time::timeout(window, ws.next()).await {
             Err(_) => return true, // 静か = 正常
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => continue,
             Ok(Some(Ok(Message::Text(t)))) => {
