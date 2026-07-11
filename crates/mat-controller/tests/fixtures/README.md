@@ -7,4 +7,9 @@ connectedhomeip v1.4.2.0 `src/credentials/tests/CHIPCert_test_vectors.cpp`
 - `*_chip.bin`: Matter TLV 形式 / `*_der.bin`: 同一証明書の X.509 DER 形式
 - `*_pubkey.bin`: P-256 公開鍵 (65B uncompressed) / `*_privkey.bin`: 秘密鍵 (32B)
 
-再抽出手順は `docs/superpowers/plans/2026-07-11-phase5-m2-case-im.md` Task 4 参照。
+`root01_privkey.bin` / `ica01_privkey.bin`（`sTestCert_Root01_PrivateKey` /
+`sTestCert_ICA01_PrivateKey`）は `issue_noc()` のテスト（root による NOC 直接署名）用に
+Phase 5 M2b Task 3 で追加。
+
+再抽出手順は `docs/superpowers/plans/2026-07-11-phase5-m2-case-im.md` Task 4 参照
+（`root01_privkey.bin` / `ica01_privkey.bin` は同じ抽出スクリプトに対象シンボルを追加して実行）。
