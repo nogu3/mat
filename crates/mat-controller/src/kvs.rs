@@ -31,8 +31,14 @@ pub enum KvsError {
     SectionMissing,
     KeyMissing(String),
     BadBase64(String),
-    BadOpKey(&'static str),
-    BadKeyset(&'static str),
+    BadOpKey {
+        fabric_index: u8,
+        reason: &'static str,
+    },
+    BadKeyset {
+        fabric_index: u8,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for KvsError {
@@ -42,11 +48,17 @@ impl std::fmt::Display for KvsError {
             KvsError::SectionMissing => write!(f, "kvs: missing [Default] section"),
             KvsError::KeyMissing(k) => write!(f, "kvs key \"{k}\": missing"),
             KvsError::BadBase64(k) => write!(f, "kvs key \"{k}\": invalid base64"),
-            KvsError::BadOpKey(reason) => {
-                write!(f, "kvs key \"f/<n>/o\": bad op key: {reason}")
+            KvsError::BadOpKey {
+                fabric_index,
+                reason,
+            } => {
+                write!(f, "kvs key \"f/{fabric_index}/o\": bad op key: {reason}")
             }
-            KvsError::BadKeyset(reason) => {
-                write!(f, "kvs key \"f/<n>/k/0\": bad keyset: {reason}")
+            KvsError::BadKeyset {
+                fabric_index,
+                reason,
+            } => {
+                write!(f, "kvs key \"f/{fabric_index}/k/0\": bad keyset: {reason}")
             }
         }
     }
@@ -90,7 +102,9 @@ fn default_section(text: &str) -> Option<&str> {
 /// `=`, both sides trimmed.
 fn lookup<'a>(section: &'a str, key: &str) -> Option<&'a str> {
     for line in section.lines() {
-        let (k, v) = line.split_once('=')?;
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         if k.trim() == key {
             return Some(v.trim());
         }
@@ -99,38 +113,63 @@ fn lookup<'a>(section: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Reads the next TLV element, mapping decode/EOF errors to `BadOpKey`.
-fn next_opkey_el<'a>(r: &mut Reader<'a>) -> Result<Element<'a>, KvsError> {
+fn next_opkey_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a>, KvsError> {
     r.next()
-        .map_err(|_| KvsError::BadOpKey("malformed tlv"))?
-        .ok_or(KvsError::BadOpKey("malformed tlv"))
+        .map_err(|_| KvsError::BadOpKey {
+            fabric_index,
+            reason: "malformed tlv",
+        })?
+        .ok_or(KvsError::BadOpKey {
+            fabric_index,
+            reason: "malformed tlv",
+        })
 }
 
 /// Parses the chip-tool `OperationalKeypair` TLV blob (version + 97-byte
 /// SEC1-uncompressed-pubkey||privkey pair) into its two halves.
-fn parse_opkey(blob: &[u8]) -> Result<([u8; 65], [u8; 32]), KvsError> {
+fn parse_opkey(blob: &[u8], fabric_index: u8) -> Result<([u8; 65], [u8; 32]), KvsError> {
     let mut r = Reader::new(blob);
 
-    let el = next_opkey_el(&mut r)?;
+    let el = next_opkey_el(&mut r, fabric_index)?;
     if el.value != Value::StructStart {
-        return Err(KvsError::BadOpKey("malformed tlv"));
+        return Err(KvsError::BadOpKey {
+            fabric_index,
+            reason: "malformed tlv",
+        });
     }
 
-    let el = next_opkey_el(&mut r)?;
+    let el = next_opkey_el(&mut r, fabric_index)?;
     let version = match (el.tag, el.value) {
         (Tag::Context(0), Value::Uint(v)) => v,
-        _ => return Err(KvsError::BadOpKey("malformed tlv")),
+        _ => {
+            return Err(KvsError::BadOpKey {
+                fabric_index,
+                reason: "malformed tlv",
+            })
+        }
     };
     if version != 1 {
-        return Err(KvsError::BadOpKey("unsupported version"));
+        return Err(KvsError::BadOpKey {
+            fabric_index,
+            reason: "unsupported version",
+        });
     }
 
-    let el = next_opkey_el(&mut r)?;
+    let el = next_opkey_el(&mut r, fabric_index)?;
     let keypair = match (el.tag, el.value) {
         (Tag::Context(1), Value::Bytes(b)) => b,
-        _ => return Err(KvsError::BadOpKey("malformed tlv")),
+        _ => {
+            return Err(KvsError::BadOpKey {
+                fabric_index,
+                reason: "malformed tlv",
+            })
+        }
     };
     if keypair.len() != 97 {
-        return Err(KvsError::BadOpKey("keypair must be 97 bytes"));
+        return Err(KvsError::BadOpKey {
+            fabric_index,
+            reason: "keypair must be 97 bytes",
+        });
     }
 
     let mut pubkey = [0u8; 65];
@@ -141,10 +180,16 @@ fn parse_opkey(blob: &[u8]) -> Result<([u8; 65], [u8; 32]), KvsError> {
 }
 
 /// Reads the next TLV element, mapping decode/EOF errors to `BadKeyset`.
-fn next_keyset_el<'a>(r: &mut Reader<'a>) -> Result<Element<'a>, KvsError> {
+fn next_keyset_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a>, KvsError> {
     r.next()
-        .map_err(|_| KvsError::BadKeyset("malformed tlv"))?
-        .ok_or(KvsError::BadKeyset("malformed tlv"))
+        .map_err(|_| KvsError::BadKeyset {
+            fabric_index,
+            reason: "malformed tlv",
+        })?
+        .ok_or(KvsError::BadKeyset {
+            fabric_index,
+            reason: "malformed tlv",
+        })
 }
 
 /// Skips the remainder of the container currently open at relative depth 0
@@ -152,10 +197,10 @@ fn next_keyset_el<'a>(r: &mut Reader<'a>) -> Result<Element<'a>, KvsError> {
 /// `ContainerEnd` that matches the container we're inside of). Used both to
 /// skip over unknown/uninteresting subtrees and to finish consuming a
 /// container after we've already extracted what we needed from its start.
-fn skip_rest_of_container(r: &mut Reader) -> Result<(), KvsError> {
+fn skip_rest_of_container(r: &mut Reader, fabric_index: u8) -> Result<(), KvsError> {
     let mut depth: i32 = 0;
     loop {
-        let el = next_keyset_el(r)?;
+        let el = next_keyset_el(r, fabric_index)?;
         match el.value {
             Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
             Value::ContainerEnd => {
@@ -171,69 +216,90 @@ fn skip_rest_of_container(r: &mut Reader) -> Result<(), KvsError> {
 
 /// Parses one `GroupKey` struct (start_time / hash / key bytes) from within
 /// the keyset's key array, returning the 16-byte operational key.
-fn parse_key_struct(r: &mut Reader) -> Result<[u8; 16], KvsError> {
-    let el = next_keyset_el(r)?;
+fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<[u8; 16], KvsError> {
+    let el = next_keyset_el(r, fabric_index)?;
     if el.value != Value::StructStart {
-        return Err(KvsError::BadKeyset("malformed tlv"));
+        return Err(KvsError::BadKeyset {
+            fabric_index,
+            reason: "malformed tlv",
+        });
     }
 
     let mut key: Option<[u8; 16]> = None;
     loop {
-        let el = next_keyset_el(r)?;
+        let el = next_keyset_el(r, fabric_index)?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(6), Value::Bytes(b)) => {
                 if b.len() != 16 {
-                    return Err(KvsError::BadKeyset("operational key must be 16 bytes"));
+                    return Err(KvsError::BadKeyset {
+                        fabric_index,
+                        reason: "operational key must be 16 bytes",
+                    });
                 }
                 let mut arr = [0u8; 16];
                 arr.copy_from_slice(b);
                 key = Some(arr);
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_rest_of_container(r)?;
+                skip_rest_of_container(r, fabric_index)?;
             }
             _ => {}
         }
     }
-    key.ok_or(KvsError::BadKeyset("missing operational key"))
+    key.ok_or(KvsError::BadKeyset {
+        fabric_index,
+        reason: "missing operational key",
+    })
 }
 
 /// Parses the chip-tool `KeySet` TLV blob, returning the operational group
 /// key (`ipk_operational`) of the first entry in the key array. `keys_count`
 /// (Context(2)) must be at least 1; unknown tags/containers are skipped.
-fn parse_keyset(blob: &[u8]) -> Result<[u8; 16], KvsError> {
+fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
     let mut r = Reader::new(blob);
 
-    let el = next_keyset_el(&mut r)?;
+    let el = next_keyset_el(&mut r, fabric_index)?;
     if el.value != Value::StructStart {
-        return Err(KvsError::BadKeyset("malformed tlv"));
+        return Err(KvsError::BadKeyset {
+            fabric_index,
+            reason: "malformed tlv",
+        });
     }
 
     let mut keys_count: Option<u64> = None;
     let mut ipk: Option<[u8; 16]> = None;
 
     loop {
-        let el = next_keyset_el(&mut r)?;
+        let el = next_keyset_el(&mut r, fabric_index)?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(2), Value::Uint(v)) => keys_count = Some(v),
             (Tag::Context(3), Value::ArrayStart) => {
-                ipk = Some(parse_key_struct(&mut r)?);
-                skip_rest_of_container(&mut r)?;
+                ipk = Some(parse_key_struct(&mut r, fabric_index)?);
+                skip_rest_of_container(&mut r, fabric_index)?;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_rest_of_container(&mut r)?;
+                skip_rest_of_container(&mut r, fabric_index)?;
             }
             _ => {}
         }
     }
 
-    let keys_count = keys_count.ok_or(KvsError::BadKeyset("missing keys_count"))?;
+    let keys_count = keys_count.ok_or(KvsError::BadKeyset {
+        fabric_index,
+        reason: "missing keys_count",
+    })?;
     if keys_count < 1 {
-        return Err(KvsError::BadKeyset("keys_count must be >= 1"));
+        return Err(KvsError::BadKeyset {
+            fabric_index,
+            reason: "keys_count must be >= 1",
+        });
     }
-    ipk.ok_or(KvsError::BadKeyset("missing key entries"))
+    ipk.ok_or(KvsError::BadKeyset {
+        fabric_index,
+        reason: "missing key entries",
+    })
 }
 
 /// Reads the five fabric credentials chip-tool's CASE implementation needs
@@ -261,8 +327,9 @@ pub fn read_fabric_credentials(
     let rcac = must(format!("f/{fabric_index}/r"))?;
     let icac = get(format!("f/{fabric_index}/i"))?;
     let noc = must(format!("f/{fabric_index}/n"))?;
-    let (op_public_key, op_private_key) = parse_opkey(&must(format!("f/{fabric_index}/o"))?)?;
-    let ipk_operational = parse_keyset(&must(format!("f/{fabric_index}/k/0"))?)?;
+    let (op_public_key, op_private_key) =
+        parse_opkey(&must(format!("f/{fabric_index}/o"))?, fabric_index)?;
+    let ipk_operational = parse_keyset(&must(format!("f/{fabric_index}/k/0"))?, fabric_index)?;
 
     Ok(RawFabricCredentials {
         rcac,
@@ -293,10 +360,14 @@ mod tests {
     }
 
     fn keyset_blob(key: &[u8; 16]) -> Vec<u8> {
+        keyset_blob_with_count(key, 1)
+    }
+
+    fn keyset_blob_with_count(key: &[u8; 16], keys_count: u64) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
         w.put_uint(Tag::Context(1), 0); // policy
-        w.put_uint(Tag::Context(2), 1); // keys_count
+        w.put_uint(Tag::Context(2), keys_count);
         w.start_array(Tag::Context(3));
         for i in 0..3u8 {
             w.start_struct(Tag::Anonymous);
@@ -312,14 +383,17 @@ mod tests {
     }
 
     fn write_ini(entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut body = String::from("[Default]\n");
         for (k, v) in entries {
             body.push_str(&format!("{} = {}\n", k, Base64::encode_string(v)));
         }
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "mat-kvs-test-{}-{}.ini",
+            "mat-kvs-test-{}-{}-{}.ini",
             std::process::id(),
-            entries.len()
+            entries.len(),
+            seq
         ));
         std::fs::write(&path, body).unwrap();
         path
@@ -347,6 +421,33 @@ mod tests {
         assert_eq!(c.op_public_key, PUB);
         assert_eq!(c.op_private_key, PRIV);
         assert_eq!(c.ipk_operational, IPK);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn lookup_skips_lines_without_equals_sign() {
+        let op = opkey_blob(&PUB, &PRIV);
+        let ks = keyset_blob(&IPK);
+        let path = write_ini(&[
+            ("f/1/r", b"rcac-bytes"),
+            ("f/1/n", b"noc-bytes"),
+            ("f/1/o", &op),
+            ("f/1/k/0", &ks),
+        ]);
+        // Inject a blank line and a comment-ish line without '=' between the
+        // [Default] header and the target keys, simulating real chip-tool
+        // ini quirks that must not abort the section scan.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replacen(
+            "[Default]\n",
+            "[Default]\n\n; a comment without an equals sign\n",
+            1,
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let c = read_fabric_credentials(&path, 1).unwrap();
+        assert_eq!(c.rcac, b"rcac-bytes");
+        assert_eq!(c.noc, b"noc-bytes");
         std::fs::remove_file(path).ok();
     }
 
@@ -387,7 +488,10 @@ mod tests {
         ]);
         assert!(matches!(
             read_fabric_credentials(&path, 1).unwrap_err(),
-            KvsError::BadOpKey(_)
+            KvsError::BadOpKey {
+                fabric_index: 1,
+                ..
+            }
         ));
         std::fs::remove_file(&path).ok();
 
@@ -397,6 +501,31 @@ mod tests {
             read_fabric_credentials(&path, 1).unwrap_err(),
             KvsError::BadBase64(_)
         ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn rejects_keyset_with_zero_keys_count() {
+        let op = opkey_blob(&PUB, &PRIV);
+        let ks = keyset_blob_with_count(&IPK, 0);
+        let path = write_ini(&[
+            ("f/1/r", b"r"),
+            ("f/1/n", b"n"),
+            ("f/1/o", &op),
+            ("f/1/k/0", &ks),
+        ]);
+        let err = read_fabric_credentials(&path, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            KvsError::BadKeyset {
+                fabric_index: 1,
+                reason: "keys_count must be >= 1"
+            }
+        ));
+        assert!(
+            err.to_string().contains("f/1/k/0"),
+            "error message should name the failing key: {err}"
+        );
         std::fs::remove_file(path).ok();
     }
 }
