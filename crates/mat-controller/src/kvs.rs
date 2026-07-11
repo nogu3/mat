@@ -366,11 +366,10 @@ pub fn read_fabric_credentials(
     })
 }
 
-/// CA materials chip-tool persists in its "alpha" fabric-admin KVS, needed to
-/// self-issue a NOC without going through chip-tool. `node_id`/`fabric_id`
-/// come from the *main* KVS (the operational identity that would sign the
-/// CSR), while `rcac`/`root_public_key`/`root_private_key` come from the
-/// *alpha* KVS (the CA's own identity).
+/// CA materials chip-tool persists, needed to self-issue a NOC without going
+/// through chip-tool. `root_public_key`/`root_private_key` come from the
+/// *alpha* KVS (the CA's own key pair); `rcac` (root cert, Matter-TLV form),
+/// `ipk_operational`, and `node_id`/`fabric_id` come from the *main* KVS.
 #[derive(Clone)]
 pub struct SelfIssueMaterials {
     pub rcac: Vec<u8>,
@@ -410,12 +409,10 @@ pub fn read_self_issue_materials(
     fabric_index: u8,
     issuer_index: u8,
 ) -> Result<SelfIssueMaterials, KvsError> {
-    // --- alpha ini: CA materials ---
+    // --- alpha ini: root CA key pair ---
     let alpha_text = std::fs::read_to_string(alpha_ini).map_err(KvsError::Io)?;
     let alpha_sec = default_section(&alpha_text).ok_or(KvsError::SectionMissing)?;
-    let rcac_key = format!("ExampleCARootCert{issuer_index}");
     let cakey_key = format!("ExampleOpCredsCAKey{issuer_index}");
-    let rcac = decode_b64(alpha_sec, &rcac_key)?.ok_or(KvsError::KeyMissing(rcac_key))?;
     let ca_key = decode_b64(alpha_sec, &cakey_key)?.ok_or(KvsError::KeyMissing(cakey_key))?;
     if ca_key.len() != 97 {
         return Err(KvsError::BadCaKey(
@@ -425,9 +422,16 @@ pub fn read_self_issue_materials(
     let root_public_key: [u8; 65] = ca_key[..65].try_into().expect("65");
     let root_private_key: [u8; 32] = ca_key[65..].try_into().expect("32");
 
-    // --- main ini: IPK + node id ---
+    // --- main ini: root cert (TLV), IPK, node id ---
     let main_text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
     let main_sec = default_section(&main_text).ok_or(KvsError::SectionMissing)?;
+    // The root cert in operational Matter-TLV form lives in the *main* KVS
+    // fabric table (`f/<idx>/r`). alpha's `ExampleCARootCert<issuer>` is stored
+    // as X.509 DER, which our Matter-TLV cert parser does not accept — read the
+    // TLV form here instead. Both encode the same root key (verified: the
+    // 65-byte pubkey from `ExampleOpCredsCAKey<issuer>` appears in `f/<idx>/r`).
+    let rcac_key = format!("f/{fabric_index}/r");
+    let rcac = decode_b64(main_sec, &rcac_key)?.ok_or(KvsError::KeyMissing(rcac_key))?;
     let ipk_operational = parse_keyset(
         &decode_b64(main_sec, &format!("f/{fabric_index}/k/0"))?
             .ok_or_else(|| KvsError::KeyMissing(format!("f/{fabric_index}/k/0")))?,
@@ -658,16 +662,12 @@ mod tests {
         root_key.extend_from_slice(&[0xBB; 32]); // priv
         let ks = keyset_blob(&[0xCC; 16]); // 既存ヘルパ（Task 2/M2 の keyset_blob 相当）
 
-        let alpha = write_named_ini(
-            "alpha",
-            &[
-                ("ExampleCARootCert0", b"rcac-tlv-bytes"),
-                ("ExampleOpCredsCAKey0", &root_key),
-            ],
-        );
+        let alpha = write_named_ini("alpha", &[("ExampleOpCredsCAKey0", &root_key)]);
         let main = write_named_ini(
             "main",
             &[
+                // root cert (TLV form) は fabric table に入っている
+                ("f/1/r", b"rcac-tlv-bytes"),
                 ("f/1/k/0", &ks),
                 // LocalNodeId 無し → 既定 112233
             ],
@@ -689,16 +689,13 @@ mod tests {
         let mut root_key = vec![0xAA; 65];
         root_key.extend_from_slice(&[0xBB; 32]);
         let ks = keyset_blob(&[0xCC; 16]);
-        let alpha = write_named_ini(
-            "alpha2",
-            &[
-                ("ExampleCARootCert0", b"r"),
-                ("ExampleOpCredsCAKey0", &root_key),
-            ],
-        );
+        let alpha = write_named_ini("alpha2", &[("ExampleOpCredsCAKey0", &root_key)]);
         // LocalNodeId = 0x1122334455667788, u64 LE 8 バイト
         let node_le = 0x1122_3344_5566_7788u64.to_le_bytes();
-        let main = write_named_ini("main2", &[("f/1/k/0", &ks), ("LocalNodeId", &node_le)]);
+        let main = write_named_ini(
+            "main2",
+            &[("f/1/r", b"r"), ("f/1/k/0", &ks), ("LocalNodeId", &node_le)],
+        );
         let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
         assert_eq!(m.node_id, 0x1122_3344_5566_7788);
         std::fs::remove_file(alpha).ok();
