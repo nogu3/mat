@@ -76,6 +76,7 @@ pub struct UnsecuredExchange<'t> {
     source_node_id: u64,
     counter: TxCounter,
     rx_window: RxWindow,
+    last_sent_counter: Option<u32>,
 }
 
 impl<'t> UnsecuredExchange<'t> {
@@ -89,11 +90,17 @@ impl<'t> UnsecuredExchange<'t> {
             source_node_id: u64::from_le_bytes(b[2..10].try_into().expect("8 bytes")),
             counter: TxCounter::new_random(),
             rx_window: RxWindow::new(),
+            last_sent_counter: None,
         }
     }
 
     pub fn exchange_id(&self) -> u16 {
         self.exchange_id
+    }
+
+    /// The message counter used by the most recent `send_reliable` call, if any.
+    pub fn last_sent_counter(&self) -> Option<u32> {
+        self.last_sent_counter
     }
 
     fn build(
@@ -192,6 +199,7 @@ impl<'t> UnsecuredExchange<'t> {
         cfg: &MrpConfig,
     ) -> Result<Option<IncomingMessage>, ExchangeError> {
         let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
+        self.last_sent_counter = Some(our_counter);
         let mut interval = cfg.initial_interval;
         let mut attempts = 0u32;
         loop {
@@ -328,6 +336,7 @@ mod tests {
         let peer = responder.local_addr().unwrap();
         let transport = bind_local().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
+        assert_eq!(ex.last_sent_counter(), None);
 
         let responder_task = tokio::spawn(async move {
             let (h, p, from) = read_msg(&responder).await;
@@ -348,6 +357,7 @@ mod tests {
             .await
             .unwrap();
         assert!(res.is_none());
+        assert!(ex.last_sent_counter().is_some());
         responder_task.await.unwrap();
     }
 

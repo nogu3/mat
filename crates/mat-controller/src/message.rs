@@ -17,6 +17,7 @@ const EXCHANGE_FLAG_VENDOR: u8 = 0x10;
 pub enum MessageError {
     Truncated,
     UnsupportedVersion(u8),
+    ReservedDestination,
 }
 
 impl std::fmt::Display for MessageError {
@@ -24,6 +25,9 @@ impl std::fmt::Display for MessageError {
         match self {
             MessageError::Truncated => write!(f, "message truncated"),
             MessageError::UnsupportedVersion(v) => write!(f, "unsupported message version {v}"),
+            MessageError::ReservedDestination => {
+                write!(f, "reserved destination size in message header")
+            }
         }
     }
 }
@@ -96,6 +100,7 @@ impl MessageHeader {
         let destination = match flags & 0x03 {
             1 => Destination::Node(c.u64()?),
             2 => Destination::Group(c.u16()?),
+            3 => return Err(MessageError::ReservedDestination),
             _ => Destination::None,
         };
         Ok((
@@ -281,6 +286,11 @@ mod tests {
         assert_eq!(
             MessageHeader::decode(&[0x04, 0, 0, 0, 0, 0, 0, 0]),
             Err(MessageError::Truncated)
+        );
+        // DSIZ 予約値 0b11（spec 4.4.1.2 reserved）は拒否
+        assert_eq!(
+            MessageHeader::decode(&[0x03, 0, 0, 0, 0, 0, 0, 0]),
+            Err(MessageError::ReservedDestination)
         );
     }
 

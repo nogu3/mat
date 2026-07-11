@@ -12,5 +12,6 @@ pub mod exchange;
 pub mod fabric;
 pub mod kvs;
 pub mod message;
+pub mod session;
 pub mod tlv;
 pub mod transport;
