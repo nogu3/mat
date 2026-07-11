@@ -18,6 +18,10 @@ pub const ATTR_ON_OFF: u32 = 0x0000;
 pub const CMD_ON_OFF_OFF: u32 = 0x00;
 pub const CMD_ON_OFF_ON: u32 = 0x01;
 pub const CMD_ON_OFF_TOGGLE: u32 = 0x02;
+pub const CLUSTER_COLOR_CONTROL: u32 = 0x0300;
+pub const ATTR_CURRENT_HUE: u32 = 0x0000;
+pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
+pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -346,6 +350,26 @@ fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
         }
         copy_value(w, r, el.tag, el.value)?;
     }
+}
+
+/// CommandFields for colorcontrol MoveToHueAndSaturation (cluster spec
+/// §3.2.11.7): `{0: hue, 1: saturation, 2: transition_time (0.1 s units),
+/// 3: options_mask, 4: options_override}`. Options are fixed to 0 (execute
+/// unconditionally), which is what chip-tool sends by default too.
+pub fn encode_move_to_hue_and_saturation_fields(
+    hue: u8,
+    saturation: u8,
+    transition_time_ds: u16,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(hue));
+    w.put_uint(Tag::Context(1), u64::from(saturation));
+    w.put_uint(Tag::Context(2), u64::from(transition_time_ds));
+    w.put_uint(Tag::Context(3), 0);
+    w.put_uint(Tag::Context(4), 0);
+    w.end_container();
+    w.finish()
 }
 
 /// InvokeRequestMessage (spec §8.9.4) for a single command.
@@ -811,5 +835,38 @@ mod tests {
             decode_status_response(&encode_status_response(0x7E)).unwrap(),
             0x7E
         );
+    }
+
+    #[test]
+    fn move_to_hue_and_saturation_fields_shape() {
+        let fields = encode_move_to_hue_and_saturation_fields(200, 254, 10);
+        let mut r = Reader::new(&fields);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let expect = [
+            (0u8, 200u64), // hue
+            (1, 254),      // saturation
+            (2, 10),       // transition time (0.1s 単位)
+            (3, 0),        // options mask
+            (4, 0),        // options override
+        ];
+        for (tag, val) in expect {
+            let el = r.next().unwrap().unwrap();
+            assert_eq!((el.tag, el.value), (Tag::Context(tag), Value::Uint(val)));
+        }
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd);
+        assert!(r.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn move_fields_splice_into_invoke_request() {
+        // fields_tlv スプライス経路（well-formed 1 要素として受理され panic しない）
+        let fields = encode_move_to_hue_and_saturation_fields(1, 2, 3);
+        let req = encode_invoke_request(
+            1,
+            CLUSTER_COLOR_CONTROL,
+            CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(&fields),
+        );
+        assert!(!req.is_empty());
     }
 }
