@@ -445,6 +445,16 @@ pub fn verify_noc_chain(
     Ok(())
 }
 
+/// True if `matter_epoch_now` falls within `cert`'s `[not_before, not_after]`
+/// validity window (`not_after == 0` means no expiry). `verify_noc_chain`
+/// itself does not check validity — the time source (wall clock vs. some
+/// other reference) is a decision for the CASE call site / M4, not this
+/// module — so callers that need a validity check call this separately.
+pub fn cert_time_valid(cert: &MatterCert, matter_epoch_now: u32) -> bool {
+    matter_epoch_now >= cert.not_before
+        && (cert.not_after == 0 || matter_epoch_now <= cert.not_after)
+}
+
 /// Parse a DN (issuer/subject) TLV list until its `ContainerEnd`.
 fn parse_dn(r: &mut Reader<'_>) -> Result<Vec<DnAttr>, CertError> {
     let mut attrs = Vec::new();
@@ -840,6 +850,32 @@ mod tests {
             let cert = MatterCert::parse(chip).unwrap();
             assert_eq!(cert.to_tlv().as_slice(), chip, "re-encode must byte-match");
         }
+    }
+
+    #[test]
+    fn cert_time_valid_checks_notbefore_notafter_window() {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let noc = issue_noc(&op_pub, 0x1B669, 1, &root, &root_priv, &[0x05]).unwrap();
+
+        // 10-year validity window starting 2021-01-01: valid throughout, i.e.
+        // both endpoints and a point strictly inside are valid.
+        assert!(cert_time_valid(&noc, MATTER_EPOCH_2021));
+        assert!(cert_time_valid(&noc, noc.not_after));
+        assert!(cert_time_valid(
+            &noc,
+            MATTER_EPOCH_2021 + NOC_VALIDITY_SECS / 2 // roughly 2026
+        ));
+        // Before not-before, and past not-after (roughly 2032), are invalid.
+        assert!(!cert_time_valid(&noc, MATTER_EPOCH_2021 - 1));
+        assert!(!cert_time_valid(&noc, noc.not_after + 1));
     }
 
     #[test]

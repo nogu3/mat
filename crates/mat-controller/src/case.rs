@@ -334,7 +334,7 @@ pub(crate) fn derive_session_keys(
 
 /// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
 /// out-of-range case and retries with fresh randomness).
-fn random_p256_secret() -> p256::SecretKey {
+pub(crate) fn random_p256_secret() -> p256::SecretKey {
     loop {
         let mut b = [0u8; 32];
         getrandom::getrandom(&mut b).expect("os rng");
