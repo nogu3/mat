@@ -102,6 +102,11 @@ tasks:
     cmds:
       - cargo test -p mat-controller --test live_all_clusters -- --ignored --nocapture
 
+  e2e:m2:
+    desc: M2b ライブ E2E（自己発行 NOC で CASE + onoff toggle/read。要 ./chip-tool と ./chip-all-clusters-app）
+    cmds:
+      - bash scripts/e2e-m2.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
