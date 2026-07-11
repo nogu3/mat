@@ -56,6 +56,7 @@ pub enum KvsError {
         fabric_index: u8,
         reason: &'static str,
     },
+    BadCaKey(&'static str),
 }
 
 impl std::fmt::Display for KvsError {
@@ -77,6 +78,7 @@ impl std::fmt::Display for KvsError {
             } => {
                 write!(f, "kvs key \"f/{fabric_index}/k/0\": bad keyset: {reason}")
             }
+            KvsError::BadCaKey(reason) => write!(f, "kvs: bad CA key: {reason}"),
         }
     }
 }
@@ -127,6 +129,20 @@ fn lookup<'a>(section: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Looks up `key` in `section` and base64-decodes it. Missing key or an
+/// empty value both map to `None` (chip-tool writes empty values for some
+/// absent-but-present keys); a present, non-empty, unparseable value is a
+/// hard error naming the key.
+fn decode_b64(section: &str, key: &str) -> Result<Option<Vec<u8>>, KvsError> {
+    match lookup(section, key) {
+        None => Ok(None),
+        Some("") => Ok(None),
+        Some(v) => Base64::decode_vec(v)
+            .map(Some)
+            .map_err(|_| KvsError::BadBase64(key.to_string())),
+    }
 }
 
 /// Reads the next TLV element, mapping decode/EOF errors to `BadOpKey`.
@@ -328,15 +344,7 @@ pub fn read_fabric_credentials(
 ) -> Result<RawFabricCredentials, KvsError> {
     let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
     let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let get = |key: String| -> Result<Option<Vec<u8>>, KvsError> {
-        match lookup(section, &key) {
-            None => Ok(None),
-            Some("") => Ok(None),
-            Some(v) => Base64::decode_vec(v)
-                .map(Some)
-                .map_err(|_| KvsError::BadBase64(key)),
-        }
-    };
+    let get = |key: String| -> Result<Option<Vec<u8>>, KvsError> { decode_b64(section, &key) };
     let must = |key: String| -> Result<Vec<u8>, KvsError> {
         get(key.clone())?.ok_or(KvsError::KeyMissing(key))
     };
@@ -355,6 +363,88 @@ pub fn read_fabric_credentials(
         op_public_key,
         op_private_key,
         ipk_operational,
+    })
+}
+
+/// CA materials chip-tool persists in its "alpha" fabric-admin KVS, needed to
+/// self-issue a NOC without going through chip-tool. `node_id`/`fabric_id`
+/// come from the *main* KVS (the operational identity that would sign the
+/// CSR), while `rcac`/`root_public_key`/`root_private_key` come from the
+/// *alpha* KVS (the CA's own identity).
+#[derive(Clone)]
+pub struct SelfIssueMaterials {
+    pub rcac: Vec<u8>,
+    pub root_public_key: [u8; 65],
+    pub root_private_key: [u8; 32],
+    pub ipk_operational: [u8; 16],
+    pub node_id: u64,
+    pub fabric_id: u64,
+}
+
+/// Manual `Debug`: carries the root CA's private key and the fabric's
+/// identity-protection key, both secret. See `RawFabricCredentials`'s `Debug`
+/// impl for the same rationale.
+impl std::fmt::Debug for SelfIssueMaterials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfIssueMaterials")
+            .field("rcac_len", &self.rcac.len())
+            .field("root_public_key_len", &self.root_public_key.len())
+            .field("root_private_key", &"[REDACTED]")
+            .field("ipk_operational", &"[REDACTED]")
+            .field("node_id", &self.node_id)
+            .field("fabric_id", &self.fabric_id)
+            .finish()
+    }
+}
+
+/// chip-tool's `kTestControllerNodeId` (SDK v1.4.2.0): the node id used when
+/// `LocalNodeId` is absent from the main KVS.
+pub const DEFAULT_CONTROLLER_NODE_ID: u64 = 112_233;
+
+/// Reads the CA materials chip-tool persists (root cert + root CA key, from
+/// `alpha_ini`) plus the IPK and controller node id (from `main_ini`) needed
+/// to self-issue a NOC for `fabric_index`, using CA `issuer_index`.
+pub fn read_self_issue_materials(
+    alpha_ini: &Path,
+    main_ini: &Path,
+    fabric_index: u8,
+    issuer_index: u8,
+) -> Result<SelfIssueMaterials, KvsError> {
+    // --- alpha ini: CA materials ---
+    let alpha_text = std::fs::read_to_string(alpha_ini).map_err(KvsError::Io)?;
+    let alpha_sec = default_section(&alpha_text).ok_or(KvsError::SectionMissing)?;
+    let rcac_key = format!("ExampleCARootCert{issuer_index}");
+    let cakey_key = format!("ExampleOpCredsCAKey{issuer_index}");
+    let rcac = decode_b64(alpha_sec, &rcac_key)?.ok_or(KvsError::KeyMissing(rcac_key))?;
+    let ca_key = decode_b64(alpha_sec, &cakey_key)?.ok_or(KvsError::KeyMissing(cakey_key))?;
+    if ca_key.len() != 97 {
+        return Err(KvsError::BadCaKey(
+            "root ca key must be 97 raw bytes (pub65||priv32)",
+        ));
+    }
+    let root_public_key: [u8; 65] = ca_key[..65].try_into().expect("65");
+    let root_private_key: [u8; 32] = ca_key[65..].try_into().expect("32");
+
+    // --- main ini: IPK + node id ---
+    let main_text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let main_sec = default_section(&main_text).ok_or(KvsError::SectionMissing)?;
+    let ipk_operational = parse_keyset(
+        &decode_b64(main_sec, &format!("f/{fabric_index}/k/0"))?
+            .ok_or_else(|| KvsError::KeyMissing(format!("f/{fabric_index}/k/0")))?,
+        fabric_index,
+    )?;
+    let node_id = match decode_b64(main_sec, "LocalNodeId")? {
+        Some(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().expect("8")),
+        _ => DEFAULT_CONTROLLER_NODE_ID,
+    };
+
+    Ok(SelfIssueMaterials {
+        rcac,
+        root_public_key,
+        root_private_key,
+        ipk_operational,
+        node_id,
+        fabric_id: u64::from(fabric_index),
     })
 }
 
@@ -412,6 +502,20 @@ mod tests {
             entries.len(),
             seq
         ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Like `write_ini`, but with a caller-chosen filename tag instead of a
+    /// counter, so two related fixtures (e.g. alpha + main ini) in the same
+    /// test are easy to tell apart in a failure message.
+    fn write_named_ini(tag: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let mut body = String::from("[Default]\n");
+        for (k, v) in entries {
+            body.push_str(&format!("{} = {}\n", k, Base64::encode_string(v)));
+        }
+        let path =
+            std::env::temp_dir().join(format!("mat-kvs-test-{}-{tag}.ini", std::process::id()));
         std::fs::write(&path, body).unwrap();
         path
     }
@@ -544,5 +648,60 @@ mod tests {
             "error message should name the failing key: {err}"
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reads_self_issue_materials() {
+        // root 鍵は生 97B（TLV ラップ無し）
+        let mut root_key = Vec::with_capacity(97);
+        root_key.extend_from_slice(&[0xAA; 65]); // pub
+        root_key.extend_from_slice(&[0xBB; 32]); // priv
+        let ks = keyset_blob(&[0xCC; 16]); // 既存ヘルパ（Task 2/M2 の keyset_blob 相当）
+
+        let alpha = write_named_ini(
+            "alpha",
+            &[
+                ("ExampleCARootCert0", b"rcac-tlv-bytes"),
+                ("ExampleOpCredsCAKey0", &root_key),
+            ],
+        );
+        let main = write_named_ini(
+            "main",
+            &[
+                ("f/1/k/0", &ks),
+                // LocalNodeId 無し → 既定 112233
+            ],
+        );
+
+        let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
+        assert_eq!(m.rcac, b"rcac-tlv-bytes");
+        assert_eq!(m.root_public_key, [0xAA; 65]);
+        assert_eq!(m.root_private_key, [0xBB; 32]);
+        assert_eq!(m.ipk_operational, [0xCC; 16]);
+        assert_eq!(m.node_id, 112233);
+        assert_eq!(m.fabric_id, 1);
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
+    }
+
+    #[test]
+    fn local_node_id_overrides_default() {
+        let mut root_key = vec![0xAA; 65];
+        root_key.extend_from_slice(&[0xBB; 32]);
+        let ks = keyset_blob(&[0xCC; 16]);
+        let alpha = write_named_ini(
+            "alpha2",
+            &[
+                ("ExampleCARootCert0", b"r"),
+                ("ExampleOpCredsCAKey0", &root_key),
+            ],
+        );
+        // LocalNodeId = 0x1122334455667788, u64 LE 8 バイト
+        let node_le = 0x1122_3344_5566_7788u64.to_le_bytes();
+        let main = write_named_ini("main2", &[("f/1/k/0", &ks), ("LocalNodeId", &node_le)]);
+        let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
+        assert_eq!(m.node_id, 0x1122_3344_5566_7788);
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
     }
 }
