@@ -19,6 +19,12 @@ use crate::message::{
 };
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
 
+/// How long to wait for a ReportData/InvokeResponse/StatusResponse after the
+/// request's own reliable send already completed (i.e. the response didn't
+/// piggyback on the ack). Generous relative to MRP's own retry budget since
+/// the device may be doing real work (e.g. actuating a relay) before replying.
+const IM_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The three session keys derived during CASE/PASE (spec §4.7, §4.13).
 pub struct SessionKeys {
     pub i2r: [u8; 16],
@@ -32,6 +38,8 @@ pub enum SessionError {
     Io(std::io::Error),
     Message(MessageError),
     Crypto(CryptoError),
+    Im(crate::im::ImError),
+    UnexpectedOpcode(u8),
 }
 
 impl std::fmt::Display for SessionError {
@@ -41,6 +49,10 @@ impl std::fmt::Display for SessionError {
             SessionError::Io(e) => write!(f, "transport error: {e}"),
             SessionError::Message(e) => write!(f, "peer sent malformed message: {e}"),
             SessionError::Crypto(e) => write!(f, "session crypto error: {e}"),
+            SessionError::Im(e) => write!(f, "interaction model error: {e}"),
+            SessionError::UnexpectedOpcode(op) => {
+                write!(f, "unexpected protocol opcode 0x{op:02X} on secure session")
+            }
         }
     }
 }
@@ -292,6 +304,107 @@ impl<'t> SecureSession<'t> {
             return Ok(msg);
         }
     }
+
+    /// Reads a single attribute over the Interaction Model (spec §8.9.2).
+    /// If the device's ReportData doesn't suppress the response, this also
+    /// sends back the required StatusResponse(SUCCESS) — best-effort: the
+    /// read has already succeeded from our side, so we don't fail it if
+    /// that ack round-trip itself times out.
+    pub async fn read_attribute(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        cfg: &MrpConfig,
+    ) -> Result<crate::im::ImValue, SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+        let req = im::encode_read_request(endpoint, cluster, attribute);
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_READ_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        match msg.proto.opcode {
+            im::OPCODE_REPORT_DATA => {
+                let rd = im::decode_report_data(&msg.payload).map_err(SessionError::Im)?;
+                if !rd.suppress_response {
+                    let ok = im::encode_status_response(0);
+                    let _ = self
+                        .send_reliable(
+                            exchange_id,
+                            im::PROTOCOL_ID_IM,
+                            im::OPCODE_STATUS_RESPONSE,
+                            &ok,
+                            cfg,
+                        )
+                        .await?;
+                }
+                if let Some(status) = rd.status {
+                    return Err(SessionError::Im(ImError::AttributeStatus(status)));
+                }
+                rd.value
+                    .ok_or(SessionError::Im(ImError::Malformed("no value")))
+            }
+            im::OPCODE_STATUS_RESPONSE => {
+                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                Err(SessionError::Im(ImError::StatusResponse(s)))
+            }
+            op => Err(SessionError::UnexpectedOpcode(op)),
+        }
+    }
+
+    /// Invokes a single command over the Interaction Model (spec §8.9.4).
+    pub async fn invoke(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields_tlv: Option<&[u8]>,
+        cfg: &MrpConfig,
+    ) -> Result<crate::im::InvokeOutcome, SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+        let req = im::encode_invoke_request(endpoint, cluster, command, fields_tlv);
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        match msg.proto.opcode {
+            im::OPCODE_INVOKE_RESPONSE => {
+                let outcome = im::decode_invoke_response(&msg.payload).map_err(SessionError::Im)?;
+                if outcome.status != 0 {
+                    return Err(SessionError::Im(ImError::CommandStatus {
+                        status: outcome.status,
+                        cluster_status: outcome.cluster_status,
+                    }));
+                }
+                Ok(outcome)
+            }
+            im::OPCODE_STATUS_RESPONSE => {
+                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                Err(SessionError::Im(ImError::StatusResponse(s)))
+            }
+            op => Err(SessionError::UnexpectedOpcode(op)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +450,7 @@ mod tests {
     /// デバイス→controller のセキュアデータグラムを作る。
     fn device_datagram(
         exchange_id: u16,
+        protocol_id: u16,
         opcode: u8,
         acked: Option<u32>,
         needs_ack: bool,
@@ -356,7 +470,7 @@ mod tests {
             acked_counter: acked,
             opcode,
             exchange_id,
-            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+            protocol_id,
             vendor_id: None,
         };
         seal_message(&R2I, &header, &proto, payload, DEV_NODE).unwrap()
@@ -393,6 +507,7 @@ mod tests {
             assert_eq!(body, b"ping");
             let ack = device_datagram(
                 p.exchange_id,
+                PROTOCOL_ID_SECURE_CHANNEL,
                 OPCODE_MRP_STANDALONE_ACK,
                 Some(h.message_counter),
                 false,
@@ -428,7 +543,15 @@ mod tests {
         let ex = SecureSession::new_exchange_id();
 
         let dev = tokio::spawn(async move {
-            let msg = device_datagram(ex, OPCODE_STATUS_REPORT, None, true, 500, b"report");
+            let msg = device_datagram(
+                ex,
+                PROTOCOL_ID_SECURE_CHANNEL,
+                OPCODE_STATUS_REPORT,
+                None,
+                true,
+                500,
+                b"report",
+            );
             device.send_to(&msg, local).await.unwrap();
             device.send_to(&msg, local).await.unwrap(); // 重複
                                                         // ACK は暗号化されて 2 回返る
@@ -496,6 +619,7 @@ mod tests {
             // exchange 違い（正しく封緘されるが screening で落ちる）
             let other_ex = device_datagram(
                 ex.wrapping_add(1),
+                PROTOCOL_ID_SECURE_CHANNEL,
                 OPCODE_STATUS_REPORT,
                 None,
                 true,
@@ -510,5 +634,202 @@ mod tests {
             Err(SessionError::Timeout)
         ));
         dev.await.unwrap();
+    }
+
+    /// ReportData shaped like Task 8's `im.rs` test fixture: a single
+    /// AttributeReportIB for onoff's `OnOff` bool attribute.
+    fn report_data_payload(value: bool, suppress: bool) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReportIBs
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeData
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), 1);
+        w.put_uint(Tag::Context(3), 6);
+        w.put_uint(Tag::Context(4), 0);
+        w.end_container();
+        w.put_bool(Tag::Context(2), value); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        if suppress {
+            w.put_bool(Tag::Context(4), true);
+        }
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// InvokeResponse shaped like Task 8's `im.rs` test fixture: a single
+    /// successful InvokeResponseIB (status 0, no cluster status).
+    fn invoke_response_success_payload() -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    #[tokio::test]
+    async fn read_attribute_roundtrip() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = bind_local().await;
+        let mut s = SecureSession::new(
+            &transport,
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+            // ack the request while carrying the real ReportData reply.
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                Some(h.message_counter),
+                true,
+                9100,
+                &report_data_payload(true, true), // suppress=true: no StatusResponse expected back
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+
+        let value = s
+            .read_attribute(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::ATTR_ON_OFF,
+                &fast_cfg(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, crate::im::ImValue::Bool(true));
+        dev.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invoke_roundtrip_and_status_response_error() {
+        // Scenario 1: InvokeRequest -> InvokeResponse(status 0) -> Ok.
+        {
+            let device = bind_local().await;
+            let peer = device.local_addr().unwrap();
+            let transport = bind_local().await;
+            let mut s = SecureSession::new(
+                &transport,
+                peer,
+                LOCAL_SID,
+                PEER_SID,
+                keys(),
+                OUR_NODE,
+                DEV_NODE,
+            );
+
+            let dev = tokio::spawn(async move {
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let (n, from) = device.recv_from(&mut buf).await.unwrap();
+                let (h, p, _body) = open_from_controller(&buf[..n]);
+                assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+                assert_eq!(p.opcode, crate::im::OPCODE_INVOKE_REQUEST);
+                let resp = device_datagram(
+                    p.exchange_id,
+                    crate::im::PROTOCOL_ID_IM,
+                    crate::im::OPCODE_INVOKE_RESPONSE,
+                    Some(h.message_counter),
+                    true,
+                    9200,
+                    &invoke_response_success_payload(),
+                );
+                device.send_to(&resp, from).await.unwrap();
+            });
+
+            let out = s
+                .invoke(
+                    1,
+                    crate::im::CLUSTER_ON_OFF,
+                    crate::im::CMD_ON_OFF_TOGGLE,
+                    None,
+                    &fast_cfg(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.status, 0);
+            assert_eq!(out.cluster_status, None);
+            dev.await.unwrap();
+        }
+
+        // Scenario 2: ReadRequest -> StatusResponse(0x7E ACCESS_DENIED) -> Err.
+        {
+            let device = bind_local().await;
+            let peer = device.local_addr().unwrap();
+            let transport = bind_local().await;
+            let mut s = SecureSession::new(
+                &transport,
+                peer,
+                LOCAL_SID,
+                PEER_SID,
+                keys(),
+                OUR_NODE,
+                DEV_NODE,
+            );
+
+            let dev = tokio::spawn(async move {
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let (n, from) = device.recv_from(&mut buf).await.unwrap();
+                let (h, p, _body) = open_from_controller(&buf[..n]);
+                assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+                assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+                let resp = device_datagram(
+                    p.exchange_id,
+                    crate::im::PROTOCOL_ID_IM,
+                    crate::im::OPCODE_STATUS_RESPONSE,
+                    Some(h.message_counter),
+                    true,
+                    9300,
+                    &crate::im::encode_status_response(0x7E),
+                );
+                device.send_to(&resp, from).await.unwrap();
+            });
+
+            let err = s
+                .read_attribute(
+                    1,
+                    crate::im::CLUSTER_ON_OFF,
+                    crate::im::ATTR_ON_OFF,
+                    &fast_cfg(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                SessionError::Im(crate::im::ImError::StatusResponse(0x7E))
+            ));
+            dev.await.unwrap();
+        }
     }
 }

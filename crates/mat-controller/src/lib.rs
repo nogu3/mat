@@ -11,6 +11,7 @@ pub mod counter;
 pub mod crypto;
 pub mod exchange;
 pub mod fabric;
+pub mod im;
 pub mod kvs;
 pub mod message;
 pub mod session;
