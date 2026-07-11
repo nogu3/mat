@@ -39,25 +39,30 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
-async fn read_bool(s: &mut SecureSession<'_>, ep: u16, cfg: &MrpConfig) -> bool {
+async fn read_bool(s: &mut SecureSession<'_>, ep: u16, cfg: &MrpConfig) -> Result<bool, String> {
     match s
         .read_attribute(ep, CLUSTER_ON_OFF, ATTR_ON_OFF, cfg)
         .await
-        .expect("read on-off")
+        .map_err(|e| format!("read on-off: {e}"))?
     {
-        ImValue::Bool(b) => b,
-        v => panic!("on-off not bool: {v:?}"),
+        ImValue::Bool(b) => Ok(b),
+        v => Err(format!("on-off not bool: {v:?}")),
     }
 }
 
-async fn read_color_u8(s: &mut SecureSession<'_>, ep: u16, attr: u32, cfg: &MrpConfig) -> u8 {
+async fn read_color_u8(
+    s: &mut SecureSession<'_>,
+    ep: u16,
+    attr: u32,
+    cfg: &MrpConfig,
+) -> Result<u8, String> {
     match s
         .read_attribute(ep, CLUSTER_COLOR_CONTROL, attr, cfg)
         .await
-        .expect("read colorcontrol attr")
+        .map_err(|e| format!("read colorcontrol attr: {e}"))?
     {
-        ImValue::Uint(v) => u8::try_from(v).expect("u8 attr"),
-        v => panic!("colorcontrol attr not uint: {v:?}"),
+        ImValue::Uint(v) => u8::try_from(v).map_err(|e| format!("u8 attr: {e}")),
+        v => Err(format!("colorcontrol attr not uint: {v:?}")),
     }
 }
 
@@ -125,9 +130,15 @@ async fn fabric_ride_along_onoff_and_color() {
     let mut session = session.expect("CASE establishment failed on all resolved addresses");
 
     // 受け入れ 5/6 の前提状態を先に読み切る（読みのみ、失敗しても実機は無傷）
-    let before = read_bool(&mut session, endpoint, &mrp).await;
-    let hue0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_HUE, &mrp).await;
-    let sat0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_SATURATION, &mrp).await;
+    let before = read_bool(&mut session, endpoint, &mrp)
+        .await
+        .expect("read on-off (pre-mutation)");
+    let hue0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_HUE, &mrp)
+        .await
+        .expect("read current-hue (pre-mutation)");
+    let sat0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_SATURATION, &mrp)
+        .await
+        .expect("read current-saturation (pre-mutation)");
 
     // 受け入れ 5/6 本体: 途中で失敗しても実機を変更したまま panic しないよう
     // Result で返す。復元は呼び出し側で best-effort に必ず行う。
@@ -167,7 +178,7 @@ async fn exercise(
         .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
         .map_err(|e| format!("toggle 1: {e}"))?;
-    let after1 = read_bool(session, endpoint, mrp).await;
+    let after1 = read_bool(session, endpoint, mrp).await?;
     if after1 == before {
         return Err(format!(
             "toggle must flip on-off: expected {}, got {after1}",
@@ -178,7 +189,7 @@ async fn exercise(
         .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
         .map_err(|e| format!("toggle 2: {e}"))?;
-    let after2 = read_bool(session, endpoint, mrp).await;
+    let after2 = read_bool(session, endpoint, mrp).await?;
     if after2 != before {
         return Err(format!(
             "second toggle must restore on-off: expected {before}, got {after2}"
@@ -193,7 +204,7 @@ async fn exercise(
             .await
             .map_err(|e| format!("on for color: {e}"))?;
     }
-    let hue0 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await;
+    let hue0 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await?;
     // CurrentHue は 0..=254 の円環。確実に離れた目標を選ぶ。
     let target_hue = ((u16::from(hue0) + 80) % 254) as u8;
     let fields = encode_move_to_hue_and_saturation_fields(target_hue, 200, 0);
@@ -209,7 +220,7 @@ async fn exercise(
         .map_err(|e| format!("move-to-hue-and-saturation: {e}"))?;
     // transition 0 でも装置内の属性反映に猶予を置く
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let hue1 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await;
+    let hue1 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await?;
     let d = (i32::from(hue1) - i32::from(target_hue)).abs();
     let d = d.min(254 - d); // 円環距離
     if d > 8 {
