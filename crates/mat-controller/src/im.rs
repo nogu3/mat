@@ -170,7 +170,11 @@ fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> {
                     let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
                     match (e2.tag, e2.value) {
                         (_, Value::ContainerEnd) => break,
-                        (Tag::Context(0), Value::Uint(v)) => status = Some(v as u8),
+                        (Tag::Context(0), Value::Uint(v)) => {
+                            status = Some(u8::try_from(v).map_err(|_| {
+                                ImError::Malformed("attribute status code out of range")
+                            })?);
+                        }
                         (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                             skip_container(r)?;
                         }
@@ -384,8 +388,18 @@ fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
         let el = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Uint(v)) => status = Some(v as u8),
-            (Tag::Context(1), Value::Uint(v)) => cluster_status = Some(v as u8),
+            (Tag::Context(0), Value::Uint(v)) => {
+                status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("command status code out of range"))?,
+                );
+            }
+            (Tag::Context(1), Value::Uint(v)) => {
+                cluster_status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("cluster status code out of range"))?,
+                );
+            }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(r)?;
             }
@@ -523,7 +537,12 @@ pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
             .ok_or(ImError::Malformed("truncated status response"))?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Uint(v)) => status = Some(v as u8),
+            (Tag::Context(0), Value::Uint(v)) => {
+                status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("status response code out of range"))?,
+                );
+            }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
             }
@@ -687,6 +706,63 @@ mod tests {
         let out = decode_invoke_response(&w.finish()).unwrap();
         assert_eq!(out.status, 0);
         assert_eq!(out.cluster_status, None);
+    }
+
+    #[test]
+    fn decodes_invoke_response_nonzero_status_with_cluster_status() {
+        // CommandStatusIB carrying StatusIB{0: 0x81 UNSUPPORTED_COMMAND, 1: 0x42}.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0x81);
+        w.put_uint(Tag::Context(1), 0x42);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let out = decode_invoke_response(&w.finish()).unwrap();
+        assert_eq!(out.status, 0x81);
+        assert_eq!(out.cluster_status, Some(0x42));
+    }
+
+    #[test]
+    fn encode_invoke_request_splices_fields_tlv() {
+        // A one-field CommandFields struct: { 0: 128 }.
+        let mut fw = Writer::new();
+        fw.start_struct(Tag::Anonymous);
+        fw.put_uint(Tag::Context(0), 128);
+        fw.end_container();
+        let fields = fw.finish();
+
+        let buf = encode_invoke_request(1, CLUSTER_ON_OFF, CMD_ON_OFF_ON, Some(&fields));
+        let mut r = Reader::new(&buf);
+        let mut els = Vec::new();
+        while let Some(e) = r.next().unwrap() {
+            els.push(e);
+        }
+        // struct{ 0: false, 1: false, 2: array[ struct{ 0: list{1,6,1}, <fields> } ], 255: 12 }
+        assert_eq!(els[4].value, Value::StructStart); // CommandDataIB
+        assert_eq!(els[5].value, Value::ListStart); // CommandPath
+        assert_eq!(els[9].value, Value::ContainerEnd); // end of CommandPath list
+                                                       // The spliced fields struct, retagged to Context(1) inside CommandDataIB.
+        assert_eq!(
+            (els[10].tag, els[10].value),
+            (Tag::Context(1), Value::StructStart)
+        );
+        assert_eq!(
+            (els[11].tag, els[11].value),
+            (Tag::Context(0), Value::Uint(128))
+        );
+        assert_eq!(els[12].value, Value::ContainerEnd); // end of fields struct
+        assert_eq!(els[13].value, Value::ContainerEnd); // end of CommandDataIB
     }
 
     #[test]
