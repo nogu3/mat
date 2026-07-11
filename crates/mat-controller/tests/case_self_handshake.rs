@@ -67,7 +67,6 @@ const NODE01_NOC: &[u8] = include_bytes!("fixtures/node01_01_chip.bin");
 const NODE01_PRIV: &[u8] = include_bytes!("fixtures/node01_01_privkey.bin");
 const ICA01: &[u8] = include_bytes!("fixtures/ica01_chip.bin");
 const ROOT01_CHIP: &[u8] = include_bytes!("fixtures/root01_chip.bin");
-const ROOT01_PUB: &[u8] = include_bytes!("fixtures/root01_pubkey.bin");
 const ROOT01_PRIV: &[u8] = include_bytes!("fixtures/root01_privkey.bin");
 
 fn fast_cfg() -> MrpConfig {
@@ -341,7 +340,6 @@ async fn case_establishes_and_reads_over_loopback() {
     // Initiator: fresh self-issued NOC under root01, same IPK and fabric id.
     let materials = SelfIssueMaterials {
         rcac: ROOT01_CHIP.to_vec(),
-        root_public_key: ROOT01_PUB.try_into().unwrap(),
         root_private_key: ROOT01_PRIV.try_into().unwrap(),
         ipk_operational: IPK,
         node_id: INITIATOR_NODE_ID,

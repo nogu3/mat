@@ -367,13 +367,13 @@ pub fn read_fabric_credentials(
 }
 
 /// CA materials chip-tool persists, needed to self-issue a NOC without going
-/// through chip-tool. `root_public_key`/`root_private_key` come from the
-/// *alpha* KVS (the CA's own key pair); `rcac` (root cert, Matter-TLV form),
-/// `ipk_operational`, and `node_id`/`fabric_id` come from the *main* KVS.
+/// through chip-tool. `root_private_key` comes from the *alpha* KVS (the CA's
+/// own key pair); `rcac` (root cert, Matter-TLV form — its parsed public key is
+/// the root public key), `ipk_operational`, and `node_id`/`fabric_id` come from
+/// the *main* KVS.
 #[derive(Clone)]
 pub struct SelfIssueMaterials {
     pub rcac: Vec<u8>,
-    pub root_public_key: [u8; 65],
     pub root_private_key: [u8; 32],
     pub ipk_operational: [u8; 16],
     pub node_id: u64,
@@ -387,7 +387,6 @@ impl std::fmt::Debug for SelfIssueMaterials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SelfIssueMaterials")
             .field("rcac_len", &self.rcac.len())
-            .field("root_public_key_len", &self.root_public_key.len())
             .field("root_private_key", &"[REDACTED]")
             .field("ipk_operational", &"[REDACTED]")
             .field("node_id", &self.node_id)
@@ -419,7 +418,8 @@ pub fn read_self_issue_materials(
             "root ca key must be 97 raw bytes (pub65||priv32)",
         ));
     }
-    let root_public_key: [u8; 65] = ca_key[..65].try_into().expect("65");
+    // Only the private half is needed; the root public key is taken from the
+    // parsed RCAC (single source of truth for `case_destination_id`).
     let root_private_key: [u8; 32] = ca_key[65..].try_into().expect("32");
 
     // --- main ini: root cert (TLV), IPK, node id ---
@@ -444,7 +444,6 @@ pub fn read_self_issue_materials(
 
     Ok(SelfIssueMaterials {
         rcac,
-        root_public_key,
         root_private_key,
         ipk_operational,
         node_id,
@@ -675,7 +674,6 @@ mod tests {
 
         let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
         assert_eq!(m.rcac, b"rcac-tlv-bytes");
-        assert_eq!(m.root_public_key, [0xAA; 65]);
         assert_eq!(m.root_private_key, [0xBB; 32]);
         assert_eq!(m.ipk_operational, [0xCC; 16]);
         assert_eq!(m.node_id, 112233);
