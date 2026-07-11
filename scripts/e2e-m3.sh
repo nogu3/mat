@@ -42,7 +42,8 @@ if [ -z "${MAT_E2E_IFACE}" ] && [ -z "${MAT_E2E_PEER}" ]; then
   MAT_E2E_IFACE=$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
   echo "auto-detected iface: ${MAT_E2E_IFACE}"
 fi
-export MAT_E2E_KVS_DIR MAT_E2E_IFACE
+export MAT_E2E_KVS_DIR
+[ -n "${MAT_E2E_IFACE}" ] && export MAT_E2E_IFACE || unset MAT_E2E_IFACE
 [ -n "${MAT_E2E_PEER}" ] && export MAT_E2E_PEER || unset MAT_E2E_PEER
 exec /tmp/live_jarvis --ignored --nocapture
 EOF
