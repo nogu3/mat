@@ -107,6 +107,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m2.sh
 
+  e2e:m3:
+    desc: M3 ライブ E2E（jarvis 相乗り。要 MAT_E2E_HOST / MAT_E2E_NODE_ID。実機で onoff+色変更）
+    cmds:
+      - bash scripts/e2e-m3.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
