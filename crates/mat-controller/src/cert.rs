@@ -17,6 +17,73 @@ pub fn subject_key_id(public_key: &[u8; 65]) -> [u8; 20] {
     Sha1::digest(public_key).into()
 }
 
+/// Matter epoch (seconds since 2000-01-01T00:00:00Z) for 2021-01-01T00:00:00Z.
+pub const MATTER_EPOCH_2021: u32 = 662_688_000;
+/// NOC validity period: 10 years.
+pub const NOC_VALIDITY_SECS: u32 = 315_360_000;
+
+// EKU (Matter TLV enum values): serverAuth=1, clientAuth=2. NOC uses client, server.
+const EKU_CLIENT_AUTH: u64 = 2;
+const EKU_SERVER_AUTH: u64 = 1;
+const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 0x0001;
+
+/// Build and sign a NOC (2-cert chain: signed directly by `issuer`, no ICAC).
+/// `issuer` is the RCAC (self-signed root); `issuer_private_key` its op key.
+pub fn issue_noc(
+    op_public_key: &[u8; 65],
+    node_id: u64,
+    fabric_id: u64,
+    issuer: &MatterCert,
+    issuer_private_key: &[u8; 32],
+    serial: &[u8],
+) -> Result<MatterCert, CertError> {
+    // 発行者(root)の SubjectKeyId を AKID に使う
+    let issuer_skid = issuer
+        .extensions
+        .iter()
+        .find_map(|e| match e {
+            CertExtension::SubjectKeyId(id) => Some(id.clone()),
+            _ => None,
+        })
+        .ok_or(CertError::Malformed("issuer has no subject key id"))?;
+
+    let extensions = vec![
+        CertExtension::BasicConstraints {
+            is_ca: false,
+            path_len: None,
+        },
+        CertExtension::KeyUsage(KEY_USAGE_DIGITAL_SIGNATURE),
+        CertExtension::ExtendedKeyUsage(vec![EKU_CLIENT_AUTH, EKU_SERVER_AUTH]),
+        CertExtension::SubjectKeyId(subject_key_id(op_public_key).to_vec()),
+        CertExtension::AuthorityKeyId(issuer_skid),
+    ];
+
+    let mut noc = MatterCert {
+        serial: serial.to_vec(),
+        issuer: issuer.subject.clone(),
+        not_before: MATTER_EPOCH_2021,
+        not_after: MATTER_EPOCH_2021.saturating_add(NOC_VALIDITY_SECS),
+        subject: vec![
+            DnAttr {
+                tlv_tag: 17,
+                value: DnValue::MatterId(node_id),
+            },
+            DnAttr {
+                tlv_tag: 21,
+                value: DnValue::MatterId(fabric_id),
+            },
+        ],
+        pub_key: *op_public_key,
+        extensions,
+        signature: [0u8; 64], // TBS 署名で埋める
+    };
+
+    let tbs = noc.tbs_der()?;
+    noc.signature = crate::crypto::sign_ecdsa_p256(issuer_private_key, &tbs)
+        .map_err(|_| CertError::BadSignature)?;
+    Ok(noc)
+}
+
 // --- Pre-computed OID constants (DER bytes, tag 0x06 included) ---
 
 const OID_ECDSA_WITH_SHA256: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
@@ -773,5 +840,66 @@ mod tests {
             let cert = MatterCert::parse(chip).unwrap();
             assert_eq!(cert.to_tlv().as_slice(), chip, "re-encode must byte-match");
         }
+    }
+
+    #[test]
+    fn issue_noc_produces_chain_valid_cert() {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        // 我々の operational 鍵ペア（テストではフィクスチャの node 鍵を流用）
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+
+        let noc = issue_noc(
+            &op_pub,
+            0x1B669,
+            1,
+            &root,
+            &root_priv,
+            &[0x01, 0x02, 0x03, 0x04],
+        )
+        .unwrap();
+
+        // subject に node/fabric id が入っている
+        assert_eq!(noc.node_id(), Some(0x1B669));
+        assert_eq!(noc.fabric_id(), Some(1));
+        // pub key は渡したもの
+        assert_eq!(noc.pub_key, op_pub);
+        // root で署名検証が通る（DER TBS への署名が正しい）
+        noc.verify_signed_by(&root.pub_key).unwrap();
+        // ICAC 無しのチェーン検証が通る（root 直署名）
+        verify_noc_chain(&noc, None, &root).unwrap();
+        // NOC 拡張: BasicConstraints(false) / KeyUsage(digitalSignature) / EKU(client,server) / SKID / AKID
+        assert!(noc.extensions.iter().any(|e| matches!(
+            e,
+            CertExtension::BasicConstraints {
+                is_ca: false,
+                path_len: None
+            }
+        )));
+        assert!(noc
+            .extensions
+            .iter()
+            .any(|e| matches!(e, CertExtension::KeyUsage(0x0001))));
+        // SKID = SHA1(op_pub), AKID = root の SKID
+        let root_skid = root.extensions.iter().find_map(|e| match e {
+            CertExtension::SubjectKeyId(id) => Some(id.clone()),
+            _ => None,
+        });
+        assert!(noc.extensions.iter().any(|e| matches!(
+            e, CertExtension::SubjectKeyId(id) if id.as_slice() == subject_key_id(&op_pub)
+        )));
+        assert!(noc.extensions.iter().any(|e| matches!(
+            e, CertExtension::AuthorityKeyId(id) if root_skid.as_deref() == Some(id.as_slice())
+        )));
+        // TLV に書き出して再パースしても等価
+        let reparsed = MatterCert::parse(&noc.to_tlv()).unwrap();
+        assert_eq!(reparsed.node_id(), Some(0x1B669));
+        reparsed.verify_signed_by(&root.pub_key).unwrap();
     }
 }
