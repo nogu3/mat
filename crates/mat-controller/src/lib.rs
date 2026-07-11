@@ -9,6 +9,7 @@ pub mod case;
 pub mod cert;
 pub mod counter;
 pub mod crypto;
+pub mod dnssd;
 pub mod exchange;
 pub mod fabric;
 pub mod im;
