@@ -198,7 +198,9 @@ impl FabricCredentials {
             ipk_operational: m.ipk_operational,
             node_id: m.node_id,
             fabric_id: m.fabric_id,
-            root_public_key: m.root_public_key,
+            // Single source of truth: the anchor cert we verified the chain
+            // against (equals the CA key's public half).
+            root_public_key: rcac.pub_key,
         })
     }
 }
@@ -291,7 +293,6 @@ mod tests {
             .unwrap();
         let m = crate::kvs::SelfIssueMaterials {
             rcac,
-            root_public_key: root_pub,
             root_private_key: root_priv,
             ipk_operational: [0xCC; 16],
             node_id: 0x1B669,
