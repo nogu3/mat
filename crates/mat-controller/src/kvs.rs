@@ -13,7 +13,7 @@ use crate::tlv::{Element, Reader, Tag, Value};
 
 /// Fabric credentials read from chip-tool's ini KVS, still in raw form
 /// (opaque certs, unparsed keys) as CASE needs them.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RawFabricCredentials {
     pub rcac: Vec<u8>,
     pub icac: Option<Vec<u8>>,
@@ -21,6 +21,23 @@ pub struct RawFabricCredentials {
     pub op_public_key: [u8; 65],
     pub op_private_key: [u8; 32],
     pub ipk_operational: [u8; 16],
+}
+
+/// Manual `Debug`: this struct carries the operational private key and the
+/// fabric's identity-protection key, both secret. Never derive `Debug` here
+/// again — certs/keys are logged incidentally via `{:?}` (error contexts,
+/// test failure output, etc.) and this repo is public.
+impl std::fmt::Debug for RawFabricCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawFabricCredentials")
+            .field("rcac_len", &self.rcac.len())
+            .field("icac_len", &self.icac.as_ref().map(Vec::len))
+            .field("noc_len", &self.noc.len())
+            .field("op_public_key_len", &self.op_public_key.len())
+            .field("op_private_key", &"[REDACTED]")
+            .field("ipk_operational", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// KVS read/parse error. `Display` names the offending key and reason so an

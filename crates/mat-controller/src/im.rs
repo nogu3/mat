@@ -277,6 +277,13 @@ pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
                     }
                 }
             }
+            (Tag::Context(3), Value::Bool(true)) => {
+                // MoreChunkedMessages: M2 has no chunk-reassembly support, so
+                // silently returning the first chunk's partial data would be
+                // wrong — the caller would see a "successful" read that is
+                // actually incomplete.
+                return Err(ImError::Malformed("chunked report data unsupported"));
+            }
             (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
@@ -654,6 +661,35 @@ mod tests {
         let rd = decode_report_data(&w.finish()).unwrap();
         assert_eq!(rd.status, Some(0x86));
         assert_eq!(rd.value, None);
+    }
+
+    #[test]
+    fn decode_report_data_rejects_more_chunked_messages() {
+        // ReportDataMessage の MoreChunkedMessages (tag 3) = true: M2 は
+        // チャンク再構成をサポートしないので、部分データを黙って返しては
+        // ならない。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReportIBs
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeData
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), 1);
+        w.put_uint(Tag::Context(3), 6);
+        w.put_uint(Tag::Context(4), 0);
+        w.end_container();
+        w.put_bool(Tag::Context(2), true); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages = true
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        assert_eq!(
+            decode_report_data(&w.finish()),
+            Err(ImError::Malformed("chunked report data unsupported"))
+        );
     }
 
     #[test]

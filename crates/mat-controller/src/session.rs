@@ -126,10 +126,18 @@ impl<'t> SecureSession<'t> {
 
     /// Seals a message for the peer; returns the datagram and the plaintext
     /// message counter used (so callers can match it against an ack).
+    ///
+    /// `initiator` marks our role on `exchange_id`. Our own requests always
+    /// carry `true` (we are always the exchange initiator in M2). Standalone
+    /// acks may need `false`: when acking a message on an exchange the
+    /// *device* initiated (e.g. a device-initiated secured StatusReport), we
+    /// are the non-initiator of that exchange, and the peer can only match
+    /// our ack if it carries that role correctly.
     #[allow(clippy::too_many_arguments)]
     fn seal(
         &mut self,
         exchange_id: u16,
+        initiator: bool,
         protocol_id: u16,
         opcode: u8,
         needs_ack: bool,
@@ -145,7 +153,7 @@ impl<'t> SecureSession<'t> {
             destination: Destination::None,
         };
         let proto = ProtocolHeader {
-            initiator: true,
+            initiator,
             needs_ack,
             acked_counter,
             opcode,
@@ -157,13 +165,18 @@ impl<'t> SecureSession<'t> {
         Ok((datagram, message_counter))
     }
 
+    /// Sends a standalone ack for `acked` on `exchange_id`, with our role on
+    /// that exchange given explicitly by `initiator` (see `seal`'s doc for
+    /// why this can't just be assumed to be `true`).
     async fn send_standalone_ack(
         &mut self,
         exchange_id: u16,
+        initiator: bool,
         acked: u32,
     ) -> Result<(), SessionError> {
         let (datagram, _) = self.seal(
             exchange_id,
+            initiator,
             PROTOCOL_ID_SECURE_CHANNEL,
             OPCODE_MRP_STANDALONE_ACK,
             false,
@@ -201,19 +214,33 @@ impl<'t> SecureSession<'t> {
             Ok(v) => v,
             Err(OpenError::Message(_)) | Err(OpenError::Crypto(_)) => return Ok(None),
         };
+        // RxWindow の重複検知はセッション単位（exchange 単位ではない）なので、
+        // exchange フィルタより前にコミットする（コメント: この順序は意図的）。
         if !self.rx_window.check_and_commit(header.message_counter) {
+            // 重複の再送。ack は必ずメッセージ自身の exchange id / role で
+            // 発行する — 呼び出し元の filter exchange ではない。他 exchange
+            // （デバイス起点など）宛の重複を誤った exchange/role で ack する
+            // と相手が突合できず、再送予算を使い切るまでリトライし続ける。
             if proto.needs_ack {
-                self.send_standalone_ack(exchange_id, header.message_counter)
-                    .await?;
+                self.send_standalone_ack(
+                    proto.exchange_id,
+                    !proto.initiator,
+                    header.message_counter,
+                )
+                .await?;
             }
             return Ok(None);
         }
+        // 認証済みの新規メッセージは、こちらの exchange 宛かどうかに関わらず
+        // needs_ack ならここで ack する（初回配送の時点で ack する — 重複の
+        // 再送を待たない）。exchange フィルタは配送の可否だけを決め、ack の
+        // 有無には影響しない。
+        if proto.needs_ack {
+            self.send_standalone_ack(proto.exchange_id, !proto.initiator, header.message_counter)
+                .await?;
+        }
         if proto.exchange_id != exchange_id || proto.initiator {
             return Ok(None);
-        }
-        if proto.needs_ack {
-            self.send_standalone_ack(exchange_id, header.message_counter)
-                .await?;
         }
         Ok(Some(IncomingMessage {
             header,
@@ -234,7 +261,7 @@ impl<'t> SecureSession<'t> {
         cfg: &MrpConfig,
     ) -> Result<Option<IncomingMessage>, SessionError> {
         let (datagram, our_counter) =
-            self.seal(exchange_id, protocol_id, opcode, true, None, payload)?;
+            self.seal(exchange_id, true, protocol_id, opcode, true, None, payload)?;
         let mut interval = cfg.initial_interval;
         let mut attempts = 0u32;
         loop {
@@ -640,6 +667,76 @@ mod tests {
             device.send_to(&other_ex, local).await.unwrap();
         });
 
+        assert!(matches!(
+            s.recv(ex, Duration::from_millis(300)).await,
+            Err(SessionError::Timeout)
+        ));
+        dev.await.unwrap();
+    }
+
+    /// Regression for the MRP ack-attribution bug: a needs-ack message that
+    /// arrives on an exchange the *device* initiated (foreign to our own
+    /// `exchange_id` filter — e.g. a device-initiated secured StatusReport)
+    /// must still be acked, and the ack must carry that message's own
+    /// exchange id with us as the non-initiator of THEIR exchange — not our
+    /// filter's exchange id with `initiator: true`, which the peer could
+    /// never match.
+    #[tokio::test]
+    async fn acks_foreign_exchange_needs_ack_message_with_its_own_exchange_id() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = bind_local().await;
+        let local = transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            &transport,
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        let ex = SecureSession::new_exchange_id();
+        let foreign_ex = ex.wrapping_add(1);
+
+        let dev = tokio::spawn(async move {
+            // デバイス起点の別 exchange 上のメッセージ（例: セキュアな
+            // StatusReport をデバイス側から自分の exchange で送ってくる
+            // ケース）。initiator: true はデバイスが「その exchange の」
+            // initiator であることを示す。
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 700,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: None,
+                opcode: OPCODE_STATUS_REPORT,
+                exchange_id: foreign_ex,
+                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                vendor_id: None,
+            };
+            let msg = seal_message(&R2I, &header, &proto, b"foreign", DEV_NODE).unwrap();
+            device.send_to(&msg, local).await.unwrap();
+
+            // controller の standalone ack は、そのメッセージ自身の
+            // exchange id で、こちらが「その exchange の」non-initiator
+            // として返ってくるはず。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = device.recv_from(&mut buf).await.unwrap();
+            let (_, p, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, OPCODE_MRP_STANDALONE_ACK);
+            assert_eq!(p.exchange_id, foreign_ex);
+            assert!(!p.initiator);
+            assert_eq!(p.acked_counter, Some(700));
+        });
+
+        // こちらの exchange (`ex`) にはこのメッセージは配送されない —
+        // 他 exchange 宛だから。
         assert!(matches!(
             s.recv(ex, Duration::from_millis(300)).await,
             Err(SessionError::Timeout)
