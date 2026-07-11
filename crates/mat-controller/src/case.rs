@@ -9,8 +9,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 
@@ -419,19 +417,6 @@ fn encode_sigma3(encrypted3: &[u8]) -> Vec<u8> {
     w.finish()
 }
 
-fn sign_raw_ecdsa(priv32: &[u8; 32], msg: &[u8]) -> Result<[u8; 64], CaseError> {
-    let key = SigningKey::from_slice(priv32)
-        .map_err(|_| CaseError::Crypto("invalid operational private key"))?;
-    let sig: Signature = key.sign(msg);
-    Ok(sig.to_bytes().into())
-}
-
-fn verify_raw_ecdsa(pub65: &[u8; 65], msg: &[u8], sig64: &[u8; 64]) -> Result<(), ()> {
-    let key = VerifyingKey::from_sec1_bytes(pub65).map_err(|_| ())?;
-    let sig = Signature::from_slice(sig64).map_err(|_| ())?;
-    key.verify(msg, &sig).map_err(|_| ())
-}
-
 /// Runs the CASE initiator handshake against `peer` and returns the
 /// resulting secured session on success.
 pub async fn establish<'t>(
@@ -540,7 +525,7 @@ pub async fn establish<'t>(
         &sigma2.responder_eph_pub,
         &eph_pub,
     );
-    verify_raw_ecdsa(&peer_noc.pub_key, &tbs2, &tbe2.signature)
+    crate::crypto::verify_ecdsa_p256(&peer_noc.pub_key, &tbs2, &tbe2.signature)
         .map_err(|_| CaseError::Sigma2SignatureInvalid)?;
 
     // 4. Sigma3.
@@ -550,7 +535,8 @@ pub async fn establish<'t>(
         &eph_pub,
         &sigma2.responder_eph_pub,
     );
-    let signature = sign_raw_ecdsa(&creds.op_private_key, &tbs3)?;
+    let signature = crate::crypto::sign_ecdsa_p256(&creds.op_private_key, &tbs3)
+        .map_err(|_| CaseError::Crypto("sigma3 signature"))?;
     let tbe3 = encode_tbe3(&creds.noc_tlv, creds.icac_tlv.as_deref(), &signature);
     let sigma2_hash: [u8; 32] = transcript.clone().finalize().into();
     let mut s3k_salt = Vec::with_capacity(48);

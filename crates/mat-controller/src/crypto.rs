@@ -4,6 +4,8 @@ use aes::Aes128;
 use ccm::aead::{Aead, KeyInit, Payload};
 use ccm::consts::{U13, U16};
 use ccm::Ccm;
+use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
 use crate::message::{MessageError, MessageHeader, ProtocolHeader};
 
@@ -19,6 +21,8 @@ const MAX_CCM_PAYLOAD: usize = 65535;
 pub enum CryptoError {
     AuthFailed,
     PayloadTooLarge,
+    BadKey,
+    BadSignature,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -29,6 +33,8 @@ impl std::fmt::Display for CryptoError {
                 f,
                 "payload exceeds AES-CCM limit of {MAX_CCM_PAYLOAD} bytes"
             ),
+            CryptoError::BadKey => write!(f, "invalid ec key"),
+            CryptoError::BadSignature => write!(f, "ecdsa signature verification failed"),
         }
     }
 }
@@ -62,6 +68,25 @@ impl From<CryptoError> for OpenError {
     fn from(e: CryptoError) -> Self {
         OpenError::Crypto(e)
     }
+}
+
+/// ECDSA-P256 sign over SHA-256(message) (p256 default). Returns raw r||s (64B).
+pub fn sign_ecdsa_p256(private_key: &[u8; 32], message: &[u8]) -> Result<[u8; 64], CryptoError> {
+    let key = SigningKey::from_slice(private_key).map_err(|_| CryptoError::BadKey)?;
+    let sig: Signature = key.sign(message);
+    Ok(sig.to_bytes().into())
+}
+
+/// Verify a raw r||s (64B) ECDSA-P256 signature over SHA-256(message).
+pub fn verify_ecdsa_p256(
+    public_key: &[u8; 65],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), CryptoError> {
+    let key = VerifyingKey::from_sec1_bytes(public_key).map_err(|_| CryptoError::BadKey)?;
+    let sig = Signature::from_slice(signature).map_err(|_| CryptoError::BadSignature)?;
+    key.verify(message, &sig)
+        .map_err(|_| CryptoError::BadSignature)
 }
 
 /// Nonce = security flags (1B) || message counter (4B LE) || source node id (8B LE).
@@ -256,5 +281,26 @@ mod tests {
         assert_eq!(h2, header);
         assert_eq!(p2, proto);
         assert_eq!(body, b"payload");
+    }
+
+    #[test]
+    fn ecdsa_sign_verify_roundtrip() {
+        // 既知の p256 テスト鍵（RustCrypto でその場生成）
+        use p256::ecdsa::SigningKey;
+
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let priv_bytes: [u8; 32] = sk.to_bytes().into();
+        let vk = sk.verifying_key();
+        let pub_bytes: [u8; 65] = vk.to_encoded_point(false).as_bytes().try_into().unwrap();
+        let msg = b"attestation over TBS bytes";
+        let sig = sign_ecdsa_p256(&priv_bytes, msg).unwrap();
+        verify_ecdsa_p256(&pub_bytes, msg, &sig).unwrap();
+        // 改ざんメッセージは失敗
+        assert!(verify_ecdsa_p256(&pub_bytes, b"other", &sig).is_err());
+        // 不正鍵は BadKey
+        assert!(matches!(
+            verify_ecdsa_p256(&[0u8; 65], msg, &sig),
+            Err(CryptoError::BadKey)
+        ));
     }
 }
