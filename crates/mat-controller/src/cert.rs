@@ -7,9 +7,15 @@
 //! for byte, and verifies signatures / chains against it.
 
 use crate::asn1;
-use crate::tlv::{Reader, Tag, Value};
+use crate::tlv::{Reader, Tag, Value, Writer};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
+
+/// SubjectKeyIdentifier per Matter/X.509: SHA-1 of the 65-byte public key.
+pub fn subject_key_id(public_key: &[u8; 65]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(public_key).into()
+}
 
 // --- Pre-computed OID constants (DER bytes, tag 0x06 included) ---
 
@@ -276,6 +282,64 @@ impl MatterCert {
 
     pub fn fabric_id(&self) -> Option<u64> {
         self.subject_matter_id(21)
+    }
+
+    /// Encode this certificate back to Matter TLV — inverse of `parse`.
+    /// Field/extension order follows the parsed struct (which preserves TLV order).
+    pub fn to_tlv(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &self.serial);
+        w.put_uint(Tag::Context(2), 1); // ecdsa-with-sha256
+        write_dn(&mut w, 3, &self.issuer);
+        w.put_uint(Tag::Context(4), u64::from(self.not_before));
+        w.put_uint(Tag::Context(5), u64::from(self.not_after));
+        write_dn(&mut w, 6, &self.subject);
+        w.put_uint(Tag::Context(7), 1); // ec public key
+        w.put_uint(Tag::Context(8), 1); // prime256v1
+        w.put_bytes(Tag::Context(9), &self.pub_key);
+        w.start_list(Tag::Context(10));
+        for ext in &self.extensions {
+            write_extension(&mut w, ext);
+        }
+        w.end_container(); // extensions list
+        w.put_bytes(Tag::Context(11), &self.signature);
+        w.end_container(); // top struct
+        w.finish()
+    }
+}
+
+fn write_dn(w: &mut Writer, ctx: u8, attrs: &[DnAttr]) {
+    w.start_list(Tag::Context(ctx));
+    for a in attrs {
+        match &a.value {
+            DnValue::MatterId(id) => w.put_uint(Tag::Context(a.tlv_tag), *id),
+            DnValue::Text(s) => w.put_str(Tag::Context(a.tlv_tag), s),
+        }
+    }
+    w.end_container();
+}
+
+fn write_extension(w: &mut Writer, ext: &CertExtension) {
+    match ext {
+        CertExtension::BasicConstraints { is_ca, path_len } => {
+            w.start_struct(Tag::Context(1));
+            w.put_bool(Tag::Context(1), *is_ca);
+            if let Some(pl) = path_len {
+                w.put_uint(Tag::Context(2), u64::from(*pl));
+            }
+            w.end_container();
+        }
+        CertExtension::KeyUsage(bits) => w.put_uint(Tag::Context(2), u64::from(*bits)),
+        CertExtension::ExtendedKeyUsage(purposes) => {
+            w.start_array(Tag::Context(3));
+            for p in purposes {
+                w.put_uint(Tag::Anonymous, *p);
+            }
+            w.end_container();
+        }
+        CertExtension::SubjectKeyId(id) => w.put_bytes(Tag::Context(4), id),
+        CertExtension::AuthorityKeyId(id) => w.put_bytes(Tag::Context(5), id),
     }
 }
 
@@ -692,5 +756,22 @@ mod tests {
         let oversized = vec![0x15; 2000];
         let result = MatterCert::parse(&oversized);
         assert!(matches!(result, Err(CertError::Malformed(_))));
+    }
+
+    #[test]
+    fn subject_key_id_is_sha1_of_pubkey() {
+        use sha1::{Digest, Sha1};
+        let node = MatterCert::parse(NODE_CHIP).unwrap();
+        let expected: [u8; 20] = Sha1::digest(node.pub_key).into();
+        assert_eq!(subject_key_id(&node.pub_key), expected);
+    }
+
+    #[test]
+    fn to_tlv_roundtrips_all_fixtures() {
+        // パース → 再エンコード → 元の TLV バイトと完全一致（エンコーダ正しさの決定的アンカー）
+        for chip in [ROOT_CHIP, ICA_CHIP, NODE_CHIP] {
+            let cert = MatterCert::parse(chip).unwrap();
+            assert_eq!(cert.to_tlv().as_slice(), chip, "re-encode must byte-match");
+        }
     }
 }

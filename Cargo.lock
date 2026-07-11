@@ -713,6 +713,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "p256",
+ "sha1",
  "sha2",
  "tokio",
 ]
