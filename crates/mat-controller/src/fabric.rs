@@ -34,7 +34,7 @@ pub fn case_destination_id(
 
 /// Assembled, verified fabric credentials for CASE (own-chain sanity already
 /// checked; TLV byte forms retained for Sigma3).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FabricCredentials {
     pub rcac_tlv: Vec<u8>,
     pub icac_tlv: Option<Vec<u8>>,
@@ -45,6 +45,26 @@ pub struct FabricCredentials {
     pub node_id: u64,
     pub fabric_id: u64,
     pub root_public_key: [u8; 65],
+}
+
+/// Manual `Debug`: this struct carries the operational private key and the
+/// fabric's identity-protection key, both secret. Never derive `Debug` here
+/// again — certs/keys are logged incidentally via `{:?}` (error contexts,
+/// test failure output, etc.) and this repo is public.
+impl std::fmt::Debug for FabricCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FabricCredentials")
+            .field("rcac_tlv_len", &self.rcac_tlv.len())
+            .field("icac_tlv_len", &self.icac_tlv.as_ref().map(Vec::len))
+            .field("noc_tlv_len", &self.noc_tlv.len())
+            .field("op_public_key_len", &self.op_public_key.len())
+            .field("op_private_key", &"[REDACTED]")
+            .field("ipk_operational", &"[REDACTED]")
+            .field("node_id", &self.node_id)
+            .field("fabric_id", &self.fabric_id)
+            .field("root_public_key_len", &self.root_public_key.len())
+            .finish()
+    }
 }
 
 /// `FabricCredentials::from_raw` error.

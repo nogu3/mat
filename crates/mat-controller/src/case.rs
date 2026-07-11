@@ -225,10 +225,17 @@ pub(crate) fn parse_sigma2(payload: &[u8]) -> Result<Sigma2, CaseError> {
         }
     }
 
+    let responder_session_id =
+        responder_session_id.ok_or(CaseError::Sigma2Malformed("responder session id"))?;
+    if responder_session_id == 0 {
+        return Err(CaseError::Sigma2Malformed(
+            "responder session id must be non-zero",
+        ));
+    }
+
     Ok(Sigma2 {
         responder_random: responder_random.ok_or(CaseError::Sigma2Malformed("responder random"))?,
-        responder_session_id: responder_session_id
-            .ok_or(CaseError::Sigma2Malformed("responder session id"))?,
+        responder_session_id,
         responder_eph_pub: responder_eph_pub
             .ok_or(CaseError::Sigma2Malformed("responder ephemeral key"))?,
         encrypted2: encrypted2.ok_or(CaseError::Sigma2Malformed("encrypted2"))?,
@@ -634,6 +641,21 @@ mod tests {
         assert_eq!(s2.responder_eph_pub, [0x22; 65]);
         assert_eq!(s2.encrypted2, b"encrypted-blob");
         assert!(parse_sigma2(&[0x15, 0x18]).is_err()); // 必須欠落
+    }
+
+    #[test]
+    fn parse_sigma2_rejects_zero_responder_session_id() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &[0x11; 32]);
+        w.put_uint(Tag::Context(2), 0); // responder session id = 0 は不正
+        w.put_bytes(Tag::Context(3), &[0x22; 65]);
+        w.put_bytes(Tag::Context(4), b"encrypted-blob");
+        w.end_container();
+        assert!(matches!(
+            parse_sigma2(&w.finish()),
+            Err(CaseError::Sigma2Malformed(_))
+        ));
     }
 
     #[test]
