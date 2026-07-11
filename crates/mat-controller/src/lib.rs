@@ -5,6 +5,7 @@
 //! M1 scope: TLV codec, message layer, session crypto, MRP.
 
 pub mod asn1;
+pub mod case;
 pub mod cert;
 pub mod counter;
 pub mod crypto;
