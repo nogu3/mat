@@ -13,6 +13,7 @@ aes = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
 getrandom = { workspace = true }
 sha2 = "0.10"
+sha1 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
