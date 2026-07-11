@@ -4,6 +4,7 @@
 //! command layers never speak TLV / CASE / crypto directly.
 //! M1 scope: TLV codec, message layer, session crypto, MRP.
 
+pub mod asn1;
 pub mod counter;
 pub mod crypto;
 pub mod exchange;
