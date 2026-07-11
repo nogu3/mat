@@ -404,6 +404,11 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   path stays untouched until M4 swaps matd's adapter in-process.
 - The replacement is still one adapter with `mat`'s JSON schema as the
   contract. Subcommands and output schema do not change.
+- M1 完了(2026-07-10): TLV/メッセージ層/セッション暗号（unsecured/secured
+  unicast）。ローカル + Thread 実機 Nanoleaf 2 ノードで E2E 合格。
+- M2 完了: CASE + IM read/invoke（fabric/kvs/cert/case/session/im）。M2b:
+  chip-tool の永続 root CA 鍵で operational identity を自己発行し、ローカル
+  all-clusters-app に対し CASE + onoff toggle/read の E2E 合格（`task e2e:m2`）。
 
 ---
 
