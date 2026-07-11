@@ -116,9 +116,18 @@ impl From<crate::tlv::TlvError> for CertError {
     }
 }
 
+/// Matter operational certs are ~400-600 bytes (SDK caps them at 600);
+/// anything larger is hostile or corrupt, and oversized fields would
+/// otherwise reach asn1::tlv's length assert during TBS rebuilding.
+const MAX_CERT_TLV_LEN: usize = 1024;
+
 impl MatterCert {
     /// Parse a Matter TLV certificate (anonymous struct, context tags 1..11).
     pub fn parse(tlv_bytes: &[u8]) -> Result<MatterCert, CertError> {
+        if tlv_bytes.len() > MAX_CERT_TLV_LEN {
+            return Err(CertError::Malformed("certificate too large"));
+        }
+
         let mut r = Reader::new(tlv_bytes);
 
         match r.next()?.map(|el| el.value) {
@@ -676,5 +685,12 @@ mod tests {
     fn rejects_malformed_tlv() {
         assert!(MatterCert::parse(&[0x15, 0x18]).is_err()); // 空 struct
         assert!(MatterCert::parse(b"junk").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_cert() {
+        let oversized = vec![0x15; 2000];
+        let result = MatterCert::parse(&oversized);
+        assert!(matches!(result, Err(CertError::Malformed(_))));
     }
 }
