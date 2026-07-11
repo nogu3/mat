@@ -124,37 +124,76 @@ async fn fabric_ride_along_onoff_and_color() {
     }
     let mut session = session.expect("CASE establishment failed on all resolved addresses");
 
-    // 受け入れ 5: onoff toggle 往復（元の状態に戻して終わる）
+    // 受け入れ 5/6 の前提状態を先に読み切る（読みのみ、失敗しても実機は無傷）
     let before = read_bool(&mut session, endpoint, &mrp).await;
+    let hue0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_HUE, &mrp).await;
+    let sat0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_SATURATION, &mrp).await;
+
+    // 受け入れ 5/6 本体: 途中で失敗しても実機を変更したまま panic しないよう
+    // Result で返す。復元は呼び出し側で best-effort に必ず行う。
+    let outcome = exercise(&mut session, endpoint, &mrp, before).await;
+
+    // 後始末: 成否に関わらず色と電源状態を復元（best-effort、エラーは無視）
+    let fields = encode_move_to_hue_and_saturation_fields(hue0, sat0, 0);
+    let _ = session
+        .invoke(
+            endpoint,
+            CLUSTER_COLOR_CONTROL,
+            CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(&fields),
+            &mrp,
+        )
+        .await;
+    if !before {
+        let _ = session
+            .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None, &mrp)
+            .await;
+    }
+    eprintln!("restored original state (best-effort)");
+
+    outcome.expect("live E2E failed (state restore attempted)");
+}
+
+/// 受け入れ 5/6 本体: onoff toggle 往復 + 色変更。途中で失敗しても panic
+/// せず `Err` を返し、呼び出し側が実機の状態復元を試みられるようにする。
+async fn exercise(
+    session: &mut SecureSession<'_>,
+    endpoint: u16,
+    mrp: &MrpConfig,
+    before: bool,
+) -> Result<(), String> {
+    // 受け入れ 5: onoff toggle 往復（元の状態に戻して終わる）
     session
-        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, &mrp)
+        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
-        .expect("toggle 1");
-    assert_eq!(
-        read_bool(&mut session, endpoint, &mrp).await,
-        !before,
-        "toggle must flip on-off"
-    );
+        .map_err(|e| format!("toggle 1: {e}"))?;
+    let after1 = read_bool(session, endpoint, mrp).await;
+    if after1 == before {
+        return Err(format!(
+            "toggle must flip on-off: expected {}, got {after1}",
+            !before
+        ));
+    }
     session
-        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, &mrp)
+        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
-        .expect("toggle 2");
-    assert_eq!(
-        read_bool(&mut session, endpoint, &mrp).await,
-        before,
-        "second toggle must restore on-off"
-    );
+        .map_err(|e| format!("toggle 2: {e}"))?;
+    let after2 = read_bool(session, endpoint, mrp).await;
+    if after2 != before {
+        return Err(format!(
+            "second toggle must restore on-off: expected {before}, got {after2}"
+        ));
+    }
     eprintln!("onoff toggle round-trip OK (was {before})");
 
     // 受け入れ 6: 色変更（ライト on で実施し、hue/sat とも元へ復元）
     if !before {
         session
-            .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None, &mrp)
+            .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None, mrp)
             .await
-            .expect("on for color");
+            .map_err(|e| format!("on for color: {e}"))?;
     }
-    let hue0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_HUE, &mrp).await;
-    let sat0 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_SATURATION, &mrp).await;
+    let hue0 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await;
     // CurrentHue は 0..=254 の円環。確実に離れた目標を選ぶ。
     let target_hue = ((u16::from(hue0) + 80) % 254) as u8;
     let fields = encode_move_to_hue_and_saturation_fields(target_hue, 200, 0);
@@ -164,35 +203,19 @@ async fn fabric_ride_along_onoff_and_color() {
             CLUSTER_COLOR_CONTROL,
             CMD_MOVE_TO_HUE_AND_SATURATION,
             Some(&fields),
-            &mrp,
+            mrp,
         )
         .await
-        .expect("move-to-hue-and-saturation");
+        .map_err(|e| format!("move-to-hue-and-saturation: {e}"))?;
     // transition 0 でも装置内の属性反映に猶予を置く
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let hue1 = read_color_u8(&mut session, endpoint, ATTR_CURRENT_HUE, &mrp).await;
+    let hue1 = read_color_u8(session, endpoint, ATTR_CURRENT_HUE, mrp).await;
     let d = (i32::from(hue1) - i32::from(target_hue)).abs();
     let d = d.min(254 - d); // 円環距離
-    assert!(d <= 8, "current-hue {hue1} not near target {target_hue}");
+    if d > 8 {
+        return Err(format!("current-hue {hue1} not near target {target_hue}"));
+    }
     eprintln!("color change OK: hue {hue0} -> {hue1} (target {target_hue})");
 
-    // 後始末: 色と電源状態を復元
-    let fields = encode_move_to_hue_and_saturation_fields(hue0, sat0, 0);
-    session
-        .invoke(
-            endpoint,
-            CLUSTER_COLOR_CONTROL,
-            CMD_MOVE_TO_HUE_AND_SATURATION,
-            Some(&fields),
-            &mrp,
-        )
-        .await
-        .expect("restore color");
-    if !before {
-        session
-            .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None, &mrp)
-            .await
-            .expect("restore off");
-    }
-    eprintln!("restored original state");
+    Ok(())
 }
