@@ -1,9 +1,14 @@
 //! Minimal reader for chip-tool's Linux ini KVS (connectedhomeip v1.4.2.0).
 //!
-//! Reads the five fabric credentials CASE needs. Format facts (verified
-//! against SDK v1.4.2.0): `[Default]` section, base64 values, keys
-//! `f/<index>/{r,i,n,o}` and `f/<index>/k/0`; the keyset stores the already
-//! derived *operational* group key, not the epoch key.
+//! Two readers: [`read_fabric_credentials`] (a full credential set including
+//! the operational key, keys `f/<index>/{r,i,n,o}` and `f/<index>/k/0` —
+//! chip-tool does not persist its *own* op key, so this path serves fixtures
+//! and non-chip-tool stores), and [`read_self_issue_materials`] (what
+//! self-issuing our own NOC needs: the root CA key from the alpha ini; the
+//! root cert, our node/fabric id, and the IPK from the main ini fabric
+//! table). Format facts (verified against SDK v1.4.2.0): `[Default]`
+//! section, base64 values; the keyset stores the already derived
+//! *operational* group key, not the epoch key.
 
 use std::path::Path;
 
@@ -56,6 +61,10 @@ pub enum KvsError {
         fabric_index: u8,
         reason: &'static str,
     },
+    BadNoc {
+        fabric_index: u8,
+        reason: &'static str,
+    },
     BadCaKey(&'static str),
 }
 
@@ -77,6 +86,12 @@ impl std::fmt::Display for KvsError {
                 reason,
             } => {
                 write!(f, "kvs key \"f/{fabric_index}/k/0\": bad keyset: {reason}")
+            }
+            KvsError::BadNoc {
+                fabric_index,
+                reason,
+            } => {
+                write!(f, "kvs key \"f/{fabric_index}/n\": bad noc: {reason}")
             }
             KvsError::BadCaKey(reason) => write!(f, "kvs: bad CA key: {reason}"),
         }
@@ -369,8 +384,10 @@ pub fn read_fabric_credentials(
 /// CA materials chip-tool persists, needed to self-issue a NOC without going
 /// through chip-tool. `root_private_key` comes from the *alpha* KVS (the CA's
 /// own key pair); `rcac` (root cert, Matter-TLV form — its parsed public key is
-/// the root public key), `ipk_operational`, and `node_id`/`fabric_id` come from
-/// the *main* KVS.
+/// the root public key), `ipk_operational`, and `node_id`/`fabric_id` (both
+/// from the subject of chip-tool's own operational NOC at `f/<idx>/n` — the
+/// identity the device ACLs actually admit; the KVS index is just a table
+/// slot) come from the *main* KVS.
 #[derive(Clone)]
 pub struct SelfIssueMaterials {
     pub rcac: Vec<u8>,
@@ -395,13 +412,9 @@ impl std::fmt::Debug for SelfIssueMaterials {
     }
 }
 
-/// chip-tool's `kTestControllerNodeId` (SDK v1.4.2.0): the node id used when
-/// `LocalNodeId` is absent from the main KVS.
-pub const DEFAULT_CONTROLLER_NODE_ID: u64 = 112_233;
-
 /// Reads the CA materials chip-tool persists (root cert + root CA key, from
-/// `alpha_ini`) plus the IPK and controller node id (from `main_ini`) needed
-/// to self-issue a NOC for `fabric_index`, using CA `issuer_index`.
+/// `alpha_ini`) plus the IPK and the node/fabric id (from the fabric table's
+/// own NOC) needed to self-issue a NOC for `fabric_index`, using CA `issuer_index`.
 pub fn read_self_issue_materials(
     alpha_ini: &Path,
     main_ini: &Path,
@@ -437,17 +450,33 @@ pub fn read_self_issue_materials(
             .ok_or_else(|| KvsError::KeyMissing(format!("f/{fabric_index}/k/0")))?,
         fabric_index,
     )?;
-    let node_id = match decode_b64(main_sec, "LocalNodeId")? {
-        Some(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().expect("8")),
-        _ => DEFAULT_CONTROLLER_NODE_ID,
-    };
+
+    // node id / fabric id come from the subject of chip-tool's own
+    // operational NOC in the fabric table (`f/<idx>/n`, Matter-TLV): the
+    // device ACLs admit exactly the identity in that cert, and its subject
+    // carries the *operational* fabric id — the KVS index is just a table
+    // slot and differs from the fabric id on any non-alpha fabric.
+    let noc_key = format!("f/{fabric_index}/n");
+    let noc_tlv = decode_b64(main_sec, &noc_key)?.ok_or(KvsError::KeyMissing(noc_key))?;
+    let noc = crate::cert::MatterCert::parse(&noc_tlv).map_err(|_| KvsError::BadNoc {
+        fabric_index,
+        reason: "unparseable matter-tlv certificate",
+    })?;
+    let node_id = noc.node_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing node id (tag 17)",
+    })?;
+    let fabric_id = noc.fabric_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing fabric id (tag 21)",
+    })?;
 
     Ok(SelfIssueMaterials {
         rcac,
         root_private_key,
         ipk_operational,
         node_id,
-        fabric_id: u64::from(fabric_index),
+        fabric_id,
     })
 }
 
@@ -526,6 +555,15 @@ mod tests {
     const PUB: [u8; 65] = [0xAA; 65];
     const PRIV: [u8; 32] = [0xBB; 32];
     const IPK: [u8; 16] = [0xCC; 16];
+
+    /// node01_01 フィクスチャ（chip SDK テスト証明書）とその subject の実 id。
+    /// 期待値はパーサ経由で取るが、cert パース自体は cert.rs 側でフィクスチャ
+    /// 検証済みなので、ここでは「kvs がその値を配線しているか」だけを見る。
+    fn noc_fixture() -> (&'static [u8], u64, u64) {
+        let bytes: &[u8] = include_bytes!("../tests/fixtures/node01_01_chip.bin");
+        let cert = crate::cert::MatterCert::parse(bytes).unwrap();
+        (bytes, cert.node_id().unwrap(), cert.fabric_id().unwrap())
+    }
 
     #[test]
     fn reads_all_five_items() {
@@ -659,16 +697,17 @@ mod tests {
         let mut root_key = Vec::with_capacity(97);
         root_key.extend_from_slice(&[0xAA; 65]); // pub
         root_key.extend_from_slice(&[0xBB; 32]); // priv
-        let ks = keyset_blob(&[0xCC; 16]); // 既存ヘルパ（Task 2/M2 の keyset_blob 相当）
+        let ks = keyset_blob(&[0xCC; 16]);
+        let (noc, node_id, fabric_id) = noc_fixture();
 
         let alpha = write_named_ini("alpha", &[("ExampleOpCredsCAKey0", &root_key)]);
         let main = write_named_ini(
             "main",
             &[
-                // root cert (TLV form) は fabric table に入っている
+                // root cert (TLV form) と自 NOC は fabric table に入っている
                 ("f/1/r", b"rcac-tlv-bytes"),
+                ("f/1/n", noc),
                 ("f/1/k/0", &ks),
-                // LocalNodeId 無し → 既定 112233
             ],
         );
 
@@ -676,26 +715,74 @@ mod tests {
         assert_eq!(m.rcac, b"rcac-tlv-bytes");
         assert_eq!(m.root_private_key, [0xBB; 32]);
         assert_eq!(m.ipk_operational, [0xCC; 16]);
-        assert_eq!(m.node_id, 112233);
-        assert_eq!(m.fabric_id, 1);
+        assert_eq!(m.node_id, node_id);
+        assert_eq!(m.fabric_id, fabric_id);
         std::fs::remove_file(alpha).ok();
         std::fs::remove_file(main).ok();
     }
 
     #[test]
-    fn local_node_id_overrides_default() {
+    fn ids_come_from_noc_subject_not_table_index() {
         let mut root_key = vec![0xAA; 65];
         root_key.extend_from_slice(&[0xBB; 32]);
         let ks = keyset_blob(&[0xCC; 16]);
-        let alpha = write_named_ini("alpha2", &[("ExampleOpCredsCAKey0", &root_key)]);
-        // LocalNodeId = 0x1122334455667788, u64 LE 8 バイト
-        let node_le = 0x1122_3344_5566_7788u64.to_le_bytes();
+        let (noc, node_id, fabric_id) = noc_fixture();
+        // fabric テーブルの index 9 に置く — subject の id は 9 ではない
+        let alpha = write_named_ini("alpha-idx", &[("ExampleOpCredsCAKey0", &root_key)]);
         let main = write_named_ini(
-            "main2",
-            &[("f/1/r", b"r"), ("f/1/k/0", &ks), ("LocalNodeId", &node_le)],
+            "main-idx",
+            &[("f/9/r", b"r"), ("f/9/n", noc), ("f/9/k/0", &ks)],
         );
-        let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
-        assert_eq!(m.node_id, 0x1122_3344_5566_7788);
+        let m = read_self_issue_materials(&alpha, &main, 9, 0).unwrap();
+        assert_ne!(
+            fabric_id, 9,
+            "fixture の fabric id が index と偶然一致すると本テストは無意味"
+        );
+        assert_eq!(m.fabric_id, fabric_id);
+        assert_eq!(m.node_id, node_id);
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
+    }
+
+    #[test]
+    fn missing_noc_is_key_missing() {
+        let mut root_key = vec![0xAA; 65];
+        root_key.extend_from_slice(&[0xBB; 32]);
+        let ks = keyset_blob(&[0xCC; 16]);
+        let alpha = write_named_ini("alpha-non", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let main = write_named_ini("main-non", &[("f/1/r", b"r"), ("f/1/k/0", &ks)]);
+        let err = read_self_issue_materials(&alpha, &main, 1, 0).unwrap_err();
+        assert!(matches!(err, KvsError::KeyMissing(k) if k == "f/1/n"));
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
+    }
+
+    #[test]
+    fn garbage_noc_is_bad_noc_naming_the_key() {
+        let mut root_key = vec![0xAA; 65];
+        root_key.extend_from_slice(&[0xBB; 32]);
+        let ks = keyset_blob(&[0xCC; 16]);
+        let alpha = write_named_ini("alpha-bad", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let main = write_named_ini(
+            "main-bad",
+            &[
+                ("f/1/r", b"r"),
+                ("f/1/n", b"not a matter cert"),
+                ("f/1/k/0", &ks),
+            ],
+        );
+        let err = read_self_issue_materials(&alpha, &main, 1, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            KvsError::BadNoc {
+                fabric_index: 1,
+                ..
+            }
+        ));
+        assert!(
+            err.to_string().contains("f/1/n"),
+            "エラーは実キー名を名指しすること: {err}"
+        );
         std::fs::remove_file(alpha).ok();
         std::fs::remove_file(main).ok();
     }
