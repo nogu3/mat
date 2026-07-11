@@ -337,6 +337,10 @@ impl<'t> SecureSession<'t> {
             im::OPCODE_REPORT_DATA => {
                 let rd = im::decode_report_data(&msg.payload).map_err(SessionError::Im)?;
                 if !rd.suppress_response {
+                    // Best-effort close: the read already succeeded (we
+                    // have `rd` in hand), so a lost ack on this trailing
+                    // StatusResponse must not turn it into an error here —
+                    // it's the peer's retransmit problem, not ours.
                     let ok = im::encode_status_response(0);
                     let _ = self
                         .send_reliable(
@@ -346,7 +350,7 @@ impl<'t> SecureSession<'t> {
                             &ok,
                             cfg,
                         )
-                        .await?;
+                        .await;
                 }
                 if let Some(status) = rd.status {
                     return Err(SessionError::Im(ImError::AttributeStatus(status)));
@@ -363,6 +367,13 @@ impl<'t> SecureSession<'t> {
     }
 
     /// Invokes a single command over the Interaction Model (spec §8.9.4).
+    ///
+    /// The interaction ends with the InvokeResponse itself: for a
+    /// non-chunked response (M2's only case) we send no closing
+    /// StatusResponse — this mirrors CHIP's `CommandSender`, where the MRP
+    /// ack of the InvokeResponse is what closes the exchange, not a
+    /// follow-up message. The InvokeResponseMessage's own `SuppressResponse`
+    /// field is intentionally ignored in M2.
     pub async fn invoke(
         &mut self,
         endpoint: u16,
@@ -730,6 +741,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, crate::im::ImValue::Bool(true));
+        dev.await.unwrap();
+    }
+
+    /// InvokeResponse (error) shaped like Task 8's `im.rs` test fixture:
+    /// CommandStatusIB carrying `StatusIB{0: status, 1: cluster_status}`.
+    fn invoke_response_error_payload(status: u8, cluster_status: Option<u8>) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), u64::from(status));
+        if let Some(cs) = cluster_status {
+            w.put_uint(Tag::Context(1), u64::from(cs));
+        }
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// Regression for the read closing-ack: `read_attribute`'s own read has
+    /// already succeeded once we've decoded the device's ReportData. The
+    /// trailing StatusResponse(SUCCESS) we send back is a courtesy close of
+    /// the exchange — if the device never acks it, that must NOT turn an
+    /// already-successful read into a `Timeout` error.
+    #[tokio::test]
+    async fn read_attribute_succeeds_even_if_closing_status_response_unacked() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = bind_local().await;
+        let mut s = SecureSession::new(
+            &transport,
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        // Fast MRP so the unacked closing send exhausts its retry budget
+        // quickly instead of stalling the test.
+        let cfg = MrpConfig {
+            initial_interval: Duration::from_millis(50),
+            max_retries: 1,
+            backoff: 1.0,
+        };
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+            // Ack the request while carrying the real ReportData reply.
+            // suppress_response = false → the controller will try to close
+            // the exchange with a StatusResponse(SUCCESS) that we
+            // deliberately never ack, and never send anything else.
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                Some(h.message_counter),
+                true,
+                9400,
+                &report_data_payload(true, false),
+            );
+            device.send_to(&resp, from).await.unwrap();
+
+            // Drain (and discard) whatever the controller sends next: the
+            // standalone ack for this ReportData, then the closing
+            // StatusResponse retried per MrpConfig. Read them so the
+            // in-flight sends complete, but never ack any of them — that's
+            // the whole point of the test.
+            loop {
+                let mut b2 = [0u8; MAX_DATAGRAM];
+                let recv =
+                    tokio::time::timeout(Duration::from_millis(500), device.recv_from(&mut b2))
+                        .await;
+                let Ok(Ok((n2, _))) = recv else { break };
+                let _ = open_from_controller(&b2[..n2]);
+            }
+        });
+
+        let value = s
+            .read_attribute(1, crate::im::CLUSTER_ON_OFF, crate::im::ATTR_ON_OFF, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(value, crate::im::ImValue::Bool(true));
+        dev.await.unwrap();
+    }
+
+    /// Regression: a non-zero command status in the InvokeResponse must map
+    /// to `SessionError::Im(ImError::CommandStatus { .. })`, carrying both
+    /// the IM status and (when present) the cluster-specific status.
+    #[tokio::test]
+    async fn invoke_maps_nonzero_status_to_command_status_error() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = bind_local().await;
+        let mut s = SecureSession::new(
+            &transport,
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_INVOKE_REQUEST);
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_INVOKE_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9500,
+                &invoke_response_error_payload(0x81, Some(0x42)),
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+
+        let err = s
+            .invoke(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::CMD_ON_OFF_TOGGLE,
+                None,
+                &fast_cfg(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Im(crate::im::ImError::CommandStatus {
+                status: 0x81,
+                cluster_status: Some(0x42),
+            })
+        ));
         dev.await.unwrap();
     }
 
