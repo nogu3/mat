@@ -201,6 +201,53 @@ struct Record {
     rdata: RData,
 }
 
+/// Smallest possible record: 1-byte root name + type(2) + class(2) +
+/// ttl(4) + rdlength(2) with empty rdata.
+const MIN_RECORD_LEN: usize = 11;
+/// Cap on folded AAAA candidates while the SRV target is still unknown —
+/// a flooder must not grow memory; the real address always fits once the
+/// SRV answer arrives and non-matching entries are pruned.
+const MAX_AAAA: usize = 16;
+
+/// Capacity to pre-reserve for `claimed` records in a `msg_len`-byte
+/// message: never more than could physically fit (header counts are
+/// attacker-controlled; a forged 3×65535 must not reserve megabytes).
+fn record_capacity(claimed: usize, msg_len: usize) -> usize {
+    claimed.min(msg_len.saturating_sub(12) / MIN_RECORD_LEN)
+}
+
+/// Folds one AAAA record into the candidate list, bounding growth:
+/// once the SRV target is known only matching names are kept; before
+/// that, candidates are capped at [`MAX_AAAA`] and deduplicated.
+fn push_aaaa(
+    aaaa: &mut Vec<(String, Ipv6Addr)>,
+    srv_target: Option<&str>,
+    name: String,
+    addr: Ipv6Addr,
+) {
+    if let Some(target) = srv_target {
+        if !name.eq_ignore_ascii_case(target) {
+            return;
+        }
+    }
+    if aaaa.len() >= MAX_AAAA {
+        return;
+    }
+    if aaaa
+        .iter()
+        .any(|(n, a)| *a == addr && n.eq_ignore_ascii_case(&name))
+    {
+        return;
+    }
+    aaaa.push((name, addr));
+}
+
+/// Drops candidates that do not belong to the SRV target (called once the
+/// target becomes known, so flooded slots free up for the real address).
+fn prune_aaaa(aaaa: &mut Vec<(String, Ipv6Addr)>, target: &str) {
+    aaaa.retain(|(n, _)| n.eq_ignore_ascii_case(target));
+}
+
 fn be16(buf: &[u8], pos: usize) -> Result<u16, DnssdError> {
     let b = buf
         .get(pos..pos + 2)
@@ -226,7 +273,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             return Err(DnssdError::Malformed("truncated question"));
         }
     }
-    let mut records = Vec::with_capacity(total);
+    let mut records = Vec::with_capacity(record_capacity(total, buf.len()));
     for _ in 0..total {
         let (name, p) = read_name(buf, pos)?;
         let rtype = be16(buf, p)?;
@@ -340,12 +387,16 @@ pub async fn resolve_operational(
         for r in records {
             match r.rdata {
                 RData::Srv { port, target } if r.name.eq_ignore_ascii_case(&service) => {
+                    prune_aaaa(&mut aaaa, &target);
                     srv = Some((port, target));
                 }
                 RData::Txt(strings) if r.name.eq_ignore_ascii_case(&service) => {
                     txt = Some(strings);
                 }
-                RData::Aaaa(addr) => aaaa.push((r.name, addr)),
+                RData::Aaaa(addr) => {
+                    let target = srv.as_ref().map(|(_, t)| t.as_str());
+                    push_aaaa(&mut aaaa, target, r.name, addr);
+                }
                 _ => {}
             }
         }
@@ -485,6 +536,69 @@ mod tests {
             panic!("not aaaa");
         };
         assert_eq!(got, addr);
+    }
+
+    #[test]
+    fn record_capacity_clamps_forged_counts() {
+        // 12B ヘッダだけで an/ns/ar=65535×3 を偽装しても、メッセージ長から
+        // 物理的に入り得ない分は事前確保しない（フラッド耐性）
+        assert_eq!(record_capacity(196_605, 12), 0);
+        // 1500B のデータグラムなら最大でも (1500-12)/11 レコード
+        assert!(record_capacity(196_605, 1500) <= (1500 - 12) / 11);
+        // 正直なカウントはそのまま
+        assert_eq!(record_capacity(3, 1500), 3);
+    }
+
+    #[test]
+    fn aaaa_fold_caps_growth_before_srv_is_known() {
+        // SRV target 判明前のフラッド: 異名 AAAA を大量に受けても cap 止まり
+        let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+        for i in 0..10_000u32 {
+            let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i as u16);
+            push_aaaa(&mut aaaa, None, format!("h{i}.local"), addr);
+        }
+        assert_eq!(aaaa.len(), MAX_AAAA);
+    }
+
+    #[test]
+    fn aaaa_fold_dedupes() {
+        let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        push_aaaa(&mut aaaa, None, "dev.local".into(), addr);
+        push_aaaa(&mut aaaa, None, "DEV.local".into(), addr); // 名前は大文字小文字非依存
+        assert_eq!(aaaa.len(), 1);
+    }
+
+    #[test]
+    fn aaaa_fold_filters_on_srv_target_once_known() {
+        // SRV target 判明後: 不一致 AAAA は保持しない
+        let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+        for i in 0..10_000u32 {
+            let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, i as u16);
+            push_aaaa(&mut aaaa, Some("dev.local"), format!("evil{i}.local"), addr);
+        }
+        assert!(aaaa.is_empty());
+        // 一致（大文字小文字非依存）は入る
+        let real: Ipv6Addr = "fd00::42".parse().unwrap();
+        push_aaaa(&mut aaaa, Some("dev.local"), "DEV.LOCAL".into(), real);
+        assert_eq!(aaaa, vec![("DEV.LOCAL".to_string(), real)]);
+    }
+
+    #[test]
+    fn aaaa_prune_frees_flooded_slots_for_the_real_target() {
+        // cap がフラッドで埋まったあとに SRV が判明しても、prune で
+        // 本物の AAAA が入る余地が戻る
+        let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+        for i in 0..MAX_AAAA as u16 {
+            let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, i);
+            push_aaaa(&mut aaaa, None, format!("junk{i}.local"), addr);
+        }
+        assert_eq!(aaaa.len(), MAX_AAAA);
+        prune_aaaa(&mut aaaa, "dev.local");
+        assert!(aaaa.is_empty());
+        let real: Ipv6Addr = "fd00::99".parse().unwrap();
+        push_aaaa(&mut aaaa, Some("dev.local"), "dev.local".into(), real);
+        assert_eq!(aaaa.len(), 1);
     }
 
     #[test]
