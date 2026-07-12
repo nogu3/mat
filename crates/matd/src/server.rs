@@ -22,6 +22,7 @@ use mat_core::parse::normalize_value;
 use mat_core::store::Store;
 
 use crate::backend::ChipToolBackend;
+use crate::native::NativeBackend;
 use crate::protocol::{Op, Request};
 
 /// ソケットを bind し、接続を受け付け続ける。`Ctrl-C` で抜ける。
@@ -29,7 +30,9 @@ pub async fn serve(
     socket_path: &Path,
     store_path: PathBuf,
     backend: Arc<ChipToolBackend>,
+    native: Option<Arc<NativeBackend>>,
 ) -> std::io::Result<()> {
+    tracing::info!(native = native.is_some(), "matd backends");
     // 前回の残骸を掃除してから bind。
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
@@ -73,10 +76,11 @@ pub async fn serve(
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
                 let backend = Arc::clone(&backend);
+                let native = native.clone();
                 let store_path = Arc::clone(&store_path);
                 let shutdown = Arc::clone(&shutdown);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, backend, store_path, shutdown).await {
+                    if let Err(e) = handle_conn(stream, backend, native, store_path, shutdown).await {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
                 });
@@ -104,6 +108,7 @@ pub async fn serve(
 async fn handle_conn(
     stream: UnixStream,
     backend: Arc<ChipToolBackend>,
+    native: Option<Arc<NativeBackend>>,
     store_path: Arc<PathBuf>,
     shutdown: Arc<Notify>,
 ) -> std::io::Result<()> {
@@ -114,7 +119,8 @@ async fn handle_conn(
         if line.trim().is_empty() {
             continue;
         }
-        let (response, is_shutdown) = dispatch(&line, &backend, &store_path).await;
+        let (response, is_shutdown) =
+            dispatch(&line, &backend, native.as_deref(), &store_path).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
@@ -129,7 +135,12 @@ async fn handle_conn(
 }
 
 /// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
-async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> (Value, bool) {
+async fn dispatch(
+    line: &str,
+    backend: &ChipToolBackend,
+    native: Option<&NativeBackend>,
+    store_path: &Path,
+) -> (Value, bool) {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -145,7 +156,7 @@ async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> (
     let id = req.id.clone();
     let is_shutdown = matches!(req.op, Op::Shutdown);
 
-    let body = match run_op(&req.op, backend, store_path).await {
+    let body = match run_op(&req.op, backend, native, store_path).await {
         Ok(mut body) => {
             // id をエコーし、timestamp を必ず付ける（mat スキーマ規約）。
             if let Value::Object(map) = &mut body {
@@ -165,7 +176,19 @@ async fn dispatch(line: &str, backend: &ChipToolBackend, store_path: &Path) -> (
 /// 操作を実行し、mat スキーマの成功ボディ（timestamp 抜き）を返す。応答は `mat` の
 /// one-shot CLI と同じ純粋スキーマで、chip-tool ws の生結果（`results`/`logs`）は
 /// 添付しない（logs は backend で除去済み、CLAUDE.md ルール 2「素通し禁止」）。
-async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result<Value, MatError> {
+async fn run_op(
+    op: &Op,
+    backend: &ChipToolBackend,
+    native: Option<&NativeBackend>,
+    store_path: &Path,
+) -> Result<Value, MatError> {
+    // native が有効かつホットパスなら native 経路（M4）。無効時は従来どおり全 op が
+    // chip-tool へ通る。
+    if let Some(native) = native {
+        if is_native_hotpath(op) {
+            return native_op(op, native, store_path).await;
+        }
+    }
     match op {
         // Ping は chip-tool に触れず即応。
         Op::Ping => Ok(json!({ "pong": true })),
@@ -185,69 +208,72 @@ async fn run_op(op: &Op, backend: &ChipToolBackend, store_path: &Path) -> Result
     }
 }
 
-/// 単一 chip-tool コマンドに対応する op（read/write/invoke/on/off）を実行する。
-async fn simple_op(
-    op: &Op,
-    backend: &ChipToolBackend,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    // node_id が解決できるか（= commission 済みか）を毎回 KVS で確認する。
+/// この op を native warm session で処理するか（ホットパス）。それ以外は
+/// chip-tool ws にフォールバックする（M4 スコープ）。
+pub(crate) fn is_native_hotpath(op: &Op) -> bool {
+    match op {
+        Op::On { .. } | Op::Off { .. } | Op::Color { .. } | Op::ColorTemp { .. } => true,
+        // read は onoff on-off のみ native（汎用 attr 名→ID テーブルは未実装）。
+        Op::Read {
+            cluster, attribute, ..
+        } => cluster == "onoff" && attribute == "on-off",
+        _ => false,
+    }
+}
+
+/// native ホットパス op を warm session で実行し、成功 body を組む。
+async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result<Value, MatError> {
+    // commission 済みか毎回 KVS で確認する（chip-tool 経路と同じ挙動）。
     if let Some(node_id) = op.node_id() {
         require_node(store_path, node_id)?;
     }
-
-    let cmdline = op.to_cmdline().expect("simple op always has a cmdline");
-    let result = backend.run_cmdline(&cmdline).await?;
-    ensure_ok(&result)?;
-
-    let body = match op {
-        Op::Read {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-        } => {
-            let value = read_value(&result).ok_or_else(|| {
-                MatError::parse_error(format!(
-                    "no value in chip-tool ws result for read {cluster}/{attribute}"
-                ))
-            })?;
-            json!({
-                "node_id": node_id,
-                "endpoint": endpoint,
-                "cluster": cluster,
-                "attribute": attribute,
-                "value": value,
-            })
+    match op {
+        Op::On { node_id, endpoint } => {
+            native.on(*node_id, *endpoint).await?;
+            Ok(hotpath_success_body(op, None))
         }
-        Op::Write {
+        Op::Off { node_id, endpoint } => {
+            native.off(*node_id, *endpoint).await?;
+            Ok(hotpath_success_body(op, None))
+        }
+        Op::Color {
             node_id,
             endpoint,
-            cluster,
-            attribute,
-            value,
-        } => json!({
-            "node_id": node_id,
-            "endpoint": endpoint,
-            "cluster": cluster,
-            "attribute": attribute,
-            // mat write と同じく、入力文字列を read と揃えた型へ正規化して返す。
-            "value": normalize_value(value),
-            "status": "success",
-        }),
-        Op::Invoke {
-            node_id,
-            endpoint,
-            cluster,
-            command,
+            hue_raw,
+            saturation_raw,
+            transition,
             ..
-        } => json!({
-            "node_id": node_id,
-            "endpoint": endpoint,
-            "cluster": cluster,
-            "command": command,
-            "status": "success",
-        }),
+        } => {
+            native
+                .color(*node_id, *endpoint, *hue_raw, *saturation_raw, *transition)
+                .await?;
+            Ok(hotpath_success_body(op, None))
+        }
+        Op::ColorTemp {
+            node_id,
+            endpoint,
+            mireds,
+            transition,
+            ..
+        } => {
+            native
+                .color_temp(*node_id, *endpoint, *mireds, *transition)
+                .await?;
+            Ok(hotpath_success_body(op, None))
+        }
+        Op::Read {
+            node_id, endpoint, ..
+        } => {
+            let v = native.read_onoff(*node_id, *endpoint).await?;
+            Ok(hotpath_success_body(op, Some(Value::Bool(v))))
+        }
+        _ => unreachable!("native_op called with non-hotpath op"),
+    }
+}
+
+/// native/chip-tool どちらの経路でも使う、ホットパス op の成功 body（timestamp 抜き）。
+fn hotpath_success_body(op: &Op, read_value: Option<Value>) -> Value {
+    match op {
         Op::On { node_id, endpoint } => json!({
             "node_id": node_id, "endpoint": endpoint,
             "cluster": "onoff", "command": "on", "status": "success",
@@ -296,6 +322,79 @@ async fn simple_op(
                 body["rgb"] = json!(r);
             }
             body
+        }
+        Op::Read {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+        } => json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "cluster": cluster,
+            "attribute": attribute,
+            "value": read_value.unwrap_or(Value::Null),
+        }),
+        _ => unreachable!("hotpath_success_body called with non-hotpath op"),
+    }
+}
+
+/// 単一 chip-tool コマンドに対応する op（read/write/invoke/on/off）を実行する。
+async fn simple_op(
+    op: &Op,
+    backend: &ChipToolBackend,
+    store_path: &Path,
+) -> Result<Value, MatError> {
+    // node_id が解決できるか（= commission 済みか）を毎回 KVS で確認する。
+    if let Some(node_id) = op.node_id() {
+        require_node(store_path, node_id)?;
+    }
+
+    let cmdline = op.to_cmdline().expect("simple op always has a cmdline");
+    let result = backend.run_cmdline(&cmdline).await?;
+    ensure_ok(&result)?;
+
+    let body = match op {
+        Op::Read {
+            cluster, attribute, ..
+        } => {
+            let value = read_value(&result).ok_or_else(|| {
+                MatError::parse_error(format!(
+                    "no value in chip-tool ws result for read {cluster}/{attribute}"
+                ))
+            })?;
+            hotpath_success_body(op, Some(value))
+        }
+        Op::Write {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            value,
+        } => json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "cluster": cluster,
+            "attribute": attribute,
+            // mat write と同じく、入力文字列を read と揃えた型へ正規化して返す。
+            "value": normalize_value(value),
+            "status": "success",
+        }),
+        Op::Invoke {
+            node_id,
+            endpoint,
+            cluster,
+            command,
+            ..
+        } => json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "cluster": cluster,
+            "command": command,
+            "status": "success",
+        }),
+        Op::On { .. } | Op::Off { .. } | Op::ColorTemp { .. } | Op::Color { .. } => {
+            hotpath_success_body(op, None)
         }
         Op::Ping
         | Op::Describe { .. }
@@ -705,6 +804,79 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Op;
+
+    #[test]
+    fn hotpath_routing_selects_native_ops() {
+        // native で処理するホットパス。
+        assert!(is_native_hotpath(&Op::On {
+            node_id: 1,
+            endpoint: 1
+        }));
+        assert!(is_native_hotpath(&Op::Off {
+            node_id: 1,
+            endpoint: 1
+        }));
+        assert!(is_native_hotpath(&Op::ColorTemp {
+            node_id: 1,
+            endpoint: 1,
+            mireds: 370,
+            kelvin: 2700,
+            transition: 0
+        }));
+        assert!(is_native_hotpath(&Op::Color {
+            node_id: 1,
+            endpoint: 1,
+            hue_raw: 0,
+            saturation_raw: 254,
+            hue: 0,
+            saturation: 100,
+            name: None,
+            rgb: None,
+            transition: 0
+        }));
+        // onoff on-off の read だけ native。
+        assert!(is_native_hotpath(&Op::Read {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            attribute: "on-off".into()
+        }));
+    }
+
+    #[test]
+    fn hotpath_routing_leaves_others_to_chip_tool() {
+        // 別 cluster/attr の read は chip-tool へ。
+        assert!(!is_native_hotpath(&Op::Read {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into()
+        }));
+        assert!(!is_native_hotpath(&Op::Write {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+            value: "1".into()
+        }));
+        assert!(!is_native_hotpath(&Op::Describe { node_id: 1 }));
+        assert!(!is_native_hotpath(&Op::Invoke {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "identify".into(),
+            command: "identify".into(),
+            args: vec![]
+        }));
+        assert!(!is_native_hotpath(&Op::GroupInvoke {
+            group_id: 1,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec![],
+            endpoint: 1
+        }));
+        assert!(!is_native_hotpath(&Op::Ping));
+    }
 
     #[test]
     fn ensure_ok_passes_on_empty_results() {

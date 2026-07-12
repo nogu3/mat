@@ -234,7 +234,7 @@ async fn matd_serve(
     store_path: PathBuf,
     backend: Arc<matd::backend::ChipToolBackend>,
 ) {
-    let _ = matd::server::serve(socket, store_path, backend).await;
+    let _ = matd::server::serve(socket, store_path, backend, None).await;
 }
 
 fn rand_suffix() -> u64 {
