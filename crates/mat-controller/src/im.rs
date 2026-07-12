@@ -21,7 +21,9 @@ pub const CMD_ON_OFF_TOGGLE: u32 = 0x02;
 pub const CLUSTER_COLOR_CONTROL: u32 = 0x0300;
 pub const ATTR_CURRENT_HUE: u32 = 0x0000;
 pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
+pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
 pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
+pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -368,6 +370,22 @@ pub fn encode_move_to_hue_and_saturation_fields(
     w.put_uint(Tag::Context(2), u64::from(transition_time_ds));
     w.put_uint(Tag::Context(3), 0);
     w.put_uint(Tag::Context(4), 0);
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for colorcontrol MoveToColorTemperature (cluster spec
+/// §3.2.11.10): `{0: ColorTemperatureMireds(u16), 1: TransitionTime(u16,
+/// 0.1 s units), 2: OptionsMask(u8), 3: OptionsOverride(u8)}`. Options are
+/// fixed to 0 (execute per the device's Options attribute), matching what
+/// chip-tool sends by default.
+pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(mireds));
+    w.put_uint(Tag::Context(1), u64::from(transition_time_ds));
+    w.put_uint(Tag::Context(2), 0);
+    w.put_uint(Tag::Context(3), 0);
     w.end_container();
     w.finish()
 }
@@ -868,5 +886,27 @@ mod tests {
             Some(&fields),
         );
         assert!(!req.is_empty());
+    }
+
+    #[test]
+    fn move_to_color_temperature_fields_match_wire_shape() {
+        // CommandFields (colorcontrol MoveToColorTemperature, cluster §3.2.11.10):
+        // {0: ColorTemperatureMireds(u16), 1: TransitionTime(u16 0.1s),
+        //  2: OptionsMask(u8)=0, 3: OptionsOverride(u8)=0}.
+        // MoveToHueAndSaturation エンコーダと同じ手筋（anonymous struct + context tags）。
+        let bytes = encode_move_to_color_temperature_fields(370, 30);
+        // anonymous struct open (0x15) ... context-tagged uints ... close (0x18)
+        assert_eq!(bytes.first(), Some(&0x15), "opens anonymous struct");
+        assert_eq!(bytes.last(), Some(&0x18), "closes container");
+        // mireds=370=0x0172 が context tag 0 の u16 として載る（0x25 = ctx-tag u16）
+        assert!(
+            bytes.windows(4).any(|w| w == [0x25, 0x00, 0x72, 0x01]),
+            "mireds 370 as ctx-tag-0 u16 little-endian, got {bytes:02X?}"
+        );
+        // transition=30=0x1E が context tag 1 の u8 として載る（0x24 = ctx-tag u8）
+        assert!(
+            bytes.windows(3).any(|w| w == [0x24, 0x01, 0x1E]),
+            "transition 30 as ctx-tag-1 u8, got {bytes:02X?}"
+        );
     }
 }
