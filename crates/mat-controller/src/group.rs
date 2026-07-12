@@ -6,8 +6,15 @@
 //! semantics) and boot-jumps past both its own file and chip-tool's `g/gdc`.
 
 use std::io;
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::crypto::{self, CryptoError};
+use crate::im;
+use crate::kvs::GroupCredentials;
+use crate::message::{Destination, MessageHeader, ProtocolHeader};
+use crate::transport::UdpTransport;
 
 /// Persist-ahead window: the file always stores a value no counter below
 /// which has been handed out, so a crash can never reuse a sent counter.
@@ -76,6 +83,145 @@ impl PersistedGroupCounter {
         std::fs::rename(&tmp, &self.path)?;
         self.ceiling = ceiling;
         Ok(())
+    }
+}
+
+/// Security flags for a group session data message (spec §4.4.1.4:
+/// session type = 1, no privacy).
+pub const GROUP_SECURITY_FLAGS: u8 = 0x01;
+
+/// Multicast hop limit for groupcast sends (Matter SDK default).
+pub const MULTICAST_HOP_LIMIT: u32 = 64;
+
+/// Groupcast send failure: encryption (caller bug / oversized payload) or
+/// socket I/O.
+#[derive(Debug)]
+pub enum GroupSendError {
+    Crypto(CryptoError),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for GroupSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Crypto(e) => write!(f, "group message encryption: {e}"),
+            Self::Io(e) => write!(f, "group multicast send: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GroupSendError {}
+
+/// Builds the encrypted groupcast datagram (pure; unit-testable without
+/// sockets): group-session plain header + CCM-sealed group InvokeRequest.
+#[allow(clippy::too_many_arguments)]
+pub fn build_group_datagram(
+    creds: &GroupCredentials,
+    source_node_id: u64,
+    counter: u32,
+    exchange_id: u16,
+    group_id: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Result<Vec<u8>, CryptoError> {
+    let header = MessageHeader {
+        session_id: creds.session_id,
+        security_flags: GROUP_SECURITY_FLAGS,
+        message_counter: counter,
+        source_node_id: Some(source_node_id),
+        destination: Destination::Group(group_id),
+    };
+    let proto = ProtocolHeader {
+        initiator: true,
+        needs_ack: false, // groupcast is unreliable by spec — no MRP
+        acked_counter: None,
+        opcode: im::OPCODE_INVOKE_REQUEST,
+        exchange_id,
+        protocol_id: im::PROTOCOL_ID_IM,
+        vendor_id: None,
+    };
+    let payload = im::encode_group_invoke_request(cluster, command, fields_tlv);
+    crypto::seal_message(
+        &creds.encryption_key,
+        &header,
+        &proto,
+        &payload,
+        source_node_id,
+    )
+}
+
+/// Send-only groupcast path. Holds no per-group key state: credentials are
+/// passed per call (the caller re-reads the KVS so re-provisioned keys are
+/// picked up immediately).
+pub struct GroupSender {
+    transport: Arc<UdpTransport>,
+    scope_id: u32,
+    dest_port: u16,
+    fabric_id: u64,
+    source_node_id: u64,
+    counter: PersistedGroupCounter,
+}
+
+impl GroupSender {
+    /// Configures the shared socket's multicast hop limit and assembles the
+    /// sender. `dest_port` is `message::MATTER_PORT` in production (tests
+    /// point it at an ephemeral receiver).
+    pub fn new(
+        transport: Arc<UdpTransport>,
+        scope_id: u32,
+        dest_port: u16,
+        fabric_id: u64,
+        source_node_id: u64,
+        counter: PersistedGroupCounter,
+    ) -> std::io::Result<Self> {
+        transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
+        Ok(Self {
+            transport,
+            scope_id,
+            dest_port,
+            fabric_id,
+            source_node_id,
+            counter,
+        })
+    }
+
+    /// Fire-and-forget groupcast InvokeRequest (single send, no response,
+    /// no retransmit). Returns the message counter used, for logging.
+    pub async fn send_invoke(
+        &mut self,
+        creds: &GroupCredentials,
+        group_id: u16,
+        cluster: u32,
+        command: u32,
+        fields_tlv: Option<&[u8]>,
+    ) -> Result<u32, GroupSendError> {
+        let counter = self.counter.next().map_err(GroupSendError::Io)?;
+        let mut ex = [0u8; 2];
+        getrandom::getrandom(&mut ex).expect("os rng");
+        let datagram = build_group_datagram(
+            creds,
+            self.source_node_id,
+            counter,
+            u16::from_le_bytes(ex),
+            group_id,
+            cluster,
+            command,
+            fields_tlv,
+        )
+        .map_err(GroupSendError::Crypto)?;
+        let dest = SocketAddr::V6(SocketAddrV6::new(
+            group_multicast_addr(self.fabric_id, group_id),
+            self.dest_port,
+            0,
+            // multicast 宛先では sin6_scope_id が送出 iface を選ぶ
+            self.scope_id,
+        ));
+        self.transport
+            .send_to(&datagram, dest)
+            .await
+            .map_err(GroupSendError::Io)?;
+        Ok(counter)
     }
 }
 
@@ -157,5 +303,159 @@ mod tests {
         std::fs::write(&p, "not a number").unwrap();
         assert!(PersistedGroupCounter::load(&p, 0).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    use crate::im::{CLUSTER_ON_OFF, CMD_ON_OFF_ON, OPCODE_INVOKE_REQUEST, PROTOCOL_ID_IM};
+    use crate::kvs::GroupCredentials;
+    use crate::message::{Destination, MessageHeader};
+
+    fn test_creds() -> GroupCredentials {
+        GroupCredentials {
+            session_id: 0x855f,
+            encryption_key: [0xDD; 16],
+        }
+    }
+
+    #[test]
+    fn group_datagram_roundtrips_with_group_header() {
+        let dg = build_group_datagram(
+            &test_creds(),
+            0x0001_0001,
+            5000,
+            0x42,
+            10,
+            CLUSTER_ON_OFF,
+            CMD_ON_OFF_ON,
+            None,
+        )
+        .unwrap();
+        // 平文ヘッダ: DSIZ=group(2) + S flag、session type = group。
+        let (header, _) = MessageHeader::decode(&dg).unwrap();
+        assert_eq!(header.session_id, 0x855f);
+        assert_eq!(header.security_flags, GROUP_SECURITY_FLAGS);
+        assert_eq!(header.message_counter, 5000);
+        assert_eq!(header.source_node_id, Some(0x0001_0001));
+        assert_eq!(header.destination, Destination::Group(10));
+        // 復号して protocol header / payload を確認（nonce・AAD が正しい証拠）。
+        let (h2, proto, payload) =
+            crate::crypto::open_message(&test_creds().encryption_key, &dg, 0x0001_0001).unwrap();
+        assert_eq!(h2, header);
+        assert!(proto.initiator);
+        assert!(!proto.needs_ack);
+        assert_eq!(proto.opcode, OPCODE_INVOKE_REQUEST);
+        assert_eq!(proto.protocol_id, PROTOCOL_ID_IM);
+        assert_eq!(
+            payload,
+            crate::im::encode_group_invoke_request(CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+        );
+    }
+
+    /// A network interface eligible to try as the multicast join/egress
+    /// interface for the test below.
+    struct McastCandidate {
+        name: String,
+        index: u32,
+    }
+
+    /// Enumerates interfaces that advertise `IFF_UP | IFF_MULTICAST` via
+    /// `/sys/class/net/*/flags`, excluding `lo` (which lacks the MULTICAST
+    /// flag on Linux — IPv6 multicast never delivers through it, in any
+    /// environment). Interfaces reporting `operstate == "up"` are tried
+    /// first, since flags alone (as seen on some bridge/veth interfaces)
+    /// don't guarantee delivery.
+    fn multicast_capable_interfaces() -> Vec<McastCandidate> {
+        const IFF_UP: u32 = 0x1;
+        const IFF_MULTICAST: u32 = 0x1000;
+        let mut up_first = Vec::new();
+        let mut rest = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let flags = std::fs::read_to_string(base.join("flags"))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
+                continue;
+            }
+            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
+            let candidate = McastCandidate { name, index };
+            if operstate.trim() == "up" {
+                up_first.push(candidate);
+            } else {
+                rest.push(candidate);
+            }
+        }
+        up_first.sort_by_key(|c| c.index);
+        rest.sort_by_key(|c| c.index);
+        up_first.extend(rest);
+        up_first
+    }
+
+    #[tokio::test]
+    async fn group_sender_multicast_loops_back_locally() {
+        use crate::transport::UdpTransport;
+
+        let addr = group_multicast_addr(1, 10);
+        let mut tried = Vec::new();
+
+        for cand in multicast_capable_interfaces() {
+            // Fresh receiver per candidate: a socket can only join a given
+            // multicast group once per interface, and candidates that fail
+            // to join must not poison the next attempt.
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = recv.local_addr().unwrap().port();
+            if recv.join_multicast_v6(&addr, cand.index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+                continue;
+            }
+
+            let p = tmp_counter_path(&format!("sender-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            let mut s =
+                GroupSender::new(transport, cand.index, port, 1, 0x0001_0001, counter).unwrap();
+            let sent_counter = s
+                .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+                .await
+                .unwrap();
+
+            let mut buf = [0u8; 1280];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            let _ = std::fs::remove_file(&p);
+
+            match result {
+                Ok(Ok((n, _))) => {
+                    let (header, _) = MessageHeader::decode(&buf[..n]).unwrap();
+                    assert_eq!(header.destination, Destination::Group(10));
+                    assert_eq!(header.message_counter, sent_counter);
+                    return; // first delivering interface is enough — PASS.
+                }
+                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+            }
+        }
+
+        panic!(
+            "no multicast-capable interface delivered a loopback groupcast \
+             datagram (lo excluded — it lacks IFF_MULTICAST on Linux); \
+             tried: {tried:?}"
+        );
     }
 }
