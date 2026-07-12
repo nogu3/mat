@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 mat-core.workspace = true
+mat-controller.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
