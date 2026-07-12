@@ -16,10 +16,13 @@ use tokio::sync::Mutex;
 
 use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::{compressed_fabric_id, FabricCredentials};
+use mat_controller::group::{GroupSender, PersistedGroupCounter};
 use mat_controller::im::{
     self, ImValue, ATTR_ON_OFF, CLUSTER_COLOR_CONTROL, CLUSTER_ON_OFF,
     CMD_MOVE_TO_COLOR_TEMPERATURE, CMD_MOVE_TO_HUE_AND_SATURATION, CMD_ON_OFF_OFF, CMD_ON_OFF_ON,
 };
+use mat_controller::kvs;
+use mat_controller::message::MATTER_PORT;
 use mat_controller::transport::UdpTransport;
 use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
@@ -59,10 +62,33 @@ pub(crate) trait Establisher: Send + Sync {
 /// 外側 `Arc` を短時間の外側ロック下で clone し、往復は内側 `Mutex` で直列化する。
 type NodeSlot = Arc<Mutex<Option<Box<dyn NodeConn>>>>;
 
+/// group 送信に必要な材料一式。`sender`（counter を内包）は初 group op で
+/// lazy 構築する。鍵は send のたびに KVS から読む（`provision --rebind`
+/// 直後でも stale にならない）。
+pub(crate) struct GroupCtx {
+    pub main_ini: PathBuf,
+    pub counter_path: PathBuf,
+    pub fabric_index: u8,
+    pub fabric_id: u64,
+    pub node_id: u64,
+    pub scope_id: u32,
+    pub dest_port: u16,
+    pub transport: Arc<UdpTransport>,
+    pub sender: Mutex<Option<GroupSender>>,
+}
+
+/// group 送信の結果。`Unavailable` は「native では送れない（未 provision・
+/// KVS 不備等）」で、server 層が chip-tool へフォールバックする合図。
+pub enum GroupOutcome {
+    Sent,
+    Unavailable(String),
+}
+
 /// warm CASE セッションを per-node に保持する native バックエンド。
 pub struct NativeBackend {
     establisher: Box<dyn Establisher>,
     sessions: Mutex<HashMap<u64, NodeSlot>>,
+    group: Option<GroupCtx>,
 }
 
 /// 手動 `Debug`: `Box<dyn Establisher>` / warm セッションは `Debug` を持たず、
@@ -111,19 +137,41 @@ impl NativeBackend {
         let transport = UdpTransport::bind().await.map_err(|e| {
             MatError::new(ErrorKind::Other, format!("native: bind udp transport: {e}"))
         })?;
+        // establisher に creds/transport を move する前に、group 送信に要る値を控える。
+        let fabric_id = creds.fabric_id;
+        let node_id = creds.node_id;
+        let transport = Arc::new(transport);
+        let group = GroupCtx {
+            main_ini,
+            counter_path: cfg.store.join("native_group_counter"),
+            fabric_index: cfg.fabric_index,
+            fabric_id,
+            node_id,
+            scope_id,
+            dest_port: MATTER_PORT,
+            transport: Arc::clone(&transport),
+            sender: Mutex::new(None),
+        };
         let establisher = CaseEstablisher {
             creds: Arc::new(creds),
-            transport: Arc::new(transport),
+            transport,
             scope_id,
         };
-        Ok(Self::with_establisher(Box::new(establisher)))
+        Ok(Self::with_parts(Box::new(establisher), Some(group)))
     }
 
-    /// テスト用: 任意の Establisher を注入する。
+    /// テスト用: 任意の Establisher を注入する（group 送信は無効）。
+    #[cfg(test)]
     pub(crate) fn with_establisher(establisher: Box<dyn Establisher>) -> Self {
+        Self::with_parts(establisher, None)
+    }
+
+    /// テスト用: Establisher と group 送信コンテキストの両方を注入する。
+    pub(crate) fn with_parts(establisher: Box<dyn Establisher>, group: Option<GroupCtx>) -> Self {
         Self {
             establisher,
             sessions: Mutex::new(HashMap::new()),
+            group,
         }
     }
 
@@ -244,6 +292,81 @@ impl NativeBackend {
         })
         .await
     }
+
+    /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
+    /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
+    /// （socket）だけを Err にする。
+    pub async fn group_invoke(
+        &self,
+        group_id: u16,
+        cluster: u32,
+        command: u32,
+        fields: Option<Vec<u8>>,
+    ) -> Result<GroupOutcome, MatError> {
+        let Some(ctx) = &self.group else {
+            return Ok(GroupOutcome::Unavailable(
+                "native group context not configured".into(),
+            ));
+        };
+        let creds = match kvs::read_group_credentials(&ctx.main_ini, ctx.fabric_index, group_id) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(GroupOutcome::Unavailable(format!(
+                    "group {group_id} credentials: {e} (not provisioned? run `mat group provision`)"
+                )))
+            }
+        };
+        let mut slot = ctx.sender.lock().await;
+        if slot.is_none() {
+            let gdc = match kvs::read_group_data_counter(&ctx.main_ini) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    return Ok(GroupOutcome::Unavailable(
+                        "chip-tool g/gdc missing; refusing to start the group counter low".into(),
+                    ))
+                }
+                Err(e) => return Ok(GroupOutcome::Unavailable(format!("read g/gdc: {e}"))),
+            };
+            let counter = match PersistedGroupCounter::load(&ctx.counter_path, gdc) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(GroupOutcome::Unavailable(format!(
+                        "group counter store: {e}"
+                    )))
+                }
+            };
+            match GroupSender::new(
+                Arc::clone(&ctx.transport),
+                ctx.scope_id,
+                ctx.dest_port,
+                ctx.fabric_id,
+                ctx.node_id,
+                counter,
+            ) {
+                Ok(s) => *slot = Some(s),
+                Err(e) => {
+                    return Ok(GroupOutcome::Unavailable(format!(
+                        "multicast socket setup: {e}"
+                    )))
+                }
+            }
+        }
+        match slot
+            .as_mut()
+            .expect("built above")
+            .send_invoke(&creds, group_id, cluster, command, fields.as_deref())
+            .await
+        {
+            Ok(counter) => {
+                tracing::info!(group_id, counter, "groupcast sent (native)");
+                Ok(GroupOutcome::Sent)
+            }
+            Err(e) => Err(MatError::new(
+                ErrorKind::Unreachable,
+                format!("groupcast send to group {group_id}: {e}"),
+            )),
+        }
+    }
 }
 
 /// 実確立器: 保持した資格情報で mDNS 解決 → CASE。
@@ -348,19 +471,23 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     }
 }
 
+/// テストヘルパ置き場。Task 6 の server ルーティングテストからも
+/// `use crate::native::test_support::*;` で使うため `pub(crate)`。
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use base64ct::{Base64, Encoding};
+    use mat_controller::tlv::{Tag, Writer};
 
     /// 送信 1 回目に `fail_kind` で失敗するよう設定できる fake セッション。
     /// `sent` は `&mut self` 下でのみ触るので素の `usize` で足りる（atomic 不要）。
-    struct FakeConn {
-        fail_first_send: bool,
-        fail_kind: ErrorKind,
-        sent: usize,
+    pub(crate) struct FakeConn {
+        pub(crate) fail_first_send: bool,
+        pub(crate) fail_kind: ErrorKind,
+        pub(crate) sent: usize,
     }
 
     #[async_trait]
@@ -386,11 +513,22 @@ mod tests {
 
     /// establish 呼び出し回数を外部の `Arc<AtomicUsize>` で数える fake。
     /// `fail_first_send`/`fail_kind` を確立する Conn に伝える
-    /// （2 回目の確立=再確立では成功させる）。
-    struct FakeEstablisher {
-        calls: std::sync::Arc<AtomicUsize>,
-        fail_first_send: bool,
-        fail_kind: ErrorKind,
+    /// （2 回目の確立=再確立では成功させる）。デフォルトは常に成功する
+    /// establish（group_invoke テストのように失敗パスを使わない場合向け）。
+    pub(crate) struct FakeEstablisher {
+        pub(crate) calls: std::sync::Arc<AtomicUsize>,
+        pub(crate) fail_first_send: bool,
+        pub(crate) fail_kind: ErrorKind,
+    }
+
+    impl Default for FakeEstablisher {
+        fn default() -> Self {
+            Self {
+                calls: std::sync::Arc::new(AtomicUsize::new(0)),
+                fail_first_send: false,
+                fail_kind: ErrorKind::Timeout,
+            }
+        }
     }
 
     #[async_trait]
@@ -404,6 +542,60 @@ mod tests {
             }))
         }
     }
+
+    /// KeyMapData blob（`f/<idx>/gk/<n>`）: struct{ctx1:group_id,
+    /// ctx2:keyset_id, ctx3:next}。`crate::kvs` のテストフィクスチャと同構造。
+    fn keymap_blob(group_id: u16, keyset_id: u16, next: u8) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(group_id));
+        w.put_uint(Tag::Context(2), u64::from(keyset_id));
+        w.put_uint(Tag::Context(3), u64::from(next));
+        w.end_container();
+        w.finish()
+    }
+
+    /// keyset blob（`f/<idx>/k/<n>`）: struct{ctx1:policy, ctx2:keys_count,
+    /// ctx3:array[struct{ctx4:start_time, ctx5:hash, ctx6:key(16B)}],
+    /// ctx7:next}。`crate::kvs` のテストフィクスチャと同構造（配列は1エントリ
+    /// のみで十分 — parser は最初のエントリだけ見る）。
+    fn keyset_blob(hash: u16, key: &[u8; 16]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0); // policy
+        w.put_uint(Tag::Context(2), 1); // keys_count
+        w.start_array(Tag::Context(3));
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(4), 0); // start_time
+        w.put_uint(Tag::Context(5), u64::from(hash));
+        w.put_bytes(Tag::Context(6), key);
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(7), 0xFFFF); // next keyset id（無視される）
+        w.end_container();
+        w.finish()
+    }
+
+    /// fabric index 2 に group 10 → keyset 0x3c（hash 0x855f, key
+    /// `[0xDD;16]`）と `g/gdc = 1000` を持つ chip-tool KVS ini フィクスチャを
+    /// 書く。Task 6 の server ルーティングテストからも使う。
+    pub(crate) fn write_group_fixture_ini(path: &std::path::Path) {
+        let gk = keymap_blob(10, 0x3c, 0);
+        let ks = keyset_blob(0x855f, &[0xDD; 16]);
+        let gdc = 1000u32.to_le_bytes();
+        let mut body = String::from("[Default]\n");
+        body.push_str(&format!("f/2/gk/1 = {}\n", Base64::encode_string(&gk)));
+        body.push_str(&format!("f/2/k/3c = {}\n", Base64::encode_string(&ks)));
+        body.push_str(&format!("g/gdc = {}\n", Base64::encode_string(&gdc)));
+        std::fs::write(path, body).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn reuses_warm_session_for_same_node() {
@@ -506,6 +698,143 @@ mod tests {
             matches!(err.kind, ErrorKind::StoreMissing | ErrorKind::Other),
             "unexpected kind: {:?}",
             err.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn group_invoke_without_ctx_is_unavailable() {
+        let b = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let r = b
+            .group_invoke(10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
+            .await
+            .unwrap();
+        assert!(matches!(r, GroupOutcome::Unavailable(_)));
+    }
+
+    /// A network interface eligible to try as the multicast join/egress
+    /// interface for the test below. Same discovery logic as
+    /// `mat_controller::group`'s `group_sender_multicast_loops_back_locally`
+    /// test (private there, so duplicated here): `lo` lacks `IFF_MULTICAST`
+    /// on Linux and never delivers.
+    struct McastCandidate {
+        name: String,
+        index: u32,
+    }
+
+    fn multicast_capable_interfaces() -> Vec<McastCandidate> {
+        const IFF_UP: u32 = 0x1;
+        const IFF_MULTICAST: u32 = 0x1000;
+        let mut up_first = Vec::new();
+        let mut rest = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let flags = std::fs::read_to_string(base.join("flags"))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
+                continue;
+            }
+            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
+            let candidate = McastCandidate { name, index };
+            if operstate.trim() == "up" {
+                up_first.push(candidate);
+            } else {
+                rest.push(candidate);
+            }
+        }
+        up_first.sort_by_key(|c| c.index);
+        rest.sort_by_key(|c| c.index);
+        up_first.extend(rest);
+        up_first
+    }
+
+    #[tokio::test]
+    async fn group_invoke_sends_multicast_and_reports_sent() {
+        // フィクスチャ ini（gk + keyset + g/gdc）と loopback 受信で end-to-end。
+        // `lo` は multicast join を受け付けないので、実際に配達できる iface を
+        // 実行時に探す（`scope_id` はループの試行ごとに決まる）。
+        let dir = std::env::temp_dir().join(format!("mat-native-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+
+        let mut tried = Vec::new();
+        for cand in multicast_capable_interfaces() {
+            // 候補ごとに新しい受信ソケット: 1 ソケットは同じ multicast group に
+            // 1回しか join できず、失敗した候補が次を汚染してはいけない。
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = recv.local_addr().unwrap().port();
+            if recv
+                .join_multicast_v6(
+                    &mat_controller::group::group_multicast_addr(1, 10),
+                    cand.index,
+                )
+                .is_err()
+            {
+                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+                continue;
+            }
+
+            let counter_path = dir.join(format!("native_group_counter-{}", cand.index));
+            let _ = std::fs::remove_file(&counter_path);
+            let transport = Arc::new(UdpTransport::bind().await.unwrap());
+            let ctx = GroupCtx {
+                main_ini: ini.clone(),
+                counter_path,
+                fabric_index: 2,
+                fabric_id: 1,
+                node_id: 0x0001_0001,
+                scope_id: cand.index,
+                dest_port: port,
+                transport,
+                sender: Mutex::new(None),
+            };
+            let b = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
+            let r = b
+                .group_invoke(10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
+                .await
+                .unwrap();
+            assert!(matches!(r, GroupOutcome::Sent));
+
+            let mut buf = [0u8; 1280];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            match result {
+                Ok(Ok(_)) => {
+                    // 未 provision group は Unavailable（フォールバックさせる）。
+                    let r = b
+                        .group_invoke(99, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
+                        .await
+                        .unwrap();
+                    assert!(matches!(r, GroupOutcome::Unavailable(_)));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return; // 配達できる iface が見つかった時点で PASS。
+                }
+                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!(
+            "no multicast-capable interface delivered a loopback groupcast \
+             datagram (lo excluded — it lacks IFF_MULTICAST on Linux); \
+             tried: {tried:?}"
         );
     }
 }
