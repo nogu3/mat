@@ -42,6 +42,13 @@ impl UdpTransport {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+
+    /// Sets the hop limit for multicast sends. The OS default of 1 never
+    /// crosses the border router, so groupcast callers must raise it
+    /// (Matter SDK uses 64). Unicast sends are unaffected.
+    pub fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
+        socket2::SockRef::from(&self.socket).set_multicast_hops_v6(hops)
+    }
 }
 
 #[cfg(test)]

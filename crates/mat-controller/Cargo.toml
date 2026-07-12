@@ -17,6 +17,7 @@ sha1 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+socket2 = "0.6"
 
 [dev-dependencies]
 serde_json = { workspace = true }
