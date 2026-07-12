@@ -338,18 +338,21 @@ mod tests {
 
     use async_trait::async_trait;
 
-    /// 送信 n 回目に Timeout を返すよう設定できる fake セッション。
+    /// 送信 1 回目に `fail_kind` で失敗するよう設定できる fake セッション。
+    /// `sent` は `&mut self` 下でのみ触るので素の `usize` で足りる（atomic 不要）。
     struct FakeConn {
         fail_first_send: bool,
-        sent: AtomicUsize,
+        fail_kind: ErrorKind,
+        sent: usize,
     }
 
     #[async_trait]
     impl NodeConn for FakeConn {
         async fn read_onoff(&mut self, _endpoint: u16) -> Result<bool, MatError> {
-            let n = self.sent.fetch_add(1, Ordering::SeqCst);
+            let n = self.sent;
+            self.sent += 1;
             if self.fail_first_send && n == 0 {
-                return Err(MatError::new(ErrorKind::Timeout, "fake MRP exhausted"));
+                return Err(MatError::new(self.fail_kind, "fake send failure"));
             }
             Ok(true)
         }
@@ -365,10 +368,12 @@ mod tests {
     }
 
     /// establish 呼び出し回数を外部の `Arc<AtomicUsize>` で数える fake。
-    /// `fail_first_send` を確立する Conn に伝える（2 回目の確立=再確立では成功）。
+    /// `fail_first_send`/`fail_kind` を確立する Conn に伝える
+    /// （2 回目の確立=再確立では成功させる）。
     struct FakeEstablisher {
         calls: std::sync::Arc<AtomicUsize>,
         fail_first_send: bool,
+        fail_kind: ErrorKind,
     }
 
     #[async_trait]
@@ -377,7 +382,8 @@ mod tests {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeConn {
                 fail_first_send: self.fail_first_send && n == 0,
-                sent: AtomicUsize::new(0),
+                fail_kind: self.fail_kind,
+                sent: 0,
             }))
         }
     }
@@ -388,6 +394,7 @@ mod tests {
         let est = FakeEstablisher {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: false,
+            fail_kind: ErrorKind::Timeout,
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         backend.read_onoff(0x1234, 1).await.unwrap();
@@ -402,12 +409,32 @@ mod tests {
         let est = FakeEstablisher {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が Timeout → slot 破棄 → 再確立 → 再送成功。
         let v = backend.read_onoff(0x1234, 1).await.unwrap();
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_re_establish_on_device_rejected() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            fail_first_send: true,
+            fail_kind: ErrorKind::DeviceRejected,
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        // 1 回目の send が DeviceRejected（コマンドは届いている）→ 再確立せず
+        // そのままエラーを返す契約 (3)。
+        let err = backend
+            .read_onoff(0x1234, 1)
+            .await
+            .expect_err("device rejected must surface as an error");
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
