@@ -29,6 +29,7 @@
 //! pre-live guard.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -347,13 +348,15 @@ async fn case_establishes_and_reads_over_loopback() {
     };
     let creds = FabricCredentials::from_self_issued(materials).expect("self-issued creds");
 
-    let initiator_transport = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-        .await
-        .unwrap();
+    let initiator_transport = Arc::new(
+        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap(),
+    );
 
     let cfg = fast_cfg();
     let mut session = case::establish(
-        &initiator_transport,
+        Arc::clone(&initiator_transport),
         responder_addr,
         &creds,
         responder_node_id,

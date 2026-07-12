@@ -6,6 +6,7 @@
 //! this type owns them and exchanges are just an `exchange_id` argument.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -78,8 +79,8 @@ impl From<CryptoError> for SessionError {
 }
 
 /// One secured unicast session, this side as the exchange initiator, with MRP.
-pub struct SecureSession<'t> {
-    transport: &'t UdpTransport,
+pub struct SecureSession {
+    transport: Arc<UdpTransport>,
     peer: SocketAddr,
     local_session_id: u16,
     peer_session_id: u16,
@@ -90,9 +91,9 @@ pub struct SecureSession<'t> {
     rx_window: RxWindow,
 }
 
-impl<'t> SecureSession<'t> {
+impl SecureSession {
     pub fn new(
-        transport: &'t UdpTransport,
+        transport: Arc<UdpTransport>,
         peer: SocketAddr,
         local_session_id: u16,
         peer_session_id: u16,
@@ -523,9 +524,9 @@ mod tests {
     async fn send_reliable_encrypts_and_completes_on_sealed_ack() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -567,10 +568,10 @@ mod tests {
     async fn recv_decrypts_dedups_and_acks() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let local = transport.local_addr().unwrap();
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -616,10 +617,10 @@ mod tests {
     async fn ignores_wrong_key_wrong_session_and_wrong_exchange() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let local = transport.local_addr().unwrap();
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -685,10 +686,10 @@ mod tests {
     async fn acks_foreign_exchange_needs_ack_message_with_its_own_exchange_id() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let local = transport.local_addr().unwrap();
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -798,9 +799,9 @@ mod tests {
     async fn read_attribute_roundtrip() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -876,9 +877,9 @@ mod tests {
     async fn read_attribute_succeeds_even_if_closing_status_response_unacked() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -945,9 +946,9 @@ mod tests {
     async fn invoke_maps_nonzero_status_to_command_status_error() {
         let device = bind_local().await;
         let peer = device.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = Arc::new(bind_local().await);
         let mut s = SecureSession::new(
-            &transport,
+            Arc::clone(&transport),
             peer,
             LOCAL_SID,
             PEER_SID,
@@ -999,9 +1000,9 @@ mod tests {
         {
             let device = bind_local().await;
             let peer = device.local_addr().unwrap();
-            let transport = bind_local().await;
+            let transport = Arc::new(bind_local().await);
             let mut s = SecureSession::new(
-                &transport,
+                Arc::clone(&transport),
                 peer,
                 LOCAL_SID,
                 PEER_SID,
@@ -1047,9 +1048,9 @@ mod tests {
         {
             let device = bind_local().await;
             let peer = device.local_addr().unwrap();
-            let transport = bind_local().await;
+            let transport = Arc::new(bind_local().await);
             let mut s = SecureSession::new(
-                &transport,
+                Arc::clone(&transport),
                 peer,
                 LOCAL_SID,
                 PEER_SID,

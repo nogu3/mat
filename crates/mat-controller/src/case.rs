@@ -7,6 +7,7 @@
 //! callers only see `establish()` and a `SecureSession` on success.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -419,13 +420,13 @@ fn encode_sigma3(encrypted3: &[u8]) -> Vec<u8> {
 
 /// Runs the CASE initiator handshake against `peer` and returns the
 /// resulting secured session on success.
-pub async fn establish<'t>(
-    transport: &'t UdpTransport,
+pub async fn establish(
+    transport: Arc<UdpTransport>,
     peer: SocketAddr,
     creds: &FabricCredentials,
     peer_node_id: u64,
     cfg: &MrpConfig,
-) -> Result<SecureSession<'t>, CaseError> {
+) -> Result<SecureSession, CaseError> {
     // 1. Material: initiator random / ephemeral key pair / local session id.
     let mut initiator_random = [0u8; 32];
     getrandom::getrandom(&mut initiator_random).expect("os rng");
@@ -445,7 +446,7 @@ pub async fn establish<'t>(
     let mut transcript = Sha256::new();
     transcript.update(&sigma1);
 
-    let mut ex = UnsecuredExchange::new(transport, peer);
+    let mut ex = UnsecuredExchange::new(&transport, peer);
     let resp = ex
         .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_CASE_SIGMA1, &sigma1, cfg)
         .await
