@@ -589,6 +589,58 @@ pub(crate) mod test_support {
         body.push_str(&format!("g/gdc = {}\n", Base64::encode_string(&gdc)));
         std::fs::write(path, body).unwrap();
     }
+
+    /// A network interface eligible to try as the multicast join/egress
+    /// interface for multicast-loopback tests. Same discovery logic as
+    /// `mat_controller::group`'s `group_sender_multicast_loops_back_locally`
+    /// test (private there, so duplicated here): `lo` lacks `IFF_MULTICAST`
+    /// on Linux and never delivers. Shared here (rather than duplicated a
+    /// third time) for both `native.rs` and `server.rs` group-routing tests.
+    pub(crate) struct McastCandidate {
+        pub(crate) name: String,
+        pub(crate) index: u32,
+    }
+
+    pub(crate) fn multicast_capable_interfaces() -> Vec<McastCandidate> {
+        const IFF_UP: u32 = 0x1;
+        const IFF_MULTICAST: u32 = 0x1000;
+        let mut up_first = Vec::new();
+        let mut rest = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let flags = std::fs::read_to_string(base.join("flags"))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
+                continue;
+            }
+            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
+            let candidate = McastCandidate { name, index };
+            if operstate.trim() == "up" {
+                up_first.push(candidate);
+            } else {
+                rest.push(candidate);
+            }
+        }
+        up_first.sort_by_key(|c| c.index);
+        rest.sort_by_key(|c| c.index);
+        up_first.extend(rest);
+        up_first
+    }
 }
 
 #[cfg(test)]
@@ -709,57 +761,6 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, GroupOutcome::Unavailable(_)));
-    }
-
-    /// A network interface eligible to try as the multicast join/egress
-    /// interface for the test below. Same discovery logic as
-    /// `mat_controller::group`'s `group_sender_multicast_loops_back_locally`
-    /// test (private there, so duplicated here): `lo` lacks `IFF_MULTICAST`
-    /// on Linux and never delivers.
-    struct McastCandidate {
-        name: String,
-        index: u32,
-    }
-
-    fn multicast_capable_interfaces() -> Vec<McastCandidate> {
-        const IFF_UP: u32 = 0x1;
-        const IFF_MULTICAST: u32 = 0x1000;
-        let mut up_first = Vec::new();
-        let mut rest = Vec::new();
-        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-            return Vec::new();
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "lo" {
-                continue;
-            }
-            let base = entry.path();
-            let flags = std::fs::read_to_string(base.join("flags"))
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
-                continue;
-            }
-            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
-            let candidate = McastCandidate { name, index };
-            if operstate.trim() == "up" {
-                up_first.push(candidate);
-            } else {
-                rest.push(candidate);
-            }
-        }
-        up_first.sort_by_key(|c| c.index);
-        rest.sort_by_key(|c| c.index);
-        up_first.extend(rest);
-        up_first
     }
 
     #[tokio::test]
