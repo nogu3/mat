@@ -115,7 +115,9 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
-    server::serve(&socket, store_path, Arc::new(backend))
+    // TODO(M4/Task 7): native backend wiring lands in a later task; pass None for now
+    // so all ops keep going through chip-tool until the CLI flag/config exists.
+    server::serve(&socket, store_path, Arc::new(backend), None)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
