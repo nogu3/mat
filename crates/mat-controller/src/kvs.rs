@@ -66,6 +66,11 @@ pub enum KvsError {
         reason: &'static str,
     },
     BadCaKey(&'static str),
+    GroupNotFound {
+        fabric_index: u8,
+        group_id: u16,
+    },
+    BadCounter(&'static str),
 }
 
 impl std::fmt::Display for KvsError {
@@ -94,6 +99,16 @@ impl std::fmt::Display for KvsError {
                 write!(f, "kvs key \"f/{fabric_index}/n\": bad noc: {reason}")
             }
             KvsError::BadCaKey(reason) => write!(f, "kvs: bad CA key: {reason}"),
+            KvsError::GroupNotFound {
+                fabric_index,
+                group_id,
+            } => {
+                write!(
+                    f,
+                    "kvs: group {group_id} not found in fabric {fabric_index}'s GroupKeyMap"
+                )
+            }
+            KvsError::BadCounter(reason) => write!(f, "kvs key \"g/gdc\": {reason}"),
         }
     }
 }
@@ -263,8 +278,9 @@ fn skip_rest_of_container(r: &mut Reader, fabric_index: u8) -> Result<(), KvsErr
 }
 
 /// Parses one `GroupKey` struct (start_time / hash / key bytes) from within
-/// the keyset's key array, returning the 16-byte operational key.
-fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<[u8; 16], KvsError> {
+/// the keyset's key array, returning the 16-byte operational key and its
+/// 16-bit hash (the group session id, aka GKH).
+fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], u16), KvsError> {
     let el = next_keyset_el(r, fabric_index)?;
     if el.value != Value::StructStart {
         return Err(KvsError::BadKeyset {
@@ -274,10 +290,17 @@ fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<[u8; 16], KvsErr
     }
 
     let mut key: Option<[u8; 16]> = None;
+    let mut hash: Option<u16> = None;
     loop {
         let el = next_keyset_el(r, fabric_index)?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
+            (Tag::Context(5), Value::Uint(v)) => {
+                hash = Some(u16::try_from(v).map_err(|_| KvsError::BadKeyset {
+                    fabric_index,
+                    reason: "hash out of range",
+                })?);
+            }
             (Tag::Context(6), Value::Bytes(b)) => {
                 if b.len() != 16 {
                     return Err(KvsError::BadKeyset {
@@ -295,16 +318,21 @@ fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<[u8; 16], KvsErr
             _ => {}
         }
     }
-    key.ok_or(KvsError::BadKeyset {
+    let key = key.ok_or(KvsError::BadKeyset {
         fabric_index,
         reason: "missing operational key",
-    })
+    })?;
+    let hash = hash.ok_or(KvsError::BadKeyset {
+        fabric_index,
+        reason: "missing key hash",
+    })?;
+    Ok((key, hash))
 }
 
-/// Parses the chip-tool `KeySet` TLV blob, returning the operational group
-/// key (`ipk_operational`) of the first entry in the key array. `keys_count`
-/// (Context(2)) must be at least 1; unknown tags/containers are skipped.
-fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
+/// Parses the chip-tool `KeySet` TLV blob, returning the operational key and
+/// hash of the first entry in the key array. `keys_count` (Context(2)) must
+/// be at least 1; unknown tags/containers are skipped.
+fn parse_keyset_first_entry(blob: &[u8], fabric_index: u8) -> Result<([u8; 16], u16), KvsError> {
     let mut r = Reader::new(blob);
 
     let el = next_keyset_el(&mut r, fabric_index)?;
@@ -316,7 +344,7 @@ fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
     }
 
     let mut keys_count: Option<u64> = None;
-    let mut ipk: Option<[u8; 16]> = None;
+    let mut entry: Option<([u8; 16], u16)> = None;
 
     loop {
         let el = next_keyset_el(&mut r, fabric_index)?;
@@ -324,7 +352,7 @@ fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(2), Value::Uint(v)) => keys_count = Some(v),
             (Tag::Context(3), Value::ArrayStart) => {
-                ipk = Some(parse_key_struct(&mut r, fabric_index)?);
+                entry = Some(parse_key_struct(&mut r, fabric_index)?);
                 skip_rest_of_container(&mut r, fabric_index)?;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
@@ -344,10 +372,18 @@ fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
             reason: "keys_count must be >= 1",
         });
     }
-    ipk.ok_or(KvsError::BadKeyset {
+    entry.ok_or(KvsError::BadKeyset {
         fabric_index,
         reason: "missing key entries",
     })
+}
+
+/// Parses the chip-tool `KeySet` TLV blob, returning the operational group
+/// key (`ipk_operational`) of the first entry in the key array. Thin wrapper
+/// over [`parse_keyset_first_entry`] that discards the hash, kept separate so
+/// the IPK read path's behavior and error reasons stay unchanged.
+fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
+    parse_keyset_first_entry(blob, fabric_index).map(|(key, _hash)| key)
 }
 
 /// Reads the five fabric credentials chip-tool's CASE implementation needs
@@ -478,6 +514,102 @@ pub fn read_self_issue_materials(
         node_id,
         fabric_id,
     })
+}
+
+/// Group send credentials from the GroupKeyMap + keyset blob: the group
+/// session id (the keyset's GKH) and the operational encryption key.
+#[derive(Clone)]
+pub struct GroupCredentials {
+    pub session_id: u16,
+    pub encryption_key: [u8; 16],
+}
+
+/// Manual `Debug`: carries the operational group encryption key, a secret.
+/// See `RawFabricCredentials`'s `Debug` impl for the same rationale.
+impl std::fmt::Debug for GroupCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupCredentials")
+            .field("session_id", &self.session_id)
+            .field("encryption_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// KeyMapData blob (`f/<idx>/gk/<n>`): struct{ ctx1: group_id, ctx2:
+/// keyset_id, ctx3: next }. Verified against a live v1.4.2.0 store.
+/// Malformed entries yield `None` so the scan can skip them.
+fn parse_keymap_entry(blob: &[u8]) -> Option<(u16, u16)> {
+    let mut r = Reader::new(blob);
+    if r.next().ok()??.value != Value::StructStart {
+        return None;
+    }
+    let (mut group, mut keyset) = (None, None);
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::Uint(v)) => group = u16::try_from(v).ok(),
+            (Tag::Context(2), Value::Uint(v)) => keyset = u16::try_from(v).ok(),
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_rest_of_container(&mut r, 0).ok()?;
+            }
+            _ => {}
+        }
+    }
+    Some((group?, keyset?))
+}
+
+/// Reads the send credentials for `group_id`: scans the GroupKeyMap
+/// (`f/<idx>/gk/1..=ff`, sparse after removals, so no early stop) for the
+/// keyset id, then takes the first key entry's hash + operational key from
+/// the keyset blob.
+pub fn read_group_credentials(
+    path: &Path,
+    fabric_index: u8,
+    group_id: u16,
+) -> Result<GroupCredentials, KvsError> {
+    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
+    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    let mut keyset_id = None;
+    for n in 1u32..=0xff {
+        let Some(blob) = decode_b64(section, &format!("f/{fabric_index}/gk/{n:x}"))? else {
+            continue;
+        };
+        if let Some((gid, ksid)) = parse_keymap_entry(&blob) {
+            if gid == group_id {
+                keyset_id = Some(ksid);
+                break;
+            }
+        }
+    }
+    let keyset_id = keyset_id.ok_or(KvsError::GroupNotFound {
+        fabric_index,
+        group_id,
+    })?;
+    let key = format!("f/{fabric_index}/k/{keyset_id:x}");
+    let blob = decode_b64(section, &key)?.ok_or(KvsError::KeyMissing(key))?;
+    // parse_keyset と同じ枠組みで最初の key entry の (key, hash) を取る。
+    let (encryption_key, session_id) = parse_keyset_first_entry(&blob, fabric_index)?;
+    Ok(GroupCredentials {
+        session_id,
+        encryption_key,
+    })
+}
+
+/// Reads chip-tool's persisted Global Group Data Counter (`g/gdc`, u32 LE).
+pub fn read_group_data_counter(path: &Path) -> Result<Option<u32>, KvsError> {
+    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
+    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    match decode_b64(section, "g/gdc")? {
+        None => Ok(None),
+        Some(b) => {
+            let arr: [u8; 4] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| KvsError::BadCounter("g/gdc must be 4 bytes"))?;
+            Ok(Some(u32::from_le_bytes(arr)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -785,5 +917,111 @@ mod tests {
         );
         std::fs::remove_file(alpha).ok();
         std::fs::remove_file(main).ok();
+    }
+
+    fn keymap_blob(group_id: u16, keyset_id: u16, next: u8) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(group_id));
+        w.put_uint(Tag::Context(2), u64::from(keyset_id));
+        w.put_uint(Tag::Context(3), u64::from(next));
+        w.end_container();
+        w.finish()
+    }
+
+    fn keyset_blob_with_hash(key: &[u8; 16], hash: u16) -> Vec<u8> {
+        // keyset_blob_with_count と同構造だが最初のエントリの ctx5 に hash を焼く
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_uint(Tag::Context(2), 1);
+        w.start_array(Tag::Context(3));
+        for i in 0..3u8 {
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(4), u64::from(i == 0));
+            w.put_uint(Tag::Context(5), if i == 0 { u64::from(hash) } else { 0 });
+            w.put_bytes(Tag::Context(6), if i == 0 { key } else { &[0u8; 16] });
+            w.end_container();
+        }
+        w.end_container();
+        w.put_uint(Tag::Context(7), 0);
+        w.end_container();
+        w.finish()
+    }
+
+    const GROUP_KEY: [u8; 16] = [0xDD; 16];
+
+    #[test]
+    fn reads_group_credentials_scanning_past_builtin_entries() {
+        // 実機と同形: chip-tool 組み込みサンプル (0x101→0x1a1) が先に居て、
+        // 本命 (group 10 → keyset 0x3c) が gk/4 に居る。
+        let path = write_ini(&[
+            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 2)[..]),
+            ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/1a1", &keyset_blob_with_hash(&[0xEE; 16], 0x1111)[..]),
+            ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
+        ]);
+        let c = read_group_credentials(&path, 2, 10).unwrap();
+        assert_eq!(c.session_id, 0x855f);
+        assert_eq!(c.encryption_key, GROUP_KEY);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn group_not_in_keymap_is_group_not_found() {
+        let path = write_ini(&[("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 0)[..])]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn keymap_hit_without_keyset_blob_is_key_missing() {
+        let path = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::KeyMissing(k)) if k == "f/2/k/3c"
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn malformed_keymap_entry_is_skipped() {
+        // gk/1 が壊れていても gk/2 の本命は見つかる（容認的走査）。
+        let path = write_ini(&[
+            ("f/2/gk/1", &[0xFF, 0x00][..]),
+            ("f/2/gk/2", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
+        ]);
+        assert_eq!(
+            read_group_credentials(&path, 2, 10).unwrap().session_id,
+            0x855f
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reads_group_data_counter_u32_le() {
+        let path = write_ini(&[("g/gdc", &175851168u32.to_le_bytes()[..])]);
+        assert_eq!(read_group_data_counter(&path).unwrap(), Some(175851168));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn missing_gdc_is_none_and_bad_length_is_error() {
+        let none = write_ini(&[("f/2/n", &[0u8][..])]);
+        assert_eq!(read_group_data_counter(&none).unwrap(), None);
+        std::fs::remove_file(&none).ok();
+        let bad = write_ini(&[("g/gdc", &[1u8, 2, 3][..])]);
+        assert!(matches!(
+            read_group_data_counter(&bad),
+            Err(KvsError::BadCounter(_))
+        ));
+        std::fs::remove_file(bad).ok();
     }
 }
