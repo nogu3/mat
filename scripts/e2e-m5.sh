@@ -115,6 +115,14 @@ ssh "$MAT_E2E_HOST" \
   MAT_E2E_ENDPOINT="$ENDPOINT" \
   'exec /tmp/live_matd_group --ignored --nocapture matd_group_roundtrip'
 
+# 最終レビュー指摘: native が無効（フォールバック先の chip-tool のみ）でも
+# roundtrip/after_restart テスト自体は全 op が chip-tool 経由で "sent" を返し
+# 通ってしまう — silent full fallback を検出できない。restart 前後の
+# ログ行数を記録しておき、末尾で「native 送信ログが restart 前後の両方に
+# 実在するか」と「counter が単調増加か」を実アサーションにする。
+PRE_RESTART_LINES=$(ssh "$MAT_E2E_HOST" 'wc -l < /tmp/matd-m5.log' | tr -d '[:space:]')
+PRE_RESTART_LINES="${PRE_RESTART_LINES:-0}"
+
 echo "== 5/5 matd 再起動 → jump-ahead 配達検証"
 ssh "$MAT_E2E_HOST" 'kill "$(cat /tmp/matd-m5.pid)" 2>/dev/null; sleep 1' || true
 start_matd
@@ -125,6 +133,46 @@ ssh "$MAT_E2E_HOST" \
   MAT_E2E_ENDPOINT="$ENDPOINT" \
   'exec /tmp/live_matd_group --ignored --nocapture matd_group_after_restart'
 
-echo "== counter 履歴（jump-ahead の目視確認用）"
-ssh "$MAT_E2E_HOST" 'grep "groupcast sent" /tmp/matd-m5.log || true'
+echo "== counter 履歴（native groupcast 送信ログ; ログ形式は"
+echo "   tracing::info!(group_id, counter, \"groupcast sent (native)\") の rendering）"
+FULL_LOG=$(ssh "$MAT_E2E_HOST" 'cat /tmp/matd-m5.log')
+printf '%s\n' "$FULL_LOG" | grep "groupcast sent" || true   # 目視確認用の人間可読出力
+
+BEFORE_COUNT=$(printf '%s\n' "$FULL_LOG" | head -n "$PRE_RESTART_LINES" \
+  | grep -c "groupcast sent (native)" || true)
+AFTER_COUNT=$(printf '%s\n' "$FULL_LOG" | tail -n "+$((PRE_RESTART_LINES + 1))" \
+  | grep -c "groupcast sent (native)" || true)
+
+if [ "${BEFORE_COUNT:-0}" -lt 1 ]; then
+  echo "FAIL: no 'groupcast sent (native)' log line found BEFORE the restart." >&2
+  echo "      native groupcast may be disabled; this run would have silently" >&2
+  echo "      gone through chip-tool for every op and still printed PASS without" >&2
+  echo "      this check." >&2
+  exit 1
+fi
+if [ "${AFTER_COUNT:-0}" -lt 1 ]; then
+  echo "FAIL: no 'groupcast sent (native)' log line found AFTER the restart." >&2
+  echo "      jump-ahead re-init or native itself may be broken post-restart." >&2
+  exit 1
+fi
+
+COUNTERS=$(printf '%s\n' "$FULL_LOG" \
+  | grep "groupcast sent (native)" \
+  | sed -nE 's/.*counter=([0-9]+).*/\1/p')
+PREV=""
+while IFS= read -r c; do
+  [ -z "$c" ] && continue
+  if [ -n "$PREV" ] && [ "$c" -le "$PREV" ]; then
+    echo "FAIL: groupcast counter not strictly increasing across the run" \
+      "($PREV -> $c) — possible counter reuse/desync." >&2
+    exit 1
+  fi
+  PREV="$c"
+done <<EOF
+$COUNTERS
+EOF
+
+echo "counters observed (chronological, native sends only, before+after restart):"
+printf '%s' "$COUNTERS" | tr '\n' ' '
+echo
 echo "== e2e:m5 PASS"

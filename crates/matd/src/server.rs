@@ -208,6 +208,25 @@ async fn run_op(
                     );
                 }
             }
+        } else if let Some(group_id) = group_send_op_group_id(op) {
+            // native は有効だが、この group 送信 op は native 対象外の形（例:
+            // onoff 以外の cluster / 引数付き onoff）— chip-tool へ通る。この
+            // 経路は matd の native counter とは別に chip-tool 自身の counter を
+            // 使うため、native が既に counter を進めた後だと chip-tool の
+            // counter は同じ送信元 node id の native より低くなり得る
+            // （counter 窓は送信元 node id ごと・全 group 共通）。同じ group を
+            // native 経由でも受けているデバイスは、この送信を古い/重複として
+            // 黙って捨てる可能性がある（レビュー指摘: intra-matd counter
+            // mixing）。ルーティングは変えない（製品判断として拒否は見送り）—
+            // 観測性のためのログのみ。
+            tracing::warn!(
+                group_id,
+                "group send op is outside native-eligible shapes; routing via chip-tool, \
+                 whose counter may now be BELOW native's jumped-ahead counter for this \
+                 source node id (counter window is per-source-node across all groups) — \
+                 devices that also receive native-driven groupcasts for this group may \
+                 silently drop this send (intra-matd counter mixing)"
+            );
         }
     }
     match op {
@@ -293,6 +312,17 @@ fn native_group_params(op: &Op) -> Option<(u16, u32, u32, Option<Vec<u8>>)> {
                 *transition,
             )),
         )),
+        _ => None,
+    }
+}
+
+/// この op が group 送信 op（`GroupInvoke`/`GroupColor`/`GroupColorTemp`）なら
+/// その `group_id` を返す。counter-mixing 警告（`run_op`）が対象 op を絞るのに使う。
+fn group_send_op_group_id(op: &Op) -> Option<u16> {
+    match op {
+        Op::GroupInvoke { group_id, .. }
+        | Op::GroupColor { group_id, .. }
+        | Op::GroupColorTemp { group_id, .. } => Some(*group_id),
         _ => None,
     }
 }
@@ -1120,6 +1150,47 @@ mod tests {
 
         // GroupProvision は常に chip-tool。
         assert!(native_group_params(&Op::Ping).is_none());
+    }
+
+    #[test]
+    fn group_send_op_group_id_identifies_group_send_ops_only() {
+        assert_eq!(
+            group_send_op_group_id(&Op::GroupInvoke {
+                group_id: 10,
+                cluster: "levelcontrol".into(),
+                command: "move-to-level".into(),
+                args: vec!["100".into()],
+                endpoint: 1,
+            }),
+            Some(10)
+        );
+        assert_eq!(
+            group_send_op_group_id(&Op::GroupColor {
+                group_id: 20,
+                hue_raw: 0,
+                saturation_raw: 0,
+                hue: 0,
+                saturation: 0,
+                name: None,
+                rgb: None,
+                transition: 0,
+                endpoint: 1,
+            }),
+            Some(20)
+        );
+        assert_eq!(group_send_op_group_id(&Op::Ping), None);
+        assert_eq!(
+            group_send_op_group_id(&Op::GroupProvision {
+                group_id: 30,
+                node_ids: vec![1],
+                keyset_id: 1,
+                name: "n".into(),
+                endpoint: 1,
+                epoch_key: None,
+                rebind: false,
+            }),
+            None
+        );
     }
 
     use crate::native::test_support::{write_group_fixture_ini, FakeEstablisher};

@@ -279,8 +279,16 @@ fn skip_rest_of_container(r: &mut Reader, fabric_index: u8) -> Result<(), KvsErr
 
 /// Parses one `GroupKey` struct (start_time / hash / key bytes) from within
 /// the keyset's key array, returning the 16-byte operational key and its
-/// 16-bit hash (the group session id, aka GKH).
-fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], u16), KvsError> {
+/// 16-bit hash (the group session id, aka GKH), if present.
+///
+/// The hash (Context(5)) is `Option`: the IPK read path
+/// ([`parse_keyset`]/[`read_fabric_credentials`], used by M4 CASE) never
+/// needed it and the pre-M5 parser tolerated its absence — restore that
+/// tolerance here. Only the group-send path
+/// ([`parse_keyset_first_entry`]/[`read_group_credentials`]) actually needs
+/// the hash (it's the group session id used on the wire), so it is the one
+/// that turns a missing hash into an error.
+fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], Option<u16>), KvsError> {
     let el = next_keyset_el(r, fabric_index)?;
     if el.value != Value::StructStart {
         return Err(KvsError::BadKeyset {
@@ -322,17 +330,19 @@ fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], u16),
         fabric_index,
         reason: "missing operational key",
     })?;
-    let hash = hash.ok_or(KvsError::BadKeyset {
-        fabric_index,
-        reason: "missing key hash",
-    })?;
     Ok((key, hash))
 }
 
 /// Parses the chip-tool `KeySet` TLV blob, returning the operational key and
-/// hash of the first entry in the key array. `keys_count` (Context(2)) must
-/// be at least 1; unknown tags/containers are skipped.
-fn parse_keyset_first_entry(blob: &[u8], fabric_index: u8) -> Result<([u8; 16], u16), KvsError> {
+/// (if present) hash of the first entry in the key array. `keys_count`
+/// (Context(2)) must be at least 1; unknown tags/containers are skipped. The
+/// hash is `Option` — see [`parse_key_struct`] for why; callers that need the
+/// hash (group send) must check for `None` themselves, callers that don't
+/// (IPK read, via [`parse_keyset`]) ignore it entirely.
+fn parse_keyset_first_entry(
+    blob: &[u8],
+    fabric_index: u8,
+) -> Result<([u8; 16], Option<u16>), KvsError> {
     let mut r = Reader::new(blob);
 
     let el = next_keyset_el(&mut r, fabric_index)?;
@@ -344,7 +354,7 @@ fn parse_keyset_first_entry(blob: &[u8], fabric_index: u8) -> Result<([u8; 16], 
     }
 
     let mut keys_count: Option<u64> = None;
-    let mut entry: Option<([u8; 16], u16)> = None;
+    let mut entry: Option<([u8; 16], Option<u16>)> = None;
 
     loop {
         let el = next_keyset_el(&mut r, fabric_index)?;
@@ -380,8 +390,11 @@ fn parse_keyset_first_entry(blob: &[u8], fabric_index: u8) -> Result<([u8; 16], 
 
 /// Parses the chip-tool `KeySet` TLV blob, returning the operational group
 /// key (`ipk_operational`) of the first entry in the key array. Thin wrapper
-/// over [`parse_keyset_first_entry`] that discards the hash, kept separate so
-/// the IPK read path's behavior and error reasons stay unchanged.
+/// over [`parse_keyset_first_entry`] that discards the hash *without
+/// requiring its presence* — the IPK read path never needed the hash, and
+/// the pre-M5 parser tolerated a blob without it; keep that tolerance here
+/// even though the group-send path (which does need the hash) now enforces
+/// it in [`read_group_credentials`].
 fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
     parse_keyset_first_entry(blob, fabric_index).map(|(key, _hash)| key)
 }
@@ -588,8 +601,14 @@ pub fn read_group_credentials(
     })?;
     let key = format!("f/{fabric_index}/k/{keyset_id:x}");
     let blob = decode_b64(section, &key)?.ok_or(KvsError::KeyMissing(key))?;
-    // parse_keyset と同じ枠組みで最初の key entry の (key, hash) を取る。
+    // parse_keyset と同じ枠組みで最初の key entry の (key, hash) を取る。ただし
+    // group 送信は hash（= 群 session id、ワイヤに乗る値）が必須 — IPK 読み出し
+    // と違い None を許容しない。
     let (encryption_key, session_id) = parse_keyset_first_entry(&blob, fabric_index)?;
+    let session_id = session_id.ok_or(KvsError::BadKeyset {
+        fabric_index,
+        reason: "missing key hash",
+    })?;
     Ok(GroupCredentials {
         session_id,
         encryption_key,
@@ -949,7 +968,68 @@ mod tests {
         w.finish()
     }
 
+    /// keyset_blob_with_hash と同構造だが、最初のエントリの ctx5（hash）を丸ごと
+    /// 書かない — 実機で観測された「hash 無し」keyset blob（M1〜M4 で許容して
+    /// いた形）を再現する。
+    fn keyset_blob_no_hash(key: &[u8; 16]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_uint(Tag::Context(2), 1);
+        w.start_array(Tag::Context(3));
+        for i in 0..3u8 {
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(4), u64::from(i == 0));
+            // ctx5 (hash) は意図的に省略。
+            w.put_bytes(Tag::Context(6), if i == 0 { key } else { &[0u8; 16] });
+            w.end_container();
+        }
+        w.end_container();
+        w.put_uint(Tag::Context(7), 0);
+        w.end_container();
+        w.finish()
+    }
+
     const GROUP_KEY: [u8; 16] = [0xDD; 16];
+
+    #[test]
+    fn keyset_without_hash_tolerated_by_ipk_path_but_rejected_by_group_path() {
+        // 最終レビュー指摘: parse_key_struct を M5 で ctx5(hash) 必須に締めて
+        // しまうと、IPK 読み出し（M1〜M4 実機で検証済みの容認的パース）が
+        // hash 無し blob で壊れる。IPK 経路は成功し、group 経路だけ拒否する
+        // ことを確認する。
+        let ks_no_hash = keyset_blob_no_hash(&GROUP_KEY);
+
+        // IPK 読み出し（read_fabric_credentials 経由）: hash 無しでも成功。
+        let op = opkey_blob(&PUB, &PRIV);
+        let path = write_ini(&[
+            ("f/1/r", b"r"),
+            ("f/1/n", b"n"),
+            ("f/1/o", &op),
+            ("f/1/k/0", &ks_no_hash),
+        ]);
+        let c = read_fabric_credentials(&path, 1).unwrap();
+        assert_eq!(c.ipk_operational, GROUP_KEY);
+        std::fs::remove_file(&path).ok();
+
+        // group 読み出し（read_group_credentials 経由）: hash が無いと拒否する。
+        let path2 = write_ini(&[
+            ("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/3c", &ks_no_hash[..]),
+        ]);
+        let err = read_group_credentials(&path2, 2, 10).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KvsError::BadKeyset {
+                    fabric_index: 2,
+                    reason: "missing key hash"
+                }
+            ),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_file(&path2).ok();
+    }
 
     #[test]
     fn reads_group_credentials_scanning_past_builtin_entries() {
