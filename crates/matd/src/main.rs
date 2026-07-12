@@ -48,6 +48,19 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     idle_timeout: u64,
 
+    /// native warm session に使う Thread mesh の iface 名。未指定なら native を無効化し
+    /// 全 op を chip-tool へ回す（安全フォールバック）。
+    #[arg(long, env = "MAT_MATD_IFACE")]
+    iface: Option<String>,
+
+    /// KVS fabric テーブルの index（jarvis 本番は 2、alpha は 1）。
+    #[arg(long, env = "MAT_MATD_FABRIC_INDEX", default_value_t = 1)]
+    fabric_index: u8,
+
+    /// CA issuer index。
+    #[arg(long, env = "MAT_MATD_ISSUER_INDEX", default_value_t = 0)]
+    issuer_index: u8,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -115,9 +128,34 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
-    // TODO(M4/Task 7): native backend wiring lands in a later task; pass None for now
-    // so all ops keep going through chip-tool until the CLI flag/config exists.
-    server::serve(&socket, store_path, Arc::new(backend), None)
+    // native warm session バックエンド（iface 指定時のみ）。構築失敗は致命にせず、
+    // chip-tool フォールバックへ落とす（native が実機でコケても matd は無停止）。
+    let native = match &cli.iface {
+        Some(iface) => {
+            let cfg = matd::native::NativeConfig {
+                store: store_path.clone(),
+                iface: iface.clone(),
+                fabric_index: cli.fabric_index,
+                issuer_index: cli.issuer_index,
+            };
+            match matd::native::NativeBackend::build(&cfg).await {
+                Ok(b) => {
+                    tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
+                    Some(Arc::new(b))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e.detail, "native backend build failed; falling back to chip-tool for all ops");
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::info!("MAT_MATD_IFACE unset; native backend disabled (chip-tool only)");
+            None
+        }
+    };
+
+    server::serve(&socket, store_path, Arc::new(backend), native)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
