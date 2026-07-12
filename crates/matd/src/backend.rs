@@ -126,6 +126,13 @@ impl ChipToolBackend {
         self.conn.lock().await.ws = None;
     }
 
+    /// テスト用: 接続を今すぐ確立する（lazy 化以降、構築時には確立されないため、
+    /// 「確立済み前提」の検証をするテストが最初に呼ぶ）。
+    pub async fn connect_for_test(&self) -> Result<(), MatError> {
+        let mut conn = self.conn.lock().await;
+        self.ensure_connected(&mut conn).await
+    }
+
     /// コマンド行を送り、最初に返る Text メッセージ（= 実行結果 JSON）を返す。
     ///
     /// chip-tool ws はコマンド完了時に結果メッセージを 1 つ返す。送信自体の失敗は
