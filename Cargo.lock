@@ -724,6 +724,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "p256",
+ "serde_json",
  "sha1",
  "sha2",
  "tokio",
