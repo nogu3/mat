@@ -112,6 +112,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m3.sh
 
+  e2e:m4:
+    desc: "M4 実機 E2E（native 有効 matd を jarvis で起動し socket 往復。要 MAT_E2E_HOST/NODE_ID/IFACE）"
+    cmds:
+      - bash scripts/e2e-m4.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:

@@ -7,7 +7,7 @@ repository.workspace = true
 description = "From-scratch Matter controller library (Phase 5 backend)"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util"] }
 ccm = "0.5"
 aes = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
@@ -17,3 +17,6 @@ sha1 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
