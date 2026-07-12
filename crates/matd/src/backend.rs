@@ -70,6 +70,7 @@ struct Conn {
 pub struct ChipToolBackend {
     mode: Mode,
     idle: Duration,
+    startup_timeout: Duration,
     conn: Mutex<Conn>,
 }
 
@@ -83,19 +84,35 @@ impl ChipToolBackend {
                 port,
             },
             idle,
+            STARTUP_TIMEOUT,
         )
         .await
     }
 
     /// 既に動いている ws サーバへ接続する（テストや外部起動の chip-tool 用）。
     pub async fn connect(port: u16, idle: Duration) -> Result<Self, MatError> {
-        Self::new(Mode::Connect { port }, idle).await
+        Self::new(Mode::Connect { port }, idle, STARTUP_TIMEOUT).await
     }
 
-    async fn new(mode: Mode, idle: Duration) -> Result<Self, MatError> {
+    /// テスト専用: 接続失敗のリトライ上限（本番は [`STARTUP_TIMEOUT`] 固定）を
+    /// 短く差し替えて構築する。フォールバック検証テストが「接続できない」ことを
+    /// 確認するために本番の 20 秒を律儀に待たされるのを避けるための seam。
+    /// 本番経路（[`spawn`](Self::spawn) / [`connect`](Self::connect)）の挙動・
+    /// 既定値は変えない。
+    #[cfg(test)]
+    pub(crate) async fn connect_with_startup_timeout(
+        port: u16,
+        idle: Duration,
+        startup_timeout: Duration,
+    ) -> Result<Self, MatError> {
+        Self::new(Mode::Connect { port }, idle, startup_timeout).await
+    }
+
+    async fn new(mode: Mode, idle: Duration, startup_timeout: Duration) -> Result<Self, MatError> {
         Ok(ChipToolBackend {
             mode,
             idle,
+            startup_timeout,
             conn: Mutex::new(Conn {
                 ws: None,
                 child: None,
@@ -246,7 +263,7 @@ impl ChipToolBackend {
             }
             Mode::Connect { port } => *port,
         };
-        let ws = connect_with_retry(port, STARTUP_TIMEOUT).await?;
+        let ws = connect_with_retry(port, self.startup_timeout).await?;
         conn.ws = Some(ws);
         Ok(())
     }
@@ -455,16 +472,30 @@ where
 }
 
 /// ws が開くまで一定間隔で接続を試みる。
+///
+/// `connect_async` 自体の 1 回の呼び出しが（SYN が黙って捨てられる等の理由で）
+/// OS レベルの TCP connect タイムアウト（環境によっては 20 秒の `within` より
+/// はるかに長い、数十〜100 秒超）まで返ってこないことがある。単に呼び出し後に
+/// `deadline` を見るだけだと、その 1 回の呼び出し中は `within` を超過していても
+/// 抜けられない。各試行そのものを残り時間で timeout し、`within` を実効的な
+/// 上限にする。
 async fn connect_with_retry(port: u16, within: Duration) -> Result<Ws, MatError> {
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + within;
     loop {
-        match connect_async(&url).await {
-            Ok((ws, _resp)) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MatError::new(
+                ErrorKind::ChildFailed,
+                format!("chip-tool ws on port {port} did not come up within {within:?}"),
+            ));
+        }
+        match tokio::time::timeout(remaining, connect_async(&url)).await {
+            Ok(Ok((ws, _resp))) => {
                 tracing::info!(port, "connected to chip-tool ws");
                 return Ok(ws);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // まだ立ち上がっていないだけかもしれない。期限超過のときだけ諦める。
                 if Instant::now() >= deadline {
                     return Err(MatError::new(
@@ -474,6 +505,13 @@ async fn connect_with_retry(port: u16, within: Duration) -> Result<Ws, MatError>
                         ),
                     ));
                 }
+            }
+            Err(_) => {
+                // この試行自体が残り時間いっぱい応答しなかった＝もう待てない。
+                return Err(MatError::new(
+                    ErrorKind::ChildFailed,
+                    format!("chip-tool ws on port {port} did not come up within {within:?}"),
+                ));
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;

@@ -191,6 +191,10 @@ async fn run_op(
         }
         if let Some((group_id, cluster, command, fields)) = native_group_params(op) {
             // chip-tool 経路と同じ前提チェック（store が開けること）。
+            // 注意: Unavailable でフォールバックした先の chip-tool 系関数
+            // （group_invoke 等）も同じ store を開き直す。意図的な二重 open —
+            // 両経路で同じ前提条件チェックにするためで、最適化して片方を
+            // 取り除かないこと。
             let _store = Store::open(store_path)?;
             match native
                 .group_invoke(group_id, cluster, command, fields)
@@ -1071,6 +1075,14 @@ mod tests {
             endpoint: 1,
         };
         assert!(native_group_params(&other_cluster).is_none());
+        let unknown_command = Op::GroupInvoke {
+            group_id: 10,
+            cluster: "onoff".into(),
+            command: "foo".into(),
+            args: vec![],
+            endpoint: 1,
+        };
+        assert!(native_group_params(&unknown_command).is_none());
 
         let ct = Op::GroupColorTemp {
             group_id: 10,
@@ -1123,11 +1135,17 @@ mod tests {
         }
     }
 
-    /// 接続先の無い lazy backend（触られたら必ず接続エラー）。
+    /// 接続先の無い lazy backend（触られたら必ず接続エラー）。startup_timeout を
+    /// 300ms に短縮し、本番の 20 秒（[`ChipToolBackend::connect`]既定）を律儀に
+    /// 待たされないようにする（フォールバック検証テストの高速化）。
     async fn dead_backend() -> ChipToolBackend {
-        ChipToolBackend::connect(1, std::time::Duration::from_secs(30))
-            .await
-            .unwrap()
+        ChipToolBackend::connect_with_startup_timeout(
+            1,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap()
     }
 
     fn make_store() -> (tempfile::TempDir, PathBuf) {
