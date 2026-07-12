@@ -117,6 +117,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m4.sh
 
+  e2e:m5:
+    desc: "M5 実機 E2E（native groupcast。要 MAT_E2E_HOST/IFACE/GROUP_NODES）"
+    cmds:
+      - bash scripts/e2e-m5.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
