@@ -39,7 +39,7 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
-async fn read_bool(s: &mut SecureSession<'_>, ep: u16, cfg: &MrpConfig) -> Result<bool, String> {
+async fn read_bool(s: &mut SecureSession, ep: u16, cfg: &MrpConfig) -> Result<bool, String> {
     match s
         .read_attribute(ep, CLUSTER_ON_OFF, ATTR_ON_OFF, cfg)
         .await
@@ -51,7 +51,7 @@ async fn read_bool(s: &mut SecureSession<'_>, ep: u16, cfg: &MrpConfig) -> Resul
 }
 
 async fn read_color_u8(
-    s: &mut SecureSession<'_>,
+    s: &mut SecureSession,
     ep: u16,
     attr: u32,
     cfg: &MrpConfig,
@@ -115,10 +115,18 @@ async fn fabric_ride_along_onoff_and_color() {
     };
 
     // 受け入れ 4: CASE 確立（解決したアドレスを順に試す）
-    let transport = UdpTransport::bind().await.unwrap();
+    let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
     let mut session = None;
     for peer in &peers {
-        match case::establish(&transport, *peer, &creds, device_node_id, &mrp).await {
+        match case::establish(
+            std::sync::Arc::clone(&transport),
+            *peer,
+            &creds,
+            device_node_id,
+            &mrp,
+        )
+        .await
+        {
             Ok(s) => {
                 eprintln!("CASE established via {peer}");
                 session = Some(s);
@@ -168,7 +176,7 @@ async fn fabric_ride_along_onoff_and_color() {
 /// 受け入れ 5/6 本体: onoff toggle 往復 + 色変更。途中で失敗しても panic
 /// せず `Err` を返し、呼び出し側が実機の状態復元を試みられるようにする。
 async fn exercise(
-    session: &mut SecureSession<'_>,
+    session: &mut SecureSession,
     endpoint: u16,
     mrp: &MrpConfig,
     before: bool,

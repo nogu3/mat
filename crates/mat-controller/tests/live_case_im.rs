@@ -45,11 +45,17 @@ async fn self_issued_case_read_toggle_read() {
     let creds = FabricCredentials::from_self_issued(materials).expect("self-issue NOC");
 
     // 受け入れ 4: CASE 確立（我々の自己発行 NOC を実機が受理）
-    let transport = UdpTransport::bind().await.unwrap();
+    let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
     let cfg = MrpConfig::default();
-    let mut session = case::establish(&transport, peer, &creds, device_node_id, &cfg)
-        .await
-        .expect("CASE establishment");
+    let mut session = case::establish(
+        std::sync::Arc::clone(&transport),
+        peer,
+        &creds,
+        device_node_id,
+        &cfg,
+    )
+    .await
+    .expect("CASE establishment");
     eprintln!(
         "CASE established with device 0x{:016X}",
         session.peer_node_id()
