@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod dnssd;
 pub mod exchange;
 pub mod fabric;
+pub mod group;
 pub mod im;
 pub mod kvs;
 pub mod message;
