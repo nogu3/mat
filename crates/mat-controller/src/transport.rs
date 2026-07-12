@@ -49,6 +49,21 @@ impl UdpTransport {
     pub fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
         socket2::SockRef::from(&self.socket).set_multicast_hops_v6(hops)
     }
+
+    /// Pins the egress interface for multicast sends. Relying on the
+    /// destination's `sin6_scope_id` is not enough: with overlapping IPv6
+    /// routes (e.g. a VPN/tailscale device) the kernel can route a
+    /// site-scope ff35:: datagram out the wrong interface (observed live —
+    /// the groupcast left via tailscale0 and never reached the LAN).
+    /// Unicast sends are unaffected.
+    pub fn set_multicast_if_v6(&self, ifindex: u32) -> io::Result<()> {
+        socket2::SockRef::from(&self.socket).set_multicast_if_v6(ifindex)
+    }
+
+    /// Reads back the multicast egress interface (0 = kernel default).
+    pub fn multicast_if_v6(&self) -> io::Result<u32> {
+        socket2::SockRef::from(&self.socket).multicast_if_v6()
+    }
 }
 
 #[cfg(test)]

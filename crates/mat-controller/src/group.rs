@@ -176,6 +176,12 @@ impl GroupSender {
         counter: PersistedGroupCounter,
     ) -> std::io::Result<Self> {
         transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
+        // 宛先 sockaddr の sin6_scope_id だけでは egress iface を選べない環境が
+        // ある（VPN 系の広い v6 経路が multicast の経路解決を勝ち、実機で
+        // tailscale0 へ流出 → LAN に出ず 0/7 不達）。IPV6_MULTICAST_IF で明示
+        // 固定する。multicast 送信専用オプションなので共有 socket の unicast
+        // には影響しない。
+        transport.set_multicast_if_v6(scope_id)?;
         Ok(Self {
             transport,
             scope_id,
@@ -402,6 +408,22 @@ mod tests {
         rest.sort_by_key(|c| c.index);
         up_first.extend(rest);
         up_first
+    }
+
+    #[tokio::test]
+    async fn group_sender_pins_multicast_egress_interface() {
+        use crate::transport::UdpTransport;
+
+        // 実機で sin6_scope_id だけでは egress を選べず tailscale0 へ流出した
+        // 回帰の防止: new() が IPV6_MULTICAST_IF を scope_id に固定すること。
+        let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+        let p = tmp_counter_path("mcastif");
+        let _ = std::fs::remove_file(&p);
+        let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+        let _s =
+            GroupSender::new(std::sync::Arc::clone(&transport), 1, 5540, 1, 2, counter).unwrap();
+        assert_eq!(transport.multicast_if_v6().unwrap(), 1);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
