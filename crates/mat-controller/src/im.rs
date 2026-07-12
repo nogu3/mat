@@ -428,6 +428,38 @@ pub fn encode_invoke_request(
     w.finish()
 }
 
+/// InvokeRequestMessage for a groupcast command (spec §8.9.4): group
+/// invokes carry no response, so SuppressResponse is true, and the
+/// CommandPath is group-scoped (no endpoint — the device's group table
+/// routes to its bound endpoints). Fields contract matches
+/// `encode_invoke_request`.
+pub fn encode_group_invoke_request(
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), true); // SuppressResponse
+    w.put_bool(Tag::Context(1), false); // TimedRequest
+    w.start_array(Tag::Context(2)); // InvokeRequests
+    w.start_struct(Tag::Anonymous); // CommandDataIB
+    w.start_list(Tag::Context(0)); // CommandPath (group-scoped)
+    w.put_uint(Tag::Context(1), u64::from(cluster));
+    w.put_uint(Tag::Context(2), u64::from(command));
+    w.end_container();
+    if let Some(fields) = fields_tlv {
+        let mut fr = Reader::new(fields);
+        copy_retagged(&mut w, &mut fr, Tag::Context(1))
+            .expect("fields_tlv must be one well-formed TLV element");
+    }
+    w.end_container();
+    w.end_container();
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
 /// StatusIB (spec §8.9.2.3) inside a CommandStatusIB: `{0: status, 1: cluster_status}`.
 /// Assumes the caller already consumed the `StructStart` (tag 1) opening it.
 fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
@@ -908,5 +940,58 @@ mod tests {
             bytes.windows(3).any(|w| w == [0x24, 0x01, 0x1E]),
             "transition 30 as ctx-tag-1 u8, got {bytes:02X?}"
         );
+    }
+
+    #[test]
+    fn group_invoke_request_suppresses_response_and_omits_endpoint() {
+        let got = encode_group_invoke_request(CLUSTER_ON_OFF, CMD_ON_OFF_ON, None);
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), true); // SuppressResponse: group は応答なし
+        w.put_bool(Tag::Context(1), false); // TimedRequest
+        w.start_array(Tag::Context(2));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0)); // CommandPath: group-scoped、endpoint なし
+        w.put_uint(Tag::Context(1), u64::from(CLUSTER_ON_OFF));
+        w.put_uint(Tag::Context(2), u64::from(CMD_ON_OFF_ON));
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+        w.end_container();
+        assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn group_invoke_request_carries_fields() {
+        let fields = encode_move_to_color_temperature_fields(370, 0);
+        let got = encode_group_invoke_request(
+            CLUSTER_COLOR_CONTROL,
+            CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(&fields),
+        );
+        // fields が ctx1 で CommandDataIB に入ること（unicast 版と同じ再タグ規約）。
+        // 厳密比較: unicast 版のテストに倣い Writer で期待列を組む。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), true);
+        w.put_bool(Tag::Context(1), false);
+        w.start_array(Tag::Context(2));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0));
+        w.put_uint(Tag::Context(1), u64::from(CLUSTER_COLOR_CONTROL));
+        w.put_uint(Tag::Context(2), u64::from(CMD_MOVE_TO_COLOR_TEMPERATURE));
+        w.end_container();
+        w.start_struct(Tag::Context(1));
+        w.put_uint(Tag::Context(0), 370);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_uint(Tag::Context(2), 0);
+        w.put_uint(Tag::Context(3), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+        w.end_container();
+        assert_eq!(got, w.finish());
     }
 }
