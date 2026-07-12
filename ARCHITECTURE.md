@@ -421,7 +421,7 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   未指定なら従来どおり全 op が chip-tool interactive server 経由（安全な既定挙動）。
   native 構築に失敗した場合（KVS 読み取り不可等）も warn ログの上で chip-tool に
   フォールバックし、matd は落ちない。write / describe / 任意 cluster の read・invoke
-  / group 系は引き続き chip-tool 経由（group は M5 で native 化予定）。実機 E2E 合格
+  / group 系は引き続き chip-tool 経由（group 送信 3 op は M5 で native 化済み — 次項）。実機 E2E 合格
   （`task e2e:m4`、本番 matd を止めず別 socket/port で検証）: ホットパス往復 + warm
   再利用（cold 1.16s → warm 120ms、mDNS+CASE を払わない）+ describe の chip-tool
   フォールバック（lazy spawn）を実機で確認。

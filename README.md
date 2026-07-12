@@ -615,8 +615,8 @@ with arguments) are unaffected — they always go through chip-tool.
   64) — same wire semantics as chip-tool's groupcast (no response, no MRP).
 - The send counter is persisted at `<store>/native_group_counter` (plain
   decimal text, written ahead by 4096 so a crash never reuses a counter
-  value). On first use it jumps to `max(own file, chip-tool's `g/gdc`) +
-  4096`, because native shares the same source node id as chip-tool and
+  value). On first use it jumps to ``max(own file, chip-tool's `g/gdc`) +
+  4096``, because native shares the same source node id as chip-tool and
   therefore the same per-sender counter window on the receiving devices.
 - If native can't send (group not provisioned, KVS incomplete, `g/gdc`
   missing, etc.), `matd` logs a warning and falls back to chip-tool for that
@@ -634,8 +634,7 @@ with arguments) are unaffected — they always go through chip-tool.
   to sending via direct chip-tool *after* native has been sending for a
   while, chip-tool's counter is now behind native's and devices will drop
   its groupcasts as stale/duplicate (the same counter-collision failure
-  mode as mixing two chip-tool senders — see `groupcast-e2e-findings` in
-  project notes). Real-device acceptance harness: `task e2e:m5` (needs
+  mode as mixing two chip-tool senders). Real-device acceptance harness: `task e2e:m5` (needs
   `MAT_E2E_HOST` / `MAT_E2E_IFACE` / `MAT_E2E_GROUP_NODES`; stop production
   matd's group traffic for the duration — unicast ops are fine to leave
   running).
