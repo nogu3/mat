@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
+use mat_controller::im;
 use mat_core::acl::{acl_entries_from_ws_value, merge_group_entry, to_chip_write_json};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
@@ -188,6 +189,22 @@ async fn run_op(
         if is_native_hotpath(op) {
             return native_op(op, native, store_path).await;
         }
+        if let Some((group_id, cluster, command, fields)) = native_group_params(op) {
+            // chip-tool 経路と同じ前提チェック（store が開けること）。
+            let _store = Store::open(store_path)?;
+            match native
+                .group_invoke(group_id, cluster, command, fields)
+                .await?
+            {
+                crate::native::GroupOutcome::Sent => return Ok(group_sent_body(op)),
+                crate::native::GroupOutcome::Unavailable(reason) => {
+                    tracing::warn!(
+                        %reason,
+                        "native group send unavailable; falling back to chip-tool"
+                    );
+                }
+            }
+        }
     }
     match op {
         // Ping は chip-tool に触れず即応。
@@ -218,6 +235,61 @@ pub(crate) fn is_native_hotpath(op: &Op) -> bool {
             cluster, attribute, ..
         } => cluster == "onoff" && attribute == "on-off",
         _ => false,
+    }
+}
+
+/// group 送信 op の native 適用判定。native で送れるなら
+/// (group_id, cluster_id, command_id, fields) を返す。`GroupInvoke` は
+/// onoff の引数なし on/off/toggle のみ（汎用の cluster/command 名→ID
+/// テーブルは未実装 — M4 の Read 制限と同型）。None は chip-tool へ。
+fn native_group_params(op: &Op) -> Option<(u16, u32, u32, Option<Vec<u8>>)> {
+    match op {
+        Op::GroupInvoke {
+            group_id,
+            cluster,
+            command,
+            args,
+            ..
+        } if cluster == "onoff" && args.is_empty() => {
+            let cmd = match command.as_str() {
+                "on" => im::CMD_ON_OFF_ON,
+                "off" => im::CMD_ON_OFF_OFF,
+                "toggle" => im::CMD_ON_OFF_TOGGLE,
+                _ => return None,
+            };
+            Some((*group_id, im::CLUSTER_ON_OFF, cmd, None))
+        }
+        Op::GroupColorTemp {
+            group_id,
+            mireds,
+            transition,
+            ..
+        } => Some((
+            *group_id,
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(im::encode_move_to_color_temperature_fields(
+                *mireds,
+                *transition,
+            )),
+        )),
+        Op::GroupColor {
+            group_id,
+            hue_raw,
+            saturation_raw,
+            transition,
+            ..
+        } => Some((
+            *group_id,
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(im::encode_move_to_hue_and_saturation_fields(
+                *hue_raw,
+                *saturation_raw,
+                *transition,
+            )),
+        )),
+        _ => None,
     }
 }
 
@@ -630,14 +702,72 @@ async fn group_invoke(
     parts.push(endpoint.to_string());
     let _ = backend.run_cmdline(&parts.join(" ")).await?;
 
-    Ok(json!({
-        "group_id": group_id,
-        "cluster": cluster,
-        "command": command,
-        "endpoint": endpoint,
-        "status": "sent",
-        "note": "unacknowledged groupcast; per-device delivery not confirmed",
-    }))
+    Ok(group_sent_body(op))
+}
+
+/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupColor`）の成功 body。
+/// chip-tool 経路（[`group_invoke`]/[`group_color_op`]）と native 経路
+/// （`run_op` の native group 分岐）の両方から呼ぶ — 応答スキーマは経路に
+/// よらず同一（DRY、CLAUDE.md ルール「素通し禁止」とは別に schema 安定が要件）。
+fn group_sent_body(op: &Op) -> Value {
+    match op {
+        Op::GroupInvoke {
+            group_id,
+            cluster,
+            command,
+            endpoint,
+            ..
+        } => json!({
+            "group_id": group_id,
+            "cluster": cluster,
+            "command": command,
+            "endpoint": endpoint,
+            "status": "sent",
+            "note": "unacknowledged groupcast; per-device delivery not confirmed",
+        }),
+        Op::GroupColorTemp {
+            group_id,
+            mireds,
+            kelvin,
+            transition,
+            endpoint,
+        } => json!({
+            "group_id": group_id, "cluster": "colorcontrol",
+            "command": "move-to-color-temperature",
+            "kelvin": kelvin, "mireds": mireds, "transition": transition,
+            "endpoint": endpoint, "status": "sent",
+            "note": "unacknowledged groupcast; per-device delivery not confirmed",
+        }),
+        Op::GroupColor {
+            group_id,
+            hue_raw,
+            saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
+            transition,
+            endpoint,
+        } => {
+            let mut body = json!({
+                "group_id": group_id, "cluster": "colorcontrol",
+                "command": "move-to-hue-and-saturation",
+                "hue": hue, "saturation": saturation,
+                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
+                "transition": transition, "endpoint": endpoint,
+                "status": "sent",
+                "note": "unacknowledged groupcast; per-device delivery not confirmed",
+            });
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(r) = rgb {
+                body["rgb"] = json!(r);
+            }
+            body
+        }
+        _ => unreachable!("group_sent_body called with non group-send op"),
+    }
 }
 
 /// group 版 color-temp / color ショートカット（`mat group color-temp` / `mat group
@@ -655,55 +785,31 @@ async fn group_color_op(
         Op::GroupColorTemp {
             group_id,
             mireds,
-            kelvin,
             transition,
             endpoint,
+            ..
         } => {
             let line = format!(
                 "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {} {endpoint}",
                 group_node_id(*group_id)
             );
             let _ = backend.run_cmdline(&line).await?;
-            Ok(json!({
-                "group_id": group_id, "cluster": "colorcontrol",
-                "command": "move-to-color-temperature",
-                "kelvin": kelvin, "mireds": mireds, "transition": transition,
-                "endpoint": endpoint, "status": "sent",
-                "note": "unacknowledged groupcast; per-device delivery not confirmed",
-            }))
+            Ok(group_sent_body(op))
         }
         Op::GroupColor {
             group_id,
             hue_raw,
             saturation_raw,
-            hue,
-            saturation,
-            name,
-            rgb,
             transition,
             endpoint,
+            ..
         } => {
             let line = format!(
                 "colorcontrol move-to-hue-and-saturation {hue_raw} {saturation_raw} {transition} 0 0 {} {endpoint}",
                 group_node_id(*group_id)
             );
             let _ = backend.run_cmdline(&line).await?;
-            let mut body = json!({
-                "group_id": group_id, "cluster": "colorcontrol",
-                "command": "move-to-hue-and-saturation",
-                "hue": hue, "saturation": saturation,
-                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
-                "transition": transition, "endpoint": endpoint,
-                "status": "sent",
-                "note": "unacknowledged groupcast; per-device delivery not confirmed",
-            });
-            if let Some(n) = name {
-                body["name"] = json!(n);
-            }
-            if let Some(r) = rgb {
-                body["rgb"] = json!(r);
-            }
-            Ok(body)
+            Ok(group_sent_body(op))
         }
         _ => unreachable!("group_color_op called with non group color op"),
     }
@@ -930,5 +1036,190 @@ mod tests {
         });
         let err = ensure_ok(&v).expect_err("FAILURE must be an error");
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
+    }
+
+    #[test]
+    fn native_group_params_maps_onoff_and_shortcuts() {
+        let on = Op::GroupInvoke {
+            group_id: 10,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec![],
+            endpoint: 1,
+        };
+        let (gid, cluster, command, fields) = native_group_params(&on).unwrap();
+        assert_eq!(
+            (gid, cluster, command),
+            (10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON)
+        );
+        assert!(fields.is_none());
+
+        // 引数付き・onoff 以外・未知コマンドは native 対象外（chip-tool へ）。
+        let with_args = Op::GroupInvoke {
+            group_id: 10,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec!["1".into()],
+            endpoint: 1,
+        };
+        assert!(native_group_params(&with_args).is_none());
+        let other_cluster = Op::GroupInvoke {
+            group_id: 10,
+            cluster: "levelcontrol".into(),
+            command: "move-to-level".into(),
+            args: vec![],
+            endpoint: 1,
+        };
+        assert!(native_group_params(&other_cluster).is_none());
+
+        let ct = Op::GroupColorTemp {
+            group_id: 10,
+            mireds: 370,
+            kelvin: 2702,
+            transition: 0,
+            endpoint: 1,
+        };
+        let (_, cluster, command, fields) = native_group_params(&ct).unwrap();
+        assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
+        assert_eq!(command, im::CMD_MOVE_TO_COLOR_TEMPERATURE);
+        assert_eq!(
+            fields.unwrap(),
+            im::encode_move_to_color_temperature_fields(370, 0)
+        );
+
+        let color = Op::GroupColor {
+            group_id: 10,
+            hue_raw: 180,
+            saturation_raw: 200,
+            hue: 254,
+            saturation: 78,
+            name: None,
+            rgb: None,
+            transition: 0,
+            endpoint: 1,
+        };
+        let (_, cluster, command, fields) = native_group_params(&color).unwrap();
+        assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
+        assert_eq!(command, im::CMD_MOVE_TO_HUE_AND_SATURATION);
+        assert_eq!(
+            fields.unwrap(),
+            im::encode_move_to_hue_and_saturation_fields(180, 200, 0)
+        );
+
+        // GroupProvision は常に chip-tool。
+        assert!(native_group_params(&Op::Ping).is_none());
+    }
+
+    use crate::native::test_support::{write_group_fixture_ini, FakeEstablisher};
+    use std::path::PathBuf;
+
+    fn group_on_op() -> Op {
+        Op::GroupInvoke {
+            group_id: 10,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec![],
+            endpoint: 1,
+        }
+    }
+
+    /// 接続先の無い lazy backend（触られたら必ず接続エラー）。
+    async fn dead_backend() -> ChipToolBackend {
+        ChipToolBackend::connect(1, std::time::Duration::from_secs(30))
+            .await
+            .unwrap()
+    }
+
+    fn make_store() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 1,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-06-08T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn group_op_routes_native_when_available() {
+        let (_dir, store_path) = make_store();
+        let ini = store_path.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+
+        // `lo` lacks IFF_MULTICAST; reuse the runtime interface-discovery
+        // helper shared with native.rs's own multicast test.
+        let mut sent = false;
+        for cand in crate::native::test_support::multicast_capable_interfaces() {
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = recv.local_addr().unwrap().port();
+            if recv
+                .join_multicast_v6(
+                    &mat_controller::group::group_multicast_addr(1, 10),
+                    cand.index,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let transport = std::sync::Arc::new(
+                mat_controller::transport::UdpTransport::bind()
+                    .await
+                    .unwrap(),
+            );
+            let ctx = crate::native::GroupCtx {
+                main_ini: ini.clone(),
+                counter_path: store_path.join(format!("native_group_counter-{}", cand.index)),
+                fabric_index: 2,
+                fabric_id: 1,
+                node_id: 0x0001_0001,
+                scope_id: cand.index,
+                dest_port: port,
+                transport,
+                sender: tokio::sync::Mutex::new(None),
+            };
+            let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
+            let backend = dead_backend().await;
+
+            let body = run_op(&group_on_op(), &backend, Some(&native), &store_path)
+                .await
+                .unwrap();
+            assert_eq!(body["status"], "sent"); // native 経路で chip-tool 不要のまま成功
+            let mut buf = [0u8; 1280];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            if result.is_ok() {
+                sent = true;
+                break;
+            }
+        }
+        assert!(
+            sent,
+            "no multicast-capable interface delivered the groupcast datagram \
+             (lo excluded — it lacks IFF_MULTICAST on Linux)"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_op_falls_back_to_chip_tool_when_unavailable() {
+        let (_dir, store_path) = make_store();
+        // group ctx なしの native → Unavailable → chip-tool 経路へ。dead backend が
+        // エラーを返すこと自体が「フォールバックが試みられた」証拠。
+        let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), None);
+        let backend = dead_backend().await;
+        let err = run_op(&group_on_op(), &backend, Some(&native), &store_path)
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err.kind,
+            ErrorKind::Unreachable,
+            "native 送出エラーではなく chip-tool 接続系のエラーになる"
+        );
     }
 }
