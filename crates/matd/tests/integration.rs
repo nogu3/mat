@@ -918,6 +918,7 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
 
     let pid1 = backend.child_pid().await.expect("child spawned");
 
@@ -962,6 +963,32 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
     assert_ne!(pid2, pid1, "dead child must be respawned");
 }
 
+/// lazy 化の Spawn モード版契約: spawn() は構築時に子を起こさない。初回の接続確立
+/// （ここでは connect_for_test）で初めて子プロセスが上がる。
+/// （Connect モード版は backend.rs 内 unit test `connect_mode_does_not_dial_until_first_command`。）
+#[tokio::test]
+async fn spawn_mode_does_not_spawn_child_until_first_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_fake_child_bin();
+
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(0).await;
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert!(
+        backend.child_pid().await.is_none(),
+        "no child until first command"
+    );
+
+    backend.connect_for_test().await.unwrap();
+    assert!(
+        backend.child_pid().await.is_some(),
+        "first establish spawns the child"
+    );
+}
+
 /// 保険の検証: 受信失敗が 2 連続したら従来どおり子ごと畳む（wedge した chip-tool を
 /// 温存し続けて永久に timeout し続けるのを防ぐ）。
 #[tokio::test]
@@ -975,6 +1002,7 @@ async fn two_consecutive_recv_failures_tear_down_child() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let pid1 = backend.child_pid().await.expect("child spawned");
 
     // 1 回目の受信失敗: 子は温存。
@@ -1008,6 +1036,7 @@ async fn reap_kills_child_even_without_ws() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_millis(100))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let pid1 = backend.child_pid().await.expect("child spawned");
 
     // 受信失敗 → ws=None・子は温存。
@@ -1104,6 +1133,7 @@ async fn keepalive_tick_sends_ping() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
 
     backend.keepalive_tick().await;
     backend.keepalive_tick().await;
@@ -1166,6 +1196,7 @@ async fn keepalive_tick_drains_stale_messages() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await; // stale がバッファに届くのを待つ
     backend.keepalive_tick().await;
 
@@ -1204,6 +1235,7 @@ async fn keepalive_tick_bounds_drain_under_sustained_traffic() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let done = tokio::time::timeout(Duration::from_secs(3), backend.keepalive_tick()).await;
     assert!(
         done.is_ok(),
