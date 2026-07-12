@@ -409,6 +409,11 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
 - M2 完了: CASE + IM read/invoke（fabric/kvs/cert/case/session/im）。M2b:
   chip-tool の永続 root CA 鍵で operational identity を自己発行し、ローカル
   all-clusters-app に対し CASE + onoff toggle/read の E2E 合格（`task e2e:m2`）。
+- M3 完了(2026-07-12): 相乗りの堅牢化（node/fabric id を fabric テーブルの
+  NOC subject から取得 — KVS index 非依存）+ 自前 one-shot mDNS 解決
+  （TXT SII→MRP 接続）+ colorcontrol。jarvis 実機 Nanoleaf に本番 fabric
+  相乗り（fabric index ≠ fabric id 環境）で CASE + onoff/色変更の E2E 合格
+  （`task e2e:m3`）。
 
 ---
 
