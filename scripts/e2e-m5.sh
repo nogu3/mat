@@ -74,7 +74,10 @@ ARGS=(--socket "$MAT_E2E_SOCKET" --port 9111 --fabric-index "$MAT_E2E_FABRIC_IND
 export MAT_MATD_IFACE="$MAT_E2E_IFACE"
 [ -n "$MAT_E2E_CHIP_TOOL_BIN" ] && export MAT_CHIP_TOOL_BIN="$MAT_E2E_CHIP_TOOL_BIN"
 export RUST_LOG=info
-nohup /tmp/matd-m5 "${ARGS[@]}" >/tmp/matd-m5.log 2>&1 &
+# 追記（>>）: restart 時の再呼び出しでログを消さない（roundtrip フェーズの
+# counter 基準値を残し、末尾の jump-ahead 比較で使う）。初回の空ログ化は
+# 呼び出し側（最初の start_matd 呼び出し前）で rm -f 済み。
+nohup /tmp/matd-m5 "${ARGS[@]}" >>/tmp/matd-m5.log 2>&1 &
 echo $! > /tmp/matd-m5.pid
 disown
 EOF
@@ -97,9 +100,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== 3/5 native matd を起動"
+# 初回だけログを空にする（start_matd 自体は >> 追記なので、restart を跨いで
+# roundtrip フェーズの counter 基準値が残る）。
+ssh "$MAT_E2E_HOST" 'rm -f /tmp/matd-m5.log'
 start_matd
 
 echo "== 4/5 ライブテスト (roundtrip)"
+# 注意: MAT_E2E_GROUP_NODES は ssh 経由でそのまま argv に渡るため、csv にスペースを
+# 含めないこと（ssh はリモートコマンドをスペース区切りで再結合する）。
 ssh "$MAT_E2E_HOST" \
   MAT_E2E_SOCKET="$SOCKET" \
   MAT_E2E_GROUP_ID="$GROUP_ID" \
@@ -108,7 +116,7 @@ ssh "$MAT_E2E_HOST" \
   'exec /tmp/live_matd_group --ignored --nocapture matd_group_roundtrip'
 
 echo "== 5/5 matd 再起動 → jump-ahead 配達検証"
-ssh "$MAT_E2E_HOST" 'kill "$(cat /tmp/matd-m5.pid)" && sleep 1'
+ssh "$MAT_E2E_HOST" 'kill "$(cat /tmp/matd-m5.pid)" 2>/dev/null; sleep 1' || true
 start_matd
 ssh "$MAT_E2E_HOST" \
   MAT_E2E_SOCKET="$SOCKET" \

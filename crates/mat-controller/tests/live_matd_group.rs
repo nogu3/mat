@@ -82,7 +82,7 @@ async fn matd_group_roundtrip() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_all_onoff(&socket, &nodes, ep, true, "after group on").await;
 
-    // color-temp 370 mireds → 各ノードの color-temperature が目標±8。
+    // color-temp 370 mireds → 各ノードの color-temperature-mireds が目標±8。
     let ct = format!(
         r#"{{"op":"group_color_temp","group_id":{gid},"mireds":370,"kelvin":2702,"transition":0,"endpoint":{ep}}}"#
     );
@@ -90,10 +90,10 @@ async fn matd_group_roundtrip() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     for node in &nodes {
         let read = format!(
-            r#"{{"op":"read","node_id":{node},"endpoint":{ep},"cluster":"colorcontrol","attribute":"color-temperature"}}"#
+            r#"{{"op":"read","node_id":{node},"endpoint":{ep},"cluster":"colorcontrol","attribute":"color-temperature-mireds"}}"#
         );
         let r = request(&socket, &read).await;
-        assert_ok(&r, &format!("read color-temperature node {node}"));
+        assert_ok(&r, &format!("read color-temperature-mireds node {node}"));
         let v = r["value"].as_i64().expect("numeric mireds");
         assert!((v - 370).abs() <= 8, "node {node}: mireds {v} not near 370");
     }
