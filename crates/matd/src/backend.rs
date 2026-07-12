@@ -75,7 +75,7 @@ pub struct ChipToolBackend {
 
 impl ChipToolBackend {
     /// chip-tool を `interactive server` で起動して繋ぐ。`idle` 無アクセスでセッションを
-    /// 畳む。起動時に一度確立してエラーを早期検出する。
+    /// 畳む。接続は起動時には確立せず、初回コマンドで遅延確立する。
     pub async fn spawn(store: &Path, port: u16, idle: Duration) -> Result<Self, MatError> {
         Self::new(
             Mode::Spawn {
@@ -93,7 +93,7 @@ impl ChipToolBackend {
     }
 
     async fn new(mode: Mode, idle: Duration) -> Result<Self, MatError> {
-        let backend = ChipToolBackend {
+        Ok(ChipToolBackend {
             mode,
             idle,
             conn: Mutex::new(Conn {
@@ -102,12 +102,7 @@ impl ChipToolBackend {
                 last_used: Instant::now(),
                 failures: 0,
             }),
-        };
-        // 早期接続。失敗すれば matd 起動を失敗させる。
-        let mut conn = backend.conn.lock().await;
-        backend.ensure_connected(&mut conn).await?;
-        drop(conn);
-        Ok(backend)
+        })
     }
 
     /// アイドル畳み込みの基準時間。reaper の周期決めに使う。
@@ -550,5 +545,20 @@ mod tests {
             .and_then(Value::as_str)
             .expect("diag attached");
         assert!(diag.contains("0x00000032"), "got: {diag}");
+    }
+
+    #[tokio::test]
+    async fn connect_mode_does_not_dial_until_first_command() {
+        // Connect モードで、繋ぐ相手が居なくても構築は成功する（遅延確立）。
+        // 以前は new() が即接続して失敗していた。
+        let backend = ChipToolBackend::connect(59999, Duration::from_secs(300)).await;
+        assert!(
+            backend.is_ok(),
+            "lazy connect must not dial at construction"
+        );
+        assert!(
+            !backend.unwrap().ws_connected().await,
+            "no ws until first command"
+        );
     }
 }
