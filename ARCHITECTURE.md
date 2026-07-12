@@ -441,7 +441,13 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   スキーマは両経路で共通（`group_sent_body`）。native 無効時（`MAT_MATD_IFACE`
   未指定）は全 group op が chip-tool のまま（挙動不変）。設計は
   `docs/superpowers/specs/2026-07-12-phase5-m5-group-native-design.md`。
-  **実機 E2E は未実施**（合格後に別コミットで本欄を更新する。M4 と同じ運用）。
+  **実機 E2E 合格**（2026-07-13、`task e2e:m5`、実 fabric の 7 ノード group）:
+  native groupcast の off / on / color-temp が 7/7 配達（各ノードを unicast read
+  で検証）、matd 再起動後も jump-ahead した counter（+8192、単調増加をログで
+  確認）で 7/7 配達。初回走行は 0/7 不達で、tcpdump により「宛先 sockaddr の
+  `sin6_scope_id` だけでは egress iface を選べず、VPN（tailscale0）の広い v6
+  経路が multicast の経路解決を勝って LAN に出ていない」ことを特定 —
+  `GroupSender::new` で `IPV6_MULTICAST_IF` を明示設定して解決（回帰テスト付き）。
 
 ---
 
