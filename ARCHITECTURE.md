@@ -414,6 +414,16 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   （TXT SII→MRP 接続）+ colorcontrol。jarvis 実機 Nanoleaf に本番 fabric
   相乗り（fabric index ≠ fabric id 環境）で CASE + onoff/色変更の E2E 合格
   （`task e2e:m3`）。
+- M4 完了(2026-07-12): matd のホットパス（on / off / color=move-to-hue-and-saturation
+  / color-temp=move-to-color-temperature / onoff の `on-off` read）を、
+  `mat-controller` の in-process warm CASE セッションで処理する経路に差し替え。
+  有効化は `MAT_MATD_IFACE=<Thread mesh iface>` env（または `matd --iface <name>`）。
+  未指定なら従来どおり全 op が chip-tool interactive server 経由（安全な既定挙動）。
+  native 構築に失敗した場合（KVS 読み取り不可等）も warn ログの上で chip-tool に
+  フォールバックし、matd は落ちない。write / describe / 任意 cluster の read・invoke
+  / group 系は引き続き chip-tool 経由（group は M5 で native 化予定）。実機受け入れ
+  ハーネス `task e2e:m4` を実装（本番 matd を止めず別 socket/port で検証する設計）。
+  実機 E2E の実行はこれから。
 
 ---
 

@@ -556,6 +556,46 @@ permanently hot core for never paying a cold start.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
+### matd's native backend (Phase 5 M4)
+
+Set `MAT_MATD_IFACE=<thread mesh iface>` (or pass `matd --iface <name>`) to let
+`matd` handle its hotpath ops — `on` / `off` / `color`
+(`move-to-hue-and-saturation`) / `color-temp` (`move-to-color-temperature`) /
+`read`ing the `onoff` cluster's `on-off` attribute — in-process, over a warm
+CASE session held by the embedded Matter controller (crate `mat-controller`,
+Phase 5's from-scratch native backend), instead of going through the
+`chip-tool interactive server`. Leave it unset and nothing changes: every op
+still goes through chip-tool, exactly as before.
+
+```bash
+matd --iface thread0 &
+# or: MAT_MATD_IFACE=thread0 matd &
+```
+
+- Native sessions are held per-node indefinitely once established (unlike
+  `chip-tool`, no busy-loop cost — a few KB per node). A send that exhausts
+  MRP retransmission (timeout) discards the session and does one automatic
+  mDNS re-resolve + re-CASE before failing.
+- If the fabric table index isn't `1` (e.g. sharing a fabric with another
+  admin), pass `--fabric-index <n>` (env `MAT_MATD_FABRIC_INDEX`). The CA
+  issuer index defaults to `0`; override with `--issuer-index` (env
+  `MAT_MATD_ISSUER_INDEX`).
+- If native construction fails (e.g. the credential store can't be read),
+  `matd` logs a warning and falls back to chip-tool for everything — it does
+  not refuse to start.
+- Everything outside the hotpath — `write`, `describe`, arbitrary
+  cluster `read`/`invoke`, and all `group` ops — still goes through
+  chip-tool (`group` native support is planned for M5). Because of this,
+  `chip-tool` is only spawned lazily on the first op that needs it: a
+  workload that only ever hits the native hotpath never spawns `chip-tool`
+  at all, and `matd` can start even if `chip-tool` isn't installed.
+- Error kinds and exit codes are identical regardless of path: mDNS
+  resolution failure -> `unreachable`, CASE failure -> `session_failed`, MRP
+  exhaustion -> `timeout`, IM status rejection -> `device_rejected`.
+- Real-device acceptance harness: `task e2e:m4` (needs `MAT_E2E_HOST` /
+  `MAT_E2E_NODE_ID` / `MAT_E2E_IFACE`; designed to run against a separate
+  socket/port so it doesn't disturb a production `matd`).
+
 ## Credential store
 
 Resolution order: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` >
