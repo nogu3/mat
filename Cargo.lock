@@ -760,6 +760,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64",
+ "base64ct",
  "clap",
  "futures-util",
  "mat-controller",
