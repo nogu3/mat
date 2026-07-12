@@ -584,17 +584,61 @@ matd --iface thread0 &
   `matd` logs a warning and falls back to chip-tool for everything — it does
   not refuse to start.
 - Everything outside the hotpath — `write`, `describe`, arbitrary
-  cluster `read`/`invoke`, and all `group` ops — still goes through
-  chip-tool (`group` native support is planned for M5). Because of this,
-  `chip-tool` is only spawned lazily on the first op that needs it: a
-  workload that only ever hits the native hotpath never spawns `chip-tool`
-  at all, and `matd` can start even if `chip-tool` isn't installed.
+  cluster `read`/`invoke`, and `group provision` / generic `group invoke`
+  (non-onoff, or onoff with arguments) — still goes through chip-tool.
+  Because of this, `chip-tool` is only spawned lazily on the first op that
+  needs it: a workload that only ever hits the native hotpath never spawns
+  `chip-tool` at all, and `matd` can start even if `chip-tool` isn't
+  installed.
 - Error kinds and exit codes are identical regardless of path: mDNS
   resolution failure -> `unreachable`, CASE failure -> `session_failed`, MRP
   exhaustion -> `timeout`, IM status rejection -> `device_rejected`.
 - Real-device acceptance harness: `task e2e:m4` (needs `MAT_E2E_HOST` /
   `MAT_E2E_NODE_ID` / `MAT_E2E_IFACE`; designed to run against a separate
   socket/port so it doesn't disturb a production `matd`).
+
+### matd's native groupcast (Phase 5 M5)
+
+With native enabled (`MAT_MATD_IFACE` set and the native backend built
+successfully), `matd` also handles its three group-send ops in-process
+instead of going through chip-tool: `group invoke` for onoff `on`/`off`/
+`toggle` with no extra arguments, `group color`, and `group color-temp`.
+`group provision` and any other `group invoke` (non-onoff cluster, or onoff
+with arguments) are unaffected — they always go through chip-tool.
+
+- Each send re-reads the group's operational credentials from the chip-tool
+  KVS (derived GroupKeyMap -> keyset GKH + operational key), so a
+  `group provision --rebind` takes effect on the very next native send with
+  no matd restart needed.
+- The send is a single unacknowledged AES-CCM-sealed packet to the
+  site-local transient multicast address (`ff35::.../64` scope, hop limit
+  64) — same wire semantics as chip-tool's groupcast (no response, no MRP).
+- The send counter is persisted at `<store>/native_group_counter` (plain
+  decimal text, written ahead by 4096 so a crash never reuses a counter
+  value). On first use it jumps to `max(own file, chip-tool's `g/gdc`) +
+  4096`, because native shares the same source node id as chip-tool and
+  therefore the same per-sender counter window on the receiving devices.
+- If native can't send (group not provisioned, KVS incomplete, `g/gdc`
+  missing, etc.), `matd` logs a warning and falls back to chip-tool for that
+  op — it does not fail the request.
+- The response JSON is identical on both paths (same `group_sent_body`
+  schema as the direct/chip-tool group commands above).
+- With native disabled (`MAT_MATD_IFACE` unset, or native construction
+  failed), all group ops go through chip-tool exactly as before — no
+  behavior change.
+- **Recommendation: pick one group sender.** Once native groupcast is
+  active, send all groupcasts through native `matd` and stop sending them
+  through the direct `mat` (chip-tool) path. Native's counter jump-ahead at
+  startup only protects the *first* send after enabling native — it reads
+  chip-tool's `g/gdc` once and then advances independently. If you go back
+  to sending via direct chip-tool *after* native has been sending for a
+  while, chip-tool's counter is now behind native's and devices will drop
+  its groupcasts as stale/duplicate (the same counter-collision failure
+  mode as mixing two chip-tool senders — see `groupcast-e2e-findings` in
+  project notes). Real-device acceptance harness: `task e2e:m5` (needs
+  `MAT_E2E_HOST` / `MAT_E2E_IFACE` / `MAT_E2E_GROUP_NODES`; stop production
+  matd's group traffic for the duration — unicast ops are fine to leave
+  running).
 
 ## Credential store
 

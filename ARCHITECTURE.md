@@ -425,6 +425,23 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   （`task e2e:m4`、本番 matd を止めず別 socket/port で検証）: ホットパス往復 + warm
   再利用（cold 1.16s → warm 120ms、mDNS+CASE を払わない）+ describe の chip-tool
   フォールバック（lazy spawn）を実機で確認。
+- M5 完了(2026-07-12): matd の group 送信 3 op（`GroupInvoke` の onoff 引数なし
+  on/off/toggle、`GroupColor`、`GroupColorTemp`）を native groupcast 化。鍵は
+  chip-tool KVS の導出済み operational credentials（GroupKeyMap
+  `f/<idx>/gk/<n>` → keyset の GKH + operational key）を送信のたびに読み直し
+  （re-provision が即反映される）、AES-CCM で封止して ff35::（site-local
+  transient multicast, hop limit 64）へ一発送信（応答なし・MRP なし、chip-tool
+  と同じ unacknowledged groupcast の意味論）。counter は
+  `<store>/native_group_counter`（10進テキスト、persist-ahead 4096）に永続化し、
+  起動時に `max(自前, chip-tool の g/gdc) + 4096` へ jump-ahead する（chip-tool
+  と同一 source node id で counter 空間を共有するため、低い値から始めると受信側の
+  重複窓判定で全滅する）。`GroupProvision` と汎用 group invoke（onoff 以外・引数
+  付き）は引き続き chip-tool。group 未 provision・KVS 不備・`g/gdc` 欠落など native
+  で送れない事情は warn ログの上 chip-tool へフォールバックする。応答 JSON
+  スキーマは両経路で共通（`group_sent_body`）。native 無効時（`MAT_MATD_IFACE`
+  未指定）は全 group op が chip-tool のまま（挙動不変）。設計は
+  `docs/superpowers/specs/2026-07-12-phase5-m5-group-native-design.md`。
+  **実機 E2E は未実施**（合格後に別コミットで本欄を更新する。M4 と同じ運用）。
 
 ---
 
