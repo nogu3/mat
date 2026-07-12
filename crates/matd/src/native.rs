@@ -139,7 +139,9 @@ impl NativeBackend {
 
     /// warm セッションで `op` を実行する。slot が空なら確立。送信が Timeout
     /// （MRP 尽き=session が死んでいる兆候）なら slot を捨てて1回だけ再確立し再送する。
-    /// device_rejected 等（コマンドは届いた）は再送しない。
+    /// DeviceRejected / ParseError（コマンドは届き session は健全）は slot 維持で即 Err。
+    /// それ以外（Other/Unreachable 等 = session 致命の疑い）は再送せず slot を捨てて
+    /// 次コマンドでの遅延再確立に委ねる（死んだ session の持ち越しによる恒久 wedge 防止）。
     async fn with_session<F, T>(&self, node_id: u64, op: F) -> Result<T, MatError>
     where
         F: for<'a> Fn(
@@ -157,7 +159,7 @@ impl NativeBackend {
         match result {
             Ok(v) => Ok(v),
             Err(e) if e.kind == ErrorKind::Timeout => {
-                // session が死んだ疑い。捨てて1回だけ再確立→再送。
+                // MRP 再送尽き=未達の可能性大。捨てて1回だけ再確立→再送。
                 tracing::info!(
                     node_id,
                     "native session send timed out; re-establishing once"
@@ -166,7 +168,22 @@ impl NativeBackend {
                 *guard = Some(self.establisher.establish(node_id).await?);
                 op(guard.as_mut().expect("re-established")).await
             }
-            Err(e) => Err(e),
+            // DeviceRejected（IM status 拒否=届いて処理された、session 健全）と
+            // ParseError（値デコード問題、session 健全）は slot 維持で即 Err。
+            Err(e) if matches!(e.kind, ErrorKind::DeviceRejected | ErrorKind::ParseError) => Err(e),
+            // それ以外（Other/Unreachable 等 = 復号失敗・カウンタ desync・不正フレーム
+            // 等で session が死んだ疑い）。応答が受かった可能性があるので再送はしないが、
+            // 死んだ session を持ち続けると恒久 wedge になる。slot を捨てて次コマンドで
+            // 自然に再確立させる。
+            Err(e) => {
+                tracing::info!(
+                    node_id,
+                    kind = ?e.kind,
+                    "native session error; dropping session for lazy re-establish"
+                );
+                *guard = None;
+                Err(e)
+            }
         }
     }
 
@@ -435,6 +452,40 @@ mod tests {
             .expect_err("device rejected must surface as an error");
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // slot は破棄されず維持される: 同ノードへの 2 回目のコマンドは warm 再利用で
+        // 成功し、establish は 1 のまま（session 健全なので捨てない）。
+        let v = backend
+            .read_onoff(0x1234, 1)
+            .await
+            .expect("warm session must be reused after device_rejected");
+        assert!(v);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drops_session_on_session_fatal_error_without_retry() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            fail_first_send: true,
+            fail_kind: ErrorKind::Other,
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        // 1 回目の send が session 致命エラー（Other=復号失敗/counter desync 等）。
+        // (a) エラー kind は Other、(b) 再送しない → establish は 1 回のみ。
+        let err = backend
+            .read_onoff(0x1234, 1)
+            .await
+            .expect_err("session-fatal error must surface");
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // (c) 死んだ session は破棄済み → 2 回目のコマンドで再確立して成功。
+        let v = backend
+            .read_onoff(0x1234, 1)
+            .await
+            .expect("session must be lazily re-established after fatal error");
+        assert!(v);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
