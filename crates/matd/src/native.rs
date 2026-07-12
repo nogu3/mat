@@ -361,6 +361,11 @@ impl NativeBackend {
                 tracing::info!(group_id, counter, "groupcast sent (native)");
                 Ok(GroupOutcome::Sent)
             }
+            // GroupSendError::{Crypto,Io} 双方を Unreachable に一括写像する。Io
+            // （socket 送出失敗）は妥当な写像だが、Crypto（AES-CCM 暗号化失敗）は
+            // 実用上ほぼ起き得ない（caller bug か payload サイズ超過のみ）ため、
+            // 専用 ErrorKind を割かずに Unreachable へ寄せる pragmatic な
+            // catch-all という判断（レビュー指摘 minor、挙動変更なし）。
             Err(e) => Err(MatError::new(
                 ErrorKind::Unreachable,
                 format!("groupcast send to group {group_id}: {e}"),

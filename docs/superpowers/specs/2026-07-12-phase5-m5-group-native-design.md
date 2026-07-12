@@ -101,6 +101,22 @@ groupcast の受信側は送信元 node id ごとに counter 窓を持つ。nati
 知らず、interactive セッション中はメモリ内 counter を使うため排他が成立しない。
 ini の書き換え衝突（KVS 破壊）リスクも増える。
 
+**2026-07-13 最終レビュー追記（訂正）**: 上の「matd 経由では構造的に混在
+しない」は native-eligible な 3 形（onoff 引数なし on/off/toggle の
+`group invoke`、`group color`、`group color-temp`）に限った話で、それ以外の
+group 送信（他 cluster の `group invoke`、引数付き onoff の `group invoke`
+等）は matd 経由でも従来どおり chip-tool を通る（`server.rs::native_group_params`
+が `None` を返す形）。この chip-tool 経路は matd native の counter とは別に
+chip-tool 自身の counter を使うため、native がすでに送信を重ねた後だと
+chip-tool 側 counter は同じ送信元 node id の native より下回り得る（counter
+窓は送信元 node id ごと・全 group 共通）。同じ group を native 経由でも受けて
+いるデバイスは、この chip-tool 経由の送信を古い/重複として黙って捨てる
+可能性がある（intra-matd counter mixing）。対応: ルーティングは変更せず、
+`server.rs::run_op` に `tracing::warn!` を追加して観測可能にした
+（README「matd's native groupcast」節にも運用注記を追記）。native-eligible
+形を拡張して全 group 送信を native 化する／該当送信を拒否する、といった
+根本対応は製品判断として見送り（このレビューのスコープ外）。
+
 ### 決定 4: 宛先アドレスと multicast 送信
 
 - 宛先: Matter 仕様の site-local transient multicast、port 5540。16 バイトの

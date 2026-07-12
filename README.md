@@ -634,7 +634,21 @@ with arguments) are unaffected — they always go through chip-tool.
   to sending via direct chip-tool *after* native has been sending for a
   while, chip-tool's counter is now behind native's and devices will drop
   its groupcasts as stale/duplicate (the same counter-collision failure
-  mode as mixing two chip-tool senders). Real-device acceptance harness: `task e2e:m5` (needs
+  mode as mixing two chip-tool senders).
+- **Caveat: this also happens *within* a single `matd`, for group sends
+  outside the three native-eligible shapes.** Only `group invoke` for onoff
+  `on`/`off`/`toggle` with no extra arguments, `group color`, and `group
+  color-temp` go native; any other group send (e.g. `group invoke <g>
+  levelcontrol move-to-level ...`, or onoff `group invoke` with extra
+  arguments) still goes through chip-tool even while native is active. If a
+  group has members that also receive native-driven groupcasts, that
+  chip-tool-routed send uses chip-tool's counter, which can already be
+  behind native's jumped-ahead counter for the same source node id (the
+  counter window is per-source-node, across all groups) — those devices can
+  silently drop it while `matd` still reports `"status": "sent"`. `matd`
+  logs a `tracing::warn!` when this happens, but routing is unchanged
+  (refusing the send is a product decision, not made here).
+- Real-device acceptance harness: `task e2e:m5` (needs
   `MAT_E2E_HOST` / `MAT_E2E_IFACE` / `MAT_E2E_GROUP_NODES`; stop production
   matd's group traffic for the duration — unicast ops are fine to leave
   running).
