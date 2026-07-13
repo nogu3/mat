@@ -346,7 +346,7 @@ pub(crate) fn random_p256_secret() -> p256::SecretKey {
 }
 
 /// Generates a non-zero random u16 (session ids must not be zero, spec §4.5.2).
-fn random_nonzero_u16() -> u16 {
+pub(crate) fn random_nonzero_u16() -> u16 {
     loop {
         let mut b = [0u8; 2];
         getrandom::getrandom(&mut b).expect("os rng");

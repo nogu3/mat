@@ -16,6 +16,7 @@ pub mod group;
 pub mod im;
 pub mod kvs;
 pub mod message;
+pub mod pase;
 pub mod session;
 pub mod setup_code;
 pub mod spake2p;

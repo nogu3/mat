@@ -118,6 +118,12 @@ impl SecureSession {
         self.peer_node_id
     }
 
+    /// PASE で確立したセッションの Attestation Challenge (spec §11.17.5.4 が
+    /// attestation 署名の対象に含める)。
+    pub fn attestation_challenge(&self) -> [u8; 16] {
+        self.keys.attestation_challenge
+    }
+
     /// Generates a random exchange id for a new exchange on this session.
     pub fn new_exchange_id() -> u16 {
         let mut b = [0u8; 2];
