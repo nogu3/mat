@@ -22,3 +22,4 @@ pub mod setup_code;
 pub mod spake2p;
 pub mod tlv;
 pub mod transport;
+pub mod x509;
