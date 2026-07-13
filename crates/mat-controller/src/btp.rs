@@ -276,6 +276,9 @@ struct SessionState {
     last_rx_seq: u8,   // 受信した最新の peer seq
     pending_ack: bool, // peer へ ack を返す義務があるか
     reasm: Reassembler,
+    // レビュー指摘対応（fix wave 1）:
+    last_ack_progress: tokio::time::Instant, // 直近で unacked が減った時刻
+    segs_since_ack: u8,                      // 直近の送信ack以降に受信した「実データ」segment数
 }
 
 impl SessionState {
@@ -287,6 +290,8 @@ impl SessionState {
             last_rx_seq: 0,
             pending_ack: false,
             reasm: Reassembler::new(),
+            last_ack_progress: tokio::time::Instant::now(),
+            segs_since_ack: 0,
         }
     }
 }
@@ -298,14 +303,41 @@ fn process_incoming(pkt: &Packet, st: &mut SessionState) -> Result<Option<Vec<u8
     if let Some(a) = pkt.ack {
         // a..=直前 tx_seq-1 のうち ack された分を勘定（u8 wrap 対応）。
         let newly = a.wrapping_sub(st.peer_acked);
+        if newly > 0 {
+            st.last_ack_progress = tokio::time::Instant::now();
+        }
         st.unacked = st.unacked.saturating_sub(newly);
         st.peer_acked = a;
     }
     if let Some(s) = pkt.seq {
         st.last_rx_seq = s;
         st.pending_ack = true;
+        // payload が空 = standalone ack/keepalive（Reassembler::push と同じ
+        // 判定基準）。実データを運ぶ segment だけを積算対象にする — でない
+        // と「ack への ack」が無限に連鎖してしまう（純粋な ack 交換は
+        // 完了/keepalive 任せのままでよい。brief の対象は複数segmentに
+        // またがる実メッセージの詰まり）。
+        if !pkt.payload.is_empty() {
+            st.segs_since_ack = st.segs_since_ack.saturating_add(1);
+        }
     }
     st.reasm.push(pkt)
+}
+
+/// 受信segment数が閾値（ウィンドウの半分、最低1）に達していたら、メッセージ
+/// 完成を待たず即座に ack を返す。相手側のウィンドウがこちらの ack 待ちで
+/// 詰まるのを防ぐ（brief: 複数segmentに跨るメッセージのstall対策）。
+/// keepalive と同じ理由でこちらのウィンドウが満杯なら送らない。
+async fn maybe_send_proactive_ack(
+    link: &mut GattLink,
+    st: &mut SessionState,
+    params: &BtpParams,
+) -> Result<(), BtpError> {
+    let threshold = std::cmp::max(1, params.window_size / 2);
+    if st.pending_ack && st.segs_since_ack >= threshold && st.unacked < params.window_size {
+        send_standalone(link, st).await?;
+    }
+    Ok(())
 }
 
 async fn run_session(
@@ -334,7 +366,13 @@ async fn run_session(
                         if send_standalone(&mut link, &mut st).await.is_err() { break; }
                         keepalive.reset();
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // 複数segmentメッセージの途中: 閾値超えなら早めにack
+                        // (Finding 2)。
+                        if maybe_send_proactive_ack(&mut link, &mut st, &params).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(e) => { tracing::warn!(error=%e, "btp reassembly failed"); break; }
                 }
             }
@@ -344,7 +382,21 @@ async fn run_session(
                 keepalive.reset();
             }
             _ = keepalive.tick() => {
-                if send_standalone(&mut link, &mut st).await.is_err() { break; }
+                // アイドル中に unacked が全く進捗しないまま ACK_TIMEOUT を
+                // 超えたら見込みなしと判断してセッションを閉じる
+                // (Finding 1: send_message のウィンドウ待ちループ以外では
+                // ACK_TIMEOUT が効いていなかった)。
+                if st.unacked > 0 && st.last_ack_progress.elapsed() >= ACK_TIMEOUT {
+                    tracing::warn!("btp: no ack progress within ACK_TIMEOUT — closing session");
+                    break;
+                }
+                // ウィンドウが満杯なら keepalive も送らない（unacked の
+                // 無制限増加 = u8 オーバーフローを防ぐ。Finding 1）。
+                if st.unacked < params.window_size
+                    && send_standalone(&mut link, &mut st).await.is_err()
+                {
+                    break;
+                }
             }
         }
     }
@@ -354,8 +406,9 @@ async fn run_session(
 async fn send_standalone(link: &mut GattLink, st: &mut SessionState) -> Result<(), BtpError> {
     let seq = st.tx_seq;
     st.tx_seq = st.tx_seq.wrapping_add(1);
-    st.unacked += 1;
+    st.unacked = st.unacked.saturating_add(1); // defense in depth (Finding 1)
     st.pending_ack = false;
+    st.segs_since_ack = 0; // ack を出したので起点をリセット（Finding 2）
     link.writes
         .send(encode_standalone_ack(seq, st.last_rx_seq).to_vec())
         .await
@@ -382,11 +435,19 @@ async fn send_message(
                 .map_err(|_| BtpError::Timeout("window ack"))?
                 .ok_or(BtpError::Closed)?;
             let pkt = Packet::decode(&frame)?;
-            if let Some(m) = process_incoming(&pkt, st)? {
-                if in_tx.send(m).await.is_err() {
-                    return Err(BtpError::Closed);
+            match process_incoming(&pkt, st)? {
+                Some(m) => {
+                    if in_tx.send(m).await.is_err() {
+                        return Err(BtpError::Closed);
+                    }
+                    send_standalone(link, st).await?;
                 }
-                send_standalone(link, st).await?;
+                None => {
+                    // ここで unacked が減っていれば直後にゲートが開くので、
+                    // 相手の次メッセージを待たせず即座にackを返す
+                    // (Finding 2)。
+                    maybe_send_proactive_ack(link, st, params).await?;
+                }
             }
         }
         let with_ack = st.pending_ack && first;
@@ -402,9 +463,10 @@ async fn send_message(
         };
         let seq = st.tx_seq;
         st.tx_seq = st.tx_seq.wrapping_add(1);
-        st.unacked += 1;
+        st.unacked = st.unacked.saturating_add(1); // defense in depth (Finding 1)
         let ack = if with_ack {
             st.pending_ack = false;
+            st.segs_since_ack = 0; // ack を出したので起点をリセット（Finding 2）
             Some(st.last_rx_seq)
         } else {
             None
@@ -871,6 +933,86 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), peripheral)
             .await
             .expect("peripheral task must not hang")
+            .unwrap();
+    }
+
+    // --- Fix wave 1: keepalive/ack-timeout bounding, proactive inbound ack ---
+
+    #[tokio::test(start_paused = true)]
+    async fn btp_keepalive_gated_by_window_then_closes_after_ack_timeout() {
+        // window=2, peer never acks anything: keepalives must stop once
+        // unacked reaches the window (no unbounded growth / u8 overflow),
+        // and the actor must close on its own once ACK_TIMEOUT elapses with
+        // zero ack progress (idle-but-unacked watchdog).
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 2).await;
+            for _ in 0..2 {
+                let frame = p.from_client.recv().await.expect("keepalive within window");
+                let pkt = Packet::decode(&frame).unwrap();
+                assert!(pkt.payload.is_empty());
+                assert!(pkt.ack.is_some());
+            }
+            // Window is now full (unacked == window_size == 2): further
+            // keepalive ticks must be skipped, not queued, well before the
+            // eventual ACK_TIMEOUT close.
+            let blocked = tokio::time::timeout(KEEPALIVE_INTERVAL * 3, p.from_client.recv()).await;
+            assert!(blocked.is_err(), "no third keepalive: window-gated");
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let mut buf = [0u8; 16];
+        let err = tokio::time::timeout(ACK_TIMEOUT + KEEPALIVE_INTERVAL * 2, t.recv_from(&mut buf))
+            .await
+            .expect("actor must close within ACK_TIMEOUT of no ack progress")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        peripheral.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_sends_proactive_ack_before_message_completes() {
+        // window=2: proactive-ack threshold = max(1, 2/2) = 1 inbound
+        // segment. A peer that itself only tolerates 2 unacked frames sends
+        // segment 1+2 up front, then needs an ack from us before segment 3.
+        // Without the fix this only unblocks via the 2.5s keepalive; with
+        // the fix we ack after just 1 segment, so the whole exchange
+        // completes with no time advance at all (bounded by a short
+        // real-time timeout below).
+        let (link, mut p) = fake_link();
+        let msg: Vec<u8> = (0u8..60).collect(); // segment_size 30 → 3 segments (26/28/6)
+        let expect = msg.clone();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(30, 2).await;
+            let seg1 = encode_data_packet(
+                0,
+                None,
+                SegmentPos::First { ending: false },
+                Some(60),
+                &msg[..26],
+            );
+            let seg2 = encode_data_packet(1, None, SegmentPos::Middle, None, &msg[26..54]);
+            p.to_client.send(seg1).await.unwrap();
+            p.to_client.send(seg2).await.unwrap();
+            // Must see a proactive ack after segment 1 (threshold=1) before
+            // sending the final segment — no keepalive wait needed.
+            let ack_frame = p.from_client.recv().await.expect("proactive ack");
+            let ack_pkt = Packet::decode(&ack_frame).unwrap();
+            assert!(ack_pkt.payload.is_empty(), "expected standalone ack");
+            assert!(ack_pkt.ack.is_some());
+            let seg3 = encode_data_packet(2, None, SegmentPos::Last, None, &msg[54..]);
+            p.to_client.send(seg3).await.unwrap();
+            p
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let mut buf = [0u8; 1280];
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), t.recv_from(&mut buf))
+            .await
+            .expect("message must complete without waiting on keepalive")
+            .unwrap();
+        assert_eq!(&buf[..n], &expect[..]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), peripheral)
+            .await
+            .expect("peripheral must not hang")
             .unwrap();
     }
 }
