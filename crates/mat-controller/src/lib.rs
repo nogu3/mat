@@ -8,6 +8,7 @@ pub mod asn1;
 pub mod attestation;
 pub mod case;
 pub mod cert;
+pub mod commissioning;
 pub mod counter;
 pub mod crypto;
 pub mod dnssd;
