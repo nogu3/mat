@@ -19,6 +19,7 @@ use crate::exchange::MrpConfig;
 
 const MDNS_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
+const TYPE_PTR: u16 = 12;
 const TYPE_TXT: u16 = 16;
 const TYPE_AAAA: u16 = 28;
 const TYPE_SRV: u16 = 33;
@@ -190,6 +191,7 @@ fn read_name(buf: &[u8], mut pos: usize) -> Result<(String, usize), DnssdError> 
 }
 
 enum RData {
+    Ptr(String),
     Srv { port: u16, target: String },
     Txt(Vec<Vec<u8>>),
     Aaaa(Ipv6Addr),
@@ -283,6 +285,13 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             .get(rdata_pos..rdata_pos + rdlen)
             .ok_or(DnssdError::Malformed("rdata past end"))?;
         let rdata = match rtype {
+            TYPE_PTR => {
+                // rdata はそれ自体が（圧縮され得る）1 個のドメイン名
+                // (RFC 1035 §3.3.12)。メッセージ全体基準の絶対オフセットで
+                // 読む。
+                let (name, _) = read_name(buf, rdata_pos)?;
+                RData::Ptr(name)
+            }
             TYPE_SRV => {
                 if rdata.len() < 7 {
                     return Err(DnssdError::Malformed("short srv rdata"));
@@ -429,6 +438,181 @@ pub async fn resolve_operational(
     Err(DnssdError::Timeout { instance: service })
 }
 
+/// Long-discriminator サブタイプ名（spec §4.3.1: `_L<discriminator>._sub.
+/// _matterc._udp.local`、discriminator は 12bit を 10 進数表記、ゼロ埋めなし）。
+fn long_discriminator_subtype(long_discriminator: u16) -> String {
+    format!("_L{long_discriminator}._sub._matterc._udp.local")
+}
+
+/// SRV/TXT が判明し、SRV target のアドレスが 1 つ以上揃った時点で
+/// `ResolvedNode` を組み立てる。TXT `D=` が `long_discriminator` と一致し
+/// ない場合は（サブタイプで絞れていても、コミッショニング中の別デバイスの
+/// 流れ弾を弾くため）拒否する。`commissionable_from_response`（単発応答）と
+/// `resolve_commissionable`（複数応答にまたがる畳み込み）の両方から使う共通
+/// ロジック。
+fn build_commissionable(
+    long_discriminator: u16,
+    port: u16,
+    target: &str,
+    txt: &[Vec<u8>],
+    aaaa: &[(String, Ipv6Addr)],
+) -> Option<ResolvedNode> {
+    if txt_u32(txt, "D") != Some(u32::from(long_discriminator)) {
+        return None;
+    }
+    let mut addresses: Vec<Ipv6Addr> = Vec::new();
+    for (name, addr) in aaaa {
+        if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
+            addresses.push(*addr);
+        }
+    }
+    if addresses.is_empty() {
+        return None;
+    }
+    // 非 link-local 優先（同じクラス内では応答順を安定に保つ）。
+    addresses.sort_by_key(is_link_local);
+    Some(ResolvedNode {
+        port,
+        addresses,
+        session_idle_interval_ms: txt_u32(txt, "SII"),
+        session_active_interval_ms: txt_u32(txt, "SAI"),
+    })
+}
+
+/// 1 個の DNS メッセージ単体から commissionable node を抽出する（PTR→
+/// instance→SRV/TXT/AAAA が同一応答の additional に同梱された、行儀の良い
+/// responder の通常ケース）。`resolve_commissionable` がまずこの高速経路を
+/// 試し、ダメなら複数応答にまたがる畳み込みにフォールバックする。
+fn commissionable_from_response(bytes: &[u8], long_discriminator: u16) -> Option<ResolvedNode> {
+    let subtype = long_discriminator_subtype(long_discriminator);
+    let records = parse_message(bytes).ok()?;
+    let instance = records.iter().find_map(|r| match &r.rdata {
+        RData::Ptr(name) if r.name.eq_ignore_ascii_case(&subtype) => Some(name.clone()),
+        _ => None,
+    })?;
+    let (port, target) = records.iter().find_map(|r| match &r.rdata {
+        RData::Srv { port, target } if r.name.eq_ignore_ascii_case(&instance) => {
+            Some((*port, target.clone()))
+        }
+        _ => None,
+    })?;
+    let txt = records.iter().find_map(|r| match &r.rdata {
+        RData::Txt(strings) if r.name.eq_ignore_ascii_case(&instance) => Some(strings.clone()),
+        _ => None,
+    })?;
+    let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+    for r in &records {
+        if let RData::Aaaa(addr) = &r.rdata {
+            push_aaaa(&mut aaaa, Some(target.as_str()), r.name.clone(), *addr);
+        }
+    }
+    build_commissionable(long_discriminator, port, &target, &txt, &aaaa)
+}
+
+/// One-shot legacy unicast mDNS browse for the commissionable node
+/// advertising `long_discriminator` under `_matterc._udp` (spec §4.3.1).
+/// Queries the long-discriminator service subtype PTR
+/// (`_L<discriminator>._sub._matterc._udp.local`), then folds the PTR
+/// answer's instance name against SRV/TXT/AAAA the same way
+/// `resolve_operational` folds an operational instance's records — resent
+/// every second until `timeout`. TXT `D=` is checked against
+/// `long_discriminator` before a candidate is accepted: the subtype narrows
+/// the browse, but a stray response from another commissioning-mode device
+/// must not be mistaken for the intended one.
+pub async fn resolve_commissionable(
+    scope_id: u32,
+    long_discriminator: u16,
+    timeout: Duration,
+) -> Result<ResolvedNode, DnssdError> {
+    let subtype = long_discriminator_subtype(long_discriminator);
+    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(DnssdError::Io)?;
+    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+
+    let mut instance: Option<String> = None;
+    let mut srv: Option<(u16, String)> = None;
+    let mut txt: Option<Vec<Vec<u8>>> = None;
+    let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
+    let mut aaaa_queried = false;
+
+    let deadline = Instant::now() + timeout;
+    let mut next_send = Instant::now();
+    let mut buf = [0u8; 1500];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= next_send {
+            let q = encode_query(0, &[(&subtype, TYPE_PTR)]);
+            sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            if let Some((_, target)) = &srv {
+                let q = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            }
+            next_send = now + QUERY_RESEND_INTERVAL;
+        }
+        let wait = deadline.min(next_send).saturating_duration_since(now);
+        let Ok(recv) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await else {
+            continue;
+        };
+        let (n, _) = recv.map_err(DnssdError::Io)?;
+        // 単発の完結応答（PTR+SRV+TXT+AAAA が全部同梱）はここで即決する。
+        if let Some(node) = commissionable_from_response(&buf[..n], long_discriminator) {
+            return Ok(node);
+        }
+        // そうでなければ、複数応答にまたがる断片を resolve_operational と
+        // 同じ要領で畳み込む（AAAA が 2 段目クエリの別便で来る場合など）。
+        // 他の応答者のデータグラムが壊れていても解決全体を中断しない。
+        let Ok(records) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        for r in records {
+            match r.rdata {
+                RData::Ptr(name) if r.name.eq_ignore_ascii_case(&subtype) => {
+                    instance = Some(name);
+                }
+                RData::Srv { port, target }
+                    if instance
+                        .as_deref()
+                        .is_some_and(|i| r.name.eq_ignore_ascii_case(i)) =>
+                {
+                    prune_aaaa(&mut aaaa, &target);
+                    srv = Some((port, target));
+                }
+                RData::Txt(strings)
+                    if instance
+                        .as_deref()
+                        .is_some_and(|i| r.name.eq_ignore_ascii_case(i)) =>
+                {
+                    txt = Some(strings);
+                }
+                RData::Aaaa(addr) => {
+                    let target = srv.as_ref().map(|(_, t)| t.as_str());
+                    push_aaaa(&mut aaaa, target, r.name, addr);
+                }
+                _ => {}
+            }
+        }
+        if let (Some((port, target)), Some(strings)) = (&srv, &txt) {
+            if let Some(node) =
+                build_commissionable(long_discriminator, *port, target, strings, &aaaa)
+            {
+                return Ok(node);
+            }
+            if !aaaa_queried {
+                let q = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+                aaaa_queried = true;
+            }
+        }
+    }
+    Err(DnssdError::Timeout {
+        instance: instance.unwrap_or(subtype),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +688,92 @@ mod tests {
         m.extend_from_slice(&16u16.to_be_bytes());
         m.extend_from_slice(&addr.octets());
         m
+    }
+
+    /// commissionable browse 用の合成応答: PTR(subtype→instance) +
+    /// SRV(instance→port/target) + TXT(instance) + AAAA(target への圧縮名)
+    /// を 1 メッセージに詰める。`synth_response` の SRV/TXT/AAAA 部分に PTR
+    /// を足した形。
+    fn synth_commissionable_response(
+        subtype: &str,
+        instance: &str,
+        target: &str,
+        port: u16,
+        txt: &[&str],
+        addr: Ipv6Addr,
+    ) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]); // qd 0, an 4, ns/ar 0
+                                                        // --- PTR ---
+        push_name(&mut m, subtype);
+        m.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        m.extend_from_slice(&[0, 1, 0, 0, 0, 120]); // IN（PTR は cache-flush 立てないのが通例）, ttl
+        let mut rdata = Vec::new();
+        push_name(&mut rdata, instance);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        // --- SRV ---
+        push_name(&mut m, instance);
+        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl
+        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
+        rdata.extend_from_slice(&port.to_be_bytes());
+        let mut tname = Vec::new();
+        push_name(&mut tname, target);
+        rdata.extend_from_slice(&tname);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        let target_off = m.len() + 6; // rdata 先頭から 6B 目が target 名
+        m.extend_from_slice(&rdata);
+        // --- TXT ---
+        push_name(&mut m, instance);
+        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        let mut rdata = Vec::new();
+        for s in txt {
+            rdata.push(s.len() as u8);
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        // --- AAAA（名前は SRV target への圧縮ポインタ）---
+        m.extend_from_slice(&[0xC0 | (target_off >> 8) as u8, (target_off & 0xFF) as u8]);
+        m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        m.extend_from_slice(&16u16.to_be_bytes());
+        m.extend_from_slice(&addr.octets());
+        m
+    }
+
+    #[test]
+    fn extracts_commissionable_from_ptr_srv_txt_aaaa() {
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        let msg = synth_commissionable_response(
+            "_L3840._sub._matterc._udp.local",
+            "ABCD1234._matterc._udp.local",
+            "dev.local",
+            5540,
+            &["D=3840", "SII=5000"],
+            addr,
+        );
+        let node = commissionable_from_response(&msg, 3840).expect("should resolve");
+        assert_eq!(node.port, 5540);
+        assert_eq!(node.addresses, vec![addr]);
+        assert_eq!(node.session_idle_interval_ms, Some(5000));
+    }
+
+    #[test]
+    fn rejects_mismatched_discriminator() {
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        let msg = synth_commissionable_response(
+            "_L3840._sub._matterc._udp.local",
+            "ABCD1234._matterc._udp.local",
+            "dev.local",
+            5540,
+            &["D=1234", "SII=5000"], // subtype は 3840 で絞れているが TXT D は不一致
+            addr,
+        );
+        assert_eq!(commissionable_from_response(&msg, 3840), None);
     }
 
     #[test]
