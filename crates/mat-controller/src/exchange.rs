@@ -241,6 +241,25 @@ impl<'t> UnsecuredExchange<'t> {
         }
     }
 
+    /// Sends a reliability-flagged message exactly once and returns
+    /// immediately, without waiting for (or retransmitting on a missing)
+    /// acknowledgement. The R flag is still set, so the peer's own MRP layer
+    /// tracks and acks it normally — only *our* wait/retry loop is skipped.
+    /// For genuine fire-and-forget sends where the caller cannot afford
+    /// `send_reliable`'s worst-case retry budget (e.g. an abort notification
+    /// sent while already unwinding to an error).
+    pub async fn send_once(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+    ) -> Result<(), ExchangeError> {
+        let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
+        self.last_sent_counter = Some(our_counter);
+        self.transport.send_to(&datagram, self.peer).await?;
+        Ok(())
+    }
+
     /// Waits for the next real (non-ack) message on this exchange.
     pub async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
         let deadline = Instant::now() + timeout;
@@ -434,6 +453,31 @@ mod tests {
             .expect("real response expected");
         assert_eq!(res.proto.opcode, OPCODE_STATUS_REPORT);
         responder_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_once_sends_a_single_reliable_flagged_datagram() {
+        let responder = bind_local().await;
+        let peer = responder.local_addr().unwrap();
+        let transport = bind_local().await;
+        let mut ex = UnsecuredExchange::new(&transport, peer);
+        assert_eq!(ex.last_sent_counter(), None);
+
+        ex.send_once(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_STATUS_REPORT, b"abort")
+            .await
+            .unwrap();
+        assert!(ex.last_sent_counter().is_some());
+
+        let (_, p, _) = read_msg(&responder).await;
+        assert!(p.needs_ack, "R flag should still be set for peer's MRP");
+        assert!(p.initiator);
+        assert_eq!(p.opcode, OPCODE_STATUS_REPORT);
+
+        // No retransmission follows even though the peer never acked.
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let res =
+            tokio::time::timeout(Duration::from_millis(150), responder.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "send_once must not retransmit");
     }
 
     #[tokio::test]
