@@ -450,6 +450,97 @@ impl SecureSession {
             op => Err(SessionError::UnexpectedOpcode(op)),
         }
     }
+
+    /// Invokes a single command over the Interaction Model, optionally as a
+    /// *timed* invoke (spec §8.5, タイムド呼び出し), and returns the full
+    /// `InvokeResponseData` (status plus any CommandFields the device sent
+    /// back) rather than the fields-discarding `InvokeOutcome` that `invoke`
+    /// returns.
+    ///
+    /// When `timed_timeout_ms` is `Some(t)`, a `TimedRequest(t)` is sent
+    /// first on a freshly allocated exchange, and the following
+    /// `InvokeRequest` (TimedRequest flag set) is sent on that *same*
+    /// exchange — spec §8.5.1 requires the timed action to arrive on the
+    /// exchange the TimedRequest opened, within the window it establishes.
+    /// A non-SUCCESS `StatusResponse` to the TimedRequest itself aborts
+    /// before the InvokeRequest is ever sent. When `timed_timeout_ms` is
+    /// `None`, this sends a plain (non-timed) InvokeRequest, identical to
+    /// `invoke`'s own request — only the response decoding differs.
+    pub async fn invoke_for_data(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields_tlv: Option<&[u8]>,
+        timed_timeout_ms: Option<u16>,
+        cfg: &MrpConfig,
+    ) -> Result<crate::im::InvokeResponseData, SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+
+        if let Some(timeout_ms) = timed_timeout_ms {
+            let timed_req = im::encode_timed_request(timeout_ms);
+            let resp = self
+                .send_reliable(
+                    exchange_id,
+                    im::PROTOCOL_ID_IM,
+                    im::OPCODE_TIMED_REQUEST,
+                    &timed_req,
+                    cfg,
+                )
+                .await?;
+            let msg = match resp {
+                Some(m) => m,
+                None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+            };
+            match msg.proto.opcode {
+                im::OPCODE_STATUS_RESPONSE => {
+                    let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                    if s != 0 {
+                        return Err(SessionError::Im(ImError::StatusResponse(s)));
+                    }
+                }
+                op => return Err(SessionError::UnexpectedOpcode(op)),
+            }
+        }
+
+        let req = if timed_timeout_ms.is_some() {
+            im::encode_invoke_request_timed(endpoint, cluster, command, fields_tlv)
+        } else {
+            im::encode_invoke_request(endpoint, cluster, command, fields_tlv)
+        };
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        match msg.proto.opcode {
+            im::OPCODE_INVOKE_RESPONSE => {
+                let data =
+                    im::decode_invoke_response_data(&msg.payload).map_err(SessionError::Im)?;
+                if data.status != 0 {
+                    return Err(SessionError::Im(ImError::CommandStatus {
+                        status: data.status,
+                        cluster_status: data.cluster_status,
+                    }));
+                }
+                Ok(data)
+            }
+            im::OPCODE_STATUS_RESPONSE => {
+                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                Err(SessionError::Im(ImError::StatusResponse(s)))
+            }
+            op => Err(SessionError::UnexpectedOpcode(op)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1098,5 +1189,261 @@ mod tests {
             ));
             dev.await.unwrap();
         }
+    }
+
+    /// InvokeResponse carrying CommandFields (a data-returning command),
+    /// shaped like Task 7's `im.rs` fixture: a single successful
+    /// InvokeResponseIB whose Command is a CommandDataIB with fields.
+    fn invoke_response_with_fields_payload() -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous); // InvokeResponseIB
+        w.start_struct(Tag::Context(0)); // CommandDataIB
+        w.start_list(Tag::Context(0)); // CommandPathIB
+        w.put_uint(Tag::Context(0), 1);
+        w.put_uint(Tag::Context(1), 0x0300);
+        w.put_uint(Tag::Context(2), 0x00);
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // CommandFields
+        w.put_uint(Tag::Context(0), 42);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// `invoke_for_data` without a timed timeout must send an ordinary
+    /// (non-timed) InvokeRequest — same wire shape as `invoke` — and decode
+    /// a data-carrying InvokeResponse into `fields_tlv`, which `invoke`'s
+    /// `InvokeOutcome` cannot represent.
+    #[tokio::test]
+    async fn invoke_for_data_untimed_returns_command_fields() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(bind_local().await);
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_INVOKE_REQUEST);
+            // TimedRequest フラグ (tag 1) が false のままであること（timed 無し）。
+            let mut r = crate::tlv::Reader::new(&body);
+            r.next().unwrap(); // struct
+            r.next().unwrap(); // SuppressResponse
+            let flag = r.next().unwrap().unwrap();
+            assert_eq!(
+                (flag.tag, flag.value),
+                (crate::tlv::Tag::Context(1), crate::tlv::Value::Bool(false))
+            );
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_INVOKE_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9600,
+                &invoke_response_with_fields_payload(),
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+
+        let data = s
+            .invoke_for_data(
+                1,
+                crate::im::CLUSTER_COLOR_CONTROL,
+                0x00,
+                None,
+                None,
+                &fast_cfg(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.status, 0);
+        let fields = data.fields_tlv.expect("fields present");
+        let mut fr = crate::tlv::Reader::new(&fields);
+        assert_eq!(
+            fr.next().unwrap().unwrap().value,
+            crate::tlv::Value::StructStart
+        );
+        let e = fr.next().unwrap().unwrap();
+        assert_eq!(
+            (e.tag, e.value),
+            (crate::tlv::Tag::Context(0), crate::tlv::Value::Uint(42))
+        );
+        dev.await.unwrap();
+    }
+
+    /// `invoke_for_data` with a timed timeout must, on the same exchange:
+    /// send `TimedRequest(t)` first, wait for `StatusResponse(0)`, then send
+    /// the InvokeRequest with its TimedRequest flag set (spec §8.5.1).
+    #[tokio::test]
+    async fn invoke_for_data_timed_sends_timed_request_then_invoke_with_flag() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(bind_local().await);
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            // 1. TimedRequest -> StatusResponse(0)
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_TIMED_REQUEST);
+            let first_ex = p.exchange_id;
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_STATUS_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9700,
+                &crate::im::encode_status_response(0),
+            );
+            device.send_to(&resp, from).await.unwrap();
+
+            // The StatusResponse we sent asked for its own ack
+            // (needs_ack=true, matching real MRP traffic) — drain the
+            // controller's standalone ack for it before the next real
+            // message.
+            let mut ack_buf = [0u8; MAX_DATAGRAM];
+            let (ack_n, _) = device.recv_from(&mut ack_buf).await.unwrap();
+            let (_, ack_p, _) = open_from_controller(&ack_buf[..ack_n]);
+            assert_eq!(ack_p.opcode, OPCODE_MRP_STANDALONE_ACK);
+
+            // 2. InvokeRequest (same exchange, TimedRequest flag true) -> InvokeResponse(status 0)
+            let mut buf2 = [0u8; MAX_DATAGRAM];
+            let (n2, from2) = device.recv_from(&mut buf2).await.unwrap();
+            let (h2, p2, body2) = open_from_controller(&buf2[..n2]);
+            assert_eq!(p2.opcode, crate::im::OPCODE_INVOKE_REQUEST);
+            assert_eq!(p2.exchange_id, first_ex, "same exchange as TimedRequest");
+            let mut r = crate::tlv::Reader::new(&body2);
+            r.next().unwrap(); // struct
+            r.next().unwrap(); // SuppressResponse
+            let flag = r.next().unwrap().unwrap();
+            assert_eq!(
+                (flag.tag, flag.value),
+                (crate::tlv::Tag::Context(1), crate::tlv::Value::Bool(true))
+            );
+            let resp2 = device_datagram(
+                p2.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_INVOKE_RESPONSE,
+                Some(h2.message_counter),
+                true,
+                9701,
+                &invoke_response_success_payload(),
+            );
+            device.send_to(&resp2, from2).await.unwrap();
+        });
+
+        let data = s
+            .invoke_for_data(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::CMD_ON_OFF_ON,
+                None,
+                Some(5000),
+                &fast_cfg(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.status, 0);
+        assert_eq!(data.fields_tlv, None);
+        dev.await.unwrap();
+    }
+
+    /// If the device rejects the TimedRequest itself (non-zero
+    /// StatusResponse), `invoke_for_data` must abort right there and must
+    /// never send the InvokeRequest.
+    #[tokio::test]
+    async fn invoke_for_data_timed_request_rejected_aborts_before_invoke() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(bind_local().await);
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_TIMED_REQUEST);
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_STATUS_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9800,
+                &crate::im::encode_status_response(0x7E), // ACCESS_DENIED
+            );
+            device.send_to(&resp, from).await.unwrap();
+
+            // The controller still owes us a standalone ack for that
+            // needs_ack=true StatusResponse — drain it — but nothing else:
+            // no InvokeRequest follows a rejected TimedRequest.
+            let mut ack_buf = [0u8; MAX_DATAGRAM];
+            let (ack_n, _) = device.recv_from(&mut ack_buf).await.unwrap();
+            let (_, ack_p, _) = open_from_controller(&ack_buf[..ack_n]);
+            assert_eq!(ack_p.opcode, OPCODE_MRP_STANDALONE_ACK);
+
+            let mut b2 = [0u8; MAX_DATAGRAM];
+            let recv =
+                tokio::time::timeout(Duration::from_millis(200), device.recv_from(&mut b2)).await;
+            assert!(
+                recv.is_err(),
+                "no further message expected after timed request rejection"
+            );
+        });
+
+        let err = s
+            .invoke_for_data(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::CMD_ON_OFF_ON,
+                None,
+                Some(5000),
+                &fast_cfg(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Im(crate::im::ImError::StatusResponse(0x7E))
+        ));
+        dev.await.unwrap();
     }
 }
