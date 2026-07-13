@@ -6,6 +6,8 @@
 
 pub mod asn1;
 pub mod attestation;
+#[cfg(feature = "ble")]
+pub mod ble;
 pub mod btp;
 pub mod case;
 pub mod cert;

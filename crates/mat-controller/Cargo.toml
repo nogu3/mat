@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "From-scratch Matter controller library (Phase 5 backend)"
 
+[features]
+# BLE commissioning (bluer は libdbus にリンクするため隔離。
+# 本番 mat/matd の musl クロスビルドはこの feature を使わない)
+ble = ["dep:bluer", "dep:futures-util"]
+
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
 ccm = "0.5"
@@ -20,7 +25,13 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 socket2 = "0.6"
 tracing = { workspace = true }
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["test-util"] }
+
+[[example]]
+name = "ble-scan"
+required-features = ["ble"]
