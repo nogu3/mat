@@ -288,9 +288,16 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             TYPE_PTR => {
                 // rdata はそれ自体が（圧縮され得る）1 個のドメイン名
                 // (RFC 1035 §3.3.12)。メッセージ全体基準の絶対オフセットで
-                // 読む。
-                let (name, _) = read_name(buf, rdata_pos)?;
-                RData::Ptr(name)
+                // 読む。不正な圧縮ポインタなど、名前の読み込みに失敗しても
+                // このデータグラム全体を捨てない（同一応答に有効な
+                // SRV/TXT/AAAA が同梱されている場合、それらを失わないように
+                // するため）。本番 resolve_operational パスは parse_message
+                // 失敗でデータグラム全体を破棄するので、PTR だけの読み込み失敗が
+                // 全体を巻き込まないことが重要。
+                match read_name(buf, rdata_pos) {
+                    Ok((name, _)) => RData::Ptr(name),
+                    Err(_) => RData::Other,
+                }
             }
             TYPE_SRV => {
                 if rdata.len() < 7 {
@@ -932,5 +939,110 @@ mod tests {
         };
         assert_eq!(*a1.ip(), ll);
         assert_eq!(a1.scope_id(), 7);
+    }
+
+    #[test]
+    fn malformed_ptr_does_not_abort_datagram_parsing() {
+        // 不正な圧縮ポインタを持つ PTR レコードと、有効な SRV/TXT/AAAA が
+        // 同梱されたデータグラム。PTR の読み込み失敗が全体を巻き込まないことを確認。
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        let service = "0000000000000001-0000000000000002._matter._tcp.local";
+        let target = "dev.local";
+
+        // 正常な SRV+TXT+AAAA を合成
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]); // qd 0, an 4 (SRV+TXT+AAAA+PTR)
+
+        // --- SRV (有効) ---
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl
+        let mut srv_rdata = vec![0, 0, 0, 0]; // priority, weight
+        srv_rdata.extend_from_slice(&5540u16.to_be_bytes());
+        let mut tname = Vec::new();
+        push_name(&mut tname, target);
+        srv_rdata.extend_from_slice(&tname);
+        m.extend_from_slice(&(srv_rdata.len() as u16).to_be_bytes());
+        let target_off = m.len() + 6;
+        m.extend_from_slice(&srv_rdata);
+
+        // --- TXT (有効) ---
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        let txt_str = "SII=5000";
+        let mut txt_rdata = Vec::new();
+        txt_rdata.push(txt_str.len() as u8);
+        txt_rdata.extend_from_slice(txt_str.as_bytes());
+        m.extend_from_slice(&(txt_rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&txt_rdata);
+
+        // --- AAAA (有効な圧縮名) ---
+        m.extend_from_slice(&[0xC0 | (target_off >> 8) as u8, (target_off & 0xFF) as u8]);
+        m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        m.extend_from_slice(&16u16.to_be_bytes());
+        m.extend_from_slice(&addr.octets());
+
+        // --- PTR (不正な圧縮ポインタ: 範囲外を指す) ---
+        let ptr_name = "_L1234._sub._matterc._udp.local";
+        push_name(&mut m, ptr_name);
+        m.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        m.extend_from_slice(&[0, 1, 0, 0, 0, 120]); // IN, ttl
+                                                    // 不正な圧縮ポインタ: バッファ外を指す (0xC0FF = offset 255 + 256 = 511)
+        m.extend_from_slice(&2u16.to_be_bytes()); // rdlen = 2
+        m.extend_from_slice(&[0xC0, 0xFF]); // out-of-range pointer
+
+        // parse_message が成功し、PTR は Other として、
+        // SRV/TXT/AAAA は正常に抽出されることを確認
+        let records = parse_message(&m).expect("should parse despite malformed PTR");
+
+        // レコード数は 4 (SRV, TXT, AAAA, PTR/Other)
+        assert_eq!(records.len(), 4);
+
+        // SRV を検証
+        let srv = records
+            .iter()
+            .find(|r| matches!(r.rdata, RData::Srv { .. }))
+            .expect("should have SRV");
+        assert_eq!(srv.name, service);
+        if let RData::Srv { port, ref target } = srv.rdata {
+            assert_eq!(port, 5540);
+            assert_eq!(target, "dev.local");
+        } else {
+            panic!("not srv");
+        }
+
+        // TXT を検証
+        let txt = records
+            .iter()
+            .find(|r| matches!(r.rdata, RData::Txt(_)))
+            .expect("should have TXT");
+        assert_eq!(txt.name, service);
+        if let RData::Txt(ref strings) = txt.rdata {
+            assert_eq!(txt_u32(strings, "SII"), Some(5000));
+        } else {
+            panic!("not txt");
+        }
+
+        // AAAA を検証
+        let aaaa = records
+            .iter()
+            .find(|r| matches!(r.rdata, RData::Aaaa(_)))
+            .expect("should have AAAA");
+        assert_eq!(aaaa.name, "dev.local");
+        if let RData::Aaaa(got) = aaaa.rdata {
+            assert_eq!(got, addr);
+        } else {
+            panic!("not aaaa");
+        }
+
+        // PTR は Other として保存される（名前は読めたが、読み込みに失敗）
+        let ptr = records
+            .iter()
+            .find(|r| r.name == ptr_name)
+            .expect("should have PTR record");
+        assert!(matches!(ptr.rdata, RData::Other));
     }
 }
