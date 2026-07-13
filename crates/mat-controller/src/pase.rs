@@ -20,7 +20,7 @@ use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::session::{SecureSession, SessionKeys};
 use crate::spake2p::{self, SpakeError};
 use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
-use crate::transport::UdpTransport;
+use crate::transport::Transport;
 
 pub(crate) const OPCODE_PBKDF_PARAM_REQUEST: u8 = 0x20;
 pub(crate) const OPCODE_PBKDF_PARAM_RESPONSE: u8 = 0x21;
@@ -259,7 +259,7 @@ pub(crate) fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
 /// resulting secured session on success. Both sides use node id 0 — PASE
 /// sessions are unauthenticated at the Matter fabric layer (spec §4.13).
 pub async fn establish(
-    transport: Arc<UdpTransport>,
+    transport: Arc<Transport>,
     peer: SocketAddr,
     passcode: u32,
     cfg: &MrpConfig,
@@ -584,11 +584,11 @@ mod tests {
             .await
             .unwrap();
         let responder_addr = responder_transport.local_addr().unwrap();
-        let initiator_transport = Arc::new(
+        let initiator_transport = Arc::new(Transport::Udp(Arc::new(
             UdpTransport::bind_addr("[::1]:0".parse().unwrap())
                 .await
                 .unwrap(),
-        );
+        )));
 
         let cfg = fast_cfg();
         let establish_task = {

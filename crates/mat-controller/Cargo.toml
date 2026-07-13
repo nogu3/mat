@@ -7,7 +7,7 @@ repository.workspace = true
 description = "From-scratch Matter controller library (Phase 5 backend)"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util"] }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
 ccm = "0.5"
 aes = "0.8"
 base64ct = { version = "1", features = ["alloc"] }

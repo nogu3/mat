@@ -23,7 +23,7 @@ use mat_controller::im::{
 };
 use mat_controller::kvs;
 use mat_controller::message::MATTER_PORT;
-use mat_controller::transport::UdpTransport;
+use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
 
@@ -152,9 +152,12 @@ impl NativeBackend {
             transport: Arc::clone(&transport),
             sender: Mutex::new(None),
         };
+        // CaseEstablisher (CASE 確立) は Arc<Transport> を取る一方、GroupCtx
+        // の multicast 送信は UdpTransport を直接使い続ける（M6b: BTP 対応の
+        // 土台。group 送信は unicast CASE と無関係なので Transport 化しない）。
         let establisher = CaseEstablisher {
             creds: Arc::new(creds),
-            transport,
+            transport: Arc::new(Transport::Udp(Arc::clone(&transport))),
             scope_id,
         };
         Ok(Self::with_parts(Box::new(establisher), Some(group)))
@@ -377,7 +380,7 @@ impl NativeBackend {
 /// 実確立器: 保持した資格情報で mDNS 解決 → CASE。
 struct CaseEstablisher {
     creds: Arc<FabricCredentials>,
-    transport: Arc<UdpTransport>,
+    transport: Arc<Transport>,
     scope_id: u32,
 }
 

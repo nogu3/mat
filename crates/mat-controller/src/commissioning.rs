@@ -31,7 +31,7 @@ use crate::kvs::SelfIssueMaterials;
 use crate::pase;
 use crate::session::SecureSession;
 use crate::tlv::{Element, Reader, Tag, Value, Writer};
-use crate::transport::UdpTransport;
+use crate::transport::{Transport, UdpTransport};
 use crate::x509;
 
 // --- General Commissioning cluster (spec §11.10) ---
@@ -529,6 +529,11 @@ pub async fn commission_on_network(
     fabric: &CommissioningFabric,
     params: CommissionParams<'_>,
 ) -> Result<CommissionedDevice, CommissionError> {
+    // M6b: 内部の pase/case は `Arc<Transport>` を取る（BTP 対応の土台）。
+    // 公開シグネチャは既存呼び出し側（M6a）互換のため `Arc<UdpTransport>` の
+    // まま維持し、ここで一度だけ wrap する。
+    let transport: Arc<Transport> = Arc::new(Transport::Udp(Arc::clone(&transport)));
+
     // 1. ターゲット解決。
     let (peer, cfg) = match params.target {
         CommissionTarget::Addr(a) => (a, MrpConfig::default()),
