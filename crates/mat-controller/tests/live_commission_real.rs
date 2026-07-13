@@ -149,49 +149,113 @@ async fn commission_second_fabric_and_remove() {
         dev.node_id, dev.fabric_index
     );
 
+    // 5/7・6/7: 新 fabric での制御確認 + 本番 fabric 無傷確認。
+    //
+    // commission_on_network が Ok を返した時点で CommissioningComplete 済み
+    // = 対象デバイスの fail-safe は解除され、使い捨てのはずの第二 fabric は
+    // 恒久エントリになっている。ここから先で assert/panic すると
+    // RemoveFabric（撤収）が走らないまま test が落ち、実機に fabric が
+    // 残留し続ける（fabric slot は数個しかなく、再実行で更に１つ増える）。
+    // そのため制御・検証は panic しない Result 化した exercise() に閉じ込め、
+    // 呼び出し側は成否に関わらず必ず RemoveFabric を試みてから、最後に
+    // まとめて結果を expect する（live_jarvis.rs の exercise/復元パターンと
+    // 同じ考え方）。
+    let result = exercise(
+        &mut second_session,
+        &mut prod_session,
+        endpoint,
+        &mrp,
+        before,
+    )
+    .await;
+
+    // 7/7: 成否に関わらず RemoveFabric で使い捨て第二 fabric を対象デバイスから
+    // 撤収する（best-effort — 失敗はログのみ、exercise() 側の元の失敗は握り
+    // つぶさない）。
+    eprintln!("== 7/7 RemoveFabric で第二 fabric を撤収（best-effort）");
+    match dev.fabric_index {
+        Some(idx) => match second_session
+            .invoke_for_data(
+                0,
+                commissioning::CLUSTER_OPERATIONAL_CREDENTIALS,
+                commissioning::CMD_REMOVE_FABRIC,
+                Some(&commissioning::encode_remove_fabric(idx)),
+                None,
+                &mrp,
+            )
+            .await
+        {
+            Ok(resp) if resp.status == 0 => {
+                eprintln!("second fabric removed (fabric_index={idx})");
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "WARNING: RemoveFabric returned non-zero status {} (fabric_index={idx}) \
+                     — manual cleanup on the device may be required",
+                    resp.status
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: RemoveFabric failed: {e} (fabric_index={idx}) \
+                     — manual cleanup on the device may be required"
+                );
+            }
+        },
+        None => {
+            eprintln!(
+                "WARNING: no fabric_index from NOCResponse — cannot send RemoveFabric, \
+                 manual cleanup on the device may be required"
+            );
+        }
+    }
+
+    result.expect("live E2E failed (fabric B removal was attempted regardless)");
+
+    eprintln!("== M6a 実機 E2E PASS");
+}
+
+/// 5/7・6/7 本体: 新 fabric での onoff toggle 往復 + 本番 fabric セッション
+/// の無傷確認。途中で失敗しても panic せず `Err` を返し、呼び出し側が
+/// RemoveFabric による撤収を確実に実行できるようにする。
+async fn exercise(
+    second_session: &mut SecureSession,
+    prod_session: &mut SecureSession,
+    endpoint: u16,
+    mrp: &MrpConfig,
+    before: bool,
+) -> Result<(), String> {
     // 5/7: 新 fabric セッションで onoff toggle 往復（反転を確認して元に戻す）。
     eprintln!("== 5/7 新 fabric から onoff toggle 往復");
     second_session
-        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, &mrp)
+        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
-        .expect("toggle 1");
-    let toggled = read_onoff(&mut second_session, endpoint, &mrp)
-        .await
-        .expect("read on-off (toggled)");
-    assert_ne!(toggled, before, "toggle must flip on-off");
+        .map_err(|e| format!("toggle 1: {e}"))?;
+    let toggled = read_onoff(second_session, endpoint, mrp).await?;
+    if toggled == before {
+        return Err(format!(
+            "toggle must flip on-off: expected {}, got {toggled}",
+            !before
+        ));
+    }
     second_session
-        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, &mrp)
+        .invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None, mrp)
         .await
-        .expect("toggle 2");
-    let restored = read_onoff(&mut second_session, endpoint, &mrp)
-        .await
-        .expect("read on-off (restored)");
-    assert_eq!(restored, before, "second toggle must restore on-off");
+        .map_err(|e| format!("toggle 2: {e}"))?;
+    let restored = read_onoff(second_session, endpoint, mrp).await?;
+    if restored != before {
+        return Err(format!(
+            "second toggle must restore on-off: expected {before}, got {restored}"
+        ));
+    }
     eprintln!("onoff toggle round-trip OK (was {before})");
 
-    // 6/7: RemoveFabric で使い捨て第二 fabric を対象デバイスから撤収。
-    eprintln!("== 6/7 RemoveFabric で第二 fabric を撤収");
-    let idx = dev.fabric_index.expect("fabric index from NOCResponse");
-    let resp = second_session
-        .invoke_for_data(
-            0,
-            commissioning::CLUSTER_OPERATIONAL_CREDENTIALS,
-            commissioning::CMD_REMOVE_FABRIC,
-            Some(&commissioning::encode_remove_fabric(idx)),
-            None,
-            &mrp,
-        )
+    // 6/7: 本番 fabric セッション（手順 2 のもの）で read が通る = 本番無傷確認。
+    eprintln!("== 6/7 本番 fabric セッションで read → 無傷確認");
+    let after = read_onoff(prod_session, endpoint, mrp)
         .await
-        .expect("remove fabric");
-    assert_eq!(resp.status, 0, "RemoveFabric must return status 0");
-    eprintln!("second fabric removed (fabric_index={idx})");
-
-    // 7/7: 本番 fabric セッション（手順 2 のもの）で read が通る = 本番無傷。
-    eprintln!("== 7/7 本番 fabric セッションで read → 無傷確認");
-    let after = read_onoff(&mut prod_session, endpoint, &mrp)
-        .await
-        .expect("read on-off (production session, post-cleanup)");
+        .map_err(|e| format!("read on-off (production session): {e}"))?;
     eprintln!("production fabric intact: on-off = {after} (pre-commissioning was {before})");
 
-    eprintln!("== M6a 実機 E2E PASS");
+    Ok(())
 }
