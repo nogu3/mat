@@ -122,6 +122,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m5.sh
 
+  e2e:m6:
+    desc: "M6a live E2E: native commissioning (all-clusters-app)"
+    cmds:
+      - bash scripts/e2e-m6.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:

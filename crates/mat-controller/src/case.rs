@@ -307,6 +307,23 @@ pub(crate) fn parse_status_report(payload: &[u8]) -> Result<(u16, u32, u16), Cas
     Ok((general_code, protocol_id, protocol_code))
 }
 
+/// Encodes a StatusReport payload（[`parse_status_report`] の逆）: 8 バイト
+/// LE `{general_code, protocol_id, protocol_code}`。initiator 側から handshake
+/// を明示的に中断する（例: PASE 確認不一致）ときに使う — 送らずに黙って
+/// exchange を破棄すると、responder は Pake3/Sigma3 待ちのタイムアウトまで
+/// セッション確立スロットを保持し続けてしまう（spec §4.11.3 / §4.13.1.4）。
+pub(crate) fn encode_status_report(
+    general_code: u16,
+    protocol_id: u32,
+    protocol_code: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8);
+    buf.extend_from_slice(&general_code.to_le_bytes());
+    buf.extend_from_slice(&protocol_id.to_le_bytes());
+    buf.extend_from_slice(&protocol_code.to_le_bytes());
+    buf
+}
+
 pub(crate) fn derive_sigma_key(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 16] {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), shared);
     let mut out = [0u8; 16];
@@ -672,6 +689,13 @@ mod tests {
         let busy = [1u8, 0, 0, 0, 0, 0, 4, 0]; // FAILURE / SC / BUSY
         assert_eq!(parse_status_report(&busy).unwrap(), (1, 0, 4));
         assert!(parse_status_report(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn encode_status_report_round_trips_through_parse() {
+        let buf = encode_status_report(1, 0, 4); // FAILURE / SC / BUSY
+        assert_eq!(buf, [1u8, 0, 0, 0, 0, 0, 4, 0]);
+        assert_eq!(parse_status_report(&buf).unwrap(), (1, 0, 4));
     }
 
     #[test]
