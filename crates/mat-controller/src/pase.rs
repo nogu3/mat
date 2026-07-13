@@ -22,8 +22,11 @@ use crate::spake2p::{self, SpakeError};
 use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
 use crate::transport::Transport;
 
-pub(crate) const OPCODE_PBKDF_PARAM_REQUEST: u8 = 0x20;
-pub(crate) const OPCODE_PBKDF_PARAM_RESPONSE: u8 = 0x21;
+/// PBKDFParamRequest/Response opcodes (spec §4.13.1.2). `pub` (not
+/// `pub(crate)`) — reused by `tests/btp_pase_plumbing.rs` (a separate crate)
+/// so it doesn't have to duplicate these as magic numbers (M6b Task6).
+pub const OPCODE_PBKDF_PARAM_REQUEST: u8 = 0x20;
+pub const OPCODE_PBKDF_PARAM_RESPONSE: u8 = 0x21;
 pub(crate) const OPCODE_PASE_PAKE1: u8 = 0x22;
 pub(crate) const OPCODE_PASE_PAKE2: u8 = 0x23;
 pub(crate) const OPCODE_PASE_PAKE3: u8 = 0x24;
