@@ -23,6 +23,11 @@ fn env(name: &str) -> String {
 
 fn hex_bytes(s: &str) -> Vec<u8> {
     let s = s.trim();
+    assert!(
+        s.len().is_multiple_of(2),
+        "MAT_E2E_THREAD_DATASET must be even-length hex (got {} chars) — truncated paste?",
+        s.len()
+    );
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex dataset"))
