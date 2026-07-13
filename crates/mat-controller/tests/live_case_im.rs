@@ -6,7 +6,7 @@ use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::FabricCredentials;
 use mat_controller::im::{ImValue, ATTR_ON_OFF, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE};
 use mat_controller::message::MATTER_PORT;
-use mat_controller::transport::UdpTransport;
+use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, kvs};
 use std::path::PathBuf;
 
@@ -45,7 +45,9 @@ async fn self_issued_case_read_toggle_read() {
     let creds = FabricCredentials::from_self_issued(materials).expect("self-issue NOC");
 
     // 受け入れ 4: CASE 確立（我々の自己発行 NOC を実機が受理）
-    let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+    let transport = std::sync::Arc::new(Transport::Udp(std::sync::Arc::new(
+        UdpTransport::bind().await.unwrap(),
+    )));
     let cfg = MrpConfig::default();
     let mut session = case::establish(
         std::sync::Arc::clone(&transport),

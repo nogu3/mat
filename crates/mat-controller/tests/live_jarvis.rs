@@ -19,7 +19,7 @@ use mat_controller::im::{
     CMD_ON_OFF_OFF, CMD_ON_OFF_ON, CMD_ON_OFF_TOGGLE,
 };
 use mat_controller::session::SecureSession;
-use mat_controller::transport::UdpTransport;
+use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, dnssd, kvs};
 
 fn env_u64(name: &str) -> u64 {
@@ -115,7 +115,9 @@ async fn fabric_ride_along_onoff_and_color() {
     };
 
     // 受け入れ 4: CASE 確立（解決したアドレスを順に試す）
-    let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+    let transport = std::sync::Arc::new(Transport::Udp(std::sync::Arc::new(
+        UdpTransport::bind().await.unwrap(),
+    )));
     let mut session = None;
     for peer in &peers {
         match case::establish(

@@ -19,7 +19,7 @@ use crate::fabric::{case_destination_id, FabricCredentials};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::session::{SecureSession, SessionKeys};
 use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
-use crate::transport::UdpTransport;
+use crate::transport::Transport;
 
 const OPCODE_CASE_SIGMA1: u8 = 0x30;
 const OPCODE_CASE_SIGMA2: u8 = 0x31;
@@ -438,7 +438,7 @@ fn encode_sigma3(encrypted3: &[u8]) -> Vec<u8> {
 /// Runs the CASE initiator handshake against `peer` and returns the
 /// resulting secured session on success.
 pub async fn establish(
-    transport: Arc<UdpTransport>,
+    transport: Arc<Transport>,
     peer: SocketAddr,
     creds: &FabricCredentials,
     peer_node_id: u64,

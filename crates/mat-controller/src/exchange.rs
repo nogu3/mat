@@ -10,7 +10,7 @@ use crate::message::{
     Destination, MessageError, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK,
     PROTOCOL_ID_SECURE_CHANNEL,
 };
-use crate::transport::{UdpTransport, MAX_DATAGRAM};
+use crate::transport::{Transport, MAX_DATAGRAM};
 
 /// MRP retransmission parameters (spec 4.12; defaults follow chip defaults).
 #[derive(Debug, Clone)]
@@ -28,6 +28,18 @@ impl Default for MrpConfig {
             backoff: 1.6,
         }
     }
+}
+
+/// MRP の全リトライを使い切るまでの待ち時間合計。reliable transport では
+/// 「同じ体感タイムアウト」で実応答を待つ予算として使う。
+fn total_budget(cfg: &MrpConfig) -> Duration {
+    let mut total = Duration::ZERO;
+    let mut interval = cfg.initial_interval;
+    for _ in 0..=cfg.max_retries {
+        total += interval;
+        interval = interval.mul_f64(cfg.backoff);
+    }
+    total
 }
 
 #[derive(Debug)]
@@ -70,7 +82,7 @@ pub struct IncomingMessage {
 
 /// One unsecured (session id 0) exchange, this side as initiator, with MRP.
 pub struct UnsecuredExchange<'t> {
-    transport: &'t UdpTransport,
+    transport: &'t Transport,
     peer: SocketAddr,
     exchange_id: u16,
     source_node_id: u64,
@@ -80,7 +92,7 @@ pub struct UnsecuredExchange<'t> {
 }
 
 impl<'t> UnsecuredExchange<'t> {
-    pub fn new(transport: &'t UdpTransport, peer: SocketAddr) -> Self {
+    pub fn new(transport: &'t Transport, peer: SocketAddr) -> Self {
         let mut b = [0u8; 10];
         getrandom::getrandom(&mut b).expect("os rng");
         Self {
@@ -111,6 +123,7 @@ impl<'t> UnsecuredExchange<'t> {
         acked_counter: Option<u32>,
         payload: &[u8],
     ) -> (Vec<u8>, u32) {
+        let needs_ack = needs_ack && !self.transport.is_reliable();
         let message_counter = self.counter.next();
         let header = MessageHeader {
             session_id: 0,
@@ -173,12 +186,12 @@ impl<'t> UnsecuredExchange<'t> {
             return Ok(None);
         }
         if !self.rx_window.check_and_commit(header.message_counter) {
-            if proto.needs_ack {
+            if proto.needs_ack && !self.transport.is_reliable() {
                 self.send_standalone_ack(header.message_counter).await?;
             }
             return Ok(None);
         }
-        if proto.needs_ack {
+        if proto.needs_ack && !self.transport.is_reliable() {
             self.send_standalone_ack(header.message_counter).await?;
         }
         Ok(Some(IncomingMessage {
@@ -198,6 +211,17 @@ impl<'t> UnsecuredExchange<'t> {
         payload: &[u8],
         cfg: &MrpConfig,
     ) -> Result<Option<IncomingMessage>, ExchangeError> {
+        if self.transport.is_reliable() {
+            // BTP: transport が信頼性を持つ。1 回送って実応答を待つだけ。
+            let (datagram, our_counter) = self.build(protocol_id, opcode, false, None, payload);
+            self.last_sent_counter = Some(our_counter);
+            self.transport.send_to(&datagram, self.peer).await?;
+            let budget = total_budget(cfg);
+            return match self.recv(budget).await {
+                Ok(msg) => Ok(Some(msg)),
+                Err(e) => Err(e),
+            };
+        }
         let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
         self.last_sent_counter = Some(our_counter);
         let mut interval = cfg.initial_interval;
@@ -297,6 +321,7 @@ mod tests {
     };
     use crate::transport::{UdpTransport, MAX_DATAGRAM};
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn fast_cfg() -> MrpConfig {
@@ -311,6 +336,10 @@ mod tests {
         UdpTransport::bind_addr("[::1]:0".parse().unwrap())
             .await
             .unwrap()
+    }
+
+    async fn bind_local_transport() -> Transport {
+        Transport::Udp(Arc::new(bind_local().await))
     }
 
     async fn read_msg(t: &UdpTransport) -> (MessageHeader, ProtocolHeader, SocketAddr) {
@@ -353,7 +382,7 @@ mod tests {
     async fn send_reliable_completes_on_standalone_ack() {
         let responder = bind_local().await;
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
         assert_eq!(ex.last_sent_counter(), None);
 
@@ -384,7 +413,7 @@ mod tests {
     async fn send_reliable_retransmits_same_counter() {
         let responder = bind_local().await;
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
 
         let responder_task = tokio::spawn(async move {
@@ -413,7 +442,7 @@ mod tests {
     async fn send_reliable_times_out_without_ack() {
         let responder = bind_local().await; // 何も返さない
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
         let err = ex
             .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x99, b"", &fast_cfg())
@@ -426,7 +455,7 @@ mod tests {
     async fn send_reliable_returns_piggybacked_response_and_acks_it() {
         let responder = bind_local().await;
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
 
         let responder_task = tokio::spawn(async move {
@@ -459,7 +488,7 @@ mod tests {
     async fn send_once_sends_a_single_reliable_flagged_datagram() {
         let responder = bind_local().await;
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let mut ex = UnsecuredExchange::new(&transport, peer);
         assert_eq!(ex.last_sent_counter(), None);
 
@@ -481,10 +510,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reliable_transport_disables_mrp() {
+        use crate::transport::{ReliableChannel, RELIABLE_PEER};
+        let (a, b) = ReliableChannel::pair();
+        let mut ex = UnsecuredExchange::new(&a, RELIABLE_PEER);
+        let exchange_id = ex.exchange_id();
+
+        let peer_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = b.recv_from(&mut buf).await.unwrap();
+            let (h, off) = MessageHeader::decode(&buf[..n]).unwrap();
+            let (p, _) = ProtocolHeader::decode(&buf[off..n]).unwrap();
+            assert!(!p.needs_ack, "R flag must not be set on reliable transport");
+            // 実応答（R フラグなし・ack 相乗りなし——BTP では MRP 自体が無い）
+            let reply = {
+                let rh = MessageHeader {
+                    session_id: 0,
+                    security_flags: 0,
+                    message_counter: 4242,
+                    source_node_id: None,
+                    destination: Destination::None,
+                };
+                let rp = ProtocolHeader {
+                    initiator: false,
+                    needs_ack: false,
+                    acked_counter: None,
+                    opcode: OPCODE_STATUS_REPORT,
+                    exchange_id,
+                    protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                    vendor_id: None,
+                };
+                let mut buf = rh.encoded();
+                rp.encode(&mut buf);
+                buf
+            };
+            b.send_to(&reply, RELIABLE_PEER).await.unwrap();
+            // 相手からの standalone ack が来ないこと（=チャネルに後続なし）
+            let mut buf2 = [0u8; MAX_DATAGRAM];
+            let more =
+                tokio::time::timeout(Duration::from_millis(200), b.recv_from(&mut buf2)).await;
+            assert!(
+                more.is_err(),
+                "no standalone ack expected on reliable transport"
+            );
+            (h.message_counter, ())
+        });
+
+        let res = ex
+            .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x99, b"", &fast_cfg())
+            .await
+            .unwrap()
+            .expect("real response");
+        assert_eq!(res.proto.opcode, OPCODE_STATUS_REPORT);
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn recv_dedups_and_reacks_duplicates() {
         let responder = bind_local().await;
         let peer = responder.local_addr().unwrap();
-        let transport = bind_local().await;
+        let transport = bind_local_transport().await;
         let local = transport.local_addr().unwrap();
         let mut ex = UnsecuredExchange::new(&transport, peer);
         let exchange_id = ex.exchange_id();

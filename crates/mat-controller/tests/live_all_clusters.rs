@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use mat_controller::exchange::{MrpConfig, UnsecuredExchange};
 use mat_controller::message::{MATTER_PORT, PROTOCOL_ID_SECURE_CHANNEL};
-use mat_controller::transport::UdpTransport;
+use mat_controller::transport::{Transport, UdpTransport};
 
 /// Secure Channel: CASE Sigma1 opcode.
 const OPCODE_CASE_SIGMA1: u8 = 0x30;
@@ -22,7 +22,7 @@ const OPCODE_CASE_SIGMA1: u8 = 0x30;
 #[tokio::test]
 #[ignore = "requires a Matter device on udp/5540 (local chip-all-clusters-app or MAT_E2E_PEER)"]
 async fn reliable_message_gets_acked_by_real_device() {
-    let transport = UdpTransport::bind().await.unwrap();
+    let transport = Transport::Udp(std::sync::Arc::new(UdpTransport::bind().await.unwrap()));
     let peer = std::env::var("MAT_E2E_PEER")
         .unwrap_or_else(|_| format!("[::1]:{MATTER_PORT}"))
         .parse()

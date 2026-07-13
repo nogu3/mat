@@ -43,7 +43,7 @@ use mat_controller::im::{self, ImValue};
 use mat_controller::kvs::SelfIssueMaterials;
 use mat_controller::message::{Destination, MessageHeader, ProtocolHeader};
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
-use mat_controller::transport::{UdpTransport, MAX_DATAGRAM};
+use mat_controller::transport::{Transport, UdpTransport, MAX_DATAGRAM};
 
 // CASE constants — mirror of the (crate-private) ones in `case.rs`.
 const OPCODE_SIGMA1: u8 = 0x30;
@@ -348,11 +348,11 @@ async fn case_establishes_and_reads_over_loopback() {
     };
     let creds = FabricCredentials::from_self_issued(materials).expect("self-issued creds");
 
-    let initiator_transport = Arc::new(
+    let initiator_transport = Arc::new(Transport::Udp(Arc::new(
         UdpTransport::bind_addr("[::1]:0".parse().unwrap())
             .await
             .unwrap(),
-    );
+    )));
 
     let cfg = fast_cfg();
     let mut session = case::establish(
