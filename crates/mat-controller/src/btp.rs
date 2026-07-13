@@ -227,6 +227,205 @@ impl Reassembler {
     }
 }
 
+// --- Session actor (Task 3) -------------------------------------------
+
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+use crate::transport::{ReliableChannel, Transport};
+
+pub const PROPOSED_WINDOW: u8 = 6;
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(2500);
+
+/// GATT リンクの土管。ble.rs（feature "ble"、未実装）が実体を、テストが
+/// fake を作る。
+pub struct GattLink {
+    /// C1 への write。cap 1 のチャネルにして GATT write 完了で背圧をかける。
+    pub writes: mpsc::Sender<Vec<u8>>,
+    /// C2 からの indication。
+    pub indications: mpsc::Receiver<Vec<u8>>,
+}
+
+/// BTP handshake を行い、セッション actor を spawn して Transport を返す。
+pub async fn connect(mut link: GattLink, window: u8) -> Result<(BtpParams, Transport), BtpError> {
+    link.writes
+        .send(handshake_request(window).to_vec())
+        .await
+        .map_err(|_| BtpError::Closed)?;
+    let resp = tokio::time::timeout(HANDSHAKE_TIMEOUT, link.indications.recv())
+        .await
+        .map_err(|_| BtpError::Timeout("handshake response"))?
+        .ok_or(BtpError::Closed)?;
+    let params = decode_handshake_response(&resp)?;
+
+    let (app_tx, actor_out_rx) = mpsc::channel::<Vec<u8>>(4); // app → actor（送信）
+    let (actor_in_tx, app_rx) = mpsc::channel::<Vec<u8>>(4); // actor → app（受信）
+    tokio::spawn(run_session(link, params, actor_out_rx, actor_in_tx));
+    Ok((
+        params,
+        Transport::Reliable(ReliableChannel::new(app_tx, app_rx)),
+    ))
+}
+
+struct SessionState {
+    tx_seq: u8,        // 次に使う自分の sequence
+    peer_acked: u8,    // peer が ack 済みの自分の最新 seq（初期値 0 = 未 ack 相当）
+    unacked: u8,       // 未 ack の自分のフレーム数
+    last_rx_seq: u8,   // 受信した最新の peer seq
+    pending_ack: bool, // peer へ ack を返す義務があるか
+    reasm: Reassembler,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            tx_seq: 0,
+            peer_acked: 0,
+            unacked: 0,
+            last_rx_seq: 0,
+            pending_ack: false,
+            reasm: Reassembler::new(),
+        }
+    }
+}
+
+/// 受信フレームを処理してウィンドウ会計・pending_ack・再構成を進める。
+/// メッセージが完成すれば `Ok(Some(msg))`。run_session のメインループと
+/// send_message のウィンドウ待ちループの双方から使う共通ロジック。
+fn process_incoming(pkt: &Packet, st: &mut SessionState) -> Result<Option<Vec<u8>>, BtpError> {
+    if let Some(a) = pkt.ack {
+        // a..=直前 tx_seq-1 のうち ack された分を勘定（u8 wrap 対応）。
+        let newly = a.wrapping_sub(st.peer_acked);
+        st.unacked = st.unacked.saturating_sub(newly);
+        st.peer_acked = a;
+    }
+    if let Some(s) = pkt.seq {
+        st.last_rx_seq = s;
+        st.pending_ack = true;
+    }
+    st.reasm.push(pkt)
+}
+
+async fn run_session(
+    mut link: GattLink,
+    params: BtpParams,
+    mut out_rx: mpsc::Receiver<Vec<u8>>,
+    in_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let mut st = SessionState::new();
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.reset();
+    loop {
+        tokio::select! {
+            biased;
+            ind = link.indications.recv() => {
+                let Some(frame) = ind else { break }; // リンク切断
+                let Ok(pkt) = Packet::decode(&frame) else {
+                    tracing::warn!("btp: undecodable frame — dropping session");
+                    break;
+                };
+                match process_incoming(&pkt, &mut st) {
+                    Ok(Some(msg)) => {
+                        if in_tx.send(msg).await.is_err() { break; }
+                        // 即時 ack（実装簡素化: 受信メッセージ完成ごと）
+                        if send_standalone(&mut link, &mut st).await.is_err() { break; }
+                        keepalive.reset();
+                    }
+                    Ok(None) => {}
+                    Err(e) => { tracing::warn!(error=%e, "btp reassembly failed"); break; }
+                }
+            }
+            msg = out_rx.recv() => {
+                let Some(msg) = msg else { break }; // アプリ側 drop → 終了
+                if send_message(&mut link, &mut st, &params, &msg, &in_tx).await.is_err() { break; }
+                keepalive.reset();
+            }
+            _ = keepalive.tick() => {
+                if send_standalone(&mut link, &mut st).await.is_err() { break; }
+            }
+        }
+    }
+    // actor 終了 = チャネル閉鎖 → Transport 側は BrokenPipe を観測する
+}
+
+async fn send_standalone(link: &mut GattLink, st: &mut SessionState) -> Result<(), BtpError> {
+    let seq = st.tx_seq;
+    st.tx_seq = st.tx_seq.wrapping_add(1);
+    st.unacked += 1;
+    st.pending_ack = false;
+    link.writes
+        .send(encode_standalone_ack(seq, st.last_rx_seq).to_vec())
+        .await
+        .map_err(|_| BtpError::Closed)
+}
+
+/// メッセージを 1 通送信する。ウィンドウが満杯なら peer からの ack を待つ
+/// （その間に届いたデータフレームは `in_tx` 経由でアプリへ配送し、捨てない）。
+async fn send_message(
+    link: &mut GattLink,
+    st: &mut SessionState,
+    params: &BtpParams,
+    msg: &[u8],
+    in_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), BtpError> {
+    let mut off = 0usize;
+    let mut first = true;
+    while first || off < msg.len() {
+        // ウィンドウ満杯なら ack を待つ。待機中に受けたデータメッセージは
+        // 落とさず in_tx へ配送する。
+        while st.unacked >= params.window_size {
+            let frame = tokio::time::timeout(ACK_TIMEOUT, link.indications.recv())
+                .await
+                .map_err(|_| BtpError::Timeout("window ack"))?
+                .ok_or(BtpError::Closed)?;
+            let pkt = Packet::decode(&frame)?;
+            if let Some(m) = process_incoming(&pkt, st)? {
+                if in_tx.send(m).await.is_err() {
+                    return Err(BtpError::Closed);
+                }
+                send_standalone(link, st).await?;
+            }
+        }
+        let with_ack = st.pending_ack && first;
+        let cap = segment_payload_capacity(params.segment_size, first, with_ack);
+        let end = (off + cap).min(msg.len());
+        let ending = end == msg.len();
+        let pos = if first {
+            SegmentPos::First { ending }
+        } else if ending {
+            SegmentPos::Last
+        } else {
+            SegmentPos::Middle
+        };
+        let seq = st.tx_seq;
+        st.tx_seq = st.tx_seq.wrapping_add(1);
+        st.unacked += 1;
+        let ack = if with_ack {
+            st.pending_ack = false;
+            Some(st.last_rx_seq)
+        } else {
+            None
+        };
+        let frame = encode_data_packet(
+            seq,
+            ack,
+            pos,
+            if first { Some(msg.len() as u16) } else { None },
+            &msg[off..end],
+        );
+        link.writes
+            .send(frame)
+            .await
+            .map_err(|_| BtpError::Closed)?;
+        off = end;
+        first = false;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +545,332 @@ mod tests {
         assert_eq!(segment_payload_capacity(244, true, true), 239);
         // 継続 + ackなし: flags(1)+seq(1)=2
         assert_eq!(segment_payload_capacity(244, false, false), 242);
+    }
+
+    // --- Reassembler edge branches (Task 2 レビュー指摘の未テスト分岐) ---
+
+    #[test]
+    fn reassembler_rejects_beginning_segment_mid_message() {
+        let mut r = Reassembler::new();
+        let p1 = Packet::decode(&encode_data_packet(
+            0,
+            None,
+            SegmentPos::First { ending: false },
+            Some(10),
+            b"12345",
+        ))
+        .unwrap();
+        assert!(r.push(&p1).unwrap().is_none());
+        // まだ 5 バイト待ちなのに、また beginning が来た
+        let p2 = Packet::decode(&encode_data_packet(
+            1,
+            None,
+            SegmentPos::First { ending: true },
+            Some(3),
+            b"abc",
+        ))
+        .unwrap();
+        assert!(r.push(&p2).is_err());
+    }
+
+    #[test]
+    fn reassembler_rejects_continuation_without_beginning_when_nonempty() {
+        let mut r = Reassembler::new();
+        // beginning なしで payload 入りの continuation が来る
+        let p = Packet::decode(&encode_data_packet(
+            0,
+            None,
+            SegmentPos::Middle,
+            None,
+            b"xyz",
+        ))
+        .unwrap();
+        assert!(r.push(&p).is_err());
+    }
+
+    #[test]
+    fn reassembler_rejects_payload_exceeding_declared_len_mid_stream() {
+        let mut r = Reassembler::new();
+        let p1 = Packet::decode(&encode_data_packet(
+            0,
+            None,
+            SegmentPos::First { ending: false },
+            Some(5),
+            b"12345", // 早くも宣言長ぴったり届いてしまう
+        ))
+        .unwrap();
+        // まだ ending ではないのに、buf.len() == expected に達している状態から
+        // さらに追加payloadが来ると expected を超える（末尾での短さとは別分岐）。
+        assert!(r.push(&p1).unwrap().is_none());
+        let p2 =
+            Packet::decode(&encode_data_packet(1, None, SegmentPos::Last, None, b"6")).unwrap();
+        assert!(r.push(&p2).is_err());
+    }
+
+    #[test]
+    fn reassembler_standalone_ack_through_push_is_ok_none() {
+        let mut r = Reassembler::new();
+        // 空 payload、B/E なし = スタンドアロン ack / keepalive
+        let p = Packet::decode(&encode_standalone_ack(3, 9)).unwrap();
+        assert!(p.payload.is_empty());
+        assert!(!p.beginning && !p.ending);
+        assert_eq!(r.push(&p).unwrap(), None);
+    }
+
+    // --- ack accounting (u8 wrap) ---
+
+    #[test]
+    fn ack_accounting_handles_seq_wrap_past_255() {
+        let mut st = SessionState::new();
+        st.tx_seq = 2;
+        st.peer_acked = 254;
+        st.unacked = 4;
+        // peer acks value 1: wraps past 255 → 0 → 1, covering 3 new frames
+        // (255, 0, 1) relative to the previous peer_acked=254.
+        let pkt = Packet {
+            beginning: false,
+            ending: false,
+            ack: Some(1),
+            seq: Some(0),
+            msg_len: None,
+            payload: vec![],
+        };
+        let msg = process_incoming(&pkt, &mut st).unwrap();
+        assert!(msg.is_none());
+        assert_eq!(st.peer_acked, 1);
+        assert_eq!(st.unacked, 1); // 4 - 3
+    }
+
+    // --- Session actor: fake peripheral + connect() tests (Task 3) ---
+
+    /// テスト用 BTP peripheral。GattLink の裏側を演じる。
+    struct FakePeripheral {
+        from_client: tokio::sync::mpsc::Receiver<Vec<u8>>, // C1 writes
+        to_client: tokio::sync::mpsc::Sender<Vec<u8>>,     // C2 indications
+        tx_seq: u8,
+        reasm: Reassembler,
+    }
+
+    fn fake_link() -> (GattLink, FakePeripheral) {
+        let (wtx, wrx) = tokio::sync::mpsc::channel(1);
+        let (itx, irx) = tokio::sync::mpsc::channel(8);
+        (
+            GattLink {
+                writes: wtx,
+                indications: irx,
+            },
+            FakePeripheral {
+                from_client: wrx,
+                to_client: itx,
+                tx_seq: 0,
+                reasm: Reassembler::new(),
+            },
+        )
+    }
+
+    impl FakePeripheral {
+        /// handshake request を受けて response を返す。
+        async fn do_handshake(&mut self, segment_size: u16, window: u8) {
+            let req = self.from_client.recv().await.expect("handshake request");
+            assert_eq!(req, handshake_request(PROPOSED_WINDOW));
+            let mut resp = vec![0x65, 0x6C, BTP_VERSION];
+            resp.extend_from_slice(&segment_size.to_le_bytes());
+            resp.push(window);
+            self.to_client.send(resp).await.unwrap();
+        }
+
+        /// client からの書き込みを 1 メッセージ再構成するまで読む。
+        /// 返り値: (メッセージ, 最後に受けた seq)
+        async fn recv_message(&mut self) -> (Vec<u8>, u8) {
+            loop {
+                let frame = self.from_client.recv().await.expect("frame");
+                let pkt = Packet::decode(&frame).unwrap();
+                let seq = pkt.seq.unwrap();
+                if let Some(msg) = self.reasm.push(&pkt).unwrap() {
+                    return (msg, seq);
+                }
+            }
+        }
+
+        async fn send_ack(&mut self, ack: u8) {
+            let seq = self.tx_seq;
+            self.tx_seq = self.tx_seq.wrapping_add(1);
+            self.to_client
+                .send(encode_standalone_ack(seq, ack).to_vec())
+                .await
+                .unwrap();
+        }
+
+        /// メッセージを segment_size で分割して indication する（ack 相乗り付き）。
+        async fn send_message(&mut self, msg: &[u8], segment_size: u16, ack: Option<u8>) {
+            let mut off = 0usize;
+            let mut first = true;
+            while first || off < msg.len() {
+                let cap = segment_payload_capacity(segment_size, first, ack.is_some() && first);
+                let end = (off + cap).min(msg.len());
+                let ending = end == msg.len();
+                let pos = if first {
+                    SegmentPos::First { ending }
+                } else if ending {
+                    SegmentPos::Last
+                } else {
+                    SegmentPos::Middle
+                };
+                let seq = self.tx_seq;
+                self.tx_seq = self.tx_seq.wrapping_add(1);
+                let frame = encode_data_packet(
+                    seq,
+                    if first { ack } else { None },
+                    pos,
+                    if first { Some(msg.len() as u16) } else { None },
+                    &msg[off..end],
+                );
+                self.to_client.send(frame).await.unwrap();
+                off = end;
+                first = false;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn btp_connect_handshakes_and_roundtrips_small_message() {
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 4).await;
+            let (msg, seq) = p.recv_message().await;
+            assert_eq!(msg, b"ping-message");
+            p.send_message(b"pong-message", 244, Some(seq)).await;
+            p
+        });
+        let (params, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        assert_eq!(params.segment_size, 244);
+        t.send_to(b"ping-message", crate::transport::RELIABLE_PEER)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1280];
+        let (n, _) = t.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong-message");
+        peripheral.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_segments_large_message() {
+        // segment_size 30 で 100 バイト送ると複数フレームに割れて再構成できる
+        let (link, mut p) = fake_link();
+        let msg: Vec<u8> = (0u8..100).collect();
+        let expect = msg.clone();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(30, 8).await;
+            let (m, seq) = p.recv_message().await;
+            assert_eq!(m, expect);
+            p.send_ack(seq).await;
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        t.send_to(&msg, crate::transport::RELIABLE_PEER)
+            .await
+            .unwrap();
+        peripheral.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_send_blocks_on_window_until_ack() {
+        // window=2: 3 フレーム目は ack が来るまで GATT write に出てこない
+        let (link, mut p) = fake_link();
+        let msg: Vec<u8> = (0u8..60).collect(); // segment 30 → 3 フレーム
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(30, 2).await;
+            let f1 = p.from_client.recv().await.unwrap();
+            let f2 = p.from_client.recv().await.unwrap();
+            // 3 枚目はまだ来ない（ack 前）
+            let blocked =
+                tokio::time::timeout(std::time::Duration::from_millis(300), p.from_client.recv())
+                    .await;
+            assert!(blocked.is_err(), "third frame must wait for ack");
+            let s2 = Packet::decode(&f2).unwrap().seq.unwrap();
+            p.send_ack(s2).await;
+            let f3 = p.from_client.recv().await.unwrap();
+            for f in [f1, f2, f3] {
+                let pkt = Packet::decode(&f).unwrap();
+                if let Some(m) = p.reasm.push(&pkt).unwrap() {
+                    assert_eq!(m.len(), 60);
+                }
+            }
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        t.send_to(&msg, crate::transport::RELIABLE_PEER)
+            .await
+            .unwrap();
+        peripheral.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn btp_sends_keepalive_ack_when_idle() {
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 4).await;
+            // 何もしないで待つ → keepalive standalone ack が来るはず
+            let frame = p.from_client.recv().await.expect("keepalive");
+            let pkt = Packet::decode(&frame).unwrap();
+            assert!(pkt.payload.is_empty());
+            assert!(pkt.ack.is_some());
+        });
+        let (_, _t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        tokio::time::sleep(KEEPALIVE_INTERVAL + std::time::Duration::from_millis(100)).await;
+        peripheral.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_delivers_message_received_while_window_full() {
+        // window=2: 3枚目は ack 待ちでブロックされる。その最中に peripheral が
+        // 単発 ack ではなく「データメッセージ」（ack 相乗り）を送ってきても、
+        // client 側はそれを取りこぼさず recv_from で配送する。
+        //
+        // client はメッセージ受信への応答として自分の standalone ack を返す
+        // が、それ自体も 1 フレームとしてウィンドウを消費する（brief 通り:
+        // standalone ack も sequenced でウィンドウ会計に数える）。したがって
+        // 3 枚目が出てくるには、peripheral がその standalone ack にもう一度
+        // ack を返してやる必要がある — 相乗り ack 1 回だけでは足りない。
+        let (link, mut p) = fake_link();
+        let msg: Vec<u8> = (0u8..60).collect(); // segment 30 → 3 フレーム
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(30, 2).await;
+            let f1 = p.from_client.recv().await.unwrap();
+            let f2 = p.from_client.recv().await.unwrap();
+            let s2 = Packet::decode(&f2).unwrap().seq.unwrap();
+            // 単発 ack の代わりに、ack 相乗りの完全なメッセージを送る。
+            p.send_message(b"unsolicited", 244, Some(s2)).await;
+            // client が返す standalone ack（これもウィンドウを消費する）。
+            let client_ack = p.from_client.recv().await.unwrap();
+            let client_ack_pkt = Packet::decode(&client_ack).unwrap();
+            assert!(client_ack_pkt.payload.is_empty(), "expected standalone ack");
+            // それに ack を返してやって初めてウィンドウが解放される。
+            p.send_ack(client_ack_pkt.seq.unwrap()).await;
+            // ここでようやく 3 枚目（元メッセージの最終セグメント）が届く。
+            let f3 = p.from_client.recv().await.unwrap();
+            let mut completed = None;
+            for f in [f1, f2, f3] {
+                let pkt = Packet::decode(&f).unwrap();
+                if let Some(m) = p.reasm.push(&pkt).unwrap() {
+                    completed = Some(m);
+                }
+            }
+            assert_eq!(completed.expect("message should reassemble").len(), 60);
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let send_fut = t.send_to(&msg, crate::transport::RELIABLE_PEER);
+        let mut buf = [0u8; 1280];
+        let recv_fut = t.recv_from(&mut buf);
+        let (send_res, recv_res) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(send_fut, recv_fut)
+        })
+        .await
+        .expect("send/recv must not hang");
+        send_res.unwrap();
+        let (n, _) = recv_res.unwrap();
+        assert_eq!(&buf[..n], b"unsolicited");
+        tokio::time::timeout(std::time::Duration::from_secs(2), peripheral)
+            .await
+            .expect("peripheral task must not hang")
+            .unwrap();
     }
 }
