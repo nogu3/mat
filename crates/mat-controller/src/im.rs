@@ -12,6 +12,7 @@ pub const OPCODE_READ_REQUEST: u8 = 0x02;
 pub const OPCODE_REPORT_DATA: u8 = 0x05;
 pub const OPCODE_INVOKE_REQUEST: u8 = 0x08;
 pub const OPCODE_INVOKE_RESPONSE: u8 = 0x09;
+pub const OPCODE_TIMED_REQUEST: u8 = 0x0A;
 pub const IM_REVISION: u8 = 12;
 pub const CLUSTER_ON_OFF: u32 = 0x0006;
 pub const ATTR_ON_OFF: u32 = 0x0000;
@@ -51,6 +52,19 @@ pub struct ReportData {
 pub struct InvokeOutcome {
     pub status: u8,
     pub cluster_status: Option<u8>,
+}
+
+/// Decoded InvokeResponse for a single command, including any command-data
+/// fields (spec §8.9.4.2: a successful response may carry a CommandDataIB
+/// instead of a bare CommandStatusIB — e.g. commands that return a value).
+/// `fields_tlv`, when present, is one complete, well-formed TLV element (its
+/// top-level tag re-written to `Tag::Anonymous`) holding the response
+/// CommandFields struct, ready to hand to a cluster-specific decoder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvokeResponseData {
+    pub status: u8,
+    pub cluster_status: Option<u8>,
+    pub fields_tlv: Option<Vec<u8>>,
 }
 
 /// Interaction Model level errors (decode failures and device-reported
@@ -390,7 +404,10 @@ pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: 
     w.finish()
 }
 
-/// InvokeRequestMessage (spec §8.9.4) for a single command.
+/// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
+/// フィールド（タイムド呼び出し、spec §8.5）の値になる。公開関数
+/// `encode_invoke_request` / `encode_invoke_request_timed` はどちらもこれを
+/// 呼ぶだけの薄いラッパで、ワイヤ形状は完全に共有する。
 ///
 /// `fields_tlv`, if given, must be one complete, well-formed TLV element
 /// (any tag; it is re-tagged) holding the command's CommandFields struct.
@@ -399,16 +416,17 @@ pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: 
 /// when a fielded command is added later. Panics if `fields_tlv` is not
 /// well-formed TLV — a caller/programmer error, not a device response to
 /// validate defensively.
-pub fn encode_invoke_request(
+fn encode_invoke_request_inner(
     endpoint: u16,
     cluster: u32,
     command: u32,
     fields_tlv: Option<&[u8]>,
+    timed: bool,
 ) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_bool(Tag::Context(0), false); // SuppressResponse
-    w.put_bool(Tag::Context(1), false); // TimedRequest
+    w.put_bool(Tag::Context(1), timed); // TimedRequest
     w.start_array(Tag::Context(2)); // InvokeRequests
     w.start_struct(Tag::Anonymous); // CommandDataIB
     w.start_list(Tag::Context(0)); // CommandPath
@@ -425,6 +443,47 @@ pub fn encode_invoke_request(
     w.end_container(); // InvokeRequests
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
+    w.finish()
+}
+
+/// InvokeRequestMessage (spec §8.9.4) for a single command. TimedRequest is
+/// always `false` — see `encode_invoke_request_timed` for the timed variant
+/// (spec §8.5, タイムド呼び出し).
+pub fn encode_invoke_request(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    encode_invoke_request_inner(endpoint, cluster, command, fields_tlv, false)
+}
+
+/// InvokeRequestMessage (spec §8.9.4) with TimedRequest = true. Must be sent
+/// on the same exchange as a preceding `encode_timed_request` whose
+/// StatusResponse(SUCCESS) has already been received — the timeout window it
+/// establishes covers exactly this InvokeRequest (spec §8.5.1). Same fields
+/// contract as `encode_invoke_request` otherwise.
+pub fn encode_invoke_request_timed(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    encode_invoke_request_inner(endpoint, cluster, command, fields_tlv, true)
+}
+
+/// TimedRequestMessage (spec §8.5.1, タイムド呼び出し): `{0: Timeout(u16,
+/// ミリ秒), 255: InteractionModelRevision}`. Opens a timeout window during
+/// which the immediately following InvokeRequest/WriteRequest (same
+/// exchange, TimedRequest flag true) must arrive at the device, otherwise it
+/// rejects the timed action. `mat-controller` only uses this ahead of a
+/// timed invoke (`SecureSession::invoke_for_data`).
+pub fn encode_timed_request(timeout_ms: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(timeout_ms));
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
     w.finish()
 }
 
@@ -594,6 +653,131 @@ pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> 
         }
     }
     outcome.ok_or(ImError::Malformed(
+        "invoke response without InvokeResponseIB",
+    ))
+}
+
+/// CommandDataIB (spec §8.9.4.2): `{0: CommandPathIB, 1: CommandFields}`.
+/// Assumes the caller already consumed the `StructStart` (tag 0) that opens
+/// this CommandDataIB (InvokeResponseIB's `Command` field). Returns the
+/// CommandFields struct (tag 1), if present, re-tagged to `Tag::Anonymous`
+/// as one complete TLV element — the CommandPathIB (tag 0) is skipped since
+/// `decode_invoke_response_data`'s callers only need the fields, not the
+/// echoed path.
+fn decode_command_data_ib(r: &mut Reader) -> Result<Option<Vec<u8>>, ImError> {
+    let mut fields = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated command data ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::StructStart) => {
+                // CommandFields: always a struct (cluster spec command
+                // parameters). Re-tag to Anonymous, same convention as
+                // `encode_invoke_request`'s fields_tlv splice.
+                let mut w = Writer::new();
+                copy_value(&mut w, r, Tag::Anonymous, Value::StructStart)?;
+                fields = Some(w.finish());
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(fields)
+}
+
+/// InvokeResponseIB (spec §8.9.4.2): `{0: CommandDataIB} | {1: CommandStatusIB}`,
+/// decoded into `InvokeResponseData` (data-carrying variant of
+/// `decode_invoke_response_ib`). Assumes the caller already consumed the
+/// anonymous `StructStart` opening this InvokeResponseIB.
+fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, ImError> {
+    let mut result = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                // Command (CommandDataIB): a response carrying data is a
+                // successful invocation (status 0), possibly with fields.
+                let fields_tlv = decode_command_data_ib(r)?;
+                result = Some(InvokeResponseData {
+                    status: 0,
+                    cluster_status: None,
+                    fields_tlv,
+                });
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                let (status, cluster_status) = decode_command_status_ib(r)?;
+                result = Some(InvokeResponseData {
+                    status,
+                    cluster_status,
+                    fields_tlv: None,
+                });
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    result.ok_or(ImError::Malformed(
+        "invoke response ib without Command or Status",
+    ))
+}
+
+/// InvokeResponseMessage (spec §8.9.4), data-carrying variant of
+/// `decode_invoke_response`: a CommandDataIB response (status 0) yields its
+/// CommandFields as `fields_tlv`; a CommandStatusIB response yields
+/// `status`/`cluster_status` as today with `fields_tlv: None`. Only the
+/// first InvokeResponseIB is interpreted (same single-command scope as
+/// `decode_invoke_response`). Unlike `decode_invoke_response`, a non-zero
+/// status is returned as data, not as `Err` — callers that want the
+/// today's fail-on-error behavior should check `status` themselves (see
+/// `SecureSession::invoke_for_data`).
+pub fn decode_invoke_response_data(payload: &[u8]) -> Result<InvokeResponseData, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut result: Option<InvokeResponseData> = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // InvokeResponses
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated invoke responses"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            result = Some(decode_invoke_response_ib_data(&mut r)?);
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in invoke responses",
+                            ))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    result.ok_or(ImError::Malformed(
         "invoke response without InvokeResponseIB",
     ))
 }
@@ -960,6 +1144,93 @@ mod tests {
         w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
         w.end_container();
         assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn timed_request_shape() {
+        let p = encode_timed_request(10_000);
+        let mut r = Reader::new(&p);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        let e = r.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(0));
+        assert!(matches!(e.value, Value::Uint(10_000)));
+    }
+
+    #[test]
+    fn invoke_request_timed_sets_flag() {
+        let p = encode_invoke_request_timed(0, 0x3E, 0x00, None);
+        let mut r = Reader::new(&p);
+        r.next().unwrap(); // struct
+        r.next().unwrap(); // SuppressResponse
+        let e = r.next().unwrap().unwrap(); // TimedRequest
+        assert!(matches!(e.value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn decode_invoke_response_with_command_fields() {
+        // InvokeResponseMessage { 1: [ { 0: CommandDataIB { 0: path, 1: fields } } ] }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous); // InvokeResponseIB
+        w.start_struct(Tag::Context(0)); // CommandDataIB
+        w.start_list(Tag::Context(0)); // CommandPathIB
+        w.put_uint(Tag::Context(0), 0);
+        w.put_uint(Tag::Context(1), 0x3E);
+        w.put_uint(Tag::Context(2), 0x01);
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // CommandFields
+        w.put_bytes(Tag::Context(0), b"elements");
+        w.put_bytes(Tag::Context(1), &[0xAB; 64]);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let d = decode_invoke_response_data(&w.finish()).unwrap();
+        assert_eq!(d.status, 0);
+        let fields = d.fields_tlv.unwrap();
+        let mut fr = Reader::new(&fields);
+        assert!(matches!(
+            fr.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        assert!(matches!(fr.next().unwrap().unwrap().value, Value::Bytes(b) if b == b"elements"));
+    }
+
+    #[test]
+    fn decode_invoke_response_data_status_form() {
+        // 既存 decode_invoke_response の「nonzero status + cluster status」
+        // ケース (decodes_invoke_response_nonzero_status_with_cluster_status)
+        // と同じ CommandStatusIB 形（InvokeResponseIB{1: CommandStatusIB}）で
+        // 合成し、status/cluster_status が透過し fields_tlv は None になる
+        // ことを確認する。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0x81);
+        w.put_uint(Tag::Context(1), 0x42);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let d = decode_invoke_response_data(&w.finish()).unwrap();
+        assert_eq!(d.status, 0x81);
+        assert_eq!(d.cluster_status, Some(0x42));
+        assert_eq!(d.fields_tlv, None);
     }
 
     #[test]
