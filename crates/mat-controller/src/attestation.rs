@@ -832,6 +832,96 @@ mod tests {
     }
 
     #[test]
+    fn rejects_dac_with_ca_flag() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        // DAC に is_ca=true（basicConstraints cA=true）を付ける — spec 上
+        // DAC は CA 証明書であってはならない。
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AttestationError::Chain(_)));
+    }
+
+    #[test]
+    fn rejects_paa_without_ca_flag() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        // PAA に is_ca=false（basicConstraints 拡張なし = cA は None）を
+        // 付ける — spec 上 PAA は CA 証明書でなければならない。
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, false, None);
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AttestationError::Chain(_)));
+    }
+
+    #[test]
     fn epoch_seconds_matches_known_utc_values() {
         // openssl x509 -text で確認した Root01 fixture の Validity
         // （x509.rs の sdk_fixtures_expose_is_ca_and_validity テスト）を
