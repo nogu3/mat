@@ -17,5 +17,6 @@ pub mod im;
 pub mod kvs;
 pub mod message;
 pub mod session;
+pub mod setup_code;
 pub mod tlv;
 pub mod transport;
