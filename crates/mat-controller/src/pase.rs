@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::case::{parse_status_report, random_nonzero_u16};
+use crate::case::{encode_status_report, parse_status_report, random_nonzero_u16};
 use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::session::{SecureSession, SessionKeys};
@@ -34,6 +34,11 @@ pub(crate) const OPCODE_PASE_PAKE3: u8 = 0x24;
 const PAKE_CONTEXT_PREFIX: &[u8] = b"CHIP PAKE V1 Commissioning";
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 const STATUS_SUCCESS: (u16, u16) = (0, 0); // (general_code, protocol_code)
+/// SecureChannel protocol の `GeneralStatusCode::FAILURE`（spec §4.11.3 表）。
+const GENERAL_CODE_FAILURE: u16 = 1;
+/// SecureChannel protocol 固有コード `kInvalidParameter`（spec §4.11.3.1
+/// 表・SPAKE2+ 確認不一致など、handshake データ自体が拒否される場合）。
+const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 
 /// Wait budget for a real (non-ack) response once the previous message has
 /// already been acknowledged — covers device-side PBKDF/SPAKE2+ compute time.
@@ -347,6 +352,20 @@ pub async fn establish(
         .finish(&p_b, &context, b"", b"")
         .map_err(PaseError::Spake)?;
     if shared.expected_c_b != c_b {
+        // 確認不一致（passcode 違い）を黙って諦めると、responder は Pake3 待ちの
+        // まま PASE セッション確立スロットを保持し続け、直後の再試行が PBKDF
+        // param request すら処理されずに固まる（実機 E2E で発見）。StatusReport
+        // で明示的に中断を通知して responder 側のスロットを解放させる — 相手
+        // からの応答は待たない（こちらは既に失敗を返す途中なので、送達の
+        // ベストエフォートで十分。send_reliable 自体の失敗は無視する）。
+        let sr = encode_status_report(
+            GENERAL_CODE_FAILURE,
+            u32::from(PROTOCOL_ID_SECURE_CHANNEL),
+            SC_PROTOCOL_CODE_INVALID_PARAMETER,
+        );
+        let _ = ex
+            .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_STATUS_REPORT, &sr, cfg)
+            .await;
         return Err(PaseError::ConfirmMismatch);
     }
     let pake3 = encode_pake3(&shared.c_a);
