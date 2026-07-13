@@ -14,6 +14,21 @@ pub fn compressed_fabric_id(root_public_key: &[u8; 65], fabric_id: u64) -> [u8; 
     out
 }
 
+/// epoch IPK から operational IPK を導出する (spec §4.15.2:
+/// Crypto_KDF(epoch, salt=CompressedFabricId, info="GroupKey v1.0", 128bit))。
+///
+/// **epoch と operational は別物、取り違え厳禁**: AddNOC でデバイスに渡す
+/// のは epoch 側の IPK（fabric 全体で共有される groupKeySet の鍵）。CASE の
+/// destination id 計算（`case_destination_id`）や Sigma で使うのは、ここで
+/// 導出する operational 側。
+pub fn derive_ipk_operational(epoch_key: &[u8; 16], compressed_fabric_id: &[u8; 8]) -> [u8; 16] {
+    let hk = Hkdf::<Sha256>::new(Some(compressed_fabric_id), epoch_key);
+    let mut out = [0u8; 16];
+    hk.expand(b"GroupKey v1.0", &mut out)
+        .expect("16 bytes is a valid hkdf-sha256 output length");
+    out
+}
+
 /// CASE destination identifier (spec §4.14.2.1.2). Fabric id / node id are
 /// little-endian here (unlike the big-endian salt above).
 pub fn case_destination_id(
@@ -309,6 +324,15 @@ mod tests {
         // The self-issued NOC chains to the root.
         let rcac_cert = crate::cert::MatterCert::parse(&creds.rcac_tlv).unwrap();
         crate::cert::verify_noc_chain(&noc, None, &rcac_cert).unwrap();
+    }
+
+    #[test]
+    fn ipk_operational_derivation_is_deterministic_and_input_sensitive() {
+        let a = derive_ipk_operational(&[1u8; 16], &[2u8; 8]);
+        let b = derive_ipk_operational(&[1u8; 16], &[2u8; 8]);
+        let c = derive_ipk_operational(&[1u8; 16], &[3u8; 8]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]

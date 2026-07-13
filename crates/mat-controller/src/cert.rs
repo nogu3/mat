@@ -26,6 +26,8 @@ pub const NOC_VALIDITY_SECS: u32 = 315_360_000;
 const EKU_CLIENT_AUTH: u64 = 2;
 const EKU_SERVER_AUTH: u64 = 1;
 const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 0x0001;
+const KEY_USAGE_KEY_CERT_SIGN: u16 = 0x0020;
+const KEY_USAGE_CRL_SIGN: u16 = 0x0040;
 
 /// Build and sign a NOC (2-cert chain: signed directly by `issuer`, no ICAC).
 /// `issuer` is the RCAC (self-signed root); `issuer_private_key` its op key.
@@ -82,6 +84,67 @@ pub fn issue_noc(
     noc.signature = crate::crypto::sign_ecdsa_p256(issuer_private_key, &tbs)
         .map_err(|_| CertError::BadSignature)?;
     Ok(noc)
+}
+
+/// 使い捨て fabric 用の self-signed RCAC（root 証明書）を新規生成する。
+/// 発行者 DN・subject DN は同一（自己発行）で、subject の rcac-id
+/// (TLV tag 20) は乱数の u64。戻り値は `(RCAC, root 秘密鍵)` — 呼び出し側
+/// はこの root 秘密鍵で `issue_noc` を呼び、fabric の NOC を発行する
+/// （M6a: `fabric::FabricCredentials::from_self_issued` が消費する
+/// `kvs::SelfIssueMaterials` の生成元）。
+///
+/// 拡張は Matter root cert の要件どおり: BasicConstraints{is_ca: true} /
+/// KeyUsage(keyCertSign|cRLSign) / SubjectKeyId(自身) /
+/// AuthorityKeyId(自身の SKID) — 自己署名なので issuer も自分。
+pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    let sk = crate::case::random_p256_secret();
+    let private_key: [u8; 32] = sk.to_bytes().into();
+    let public_key: [u8; 65] = sk
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CertError::Malformed("pubkey encode"))?;
+
+    let mut rcac_id_b = [0u8; 8];
+    getrandom::getrandom(&mut rcac_id_b).expect("os rng");
+    let rcac_id = u64::from_le_bytes(rcac_id_b);
+    let subject = vec![DnAttr {
+        tlv_tag: 20,
+        value: DnValue::MatterId(rcac_id),
+    }];
+
+    let skid = subject_key_id(&public_key).to_vec();
+    let extensions = vec![
+        CertExtension::BasicConstraints {
+            is_ca: true,
+            path_len: None,
+        },
+        CertExtension::KeyUsage(KEY_USAGE_KEY_CERT_SIGN | KEY_USAGE_CRL_SIGN),
+        CertExtension::SubjectKeyId(skid.clone()),
+        CertExtension::AuthorityKeyId(skid),
+    ];
+
+    let mut serial = [0u8; 8];
+    getrandom::getrandom(&mut serial).expect("os rng");
+    serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
+
+    let mut rcac = MatterCert {
+        serial: serial.to_vec(),
+        issuer: subject.clone(),
+        not_before: MATTER_EPOCH_2021,
+        not_after: MATTER_EPOCH_2021.saturating_add(NOC_VALIDITY_SECS),
+        subject,
+        pub_key: public_key,
+        extensions,
+        signature: [0u8; 64], // TBS 署名で埋める
+    };
+
+    let tbs = rcac.tbs_der()?;
+    rcac.signature =
+        crate::crypto::sign_ecdsa_p256(&private_key, &tbs).map_err(|_| CertError::BadSignature)?;
+    Ok((rcac, private_key))
 }
 
 // --- Pre-computed OID constants (DER bytes, tag 0x06 included) ---
@@ -876,6 +939,27 @@ mod tests {
         // Before not-before, and past not-after (roughly 2032), are invalid.
         assert!(!cert_time_valid(&noc, MATTER_EPOCH_2021 - 1));
         assert!(!cert_time_valid(&noc, noc.not_after + 1));
+    }
+
+    #[test]
+    fn generate_rcac_is_self_signed_and_issues_valid_noc() {
+        let (rcac, root_key) = generate_rcac().unwrap();
+        // TLV 往復
+        let reparsed = MatterCert::parse(&rcac.to_tlv()).unwrap();
+        assert_eq!(reparsed.subject, rcac.subject);
+        // 自己署名検証
+        rcac.verify_signed_by(&rcac.pub_key).unwrap();
+        // この root で NOC を発行してチェーン検証が通る
+        let op = crate::case::random_p256_secret();
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let op_pub: [u8; 65] = op
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
+        verify_noc_chain(&noc, None, &rcac).unwrap();
     }
 
     #[test]
