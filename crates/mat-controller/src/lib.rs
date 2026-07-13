@@ -6,6 +6,7 @@
 
 pub mod asn1;
 pub mod attestation;
+pub mod btp;
 pub mod case;
 pub mod cert;
 pub mod commissioning;
