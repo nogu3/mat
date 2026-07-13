@@ -478,6 +478,40 @@ pub(crate) mod test_support {
         is_ca: bool,
         vid_pid: Option<(u16, u16)>,
     ) -> Vec<u8> {
+        // issuer Name は「発行元 CA の実際の subject バイト列」と一致していな
+        // ければならない（X.509 のチェーン照合はバイト一致が前提 —
+        // attestation.rs Task 5 の DAC.issuer == PAI.subject 判定）。この
+        // フィクスチャの 3 階層（PAA: vid_pid なし → PAI/DAC: 同じ vid_pid）
+        // では、leaf 証明書（is_ca=false、= DAC 相当）の発行元だけが
+        // vid_pid 入りの subject を持つので、その場合だけ vid_pid を issuer
+        // Name にも埋め込む。CA 証明書（PAA/PAI 自身、is_ca=true）の発行元は
+        // 常に vid_pid なし（ルート PAA はベンダー非依存）とみなす。
+        make_test_cert_ext(
+            subject,
+            issuer,
+            subject_key,
+            signer_key,
+            is_ca,
+            if is_ca { None } else { vid_pid },
+            vid_pid,
+        )
+    }
+
+    /// `make_test_cert` の分解版: 「basicConstraints(cA=true) を出すか」と
+    /// 「issuer / subject Name に埋める vid_pid」を独立に指定できる。
+    /// `make_test_cert` の issuer-Name ヒューリスティック（is_ca で issuer の
+    /// vid_pid を落とす）が邪魔になるケース — 例: cA=true なのに DAC 相当の
+    /// Name 構造を持つ「不正な DAC」を合成して attestation の cA 拒否分岐
+    /// **だけ** を踏ませたいテスト — 用。
+    pub(crate) fn make_test_cert_ext(
+        subject: &[u8],
+        issuer: &[u8],
+        subject_key: &p256::SecretKey,
+        signer_key: &p256::SecretKey,
+        emit_ca_basic_constraints: bool,
+        issuer_vid_pid: Option<(u16, u16)>,
+        subject_vid_pid: Option<(u16, u16)>,
+    ) -> Vec<u8> {
         use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let subject_pub: [u8; 65] = subject_key
@@ -498,27 +532,19 @@ pub(crate) mod test_support {
         let version = asn1::context_constructed(0, &asn1::integer(&[2])); // v3
         let serial = asn1::integer(&[0x01]);
         let sig_alg = asn1::seq(&[&asn1::oid(OID_ECDSA_SHA256)]);
-        // issuer Name は「発行元 CA の実際の subject バイト列」と一致していな
-        // ければならない（X.509 のチェーン照合はバイト一致が前提 —
-        // attestation.rs Task 5 の DAC.issuer == PAI.subject 判定）。この
-        // フィクスチャの 3 階層（PAA: vid_pid なし → PAI/DAC: 同じ vid_pid）
-        // では、leaf 証明書（is_ca=false、= DAC 相当）の発行元だけが
-        // vid_pid 入りの subject を持つので、その場合だけ vid_pid を issuer
-        // Name にも埋め込む。CA 証明書（PAA/PAI 自身、is_ca=true）の発行元は
-        // 常に vid_pid なし（ルート PAA はベンダー非依存）とみなす。
-        let issuer_name = build_name(issuer, if is_ca { None } else { vid_pid });
+        let issuer_name = build_name(issuer, issuer_vid_pid);
         let validity = asn1::seq(&[
             &asn1::utc_time("260101000000Z"),
             &asn1::utc_time("300101000000Z"),
         ]);
-        let subject_name = build_name(subject, vid_pid);
+        let subject_name = build_name(subject, subject_vid_pid);
         let spki = asn1::seq(&[
             &asn1::seq(&[&asn1::oid(OID_EC_PUBLIC_KEY), &asn1::oid(OID_PRIME256V1)]),
             &asn1::bit_string(0, &subject_pub),
         ]);
 
         let mut ext_items: Vec<Vec<u8>> = Vec::new();
-        if is_ca {
+        if emit_ca_basic_constraints {
             ext_items.push(basic_constraints_ext());
         }
         ext_items.push(skid_ext(&subject_skid));

@@ -599,7 +599,7 @@ mod tests {
     use crate::case::random_p256_secret;
     use crate::crypto::sign_ecdsa_p256;
     use crate::tlv::{Tag, Writer};
-    use crate::x509::test_support::make_test_cert;
+    use crate::x509::test_support::{make_test_cert, make_test_cert_ext};
 
     struct Fixture {
         dac: Vec<u8>,
@@ -790,16 +790,21 @@ mod tests {
         let fake_pai_key = random_p256_secret();
         let dac_key = random_p256_secret();
         let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
-        // "PAI" 位置に is_ca=false（basicConstraints 拡張なし = cA は
-        // None、Some(true) ではない）の証明書を置く — DAC の位置にあるべき
-        // 種類の証明書を PAI として渡すのと同義（brief: 「DAC を PAI の
-        // 位置に渡す」ことで cA=false 拒否を確認）。
-        let fake_pai = make_test_cert(
+        // "PAI" 位置に basicConstraints 拡張なし（= cA は None、Some(true)
+        // ではない）の証明書を置く — DAC の位置にあるべき種類の証明書を
+        // PAI として渡すのと同義（brief: 「DAC を PAI の位置に渡す」ことで
+        // cA=false 拒否を確認）。issuer Name は PAA の subject（CN のみ）に
+        // 一致させ、cA チェックより手前の issuer/subject 照合では落ちない
+        // ようにする（make_test_cert のヒューリスティックだと is_ca=false
+        // で issuer に vid_pid が入り「no matching PAA」で先に落ちて
+        // 検証対象の分岐に届かない）。
+        let fake_pai = make_test_cert_ext(
             b"pai",
             b"paa",
             &fake_pai_key,
             &paa_key,
             false,
+            None,
             Some((0xFFF1, 0x8001)),
         );
         let dac = make_test_cert(
@@ -828,7 +833,12 @@ mod tests {
             &challenge,
         )
         .unwrap_err();
-        assert!(matches!(err, AttestationError::Chain(_)));
+        // メッセージまで固定: 手前のチェック（issuer/subject 照合など）で
+        // 落ちて分岐がマスクされる退行を検出できるように。
+        assert!(matches!(
+            err,
+            AttestationError::Chain("pai is not a ca certificate")
+        ));
     }
 
     #[test]
@@ -845,14 +855,20 @@ mod tests {
             true,
             Some((0xFFF1, 0x8001)),
         );
-        // DAC に is_ca=true（basicConstraints cA=true）を付ける — spec 上
-        // DAC は CA 証明書であってはならない。
-        let dac = make_test_cert(
+        // DAC に basicConstraints cA=true を付ける — spec 上 DAC は CA
+        // 証明書であってはならない。issuer/subject Name の vid_pid は正規の
+        // DAC と同じ形（issuer = PAI subject と一致）に保ち、cA チェックより
+        // 手前のチェーン照合・VID/PID 照合はすべて通す（make_test_cert の
+        // ヒューリスティックだと is_ca=true で issuer から vid_pid が落ち、
+        // 「dac issuer != pai subject」で先に落ちて検証対象の分岐に
+        // 届かない）。
+        let dac = make_test_cert_ext(
             b"dac",
             b"pai",
             &dac_key,
             &pai_key,
             true,
+            Some((0xFFF1, 0x8001)),
             Some((0xFFF1, 0x8001)),
         );
         let nonce = [5u8; 32];
@@ -873,7 +889,10 @@ mod tests {
             &challenge,
         )
         .unwrap_err();
-        assert!(matches!(err, AttestationError::Chain(_)));
+        assert!(matches!(
+            err,
+            AttestationError::Chain("dac must not be a ca certificate")
+        ));
     }
 
     #[test]
@@ -918,7 +937,10 @@ mod tests {
             &challenge,
         )
         .unwrap_err();
-        assert!(matches!(err, AttestationError::Chain(_)));
+        assert!(matches!(
+            err,
+            AttestationError::Chain("paa is not a ca certificate")
+        ));
     }
 
     #[test]
