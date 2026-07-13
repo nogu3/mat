@@ -14,10 +14,25 @@
 //! ArmFailSafe → attestation → CSR → NOC 発行 → AddTrustedRoot → AddNOC →
 //! CommissioningComplete）は Task 10 の役割で、ここでは扱わない。
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::attestation;
+use crate::case;
 use crate::cert::{self, MatterCert};
+use crate::crypto;
+use crate::dnssd;
+use crate::exchange::MrpConfig;
 use crate::fabric::{self, FabricCredentials};
+use crate::im;
 use crate::kvs::SelfIssueMaterials;
+use crate::pase;
+use crate::session::SecureSession;
 use crate::tlv::{Element, Reader, Tag, Value, Writer};
+use crate::transport::UdpTransport;
+use crate::x509;
 
 // --- General Commissioning cluster (spec §11.10) ---
 
@@ -212,6 +227,90 @@ fn skip_container(r: &mut Reader, step: &'static str) -> Result<(), CommissionEr
     Ok(())
 }
 
+/// [`scan_struct_fields`] が集める TLV leaf 要素の値。以下の decoder が読む
+/// 応答はすべて「フラットな struct 直下に leaf だけが並ぶ」形（ネストした
+/// struct/array/list を持つフィールドは無い）なのでコンテナ型は持たない
+/// ——コンテナタグは `skip_container` で読み飛ばされ、この enum には現れない。
+enum FieldValue {
+    Uint(u64),
+    Bytes(Vec<u8>),
+    Utf8(String),
+}
+
+/// `fields` の TLV struct 1 段をスキャンし、直下の leaf 要素を
+/// `{contextTag: value}` に集める（同じタグが複数回現れたら後勝ち——1 回の
+/// ループで都度代入していた旧実装と同じ挙動）。Task 9 で書かれた 6 個の
+/// decoder はどれも「struct を開いて直下のタグ別 leaf を拾い、知らない
+/// コンテナは読み飛ばす」という同型のループだった。ここに 1 箇所へ集約し、
+/// 各 decoder は `take_*` でタグを引くだけにする。
+fn scan_struct_fields(
+    fields: &[u8],
+    step: &'static str,
+) -> Result<BTreeMap<u8, FieldValue>, CommissionError> {
+    let mut r = Reader::new(fields);
+    expect_struct(&mut r, step)?;
+    let mut out = BTreeMap::new();
+    loop {
+        let el = next_el(&mut r, step)?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(t), Value::Uint(v)) => {
+                out.insert(t, FieldValue::Uint(v));
+            }
+            (Tag::Context(t), Value::Bytes(b)) => {
+                out.insert(t, FieldValue::Bytes(b.to_vec()));
+            }
+            (Tag::Context(t), Value::Utf8(s)) => {
+                out.insert(t, FieldValue::Utf8(s.to_string()));
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r, step)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// `map` からタグ `tag` を u8 として取り出す。タグが無い、または値が
+/// `Uint` 以外の型なら「無かった」扱いで `Ok(None)`（旧実装で型不一致の
+/// 分岐が黙って読み捨てられていたのと同じ）。`Uint` ではあるが u8 に収まら
+/// ない場合だけ `range_detail` で `Malformed` を返す。
+fn take_u8(
+    map: &mut BTreeMap<u8, FieldValue>,
+    tag: u8,
+    step: &'static str,
+    range_detail: &'static str,
+) -> Result<Option<u8>, CommissionError> {
+    match map.remove(&tag) {
+        Some(FieldValue::Uint(v)) => Ok(Some(u8::try_from(v).map_err(|_| {
+            CommissionError::Malformed {
+                step,
+                detail: range_detail,
+            }
+        })?)),
+        _ => Ok(None),
+    }
+}
+
+/// `map` からタグ `tag` を `Vec<u8>` として取り出す（型不一致は「無かっ
+/// た」扱い、[`take_u8`] と同じ方針）。
+fn take_bytes(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<Vec<u8>> {
+    match map.remove(&tag) {
+        Some(FieldValue::Bytes(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// `map` からタグ `tag` を `String` として取り出す（型不一致は「無かっ
+/// た」扱い、[`take_u8`] と同じ方針）。
+fn take_utf8(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<String> {
+    match map.remove(&tag) {
+        Some(FieldValue::Utf8(s)) => Some(s),
+        _ => None,
+    }
+}
+
 /// ArmFailSafeResponse / SetRegulatoryConfigResponse / CommissioningComplete
 /// Response（spec §11.10.6.3 / .5 / .7）共通の `{0: ErrorCode, 1: DebugText}`
 /// 形。`DebugText` は spec 上 optional なので欠落時は空文字列にする。戻り値
@@ -220,31 +319,14 @@ pub fn decode_commissioning_status_response(
     fields: &[u8],
 ) -> Result<(u8, String), CommissionError> {
     let step = "commissioning_status_response";
-    let mut r = Reader::new(fields);
-    expect_struct(&mut r, step)?;
-    let mut error_code: Option<u8> = None;
-    let mut debug_text = String::new();
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Uint(v)) => {
-                error_code = Some(u8::try_from(v).map_err(|_| CommissionError::Malformed {
-                    step,
-                    detail: "errorCode out of range",
-                })?);
-            }
-            (Tag::Context(1), Value::Utf8(s)) => debug_text = s.to_string(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    let error_code = error_code.ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing errorCode",
-    })?;
+    let mut map = scan_struct_fields(fields, step)?;
+    let error_code = take_u8(&mut map, 0, step, "errorCode out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing errorCode",
+        },
+    )?;
+    let debug_text = take_utf8(&mut map, 1).unwrap_or_default();
     Ok((error_code, debug_text))
 }
 
@@ -252,58 +334,30 @@ pub fn decode_commissioning_status_response(
 /// AttestationSignature}`。戻り値は `(elements, signature)`。
 pub fn decode_attestation_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), CommissionError> {
     let step = "attestation_response";
-    let mut r = Reader::new(fields);
-    expect_struct(&mut r, step)?;
-    let mut elements: Option<Vec<u8>> = None;
-    let mut signature: Option<[u8; 64]> = None;
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Bytes(b)) => elements = Some(b.to_vec()),
-            (Tag::Context(1), Value::Bytes(b)) => {
-                signature = Some(b.try_into().map_err(|_| CommissionError::Malformed {
-                    step,
-                    detail: "signature length",
-                })?);
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    Ok((
-        elements.ok_or(CommissionError::Malformed {
+    let mut map = scan_struct_fields(fields, step)?;
+    let elements = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing elements",
+    })?;
+    let sig_bytes = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing signature",
+    })?;
+    let signature: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| CommissionError::Malformed {
             step,
-            detail: "missing elements",
-        })?,
-        signature.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing signature",
-        })?,
-    ))
+            detail: "signature length",
+        })?;
+    Ok((elements, signature))
 }
 
 /// CertificateChainResponse（spec §11.17.6.5）: `{0: Certificate}`（DAC ま
 /// たは PAI の X.509 DER をそのまま bytes に包んだもの）。
 pub fn decode_cert_chain_response(fields: &[u8]) -> Result<Vec<u8>, CommissionError> {
     let step = "cert_chain_response";
-    let mut r = Reader::new(fields);
-    expect_struct(&mut r, step)?;
-    let mut certificate: Option<Vec<u8>> = None;
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Bytes(b)) => certificate = Some(b.to_vec()),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    certificate.ok_or(CommissionError::Malformed {
+    let mut map = scan_struct_fields(fields, step)?;
+    take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
         step,
         detail: "missing certificate",
     })
@@ -315,37 +369,22 @@ pub fn decode_cert_chain_response(fields: &[u8]) -> Result<Vec<u8>, CommissionEr
 /// `parse_nocsr_elements` が読む）。
 pub fn decode_csr_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), CommissionError> {
     let step = "csr_response";
-    let mut r = Reader::new(fields);
-    expect_struct(&mut r, step)?;
-    let mut elements: Option<Vec<u8>> = None;
-    let mut signature: Option<[u8; 64]> = None;
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Bytes(b)) => elements = Some(b.to_vec()),
-            (Tag::Context(1), Value::Bytes(b)) => {
-                signature = Some(b.try_into().map_err(|_| CommissionError::Malformed {
-                    step,
-                    detail: "signature length",
-                })?);
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    Ok((
-        elements.ok_or(CommissionError::Malformed {
+    let mut map = scan_struct_fields(fields, step)?;
+    let elements = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing nocsr elements",
+    })?;
+    let sig_bytes = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing signature",
+    })?;
+    let signature: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| CommissionError::Malformed {
             step,
-            detail: "missing nocsr elements",
-        })?,
-        signature.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing signature",
-        })?,
-    ))
+            detail: "signature length",
+        })?;
+    Ok((elements, signature))
 }
 
 /// NOCSRElements（spec §11.17.6.10.1）: `{1: csr, 2: CSRNonce, 3/4: vendor
@@ -353,32 +392,16 @@ pub fn decode_csr_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), Commiss
 /// フィールドが付いていても無視する。
 pub fn parse_nocsr_elements(elements: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CommissionError> {
     let step = "nocsr_elements";
-    let mut r = Reader::new(elements);
-    expect_struct(&mut r, step)?;
-    let mut csr: Option<Vec<u8>> = None;
-    let mut nonce: Option<Vec<u8>> = None;
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => csr = Some(b.to_vec()),
-            (Tag::Context(2), Value::Bytes(b)) => nonce = Some(b.to_vec()),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    Ok((
-        csr.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing csr",
-        })?,
-        nonce.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing csr nonce",
-        })?,
-    ))
+    let mut map = scan_struct_fields(elements, step)?;
+    let csr = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing csr",
+    })?;
+    let nonce = take_bytes(&mut map, 2).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing csr nonce",
+    })?;
+    Ok((csr, nonce))
 }
 
 /// NOCResponse（spec §11.17.6.14, AddNOC / RemoveFabric 共通の応答）:
@@ -386,39 +409,433 @@ pub fn parse_nocsr_elements(elements: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Commi
 /// り値は `(statusCode, fabricIndex)`。
 pub fn decode_noc_response(fields: &[u8]) -> Result<(u8, Option<u8>), CommissionError> {
     let step = "noc_response";
-    let mut r = Reader::new(fields);
-    expect_struct(&mut r, step)?;
-    let mut status: Option<u8> = None;
-    let mut fabric_index: Option<u8> = None;
-    loop {
-        let el = next_el(&mut r, step)?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Uint(v)) => {
-                status = Some(u8::try_from(v).map_err(|_| CommissionError::Malformed {
-                    step,
-                    detail: "statusCode out of range",
-                })?);
-            }
-            (Tag::Context(1), Value::Uint(v)) => {
-                fabric_index = Some(u8::try_from(v).map_err(|_| CommissionError::Malformed {
-                    step,
-                    detail: "fabricIndex out of range",
-                })?);
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r, step)?;
-            }
-            _ => {}
-        }
-    }
-    Ok((
-        status.ok_or(CommissionError::Malformed {
+    let mut map = scan_struct_fields(fields, step)?;
+    let status = take_u8(&mut map, 0, step, "statusCode out of range")?.ok_or(
+        CommissionError::Malformed {
             step,
             detail: "missing statusCode",
-        })?,
+        },
+    )?;
+    let fabric_index = take_u8(&mut map, 1, step, "fabricIndex out of range")?;
+    Ok((status, fabric_index))
+}
+
+// --- ステップマシン（Task 10） ---
+//
+// 順序: ターゲット解決 → PASE → ArmFailSafe(必須) → SetRegulatoryConfig(任
+// 意、失敗は warn で続行) → attestation(厳格) → CSR → NOC 発行 →
+// AddTrustedRootCertificate → AddNOC → 新 fabric で CASE(リトライ) →
+// CommissioningComplete。failsafe は明示 disarm しない——失敗時は 120s の
+// 期限切れに任せる（spec 決定 6: 中断ハンドラを持たない一発フロー）。
+
+/// commissioning 対象デバイスの指定方法。
+pub enum CommissionTarget {
+    /// アドレス既知（ローカル E2E、または呼び出し側が別途探索済み）。
+    Addr(SocketAddr),
+    /// `_matterc` browse で long discriminator から探索する。
+    Discriminator(u16),
+}
+
+/// `commission_on_network` の入力一式。
+pub struct CommissionParams<'a> {
+    pub passcode: u32,
+    pub target: CommissionTarget,
+    pub device_node_id: u64,
+    /// PAA 信頼ストアのディレクトリ（`*.der`）。`None` は「PAA なし」——
+    /// attestation チェーン検証は必ず失敗する（PAA 必須運用、警告なしで
+    /// 弱めない）。
+    pub paa_dir: Option<&'a std::path::Path>,
+    /// CD signer 証明書ストアのディレクトリ。CD 検証は warn のみ（spec
+    /// 決定どおり戻り値には影響しない）ので `None` でも commissioning 自体
+    /// は続行できる。
+    pub cd_signer_dir: Option<&'a std::path::Path>,
+    /// mDNS / link-local アドレス用の interface index。`Addr` 直指定なら
+    /// リンクローカルでなければ `0` で構わない。
+    pub scope_id: u32,
+}
+
+/// commissioning 完了後のデバイス。
+pub struct CommissionedDevice {
+    pub node_id: u64,
+    pub fabric_index: Option<u8>,
+    /// 新 fabric 上の operational CASE セッション（CommissioningComplete
+    /// 送信済み）。呼び出し側はこれをそのまま以後の操作に使い回せる。
+    pub session: SecureSession,
+}
+
+/// `InvokeResponseData` から command fields TLV を取り出す。応答の
+/// `status` が非ゼロならその時点で `CommandStatus` に、fields が無ければ
+/// `Malformed` にする。
+fn fields_of<'a>(
+    step: &'static str,
+    resp: &'a im::InvokeResponseData,
+) -> Result<&'a [u8], CommissionError> {
+    if resp.status != 0 {
+        return Err(CommissionError::CommandStatus {
+            step,
+            code: resp.status,
+        });
+    }
+    resp.fields_tlv
+        .as_deref()
+        .ok_or(CommissionError::Malformed {
+            step,
+            detail: "no command fields",
+        })
+}
+
+/// `{0: errorCode, 1: debugText}` 型（ArmFailSafeResponse などの共通形）の
+/// 応答を検査し、`errorCode` が非ゼロなら `CommandStatus` にする。
+fn check_commissioning_response(
+    step: &'static str,
+    resp: &im::InvokeResponseData,
+) -> Result<(), CommissionError> {
+    let (code, _text) = decode_commissioning_status_response(fields_of(step, resp)?)?;
+    if code != 0 {
+        return Err(CommissionError::CommandStatus { step, code });
+    }
+    Ok(())
+}
+
+/// CertificateChainRequest を送って証明書 DER を取り出す（DAC / PAI 共
+/// 通、`cert_type` で切り替え）。
+async fn request_cert(
+    step: &'static str,
+    session: &mut SecureSession,
+    cert_type: u8,
+    cfg: &MrpConfig,
+) -> Result<Vec<u8>, CommissionError> {
+    let resp = session
+        .invoke_for_data(
+            0,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CERT_CHAIN_REQUEST,
+            Some(&encode_cert_chain_request(cert_type)),
+            None,
+            cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    decode_cert_chain_response(fields_of(step, &resp)?)
+}
+
+/// on-network commissioning のステップマシン本体（spec §5.5 全体フロー）。
+///
+/// `fabric` はこのコミッショニングだけで使い捨てる第二 fabric（呼び出し側
+/// が事前に [`CommissioningFabric::generate`] しておく）。成功すると新
+/// fabric 上の CASE セッションを持つ [`CommissionedDevice`] を返す。
+pub async fn commission_on_network(
+    transport: Arc<UdpTransport>,
+    fabric: &CommissioningFabric,
+    params: CommissionParams<'_>,
+) -> Result<CommissionedDevice, CommissionError> {
+    // 1. ターゲット解決。
+    let (peer, cfg) = match params.target {
+        CommissionTarget::Addr(a) => (a, MrpConfig::default()),
+        CommissionTarget::Discriminator(d) => {
+            let node = dnssd::resolve_commissionable(params.scope_id, d, Duration::from_secs(15))
+                .await
+                .map_err(CommissionError::Discovery)?;
+            let addr = node
+                .socket_addrs(params.scope_id)
+                .into_iter()
+                .next()
+                .ok_or(CommissionError::Timeout("no usable address"))?;
+            (addr, node.mrp_config())
+        }
+    };
+
+    // 2. PASE。
+    let mut pase = pase::establish(Arc::clone(&transport), peer, params.passcode, &cfg)
+        .await
+        .map_err(CommissionError::Pase)?;
+    let challenge = pase.attestation_challenge();
+
+    // 3. ArmFailSafe(120s)（必須）。
+    let resp = pase
+        .invoke_for_data(
+            0,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            Some(&encode_arm_fail_safe(120, 1)),
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    check_commissioning_response("arm-fail-safe", &resp)?;
+
+    // 4. SetRegulatoryConfig（任意 — spec 決定 7: 失敗は warn で続行）。
+    match pase
+        .invoke_for_data(
+            0,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_SET_REGULATORY_CONFIG,
+            Some(&encode_set_regulatory_config(2, "XX", 2)),
+            None,
+            &cfg,
+        )
+        .await
+    {
+        Ok(resp) => {
+            if let Err(e) = check_commissioning_response("set-regulatory", &resp) {
+                tracing::warn!(error = %e, "SetRegulatoryConfig rejected — continuing");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "SetRegulatoryConfig failed — continuing"),
+    }
+
+    // 5. attestation（厳格）。
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).expect("os rng");
+    let resp = pase
+        .invoke_for_data(
+            0,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ATTESTATION_REQUEST,
+            Some(&encode_attestation_request(&nonce)),
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    let (elements, att_sig) = decode_attestation_response(fields_of("attestation", &resp)?)?;
+    let dac = request_cert("dac", &mut pase, CERT_TYPE_DAC, &cfg).await?;
+    let pai = request_cert("pai", &mut pase, CERT_TYPE_PAI, &cfg).await?;
+    let paa = match params.paa_dir {
+        Some(d) => attestation::load_der_dir(d).map_err(CommissionError::Attestation)?,
+        None => Vec::new(), // 空 → チェーン検証は必ず失敗する（PAA 必須運用）
+    };
+    let cd_signers = match params.cd_signer_dir {
+        Some(d) => attestation::load_der_dir(d).map_err(CommissionError::Attestation)?,
+        None => Vec::new(),
+    };
+    attestation::verify_device_attestation(
+        &dac,
+        &pai,
+        &paa,
+        &cd_signers,
+        &elements,
+        &att_sig,
+        &nonce,
+        &challenge,
+    )
+    .map_err(CommissionError::Attestation)?;
+
+    // 6. CSR → NOC 発行。
+    let mut csr_nonce = [0u8; 32];
+    getrandom::getrandom(&mut csr_nonce).expect("os rng");
+    let resp = pase
+        .invoke_for_data(
+            0,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            Some(&encode_csr_request(&csr_nonce)),
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    let (nocsr_elements, nocsr_sig) = decode_csr_response(fields_of("csr", &resp)?)?;
+    // NOCSR 署名も DAC 鍵で elements||challenge に対して（spec §11.17.5.6）。
+    {
+        let dac_cert = x509::parse_x509(&dac).map_err(|_| CommissionError::Csr("dac reparse"))?;
+        let mut msg = nocsr_elements.clone();
+        msg.extend_from_slice(&challenge);
+        crypto::verify_ecdsa_p256(&dac_cert.public_key, &msg, &nocsr_sig)
+            .map_err(|_| CommissionError::Csr("nocsr signature"))?;
+    }
+    let (csr_der, returned_nonce) = parse_nocsr_elements(&nocsr_elements)?;
+    if returned_nonce != csr_nonce {
+        return Err(CommissionError::Csr("csr nonce mismatch"));
+    }
+    let device_pub = x509::parse_csr(&csr_der).map_err(|_| CommissionError::Csr("csr parse"))?;
+    let noc_tlv = fabric.issue_device_noc(&device_pub, params.device_node_id)?;
+
+    // 7. AddTrustedRootCertificate → AddNOC。
+    let resp = pase
+        .invoke_for_data(
+            0,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ADD_TRUSTED_ROOT,
+            Some(&encode_add_trusted_root(&fabric.rcac_tlv)),
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    if resp.status != 0 {
+        return Err(CommissionError::CommandStatus {
+            step: "add-trusted-root",
+            code: resp.status,
+        });
+    }
+    let resp = pase
+        .invoke_for_data(
+            0,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ADD_NOC,
+            Some(&encode_add_noc(
+                &noc_tlv,
+                &fabric.ipk_epoch,
+                fabric.admin_node_id,
+                0xFFF1,
+            )),
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    let (noc_status, fabric_index) = decode_noc_response(fields_of("add-noc", &resp)?)?;
+    if noc_status != 0 {
+        return Err(CommissionError::Noc(noc_status));
+    }
+
+    // 8. 新 fabric で CASE（同一アドレスへ直接。AddNOC 直後は fabric 起動待
+    //    ちが必要なことがあるためリトライ、全体 ~30s / failsafe 120s 内）。
+    let creds = fabric.admin_credentials()?;
+    let mut session = None;
+    let mut last = None;
+    for _ in 0..6 {
+        match case::establish(
+            Arc::clone(&transport),
+            peer,
+            &creds,
+            params.device_node_id,
+            &cfg,
+        )
+        .await
+        {
+            Ok(s) => {
+                session = Some(s);
+                break;
+            }
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+    let mut session =
+        session.ok_or_else(|| CommissionError::Case(last.expect("at least one try")))?;
+
+    // 9. CommissioningComplete（CASE 上で）。
+    let resp = session
+        .invoke_for_data(
+            0,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_COMMISSIONING_COMPLETE,
+            None,
+            None,
+            &cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    check_commissioning_response("commissioning-complete", &resp)?;
+
+    Ok(CommissionedDevice {
+        node_id: params.device_node_id,
         fabric_index,
-    ))
+        session,
+    })
+}
+
+// --- open-window（Task 10） ---
+
+/// spec §5.1.3.1 の「trivial/attack-prone」として禁止される setup passcode
+/// の一覧。native window open では毎回ランダムに引き直して避ける。
+pub const INVALID_PASSCODES: [u32; 12] = [
+    0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888, 99999999,
+    12345678, 87654321,
+];
+
+/// `1..=99_999_998` の範囲かつ [`INVALID_PASSCODES`] に含まれない passcode
+/// を引き直しながら返す。
+fn random_valid_passcode() -> u32 {
+    loop {
+        let mut b = [0u8; 4];
+        getrandom::getrandom(&mut b).expect("os rng");
+        let candidate = u32::from_le_bytes(b) % 99_999_998 + 1; // 1..=99_999_998
+        if !INVALID_PASSCODES.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+/// [`open_commissioning_window`] が生成した一時 window の設定コード一式。
+pub struct OpenedWindow {
+    pub passcode: u32,
+    /// 12-bit discriminator。
+    pub discriminator: u16,
+    pub manual_code: String,
+    pub qr_payload: String,
+    pub window_timeout_s: u16,
+}
+
+/// Enhanced Commissioning Method（spec §5.5）で一時的な commissioning
+/// window を開く。既存の operational CASE セッション上で
+/// `AdministratorCommissioning::OpenCommissioningWindow` を送る——PASE は使
+/// わない（対象デバイスは既にこの fabric にコミッショニング済み）。
+pub async fn open_commissioning_window(
+    session: &mut SecureSession,
+    timeout_s: u16,
+    cfg: &MrpConfig,
+) -> Result<OpenedWindow, CommissionError> {
+    let passcode = random_valid_passcode();
+    let mut disc_b = [0u8; 2];
+    getrandom::getrandom(&mut disc_b).expect("os rng");
+    let discriminator = u16::from_le_bytes(disc_b) & 0x0FFF;
+    let mut salt = [0u8; 32];
+    getrandom::getrandom(&mut salt).expect("os rng");
+    let iterations = 1000u32; // spec §3.9: PBKDF_MINIMUM=1000
+    let verifier = crate::spake2p::compute_verifier(passcode, &salt, iterations);
+    // OpenCommissioningWindow は timed invoke 必須（spec §11.19.8.1）。
+    let resp = session
+        .invoke_for_data(
+            0,
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            Some(&encode_open_commissioning_window(
+                timeout_s,
+                &verifier,
+                discriminator,
+                iterations,
+                &salt,
+            )),
+            Some(10_000),
+            cfg,
+        )
+        .await
+        .map_err(CommissionError::Session)?;
+    if resp.status != 0 {
+        return Err(CommissionError::CommandStatus {
+            step: "open-window",
+            code: resp.status,
+        });
+    }
+    Ok(OpenedWindow {
+        passcode,
+        discriminator,
+        manual_code: build_manual_code(passcode, discriminator),
+        qr_payload: build_window_qr(passcode, discriminator),
+        window_timeout_s: timeout_s,
+    })
+}
+
+fn build_manual_code(passcode: u32, discriminator12: u16) -> String {
+    crate::setup_code::encode_manual_code(passcode, (discriminator12 >> 8) as u8)
+}
+
+fn build_window_qr(passcode: u32, discriminator12: u16) -> String {
+    crate::setup_code::encode_qr(&crate::setup_code::SetupPayload {
+        version: 0,
+        vendor_id: 0, // ECM window の QR は VID/PID 不定で良い
+        product_id: 0,
+        custom_flow: 0,
+        discovery_capabilities: 0x04, // on-network
+        discriminator: discriminator12,
+        passcode,
+    })
 }
 
 // --- 使い捨て第二 fabric ---
@@ -737,5 +1154,34 @@ mod tests {
             Value::Uint(1000)
         ));
         assert!(matches!(r.next().unwrap().unwrap().value, Value::Bytes(b) if b.len() == 32));
+    }
+
+    // --- Task 10: open-window の純関数部分（フロー全体は Task 11 のライブ
+    // E2E が検証する — ここでは PASE/CASE を伴わない部分だけを unit test する）。
+
+    #[test]
+    fn random_passcode_is_valid() {
+        for _ in 0..64 {
+            let p = random_valid_passcode();
+            assert!((1..=99_999_998).contains(&p));
+            assert!(!INVALID_PASSCODES.contains(&p));
+        }
+    }
+
+    #[test]
+    fn opened_window_setup_codes_are_consistent() {
+        let w = OpenedWindow {
+            passcode: 20202021,
+            discriminator: 3840,
+            manual_code: build_manual_code(20202021, 3840),
+            qr_payload: build_window_qr(20202021, 3840),
+            window_timeout_s: 180,
+        };
+        let m = crate::setup_code::parse_manual_code(&w.manual_code).unwrap();
+        assert_eq!(m.passcode, 20202021);
+        assert_eq!(u16::from(m.short_discriminator), 3840 >> 8);
+        let q = crate::setup_code::parse_qr(&w.qr_payload).unwrap();
+        assert_eq!(q.passcode, 20202021);
+        assert_eq!(q.discriminator, 3840);
     }
 }
