@@ -448,6 +448,22 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   `sin6_scope_id` だけでは egress iface を選べず、VPN（tailscale0）の広い v6
   経路が multicast の経路解決を勝って LAN に出ていない」ことを特定 —
   `GroupSender::new` で `IPV6_MULTICAST_IF` を明示設定して解決（回帰テスト付き）。
+- M6a 完了(2026-07-13): native commissioning（on-network PASE、attestation は
+  DAC/PAI/PAA チェーン検証 厳格 + CD signer 検証は warn のみ、RCAC/NOC の
+  自己生成による使い捨て第二 fabric、既存 operational セッション上での
+  native OpenCommissioningWindow、`_matterc` browse による discriminator
+  探索）を `mat-controller` に実装。ライブラリ + E2E のみで、本番の
+  `mat commission` / `matd` は無変更（chip-tool 一発コミッショニングのまま）。
+  設計は `docs/superpowers/specs/2026-07-13-phase5-m6a-commissioning-design.md`。
+  ローカル E2E 合格（`task e2e:m6`、all-clusters-app 相手、5 手順: 誤
+  passcode 拒否 / native commission+制御 / native open-window / 第二 admin
+  commission / RemoveFabric 撤収で最初の fabric が生存）。実機 E2E ハーネス
+  （`task e2e:m6:real` — 本番 fabric の Nanoleaf へ相乗り open-window→
+  使い捨て第二 fabric へ native commission→onoff 制御→RemoveFabric 撤収→
+  本番 fabric 無傷確認、本物 DAC の厳格 attestation を通す）は実装済みで
+  コンパイル確認済みだが、ユーザー立ち会いでの実機実行はまだ行っていない
+  （次セッションで実施）。M6b（BTP/BLE コミッショニング + Thread operational
+  dataset 配布）は未着手 — chip-tool 廃止はその後。
 
 ---
 

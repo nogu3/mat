@@ -127,6 +127,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m6.sh
 
+  e2e:m6:real:
+    desc: "M6a 実機 E2E（本番 fabric へ相乗り open-window→使い捨て第二fabricへnative commission→RemoveFabric撤収。要 MAT_E2E_HOST/NODE_ID）"
+    cmds:
+      - bash scripts/e2e-m6-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
