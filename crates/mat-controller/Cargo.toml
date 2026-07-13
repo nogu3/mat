@@ -35,3 +35,7 @@ tokio = { version = "1", features = ["test-util"] }
 [[example]]
 name = "ble-scan"
 required-features = ["ble"]
+
+[[test]]
+name = "live_commission_ble"
+required-features = ["ble"]

@@ -462,8 +462,24 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   使い捨て第二 fabric へ native commission→onoff 制御→RemoveFabric 撤収→
   本番 fabric 無傷確認、本物 DAC の厳格 attestation を通す）は実装済みで
   コンパイル確認済みだが、ユーザー立ち会いでの実機実行はまだ行っていない
-  （次セッションで実施）。M6b（BTP/BLE コミッショニング + Thread operational
-  dataset 配布）は未着手 — chip-tool 廃止はその後。
+  （次セッションで実施）。
+- M6b 実装済み(2026-07-13): BTP/BLE native commissioning（bluer 経由、GATT
+  ペリフェラル接続 + BTP ハンドシェイクの上に PASE を通す。libdbus にリンクする
+  bluer は feature `ble` で隔離 — 本番 `mat`/`matd` の musl クロスビルドは
+  この feature を使わず、chip-tool 廃止後も本番バイナリは BLE 依存を持たない）
+  + Thread operational dataset 配布（`NetworkCommissioning` cluster への
+  `AddOrUpdateThreadNetwork` + `ConnectNetwork` で書き込み、以後は operational
+  mDNS 経由で追跡）を追加。BTP 上では MRP は無効（GATT notify 自体が信頼性を
+  担保するため、BLE 区間は unreliable-send の単純往復）。本番経路は無変更
+  （`mat commission` / `matd` は引き続き chip-tool 一発コミッショニング）。
+  テストはモック `GattLink` を使った統合テスト（`tests/btp_pase_plumbing.rs` —
+  実際に PASE の最初のメッセージまで通す、feature 不要）+ 実機ハーネス
+  （`crates/mat-controller/tests/live_commission_ble.rs`, feature `ble` 必須、
+  `task e2e:m6b:real` — 工場リセットした玄関ライトを対象に BLE+Thread native
+  commission→使い捨て fabric で onoff 制御→native open-window→別端末で本番
+  `mat commission` 実行→使い捨て fabric を RemoveFabric 撤収、という spec の
+  実機受け入れ手順そのまま。jarvis 上で実行する前提、BLE は WSL では動かない）。
+  実機 E2E はこのタスクでは未実施 — 別途実施後、結果をここに追記して最終化する。
 
 ---
 

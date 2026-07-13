@@ -132,6 +132,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m6-real.sh
 
+  e2e:m6b:real:
+    desc: "M6b 実機 E2E（jarvis 上で実行。工場リセット済みデバイスを BLE+Thread で native commission→open-window→本番復帰→RemoveFabric。要 MAT_E2E_BLE_* / THREAD_DATASET / IFACE / PAA_DIR）"
+    cmds:
+      - bash scripts/e2e-m6b-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
