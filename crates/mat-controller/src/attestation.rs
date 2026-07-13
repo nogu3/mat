@@ -134,6 +134,38 @@ pub fn verify_device_attestation(
     pai.verify_signed_by(&paa)
         .map_err(|_| AttestationError::Chain("pai signature"))?;
 
+    // --- チェーン（厳格）: DAC↔PAI の Matter VID/PID 整合（spec §6.2.2.2）---
+    match (dac.vid, pai.vid) {
+        (Some(dac_vid), Some(pai_vid)) if dac_vid == pai_vid => {}
+        _ => return Err(AttestationError::Chain("dac/pai vid mismatch")),
+    }
+    // PAI の PID は省略可（spec 上 optional）。あれば DAC と一致必須。
+    if let Some(pai_pid) = pai.pid {
+        if dac.pid != Some(pai_pid) {
+            return Err(AttestationError::Chain("dac/pai pid mismatch"));
+        }
+    }
+
+    // --- チェーン（厳格）: basicConstraints cA（spec §6.2.2.1）---
+    // PAI/PAA は CA 証明書（cA=true）でなければならない。DAC は CA
+    // 証明書であってはならない（cA=false または拡張なしのみ許容）。
+    if pai.is_ca != Some(true) {
+        return Err(AttestationError::Chain("pai is not a ca certificate"));
+    }
+    if paa.is_ca != Some(true) {
+        return Err(AttestationError::Chain("paa is not a ca certificate"));
+    }
+    if dac.is_ca == Some(true) {
+        return Err(AttestationError::Chain("dac must not be a ca certificate"));
+    }
+
+    // --- 有効期間（warn のみ）: 時計ずれ・特殊 notAfter 運用で
+    // commissioning を壊さないための意図的仕様（brief #4、M6a spec 決定 3 の
+    // 哲学を踏襲）。
+    warn_if_out_of_validity("dac", &dac);
+    warn_if_out_of_validity("pai", &pai);
+    warn_if_out_of_validity("paa", &paa);
+
     // --- attestation 署名（厳格）: DAC 秘密鍵が elements‖challenge に署名したか ---
     let mut msg = Vec::with_capacity(elements.len() + attestation_challenge.len());
     msg.extend_from_slice(elements);
@@ -151,6 +183,122 @@ pub fn verify_device_attestation(
     verify_cd_warn(&cd_bytes, &dac, cd_signer_ders);
 
     Ok(())
+}
+
+/// notAfter がこの値（GeneralizedTime）なら「無期限」（spec の運用上の
+/// 慣例）— warn しない。
+const NO_EXPIRY_NOT_AFTER: &str = "99991231235959Z";
+
+/// `label` 証明書（`"dac"`/`"pai"`/`"paa"`）の Validity が現在時刻を含んで
+/// いるか確認し、外れていれば/解釈できなければ `tracing::warn!` して継続する
+/// （brief #4: 有効期間は厳格失敗にしない）。
+fn warn_if_out_of_validity(label: &'static str, cert: &X509Cert) {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return; // システム時計がエポック以前 — 比較不能、何もしない
+    };
+    let now = now.as_secs() as i64;
+
+    match cert.not_before.as_deref().map(parse_cert_time) {
+        Some(Some((y, mo, d, h, mi, s))) => {
+            let nb = epoch_seconds(y, mo, d, h, mi, s);
+            if now < nb {
+                tracing::warn!(
+                    cert = label,
+                    not_before = cert.not_before.as_deref(),
+                    "certificate not yet valid — continuing"
+                );
+            }
+        }
+        _ => {
+            tracing::warn!(
+                cert = label,
+                raw = ?cert.not_before,
+                "certificate notBefore unparseable — continuing"
+            );
+        }
+    }
+
+    match cert.not_after.as_deref() {
+        Some(NO_EXPIRY_NOT_AFTER) => {} // 無期限 — 警告しない
+        Some(raw) => match parse_cert_time(raw) {
+            Some((y, mo, d, h, mi, s)) => {
+                let na = epoch_seconds(y, mo, d, h, mi, s);
+                if now > na {
+                    tracing::warn!(
+                        cert = label,
+                        not_after = raw,
+                        "certificate expired — continuing"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    cert = label,
+                    raw,
+                    "certificate notAfter unparseable — continuing"
+                );
+            }
+        },
+        None => {
+            tracing::warn!(
+                cert = label,
+                "certificate notAfter unparseable — continuing"
+            );
+        }
+    }
+}
+
+/// 証明書 Time の生文字列（UTCTime `YYMMDDHHMMSSZ` / GeneralizedTime
+/// `YYYYMMDDHHMMSSZ`）を `(year, month, day, hour, min, sec)` に分解する。
+/// どちらの形式でもなければ `None`（呼び出し側で「解釈不能」として扱う）。
+/// UTCTime の年は `YY < 50 → 20YY`、それ以外 `→ 19YY`（X.509 の慣例）。
+fn parse_cert_time(raw: &str) -> Option<(i32, u32, u32, u32, u32, u32)> {
+    let digits = raw.strip_suffix('Z')?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (year, rest) = if digits.len() == 12 {
+        // UTCTime: YYMMDDHHMMSS
+        let yy: i32 = digits[0..2].parse().ok()?;
+        let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
+        (year, &digits[2..])
+    } else if digits.len() == 14 {
+        // GeneralizedTime: YYYYMMDDHHMMSS
+        (digits[0..4].parse().ok()?, &digits[4..])
+    } else {
+        return None;
+    };
+    let mon: u32 = rest[0..2].parse().ok()?;
+    let day: u32 = rest[2..4].parse().ok()?;
+    let hour: u32 = rest[4..6].parse().ok()?;
+    let min: u32 = rest[6..8].parse().ok()?;
+    let sec: u32 = rest[8..10].parse().ok()?;
+    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    Some((year, mon, day, hour, min, sec))
+}
+
+/// `(year, month, day, hour, min, sec)` をエポック秒に変換する。
+/// 日数計算は Howard Hinnant の `days_from_civil`（proleptic Gregorian 暦、
+/// 1970-01-01 を 0 とする）— chrono 等の外部 crate を使わずに済ませるため
+/// ここだけ自前で持つ。
+fn epoch_seconds(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(min) * 60
+        + i64::from(sec)
+}
+
+/// Howard Hinnant `days_from_civil`。<http://howardhinnant.github.io/date_algorithms.html>
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = i64::from(if m <= 2 { y - 1 } else { y });
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (i64::from(m) + 9) % 12; // [0, 11]: 3月=0 ... 2月=11
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 /// `AttestationElements ::= TLV struct { 1: certification_declaration OCTET
@@ -588,5 +736,136 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AttestationError::Signature));
+    }
+
+    // --- Task 4.5: VID/PID 整合・cA・有効期間 ---
+
+    #[test]
+    fn rejects_dac_pai_vid_mismatch() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        // PAI は VID 0xFFF2、DAC は VID 0xFFF1 — 不一致。
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF2, 0x8001)),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AttestationError::Chain(_)));
+    }
+
+    #[test]
+    fn rejects_pai_without_ca_flag() {
+        let paa_key = random_p256_secret();
+        let fake_pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        // "PAI" 位置に is_ca=false（basicConstraints 拡張なし = cA は
+        // None、Some(true) ではない）の証明書を置く — DAC の位置にあるべき
+        // 種類の証明書を PAI として渡すのと同義（brief: 「DAC を PAI の
+        // 位置に渡す」ことで cA=false 拒否を確認）。
+        let fake_pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &fake_pai_key,
+            &paa_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &fake_pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &fake_pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AttestationError::Chain(_)));
+    }
+
+    #[test]
+    fn epoch_seconds_matches_known_utc_values() {
+        // openssl x509 -text で確認した Root01 fixture の Validity
+        // （x509.rs の sdk_fixtures_expose_is_ca_and_validity テスト）を
+        // 独立に検算した既知値（date -u -d ... +%s 相当）。
+        assert_eq!(epoch_seconds(2020, 10, 15, 14, 23, 43), 1_602_771_823);
+        assert_eq!(epoch_seconds(2040, 10, 15, 14, 23, 42), 2_233_923_822);
+        assert_eq!(epoch_seconds(1970, 1, 1, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn parse_cert_time_handles_utc_and_generalized() {
+        assert_eq!(
+            parse_cert_time("201015142343Z"),
+            Some((2020, 10, 15, 14, 23, 43))
+        );
+        assert_eq!(
+            parse_cert_time("20201015142343Z"),
+            Some((2020, 10, 15, 14, 23, 43))
+        );
+        // UTCTime の慣例: YY < 50 -> 20YY、それ以外 -> 19YY。
+        assert_eq!(
+            parse_cert_time("990101000000Z"),
+            Some((1999, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_cert_time(NO_EXPIRY_NOT_AFTER),
+            Some((9999, 12, 31, 23, 59, 59))
+        );
+    }
+
+    #[test]
+    fn parse_cert_time_rejects_garbage() {
+        assert_eq!(parse_cert_time("not-a-time"), None);
+        assert_eq!(parse_cert_time("2020101514234"), None); // Z 無し
+        assert_eq!(parse_cert_time("209915142343Z"), None); // 月 99
     }
 }

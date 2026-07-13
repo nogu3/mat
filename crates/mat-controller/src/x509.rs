@@ -71,6 +71,16 @@ pub struct X509Cert {
     pub vid: Option<u16>,
     /// Matter PID（Matter PID OID の RDN、無ければ CN 中の `Mpid:XXXX` から）。
     pub pid: Option<u16>,
+    /// BasicConstraints 拡張の cA（OID 2.5.29.19）。拡張自体が無ければ
+    /// `None`（DEFAULT FALSE だが「省略」と「明示 FALSE」を区別できるよう
+    /// 残す）。拡張はあるが cA が省略されていれば `Some(false)`。
+    pub is_ca: Option<bool>,
+    /// Validity.notBefore の生文字列（UTCTime `YYMMDDHHMMSSZ` /
+    /// GeneralizedTime `YYYYMMDDHHMMSSZ`）。解釈できない Time 形式は
+    /// `None`（呼び出し側 attestation.rs で「解釈不能 = warn」として扱う）。
+    pub not_before: Option<String>,
+    /// Validity.notAfter の生文字列。意味は `not_before` と同じ。
+    pub not_after: Option<String>,
 }
 
 impl X509Cert {
@@ -195,7 +205,8 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
     }
     let issuer = issuer_raw.to_vec();
 
-    t.expect(0x30)?; // validity — 使わない
+    let validity_content = t.expect(0x30)?;
+    let (not_before, not_after) = parse_validity(validity_content)?;
 
     let (subject_tag, subject_content, subject_raw) = t.read()?;
     if subject_tag != 0x30 {
@@ -208,6 +219,7 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
 
     let mut skid = None;
     let mut akid = None;
+    let mut is_ca = None;
     if t.peek_tag() == Some(0xA3) {
         let ext_wrap = t.expect(0xA3)?;
         let mut ew = DerReader::new(ext_wrap);
@@ -231,8 +243,10 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
                 if sr.peek_tag() == Some(0x80) {
                     akid = Some(sr.expect(0x80)?.to_vec());
                 }
+            } else if oid_bytes == OID_BASIC_CONSTRAINTS {
+                is_ca = Some(parse_basic_constraints(value)?);
             }
-            // 他の拡張（BasicConstraints 等）は読み捨てる。
+            // 他の拡張（KeyUsage 等）は読み捨てる。
         }
     }
 
@@ -248,7 +262,48 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
         akid,
         vid,
         pid,
+        is_ca,
+        not_before,
+        not_after,
     })
+}
+
+/// BasicConstraints 拡張値（OCTET STRING の中身）から `cA`
+/// （`SEQ { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }`）
+/// を取り出す。空 SEQUENCE（cA 省略）は DEFAULT どおり `false`。
+fn parse_basic_constraints(value: &[u8]) -> Result<bool, X509Error> {
+    let mut vr = DerReader::new(value);
+    let seq_content = vr.expect(0x30)?;
+    let mut sr = DerReader::new(seq_content);
+    if sr.is_empty() {
+        return Ok(false);
+    }
+    if sr.peek_tag() != Some(0x01) {
+        // cA を省略して pathLenConstraint だけを先に置くことは規格上ない
+        // が、堅牢性のため BOOLEAN が先頭に無ければ DEFAULT FALSE とみなす。
+        return Ok(false);
+    }
+    let b = sr.expect(0x01)?;
+    Ok(b.first().copied().unwrap_or(0) != 0)
+}
+
+/// `Validity ::= SEQ { notBefore Time, notAfter Time }` から 2 つの Time の
+/// 生文字列を取り出す。`Time` は UTCTime(0x17)/GeneralizedTime(0x18) の
+/// CHOICE — それ以外のタグ、または非 ASCII 内容は「解釈不能」として
+/// `None`（構造自体が壊れている＝ truncated 等は `Err` のまま伝播する）。
+fn parse_validity(content: &[u8]) -> Result<(Option<String>, Option<String>), X509Error> {
+    let mut r = DerReader::new(content);
+    let not_before = parse_time_value(&mut r)?;
+    let not_after = parse_time_value(&mut r)?;
+    Ok((not_before, not_after))
+}
+
+fn parse_time_value(r: &mut DerReader) -> Result<Option<String>, X509Error> {
+    let (tag, content, _) = r.read()?;
+    if tag != 0x17 && tag != 0x18 {
+        return Ok(None);
+    }
+    Ok(std::str::from_utf8(content).ok().map(str::to_string))
 }
 
 /// `CertificationRequest ::= SEQ { certificationRequestInfo SEQ, sigAlg SEQ, signature BIT STRING }`
@@ -637,5 +692,44 @@ mod tests {
     #[test]
     fn rejects_truncated_der() {
         assert!(parse_x509(&[0x30, 0x05, 0x01]).is_err());
+    }
+
+    // --- Task 4.5: basicConstraints(cA) / Validity ---
+
+    const ROOT01_DER: &[u8] = include_bytes!("../tests/fixtures/root01_der.bin");
+    const ICA01_DER: &[u8] = include_bytes!("../tests/fixtures/ica01_der.bin");
+    const NODE01_01_DER: &[u8] = include_bytes!("../tests/fixtures/node01_01_der.bin");
+
+    #[test]
+    fn sdk_fixtures_expose_is_ca_and_validity() {
+        // connectedhomeip CHIPCert_test_vectors.cpp（README.md 参照）の
+        // Root01/ICA01/Node01_01 は実際の X.509 DER で cA/Validity を
+        // openssl x509 -text で確認済み: Root01/ICA01 は CA:TRUE、
+        // Node01_01 は CA:FALSE、Validity は 3 通とも
+        // 2020-10-15T14:23:43Z 〜 2040-10-15T14:23:42Z（UTCTime）。
+        let root = parse_x509(ROOT01_DER).unwrap();
+        assert_eq!(root.is_ca, Some(true));
+        assert_eq!(root.not_before.as_deref(), Some("201015142343Z"));
+        assert_eq!(root.not_after.as_deref(), Some("401015142342Z"));
+
+        let ica = parse_x509(ICA01_DER).unwrap();
+        assert_eq!(ica.is_ca, Some(true));
+        assert_eq!(ica.not_before.as_deref(), Some("201015142343Z"));
+        assert_eq!(ica.not_after.as_deref(), Some("401015142342Z"));
+
+        let node = parse_x509(NODE01_01_DER).unwrap();
+        assert_eq!(node.is_ca, Some(false));
+        assert_eq!(node.not_before.as_deref(), Some("201015142343Z"));
+        assert_eq!(node.not_after.as_deref(), Some("401015142342Z"));
+    }
+
+    #[test]
+    fn is_ca_is_none_when_extension_absent() {
+        // test_support::make_test_cert(is_ca=false) は basicConstraints
+        // 拡張自体を付けない（現実の DAC と同じ — 省略可、必須ではない）。
+        let key = random_p256_secret();
+        let der = make_test_cert(b"leaf", b"leaf", &key, &key, false, None);
+        let cert = parse_x509(&der).unwrap();
+        assert_eq!(cert.is_ca, None);
     }
 }
