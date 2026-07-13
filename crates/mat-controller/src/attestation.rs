@@ -755,12 +755,20 @@ mod tests {
             true,
             Some((0xFFF2, 0x8001)),
         );
-        let dac = make_test_cert(
+        // DAC の issuer Name は PAI の subject（CN "pai" + VID 0xFFF2/PID
+        // 0x8001）にバイト一致させ、VID 照合より手前の issuer/subject 照合
+        // では落ちないようにする（make_test_cert のヒューリスティックだと
+        // issuer に DAC 側の vid_pid=0xFFF1 が入り「dac issuer != pai
+        // subject」で先に落ちて検証対象の分岐に届かない）。subject の VID は
+        // 0xFFF1 のまま — これが PAI の 0xFFF2 と食い違うのが本テストの
+        // 検証対象。
+        let dac = make_test_cert_ext(
             b"dac",
             b"pai",
             &dac_key,
             &pai_key,
             false,
+            Some((0xFFF2, 0x8001)),
             Some((0xFFF1, 0x8001)),
         );
         let nonce = [5u8; 32];
@@ -781,7 +789,10 @@ mod tests {
             &challenge,
         )
         .unwrap_err();
-        assert!(matches!(err, AttestationError::Chain(_)));
+        assert!(matches!(
+            err,
+            AttestationError::Chain("dac/pai vid mismatch")
+        ));
     }
 
     #[test]
