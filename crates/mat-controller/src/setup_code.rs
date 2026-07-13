@@ -144,7 +144,31 @@ fn decode_base38_chunk(chars: &[u8]) -> Result<u64, SetupCodeError> {
 /// フィールド順: version(3) / vendor_id(16) / product_id(16) /
 /// custom_flow(2) / discovery_capabilities(8) / discriminator(12) /
 /// passcode(27) / padding(4)。
+///
+/// Panics if version > 0x7, custom_flow > 0x3, discriminator > 0x0FFF, or
+/// passcode > 0x07FF_FFFF — caller/programmer errors indicating out-of-domain inputs.
 fn pack_payload(p: &SetupPayload) -> [u8; PAYLOAD_BYTES] {
+    assert!(
+        u32::from(p.version) <= 0x7,
+        "version must fit in 3 bits (≤ 0x7), got 0x{:X}",
+        p.version
+    );
+    assert!(
+        u32::from(p.custom_flow) <= 0x3,
+        "custom_flow must fit in 2 bits (≤ 0x3), got 0x{:X}",
+        p.custom_flow
+    );
+    assert!(
+        u32::from(p.discriminator) <= 0x0FFF,
+        "discriminator must fit in 12 bits (≤ 0x0FFF), got 0x{:X}",
+        p.discriminator
+    );
+    assert!(
+        p.passcode <= 0x07FF_FFFF,
+        "passcode must fit in 27 bits (≤ 0x07FF_FFFF), got 0x{:X}",
+        p.passcode
+    );
+
     let mut acc: u128 = 0;
     let mut offset = 0u32;
     let mut push = |value: u32, bits: u32| {
@@ -315,10 +339,23 @@ pub fn parse_manual_code(s: &str) -> Result<ManualCode, SetupCodeError> {
 
 /// `ManualCode` を 11 桁の manual pairing code 文字列に encode する
 /// （VID/PID は付与しない）。
+///
+/// Panics if passcode > 99_999_998 (Matter's valid passcode upper limit) or
+/// short_discriminator > 0xF — caller/programmer errors indicating out-of-domain inputs.
 pub fn encode_manual_code(passcode: u32, short_discriminator: u8) -> String {
-    let short_disc = short_discriminator & 0xF;
-    let digit1 = u32::from(short_disc >> 2); // vid_pid_present = 0
-    let digits2_6 = (u32::from(short_disc & 0x3) << 14) | (passcode & 0x3FFF);
+    assert!(
+        passcode <= 99_999_998,
+        "passcode must be ≤ 99,999,998 (Matter limit), got {}",
+        passcode
+    );
+    assert!(
+        u32::from(short_discriminator) <= 0xF,
+        "short_discriminator must fit in 4 bits (≤ 0xF), got 0x{:X}",
+        short_discriminator
+    );
+
+    let digit1 = u32::from(short_discriminator >> 2); // vid_pid_present = 0
+    let digits2_6 = (u32::from(short_discriminator & 0x3) << 14) | (passcode & 0x3FFF);
     let digits7_10 = passcode >> 14;
 
     let body = format!("{digit1}{digits2_6:05}{digits7_10:04}");
@@ -381,5 +418,19 @@ mod tests {
             parse_qr("-24J0AFN00KA0648G00"),
             Err(SetupCodeError::BadPrefix)
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "discriminator must fit in 12 bits")]
+    fn encode_qr_panics_on_oversize_discriminator() {
+        let mut p = parse_qr(QR).unwrap();
+        p.discriminator = 0x1000; // 13 bits, out of range
+        let _ = encode_qr(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "passcode must be ≤ 99,999,998")]
+    fn encode_manual_code_panics_on_oversize_passcode() {
+        let _ = encode_manual_code(1u32 << 27, 15);
     }
 }
