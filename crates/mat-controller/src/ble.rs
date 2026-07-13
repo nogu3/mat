@@ -43,18 +43,6 @@ pub fn parse_matter_service_data(sd: &[u8]) -> Option<MatterAdvert> {
     })
 }
 
-/// discriminator 一致の commissionable デバイス。addr はレイヤ内部
-/// （bluer::Device）から取れるため、呼び出し元へ返す値としては
-/// MatterAdvert のフィールドで足りる。ここでは brief のインターフェース
-/// 仕様どおり addr 付きの型も用意する。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Commissionable {
-    pub discriminator: u16,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub addr: bluer::Address,
-}
-
 fn gatt(step: &'static str) -> impl FnOnce(bluer::Error) -> BtpError {
     move |e| BtpError::Gatt(format!("{step}: {e}"))
 }
