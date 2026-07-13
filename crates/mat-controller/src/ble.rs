@@ -103,7 +103,9 @@ pub async fn find_commissionable(
     }
 }
 
-/// 接続済み GATT リンク。drop または `disconnect()` で切断。
+/// 接続済み GATT リンク。**必ず明示的に `disconnect()` を呼ぶこと** —
+/// 素の drop は転送タスクのハンドルを手放すだけで、GATT 接続は残る
+/// （tokio の JoinHandle drop はタスクを abort しない）。
 pub struct BleConnection {
     device: bluer::Device,
     writer: tokio::task::JoinHandle<()>,
