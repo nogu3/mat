@@ -355,16 +355,18 @@ pub async fn establish(
         // 確認不一致（passcode 違い）を黙って諦めると、responder は Pake3 待ちの
         // まま PASE セッション確立スロットを保持し続け、直後の再試行が PBKDF
         // param request すら処理されずに固まる（実機 E2E で発見）。StatusReport
-        // で明示的に中断を通知して responder 側のスロットを解放させる — 相手
-        // からの応答は待たない（こちらは既に失敗を返す途中なので、送達の
-        // ベストエフォートで十分。send_reliable 自体の失敗は無視する）。
+        // で明示的に中断を通知して responder 側のスロットを解放させる。ここは
+        // 呼び出し側に既に ConfirmMismatch を返す途中なので、`send_reliable` の
+        // MRP 再送ループ（最悪 ~4.7s）で呼び出しをブロックしたくない —
+        // `send_once` で一度だけ送って ack は待たない（R フラグは立てるので
+        // 相手の MRP は通常どおり ack/再送要求できる）。送達に失敗しても無視する。
         let sr = encode_status_report(
             GENERAL_CODE_FAILURE,
             u32::from(PROTOCOL_ID_SECURE_CHANNEL),
             SC_PROTOCOL_CODE_INVALID_PARAMETER,
         );
         let _ = ex
-            .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_STATUS_REPORT, &sr, cfg)
+            .send_once(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_STATUS_REPORT, &sr)
             .await;
         return Err(PaseError::ConfirmMismatch);
     }
@@ -486,5 +488,182 @@ mod tests {
         let (p_b, c_b) = decode_pake2(&w.finish()).unwrap();
         assert_eq!(p_b, [9u8; 65]);
         assert_eq!(c_b, [10u8; 32]);
+    }
+
+    /// Drives `establish` against a fake device over loopback UDP up through
+    /// Pake2 with a deliberately wrong `cB`, so the initiator takes the
+    /// `ConfirmMismatch` branch. Asserts the fake device then receives the
+    /// abort StatusReport (FAILURE / SecureChannel / kInvalidParameter) on
+    /// the same exchange, and that `establish` returns `ConfirmMismatch`.
+    ///
+    /// The fake device doesn't need real SPAKE2+ verifier math: since the
+    /// test wants a *mismatch*, any valid P-256 point works for `pB` (it
+    /// only needs to pass `Spake2pProver::finish`'s point-validity check)
+    /// and `cB` can just be garbage bytes.
+    #[tokio::test]
+    async fn confirm_mismatch_sends_abort_status_report() {
+        use crate::message::{Destination, MessageHeader, ProtocolHeader};
+        use crate::transport::{UdpTransport, MAX_DATAGRAM};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        fn fast_cfg() -> MrpConfig {
+            MrpConfig {
+                initial_interval: Duration::from_millis(50),
+                max_retries: 2,
+                backoff: 1.0,
+            }
+        }
+
+        /// A syntactically valid (on-curve, non-identity) P-256 point that is
+        /// *not* the real SPAKE2+ shareV — good enough to reach the cB check.
+        fn random_point() -> [u8; 65] {
+            loop {
+                let mut b = [0u8; 32];
+                getrandom::getrandom(&mut b).expect("os rng");
+                if let Ok(sk) = p256::SecretKey::from_slice(&b) {
+                    return sk
+                        .public_key()
+                        .to_encoded_point(false)
+                        .as_bytes()
+                        .try_into()
+                        .expect("uncompressed p256 point is 65 bytes");
+                }
+            }
+        }
+
+        fn build_unsecured(
+            counter: u32,
+            opcode: u8,
+            exchange_id: u16,
+            acked_counter: Option<u32>,
+            payload: &[u8],
+        ) -> Vec<u8> {
+            let header = MessageHeader {
+                session_id: 0,
+                security_flags: 0,
+                message_counter: counter,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: false,
+                needs_ack: false,
+                acked_counter,
+                opcode,
+                exchange_id,
+                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                vendor_id: None,
+            };
+            let mut buf = header.encoded();
+            proto.encode(&mut buf);
+            buf.extend_from_slice(payload);
+            buf
+        }
+
+        async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
+                .await
+                .expect("fake device timed out waiting for a datagram")
+                .expect("recv_from io error");
+            (buf[..n].to_vec(), from)
+        }
+
+        /// Decodes an unsecured (session id 0) datagram into its headers +
+        /// payload, or `None` if malformed.
+        fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Vec<u8>)> {
+            let (h, off) = MessageHeader::decode(buf).ok()?;
+            if h.session_id != 0 {
+                return None;
+            }
+            let (p, boff) = ProtocolHeader::decode(&buf[off..]).ok()?;
+            Some((h, p, buf[off + boff..].to_vec()))
+        }
+
+        let responder_transport = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let responder_addr = responder_transport.local_addr().unwrap();
+        let initiator_transport = Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+
+        let cfg = fast_cfg();
+        let establish_task = {
+            let transport = Arc::clone(&initiator_transport);
+            let cfg = cfg.clone();
+            tokio::spawn(async move { establish(transport, responder_addr, 20202021, &cfg).await })
+        };
+
+        // --- PBKDFParamRequest -> PBKDFParamResponse ---
+        let (req_buf, initiator_addr) = recv_dg(&responder_transport).await;
+        let (req_header, req_proto, _req_payload) =
+            decode_unsecured(&req_buf).expect("valid PBKDFParamRequest datagram");
+        assert_eq!(req_proto.opcode, OPCODE_PBKDF_PARAM_REQUEST);
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &[1u8; 32]); // initiatorRandom echo (ignored)
+        w.put_bytes(Tag::Context(2), &[2u8; 32]); // responderRandom (ignored)
+        w.put_uint(Tag::Context(3), 0xBEEF); // responderSessionId
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), 1000); // iterations
+        w.put_bytes(Tag::Context(2), b"0123456789abcdef"); // salt
+        w.end_container();
+        w.end_container();
+        let resp_dg = build_unsecured(
+            100,
+            OPCODE_PBKDF_PARAM_RESPONSE,
+            req_proto.exchange_id,
+            Some(req_header.message_counter),
+            &w.finish(),
+        );
+        responder_transport
+            .send_to(&resp_dg, initiator_addr)
+            .await
+            .unwrap();
+
+        // --- Pake1 -> Pake2 (deliberately wrong cB) ---
+        let (pake1_buf, _) = recv_dg(&responder_transport).await;
+        let (pake1_header, pake1_proto, _pake1_payload) =
+            decode_unsecured(&pake1_buf).expect("valid Pake1 datagram");
+        assert_eq!(pake1_proto.opcode, OPCODE_PASE_PAKE1);
+
+        let p_b = random_point();
+        let c_b = [0xEEu8; 32]; // deliberately wrong confirmation -> ConfirmMismatch
+        let mut w2 = Writer::new();
+        w2.start_struct(Tag::Anonymous);
+        w2.put_bytes(Tag::Context(1), &p_b);
+        w2.put_bytes(Tag::Context(2), &c_b);
+        w2.end_container();
+        let pake2_dg = build_unsecured(
+            101,
+            OPCODE_PASE_PAKE2,
+            pake1_proto.exchange_id,
+            Some(pake1_header.message_counter),
+            &w2.finish(),
+        );
+        responder_transport
+            .send_to(&pake2_dg, initiator_addr)
+            .await
+            .unwrap();
+
+        // --- Expect the abort StatusReport on the same exchange ---
+        let (abort_buf, _) = recv_dg(&responder_transport).await;
+        let (_abort_header, abort_proto, abort_payload) =
+            decode_unsecured(&abort_buf).expect("valid abort datagram");
+        assert_eq!(abort_proto.opcode, OPCODE_STATUS_REPORT);
+        assert_eq!(abort_proto.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
+        assert_eq!(abort_proto.exchange_id, pake1_proto.exchange_id);
+        let (general_code, protocol_id, protocol_code) =
+            parse_status_report(&abort_payload).expect("well-formed StatusReport");
+        assert_eq!(general_code, GENERAL_CODE_FAILURE);
+        assert_eq!(protocol_id, u32::from(PROTOCOL_ID_SECURE_CHANNEL));
+        assert_eq!(protocol_code, SC_PROTOCOL_CODE_INVALID_PARAMETER);
+
+        let result = establish_task.await.expect("establish task panicked");
+        assert!(matches!(result, Err(PaseError::ConfirmMismatch)));
     }
 }
