@@ -61,6 +61,12 @@ pub const CERT_TYPE_DAC: u8 = 1;
 /// CertificateChainRequest の CertificateType（spec §11.17.6.4）: PAI。
 pub const CERT_TYPE_PAI: u8 = 2;
 
+// --- Network Commissioning cluster (spec §11.9) ---
+
+pub const CLUSTER_NETWORK_COMMISSIONING: u32 = 0x0031;
+pub const CMD_ADD_OR_UPDATE_THREAD: u32 = 0x03; // resp NetworkConfigResponse 0x05
+pub const CMD_CONNECT_NETWORK: u32 = 0x06; // resp ConnectNetworkResponse 0x07
+
 // --- builders ---
 //
 // すべて anonymous struct + context tag の CommandFields 1 個を返す。
@@ -156,6 +162,29 @@ pub fn encode_remove_fabric(fabric_index: u8) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_uint(Tag::Context(0), u64::from(fabric_index));
+    w.end_container();
+    w.finish()
+}
+
+/// AddOrUpdateThreadNetwork（spec §11.9.7.3）: `{0: OperationalDataset, 1:
+/// Breadcrumb}`。dataset は OTBR の `dataset active -x` が返す Thread TLV
+/// 生バイト列そのまま。
+pub fn encode_add_or_update_thread_network(dataset: &[u8], breadcrumb: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(0), dataset);
+    w.put_uint(Tag::Context(1), breadcrumb);
+    w.end_container();
+    w.finish()
+}
+
+/// ConnectNetwork（spec §11.9.7.9）: `{0: NetworkID, 1: Breadcrumb}`。Thread
+/// の NetworkID は dataset 中の Extended PAN ID（8 バイト）。
+pub fn encode_connect_network(network_id: &[u8], breadcrumb: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(0), network_id);
+    w.put_uint(Tag::Context(1), breadcrumb);
     w.end_container();
     w.finish()
 }
@@ -418,6 +447,66 @@ pub fn decode_noc_response(fields: &[u8]) -> Result<(u8, Option<u8>), Commission
     )?;
     let fabric_index = take_u8(&mut map, 1, step, "fabricIndex out of range")?;
     Ok((status, fabric_index))
+}
+
+/// NetworkConfigResponse（spec §11.9.7.6）: `{0: NetworkingStatus, 1:
+/// DebugText(optional), 2: NetworkIndex(optional)}`。戻り値は
+/// `(networkingStatus, debugText)`。NetworkIndex は現状使わないので
+/// `scan_struct_fields` が拾っても読み捨てる。
+pub fn decode_network_config_response(
+    fields: &[u8],
+) -> Result<(u8, Option<String>), CommissionError> {
+    let step = "network_config_response";
+    let mut map = scan_struct_fields(fields, step)?;
+    let status = take_u8(&mut map, 0, step, "networkingStatus out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing networkingStatus",
+        },
+    )?;
+    let debug_text = take_utf8(&mut map, 1);
+    Ok((status, debug_text))
+}
+
+/// ConnectNetworkResponse（spec §11.9.7.9 応答）: `{0: NetworkingStatus, 1:
+/// DebugText(optional), 2: ErrorValue(optional, signed int32)}`。戻り値は
+/// `(networkingStatus, debugText)`。ErrorValue は `Value::Int` として
+/// `scan_struct_fields` の catch-all で読み捨てられるので tag2 の有無どち
+/// らでも decode できる。
+pub fn decode_connect_network_response(
+    fields: &[u8],
+) -> Result<(u8, Option<String>), CommissionError> {
+    let step = "connect_network_response";
+    let mut map = scan_struct_fields(fields, step)?;
+    let status = take_u8(&mut map, 0, step, "networkingStatus out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing networkingStatus",
+        },
+    )?;
+    let debug_text = take_utf8(&mut map, 1);
+    Ok((status, debug_text))
+}
+
+/// Thread operational dataset（MeshCoP TLV 列）から Extended PAN ID
+/// （type 2, len 8）を取り出す。ConnectNetwork の NetworkID に使う。純関数
+/// ——OTBR が返す生バイト列を直接舐めるので、境界外アクセスは一切せず
+/// `checked_add` で長さ計算をガードする（壊れた TLV は panic ではなく
+/// `None`）。
+pub fn thread_ext_pan_id(dataset: &[u8]) -> Option<[u8; 8]> {
+    let mut i = 0usize;
+    while i + 2 <= dataset.len() {
+        let (t, l) = (dataset[i], usize::from(dataset[i + 1]));
+        let end = i.checked_add(2)?.checked_add(l)?;
+        if end > dataset.len() {
+            return None;
+        }
+        if t == 2 && l == 8 {
+            return dataset[i + 2..end].try_into().ok();
+        }
+        i = end;
+    }
+    None
 }
 
 // --- ステップマシン（Task 10） ---
@@ -975,6 +1064,17 @@ pub enum CommissionError {
     Fabric(crate::fabric::FabricError),
     Case(crate::case::CaseError),
     Timeout(&'static str),
+    /// BLE / BTP 層の失敗（scan / connect / gatt / btp）。
+    Ble {
+        step: &'static str,
+        detail: String,
+    },
+    /// NetworkCommissioning 応答の NetworkingStatus が成功 (0) でない。
+    NetworkConfig {
+        step: &'static str,
+        status: u8,
+        debug_text: Option<String>,
+    },
 }
 
 impl std::fmt::Display for CommissionError {
@@ -998,6 +1098,20 @@ impl std::fmt::Display for CommissionError {
             CommissionError::Fabric(e) => write!(f, "commissioning: fabric error: {e}"),
             CommissionError::Case(e) => write!(f, "commissioning: case error: {e}"),
             CommissionError::Timeout(step) => write!(f, "commissioning: timeout ({step})"),
+            CommissionError::Ble { step, detail } => {
+                write!(f, "commissioning: ble {step}: {detail}")
+            }
+            CommissionError::NetworkConfig {
+                step,
+                status,
+                debug_text,
+            } => {
+                write!(f, "commissioning: {step} NetworkingStatus 0x{status:02X}")?;
+                if let Some(t) = debug_text {
+                    write!(f, " ({t})")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1188,5 +1302,98 @@ mod tests {
         let q = crate::setup_code::parse_qr(&w.qr_payload).unwrap();
         assert_eq!(q.passcode, 20202021);
         assert_eq!(q.discriminator, 3840);
+    }
+
+    // --- Task 4: NetworkCommissioning TLV / Thread dataset ---
+
+    #[test]
+    fn thread_dataset_ext_pan_id_extracts_type2() {
+        // MeshCoP TLV: ActiveTimestamp(14,len8) + ExtPanId(2,len8) + Channel(0,len3)
+        let mut ds = vec![0x0E, 0x08, 0, 0, 0, 0, 0, 1, 0, 0];
+        ds.extend_from_slice(&[0x02, 0x08, 0xDE, 0xAD, 0x00, 0xBE, 0xEF, 0x00, 0xCA, 0xFE]);
+        ds.extend_from_slice(&[0x00, 0x03, 0x00, 0x00, 0x0F]);
+        assert_eq!(
+            thread_ext_pan_id(&ds),
+            Some([0xDE, 0xAD, 0x00, 0xBE, 0xEF, 0x00, 0xCA, 0xFE])
+        );
+        // ExtPanId なし / 壊れた TLV は None
+        assert_eq!(thread_ext_pan_id(&ds[..10]), None);
+        assert_eq!(thread_ext_pan_id(&[0x02, 0x09, 0x00]), None);
+    }
+
+    #[test]
+    fn network_commissioning_encoders_shape() {
+        // AddOrUpdateThreadNetwork {0: dataset, 1: breadcrumb}
+        let f = encode_add_or_update_thread_network(&[0xAA, 0xBB], 3);
+        let mut r = Reader::new(&f);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        let e = r.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(0));
+        assert!(matches!(e.value, Value::Bytes(b) if b == [0xAA, 0xBB]));
+        let e = r.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(1));
+        assert!(matches!(e.value, Value::Uint(3)));
+
+        // ConnectNetwork {0: networkID, 1: breadcrumb}
+        let f2 = encode_connect_network(&[1, 2, 3, 4, 5, 6, 7, 8], 4);
+        let mut r2 = Reader::new(&f2);
+        assert!(matches!(
+            r2.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        let e = r2.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(0));
+        assert!(matches!(e.value, Value::Bytes(b) if b == [1, 2, 3, 4, 5, 6, 7, 8]));
+        let e = r2.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(1));
+        assert!(matches!(e.value, Value::Uint(4)));
+    }
+
+    #[test]
+    fn connect_network_response_decodes_status_and_text() {
+        // {0: status=0, 1: "ok", 2: errorValue} を Writer で作って decode
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 0);
+        w.put_str(Tag::Context(1), "ok");
+        w.put_int(Tag::Context(2), 0);
+        w.end_container();
+        let (status, text) = decode_connect_network_response(&w.finish()).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(text.as_deref(), Some("ok"));
+
+        // tag2 (ErrorValue) 省略でも decode できる
+        let mut w2 = Writer::new();
+        w2.start_struct(Tag::Anonymous);
+        w2.put_uint(Tag::Context(0), 1);
+        w2.end_container();
+        let (status2, text2) = decode_connect_network_response(&w2.finish()).unwrap();
+        assert_eq!(status2, 1);
+        assert_eq!(text2, None);
+    }
+
+    #[test]
+    fn network_config_response_decodes_status_and_text() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 0);
+        w.put_str(Tag::Context(1), "added");
+        w.put_uint(Tag::Context(2), 0); // NetworkIndex
+        w.end_container();
+        let (status, text) = decode_network_config_response(&w.finish()).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(text.as_deref(), Some("added"));
+
+        // tag1/tag2 省略でも decode できる
+        let mut w2 = Writer::new();
+        w2.start_struct(Tag::Anonymous);
+        w2.put_uint(Tag::Context(0), 5);
+        w2.end_container();
+        let (status2, text2) = decode_network_config_response(&w2.finish()).unwrap();
+        assert_eq!(status2, 5);
+        assert_eq!(text2, None);
     }
 }
