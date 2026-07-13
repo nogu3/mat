@@ -443,7 +443,15 @@ pub(crate) mod test_support {
         let version = asn1::context_constructed(0, &asn1::integer(&[2])); // v3
         let serial = asn1::integer(&[0x01]);
         let sig_alg = asn1::seq(&[&asn1::oid(OID_ECDSA_SHA256)]);
-        let issuer_name = build_name(issuer, None);
+        // issuer Name は「発行元 CA の実際の subject バイト列」と一致していな
+        // ければならない（X.509 のチェーン照合はバイト一致が前提 —
+        // attestation.rs Task 5 の DAC.issuer == PAI.subject 判定）。この
+        // フィクスチャの 3 階層（PAA: vid_pid なし → PAI/DAC: 同じ vid_pid）
+        // では、leaf 証明書（is_ca=false、= DAC 相当）の発行元だけが
+        // vid_pid 入りの subject を持つので、その場合だけ vid_pid を issuer
+        // Name にも埋め込む。CA 証明書（PAA/PAI 自身、is_ca=true）の発行元は
+        // 常に vid_pid なし（ルート PAA はベンダー非依存）とみなす。
+        let issuer_name = build_name(issuer, if is_ca { None } else { vid_pid });
         let validity = asn1::seq(&[
             &asn1::utc_time("260101000000Z"),
             &asn1::utc_time("300101000000Z"),
