@@ -37,6 +37,12 @@ pub fn integer(content: &[u8]) -> Vec<u8> {
     tlv(0x02, content)
 }
 
+/// Encode an OBJECT IDENTIFIER (tag 0x06). `content` is the OID's encoded
+/// arcs (no tag/length), e.g. `[0x2A, 0x86, 0x48, ...]`.
+pub fn oid(content: &[u8]) -> Vec<u8> {
+    tlv(0x06, content)
+}
+
 /// Encode a BOOLEAN (tag 0x01), value 0xFF for true, 0x00 for false.
 pub fn boolean(v: bool) -> Vec<u8> {
     tlv(0x01, &[if v { 0xFF } else { 0x00 }])
@@ -110,6 +116,7 @@ mod tests {
         assert_eq!(octet_string(&[1, 2]), vec![0x04, 0x02, 0x01, 0x02]);
         assert_eq!(utf8_string("AB"), vec![0x0C, 0x02, 0x41, 0x42]);
         assert_eq!(printable_string("A"), vec![0x13, 0x01, 0x41]);
+        assert_eq!(oid(&[0x55, 0x1D, 0x0E]), vec![0x06, 0x03, 0x55, 0x1D, 0x0E]);
         assert_eq!(
             utc_time("260101000000Z"),
             [vec![0x17, 0x0D], b"260101000000Z".to_vec()].concat()
