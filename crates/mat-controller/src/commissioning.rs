@@ -1329,14 +1329,19 @@ impl CommissioningFabric {
 
 // --- errors ---
 
-/// commissioning フロー全体のエラー。呼び出し側（CLI 層）は spec 決定 5 の
-/// 対応表でこれを `ErrorKind` / exit code にマップする:
+/// commissioning フロー全体のエラー。呼び出し側（CLI 層）は spec 決定
+/// (M6a 決定 5 + M6b 決定 4) の対応表でこれを `ErrorKind` / exit code に
+/// マップする:
 ///
 /// | variant                                             | kind               | exit |
 /// |------------------------------------------------------|--------------------|------|
 /// | `Attestation(_)` / `Pase(PaseError::ConfirmMismatch)` | `device_rejected`  | 4    |
 /// | `Discovery(_)` / `Timeout(_)`                         | `timeout`          | 3    |
 /// | `Case(_)`                                             | `session_failed`   | 6    |
+/// | `Ble { step: "scan", .. }`                            | `timeout`          | 3    |
+/// | `Ble { step: "bluez-session"\|"adapter"\|"gatt"\|    | `unreachable`      | 5    |
+/// |   "btp-handshake"\|"udp-bind", .. }`                 |                    |      |
+/// | `NetworkConfig { .. }`                                | `commission_failed`| 1    |
 /// | 上記以外すべて（`Pase` の非 ConfirmMismatch variant、  | `commission_failed`| 1    |
 /// | `Csr` / `Noc` / `CommandStatus` / `Malformed` /       |                    |      |
 /// | `Cert` / `Fabric` / `Session`）                       |                    |      |
@@ -1618,6 +1623,28 @@ mod tests {
         // ExtPanId なし / 壊れた TLV は None
         assert_eq!(thread_ext_pan_id(&ds[..10]), None);
         assert_eq!(thread_ext_pan_id(&[0x02, 0x09, 0x00]), None);
+    }
+
+    #[test]
+    fn thread_ext_pan_id_boundary_cases() {
+        // type 2 だが長さ != 8 は読み飛ばし、後続の正しい type 2 を拾う。
+        let mut ds = vec![0x02, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        ds.extend_from_slice(&[0x02, 0x08, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(thread_ext_pan_id(&ds), Some([1, 2, 3, 4, 5, 6, 7, 8]));
+        // TLV がバッファ末尾ちょうどで終わる正常形。
+        let exact = [0x00, 0x01, 0xFF, 0x02, 0x08, 8, 7, 6, 5, 4, 3, 2, 1];
+        assert_eq!(thread_ext_pan_id(&exact), Some([8, 7, 6, 5, 4, 3, 2, 1]));
+        // 長さが残りを超える壊れ TLV は None（panic しない）。
+        assert_eq!(thread_ext_pan_id(&[0x00, 0xFF, 0x01]), None);
+        // 空 / ヘッダ未満。
+        assert_eq!(thread_ext_pan_id(&[]), None);
+        assert_eq!(thread_ext_pan_id(&[0x02]), None);
+        // 長さ 0 の TLV を挟んでも走査が止まらない。
+        let with_zero = [0x03, 0x00, 0x02, 0x08, 1, 1, 2, 2, 3, 3, 4, 4];
+        assert_eq!(
+            thread_ext_pan_id(&with_zero),
+            Some([1, 1, 2, 2, 3, 3, 4, 4])
+        );
     }
 
     #[test]
