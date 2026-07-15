@@ -1757,3 +1757,45 @@ fn commission_with_all_digit_alias_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("invalid alias name"));
 }
+
+#[test]
+fn native_iface_without_kvs_falls_back_to_chip_tool() {
+    // MAT_IFACE を立てても KVS（chip_tool_config.*.ini）が無ければ warn +
+    // chip-tool 直へフォールバックし、既存どおり成功する。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_IFACE", "lo")
+        .env("MAT_LOG", "warn")
+        .args(["on", "--node", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
+        .stdout(predicate::str::contains("\"command\":\"on\""))
+        .stdout(predicate::str::contains("\"status\":\"success\""))
+        .stderr(predicate::str::contains("falling back to chip-tool"));
+}
+
+#[test]
+fn native_iface_group_send_falls_back_without_kvs() {
+    // group 送信も unicast と同じ理由（KVS 不備 → Engine::build 失敗）で
+    // chip-tool 直へフォールバックし、既存どおり成功する（group op は
+    // require_node しないので store_with_node5 の node5 未使用でも通る）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_IFACE", "lo")
+        .env("MAT_LOG", "warn")
+        .args([
+            "group",
+            "invoke",
+            "--group",
+            "10",
+            "--cluster",
+            "onoff",
+            "--command",
+            "toggle",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"sent\""))
+        .stderr(predicate::str::contains("falling back to chip-tool"));
+}

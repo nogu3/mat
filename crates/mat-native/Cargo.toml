@@ -1,0 +1,23 @@
+[package]
+name = "mat-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared native backend engine (mat one-shot / matd resident) on mat-controller"
+
+[features]
+# 他 crate のテストから fake / fixture を使うための注入面。
+test-support = ["dep:base64ct"]
+
+[dependencies]
+mat-core.workspace = true
+mat-controller.workspace = true
+async-trait.workspace = true
+tokio = { version = "1", features = ["sync", "net", "time", "rt", "macros"] }
+tracing.workspace = true
+base64ct = { version = "1", features = ["alloc"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+base64ct = { version = "1", features = ["alloc"] }

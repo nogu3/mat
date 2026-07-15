@@ -182,9 +182,11 @@ fn make_store() -> (tempfile::TempDir, PathBuf) {
 
 /// 1 接続で複数リクエスト行を送り、各行の応答 JSON を順に返す。
 async fn roundtrip(socket: &std::path::Path, requests: &[Value]) -> Vec<Value> {
-    // serve が bind するまで少し待つ。
+    // serve が bind するまで待つ。並列テスト（既定）でランタイムが飽和すると
+    // spawn した serve タスクの socket bind が遅れるので、窓は広め（250×20ms=5s）に
+    // 取る（テストの意味は不変、決定化のためだけ）。
     let mut stream = None;
-    for _ in 0..50 {
+    for _ in 0..250 {
         if let Ok(s) = UnixStream::connect(socket).await {
             stream = Some(s);
             break;
@@ -234,15 +236,19 @@ async fn matd_serve(
     store_path: PathBuf,
     backend: Arc<matd::backend::ChipToolBackend>,
 ) {
-    let _ = matd::server::serve(socket, store_path, backend).await;
+    let _ = matd::server::serve(socket, store_path, backend, None).await;
 }
 
-fn rand_suffix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+/// テストごとに一意な socket 名サフィックスを作る。並列テスト（既定）が同時に
+/// `start_matd` を呼ぶと、この環境の時計は分解能 100ns・タイトループでは 75% が同値を
+/// 返すため、nanos だけでは socket path が衝突する。衝突すると別テストの serve が
+/// `remove_file` で相手の socket を消してしまい「connect できない」flake になる。
+/// プロセスグローバルな単調カウンタで衝突を根絶する（pid も混ぜて別プロセス間も分離）。
+fn rand_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}", std::process::id(), n)
 }
 
 #[tokio::test]
@@ -762,9 +768,10 @@ async fn invalid_request_json_is_parse_error() {
     let (socket, handle) = start_matd(store_path, port).await;
 
     // 生の壊れた行を送る（roundtrip は valid JSON 前提なので直接書く）。
+    // readiness 窓は roundtrip と同じ理由で広め（250×20ms=5s）。
     let stream = {
         let mut s = None;
-        for _ in 0..50 {
+        for _ in 0..250 {
             if let Ok(c) = UnixStream::connect(&socket).await {
                 s = Some(c);
                 break;
@@ -834,8 +841,9 @@ async fn spawn_fake_ws_no_reply_then_ok(
         let mut conn_no = 0usize;
         while let Ok((stream, _)) = listener.accept().await {
             conn_no += 1;
-            // 1 本目は new() の早期接続だが、最初のコマンドはその接続上で走るので
-            // 「接続 n 本目まで失敗」= 「コマンド n 回目まで失敗」に一致する。
+            // lazy 化後は接続が張られるのは初回コマンド（or connect_for_test）の
+            // ensure_connected 時点。コマンドごとに 1 接続なので「接続 n 本目まで失敗」
+            // = 「コマンド n 回目まで失敗」に一致する。
             let fail = conn_no <= fail_first;
             let log = Arc::clone(&log);
             tokio::spawn(async move {
@@ -918,6 +926,7 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
 
     let pid1 = backend.child_pid().await.expect("child spawned");
 
@@ -962,6 +971,32 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
     assert_ne!(pid2, pid1, "dead child must be respawned");
 }
 
+/// lazy 化の Spawn モード版契約: spawn() は構築時に子を起こさない。初回の接続確立
+/// （ここでは connect_for_test）で初めて子プロセスが上がる。
+/// （Connect モード版は backend.rs 内 unit test `connect_mode_does_not_dial_until_first_command`。）
+#[tokio::test]
+async fn spawn_mode_does_not_spawn_child_until_first_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_fake_child_bin();
+
+    let (port, _log) = spawn_fake_ws_no_reply_then_ok(0).await;
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert!(
+        backend.child_pid().await.is_none(),
+        "no child until first command"
+    );
+
+    backend.connect_for_test().await.unwrap();
+    assert!(
+        backend.child_pid().await.is_some(),
+        "first establish spawns the child"
+    );
+}
+
 /// 保険の検証: 受信失敗が 2 連続したら従来どおり子ごと畳む（wedge した chip-tool を
 /// 温存し続けて永久に timeout し続けるのを防ぐ）。
 #[tokio::test]
@@ -975,6 +1010,7 @@ async fn two_consecutive_recv_failures_tear_down_child() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let pid1 = backend.child_pid().await.expect("child spawned");
 
     // 1 回目の受信失敗: 子は温存。
@@ -1008,6 +1044,7 @@ async fn reap_kills_child_even_without_ws() {
     let backend = matd::backend::ChipToolBackend::spawn(&store, port, Duration::from_millis(100))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let pid1 = backend.child_pid().await.expect("child spawned");
 
     // 受信失敗 → ws=None・子は温存。
@@ -1104,6 +1141,7 @@ async fn keepalive_tick_sends_ping() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
 
     backend.keepalive_tick().await;
     backend.keepalive_tick().await;
@@ -1166,6 +1204,7 @@ async fn keepalive_tick_drains_stale_messages() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await; // stale がバッファに届くのを待つ
     backend.keepalive_tick().await;
 
@@ -1204,6 +1243,7 @@ async fn keepalive_tick_bounds_drain_under_sustained_traffic() {
     let backend = matd::backend::ChipToolBackend::connect(port, Duration::from_secs(300))
         .await
         .unwrap();
+    backend.connect_for_test().await.unwrap();
     let done = tokio::time::timeout(Duration::from_secs(3), backend.keepalive_tick()).await;
     assert!(
         done.is_ok(),

@@ -1,0 +1,9 @@
+# M6b 実機 E2E 用: BLE feature（bluer → libdbus C 依存）の aarch64 クロスビルド。
+# 素の cargo + rust-lld（e2e-m6-real.sh の musl 経路）は C 依存が無い前提なので、
+# ble feature だけは cross(docker) の gnu ターゲット + arm64 libdbus で作る。
+# jarvis (Debian 13, glibc/libdbus-1.so.3) で動く動的リンクバイナリになる。
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install --assume-yes libdbus-1-dev:arm64",
+]

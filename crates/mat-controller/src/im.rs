@@ -1,0 +1,1268 @@
+//! Minimal Interaction Model payloads (Matter Core Spec 1.4, Chapter 8).
+//!
+//! Only what M2's onoff read/invoke path needs: single-attribute
+//! ReadRequest/ReportData, single-command InvokeRequest/InvokeResponse, and
+//! StatusResponse. No subscriptions, no batched paths, no chunking.
+
+use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+
+pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
+pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
+pub const OPCODE_READ_REQUEST: u8 = 0x02;
+pub const OPCODE_REPORT_DATA: u8 = 0x05;
+pub const OPCODE_INVOKE_REQUEST: u8 = 0x08;
+pub const OPCODE_INVOKE_RESPONSE: u8 = 0x09;
+pub const OPCODE_TIMED_REQUEST: u8 = 0x0A;
+pub const IM_REVISION: u8 = 12;
+pub const CLUSTER_ON_OFF: u32 = 0x0006;
+pub const ATTR_ON_OFF: u32 = 0x0000;
+pub const CMD_ON_OFF_OFF: u32 = 0x00;
+pub const CMD_ON_OFF_ON: u32 = 0x01;
+pub const CMD_ON_OFF_TOGGLE: u32 = 0x02;
+pub const CLUSTER_COLOR_CONTROL: u32 = 0x0300;
+pub const ATTR_CURRENT_HUE: u32 = 0x0000;
+pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
+pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
+pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
+pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
+
+/// A decoded scalar attribute/data value. Containers are not supported (M2
+/// scope is single scalar attributes such as onoff's `OnOff` bool).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImValue {
+    Bool(bool),
+    Uint(u64),
+    Int(i64),
+    Utf8(String),
+    Bytes(Vec<u8>),
+    Null,
+}
+
+/// Decoded ReportData for a single-attribute read (first AttributeReportIB
+/// only; see module docs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportData {
+    pub suppress_response: bool,
+    pub value: Option<ImValue>,
+    pub status: Option<u8>,
+}
+
+/// Decoded InvokeResponse outcome for a single command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvokeOutcome {
+    pub status: u8,
+    pub cluster_status: Option<u8>,
+}
+
+/// Decoded InvokeResponse for a single command, including any command-data
+/// fields (spec §8.9.4.2: a successful response may carry a CommandDataIB
+/// instead of a bare CommandStatusIB — e.g. commands that return a value).
+/// `fields_tlv`, when present, is one complete, well-formed TLV element (its
+/// top-level tag re-written to `Tag::Anonymous`) holding the response
+/// CommandFields struct, ready to hand to a cluster-specific decoder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvokeResponseData {
+    pub status: u8,
+    pub cluster_status: Option<u8>,
+    pub fields_tlv: Option<Vec<u8>>,
+}
+
+/// Interaction Model level errors (decode failures and device-reported
+/// rejections carried in IM status codes, spec §8.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImError {
+    Tlv(TlvError),
+    Malformed(&'static str),
+    UnsupportedValue,
+    AttributeStatus(u8),
+    StatusResponse(u8),
+    CommandStatus {
+        status: u8,
+        cluster_status: Option<u8>,
+    },
+}
+
+impl std::fmt::Display for ImError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImError::Tlv(e) => write!(f, "malformed interaction model TLV: {e}"),
+            ImError::Malformed(m) => write!(f, "malformed interaction model payload: {m}"),
+            ImError::UnsupportedValue => write!(f, "unsupported attribute value encoding"),
+            ImError::AttributeStatus(s) => write!(f, "device rejected read: IM status 0x{s:02X}"),
+            ImError::StatusResponse(s) => {
+                write!(f, "device sent StatusResponse: IM status 0x{s:02X}")
+            }
+            ImError::CommandStatus {
+                status,
+                cluster_status: Some(cs),
+            } => write!(
+                f,
+                "device rejected command: IM status 0x{status:02X} (cluster status 0x{cs:02X})"
+            ),
+            ImError::CommandStatus {
+                status,
+                cluster_status: None,
+            } => write!(f, "device rejected command: IM status 0x{status:02X}"),
+        }
+    }
+}
+
+impl std::error::Error for ImError {}
+
+impl From<TlvError> for ImError {
+    fn from(e: TlvError) -> Self {
+        ImError::Tlv(e)
+    }
+}
+
+/// Reads the next element and requires it to be a struct start (every IM
+/// message is a top-level anonymous struct).
+fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
+    match r.next()?.ok_or(ImError::Malformed("empty payload"))?.value {
+        Value::StructStart => Ok(()),
+        _ => Err(ImError::Malformed("expected struct")),
+    }
+}
+
+/// Consumes the rest of a container whose `*Start` element has already been
+/// read (depth 1), including its matching `ContainerEnd`. Used to skip
+/// unknown tags/containers and additional report/response entries beyond
+/// the first (M2 only interprets a single attribute/command per message).
+fn skip_container(r: &mut Reader) -> Result<(), ImError> {
+    let mut depth = 1usize;
+    while depth > 0 {
+        let el = r.next()?.ok_or(ImError::Malformed("truncated container"))?;
+        match el.value {
+            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
+            Value::ContainerEnd => depth -= 1,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// ReadRequestMessage (spec §8.9.2) for a single attribute path.
+pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(0)); // AttributeRequests
+    w.start_list(Tag::Anonymous); // AttributePathIB
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    w.put_uint(Tag::Context(4), u64::from(attribute));
+    w.end_container(); // AttributePathIB
+    w.end_container(); // AttributeRequests
+    w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+fn value_to_im(v: Value) -> Result<ImValue, ImError> {
+    match v {
+        Value::Bool(b) => Ok(ImValue::Bool(b)),
+        Value::Uint(u) => Ok(ImValue::Uint(u)),
+        Value::Int(i) => Ok(ImValue::Int(i)),
+        Value::Utf8(s) => Ok(ImValue::Utf8(s.to_string())),
+        Value::Bytes(b) => Ok(ImValue::Bytes(b.to_vec())),
+        Value::Null => Ok(ImValue::Null),
+        Value::StructStart | Value::ArrayStart | Value::ListStart => Err(ImError::UnsupportedValue),
+        // ImValue has no float variant (M2 scope: bool/uint/int/string/bytes/null).
+        Value::F32(_) | Value::F64(_) => Err(ImError::UnsupportedValue),
+        Value::ContainerEnd => Err(ImError::Malformed("unexpected container end as data value")),
+    }
+}
+
+/// AttributeStatusIB (spec §8.9.2.2): `{0: Path, 1: StatusIB{0: status, ...}}`.
+/// Assumes the caller already consumed the `StructStart` (tag 0) that opens
+/// this AttributeStatusIB.
+fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> {
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute status"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::StructStart) => {
+                // StatusIB
+                loop {
+                    let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+                    match (e2.tag, e2.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (Tag::Context(0), Value::Uint(v)) => {
+                            status = Some(u8::try_from(v).map_err(|_| {
+                                ImError::Malformed("attribute status code out of range")
+                            })?);
+                        }
+                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                            skip_container(r)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    status.ok_or(ImError::Malformed("attribute status without StatusIB"))
+}
+
+/// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`.
+/// Assumes the caller already consumed the `StructStart` (tag 1) that opens
+/// this AttributeDataIB.
+fn decode_attribute_data_ib(r: &mut Reader) -> Result<ImValue, ImError> {
+    let mut data = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(2), v) => data = Some(value_to_im(v)?),
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    data.ok_or(ImError::Malformed("attribute data without Data field"))
+}
+
+/// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`.
+/// Assumes the caller already consumed the anonymous `StructStart` opening
+/// this AttributeReportIB.
+fn decode_attribute_report_ib(r: &mut Reader) -> Result<(Option<ImValue>, Option<u8>), ImError> {
+    let mut value = None;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute report"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                status = Some(decode_attribute_status_ib(r)?);
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                value = Some(decode_attribute_data_ib(r)?);
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((value, status))
+}
+
+/// ReportDataMessage (spec §8.9.2). Only the first AttributeReportIB is
+/// interpreted (M2 reads one attribute at a time).
+pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut suppress_response = false;
+    let mut value: Option<ImValue> = None;
+    let mut status: Option<u8> = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated report data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // AttributeReportIBs
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated attribute reports"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            let (v, s) = decode_attribute_report_ib(&mut r)?;
+                            value = v;
+                            status = s;
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in attribute reports",
+                            ))
+                        }
+                    }
+                }
+            }
+            (Tag::Context(3), Value::Bool(true)) => {
+                // MoreChunkedMessages: M2 has no chunk-reassembly support, so
+                // silently returning the first chunk's partial data would be
+                // wrong — the caller would see a "successful" read that is
+                // actually incomplete.
+                return Err(ImError::Malformed("chunked report data unsupported"));
+            }
+            (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    if value.is_none() && status.is_none() {
+        return Err(ImError::Malformed("empty report"));
+    }
+    Ok(ReportData {
+        suppress_response,
+        value,
+        status,
+    })
+}
+
+/// Deep-copies one TLV element (and, if a container, its full subtree) from
+/// `r` into `w`, re-tagging only the top-level element as `tag`. Used to
+/// splice a caller-provided, already-encoded CommandFields element into an
+/// InvokeRequest without `tlv::Writer` needing a raw-append escape hatch.
+fn copy_retagged(w: &mut Writer, r: &mut Reader, tag: Tag) -> Result<(), TlvError> {
+    let el = r.next()?.ok_or(TlvError::Truncated)?;
+    copy_value(w, r, tag, el.value)
+}
+
+fn copy_value(w: &mut Writer, r: &mut Reader, tag: Tag, value: Value) -> Result<(), TlvError> {
+    match value {
+        Value::Int(v) => w.put_int(tag, v),
+        Value::Uint(v) => w.put_uint(tag, v),
+        Value::Bool(v) => w.put_bool(tag, v),
+        Value::F32(v) => w.put_f32(tag, v),
+        Value::F64(v) => w.put_f64(tag, v),
+        Value::Utf8(v) => w.put_str(tag, v),
+        Value::Bytes(v) => w.put_bytes(tag, v),
+        Value::Null => w.put_null(tag),
+        Value::StructStart => {
+            w.start_struct(tag);
+            return copy_container(w, r);
+        }
+        Value::ArrayStart => {
+            w.start_array(tag);
+            return copy_container(w, r);
+        }
+        Value::ListStart => {
+            w.start_list(tag);
+            return copy_container(w, r);
+        }
+        Value::ContainerEnd => {}
+    }
+    Ok(())
+}
+
+fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
+    loop {
+        let el = r.next()?.ok_or(TlvError::Truncated)?;
+        if el.value == Value::ContainerEnd {
+            w.end_container();
+            return Ok(());
+        }
+        copy_value(w, r, el.tag, el.value)?;
+    }
+}
+
+/// CommandFields for colorcontrol MoveToHueAndSaturation (cluster spec
+/// §3.2.11.7): `{0: hue, 1: saturation, 2: transition_time (0.1 s units),
+/// 3: options_mask, 4: options_override}`. Options are fixed to 0 (execute
+/// unconditionally), which is what chip-tool sends by default too.
+pub fn encode_move_to_hue_and_saturation_fields(
+    hue: u8,
+    saturation: u8,
+    transition_time_ds: u16,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(hue));
+    w.put_uint(Tag::Context(1), u64::from(saturation));
+    w.put_uint(Tag::Context(2), u64::from(transition_time_ds));
+    w.put_uint(Tag::Context(3), 0);
+    w.put_uint(Tag::Context(4), 0);
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for colorcontrol MoveToColorTemperature (cluster spec
+/// §3.2.11.10): `{0: ColorTemperatureMireds(u16), 1: TransitionTime(u16,
+/// 0.1 s units), 2: OptionsMask(u8), 3: OptionsOverride(u8)}`. Options are
+/// fixed to 0 (execute per the device's Options attribute), matching what
+/// chip-tool sends by default.
+pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(mireds));
+    w.put_uint(Tag::Context(1), u64::from(transition_time_ds));
+    w.put_uint(Tag::Context(2), 0);
+    w.put_uint(Tag::Context(3), 0);
+    w.end_container();
+    w.finish()
+}
+
+/// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
+/// フィールド（タイムド呼び出し、spec §8.5）の値になる。公開関数
+/// `encode_invoke_request` / `encode_invoke_request_timed` はどちらもこれを
+/// 呼ぶだけの薄いラッパで、ワイヤ形状は完全に共有する。
+///
+/// `fields_tlv`, if given, must be one complete, well-formed TLV element
+/// (any tag; it is re-tagged) holding the command's CommandFields struct.
+/// M2's onoff commands (on/off/toggle) take no fields, so this is `None` in
+/// practice; the parameter exists so the wire format doesn't have to change
+/// when a fielded command is added later. Panics if `fields_tlv` is not
+/// well-formed TLV — a caller/programmer error, not a device response to
+/// validate defensively.
+fn encode_invoke_request_inner(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+    timed: bool,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), false); // SuppressResponse
+    w.put_bool(Tag::Context(1), timed); // TimedRequest
+    w.start_array(Tag::Context(2)); // InvokeRequests
+    w.start_struct(Tag::Anonymous); // CommandDataIB
+    w.start_list(Tag::Context(0)); // CommandPath
+    w.put_uint(Tag::Context(0), u64::from(endpoint));
+    w.put_uint(Tag::Context(1), u64::from(cluster));
+    w.put_uint(Tag::Context(2), u64::from(command));
+    w.end_container(); // CommandPath
+    if let Some(fields) = fields_tlv {
+        let mut fr = Reader::new(fields);
+        copy_retagged(&mut w, &mut fr, Tag::Context(1))
+            .expect("fields_tlv must be one well-formed TLV element");
+    }
+    w.end_container(); // CommandDataIB
+    w.end_container(); // InvokeRequests
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// InvokeRequestMessage (spec §8.9.4) for a single command. TimedRequest is
+/// always `false` — see `encode_invoke_request_timed` for the timed variant
+/// (spec §8.5, タイムド呼び出し).
+pub fn encode_invoke_request(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    encode_invoke_request_inner(endpoint, cluster, command, fields_tlv, false)
+}
+
+/// InvokeRequestMessage (spec §8.9.4) with TimedRequest = true. Must be sent
+/// on the same exchange as a preceding `encode_timed_request` whose
+/// StatusResponse(SUCCESS) has already been received — the timeout window it
+/// establishes covers exactly this InvokeRequest (spec §8.5.1). Same fields
+/// contract as `encode_invoke_request` otherwise.
+pub fn encode_invoke_request_timed(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    encode_invoke_request_inner(endpoint, cluster, command, fields_tlv, true)
+}
+
+/// TimedRequestMessage (spec §8.5.1, タイムド呼び出し): `{0: Timeout(u16,
+/// ミリ秒), 255: InteractionModelRevision}`. Opens a timeout window during
+/// which the immediately following InvokeRequest/WriteRequest (same
+/// exchange, TimedRequest flag true) must arrive at the device, otherwise it
+/// rejects the timed action. `mat-controller` only uses this ahead of a
+/// timed invoke (`SecureSession::invoke_for_data`).
+pub fn encode_timed_request(timeout_ms: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(timeout_ms));
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
+/// InvokeRequestMessage for a groupcast command (spec §8.9.4): group
+/// invokes carry no response, so SuppressResponse is true, and the
+/// CommandPath is group-scoped (no endpoint — the device's group table
+/// routes to its bound endpoints). Fields contract matches
+/// `encode_invoke_request`.
+pub fn encode_group_invoke_request(
+    cluster: u32,
+    command: u32,
+    fields_tlv: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), true); // SuppressResponse
+    w.put_bool(Tag::Context(1), false); // TimedRequest
+    w.start_array(Tag::Context(2)); // InvokeRequests
+    w.start_struct(Tag::Anonymous); // CommandDataIB
+    w.start_list(Tag::Context(0)); // CommandPath (group-scoped)
+    w.put_uint(Tag::Context(1), u64::from(cluster));
+    w.put_uint(Tag::Context(2), u64::from(command));
+    w.end_container();
+    if let Some(fields) = fields_tlv {
+        let mut fr = Reader::new(fields);
+        copy_retagged(&mut w, &mut fr, Tag::Context(1))
+            .expect("fields_tlv must be one well-formed TLV element");
+    }
+    w.end_container();
+    w.end_container();
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
+/// StatusIB (spec §8.9.2.3) inside a CommandStatusIB: `{0: status, 1: cluster_status}`.
+/// Assumes the caller already consumed the `StructStart` (tag 1) opening it.
+fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
+    let mut status = None;
+    let mut cluster_status = None;
+    loop {
+        let el = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => {
+                status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("command status code out of range"))?,
+                );
+            }
+            (Tag::Context(1), Value::Uint(v)) => {
+                cluster_status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("cluster status code out of range"))?,
+                );
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    let status = status.ok_or(ImError::Malformed("status ib without status"))?;
+    Ok((status, cluster_status))
+}
+
+/// CommandStatusIB (spec §8.9.4.2): `{0: CommandPath, 1: StatusIB}`.
+/// Assumes the caller already consumed the `StructStart` (tag 1) that opens
+/// this CommandStatusIB (InvokeResponseIB's `Status` field).
+fn decode_command_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
+    let mut result = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated command status ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::StructStart) => {
+                result = Some(decode_status_ib(r)?);
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    result.ok_or(ImError::Malformed("command status ib without StatusIB"))
+}
+
+/// InvokeResponseIB (spec §8.9.4.2): `{0: CommandDataIB} | {1: CommandStatusIB}`.
+/// Assumes the caller already consumed the anonymous `StructStart` opening
+/// this InvokeResponseIB.
+fn decode_invoke_response_ib(r: &mut Reader) -> Result<InvokeOutcome, ImError> {
+    let mut outcome = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                // Command (CommandDataIB): a response carrying data is a
+                // successful invocation. M2's onoff commands never produce
+                // one, but don't choke on a well-formed message that does.
+                skip_container(r)?;
+                outcome = Some(InvokeOutcome {
+                    status: 0,
+                    cluster_status: None,
+                });
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                let (status, cluster_status) = decode_command_status_ib(r)?;
+                outcome = Some(InvokeOutcome {
+                    status,
+                    cluster_status,
+                });
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    outcome.ok_or(ImError::Malformed(
+        "invoke response ib without Command or Status",
+    ))
+}
+
+/// InvokeResponseMessage (spec §8.9.4). Only the first InvokeResponseIB is
+/// interpreted (M2 invokes one command at a time).
+pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut outcome: Option<InvokeOutcome> = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // InvokeResponses
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated invoke responses"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            outcome = Some(decode_invoke_response_ib(&mut r)?);
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in invoke responses",
+                            ))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    outcome.ok_or(ImError::Malformed(
+        "invoke response without InvokeResponseIB",
+    ))
+}
+
+/// CommandDataIB (spec §8.9.4.2): `{0: CommandPathIB, 1: CommandFields}`.
+/// Assumes the caller already consumed the `StructStart` (tag 0) that opens
+/// this CommandDataIB (InvokeResponseIB's `Command` field). Returns the
+/// CommandFields struct (tag 1), if present, re-tagged to `Tag::Anonymous`
+/// as one complete TLV element — the CommandPathIB (tag 0) is skipped since
+/// `decode_invoke_response_data`'s callers only need the fields, not the
+/// echoed path.
+fn decode_command_data_ib(r: &mut Reader) -> Result<Option<Vec<u8>>, ImError> {
+    let mut fields = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated command data ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::StructStart) => {
+                // CommandFields: always a struct (cluster spec command
+                // parameters). Re-tag to Anonymous, same convention as
+                // `encode_invoke_request`'s fields_tlv splice.
+                let mut w = Writer::new();
+                copy_value(&mut w, r, Tag::Anonymous, Value::StructStart)?;
+                fields = Some(w.finish());
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(fields)
+}
+
+/// InvokeResponseIB (spec §8.9.4.2): `{0: CommandDataIB} | {1: CommandStatusIB}`,
+/// decoded into `InvokeResponseData` (data-carrying variant of
+/// `decode_invoke_response_ib`). Assumes the caller already consumed the
+/// anonymous `StructStart` opening this InvokeResponseIB.
+fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, ImError> {
+    let mut result = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                // Command (CommandDataIB): a response carrying data is a
+                // successful invocation (status 0), possibly with fields.
+                let fields_tlv = decode_command_data_ib(r)?;
+                result = Some(InvokeResponseData {
+                    status: 0,
+                    cluster_status: None,
+                    fields_tlv,
+                });
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                let (status, cluster_status) = decode_command_status_ib(r)?;
+                result = Some(InvokeResponseData {
+                    status,
+                    cluster_status,
+                    fields_tlv: None,
+                });
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    result.ok_or(ImError::Malformed(
+        "invoke response ib without Command or Status",
+    ))
+}
+
+/// InvokeResponseMessage (spec §8.9.4), data-carrying variant of
+/// `decode_invoke_response`: a CommandDataIB response (status 0) yields its
+/// CommandFields as `fields_tlv`; a CommandStatusIB response yields
+/// `status`/`cluster_status` as today with `fields_tlv: None`. Only the
+/// first InvokeResponseIB is interpreted (same single-command scope as
+/// `decode_invoke_response`). Unlike `decode_invoke_response`, a non-zero
+/// status is returned as data, not as `Err` — callers that want the
+/// today's fail-on-error behavior should check `status` themselves (see
+/// `SecureSession::invoke_for_data`).
+pub fn decode_invoke_response_data(payload: &[u8]) -> Result<InvokeResponseData, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut result: Option<InvokeResponseData> = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // InvokeResponses
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated invoke responses"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            result = Some(decode_invoke_response_ib_data(&mut r)?);
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in invoke responses",
+                            ))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    result.ok_or(ImError::Malformed(
+        "invoke response without InvokeResponseIB",
+    ))
+}
+
+/// StatusResponseMessage (spec §8.9.3): `{0: Status, 255: revision}`.
+pub fn encode_status_response(status: u8) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(status));
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
+pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated status response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => {
+                status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("status response code out of range"))?,
+                );
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    status.ok_or(ImError::Malformed("status response without status"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tlv::{Reader, Tag, Value, Writer};
+
+    #[test]
+    fn read_request_has_spec_structure() {
+        let buf = encode_read_request(1, CLUSTER_ON_OFF, ATTR_ON_OFF);
+        let mut r = Reader::new(&buf);
+        let mut els = Vec::new();
+        while let Some(e) = r.next().unwrap() {
+            els.push(e);
+        }
+        // struct{ 0: array[ list{2,3,4} ], 3: false, 255: 12 }
+        assert_eq!(els[0].value, Value::StructStart);
+        assert_eq!(
+            (els[1].tag, els[1].value),
+            (Tag::Context(0), Value::ArrayStart)
+        );
+        assert_eq!(els[2].value, Value::ListStart);
+        assert_eq!(
+            (els[3].tag, els[3].value),
+            (Tag::Context(2), Value::Uint(1))
+        );
+        assert_eq!(
+            (els[4].tag, els[4].value),
+            (Tag::Context(3), Value::Uint(0x0006))
+        );
+        assert_eq!(
+            (els[5].tag, els[5].value),
+            (Tag::Context(4), Value::Uint(0))
+        );
+        assert_eq!(els[6].value, Value::ContainerEnd); // list
+        assert_eq!(els[7].value, Value::ContainerEnd); // array
+        assert_eq!(
+            (els[8].tag, els[8].value),
+            (Tag::Context(3), Value::Bool(false))
+        );
+        assert_eq!(
+            (els[9].tag, els[9].value),
+            (Tag::Context(255), Value::Uint(12))
+        );
+        assert_eq!(els[10].value, Value::ContainerEnd);
+    }
+
+    fn report_data(value: bool, suppress: bool) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReportIBs
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeData
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), 1);
+        w.put_uint(Tag::Context(3), 6);
+        w.put_uint(Tag::Context(4), 0);
+        w.end_container();
+        w.put_bool(Tag::Context(2), value); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        if suppress {
+            w.put_bool(Tag::Context(4), true);
+        }
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    #[test]
+    fn decodes_report_data_bool() {
+        let rd = decode_report_data(&report_data(true, true)).unwrap();
+        assert!(rd.suppress_response);
+        assert_eq!(rd.value, Some(ImValue::Bool(true)));
+        assert_eq!(rd.status, None);
+        let rd = decode_report_data(&report_data(false, false)).unwrap();
+        assert!(!rd.suppress_response);
+        assert_eq!(rd.value, Some(ImValue::Bool(false)));
+    }
+
+    #[test]
+    fn decodes_report_data_attribute_status() {
+        // AttributeStatus (tag 0) = 読めない属性: struct{0: Path, 1: StatusIB{0: status}}
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(0)); // AttributeStatus
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0x86); // UNSUPPORTED_ATTRIBUTE
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(4), true);
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let rd = decode_report_data(&w.finish()).unwrap();
+        assert_eq!(rd.status, Some(0x86));
+        assert_eq!(rd.value, None);
+    }
+
+    #[test]
+    fn decode_report_data_rejects_more_chunked_messages() {
+        // ReportDataMessage の MoreChunkedMessages (tag 3) = true: M2 は
+        // チャンク再構成をサポートしないので、部分データを黙って返しては
+        // ならない。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReportIBs
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeData
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), 1);
+        w.put_uint(Tag::Context(3), 6);
+        w.put_uint(Tag::Context(4), 0);
+        w.end_container();
+        w.put_bool(Tag::Context(2), true); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages = true
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        assert_eq!(
+            decode_report_data(&w.finish()),
+            Err(ImError::Malformed("chunked report data unsupported"))
+        );
+    }
+
+    #[test]
+    fn invoke_request_and_response_roundtrip_shapes() {
+        let buf = encode_invoke_request(1, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE, None);
+        let mut r = Reader::new(&buf);
+        let mut els = Vec::new();
+        while let Some(e) = r.next().unwrap() {
+            els.push(e);
+        }
+        assert_eq!(
+            (els[1].tag, els[1].value),
+            (Tag::Context(0), Value::Bool(false))
+        );
+        assert_eq!(
+            (els[2].tag, els[2].value),
+            (Tag::Context(1), Value::Bool(false))
+        );
+        assert_eq!(
+            (els[3].tag, els[3].value),
+            (Tag::Context(2), Value::ArrayStart)
+        );
+        // CommandDataIB struct → path list {0:1, 1:6, 2:2}
+        assert_eq!(els[4].value, Value::StructStart);
+        assert_eq!(
+            (els[5].tag, els[5].value),
+            (Tag::Context(0), Value::ListStart)
+        );
+        assert_eq!(els[6].value, Value::Uint(1));
+        assert_eq!(els[7].value, Value::Uint(6));
+        assert_eq!(els[8].value, Value::Uint(2));
+
+        // InvokeResponse: Status(成功)
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let out = decode_invoke_response(&w.finish()).unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.cluster_status, None);
+    }
+
+    #[test]
+    fn decodes_invoke_response_nonzero_status_with_cluster_status() {
+        // CommandStatusIB carrying StatusIB{0: 0x81 UNSUPPORTED_COMMAND, 1: 0x42}.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0x81);
+        w.put_uint(Tag::Context(1), 0x42);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let out = decode_invoke_response(&w.finish()).unwrap();
+        assert_eq!(out.status, 0x81);
+        assert_eq!(out.cluster_status, Some(0x42));
+    }
+
+    #[test]
+    fn encode_invoke_request_splices_fields_tlv() {
+        // A one-field CommandFields struct: { 0: 128 }.
+        let mut fw = Writer::new();
+        fw.start_struct(Tag::Anonymous);
+        fw.put_uint(Tag::Context(0), 128);
+        fw.end_container();
+        let fields = fw.finish();
+
+        let buf = encode_invoke_request(1, CLUSTER_ON_OFF, CMD_ON_OFF_ON, Some(&fields));
+        let mut r = Reader::new(&buf);
+        let mut els = Vec::new();
+        while let Some(e) = r.next().unwrap() {
+            els.push(e);
+        }
+        // struct{ 0: false, 1: false, 2: array[ struct{ 0: list{1,6,1}, <fields> } ], 255: 12 }
+        assert_eq!(els[4].value, Value::StructStart); // CommandDataIB
+        assert_eq!(els[5].value, Value::ListStart); // CommandPath
+        assert_eq!(els[9].value, Value::ContainerEnd); // end of CommandPath list
+                                                       // The spliced fields struct, retagged to Context(1) inside CommandDataIB.
+        assert_eq!(
+            (els[10].tag, els[10].value),
+            (Tag::Context(1), Value::StructStart)
+        );
+        assert_eq!(
+            (els[11].tag, els[11].value),
+            (Tag::Context(0), Value::Uint(128))
+        );
+        assert_eq!(els[12].value, Value::ContainerEnd); // end of fields struct
+        assert_eq!(els[13].value, Value::ContainerEnd); // end of CommandDataIB
+    }
+
+    #[test]
+    fn status_response_roundtrip() {
+        assert_eq!(
+            decode_status_response(&encode_status_response(0)).unwrap(),
+            0
+        );
+        assert_eq!(
+            decode_status_response(&encode_status_response(0x7E)).unwrap(),
+            0x7E
+        );
+    }
+
+    #[test]
+    fn move_to_hue_and_saturation_fields_shape() {
+        let fields = encode_move_to_hue_and_saturation_fields(200, 254, 10);
+        let mut r = Reader::new(&fields);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let expect = [
+            (0u8, 200u64), // hue
+            (1, 254),      // saturation
+            (2, 10),       // transition time (0.1s 単位)
+            (3, 0),        // options mask
+            (4, 0),        // options override
+        ];
+        for (tag, val) in expect {
+            let el = r.next().unwrap().unwrap();
+            assert_eq!((el.tag, el.value), (Tag::Context(tag), Value::Uint(val)));
+        }
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd);
+        assert!(r.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn move_fields_splice_into_invoke_request() {
+        // fields_tlv スプライス経路（well-formed 1 要素として受理され panic しない）
+        let fields = encode_move_to_hue_and_saturation_fields(1, 2, 3);
+        let req = encode_invoke_request(
+            1,
+            CLUSTER_COLOR_CONTROL,
+            CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(&fields),
+        );
+        assert!(!req.is_empty());
+    }
+
+    #[test]
+    fn move_to_color_temperature_fields_match_wire_shape() {
+        // CommandFields (colorcontrol MoveToColorTemperature, cluster §3.2.11.10):
+        // {0: ColorTemperatureMireds(u16), 1: TransitionTime(u16 0.1s),
+        //  2: OptionsMask(u8)=0, 3: OptionsOverride(u8)=0}.
+        // MoveToHueAndSaturation エンコーダと同じ手筋（anonymous struct + context tags）。
+        let bytes = encode_move_to_color_temperature_fields(370, 30);
+        // anonymous struct open (0x15) ... context-tagged uints ... close (0x18)
+        assert_eq!(bytes.first(), Some(&0x15), "opens anonymous struct");
+        assert_eq!(bytes.last(), Some(&0x18), "closes container");
+        // mireds=370=0x0172 が context tag 0 の u16 として載る（0x25 = ctx-tag u16）
+        assert!(
+            bytes.windows(4).any(|w| w == [0x25, 0x00, 0x72, 0x01]),
+            "mireds 370 as ctx-tag-0 u16 little-endian, got {bytes:02X?}"
+        );
+        // transition=30=0x1E が context tag 1 の u8 として載る（0x24 = ctx-tag u8）
+        assert!(
+            bytes.windows(3).any(|w| w == [0x24, 0x01, 0x1E]),
+            "transition 30 as ctx-tag-1 u8, got {bytes:02X?}"
+        );
+    }
+
+    #[test]
+    fn group_invoke_request_suppresses_response_and_omits_endpoint() {
+        let got = encode_group_invoke_request(CLUSTER_ON_OFF, CMD_ON_OFF_ON, None);
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), true); // SuppressResponse: group は応答なし
+        w.put_bool(Tag::Context(1), false); // TimedRequest
+        w.start_array(Tag::Context(2));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0)); // CommandPath: group-scoped、endpoint なし
+        w.put_uint(Tag::Context(1), u64::from(CLUSTER_ON_OFF));
+        w.put_uint(Tag::Context(2), u64::from(CMD_ON_OFF_ON));
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+        w.end_container();
+        assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn timed_request_shape() {
+        let p = encode_timed_request(10_000);
+        let mut r = Reader::new(&p);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        let e = r.next().unwrap().unwrap();
+        assert_eq!(e.tag, Tag::Context(0));
+        assert!(matches!(e.value, Value::Uint(10_000)));
+    }
+
+    #[test]
+    fn invoke_request_timed_sets_flag() {
+        let p = encode_invoke_request_timed(0, 0x3E, 0x00, None);
+        let mut r = Reader::new(&p);
+        r.next().unwrap(); // struct
+        r.next().unwrap(); // SuppressResponse
+        let e = r.next().unwrap().unwrap(); // TimedRequest
+        assert!(matches!(e.value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn decode_invoke_response_with_command_fields() {
+        // InvokeResponseMessage { 1: [ { 0: CommandDataIB { 0: path, 1: fields } } ] }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous); // InvokeResponseIB
+        w.start_struct(Tag::Context(0)); // CommandDataIB
+        w.start_list(Tag::Context(0)); // CommandPathIB
+        w.put_uint(Tag::Context(0), 0);
+        w.put_uint(Tag::Context(1), 0x3E);
+        w.put_uint(Tag::Context(2), 0x01);
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // CommandFields
+        w.put_bytes(Tag::Context(0), b"elements");
+        w.put_bytes(Tag::Context(1), &[0xAB; 64]);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let d = decode_invoke_response_data(&w.finish()).unwrap();
+        assert_eq!(d.status, 0);
+        let fields = d.fields_tlv.unwrap();
+        let mut fr = Reader::new(&fields);
+        assert!(matches!(
+            fr.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        assert!(matches!(fr.next().unwrap().unwrap().value, Value::Bytes(b) if b == b"elements"));
+    }
+
+    #[test]
+    fn decode_invoke_response_data_status_form() {
+        // 既存 decode_invoke_response の「nonzero status + cluster status」
+        // ケース (decodes_invoke_response_nonzero_status_with_cluster_status)
+        // と同じ CommandStatusIB 形（InvokeResponseIB{1: CommandStatusIB}）で
+        // 合成し、status/cluster_status が透過し fields_tlv は None になる
+        // ことを確認する。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // Status = CommandStatusIB
+        w.start_list(Tag::Context(0)); // Path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0x81);
+        w.put_uint(Tag::Context(1), 0x42);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let d = decode_invoke_response_data(&w.finish()).unwrap();
+        assert_eq!(d.status, 0x81);
+        assert_eq!(d.cluster_status, Some(0x42));
+        assert_eq!(d.fields_tlv, None);
+    }
+
+    #[test]
+    fn group_invoke_request_carries_fields() {
+        let fields = encode_move_to_color_temperature_fields(370, 0);
+        let got = encode_group_invoke_request(
+            CLUSTER_COLOR_CONTROL,
+            CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(&fields),
+        );
+        // fields が ctx1 で CommandDataIB に入ること（unicast 版と同じ再タグ規約）。
+        // 厳密比較: unicast 版のテストに倣い Writer で期待列を組む。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), true);
+        w.put_bool(Tag::Context(1), false);
+        w.start_array(Tag::Context(2));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0));
+        w.put_uint(Tag::Context(1), u64::from(CLUSTER_COLOR_CONTROL));
+        w.put_uint(Tag::Context(2), u64::from(CMD_MOVE_TO_COLOR_TEMPERATURE));
+        w.end_container();
+        w.start_struct(Tag::Context(1));
+        w.put_uint(Tag::Context(0), 370);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_uint(Tag::Context(2), 0);
+        w.put_uint(Tag::Context(3), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+        w.end_container();
+        assert_eq!(got, w.finish());
+    }
+}
