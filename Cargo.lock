@@ -977,6 +977,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mat-native"
+version = "0.16.0"
+dependencies = [
+ "async-trait",
+ "base64ct",
+ "mat-controller",
+ "mat-core",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
