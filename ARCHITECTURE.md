@@ -178,9 +178,9 @@ change can break the parser.
 ### The backend is replaceable (adapter boundary)
 `mat` couples to the backend through **only `mat`'s own JSON schema**.
 
-- **Future candidates:** if parsing becomes too painful, a thin JS shim based on
-  matter.js (structured objects from the start, no C++ build, lightweight); or, to
-  stay pure Rust, a Rust-based controller prototype.
+- Decided (2026-07-10): a from-scratch Rust controller library, crate
+  `mat-controller` in this workspace — see "Phase 5" below for the decision
+  record and milestones.
 - A replacement must be one adapter in the child-runner, with `mat`'s JSON schema
   as the contract. Subcommands and output schema do not change.
 
@@ -188,10 +188,11 @@ change can break the parser.
 
 ## Design rules (must follow)
 
-1. **Do not speak the protocol directly.** No building TLV, no opening CASE
-   yourself, no multicast routing. Delegate everything to `chip-tool`. If you
-   want to bring this in, that is a backend-replacement discussion, not a change
-   to `mat` itself.
+1. **Protocol code lives only in the backend crate.** TLV, CASE, session
+   crypto, multicast routing — all of it belongs to `mat-controller`
+   (Phase 5) and nowhere else. The `mat` CLI and `matd` command layers
+   never speak the protocol; until Phase 5 lands they delegate everything
+   to `chip-tool`, which remains the production path.
 2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
    it in `mat`'s schema. No human decoration (color, progress, interactive
    prompts).
@@ -390,20 +391,147 @@ key-set-write {"epochKey0":..., "groupKeySetID":77} 5 0`.
 > `matd` is a separate binary and layer; it is allowed to be resident precisely
 > because it is not `mat`.
 
-### Phase 5 — native / backend replacement  *(optional)*
-Only if `chip-tool` parsing or build/ship becomes a bottleneck.
-- First candidate: a matter.js shim (structured output, lightweight, no C++ build).
-- Second candidate: a Rust-based controller (Rust purity, but a prototype;
-  groupcast etc. would need our own work).
-- The replacement must be one adapter in the child-runner, with `mat`'s JSON
-  schema as the contract. Subcommands and output schema do not change.
+### Phase 5 — native backend (from-scratch Rust controller)  *(decided 2026-07-10, in progress)*
+Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md`.
+- A from-scratch Rust Matter controller library, crate `mat-controller` in
+  this workspace. First stage is operational-only (CASE initiator, IM
+  read/invoke, group sessions) riding the existing fabric by reading
+  chip-tool's KVS; commissioning stays on chip-tool one-shot. Second stage
+  (PASE / BTP / attestation) removes chip-tool entirely.
+- rust-matc (tom-code/rust-matc, BSD-2) is a reference to read, never to
+  copy.
+- Crate layout (as of M7): `mat` / `matd` (command layers, JSON schema,
+  chip-tool child-runner adapter) sit on top of **`mat-native`** (shared
+  engine crate, extracted in M7 from `matd`'s native module — the
+  process-shape-independent core: KVS-backed engine construction, CASE
+  establish + unicast invoke/read, group send context), which itself sits on
+  **`mat-controller`** (the protocol library: TLV, CASE, session crypto,
+  multicast routing, commissioning) and `mat-core` (shared types, errors,
+  color, alias resolution used by every crate including chip-tool-only
+  code). `mat` and `matd` differ only in what they do with `mat-native`'s
+  `Engine`: `matd` holds warm per-node sessions in a `HashMap`, `mat`
+  establishes → runs one op → discards (design rule 4).
+- Milestones M1–M7 with independent acceptance criteria; the chip-tool
+  path stays untouched until M4 swaps matd's adapter in-process.
+- The replacement is still one adapter with `mat`'s JSON schema as the
+  contract. Subcommands and output schema do not change.
+- M1 完了(2026-07-10): TLV/メッセージ層/セッション暗号（unsecured/secured
+  unicast）。ローカル + Thread 実機 Nanoleaf 2 ノードで E2E 合格。
+- M2 完了: CASE + IM read/invoke（fabric/kvs/cert/case/session/im）。M2b:
+  chip-tool の永続 root CA 鍵で operational identity を自己発行し、ローカル
+  all-clusters-app に対し CASE + onoff toggle/read の E2E 合格（`task e2e:m2`）。
+- M3 完了(2026-07-12): 相乗りの堅牢化（node/fabric id を fabric テーブルの
+  NOC subject から取得 — KVS index 非依存）+ 自前 one-shot mDNS 解決
+  （TXT SII→MRP 接続）+ colorcontrol。jarvis 実機 Nanoleaf に本番 fabric
+  相乗り（fabric index ≠ fabric id 環境）で CASE + onoff/色変更の E2E 合格
+  （`task e2e:m3`）。
+- M4 完了(2026-07-12): matd のホットパス（on / off / color=move-to-hue-and-saturation
+  / color-temp=move-to-color-temperature / onoff の `on-off` read）を、
+  `mat-controller` の in-process warm CASE セッションで処理する経路に差し替え。
+  有効化は `MAT_MATD_IFACE=<Thread mesh iface>` env（または `matd --iface <name>`）。
+  未指定なら従来どおり全 op が chip-tool interactive server 経由（安全な既定挙動）。
+  native 構築に失敗した場合（KVS 読み取り不可等）も warn ログの上で chip-tool に
+  フォールバックし、matd は落ちない。write / describe / 任意 cluster の read・invoke
+  / group 系は引き続き chip-tool 経由（group 送信 3 op は M5 で native 化済み — 次項）。実機 E2E 合格
+  （`task e2e:m4`、本番 matd を止めず別 socket/port で検証）: ホットパス往復 + warm
+  再利用（cold 1.16s → warm 120ms、mDNS+CASE を払わない）+ describe の chip-tool
+  フォールバック（lazy spawn）を実機で確認。
+- M5 完了(2026-07-12): matd の group 送信 3 op（`GroupInvoke` の onoff 引数なし
+  on/off/toggle、`GroupColor`、`GroupColorTemp`）を native groupcast 化。鍵は
+  chip-tool KVS の導出済み operational credentials（GroupKeyMap
+  `f/<idx>/gk/<n>` → keyset の GKH + operational key）を送信のたびに読み直し
+  （re-provision が即反映される）、AES-CCM で封止して ff35::（site-local
+  transient multicast, hop limit 64）へ一発送信（応答なし・MRP なし、chip-tool
+  と同じ unacknowledged groupcast の意味論）。counter は
+  `<store>/native_group_counter`（10進テキスト、persist-ahead 4096）に永続化し、
+  起動時に `max(自前, chip-tool の g/gdc) + 4096` へ jump-ahead する（chip-tool
+  と同一 source node id で counter 空間を共有するため、低い値から始めると受信側の
+  重複窓判定で全滅する）。`GroupProvision` と汎用 group invoke（onoff 以外・引数
+  付き）は引き続き chip-tool。group 未 provision・KVS 不備・`g/gdc` 欠落など native
+  で送れない事情は warn ログの上 chip-tool へフォールバックする。応答 JSON
+  スキーマは両経路で共通（`group_sent_body`）。native 無効時（`MAT_MATD_IFACE`
+  未指定）は全 group op が chip-tool のまま（挙動不変）。設計は
+  `docs/superpowers/specs/2026-07-12-phase5-m5-group-native-design.md`。
+  **実機 E2E 合格**（2026-07-13、`task e2e:m5`、実 fabric の 7 ノード group）:
+  native groupcast の off / on / color-temp が 7/7 配達（各ノードを unicast read
+  で検証）、matd 再起動後も jump-ahead した counter（+8192、単調増加をログで
+  確認）で 7/7 配達。初回走行は 0/7 不達で、tcpdump により「宛先 sockaddr の
+  `sin6_scope_id` だけでは egress iface を選べず、VPN（tailscale0）の広い v6
+  経路が multicast の経路解決を勝って LAN に出ていない」ことを特定 —
+  `GroupSender::new` で `IPV6_MULTICAST_IF` を明示設定して解決（回帰テスト付き）。
+- M6a 完了(2026-07-13): native commissioning（on-network PASE、attestation は
+  DAC/PAI/PAA チェーン検証 厳格 + CD signer 検証は warn のみ、RCAC/NOC の
+  自己生成による使い捨て第二 fabric、既存 operational セッション上での
+  native OpenCommissioningWindow、`_matterc` browse による discriminator
+  探索）を `mat-controller` に実装。ライブラリ + E2E のみで、本番の
+  `mat commission` / `matd` は無変更（chip-tool 一発コミッショニングのまま）。
+  設計は `docs/superpowers/specs/2026-07-13-phase5-m6a-commissioning-design.md`。
+  ローカル E2E 合格（`task e2e:m6`、all-clusters-app 相手、5 手順: 誤
+  passcode 拒否 / native commission+制御 / native open-window / 第二 admin
+  commission / RemoveFabric 撤収で最初の fabric が生存）。実機 E2E ハーネス
+  （`task e2e:m6:real` — 本番 fabric の Nanoleaf へ相乗り open-window→
+  使い捨て第二 fabric へ native commission→onoff 制御→RemoveFabric 撤収→
+  本番 fabric 無傷確認、本物 DAC の厳格 attestation を通す）は実装済みで
+  コンパイル確認済みだが、ユーザー立ち会いでの実機実行はまだ行っていない
+  （次セッションで実施）。
+- M6b 完了(実装 2026-07-13、実機 E2E 合格 2026-07-15 — 玄関ライトで BLE+Thread
+  commissioning を chip-tool 無しでフル完走): BTP/BLE native commissioning（bluer 経由、GATT
+  ペリフェラル接続 + BTP ハンドシェイクの上に PASE を通す。libdbus にリンクする
+  bluer は feature `ble` で隔離 — 本番 `mat`/`matd` の musl クロスビルドは
+  この feature を使わず、chip-tool 廃止後も本番バイナリは BLE 依存を持たない）
+  + Thread operational dataset 配布（`NetworkCommissioning` cluster への
+  `AddOrUpdateThreadNetwork` + `ConnectNetwork` で書き込み、以後は operational
+  mDNS 経由で追跡）を追加。BTP 上では MRP は無効（GATT notify 自体が信頼性を
+  担保するため、BLE 区間は unreliable-send の単純往復）。本番経路は無変更
+  （`mat commission` / `matd` は引き続き chip-tool 一発コミッショニング）。
+  テストはモック `GattLink` を使った統合テスト（`tests/btp_pase_plumbing.rs` —
+  実際に PASE の最初のメッセージまで通す、feature 不要）+ 実機ハーネス
+  （`crates/mat-controller/tests/live_commission_ble.rs`, feature `ble` 必須、
+  `task e2e:m6b:real` — 工場リセットした玄関ライトを対象に BLE+Thread native
+  commission→使い捨て fabric で onoff 制御→native open-window→別端末で本番
+  `mat commission` 実行→使い捨て fabric を RemoveFabric 撤収、という spec の
+  実機受け入れ手順そのまま。jarvis 上で実行する前提、BLE は WSL では動かない）。
+  実機 E2E はこのタスクでは未実施 — 別途実施後、結果をここに追記して最終化する。
+- M7 実装済み(2026-07-15): native 版 mat（one-shot 直経路の native 化）+
+  本番 matd の native 化。設計は
+  `docs/superpowers/specs/2026-07-15-phase5-m7-native-mat-design.md`。
+  決定は 4 つ: **決定1** matd `native.rs`（849 行）からプロセス形態非依存の
+  コアを共有 crate **`mat-native`** に抽出（`NativeConfig`/`Engine`
+  構築・`Establisher`/`NodeConn`・`GroupCtx`/group 送信/`ErrorKind` 写像。
+  matd に残るのは warm セッション slot 管理と `Op`→native 判定のみで、matd の
+  外部挙動・既存統合テストは無改変）。**決定2** `mat` one-shot 直経路の配線
+  — グローバル `--iface`/`MAT_IFACE`（+ `MAT_FABRIC_INDEX` 既定1 /
+  `MAT_ISSUER_INDEX` 既定0）で opt-in、経路優先順位は op 単位で
+  matd 自動発見 → native 直 → chip-tool 直、対象 op は matd M4/M5 の
+  ホットパスと完全パリティ（unicast on/off/color/color-temp/onoff read、
+  group の onoff 引数なし on/off/toggle・color・color-temp）。失敗分岐も
+  matd と同型（エンジン構築失敗→ warn+chip-tool フォールバック、unicast 失敗
+  →即エラー（フォールバックしない、二重実行回避）、group native 不可→
+  chip-tool フォールバック）。one-shot は warm セッションを持たず確立→1 op→
+  破棄（設計ルール4維持）。**決定3** group counter のプロセス間共有 —
+  `<store>/native_group_counter` を one-shot/matd で `flock` 排他共有
+  （`PersistedGroupCounter` に `<path>.lock` の non-blocking exclusive
+  flock を追加、保持中の相手がいれば `WouldBlock`→chip-tool フォールバック）。
+  **決定4** ブランチ運用 — M7 実装+実機 E2E 合格後に `matter-controller` を
+  `main` にマージし main マージ禁止（2026-07-10 決定）を解除、本番=main の
+  原則を回復。バージョンは 0.17.0。受け入れ基準は 5 項目（one-shot 直
+  native・counter 共有・フォールバック・本番 matd native・`task check` 回帰
+  — 詳細は spec 参照）。**本記録の時点では実装 +
+  `task check` 通過のみ**で、実機 E2E（jarvis、上記受け入れ基準）は未実施
+  — 別途実施後、結果をここに追記して最終化する。
+  親 spec（2026-07-10）の未決事項のうち「mat 直経路（one-shot）を新 crate に
+  載せ替える時期」は本 M7 で解決（決定2）。「chip-tool KVS のフォーマット
+  互換をどのバージョン範囲で保証するか」は未解決のまま **M8**（chip-tool
+  完全廃止: write/describe/diag/discover/commission の native 化、汎用
+  name→ID テーブル、KVS 書込所有、バイナリ撤去）に送る。
 
 ---
 
 ## Things we never do
 
-- Implement TLV / CASE / multicast routing inside `mat` (always delegate to
-  `chip-tool`).
+- Implement TLV / CASE / multicast routing inside `mat` or `matd` command
+  layers (protocol code lives only in the `mat-controller` crate; the
+  chip-tool delegation path remains until Phase 5 lands).
 - Hold human names or logical groups in `mat` (out of scope; exception: the
   optional `aliases.toml` name→number map for node / group / endpoint, see
   above — it resolves to numbers before anything reaches chip-tool/matd).

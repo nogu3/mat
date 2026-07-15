@@ -7,6 +7,7 @@
 mod cli;
 mod commands;
 mod matd_client;
+mod native_direct;
 mod probe;
 mod resolve;
 mod runner;
@@ -59,6 +60,26 @@ fn main() -> ExitCode {
             }
         }
         matd_client::Route::Direct => {}
+    }
+
+    // native 直経路（M7）: MAT_IFACE 設定時、対象 op なら mat-controller で
+    // in-process 実行。None は chip-tool 直へフォールスルー。
+    if let Some(iface) = &args.iface {
+        let cfg = native_direct::Config {
+            iface,
+            fabric_index: args.fabric_index,
+            issuer_index: args.issuer_index,
+        };
+        if let Some(result) = native_direct::try_run(&command, &store_path, &cfg) {
+            return match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
+                    e.emit();
+                    ExitCode::from(e.kind.exit_code())
+                }
+            };
+        }
     }
 
     let result = match &command {

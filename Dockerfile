@@ -36,6 +36,12 @@ RUN bash -c "source scripts/activate.sh && \
     scripts/build/gn_gen.sh && \
     ninja -C out chip-tool"
 
+# ── Stage 1b: chip-all-clusters-app（Phase 5 開発の相手役デバイス）──────────────
+# chip-builder のビルド済みツリー上で example を1つ追加ビルドするだけ（キャッシュが効く）。
+FROM chip-builder AS all-clusters-builder
+RUN bash -c "source scripts/activate.sh && \
+    scripts/examples/gn_build_example.sh examples/all-clusters-app/linux out/all-clusters"
+
 # ── Stage 2: mat / matd をビルド（ワークスペース全体）──────────────────────────
 FROM rust:1-bookworm AS mat-builder
 WORKDIR /src

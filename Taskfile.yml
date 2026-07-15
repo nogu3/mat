@@ -86,6 +86,62 @@ tasks:
       - 'echo "実機ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 avahi-daemon"'
       - 'echo "実機実行: export MAT_CHIP_TOOL_BIN=~/chip-tool && ~/mat discover"'
 
+  chip:extract:app:
+    desc: chip-all-clusters-app（Phase 5 開発用の相手役デバイス）を Docker でビルドし ./chip-all-clusters-app に取り出す
+    cmds:
+      - docker build --target all-clusters-builder -t mat-all-clusters-builder .
+      - |
+        id=$(docker create mat-all-clusters-builder)
+        docker cp "$id:/work/connectedhomeip/out/all-clusters/chip-all-clusters-app" ./chip-all-clusters-app
+        docker rm "$id"
+      - 'echo "取り出し完了: $PWD/chip-all-clusters-app"'
+      - 'echo "起動: ./chip-all-clusters-app  （udp/5540 で待ち受け。KVS は /tmp/chip_kvs）"'
+
+  e2e:m1:
+    desc: M1 ライブ E2E（先に ./chip-all-clusters-app を起動しておく）
+    cmds:
+      - cargo test -p mat-controller --test live_all_clusters -- --ignored --nocapture
+
+  e2e:m2:
+    desc: M2b ライブ E2E（自己発行 NOC で CASE + onoff toggle/read。要 ./chip-tool と ./chip-all-clusters-app）
+    cmds:
+      - bash scripts/e2e-m2.sh
+
+  e2e:m3:
+    desc: M3 ライブ E2E（jarvis 相乗り。要 MAT_E2E_HOST / MAT_E2E_NODE_ID。実機で onoff+色変更）
+    cmds:
+      - bash scripts/e2e-m3.sh
+
+  e2e:m4:
+    desc: "M4 実機 E2E（native 有効 matd を jarvis で起動し socket 往復。要 MAT_E2E_HOST/NODE_ID/IFACE）"
+    cmds:
+      - bash scripts/e2e-m4.sh
+
+  e2e:m5:
+    desc: "M5 実機 E2E（native groupcast。要 MAT_E2E_HOST/IFACE/GROUP_NODES）"
+    cmds:
+      - bash scripts/e2e-m5.sh
+
+  e2e:m6:
+    desc: "M6a live E2E: native commissioning (all-clusters-app)"
+    cmds:
+      - bash scripts/e2e-m6.sh
+
+  e2e:m6:real:
+    desc: "M6a 実機 E2E（本番 fabric へ相乗り open-window→使い捨て第二fabricへnative commission→RemoveFabric撤収。要 MAT_E2E_HOST/NODE_ID）"
+    cmds:
+      - bash scripts/e2e-m6-real.sh
+
+  e2e:m6b:real:
+    desc: "M6b 実機 E2E（jarvis 上で実行。工場リセット済みデバイスを BLE+Thread で native commission→open-window→本番復帰→RemoveFabric。要 MAT_E2E_BLE_* / THREAD_DATASET / IFACE / PAA_DIR）"
+    cmds:
+      - bash scripts/e2e-m6b-real.sh
+
+  e2e:m7:
+    desc: "M7 受け入れ: one-shot 直経路 native + counter 共有 (要 MAT_E2E_HOST/IFACE/NODE_ID/GROUP_NODES)"
+    cmds:
+      - bash scripts/e2e-m7.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:

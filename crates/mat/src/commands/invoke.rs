@@ -26,6 +26,13 @@ pub fn run(
     args: &[String],
 ) -> Result<(), MatError> {
     execute(store_path, node_id, endpoint, cluster, command, args)?;
+    emit_invoke_success(node_id, endpoint, cluster, command);
+    Ok(())
+}
+
+/// `invoke` / `on` / `off` の成功 JSON を stdout へ emit する。chip-tool 経路と
+/// native 直経路（`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+pub(crate) fn emit_invoke_success(node_id: u64, endpoint: u16, cluster: &str, command: &str) {
     output::emit(json!({
         "node_id": node_id,
         "endpoint": endpoint,
@@ -33,7 +40,6 @@ pub fn run(
         "command": command,
         "status": "success",
     }));
-    Ok(())
 }
 
 /// invoke の実行部（出力なし）。成功判定までを行い、emit は呼び出し側の責務。
@@ -106,6 +112,19 @@ pub fn run_color_temp(
         "move-to-color-temperature",
         &args,
     )?;
+    emit_color_temp_success(node_id, endpoint, kelvin, mireds, transition);
+    Ok(())
+}
+
+/// `color-temp` の成功 JSON を stdout へ emit する（chip-tool 経路と native 直経路の
+/// 両方から呼ばれる単一ソース）。
+pub(crate) fn emit_color_temp_success(
+    node_id: u64,
+    endpoint: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+) {
     output::emit(json!({
         "node_id": node_id,
         "endpoint": endpoint,
@@ -116,7 +135,6 @@ pub fn run_color_temp(
         "transition": transition,
         "status": "success",
     }));
-    Ok(())
 }
 
 /// `mat color-temp` の `--kelvin` / `--mireds`（排他・どちらか必須）を
@@ -165,6 +183,18 @@ pub fn run_color(
         "move-to-hue-and-saturation",
         &args,
     )?;
+    emit_color_success(node_id, endpoint, color, transition);
+    Ok(())
+}
+
+/// `color` の成功 JSON を stdout へ emit する（chip-tool 経路と native 直経路の
+/// 両方から呼ばれる単一ソース）。
+pub(crate) fn emit_color_success(
+    node_id: u64,
+    endpoint: u16,
+    color: &ResolvedColor,
+    transition: u16,
+) {
     let mut body = json!({
         "node_id": node_id,
         "endpoint": endpoint,
@@ -184,7 +214,6 @@ pub fn run_color(
         body["rgb"] = json!(rgb);
     }
     output::emit(body);
-    Ok(())
 }
 
 #[cfg(test)]

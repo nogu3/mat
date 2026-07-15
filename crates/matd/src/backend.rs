@@ -70,12 +70,13 @@ struct Conn {
 pub struct ChipToolBackend {
     mode: Mode,
     idle: Duration,
+    startup_timeout: Duration,
     conn: Mutex<Conn>,
 }
 
 impl ChipToolBackend {
     /// chip-tool を `interactive server` で起動して繋ぐ。`idle` 無アクセスでセッションを
-    /// 畳む。起動時に一度確立してエラーを早期検出する。
+    /// 畳む。接続は起動時には確立せず、初回コマンドで遅延確立する。
     pub async fn spawn(store: &Path, port: u16, idle: Duration) -> Result<Self, MatError> {
         Self::new(
             Mode::Spawn {
@@ -83,31 +84,42 @@ impl ChipToolBackend {
                 port,
             },
             idle,
+            STARTUP_TIMEOUT,
         )
         .await
     }
 
     /// 既に動いている ws サーバへ接続する（テストや外部起動の chip-tool 用）。
     pub async fn connect(port: u16, idle: Duration) -> Result<Self, MatError> {
-        Self::new(Mode::Connect { port }, idle).await
+        Self::new(Mode::Connect { port }, idle, STARTUP_TIMEOUT).await
     }
 
-    async fn new(mode: Mode, idle: Duration) -> Result<Self, MatError> {
-        let backend = ChipToolBackend {
+    /// テスト専用: 接続失敗のリトライ上限（本番は [`STARTUP_TIMEOUT`] 固定）を
+    /// 短く差し替えて構築する。フォールバック検証テストが「接続できない」ことを
+    /// 確認するために本番の 20 秒を律儀に待たされるのを避けるための seam。
+    /// 本番経路（[`spawn`](Self::spawn) / [`connect`](Self::connect)）の挙動・
+    /// 既定値は変えない。
+    #[cfg(test)]
+    pub(crate) async fn connect_with_startup_timeout(
+        port: u16,
+        idle: Duration,
+        startup_timeout: Duration,
+    ) -> Result<Self, MatError> {
+        Self::new(Mode::Connect { port }, idle, startup_timeout).await
+    }
+
+    async fn new(mode: Mode, idle: Duration, startup_timeout: Duration) -> Result<Self, MatError> {
+        Ok(ChipToolBackend {
             mode,
             idle,
+            startup_timeout,
             conn: Mutex::new(Conn {
                 ws: None,
                 child: None,
                 last_used: Instant::now(),
                 failures: 0,
             }),
-        };
-        // 早期接続。失敗すれば matd 起動を失敗させる。
-        let mut conn = backend.conn.lock().await;
-        backend.ensure_connected(&mut conn).await?;
-        drop(conn);
-        Ok(backend)
+        })
     }
 
     /// アイドル畳み込みの基準時間。reaper の周期決めに使う。
@@ -129,6 +141,13 @@ impl ChipToolBackend {
     /// テスト用: ws だけ捨てる（子は触らない）。次のコマンドで遅延再接続される。
     pub async fn shutdown_ws_for_test(&self) {
         self.conn.lock().await.ws = None;
+    }
+
+    /// テスト用: 接続を今すぐ確立する（lazy 化以降、構築時には確立されないため、
+    /// 「確立済み前提」の検証をするテストが最初に呼ぶ）。
+    pub async fn connect_for_test(&self) -> Result<(), MatError> {
+        let mut conn = self.conn.lock().await;
+        self.ensure_connected(&mut conn).await
     }
 
     /// コマンド行を送り、最初に返る Text メッセージ（= 実行結果 JSON）を返す。
@@ -244,7 +263,7 @@ impl ChipToolBackend {
             }
             Mode::Connect { port } => *port,
         };
-        let ws = connect_with_retry(port, STARTUP_TIMEOUT).await?;
+        let ws = connect_with_retry(port, self.startup_timeout).await?;
         conn.ws = Some(ws);
         Ok(())
     }
@@ -453,16 +472,30 @@ where
 }
 
 /// ws が開くまで一定間隔で接続を試みる。
+///
+/// `connect_async` 自体の 1 回の呼び出しが（SYN が黙って捨てられる等の理由で）
+/// OS レベルの TCP connect タイムアウト（環境によっては 20 秒の `within` より
+/// はるかに長い、数十〜100 秒超）まで返ってこないことがある。単に呼び出し後に
+/// `deadline` を見るだけだと、その 1 回の呼び出し中は `within` を超過していても
+/// 抜けられない。各試行そのものを残り時間で timeout し、`within` を実効的な
+/// 上限にする。
 async fn connect_with_retry(port: u16, within: Duration) -> Result<Ws, MatError> {
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + within;
     loop {
-        match connect_async(&url).await {
-            Ok((ws, _resp)) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MatError::new(
+                ErrorKind::ChildFailed,
+                format!("chip-tool ws on port {port} did not come up within {within:?}"),
+            ));
+        }
+        match tokio::time::timeout(remaining, connect_async(&url)).await {
+            Ok(Ok((ws, _resp))) => {
                 tracing::info!(port, "connected to chip-tool ws");
                 return Ok(ws);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // まだ立ち上がっていないだけかもしれない。期限超過のときだけ諦める。
                 if Instant::now() >= deadline {
                     return Err(MatError::new(
@@ -472,6 +505,13 @@ async fn connect_with_retry(port: u16, within: Duration) -> Result<Ws, MatError>
                         ),
                     ));
                 }
+            }
+            Err(_) => {
+                // この試行自体が残り時間いっぱい応答しなかった＝もう待てない。
+                return Err(MatError::new(
+                    ErrorKind::ChildFailed,
+                    format!("chip-tool ws on port {port} did not come up within {within:?}"),
+                ));
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -550,5 +590,20 @@ mod tests {
             .and_then(Value::as_str)
             .expect("diag attached");
         assert!(diag.contains("0x00000032"), "got: {diag}");
+    }
+
+    #[tokio::test]
+    async fn connect_mode_does_not_dial_until_first_command() {
+        // Connect モードで、繋ぐ相手が居なくても構築は成功する（遅延確立）。
+        // 以前は new() が即接続して失敗していた。
+        let backend = ChipToolBackend::connect(59999, Duration::from_secs(300)).await;
+        assert!(
+            backend.is_ok(),
+            "lazy connect must not dial at construction"
+        );
+        assert!(
+            !backend.unwrap().ws_connected().await,
+            "no ws until first command"
+        );
     }
 }
