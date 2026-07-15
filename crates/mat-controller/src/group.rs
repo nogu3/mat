@@ -32,10 +32,17 @@ pub fn group_multicast_addr(fabric_id: u64, group_id: u16) -> Ipv6Addr {
 }
 
 /// Global Group Data Counter with persist-ahead storage (decimal text file).
+#[derive(Debug)]
 pub struct PersistedGroupCounter {
     next: u32,
     ceiling: u32,
     path: PathBuf,
+    /// プロセス間排他（advisory flock、`<path>.lock` に取る）。counter 本体は
+    /// tmp+rename で置換されるため本体 fd への flock は rename 後に無効化される
+    /// —— ロックは安定した別ファイルに取り、インスタンス生存中保持する
+    /// （Drop で OS が解放。matd 常駐中は one-shot の load が WouldBlock になり、
+    /// native 送信元の counter 混在を構造的に防ぐ）。
+    _lock: std::fs::File,
 }
 
 impl PersistedGroupCounter {
@@ -43,6 +50,25 @@ impl PersistedGroupCounter {
     /// persists the new ceiling before returning. A corrupt counter file is
     /// an error (starting low would get every send dropped by receivers).
     pub fn load(path: &Path, chip_tool_gdc: u32) -> io::Result<Self> {
+        use rustix::fs::{flock, FlockOperation};
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))?;
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            if e == rustix::io::Errno::WOULDBLOCK {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "group counter is locked by another process (matd running?)",
+                )
+            } else {
+                io::Error::other(e)
+            }
+        })?;
         let persisted = match std::fs::read_to_string(path) {
             Ok(s) => s.trim().parse::<u32>().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "corrupt group counter file")
@@ -55,6 +81,7 @@ impl PersistedGroupCounter {
             next: start,
             ceiling: start,
             path: path.to_path_buf(),
+            _lock: lock,
         };
         c.persist(start.wrapping_add(COUNTER_EPOCH))?;
         Ok(c)
@@ -309,6 +336,22 @@ mod tests {
         std::fs::write(&p, "not a number").unwrap();
         assert!(PersistedGroupCounter::load(&p, 0).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn counter_load_is_exclusive_across_handles() {
+        let p = tmp_counter_path("flock");
+        let _ = std::fs::remove_file(&p);
+        let first = PersistedGroupCounter::load(&p, 0).unwrap();
+        // 保持中の 2 度目の load は WouldBlock（別プロセスの matd/one-shot 相当。
+        // flock は open file description 単位なので同一プロセスでも競合する）。
+        let err = PersistedGroupCounter::load(&p, 0).expect_err("second load must fail while held");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        // 解放後は再取得できる。
+        drop(first);
+        let _again = PersistedGroupCounter::load(&p, 0).expect("load after release");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.lock", p.display())));
     }
 
     use crate::im::{CLUSTER_ON_OFF, CMD_ON_OFF_ON, OPCODE_INVOKE_REQUEST, PROTOCOL_ID_IM};
