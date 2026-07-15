@@ -516,9 +516,16 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   `main` にマージし main マージ禁止（2026-07-10 決定）を解除、本番=main の
   原則を回復。バージョンは 0.17.0。受け入れ基準は 5 項目（one-shot 直
   native・counter 共有・フォールバック・本番 matd native・`task check` 回帰
-  — 詳細は spec 参照）。**本記録の時点では実装 +
-  `task check` 通過のみ**で、実機 E2E（jarvis、上記受け入れ基準）は未実施
-  — 別途実施後、結果をここに追記して最終化する。
+  — 詳細は spec 参照）。**実機 E2E 合格 + 本番反映済み（2026-07-15 夜）**:
+  受け入れ 1〜3 を jarvis で全通過（one-shot 直 native の unicast 5 形 +
+  group 3 形の N/N 配達、counter のプロセス跨ぎ jump-ahead・単調増加、
+  describe/diag/write の chip-tool フォールバック健全）。matter-controller を
+  main に `--no-ff` マージ（決定 4 の実行）、本番 jarvis の matd を 0.17.0 +
+  systemd drop-in（`MAT_MATD_IFACE=eth0` / `MAT_MATD_FABRIC_INDEX=2`）で
+  native 有効化。本番受け入れ: warm unicast は native in-process（再起動後も
+  chip-tool 未 spawn のまま処理）、group N/N 配達、describe は chip-tool
+  lazy spawn フォールバックで成功。ロールバックは drop-in 削除 + restart
+  （native 無効化）またはバイナリ退避分（`*.bak-0.16.0`）の復元。
   親 spec（2026-07-10）の未決事項のうち「mat 直経路（one-shot）を新 crate に
   載せ替える時期」は本 M7 で解決（決定2）。「chip-tool KVS のフォーマット
   互換をどのバージョン範囲で保証するか」は未解決のまま **M8**（chip-tool
