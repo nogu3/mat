@@ -114,7 +114,26 @@ impl BleConnection {
 /// することでこの順序を構造的に守る。
 pub async fn open_link(device: &bluer::Device) -> Result<(GattLink, BleConnection), BtpError> {
     if !device.is_connected().await.map_err(gatt("is_connected"))? {
-        device.connect().await.map_err(gatt("connect"))?;
+        // BlueZ routinely aborts the first LE connection right after a scan
+        // ("le-connection-abort-by-local") because StopDiscovery and Connect
+        // race. The abort is transient — retry a few times before giving up.
+        let mut last: Option<bluer::Error> = None;
+        for attempt in 0..6u32 {
+            match device.connect().await {
+                Ok(()) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "ble connect failed — retrying");
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            }
+        }
+        if let Some(e) = last {
+            return Err(BtpError::Gatt(format!("connect: {e}")));
+        }
     }
     let mut c1 = None;
     let mut c2 = None;
@@ -158,16 +177,20 @@ pub async fn open_link(device: &bluer::Device) -> Result<(GattLink, BleConnectio
         let pump = tokio::spawn(async move {
             futures_util::pin_mut!(ind);
             while let Some(v) = ind.next().await {
+                tracing::debug!(bytes = v.len(), "gatt C2 indication");
                 if itx.send(v).await.is_err() {
                     break;
                 }
             }
+            tracing::debug!("gatt C2 indication stream ended");
         });
         while let Some(data) = wrx.recv().await {
+            let n = data.len();
             if let Err(e) = c1.write_ext(&data, &req).await {
                 tracing::warn!(error = %e, "gatt write failed");
                 break;
             }
+            tracing::debug!(bytes = n, "gatt C1 write ok");
         }
         pump.abort();
     });

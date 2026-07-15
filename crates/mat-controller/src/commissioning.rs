@@ -916,7 +916,17 @@ pub async fn commission_btp_thread(
     fabric: &CommissioningFabric,
     params: BleThreadParams<'_>,
 ) -> Result<CommissionedDevice, CommissionError> {
-    let cfg = MrpConfig::default();
+    // BLE devices run SPAKE2+/attestation P-256 math on a constrained MCU and
+    // answer slowly — a factory-fresh Nanoleaf takes ~4s per PASE round. On the
+    // reliable (BTP) transport `send_reliable` waits `total_budget(cfg)` for the
+    // response, so the default ~4.7s budget times out on the final Pake3/status
+    // step (observed live). Use a generous per-step budget; a fast response
+    // still returns immediately, this only raises the ceiling before we give up.
+    let cfg = MrpConfig {
+        initial_interval: Duration::from_secs(15),
+        max_retries: 1,
+        backoff: 1.0,
+    };
     let xpan = thread_ext_pan_id(params.thread_dataset).ok_or(CommissionError::Malformed {
         step: "thread-dataset",
         detail: "no extended pan id (type 2) in dataset",
