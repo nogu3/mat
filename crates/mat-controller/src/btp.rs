@@ -359,12 +359,22 @@ async fn run_session(
                     tracing::warn!("btp: undecodable frame — dropping session");
                     break;
                 };
+                tracing::debug!(
+                    bytes = frame.len(), seq = ?pkt.seq, ack = ?pkt.ack,
+                    beg = pkt.beginning, end = pkt.ending, payload = pkt.payload.len(),
+                    "btp rx frame"
+                );
                 match process_incoming(&pkt, &mut st) {
                     Ok(Some(msg)) => {
+                        tracing::debug!(len = msg.len(), "btp rx message complete");
                         if in_tx.send(msg).await.is_err() { break; }
-                        // 即時 ack（実装簡素化: 受信メッセージ完成ごと）
-                        if send_standalone(&mut link, &mut st).await.is_err() { break; }
-                        keepalive.reset();
+                        // Do NOT send an eager standalone ack here. `process_incoming`
+                        // already set pending_ack, so the ack piggybacks on our next
+                        // outbound frame (the response) — the standard BTP pattern. If
+                        // we stay idle, the keepalive tick flushes it within
+                        // KEEPALIVE_INTERVAL. Sending a separate ack-only frame before
+                        // every response doubled our frame count and left a real
+                        // Nanoleaf silent after Pake3 (observed live on jarvis).
                     }
                     Ok(None) => {
                         // 複数segmentメッセージの途中: 閾値超えなら早めにack
@@ -378,6 +388,7 @@ async fn run_session(
             }
             msg = out_rx.recv() => {
                 let Some(msg) = msg else { break }; // アプリ側 drop → 終了
+                tracing::debug!(len = msg.len(), "btp tx message");
                 if send_message(&mut link, &mut st, &params, &msg, &in_tx).await.is_err() { break; }
                 keepalive.reset();
             }
@@ -390,9 +401,19 @@ async fn run_session(
                     tracing::warn!("btp: no ack progress within ACK_TIMEOUT — closing session");
                     break;
                 }
-                // ウィンドウが満杯なら keepalive も送らない（unacked の
-                // 無制限増加 = u8 オーバーフローを防ぐ。Finding 1）。
-                if st.unacked < params.window_size
+                // アイドル時の standalone ack は「実際に ack を負っている
+                // （pending_ack）」ときだけ flush する。owe していない ack を
+                // 埋め草で送ると、request と response の間に余計な sequenced
+                // フレームが1枚挟まり、後続メッセージの seq が 1 つずれる。実機
+                // の Nanoleaf はこの埋め草 ack のせいで直後の Pake3（本来 seq2 が
+                // seq3 にずれる）を無言ドロップした（jarvis 実機 + btmon HCI
+                // キャプチャで確認。chip-tool は owe していない ack を送らず
+                // PBKDF=seq0/Pake1=seq1/Pake3=seq2 で成功）。pending_ack を
+                // 立てたまま送るデータが無い場合の flush 経路としては残す。
+                // ウィンドウ満杯なら送らない（unacked の無制限増加 = u8
+                // オーバーフロー防止。Finding 1）。
+                if st.pending_ack
+                    && st.unacked < params.window_size
                     && send_standalone(&mut link, &mut st).await.is_err()
                 {
                     break;
@@ -478,10 +499,12 @@ async fn send_message(
             if first { Some(msg.len() as u16) } else { None },
             &msg[off..end],
         );
+        let frame_len = frame.len();
         link.writes
             .send(frame)
             .await
             .map_err(|_| BtpError::Closed)?;
+        tracing::debug!(seq, bytes = frame_len, with_ack, ending, "btp tx frame");
         off = end;
         first = false;
     }
@@ -866,19 +889,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn btp_sends_keepalive_ack_when_idle() {
+    async fn btp_keepalive_flushes_owed_ack_but_not_unsolicited() {
+        // アイドルの keepalive は「owe している ack」だけを flush する。
+        // owe していない状態では何も送らない（request/response の間に埋め草
+        // ack を挟むと後続 seq がずれ、実機 Nanoleaf が Pake3 を無言ドロップ
+        // した回帰の防止 — chip-tool も owe なしでは送らない）。
         let (link, mut p) = fake_link();
         let peripheral = tokio::spawn(async move {
             p.do_handshake(244, 4).await;
-            // 何もしないで待つ → keepalive standalone ack が来るはず
-            let frame = p.from_client.recv().await.expect("keepalive");
+            // まず何も owe していない: 最初の keepalive 期間は沈黙のはず。
+            let quiet = tokio::time::timeout(KEEPALIVE_INTERVAL * 2, p.from_client.recv()).await;
+            assert!(quiet.is_err(), "no unsolicited ack when nothing is owed");
+            // データを1通送ると client は ack を owe する → 次の keepalive で
+            // piggyback 先が無ければ standalone ack として flush される。
+            p.send_message(b"hi", 244, None).await;
+            let frame = p.from_client.recv().await.expect("owed ack flush");
             let pkt = Packet::decode(&frame).unwrap();
             assert!(pkt.payload.is_empty());
             assert!(pkt.ack.is_some());
         });
-        let (_, _t) = connect(link, PROPOSED_WINDOW).await.unwrap();
-        tokio::time::sleep(KEEPALIVE_INTERVAL + std::time::Duration::from_millis(100)).await;
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        // client → app の受信を捨てる（チャネルを詰まらせない）。
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let _ = t.recv_from(&mut buf).await;
+            t // keep the transport (and thus the actor) alive
+        });
+        // 沈黙期間 + データ到着後の keepalive を跨ぐだけ時間を進める。
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 4).await;
         peripheral.await.unwrap();
+        drain.abort();
     }
 
     #[tokio::test]
@@ -939,32 +979,34 @@ mod tests {
     // --- Fix wave 1: keepalive/ack-timeout bounding, proactive inbound ack ---
 
     #[tokio::test(start_paused = true)]
-    async fn btp_keepalive_gated_by_window_then_closes_after_ack_timeout() {
-        // window=2, peer never acks anything: keepalives must stop once
-        // unacked reaches the window (no unbounded growth / u8 overflow),
-        // and the actor must close on its own once ACK_TIMEOUT elapses with
-        // zero ack progress (idle-but-unacked watchdog).
+    async fn btp_watchdog_closes_stalled_session_with_unacked_frames() {
+        // A peer that sends one data frame then never acks anything: the client
+        // owes an ack, flushes it as a standalone ack (unacked -> 1) via the
+        // keepalive path, and — since the peer never acks that frame — the idle
+        // watchdog must close the session within ACK_TIMEOUT of no ack progress.
+        // Also guards that NO unsolicited keepalive is emitted once nothing is
+        // owed (regression: the埋め草 ack shifted seq and made a live Nanoleaf
+        // silently drop Pake3).
         let (link, mut p) = fake_link();
         let peripheral = tokio::spawn(async move {
             p.do_handshake(244, 2).await;
-            for _ in 0..2 {
-                let frame = p.from_client.recv().await.expect("keepalive within window");
-                let pkt = Packet::decode(&frame).unwrap();
-                assert!(pkt.payload.is_empty());
-                assert!(pkt.ack.is_some());
-            }
-            // Window is now full (unacked == window_size == 2): further
-            // keepalive ticks must be skipped, not queued, well before the
-            // eventual ACK_TIMEOUT close.
-            let blocked = tokio::time::timeout(KEEPALIVE_INTERVAL * 3, p.from_client.recv()).await;
-            assert!(blocked.is_err(), "no third keepalive: window-gated");
+            p.send_message(b"x", 244, None).await; // client now owes an ack
+            let frame = p.from_client.recv().await.expect("owed-ack flush");
+            assert!(Packet::decode(&frame).unwrap().payload.is_empty());
+            // nothing more is owed → no further frames until the session closes.
+            let more = tokio::time::timeout(KEEPALIVE_INTERVAL * 3, p.from_client.recv()).await;
+            assert!(
+                more.is_err(),
+                "no unsolicited keepalive once nothing is owed"
+            );
         });
         let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
-        let mut buf = [0u8; 16];
-        let err = tokio::time::timeout(ACK_TIMEOUT + KEEPALIVE_INTERVAL * 2, t.recv_from(&mut buf))
-            .await
-            .expect("actor must close within ACK_TIMEOUT of no ack progress")
-            .unwrap_err();
+        let mut buf = [0u8; 64];
+        // first the delivered inbound message, then BrokenPipe once the watchdog
+        // closes the stalled session.
+        let (n, _) = t.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"x");
+        let err = t.recv_from(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         peripheral.await.unwrap();
     }

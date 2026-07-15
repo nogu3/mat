@@ -470,8 +470,10 @@ pub async fn establish(
         .map_err(CaseError::Exchange)?;
     let msg = match resp {
         Some(m) => {
-            // The real response's ack must cover the Sigma1 we just sent.
-            if m.proto.acked_counter != ex.last_sent_counter() {
+            // The real response's ack must cover the Sigma1 we just sent —
+            // but only over UDP. On a reliable transport (BTP) MRP is
+            // disabled and the peer sends no piggybacked ack.
+            if !transport.is_reliable() && m.proto.acked_counter != ex.last_sent_counter() {
                 return Err(CaseError::Sigma2NotAcked);
             }
             m

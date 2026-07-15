@@ -959,6 +959,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

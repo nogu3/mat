@@ -37,6 +37,16 @@ fn hex_bytes(s: &str) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires jarvis BLE + factory-reset device + OTBR dataset (task e2e:m6b:real)"]
 async fn commission_factory_device_over_ble_thread() {
+    // Diagnostics to stderr (RUST_LOG controls level; --nocapture shows them).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,mat_controller=debug")
+            }),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let passcode: u32 = env("MAT_E2E_BLE_PASSCODE").parse().unwrap();
     let discriminator: u16 = env("MAT_E2E_BLE_DISCRIMINATOR").parse().unwrap();
     let dataset = hex_bytes(&env("MAT_E2E_THREAD_DATASET"));
