@@ -618,6 +618,11 @@ with arguments) are unaffected — they always go through chip-tool.
   value). On first use it jumps to ``max(own file, chip-tool's `g/gdc`) +
   4096``, because native shares the same source node id as chip-tool and
   therefore the same per-sender counter window on the receiving devices.
+  This file is opened with an exclusive `flock` (on `<path>.lock`, held for
+  the life of the process) and is **shared with `mat`'s own one-shot native
+  direct path** (Phase 5 M7, below) — whichever process holds the lock sends
+  with it; the other one finds it locked (`WouldBlock`) and falls back to
+  chip-tool for that group op instead of racing the same counter file.
 - If native can't send (group not provisioned, KVS incomplete, `g/gdc`
   missing, etc.), `matd` logs a warning and falls back to chip-tool for that
   op — it does not fail the request.
@@ -634,7 +639,15 @@ with arguments) are unaffected — they always go through chip-tool.
   to sending via direct chip-tool *after* native has been sending for a
   while, chip-tool's counter is now behind native's and devices will drop
   its groupcasts as stale/duplicate (the same counter-collision failure
-  mode as mixing two chip-tool senders).
+  mode as mixing two chip-tool senders). **Forcing the direct path with
+  `MAT_MATD=0` for group sends while a native `matd` is running is still
+  prohibited** even after Phase 5 M7 gave `mat` its own native group path:
+  `MAT_MATD=0` skips matd auto-discovery, so the send either goes through
+  `mat`'s own native path (flock-shared counter file — safe, see above) or,
+  if that's unavailable, straight to chip-tool — bypassing `matd`'s in-memory
+  counter state either way and reintroducing the same mixing this section
+  warns about. Normally you don't need `MAT_MATD=0` at all: with `matd`
+  running, route priority already sends every group op to it first.
 - **Caveat: this also happens *within* a single `matd`, for group sends
   outside the three native-eligible shapes.** Only `group invoke` for onoff
   `on`/`off`/`toggle` with no extra arguments, `group color`, and `group
@@ -652,6 +665,58 @@ with arguments) are unaffected — they always go through chip-tool.
   `MAT_E2E_HOST` / `MAT_E2E_IFACE` / `MAT_E2E_GROUP_NODES`; stop production
   matd's group traffic for the duration — unicast ops are fine to leave
   running).
+
+### `mat`'s native direct path (Phase 5 M7)
+
+Set `MAT_IFACE=<thread mesh iface>` (or pass the global `--iface <name>`) to
+let `mat`'s own one-shot **direct** path — not `matd` — run its hotpath ops
+in-process too, over the same `mat-native` engine that backs `matd`'s native
+backend above (M4/M5): `on` / `off` / `color` / `color-temp` / `read`ing the
+`onoff` cluster's `on-off` attribute, and the three group-send shapes
+(`group invoke` for onoff `on`/`off`/`toggle` with no extra arguments,
+`group color`, `group color-temp`). Leave it unset and nothing changes: every
+op still goes through chip-tool, exactly as before — opt-in, the same shape
+as `matd`'s `MAT_MATD_IFACE`.
+
+```bash
+mat --iface thread0 on --node 5
+# or: MAT_IFACE=thread0 MAT_FABRIC_INDEX=2 mat group invoke --group 10 --cluster onoff --command on
+```
+
+- **Route priority is per-op, evaluated in this order:** matd auto-discovery
+  (unchanged, tried first) -> native direct (`MAT_IFACE` set and the op is
+  one of the shapes above) -> chip-tool direct. A running `matd` on the
+  probed socket wins even with `MAT_IFACE` set — `MAT_IFACE` only matters
+  once matd isn't in the picture (stopped, or the op isn't matd-supported).
+- `MAT_IFACE` is a deliberately separate name from `matd`'s `MAT_MATD_IFACE`
+  — they configure different processes and are never meant to be inherited
+  into each other by accident.
+- `MAT_FABRIC_INDEX` (default `1`) and `MAT_ISSUER_INDEX` (default `0`)
+  mirror `matd`'s `--fabric-index` / `--issuer-index` and read the same KVS
+  fabric table — pass the same values you'd give `matd` on the same host.
+- **One-shot, no warm session, no retry.** Each call establishes CASE, runs
+  the one op, and discards the session — `mat` stays the same synchronous,
+  stateless binary it always was (design rule 4); the native engine only
+  runs inside a current-thread tokio runtime for the duration of that one
+  call. Unlike `matd`'s warm sessions, there is no automatic re-resolve +
+  re-CASE on timeout: a freshly-established session can't be stale, so a
+  failure is reported as-is.
+- **Failure handling mirrors `matd`'s M4/M5 fallback exactly:** engine
+  construction failure (KVS unreadable, iface not found, etc.) logs a
+  `tracing::warn!` and falls back to chip-tool direct for the whole command.
+  A unicast op that fails after the engine is built (timeout, IM rejection,
+  unreachable) is returned as that error immediately — it does **not** fall
+  back to chip-tool (no double execution, same reasoning as matd's
+  hotpath). A group send that can't go native (not provisioned, KVS
+  incomplete, `g/gdc` missing, or the counter file is locked by another
+  process — see the counter note above) falls back to chip-tool for that op,
+  same as `matd`'s M5 behavior.
+- stdout's JSON schema is identical on every path — this setting only
+  changes which process talks to the device, never what `mat` prints.
+- Implementation: `mat` and `matd` share the same engine (crate
+  `mat-native`, extracted from `matd`'s native module in M7) so the two
+  paths have structurally identical behavior; only session lifetime (warm vs
+  one-shot) differs.
 
 ## Credential store
 
