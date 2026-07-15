@@ -32,6 +32,34 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
+    /// one-shot 直経路を native（mat-controller 内蔵）で実行する場合の
+    /// Thread mesh iface 名（例: eth0）。未設定なら従来どおり chip-tool 直。
+    /// 対象 op は on/off/color/color-temp/onoff on-off read と group の
+    /// onoff 引数なし on/off/toggle・color・color-temp のみ（他は chip-tool 直）。
+    /// matd 稼働中は matd 自動発見が優先される。
+    #[arg(long, global = true, env = "MAT_IFACE", value_name = "IFACE")]
+    pub iface: Option<String>,
+
+    /// native 直経路が読む KVS fabric テーブルの index。
+    #[arg(
+        long,
+        global = true,
+        env = "MAT_FABRIC_INDEX",
+        default_value_t = 1,
+        value_name = "N"
+    )]
+    pub fabric_index: u8,
+
+    /// native 直経路の CA issuer index。
+    #[arg(
+        long,
+        global = true,
+        env = "MAT_ISSUER_INDEX",
+        default_value_t = 0,
+        value_name = "N"
+    )]
+    pub issuer_index: u8,
+
     #[command(subcommand)]
     pub command: Command,
 }
