@@ -400,7 +400,18 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   (PASE / BTP / attestation) removes chip-tool entirely.
 - rust-matc (tom-code/rust-matc, BSD-2) is a reference to read, never to
   copy.
-- Milestones M1–M6 with independent acceptance criteria; the chip-tool
+- Crate layout (as of M7): `mat` / `matd` (command layers, JSON schema,
+  chip-tool child-runner adapter) sit on top of **`mat-native`** (shared
+  engine crate, extracted in M7 from `matd`'s native module — the
+  process-shape-independent core: KVS-backed engine construction, CASE
+  establish + unicast invoke/read, group send context), which itself sits on
+  **`mat-controller`** (the protocol library: TLV, CASE, session crypto,
+  multicast routing, commissioning) and `mat-core` (shared types, errors,
+  color, alias resolution used by every crate including chip-tool-only
+  code). `mat` and `matd` differ only in what they do with `mat-native`'s
+  `Engine`: `matd` holds warm per-node sessions in a `HashMap`, `mat`
+  establishes → runs one op → discards (design rule 4).
+- Milestones M1–M7 with independent acceptance criteria; the chip-tool
   path stays untouched until M4 swaps matd's adapter in-process.
 - The replacement is still one adapter with `mat`'s JSON schema as the
   contract. Subcommands and output schema do not change.
@@ -480,6 +491,38 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   `mat commission` 実行→使い捨て fabric を RemoveFabric 撤収、という spec の
   実機受け入れ手順そのまま。jarvis 上で実行する前提、BLE は WSL では動かない）。
   実機 E2E はこのタスクでは未実施 — 別途実施後、結果をここに追記して最終化する。
+- M7 実装済み(2026-07-15): native 版 mat（one-shot 直経路の native 化）+
+  本番 matd の native 化。設計は
+  `docs/superpowers/specs/2026-07-15-phase5-m7-native-mat-design.md`。
+  決定は 4 つ: **決定1** matd `native.rs`（849 行）からプロセス形態非依存の
+  コアを共有 crate **`mat-native`** に抽出（`NativeConfig`/`Engine`
+  構築・`Establisher`/`NodeConn`・`GroupCtx`/group 送信/`ErrorKind` 写像。
+  matd に残るのは warm セッション slot 管理と `Op`→native 判定のみで、matd の
+  外部挙動・既存統合テストは無改変）。**決定2** `mat` one-shot 直経路の配線
+  — グローバル `--iface`/`MAT_IFACE`（+ `MAT_FABRIC_INDEX` 既定1 /
+  `MAT_ISSUER_INDEX` 既定0）で opt-in、経路優先順位は op 単位で
+  matd 自動発見 → native 直 → chip-tool 直、対象 op は matd M4/M5 の
+  ホットパスと完全パリティ（unicast on/off/color/color-temp/onoff read、
+  group の onoff 引数なし on/off/toggle・color・color-temp）。失敗分岐も
+  matd と同型（エンジン構築失敗→ warn+chip-tool フォールバック、unicast 失敗
+  →即エラー（フォールバックしない、二重実行回避）、group native 不可→
+  chip-tool フォールバック）。one-shot は warm セッションを持たず確立→1 op→
+  破棄（設計ルール4維持）。**決定3** group counter のプロセス間共有 —
+  `<store>/native_group_counter` を one-shot/matd で `flock` 排他共有
+  （`PersistedGroupCounter` に `<path>.lock` の non-blocking exclusive
+  flock を追加、保持中の相手がいれば `WouldBlock`→chip-tool フォールバック）。
+  **決定4** ブランチ運用 — M7 実装+実機 E2E 合格後に `matter-controller` を
+  `main` にマージし main マージ禁止（2026-07-10 決定）を解除、本番=main の
+  原則を回復。バージョンは 0.17.0。受け入れ基準は 5 項目（one-shot 直
+  native・counter 共有・フォールバック・本番 matd native・`task check` 回帰
+  — 詳細は spec 参照）。M6b と同様、**本記録の時点ではライブラリ実装 +
+  `task check` 通過のみ**で、実機 E2E（jarvis、上記受け入れ基準）は未実施
+  — 別途実施後、結果をここに追記して最終化する。
+  親 spec（2026-07-10）の未決事項のうち「mat 直経路（one-shot）を新 crate に
+  載せ替える時期」は本 M7 で解決（決定2）。「chip-tool KVS のフォーマット
+  互換をどのバージョン範囲で保証するか」は未解決のまま **M8**（chip-tool
+  完全廃止: write/describe/diag/discover/commission の native 化、汎用
+  name→ID テーブル、KVS 書込所有、バイナリ撤去）に送る。
 
 ---
 

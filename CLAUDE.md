@@ -11,10 +11,12 @@ This file is the short list of constraints you must not break.
 
 ## Design rules (never break)
 
-1. **Protocol code lives only in the backend crate.** No TLV, no CASE, no
+1. **Protocol code lives only in the backend crates.** No TLV, no CASE, no
    multicast routing inside `mat` / `matd` command layers — that all
-   belongs to the `mat-controller` crate (Phase 5, in progress). Until
-   Phase 5 lands, the production path delegates everything to `chip-tool`.
+   belongs to the backend crates (`mat-controller` / `mat-native`, Phase 5,
+   in progress). By default the production path still delegates everything
+   to `chip-tool`; the native hotpath (see Backend section below) is opt-in
+   until `chip-tool` is fully retired (M8).
 2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
    it in `mat`'s schema. No human decoration (color, progress, prompts). Never
    pass `chip-tool` output through unchanged.
@@ -78,6 +80,11 @@ falling back to `parse_error` + `1`.
 
 ## Backend (chip-tool)
 
+- Route selection is per-op: matd auto-discovery (unchanged) -> native direct
+  (`mat-native`, only when `MAT_IFACE`/`MAT_MATD_IFACE` is set and the op is
+  in the native hotpath) -> direct `chip-tool`. Nothing above this list
+  changes when native is unset — see README for the exact op list and
+  fallback rules.
 - `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
 - The backend is replaceable: `mat` couples to it only through `mat`'s own JSON
   schema. Keep all backend specifics inside the child-runner adapter so a future
