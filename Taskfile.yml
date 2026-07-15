@@ -138,7 +138,7 @@ tasks:
       - bash scripts/e2e-m6b-real.sh
 
   e2e:m7:
-    desc: "M7 acceptance: one-shot native direct + counter sharing (jarvis)"
+    desc: "M7 受け入れ: one-shot 直経路 native + counter 共有 (要 MAT_E2E_HOST/IFACE/NODE_ID/GROUP_NODES)"
     cmds:
       - bash scripts/e2e-m7.sh
 
