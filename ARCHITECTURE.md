@@ -474,7 +474,8 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   本番 fabric 無傷確認、本物 DAC の厳格 attestation を通す）は実装済みで
   コンパイル確認済みだが、ユーザー立ち会いでの実機実行はまだ行っていない
   （次セッションで実施）。
-- M6b 実装済み(2026-07-13): BTP/BLE native commissioning（bluer 経由、GATT
+- M6b 完了(実装 2026-07-13、実機 E2E 合格 2026-07-15 — 玄関ライトで BLE+Thread
+  commissioning を chip-tool 無しでフル完走): BTP/BLE native commissioning（bluer 経由、GATT
   ペリフェラル接続 + BTP ハンドシェイクの上に PASE を通す。libdbus にリンクする
   bluer は feature `ble` で隔離 — 本番 `mat`/`matd` の musl クロスビルドは
   この feature を使わず、chip-tool 廃止後も本番バイナリは BLE 依存を持たない）
@@ -515,7 +516,7 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   `main` にマージし main マージ禁止（2026-07-10 決定）を解除、本番=main の
   原則を回復。バージョンは 0.17.0。受け入れ基準は 5 項目（one-shot 直
   native・counter 共有・フォールバック・本番 matd native・`task check` 回帰
-  — 詳細は spec 参照）。M6b と同様、**本記録の時点ではライブラリ実装 +
+  — 詳細は spec 参照）。**本記録の時点では実装 +
   `task check` 通過のみ**で、実機 E2E（jarvis、上記受け入れ基準）は未実施
   — 別途実施後、結果をここに追記して最終化する。
   親 spec（2026-07-10）の未決事項のうち「mat 直経路（one-shot）を新 crate に
