@@ -931,10 +931,13 @@ version = "0.16.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "mat-controller",
  "mat-core",
+ "mat-native",
  "predicates",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

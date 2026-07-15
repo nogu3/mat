@@ -55,6 +55,19 @@ pub fn run(
         ))
     })?;
 
+    emit_read_success(node_id, endpoint, cluster, attribute, value);
+    Ok(())
+}
+
+/// `read` の成功 JSON を stdout へ emit する。chip-tool 経路と native 直経路
+/// （`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+pub(crate) fn emit_read_success(
+    node_id: u64,
+    endpoint: u16,
+    cluster: &str,
+    attribute: &str,
+    value: serde_json::Value,
+) {
     output::emit(json!({
         "node_id": node_id,
         "endpoint": endpoint,
@@ -62,5 +75,4 @@ pub fn run(
         "attribute": attribute,
         "value": value,
     }));
-    Ok(())
 }
