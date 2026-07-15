@@ -1010,6 +1010,7 @@ dependencies = [
  "futures-util",
  "mat-controller",
  "mat-core",
+ "mat-native",
  "predicates",
  "rustix",
  "serde",
