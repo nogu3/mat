@@ -247,6 +247,12 @@ pub fn invoke(
     endpoint: u16,
 ) -> Result<(), MatError> {
     send(store_path, group_id, cluster, command, args, endpoint)?;
+    emit_invoke_sent(group_id, cluster, command, endpoint);
+    Ok(())
+}
+
+/// `invoke` の出力部（直経路 native からも共有 — M7 Task5）。
+pub(crate) fn emit_invoke_sent(group_id: u16, cluster: &str, command: &str, endpoint: u16) {
     output::emit(json!({
         "group_id": group_id,
         "cluster": cluster,
@@ -255,7 +261,6 @@ pub fn invoke(
         "status": "sent",
         "note": "unacknowledged groupcast; per-device delivery not confirmed",
     }));
-    Ok(())
 }
 
 /// `mat group color-temp` — MoveToColorTemperature を groupcast する
@@ -283,6 +288,18 @@ pub fn color_temp(
         &args,
         endpoint,
     )?;
+    emit_color_temp_sent(group_id, kelvin, mireds, transition, endpoint);
+    Ok(())
+}
+
+/// `color_temp` の出力部（直経路 native からも共有 — M7 Task5）。
+pub(crate) fn emit_color_temp_sent(
+    group_id: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+    endpoint: u16,
+) {
     output::emit(json!({
         "group_id": group_id,
         "cluster": "colorcontrol",
@@ -294,7 +311,6 @@ pub fn color_temp(
         "status": "sent",
         "note": "unacknowledged groupcast; per-device delivery not confirmed",
     }));
-    Ok(())
 }
 
 /// `mat group color` — MoveToHueAndSaturation を groupcast する（`mat color` の
@@ -323,6 +339,17 @@ pub fn color(
         &args,
         endpoint,
     )?;
+    emit_color_sent(group_id, color, transition, endpoint);
+    Ok(())
+}
+
+/// `color` の出力部（直経路 native からも共有 — M7 Task5）。
+pub(crate) fn emit_color_sent(
+    group_id: u16,
+    color: &ResolvedColor,
+    transition: u16,
+    endpoint: u16,
+) {
     let mut body = json!({
         "group_id": group_id,
         "cluster": "colorcontrol",
@@ -343,7 +370,6 @@ pub fn color(
         body["rgb"] = json!(rgb);
     }
     output::emit(body);
-    Ok(())
 }
 
 /// `mat group grant` — provision 済みグループの ACL 欠落を修復する。各ノードへ
