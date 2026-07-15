@@ -137,6 +137,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m6b-real.sh
 
+  e2e:m7:
+    desc: "M7 acceptance: one-shot native direct + counter sharing (jarvis)"
+    cmds:
+      - bash scripts/e2e-m7.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
