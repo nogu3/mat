@@ -856,6 +856,11 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                     .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
             }
 
+            tracing::info!(
+                group_id,
+                keyset_id,
+                "group provision executed (native direct)"
+            );
             crate::commands::group::emit_provision_success(
                 *group_id, *keyset_id, name, *endpoint, node_ids, *rebind,
             );
@@ -874,6 +879,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                     unchanged.push(node_id);
                 }
             }
+            tracing::info!(group_id, "group grant executed (native direct)");
             crate::commands::group::emit_grant_success(*group_id, node_ids, &updated, &unchanged);
         }
         NativeOp::ReadAttr {
@@ -886,6 +892,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
         } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
             let v = conn.read_json(*endpoint, *cluster, *attribute).await?;
+            tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
             crate::commands::read::emit_read_success(
                 *node_id,
                 *endpoint,
@@ -914,6 +921,12 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                 *timed,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster,
+                attribute,
+                "write executed (native direct)"
+            );
             crate::commands::write::emit_write_success(
                 *node_id,
                 *endpoint,
@@ -935,6 +948,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
             let mut conn = engine.establisher.establish(*node_id).await?;
             conn.invoke(*endpoint, *cluster, *command, fields_tlv.clone(), *timed)
                 .await?;
+            tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
             crate::commands::invoke::emit_invoke_success(
                 *node_id, *endpoint, cluster_in, command_in,
             );
@@ -942,6 +956,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
         NativeOp::Describe { node_id } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
             let endpoints = mat_native::ops::describe(&mut *conn).await?;
+            tracing::info!(node_id, "describe executed (native direct)");
             crate::commands::describe::emit_describe_success(*node_id, &endpoints);
         }
         NativeOp::DiagThread { node_id, endpoint } => {
@@ -960,6 +975,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                     })
                 })
                 .collect();
+            tracing::info!(node_id, endpoint, "diag thread executed (native direct)");
             crate::commands::diag::emit_diag_thread_success(
                 *node_id,
                 *endpoint,
@@ -980,6 +996,11 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
             let (manual_code, qr_payload) = conn
                 .open_window(timeout_u16, *discriminator, *iteration)
                 .await?;
+            tracing::info!(
+                node_id,
+                discriminator,
+                "open-window executed (native direct)"
+            );
             crate::commands::open_window::emit_open_window_success(
                 *node_id,
                 &manual_code,

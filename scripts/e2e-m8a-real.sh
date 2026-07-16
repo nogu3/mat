@@ -11,6 +11,15 @@
 # native 実行の実アサーション）。本番 systemd matd（chip-tool 版, port 9100,
 # 既定 socket）には触れない。
 #
+# native 実行の検出方式（M8a Task11 レビュー指摘対応）: 単に "falling back" が
+# 無いことだけでは、classify_strict が None を返す経路（ids テーブル回帰等）で
+# 警告ゼロのまま chip-tool にフォールスルーする false-pass を検出できない
+# （chip-tool 経由でも同じ正解が返るため）。そのため二重チェックにする —
+# (1) positive marker: native_direct.rs::run_op が成功時に出す
+# "<op> executed (native direct)" ログを直接 grep（read/write/invoke/describe/
+# diag/open-window/grant/provision）、(2) 従来通り "falling back" の不在
+# （assert_no_fallback）。
+#
 # 検証項目（brief 通し番号、各アサーション実装箇所は下の "== N/11" コメント参照）:
 #   1. read 汎用      2. write（read 読み返し + null 後始末）
 #   3. 未対応型拒否    4. invoke 汎用
@@ -91,6 +100,24 @@ LAST_STDERR_FILE=$(mktemp)
 # 早期登録する。cleanup() は全操作が `|| true` で防御的なので、対象がまだ
 # 存在しなくても no-op で安全。
 cleanup() {
+  # on-level を best-effort で null に復元（do_write_cycle の null write と同一
+  # コマンドを流用。途中失敗・中断で on-level=128 が残ったままにならないよう
+  # trap のたびに試みる）。必須環境変数 guard（60〜63行目）より前に trap が
+  # 発火する将来的な変更に備え、$NODE ではなく ${MAT_E2E_NODE:-} を直接
+  # 空チェックしてから使う（set -u 下で未定義変数参照により cleanup 自体が
+  # 落ちるのを防ぐ）。
+  if [ -n "${MAT_E2E_HOST:-}" ] && [ -n "${MAT_E2E_NODE:-}" ]; then
+    echo "== cleanup: on-level を null へ復元 (best-effort, node=${MAT_E2E_NODE}) =="
+    local cleanup_envs=(MAT_MATD=0 MAT_LOG=info)
+    [ -n "${MAT_E2E_IFACE:-}" ] && cleanup_envs+=("MAT_IFACE=${MAT_E2E_IFACE}")
+    [ -n "${FABRIC_INDEX:-}" ] && cleanup_envs+=("MAT_FABRIC_INDEX=${FABRIC_INDEX}")
+    local cleanup_store_arg=()
+    [ -n "${STORE:-}" ] && cleanup_store_arg=(--store "$STORE")
+    ssh "$MAT_E2E_HOST" "${cleanup_envs[@]}" /tmp/mat-m8a "${cleanup_store_arg[@]}" \
+      write -n "$MAT_E2E_NODE" -e "${ENDPOINT:-1}" -c levelcontrol -a on-level --value null \
+      >/dev/null 2>&1 || true
+  fi
+
   echo "== cleanup: 一時 matd 停止 + ssh 先の一時ファイル削除 ($MAT_E2E_HOST) =="
   ssh "$MAT_E2E_HOST" "/tmp/matd-m8a stop --socket '$SOCKET'" 2>/dev/null || true
   ssh "$MAT_E2E_HOST" "kill \"\$(cat /tmp/matd-m8a.pid 2>/dev/null)\" 2>/dev/null" || true
@@ -117,7 +144,11 @@ STORE_ARG=()
 # がそのまま効く）。ssh は argv を素朴に空白結合してリモートへ送るため、各引数は
 # 単語内にスペースを含まないこと。
 run_mat_direct() {
-  local envs=(MAT_MATD=0 "MAT_IFACE=$MAT_E2E_IFACE" "MAT_FABRIC_INDEX=$FABRIC_INDEX" RUST_LOG=info)
+  # MAT_LOG=info を明示（mat の init_tracing は MAT_LOG を RUST_LOG より優先する
+  # ので、mat 自身のログレベルを他プロセスの RUST_LOG 設定から独立させる —
+  # native 実行の positive marker ログ（"executed (native direct)"）を確実に
+  # info レベルで出すため。M8a Task11 レビュー指摘対応）。
+  local envs=(MAT_MATD=0 "MAT_IFACE=$MAT_E2E_IFACE" "MAT_FABRIC_INDEX=$FABRIC_INDEX" MAT_LOG=info)
   [ -n "$CHIP_TOOL_BIN" ] && envs+=("MAT_CHIP_TOOL_BIN=$CHIP_TOOL_BIN")
   ssh "$MAT_E2E_HOST" "${envs[@]}" /tmp/mat-m8a "$@" 2>"$LAST_STDERR_FILE"
 }
@@ -125,7 +156,7 @@ run_mat_direct() {
 # 直経路・chip-tool フォールバック（MAT_IFACE 未設定）。検証11（フォールバック
 # 健全性）専用。
 run_mat_chip() {
-  local envs=(MAT_MATD=0 RUST_LOG=info)
+  local envs=(MAT_MATD=0 MAT_LOG=info)
   [ -n "$CHIP_TOOL_BIN" ] && envs+=("MAT_CHIP_TOOL_BIN=$CHIP_TOOL_BIN")
   ssh "$MAT_E2E_HOST" "${envs[@]}" /tmp/mat-m8a "$@" 2>"$LAST_STDERR_FILE"
 }
@@ -148,6 +179,21 @@ assert_no_fallback() {
   fi
 }
 
+# positive 実証: native_direct.rs::run_op（または mat-native/src/group.rs）が
+# 成功時に出す "... executed (native direct)" / "groupcast sent (native)" を
+# 直接 grep する。assert_no_fallback（"falling back" の不在）だけでは
+# classify_strict が None を返す経路（ids テーブル回帰等）で警告ゼロのまま
+# chip-tool にフォールスルーする false-pass を検出できないための二重チェック
+# （M8a Task11 レビュー指摘対応）。
+# $1 = grep パターン, $2 = 説明（省略可）
+assert_native_marker() {
+  if ! grep -q -- "$1" "$LAST_STDERR_FILE"; then
+    echo "FAIL: ${2:-op} — stderr に native 実行の positive marker '$1' が無い（native で走った実証なし）:" >&2
+    cat "$LAST_STDERR_FILE" >&2
+    exit 1
+  fi
+}
+
 # ---- write の read/read-back/null-cleanup サイクル（検証2・検証11共有） ----
 # $1 = runner 関数名（run_mat_direct / run_mat_chip）
 # $2 = "yes" なら assert_no_fallback も行う（native 経路のみ）
@@ -156,22 +202,34 @@ do_write_cycle() {
   OUT=$("$runner" "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value 128)
   echo "$OUT"
   assert_grep '"status":"success"' "$OUT" "write levelcontrol on-level=128 が status:success を返さない"
-  [ "$native" = yes ] && assert_no_fallback "write on-level=128"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "write on-level=128"
+    assert_native_marker "write executed (native direct)" "write on-level=128"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" read -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level)
   echo "$OUT"
   assert_grep '"value":128' "$OUT" "write 直後の read on-level が value:128 を返さない"
-  [ "$native" = yes ] && assert_no_fallback "read on-level (post-write)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "read on-level (post-write)"
+    assert_native_marker "read executed (native direct)" "read on-level (post-write)"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value null)
   echo "$OUT"
   assert_grep '"status":"success"' "$OUT" "write levelcontrol on-level=null（後始末）が status:success を返さない"
-  [ "$native" = yes ] && assert_no_fallback "write on-level=null (cleanup)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "write on-level=null (cleanup)"
+    assert_native_marker "write executed (native direct)" "write on-level=null (cleanup)"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" read -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level)
   echo "$OUT"
   assert_grep '"value":null' "$OUT" "後始末後の read on-level が value:null を返さない"
-  [ "$native" = yes ] && assert_no_fallback "read on-level (post-cleanup)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "read on-level (post-cleanup)"
+    assert_native_marker "read executed (native direct)" "read on-level (post-cleanup)"
+  fi
 }
 
 # ---- invoke move-to-level + current-level 読み返し（検証4・検証11共有） ----
@@ -180,12 +238,18 @@ do_invoke_cycle() {
   OUT=$("$runner" "${STORE_ARG[@]}" invoke -n "$NODE" -e "$ENDPOINT" -c levelcontrol --command move-to-level 200 0 0 0)
   echo "$OUT"
   assert_grep '"status":"success"' "$OUT" "invoke levelcontrol move-to-level が status:success を返さない"
-  [ "$native" = yes ] && assert_no_fallback "invoke move-to-level"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "invoke move-to-level"
+    assert_native_marker "invoke executed (native direct)" "invoke move-to-level"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" read -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a current-level)
   echo "$OUT"
   assert_grep '"value":200' "$OUT" "move-to-level 後の read current-level が value:200 を返さない"
-  [ "$native" = yes ] && assert_no_fallback "read current-level (post-invoke)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "read current-level (post-invoke)"
+    assert_native_marker "read executed (native direct)" "read current-level (post-invoke)"
+  fi
 }
 
 # ---- open-window（検証7・検証11共有） ----
@@ -200,7 +264,10 @@ do_open_window() {
     || { echo "FAIL: open-window の manual_code が11桁数字でない: '$manual'" >&2; exit 1; }
   [[ "$qr" == MT:* ]] \
     || { echo "FAIL: open-window の qr_payload が 'MT:' で始まらない: '$qr'" >&2; exit 1; }
-  [ "$native" = yes ] && assert_no_fallback "open-window"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "open-window"
+    assert_native_marker "open-window executed (native direct)" "open-window"
+  fi
 }
 
 # ---- group grant 冪等性（検証8・検証11共有） ----
@@ -209,12 +276,18 @@ do_group_grant_idempotent() {
   OUT=$("$runner" "${STORE_ARG[@]}" group grant -g "$GROUP" --nodes $GROUP_NODES)
   echo "$OUT"
   assert_grep '"status":"granted"' "$OUT" "group grant（1回目）が status:granted を返さない"
-  [ "$native" = yes ] && assert_no_fallback "group grant (1st)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "group grant (1st)"
+    assert_native_marker "group grant executed (native direct)" "group grant (1st)"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" group grant -g "$GROUP" --nodes $GROUP_NODES)
   echo "$OUT"
   assert_grep '"status":"granted"' "$OUT" "group grant（2回目）が status:granted を返さない"
-  [ "$native" = yes ] && assert_no_fallback "group grant (2nd)"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "group grant (2nd)"
+    assert_native_marker "group grant executed (native direct)" "group grant (2nd)"
+  fi
 
   local updated_len unchanged_len expected_len
   updated_len=$(printf '%s' "$OUT" | jq '.updated | length')
@@ -237,18 +310,27 @@ do_group_provision_rebind() {
     --keyset-id "$KEYSET" --rebind)
   echo "$OUT"
   assert_grep '"status":"provisioned"' "$OUT" "group provision --rebind が status:provisioned を返さない"
-  [ "$native" = yes ] && assert_no_fallback "group provision --rebind"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "group provision --rebind"
+    assert_native_marker "group provision executed (native direct)" "group provision --rebind"
+  fi
 
   OUT=$("$runner" "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command off -e "$ENDPOINT")
   echo "$OUT"
   assert_grep '"status":"sent"' "$OUT" "group invoke off が status:sent を返さない"
-  [ "$native" = yes ] && assert_no_fallback "group invoke off"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "group invoke off"
+    assert_native_marker "groupcast sent (native)" "group invoke off"
+  fi
   confirm "[$label] グループ($GROUP) 全メンバー ($GROUP_NODES) が消灯していることを目視確認 (N/N)"
 
   OUT=$("$runner" "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command on -e "$ENDPOINT")
   echo "$OUT"
   assert_grep '"status":"sent"' "$OUT" "group invoke on が status:sent を返さない"
-  [ "$native" = yes ] && assert_no_fallback "group invoke on"
+  if [ "$native" = yes ]; then
+    assert_no_fallback "group invoke on"
+    assert_native_marker "groupcast sent (native)" "group invoke on"
+  fi
   confirm "[$label] グループ($GROUP) 全メンバー ($GROUP_NODES) が点灯していることを目視確認 (N/N)"
 }
 
@@ -259,6 +341,7 @@ OUT=$(run_mat_direct "${STORE_ARG[@]}" read -n "$NODE" -e "$ENDPOINT" -c levelco
 echo "$OUT"
 assert_grep '"value":' "$OUT" "read levelcontrol current-level が value を含まない"
 assert_no_fallback "read current-level (baseline)"
+assert_native_marker "read executed (native direct)" "read current-level (baseline)"
 
 echo "-- 2/11 write（read 読み返し + null 後始末）"
 do_write_cycle run_mat_direct yes
@@ -285,6 +368,7 @@ OUT=$(run_mat_direct "${STORE_ARG[@]}" describe -n "$NODE")
 echo "$OUT"
 assert_grep '"endpoints"' "$OUT" "describe（native）が endpoints を含まない"
 assert_no_fallback "describe (native)"
+assert_native_marker "describe executed (native direct)" "describe (native)"
 DESCRIBE_NATIVE="$OUT"
 
 DESCRIBE_CHIP=$(run_mat_chip "${STORE_ARG[@]}" describe -n "$NODE")
@@ -308,6 +392,7 @@ OUT=$(run_mat_direct "${STORE_ARG[@]}" diag thread -n "$NODE")
 echo "$OUT"
 assert_grep '"thread"' "$OUT" "diag thread（native）が thread を含まない"
 assert_no_fallback "diag thread (native)"
+assert_native_marker "diag thread executed (native direct)" "diag thread (native)"
 DIAG_NATIVE="$OUT"
 
 NT_IS_ARRAY=$(printf '%s' "$DIAG_NATIVE" | jq '.thread.neighbor_table | type == "array"')
