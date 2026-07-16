@@ -64,8 +64,8 @@ fn parse_code(s: &str) -> Result<Code, MatError> {
     }
 }
 
-/// `CommissionError` → mat の `ErrorKind`（spec の写像。発見の空振り =
-/// `Discovery` はここに来ない — 呼び出し側で Unavailable に落とす）。
+/// `CommissionError` → mat の `ErrorKind`（spec の写像。発見の空振り
+/// （`Discovery`）は呼び出し側が `Unavailable` に写すためここには来ない）。
 fn kind_of(e: &CommissionError) -> ErrorKind {
     match e {
         CommissionError::Timeout(_) => ErrorKind::Timeout,
@@ -214,7 +214,7 @@ pub async fn commission(
             .await
             .map_err(|e| MatError::new(ErrorKind::Other, format!("udp bind: {e}")))?,
     );
-    let dev = commissioning::commission_on_network(
+    let dev = match commissioning::commission_on_network(
         transport,
         &commissioning_fabric,
         CommissionParams {
@@ -227,16 +227,18 @@ pub async fn commission(
         },
     )
     .await
-    .map_err(|e| match e {
-        // 発見段階（resolve）内での空振りは未接触 — ただし上で事前 resolve
-        // 済みのため実際にはほぼ来ない。来たら安全側（unreachable, リトライ
-        // 可能）。
-        CommissionError::Discovery(_) => MatError::new(
-            ErrorKind::Unreachable,
-            "commissionable disappeared between discovery and PASE".to_string(),
-        ),
-        other => commission_error(other),
-    })?;
+    {
+        Ok(d) => d,
+        // 内部 resolve（PASE より前 — ワイヤ未接触）での空振り。事前 resolve
+        // 成功後の狭い競合窓だが、規則どおり Unavailable = chip-tool
+        // フォールバック可に倒す。
+        Err(CommissionError::Discovery(e)) => {
+            return Ok(CommissionAttempt::Unavailable(format!(
+                "commissionable disappeared before PASE: {e}"
+            )))
+        }
+        Err(other) => return Err(commission_error(other)),
+    };
     tracing::info!(
         node_id = dev.node_id,
         fabric_index = ?dev.fabric_index,
@@ -348,7 +350,24 @@ mod tests {
             ErrorKind::Unreachable
         );
         // attestation 失敗 = デバイス拒否相当（純正でないデバイス等）。
-        // 具体 variant は Attestation(_) — テストでは構築できる最小の値を使う。
+        assert_eq!(
+            kind_of(&E::Attestation(
+                mat_controller::attestation::AttestationError::Nonce
+            )),
+            ErrorKind::DeviceRejected
+        );
+        assert_eq!(kind_of(&E::Noc(1)), ErrorKind::DeviceRejected);
+        assert_eq!(kind_of(&E::Csr("bad")), ErrorKind::ParseError);
+        // catch-all（マッチしないその他 variant）= CommissionFailed。
+        // Ble は Timeout/Attestation/Noc/CommandStatus/NetworkConfig/
+        // Malformed/Csr のいずれの腕にも当たらないため catch-all に落ちる。
+        assert_eq!(
+            kind_of(&E::Ble {
+                step: "gatt",
+                detail: "x".into()
+            }),
+            ErrorKind::CommissionFailed
+        );
     }
 
     #[test]
