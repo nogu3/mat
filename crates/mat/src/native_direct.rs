@@ -287,14 +287,26 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
     match op {
         NativeOp::On { node_id, endpoint } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(*endpoint, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
-                .await?;
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_ON,
+                None,
+                false,
+            )
+            .await?;
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "on");
         }
         NativeOp::Off { node_id, endpoint } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(*endpoint, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_OFF, None)
-                .await?;
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_OFF,
+                None,
+                false,
+            )
+            .await?;
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "off");
         }
         NativeOp::ReadOnOff { node_id, endpoint } => {
@@ -325,6 +337,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 im::CLUSTER_COLOR_CONTROL,
                 im::CMD_MOVE_TO_HUE_AND_SATURATION,
                 Some(fields),
+                false,
             )
             .await?;
             crate::commands::invoke::emit_color_success(*node_id, *endpoint, color, *transition);
@@ -343,6 +356,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 im::CLUSTER_COLOR_CONTROL,
                 im::CMD_MOVE_TO_COLOR_TEMPERATURE,
                 Some(fields),
+                false,
             )
             .await?;
             crate::commands::invoke::emit_color_temp_success(

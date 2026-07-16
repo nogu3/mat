@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
+use serde_json::json;
 
 use mat_controller::tlv::{Tag, Writer};
 use mat_core::error::{ErrorKind, MatError};
@@ -36,7 +37,41 @@ impl NodeConn for FakeConn {
         _cluster: u32,
         _command: u32,
         _fields: Option<Vec<u8>>,
+        _timed: bool,
     ) -> Result<(), MatError> {
+        Ok(())
+    }
+
+    async fn read_json(
+        &mut self,
+        _endpoint: u16,
+        _cluster: u32,
+        _attribute: u32,
+    ) -> Result<serde_json::Value, MatError> {
+        Ok(json!(1))
+    }
+
+    async fn read_cluster(
+        &mut self,
+        _endpoint: u16,
+        _cluster: u32,
+    ) -> Result<Vec<(u32, serde_json::Value)>, MatError> {
+        Ok(vec![(0u32, json!(true))])
+    }
+
+    async fn write_tlv(
+        &mut self,
+        _endpoint: u16,
+        _cluster: u32,
+        _attribute: u32,
+        _data_tlv: Vec<u8>,
+        _timed: bool,
+    ) -> Result<(), MatError> {
+        let n = self.sent;
+        self.sent += 1;
+        if self.fail_first_send && n == 0 {
+            return Err(MatError::new(self.fail_kind, "fake send failure"));
+        }
         Ok(())
     }
 }

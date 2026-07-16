@@ -987,6 +987,7 @@ dependencies = [
  "base64ct",
  "mat-controller",
  "mat-core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
