@@ -349,6 +349,19 @@ pub struct ReportDataMessage {
 /// Struct→JSON object（キーは context tag 番号の10進文字列。名前付けは
 /// 上位層の責務）。
 fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Value, ImError> {
+    tlv_element_to_json_impl(r, first, 0)
+}
+
+fn tlv_element_to_json_impl(
+    r: &mut Reader,
+    first: Element,
+    depth: usize,
+) -> Result<serde_json::Value, ImError> {
+    const MAX_DEPTH: usize = 32;
+    if depth > MAX_DEPTH {
+        return Err(ImError::Malformed("tlv nesting too deep"));
+    }
+
     use serde_json::Value as J;
     Ok(match first.value {
         Value::Bool(b) => J::Bool(b),
@@ -366,7 +379,7 @@ fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Val
                 if el.value == Value::ContainerEnd {
                     break;
                 }
-                items.push(tlv_element_to_json(r, el)?);
+                items.push(tlv_element_to_json_impl(r, el, depth + 1)?);
             }
             J::Array(items)
         }
@@ -379,9 +392,19 @@ fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Val
                 }
                 let key = match el.tag {
                     Tag::Context(n) => n.to_string(),
-                    _ => continue, // 想定外タグはスキップ（前方互換）
+                    _ => {
+                        // 想定外タグはスキップ（前方互換）。ただしそれがコンテナ開始ならば
+                        // 中身を読み飛ばす（そうでないと兄弟フィールドの解釈が壊れる）。
+                        if matches!(
+                            el.value,
+                            Value::StructStart | Value::ArrayStart | Value::ListStart
+                        ) {
+                            skip_container(r)?;
+                        }
+                        continue;
+                    }
                 };
-                map.insert(key, tlv_element_to_json(r, el)?);
+                map.insert(key, tlv_element_to_json_impl(r, el, depth + 1)?);
             }
             J::Object(map)
         }
@@ -1722,5 +1745,82 @@ mod tests {
             !saw_attr_tag,
             "wildcard read must omit the attribute path field"
         );
+    }
+
+    #[test]
+    fn tlv_to_json_rejects_pathological_nesting() {
+        // Construct deeply nested TLV (100 levels) to test stack overflow protection.
+        // ArrayStart × 100 without matching ContainerEnd should fail with Malformed
+        // when depth limit (32) is exceeded.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        w.start_list(Tag::Context(1));
+        w.put_uint(Tag::Context(4), 1);
+        w.end_container();
+        // Data (Context(2)) with 100 nested arrays
+        for _ in 0..100 {
+            w.start_array(Tag::Context(2));
+        }
+        for _ in 0..100 {
+            w.end_container();
+        }
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        let err = decode_report_data_message(&w.finish()).unwrap_err();
+        assert!(
+            matches!(err, ImError::Malformed(_)),
+            "Expected Malformed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tlv_to_json_skips_noncontext_container_fields_safely() {
+        // Struct with a non-Context (anonymous) container followed by a Context field.
+        // Must safely skip the anonymous struct without misinterpreting the next field.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous); // Data struct
+        w.start_struct(Tag::Anonymous); // Unexpected anonymous child struct
+        w.put_uint(Tag::Context(9), 99); // Some data inside
+        w.end_container(); // End anonymous struct
+        w.put_uint(Tag::Context(0), 7); // Following Context field
+        w.end_container(); // End Data struct
+        let bytes = w.finish();
+
+        // Wrap in a full ReportDataMessage to test via decode_report_data_message
+        let mut full_msg = Writer::new();
+        full_msg.start_struct(Tag::Anonymous);
+        full_msg.start_array(Tag::Context(1)); // AttributeReportIBs
+        full_msg.start_struct(Tag::Anonymous); // AttributeReportIB
+        full_msg.start_struct(Tag::Context(1)); // AttributeDataIB
+        full_msg.put_uint(Tag::Context(0), 1); // DataVersion
+        full_msg.start_list(Tag::Context(1)); // Path
+        full_msg.put_uint(Tag::Context(2), 0);
+        full_msg.put_uint(Tag::Context(3), 0x0006);
+        full_msg.put_uint(Tag::Context(4), 0x0000);
+        full_msg.end_container();
+        // The Data field with mixed anonymous/context tags
+        let mut data_reader = Reader::new(&bytes);
+        let data_el = data_reader.next().unwrap().unwrap();
+        copy_value(
+            &mut full_msg,
+            &mut data_reader,
+            Tag::Context(2),
+            data_el.value,
+        )
+        .expect("valid TLV");
+        full_msg.end_container(); // AttributeDataIB
+        full_msg.end_container(); // AttributeReportIB
+        full_msg.end_container(); // AttributeReportIBs
+        full_msg.end_container(); // outer struct
+
+        let msg = decode_report_data_message(&full_msg.finish()).unwrap();
+        assert_eq!(msg.reports.len(), 1);
+        let data = msg.reports[0].data.as_ref().unwrap();
+        assert_eq!(data.get("0").and_then(|v| v.as_u64()), Some(7));
     }
 }
