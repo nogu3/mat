@@ -3,11 +3,16 @@
 //!
 //! Scope: resolve one `<CompressedFabricId>-<NodeId>._matter._tcp.local`
 //! instance to IPv6 addresses + port + MRP intervals (TXT `SII`/`SAI`).
-//! No browsing, no advertising, no cache: send a legacy unicast query
-//! (source port ≠ 5353, so responders reply straight back to us), fold
-//! responses until SRV + at least one AAAA for its target are in hand.
-//! TXT is folded when it arrives in the same responses but is not waited
-//! for — MRP falls back to the spec default interval without it.
+//! No advertising, no cache: send a legacy unicast query (source port ≠
+//! 5353, so responders reply straight back to us), fold responses until
+//! SRV + at least one AAAA for its target are in hand. TXT is folded when
+//! it arrives in the same responses but is not waited for — MRP falls back
+//! to the spec default interval without it.
+//!
+//! M8b adds one-shot browse (`browse_commissionable` / `browse_operational`):
+//! same legacy unicast transport, but enumerating PTR answers for a whole
+//! service type and folding SRV/TXT/AAAA per instance until a fixed window
+//! ([`BROWSE_WINDOW`]) expires — no early return, still no cache.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
@@ -627,13 +632,10 @@ pub async fn resolve_commissionable(
 pub const BROWSE_WINDOW: Duration = Duration::from_secs(3);
 /// browse が追跡する instance 数の上限（偽装 flood でメモリを伸ばさない —
 /// MAX_AAAA と同思想）。
-#[allow(dead_code)]
 const MAX_INSTANCES: usize = 32;
 /// browse 中の AAAA 候補プール上限（instance 横断で共有）。
-#[allow(dead_code)]
 const MAX_BROWSE_AAAA: usize = 64;
 /// フォローアップクエリ 1 メッセージあたりの質問数上限（MTU 超え回避）。
-#[allow(dead_code)]
 const MAX_QUESTIONS_PER_MSG: usize = 8;
 
 /// `_matterc._udp` で見つかった commissionable 1 台分（TXT パース済み）。
@@ -663,7 +665,6 @@ pub struct OperationalInstance {
 }
 
 /// finish() が返す、サービス種別に依存しない 1 instance 分の素材。
-#[allow(dead_code)]
 struct FoldedInstance {
     /// instance の完全名（先頭ラベルが instance 名）。
     name: String,
@@ -683,7 +684,6 @@ struct InstanceFold {
 
 /// browse の畳み込み状態。データグラム単位で [`fold`](Self::fold) に食わせ、
 /// window 満了後に [`finish`](Self::finish) で取り出す。
-#[allow(dead_code)]
 struct BrowseFold {
     /// 例 "_matterc._udp.local"（大文字小文字無視で照合）。
     service: String,
@@ -694,7 +694,6 @@ struct BrowseFold {
     aaaa: Vec<(String, Ipv6Addr)>,
 }
 
-#[allow(dead_code)]
 impl BrowseFold {
     fn new(service: &str) -> Self {
         BrowseFold {
@@ -807,8 +806,82 @@ impl BrowseFold {
     }
 }
 
+/// One-shot legacy unicast mDNS browse: `service`（例 "_matterc._udp.local"）
+/// の PTR を列挙し、instance ごとに SRV/TXT/AAAA を畳み込む。resolve_* と
+/// 違い早期 return せず `window` 満了まで収集する（全員から集めるため、
+/// 実行時間 = window で固定）。クエリは 1 秒間隔で再送。
+async fn browse(
+    scope_id: u32,
+    service: &str,
+    window: Duration,
+) -> Result<Vec<FoldedInstance>, DnssdError> {
+    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(DnssdError::Io)?;
+    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let mut fold = BrowseFold::new(service);
+    let deadline = Instant::now() + window;
+    let mut next_send = Instant::now();
+    // browse 応答は resolve より大きくなり得る（複数 instance の additional
+    // 同梱）ため、受信バッファは mDNS の実質上限まで取る。
+    let mut buf = vec![0u8; 9000];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= next_send {
+            let q = encode_query(0, &[(service, TYPE_PTR)]);
+            sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            let pending = fold.pending_questions();
+            for chunk in pending.chunks(MAX_QUESTIONS_PER_MSG) {
+                let qs: Vec<(&str, u16)> = chunk.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+                let q = encode_query(0, &qs);
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            }
+            next_send = now + QUERY_RESEND_INTERVAL;
+        }
+        let wait = deadline.min(next_send).saturating_duration_since(now);
+        let Ok(recv) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await else {
+            continue;
+        };
+        let (n, _) = recv.map_err(DnssdError::Io)?;
+        // 他人の壊れたデータグラムで browse を中断しない。
+        let Ok(records) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        fold.fold(&records);
+    }
+    Ok(fold.finish())
+}
+
+/// `_matterc._udp` の全 commissionable を列挙する（spec §4.3.1）。
+/// 0 件は正常（周囲に commissioning モードのデバイスが無い）。
+pub async fn browse_commissionable(
+    scope_id: u32,
+    window: Duration,
+) -> Result<Vec<CommissionableInstance>, DnssdError> {
+    Ok(browse(scope_id, "_matterc._udp.local", window)
+        .await?
+        .iter()
+        .filter_map(commissionable_from_fold)
+        .collect())
+}
+
+/// `_matter._tcp` の全 operational instance を列挙する（spec §4.3）。
+/// announce のみ（SRV/AAAA 未解決）の instance も addresses 空で含める。
+pub async fn browse_operational(
+    scope_id: u32,
+    window: Duration,
+) -> Result<Vec<OperationalInstance>, DnssdError> {
+    Ok(browse(scope_id, "_matter._tcp.local", window)
+        .await?
+        .iter()
+        .filter_map(operational_from_fold)
+        .collect())
+}
+
 /// TXT から文字列値（key は大文字小文字無視）を取り出す。
-#[allow(dead_code)]
 fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
     for s in strings {
         let Ok(s) = std::str::from_utf8(s) else {
@@ -825,7 +898,6 @@ fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
 }
 
 /// TXT `VP`（`<vendor>+<product>`、product 省略可、10 進）を分解する。
-#[allow(dead_code)]
 fn split_vp(vp: &str) -> (Option<u32>, Option<u32>) {
     match vp.split_once('+') {
         Some((v, p)) => (v.parse().ok(), p.parse().ok()),
@@ -834,14 +906,12 @@ fn split_vp(vp: &str) -> (Option<u32>, Option<u32>) {
 }
 
 /// SRV target（例 "HOST01.local"）→ hostname（末尾 ".local" を除去）。
-#[allow(dead_code)]
 fn hostname_from_target(target: &str) -> String {
     target.strip_suffix(".local").unwrap_or(target).to_string()
 }
 
 /// instance 完全名の先頭ラベル `<CFID 16hex>-<NodeId 16hex>` をパースする。
 /// 形式外は None（他プロトコル / 他サービスの流れ弾）。
-#[allow(dead_code)]
 fn parse_operational_label(name: &str) -> Option<(String, u64)> {
     let label = name.split('.').next()?;
     let (cfid, node) = label.split_once('-')?;
@@ -857,7 +927,6 @@ fn parse_operational_label(name: &str) -> Option<(String, u64)> {
 
 /// 畳み込んだ素材 → commissionable。素材ゼロ（PTR しか見えず SRV/TXT/AAAA が
 /// 期限内に揃わなかった）は None（chip-tool 経路の空エントリ skip と同じ扱い）。
-#[allow(dead_code)]
 fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance> {
     let discriminator = txt_u32(&f.txt, "D");
     let (vendor_id, product_id) = txt_str(&f.txt, "VP").map(split_vp).unwrap_or((None, None));
@@ -882,7 +951,6 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
 }
 
 /// 畳み込んだ素材 → operational。announce のみ（addresses 空）でも返す。
-#[allow(dead_code)]
 fn operational_from_fold(f: &FoldedInstance) -> Option<OperationalInstance> {
     let (compressed_fabric, node_id) = parse_operational_label(&f.name)?;
     Some(OperationalInstance {
@@ -1459,7 +1527,7 @@ mod tests {
 
     #[test]
     fn browse_fold_ignores_records_for_other_services() {
-        // 同じ網に有線 LAN プリンタ等がいても混ぎらない。
+        // 同じ網に有線 LAN プリンタ等がいても混ざらない。
         let mut fold = BrowseFold::new(MC);
         let d = synth_browse_response(
             "_ipp._tcp.local",
