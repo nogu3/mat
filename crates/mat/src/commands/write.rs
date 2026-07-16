@@ -48,6 +48,19 @@ pub fn run(
         ));
     }
 
+    emit_write_success(node_id, endpoint, cluster, attribute, value);
+    Ok(())
+}
+
+/// `write` の成功 JSON を stdout へ emit する。chip-tool 経路と native 直経路
+/// （`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+pub(crate) fn emit_write_success(
+    node_id: u64,
+    endpoint: u16,
+    cluster: &str,
+    attribute: &str,
+    value: &str,
+) {
     output::emit(json!({
         "node_id": node_id,
         "endpoint": endpoint,
@@ -58,5 +71,4 @@ pub fn run(
         "value": normalize_value(value),
         "status": "success",
     }));
-    Ok(())
 }
