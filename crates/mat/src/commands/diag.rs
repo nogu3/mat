@@ -154,7 +154,7 @@ pub fn node(
     node_id: u64,
     endpoint: u16,
     deep: bool,
-    iface: Option<&str>,
+    native: Option<&crate::native_direct::Config<'_>>,
 ) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     let rec = store.require_node(node_id)?;
@@ -198,7 +198,8 @@ pub fn node(
             node_id,
             address,
             self_cfid,
-            iface,
+            native,
+            store.root(),
         );
     } else {
         unavailable.push(json!({ "check": "ip", "kind": "skipped_no_deep" }));
@@ -255,14 +256,15 @@ fn read_thread_signal(
 }
 
 /// `--deep` の補助プローブ。ping6（IP生存）と mDNS 広告確認（iface 指定時は
-/// native browse、未指定・失敗時は avahi-browse）を実施。
+/// native の targeted resolve、未指定・失敗時は avahi-browse）を実施。
 fn deep_probes(
     checks: &mut Checks,
     unavailable: &mut Vec<Value>,
     node_id: u64,
     address: Option<String>,
     self_cfid: Option<String>,
-    iface: Option<&str>,
+    native: Option<&crate::native_direct::Config<'_>>,
+    store_root: &Path,
 ) {
     // ip: ping6
     match address.as_deref() {
@@ -283,8 +285,14 @@ fn deep_probes(
         None => unavailable.push(json!({ "check": "ip", "kind": "no_address_in_store" })),
     }
 
-    // mdns: native browse（iface 指定時）または avahi-browse
-    match crate::probe::mdns(iface) {
+    // mdns: native targeted resolve（iface 指定時）または avahi-browse
+    match crate::probe::mdns(native.map(|c| crate::probe::NativeProbe {
+        iface: c.iface,
+        fabric_index: c.fabric_index,
+        issuer_index: c.issuer_index,
+        store_root,
+        node_ids: std::slice::from_ref(&node_id),
+    })) {
         Ok(instances) => {
             // アドレスベースで照合（ストアの address が Some の場合）。
             // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。

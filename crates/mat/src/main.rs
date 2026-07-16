@@ -64,13 +64,13 @@ fn main() -> ExitCode {
 
     // native 直経路（M7）: MAT_IFACE 設定時、対象 op なら mat-controller で
     // in-process 実行。None は chip-tool 直へフォールスルー。
-    if let Some(iface) = &args.iface {
-        let cfg = native_direct::Config {
-            iface,
-            fabric_index: args.fabric_index,
-            issuer_index: args.issuer_index,
-        };
-        if let Some(result) = native_direct::try_run(&command, &store_path, &cfg) {
+    let native_cfg = args.iface.as_deref().map(|iface| native_direct::Config {
+        iface,
+        fabric_index: args.fabric_index,
+        issuer_index: args.issuer_index,
+    });
+    if let Some(cfg) = &native_cfg {
+        if let Some(result) = native_direct::try_run(&command, &store_path, cfg) {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
 
     let result = match &command {
         Command::Discover { probe } => {
-            commands::discover::run(&store_path, *probe, args.iface.as_deref())
+            commands::discover::run(&store_path, *probe, native_cfg.as_ref())
         }
         Command::Commission {
             target,
@@ -265,7 +265,7 @@ fn main() -> ExitCode {
                 node_id.id(),
                 endpoint.id(),
                 *deep,
-                args.iface.as_deref(),
+                native_cfg.as_ref(),
             ),
         },
     };
