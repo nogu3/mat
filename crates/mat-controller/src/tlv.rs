@@ -175,6 +175,72 @@ impl Writer {
         assert_eq!(self.depth, 0, "finish with unbalanced containers");
         self.buf
     }
+
+    /// Deep-copies one complete, well-formed TLV element (and, if a
+    /// container, its full subtree) from `element`, re-tagging only the
+    /// top-level element as `tag`. Used to splice a caller-provided,
+    /// already-encoded value (e.g. an IM `Data` element) into a larger
+    /// message without the caller needing to know the target tag up front.
+    ///
+    /// Panics if `element` is not exactly one well-formed TLV element — a
+    /// caller/programmer error (the element is always something `mat` itself
+    /// encoded earlier), not device input to validate defensively.
+    pub fn put_raw_element(&mut self, tag: Tag, element: &[u8]) {
+        let mut r = Reader::new(element);
+        let el = r
+            .next()
+            .expect("element must be valid tlv")
+            .expect("element must not be empty");
+        copy_value(self, &mut r, tag, el.value).expect("element must be one well-formed TLV value");
+    }
+}
+
+/// Deep-copies one TLV element (and, if a container, its full subtree) from
+/// `r` into `w`, re-tagging only the top-level element as `tag`. Shared by
+/// `Writer::put_raw_element` (splicing a standalone pre-encoded element) and
+/// callers that need to copy a value already positioned mid-stream (e.g.
+/// `im::decode_command_data_ib`'s CommandFields echo).
+pub(crate) fn copy_value(
+    w: &mut Writer,
+    r: &mut Reader,
+    tag: Tag,
+    value: Value,
+) -> Result<(), TlvError> {
+    match value {
+        Value::Int(v) => w.put_int(tag, v),
+        Value::Uint(v) => w.put_uint(tag, v),
+        Value::Bool(v) => w.put_bool(tag, v),
+        Value::F32(v) => w.put_f32(tag, v),
+        Value::F64(v) => w.put_f64(tag, v),
+        Value::Utf8(v) => w.put_str(tag, v),
+        Value::Bytes(v) => w.put_bytes(tag, v),
+        Value::Null => w.put_null(tag),
+        Value::StructStart => {
+            w.start_struct(tag);
+            return copy_container(w, r);
+        }
+        Value::ArrayStart => {
+            w.start_array(tag);
+            return copy_container(w, r);
+        }
+        Value::ListStart => {
+            w.start_list(tag);
+            return copy_container(w, r);
+        }
+        Value::ContainerEnd => {}
+    }
+    Ok(())
+}
+
+fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
+    loop {
+        let el = r.next()?.ok_or(TlvError::Truncated)?;
+        if el.value == Value::ContainerEnd {
+            w.end_container();
+            return Ok(());
+        }
+        copy_value(w, r, el.tag, el.value)?;
+    }
 }
 
 impl Default for Writer {

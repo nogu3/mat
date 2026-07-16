@@ -504,29 +504,8 @@ impl SecureSession {
         let exchange_id = Self::new_exchange_id();
 
         if let Some(timeout_ms) = timed_timeout_ms {
-            let timed_req = im::encode_timed_request(timeout_ms);
-            let resp = self
-                .send_reliable(
-                    exchange_id,
-                    im::PROTOCOL_ID_IM,
-                    im::OPCODE_TIMED_REQUEST,
-                    &timed_req,
-                    cfg,
-                )
+            self.send_timed_request(exchange_id, timeout_ms, cfg)
                 .await?;
-            let msg = match resp {
-                Some(m) => m,
-                None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-            };
-            match msg.proto.opcode {
-                im::OPCODE_STATUS_RESPONSE => {
-                    let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
-                    if s != 0 {
-                        return Err(SessionError::Im(ImError::StatusResponse(s)));
-                    }
-                }
-                op => return Err(SessionError::UnexpectedOpcode(op)),
-            }
         }
 
         let req = if timed_timeout_ms.is_some() {
@@ -558,6 +537,246 @@ impl SecureSession {
                     }));
                 }
                 Ok(data)
+            }
+            im::OPCODE_STATUS_RESPONSE => {
+                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                Err(SessionError::Im(ImError::StatusResponse(s)))
+            }
+            op => Err(SessionError::UnexpectedOpcode(op)),
+        }
+    }
+
+    /// Sends `TimedRequest(timeout_ms)` on `exchange_id` and waits for its
+    /// `StatusResponse` (spec §8.5.1), erroring on anything but SUCCESS (0).
+    /// Shared by `invoke_for_data`'s and `write_attribute_tlv`'s timed
+    /// pre-step — both must open the timeout window on the same exchange the
+    /// following InvokeRequest/WriteRequest is sent on.
+    async fn send_timed_request(
+        &mut self,
+        exchange_id: u16,
+        timeout_ms: u16,
+        cfg: &MrpConfig,
+    ) -> Result<(), SessionError> {
+        use crate::im::{self, ImError};
+        let timed_req = im::encode_timed_request(timeout_ms);
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_TIMED_REQUEST,
+                &timed_req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        match msg.proto.opcode {
+            im::OPCODE_STATUS_RESPONSE => {
+                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                if s != 0 {
+                    return Err(SessionError::Im(ImError::StatusResponse(s)));
+                }
+                Ok(())
+            }
+            op => Err(SessionError::UnexpectedOpcode(op)),
+        }
+    }
+
+    /// Drives a ReadRequest's response through any `MoreChunkedMessages`
+    /// continuation (spec §8.9.2), collecting every `ReportDataMessage`
+    /// chunk. `first` is the message already received in response to the
+    /// initial request (either the piggybacked reply or the standalone
+    /// `recv` fallback, same pattern as every other IM exchange here).
+    async fn collect_reports(
+        &mut self,
+        exchange_id: u16,
+        first: IncomingMessage,
+        cfg: &MrpConfig,
+    ) -> Result<Vec<crate::im::ReportDataMessage>, SessionError> {
+        use crate::im;
+        let mut msgs = Vec::new();
+        let mut msg = first;
+        loop {
+            match msg.proto.opcode {
+                im::OPCODE_REPORT_DATA => {
+                    let rd =
+                        im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+                    let more = rd.more_chunks;
+                    let suppress = rd.suppress_response;
+                    msgs.push(rd);
+                    if more {
+                        // Chunk continuation: a StatusResponse(0) prompts
+                        // the device to send the next chunk.
+                        let ok = im::encode_status_response(0);
+                        let resp = self
+                            .send_reliable(
+                                exchange_id,
+                                im::PROTOCOL_ID_IM,
+                                im::OPCODE_STATUS_RESPONSE,
+                                &ok,
+                                cfg,
+                            )
+                            .await?;
+                        msg = match resp {
+                            Some(m) => m,
+                            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+                        };
+                        continue;
+                    }
+                    if !suppress {
+                        // Best-effort close of the final chunk, same
+                        // rationale as `read_attribute`'s trailing
+                        // StatusResponse: the data is already in hand, so a
+                        // lost ack here must not turn a successful read into
+                        // an error.
+                        let ok = im::encode_status_response(0);
+                        let _ = self
+                            .send_reliable(
+                                exchange_id,
+                                im::PROTOCOL_ID_IM,
+                                im::OPCODE_STATUS_RESPONSE,
+                                &ok,
+                                cfg,
+                            )
+                            .await;
+                    }
+                    return Ok(msgs);
+                }
+                im::OPCODE_STATUS_RESPONSE => {
+                    let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+                    return Err(SessionError::Im(im::ImError::StatusResponse(s)));
+                }
+                op => return Err(SessionError::UnexpectedOpcode(op)),
+            }
+        }
+    }
+
+    /// Reads a single attribute (spec §8.9.2), chunk-aware, returning its
+    /// value as JSON via `im::tlv_element_to_json`'s conventions (see
+    /// `im::merge_reports`). Unlike `read_attribute` (M2, scalar-only), this
+    /// accepts any TLV shape (struct/array/list) and reassembles
+    /// `MoreChunkedMessages` chunks. A status-only report (device rejected
+    /// the read) surfaces as `ImError::AttributeStatus`.
+    pub async fn read_attribute_json(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        cfg: &MrpConfig,
+    ) -> Result<serde_json::Value, SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+        let req = im::encode_read_request(endpoint, cluster, attribute);
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_READ_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        let msgs = self.collect_reports(exchange_id, msg, cfg).await?;
+        if let Some((_, value)) = im::merge_reports(&msgs).into_iter().next() {
+            return Ok(value);
+        }
+        // No data reports: a single-attribute read that came back
+        // status-only means the device rejected it — surface that status
+        // rather than a generic "no value" if we have one in hand.
+        let status = msgs
+            .iter()
+            .flat_map(|m| m.reports.iter())
+            .find_map(|r| r.status);
+        Err(match status {
+            Some(s) => SessionError::Im(ImError::AttributeStatus(s)),
+            None => SessionError::Im(ImError::Malformed("no value")),
+        })
+    }
+
+    /// Wildcard-reads every attribute of a cluster (spec §8.9.2), chunk-aware
+    /// (see `read_attribute_json`). Returns `(attribute_id, JSON value)`
+    /// pairs in first-seen order, per `im::merge_reports`.
+    pub async fn read_cluster_json(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        cfg: &MrpConfig,
+    ) -> Result<Vec<(u32, serde_json::Value)>, SessionError> {
+        use crate::im;
+        let exchange_id = Self::new_exchange_id();
+        let req = im::encode_read_request_cluster(endpoint, cluster);
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_READ_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        let msgs = self.collect_reports(exchange_id, msg, cfg).await?;
+        Ok(im::merge_reports(&msgs))
+    }
+
+    /// Writes a single attribute (spec §8.9.2.4). `data_tlv` must be one
+    /// complete, well-formed TLV element holding the new value (any
+    /// top-level tag; `im::encode_write_request_tlv` re-tags it). When
+    /// `timed_ms` is `Some(t)`, sends `TimedRequest(t)` first on the same
+    /// exchange (spec §8.5.1) — same pre-step as `invoke_for_data`'s timed
+    /// path, via `send_timed_request`. A non-zero `AttributeStatusIB` status
+    /// in the WriteResponse is returned as `ImError::AttributeStatus`.
+    pub async fn write_attribute_tlv(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        data_tlv: &[u8],
+        timed_ms: Option<u16>,
+        cfg: &MrpConfig,
+    ) -> Result<(), SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+
+        if let Some(timeout_ms) = timed_ms {
+            self.send_timed_request(exchange_id, timeout_ms, cfg)
+                .await?;
+        }
+
+        let req = if timed_ms.is_some() {
+            im::encode_write_request_tlv_timed(endpoint, cluster, attribute, data_tlv)
+        } else {
+            im::encode_write_request_tlv(endpoint, cluster, attribute, data_tlv)
+        };
+        let resp = self
+            .send_reliable(
+                exchange_id,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_WRITE_REQUEST,
+                &req,
+                cfg,
+            )
+            .await?;
+        let msg = match resp {
+            Some(m) => m,
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
+        };
+        match msg.proto.opcode {
+            im::OPCODE_WRITE_RESPONSE => {
+                let status = im::decode_write_response(&msg.payload).map_err(SessionError::Im)?;
+                if status != 0 {
+                    return Err(SessionError::Im(ImError::AttributeStatus(status)));
+                }
+                Ok(())
             }
             im::OPCODE_STATUS_RESPONSE => {
                 let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
@@ -1469,6 +1688,296 @@ mod tests {
             err,
             SessionError::Im(crate::im::ImError::StatusResponse(0x7E))
         ));
+        dev.await.unwrap();
+    }
+
+    /// WriteResponse shaped like Task 5's `im.rs` fixture
+    /// (`decode_write_response_returns_first_status`): a single
+    /// AttributeStatusIB with the given status.
+    fn write_response_payload(status: u8) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(0));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0)); // path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), u64::from(status));
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    #[tokio::test]
+    async fn write_attribute_reports_status_zero_as_ok() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_WRITE_REQUEST);
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_WRITE_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9500,
+                &write_response_payload(0),
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+
+        let mut w = crate::tlv::Writer::new();
+        w.put_uint(crate::tlv::Tag::Anonymous, 128);
+        let data_tlv = w.finish();
+
+        s.write_attribute_tlv(
+            1,
+            crate::im::CLUSTER_ON_OFF,
+            crate::im::ATTR_ON_OFF,
+            &data_tlv,
+            None,
+            &fast_cfg(),
+        )
+        .await
+        .unwrap();
+        dev.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_attribute_maps_nonzero_status_to_attribute_status_error() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_WRITE_REQUEST);
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_WRITE_RESPONSE,
+                Some(h.message_counter),
+                true,
+                9501,
+                &write_response_payload(0x87), // CONSTRAINT_ERROR
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+
+        let mut w = crate::tlv::Writer::new();
+        w.put_uint(crate::tlv::Tag::Anonymous, 999);
+        let data_tlv = w.finish();
+
+        let err = s
+            .write_attribute_tlv(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::ATTR_ON_OFF,
+                &data_tlv,
+                None,
+                &fast_cfg(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Im(crate::im::ImError::AttributeStatus(0x87))
+        ));
+        dev.await.unwrap();
+    }
+
+    /// Single-attribute ReportData for `read_cluster_json_merges_two_chunks`'s
+    /// first chunk: one AttributeDataIB (Replace, scalar value).
+    fn report_data_message_attr(
+        endpoint: u16,
+        cluster: u32,
+        attr: u32,
+        value: u64,
+        more_chunks: bool,
+        suppress: bool,
+    ) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReportIBs
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeDataIB
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), u64::from(endpoint));
+        w.put_uint(Tag::Context(3), u64::from(cluster));
+        w.put_uint(Tag::Context(4), u64::from(attr));
+        w.end_container();
+        w.put_uint(Tag::Context(2), value); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        if more_chunks {
+            w.put_bool(Tag::Context(3), true);
+        }
+        if suppress {
+            w.put_bool(Tag::Context(4), true);
+        }
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// ReportData for `read_cluster_json_merges_two_chunks`'s second (final)
+    /// chunk: 2 AttributeReportIBs for the same attribute, both list-append
+    /// (ListIndex = null), matching Task 4's
+    /// `merge_reports_joins_chunked_list_appends` fixture shape.
+    fn report_data_message_attr_list_append_2(
+        endpoint: u16,
+        cluster: u32,
+        attr: u32,
+        v1: u64,
+        v2: u64,
+        suppress: bool,
+    ) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        fn path(w: &mut Writer, endpoint: u16, cluster: u32, attr: u32) {
+            w.start_list(Tag::Context(1));
+            w.put_uint(Tag::Context(2), u64::from(endpoint));
+            w.put_uint(Tag::Context(3), u64::from(cluster));
+            w.put_uint(Tag::Context(4), u64::from(attr));
+            w.put_null(Tag::Context(5)); // ListIndex = null -> append
+            w.end_container();
+        }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        for v in [v1, v2] {
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(1));
+            path(&mut w, endpoint, cluster, attr);
+            w.put_uint(Tag::Context(2), v);
+            w.end_container();
+            w.end_container();
+        }
+        w.end_container();
+        if suppress {
+            w.put_bool(Tag::Context(4), true);
+        }
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// `read_cluster_json` must follow a `MoreChunkedMessages` continuation
+    /// (StatusResponse(0) to prompt the next chunk, per spec §8.9.2) and
+    /// merge the resulting reports across chunks via `im::merge_reports`.
+    #[tokio::test]
+    async fn read_cluster_json_merges_two_chunks() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        const ATTR_A: u32 = 0x0005;
+        const ATTR_B: u32 = 0x0006;
+
+        let dev = tokio::spawn(async move {
+            // 1. ReadRequest -> ReportData chunk1 (attr A, MoreChunkedMessages=true)
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+            let resp1 = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                Some(h.message_counter),
+                true,
+                9900,
+                &report_data_message_attr(1, crate::im::CLUSTER_ON_OFF, ATTR_A, 7, true, false),
+            );
+            device.send_to(&resp1, from).await.unwrap();
+
+            // Our ReportData chunk1 asked for its own ack (needs_ack=true,
+            // matching real MRP traffic) — drain the controller's
+            // standalone ack for it before the next real message.
+            let mut ack_buf = [0u8; MAX_DATAGRAM];
+            let (ack_n, _) = device.recv_from(&mut ack_buf).await.unwrap();
+            let (_, ack_p, _) = open_from_controller(&ack_buf[..ack_n]);
+            assert_eq!(ack_p.opcode, OPCODE_MRP_STANDALONE_ACK);
+
+            // 2. controller prompts the next chunk with StatusResponse(0)
+            let mut buf2 = [0u8; MAX_DATAGRAM];
+            let (n2, from2) = device.recv_from(&mut buf2).await.unwrap();
+            let (h2, p2, _body2) = open_from_controller(&buf2[..n2]);
+            assert_eq!(p2.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+
+            // 3. ReportData chunk2 (attr B, list-append x2, final chunk, suppressed)
+            let resp2 = device_datagram(
+                p2.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                Some(h2.message_counter),
+                true,
+                9901,
+                &report_data_message_attr_list_append_2(
+                    1,
+                    crate::im::CLUSTER_ON_OFF,
+                    ATTR_B,
+                    10,
+                    20,
+                    true,
+                ),
+            );
+            device.send_to(&resp2, from2).await.unwrap();
+        });
+
+        let got = s
+            .read_cluster_json(1, crate::im::CLUSTER_ON_OFF, &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (ATTR_A, serde_json::json!(7)),
+                (ATTR_B, serde_json::json!([10, 20])),
+            ]
+        );
         dev.await.unwrap();
     }
 }
