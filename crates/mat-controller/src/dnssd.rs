@@ -155,6 +155,122 @@ fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
     out
 }
 
+/// Byte budget per packet for [`encode_ptr_query_with_known`] (comfortably
+/// under a typical path MTU; real responders truncated at ~1428B — see the
+/// module doc's known-answer-suppression note).
+const KNOWN_ANSWER_PACKET_BUDGET: usize = 1400;
+
+/// PTR クエリ + Known-Answer リストを 1..N 個のパケットに符号化する
+/// (RFC 6762 §7.2)。KA が 1 パケットに収まらない場合は分割し、最後以外の
+/// パケットに TC を立てる（responder は TC の間、応答を保留して継続を待つ）。
+/// 2 パケット目以降は question 数 0 の KA 継続パケット。
+///
+/// レコードの owner name は、そのパケット内でオフセット 12 に置かれた名前
+/// （パケット 1 なら question 名そのもの、継続パケットならその中の最初の
+/// レコードが literal に書く service 名）への圧縮ポインタ (`0xC0 0x0C`) で
+/// 表す。継続パケットの最初のレコードだけは、指す先がまだ無いので service
+/// 名を literal に書く（以後のレコードはそれを指せる）。rdata（instance の
+/// 完全名）は先頭ラベルを literal に書き、残り（service 名の tail）は同じ
+/// オフセット 12 への圧縮ポインタで表す。
+///
+/// 既知 instance が 0 件のときは旧来の単発クエリ（TC 無し、1 パケット）に
+/// 退化する。
+fn encode_ptr_query_with_known(service: &str, known: &[(String, u32)]) -> Vec<Vec<u8>> {
+    if known.is_empty() {
+        return vec![encode_query(0, &[(service, TYPE_PTR)])];
+    }
+
+    let mut qname = Vec::new();
+    push_name(&mut qname, service);
+    let mut question = qname.clone();
+    question.extend_from_slice(&TYPE_PTR.to_be_bytes());
+    question.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    // 各 KA の "tail"（type+class+ttl+rdlength+rdata）を先に組み立てる。
+    // owner name（ポインタ or literal）はパケット内の位置に依存するため、
+    // グループ分けの段階で別途足す。
+    let suffix = format!(".{service}");
+    let mut ka_tails: Vec<Vec<u8>> = Vec::new();
+    for (name, ttl) in known {
+        if name.len() <= suffix.len() {
+            continue; // 防御的スキップ: service の下位名の形になっていない
+        }
+        let (label, tail) = name.split_at(name.len() - suffix.len());
+        if !tail.eq_ignore_ascii_case(&suffix) || label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        let mut rec = Vec::with_capacity(2 + 2 + 4 + 2 + 1 + label.len() + 2);
+        rec.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        rec.extend_from_slice(&CLASS_IN.to_be_bytes());
+        rec.extend_from_slice(&ttl.to_be_bytes());
+        let rdlen = (1 + label.len() + 2) as u16;
+        rec.extend_from_slice(&rdlen.to_be_bytes());
+        rec.push(label.len() as u8);
+        rec.extend_from_slice(label.as_bytes());
+        rec.extend_from_slice(&[0xC0, 0x0C]); // rdata: service 名 tail への圧縮ポインタ
+        ka_tails.push(rec);
+    }
+
+    if ka_tails.is_empty() {
+        return vec![encode_query(0, &[(service, TYPE_PTR)])];
+    }
+
+    // グループ分け: 各パケットの owner name コストは
+    // - パケット 1 のレコード: 常に 2B ポインタ（question が既にオフセット 12 にある）
+    // - 継続パケットの最初のレコード: qname.len()B literal（後続の指す先を作る）
+    // - 継続パケットの 2 個目以降: 2B ポインタ
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut current_size = 12 + question.len();
+    for (idx, tail) in ka_tails.iter().enumerate() {
+        loop {
+            let gi = groups.len() - 1;
+            let is_packet0 = gi == 0;
+            let is_first_in_group = groups[gi].is_empty();
+            let name_len = if is_packet0 || !is_first_in_group {
+                2
+            } else {
+                qname.len()
+            };
+            let rec_len = name_len + tail.len();
+            if groups[gi].is_empty() || current_size + rec_len <= KNOWN_ANSWER_PACKET_BUDGET {
+                groups[gi].push(idx);
+                current_size += rec_len;
+                break;
+            }
+            groups.push(Vec::new());
+            current_size = 12;
+        }
+    }
+
+    let n = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, idxs)| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u16.to_be_bytes()); // id
+            let flags: u16 = if i + 1 < n { 0x0200 } else { 0 };
+            out.extend_from_slice(&flags.to_be_bytes());
+            let qdcount: u16 = if i == 0 { 1 } else { 0 };
+            out.extend_from_slice(&qdcount.to_be_bytes());
+            out.extend_from_slice(&(idxs.len() as u16).to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
+            if i == 0 {
+                out.extend_from_slice(&question);
+            }
+            for (j, &idx) in idxs.iter().enumerate() {
+                if i == 0 || j > 0 {
+                    out.extend_from_slice(&[0xC0, 0x0C]);
+                } else {
+                    out.extend_from_slice(&qname);
+                }
+                out.extend_from_slice(&ka_tails[idx]);
+            }
+            out
+        })
+        .collect()
+}
+
 /// Reads a possibly-compressed name starting at `pos`. Returns the dotted
 /// name and the offset just past the name *at its original location*.
 /// Pointer chains are hop-bounded to reject compression loops.
@@ -206,6 +322,7 @@ enum RData {
 struct Record {
     name: String,
     rdata: RData,
+    ttl: u32,
 }
 
 /// Smallest possible record: 1-byte root name + type(2) + class(2) +
@@ -262,6 +379,13 @@ fn be16(buf: &[u8], pos: usize) -> Result<u16, DnssdError> {
     Ok(u16::from_be_bytes(b.try_into().expect("2 bytes")))
 }
 
+fn be32(buf: &[u8], pos: usize) -> Result<u32, DnssdError> {
+    let b = buf
+        .get(pos..pos + 4)
+        .ok_or(DnssdError::Malformed("truncated"))?;
+    Ok(u32::from_be_bytes(b.try_into().expect("4 bytes")))
+}
+
 /// Parses the answer + authority + additional records of one DNS message.
 /// Record classes are ignored (mDNS is IN-only; the cache-flush bit lives in
 /// the class field and must not break parsing).
@@ -284,6 +408,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     for _ in 0..total {
         let (name, p) = read_name(buf, pos)?;
         let rtype = be16(buf, p)?;
+        let ttl = be32(buf, p + 4)?;
         let rdlen = usize::from(be16(buf, p + 8)?);
         let rdata_pos = p + 10;
         let rdata = buf
@@ -335,7 +460,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             }
             _ => RData::Other,
         };
-        records.push(Record { name, rdata });
+        records.push(Record { name, rdata, ttl });
         pos = rdata_pos + rdlen;
     }
     Ok(records)
@@ -631,8 +756,11 @@ pub async fn resolve_commissionable(
 /// せず、この時間で打ち切る。
 pub const BROWSE_WINDOW: Duration = Duration::from_secs(3);
 /// browse が追跡する instance 数の上限（偽装 flood でメモリを伸ばさない —
-/// MAX_AAAA と同思想）。
-const MAX_INSTANCES: usize = 32;
+/// MAX_AAAA と同思想）。実機の複数 fabric レジストリは 32 を上回る
+/// （2026-07 実機観測: 29+ instance が単一 TC 切り捨て応答に収まらず、かつ
+/// 古い fabric の残留 entry も含め 32 を超過）ため 128 に拡張。
+/// 128 × 約 100B は依然として無視できるフラッド上限。
+const MAX_INSTANCES: usize = 128;
 /// browse 中の AAAA 候補プール上限（instance 横断で共有）。
 const MAX_BROWSE_AAAA: usize = 64;
 /// フォローアップクエリ 1 メッセージあたりの質問数上限（MTU 超え回避）。
@@ -679,6 +807,9 @@ struct FoldedInstance {
 struct InstanceFold {
     srv: Option<(u16, String)>,
     txt: Option<Vec<Vec<u8>>>,
+    /// この instance を紹介した PTR レコードの TTL（重複 PTR は最新を残す）。
+    /// Known-Answer suppression の再送クエリに載せる値。
+    ttl: u32,
 }
 
 /// browse の畳み込み状態。データグラム単位で [`fold`](Self::fold) に食わせ、
@@ -707,14 +838,22 @@ impl BrowseFold {
     fn fold(&mut self, records: &[Record]) {
         for r in records {
             if let RData::Ptr(inst) = &r.rdata {
-                if r.name.eq_ignore_ascii_case(&self.service)
-                    && self.instances.len() < MAX_INSTANCES
-                    && !self
-                        .instances
-                        .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case(inst))
+                if !r.name.eq_ignore_ascii_case(&self.service) {
+                    continue;
+                }
+                if let Some((_, f)) = self
+                    .instances
+                    .iter_mut()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(inst))
                 {
-                    self.instances.push((inst.clone(), InstanceFold::default()));
+                    // 重複 PTR: TTL は最新のものを残す。
+                    f.ttl = r.ttl;
+                } else if self.instances.len() < MAX_INSTANCES {
+                    let f = InstanceFold {
+                        ttl: r.ttl,
+                        ..InstanceFold::default()
+                    };
+                    self.instances.push((inst.clone(), f));
                 }
             }
         }
@@ -775,6 +914,18 @@ impl BrowseFold {
         out
     }
 
+    /// Known-Answer suppression（RFC 6762 §7.1）用に、既知 instance の
+    /// (完全名, TTL) を返す。再送クエリの answer セクションに載せると
+    /// responder は載っていない残りだけを返すため、単一データグラムに
+    /// 収まらない大きなレジストリ（実機で 29 PTR + TC 切り捨てを実証）でも
+    /// 再送のたびに続きが取れる。
+    fn known_answers(&self) -> Vec<(String, u32)> {
+        self.instances
+            .iter()
+            .map(|(name, f)| (name.clone(), f.ttl))
+            .collect()
+    }
+
     fn finish(self) -> Vec<FoldedInstance> {
         let pool = self.aaaa;
         self.instances
@@ -830,8 +981,9 @@ async fn browse(
             break;
         }
         if now >= next_send {
-            let q = encode_query(0, &[(service, TYPE_PTR)]);
-            sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            for q in encode_ptr_query_with_known(service, &fold.known_answers()) {
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            }
             let pending = fold.pending_questions();
             for chunk in pending.chunks(MAX_QUESTIONS_PER_MSG) {
                 let qs: Vec<(&str, u16)> = chunk.iter().map(|(n, t)| (n.as_str(), *t)).collect();
@@ -1665,5 +1817,79 @@ mod tests {
             };
             assert!(operational_from_fold(&f).is_none());
         }
+    }
+
+    #[test]
+    fn record_ttl_is_parsed() {
+        // synth_browse_response uses TTL 120 (bytes [0,0,0,120]) — fold の
+        // known_answers() 経由で PTR レコードの ttl が取り出せることを確認。
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&parse_message(&d).unwrap());
+        assert_eq!(fold.known_answers(), vec![(format!("INST1.{MC}"), 120)]);
+    }
+
+    #[test]
+    fn known_answer_query_degenerates_without_known() {
+        let pkts = encode_ptr_query_with_known(MC, &[]);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0], encode_query(0, &[(MC, TYPE_PTR)]));
+    }
+
+    #[test]
+    fn known_answer_query_roundtrips_through_parser() {
+        // KA 2 件入りクエリを自前 parse_message で読み戻し、answer の PTR が
+        // 完全名で復元される（圧縮ポインタの検証）。
+        let known = vec![
+            (format!("INST1.{MC}"), 120u32),
+            (format!("INST2.{MC}"), 99u32),
+        ];
+        let pkts = encode_ptr_query_with_known(MC, &known);
+        assert_eq!(pkts.len(), 1);
+        let records = parse_message(&pkts[0]).unwrap();
+        let ptrs: Vec<_> = records
+            .iter()
+            .filter_map(|r| match &r.rdata {
+                RData::Ptr(n) if r.name.eq_ignore_ascii_case(MC) => Some((n.clone(), r.ttl)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ptrs.len(), 2);
+        assert_eq!(ptrs[0], (format!("INST1.{MC}"), 120));
+        assert_eq!(ptrs[1], (format!("INST2.{MC}"), 99));
+    }
+
+    #[test]
+    fn known_answer_query_splits_and_sets_tc() {
+        // 1400B を超える KA（長いラベルで水増し）が複数パケットに割れ、
+        // 最後以外に TC が立ち、全 KA が失われず分配される。
+        let known: Vec<(String, u32)> = (0..60)
+            .map(|i| (format!("INSTANCE-{i:04}-{}.{MC}", "X".repeat(20)), 120))
+            .collect();
+        let pkts = encode_ptr_query_with_known(MC, &known);
+        assert!(pkts.len() >= 2);
+        for p in &pkts {
+            assert!(p.len() <= 1400);
+        }
+        for p in &pkts[..pkts.len() - 1] {
+            assert_eq!(
+                u16::from_be_bytes([p[2], p[3]]) & 0x0200,
+                0x0200,
+                "TC on non-last"
+            );
+        }
+        let last = pkts.last().unwrap();
+        assert_eq!(u16::from_be_bytes([last[2], last[3]]) & 0x0200, 0);
+        let total: usize = pkts
+            .iter()
+            .map(|p| {
+                parse_message(p)
+                    .unwrap()
+                    .iter()
+                    .filter(|r| matches!(r.rdata, RData::Ptr(_)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(total, 60);
     }
 }
