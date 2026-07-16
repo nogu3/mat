@@ -1359,22 +1359,24 @@ impl CommissioningFabric {
 
 // --- errors ---
 
-/// commissioning フロー全体のエラー。呼び出し側（CLI 層）は spec 決定
-/// (M6a 決定 5 + M6b 決定 4) の対応表でこれを `ErrorKind` / exit code に
-/// マップする:
+/// commissioning フロー全体のエラー。呼び出し側 `mat-native::commission`
+/// （M8c-1 Task4 `kind_of`）がこれを `ErrorKind` / exit code へ写像する:
 ///
-/// | variant                                             | kind               | exit |
-/// |------------------------------------------------------|--------------------|------|
-/// | `Attestation(_)` / `Pase(PaseError::ConfirmMismatch)` | `device_rejected`  | 4    |
-/// | `Discovery(_)` / `Timeout(_)`                         | `timeout`          | 3    |
-/// | `Case(_)`                                             | `session_failed`   | 6    |
-/// | `Ble { step: "scan", .. }`                            | `timeout`          | 3    |
-/// | `Ble { step: "bluez-session"\|"adapter"\|"gatt"\|    | `unreachable`      | 5    |
-/// |   "btp-handshake"\|"udp-bind", .. }`                 |                    |      |
-/// | `NetworkConfig { .. }`                                | `commission_failed`| 1    |
-/// | 上記以外すべて（`Pase` の非 ConfirmMismatch variant、  | `commission_failed`| 1    |
-/// | `Csr` / `Noc` / `CommandStatus` / `Malformed` /       |                    |      |
-/// | `Cert` / `Fabric` / `Session`）                       |                    |      |
+/// | variant                                               | kind                | exit |
+/// |--------------------------------------------------------|---------------------|------|
+/// | `Timeout(_)`                                            | `timeout`           | 3    |
+/// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
+/// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
+/// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
+/// | `Discovery(_)`                                           | 通常はワイヤ未接触 —`mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない。PASE 開始後の稀な発生（`commission_on_network` の pre-resolve と PASE の間で対象が消える競合）だけ呼び出し側が個別に `unreachable` へ override する | 5 (override 時) |
+/// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
+/// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
+///
+/// `Ble { step: "scan", .. }` は `kind_of` を経由しない — `find_commissionable`
+/// の空振り（デバイスが見えない）はワイヤ未接触なので、呼び出し側
+/// (`mat-native::commission` の `ble_path`) が個別に検出して `Unavailable`
+/// にする。BLE/BTP のそれ以外の失敗（`bluez-session` / `adapter` / `gatt` /
+/// `btp-handshake` / `udp-bind`）は他の variant と同様 `commission_failed`。
 #[derive(Debug)]
 pub enum CommissionError {
     Discovery(crate::dnssd::DnssdError),
