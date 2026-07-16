@@ -31,6 +31,9 @@ pub struct FakeConn {
     /// — `"invoke(ep,0xCCCC,0xCCCC)"` / `"write_tlv(ep,0xCCCC,0xCCCC)"` 形
     /// （cluster/command/attribute は `{:#06X}` — 4桁ゼロ埋め大文字 hex）。
     calls: Vec<String>,
+    /// `write_tlv` の TLV ペイロード記録（M8a Task9）: (endpoint, cluster, attribute, tlv_bytes)。
+    /// group-key-map マージ検証用。
+    written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
 }
 
 impl Default for FakeConn {
@@ -42,6 +45,7 @@ impl Default for FakeConn {
             reads: HashMap::new(),
             clusters: HashMap::new(),
             calls: Vec::new(),
+            written_tlv: Vec::new(),
         }
     }
 }
@@ -57,6 +61,11 @@ impl FakeConn {
     /// `invoke`/`write_tlv` の呼び出し記録を順序どおりに返す（M8a Task9）。
     pub fn calls(&self) -> &[String] {
         &self.calls
+    }
+
+    /// `write_tlv` の TLV ペイロード記録を返す（M8a Task9）。
+    pub fn written_tlv(&self) -> &[(u16, u32, u32, Vec<u8>)] {
+        &self.written_tlv
     }
 
     /// `read_json(endpoint, cluster, attribute)` の応答を1件登録する。
@@ -135,7 +144,7 @@ impl NodeConn for FakeConn {
         endpoint: u16,
         cluster: u32,
         attribute: u32,
-        _data_tlv: Vec<u8>,
+        data_tlv: Vec<u8>,
         _timed: bool,
     ) -> Result<(), MatError> {
         let n = self.sent;
@@ -146,6 +155,8 @@ impl NodeConn for FakeConn {
         self.calls.push(format!(
             "write_tlv({endpoint},{cluster:#06X},{attribute:#06X})"
         ));
+        self.written_tlv
+            .push((endpoint, cluster, attribute, data_tlv));
         Ok(())
     }
 

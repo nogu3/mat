@@ -568,4 +568,85 @@ mod tests {
             "must not write when the Group entry already exists"
         );
     }
+
+    #[tokio::test]
+    async fn provision_node_replaces_existing_mapping_for_same_group() {
+        // 既存 map に groupId=10→keyset 50 がある状態で keyset 60 を provision:
+        // 書かれた map は 10→60 の1件（置換、重複しない）。
+        let mut conn = FakeConn::scripted()
+            .with_read(
+                0,
+                0x003F,
+                0x0000,
+                serde_json::json!([{"1": 10, "2": 50}]), // 既存 10→50
+            )
+            .with_read(
+                0,
+                0x001F,
+                0x0000,
+                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
+            );
+        let p = ProvisionNodeParams {
+            group_id: 10,
+            keyset_id: 60,
+            name: "grp10".into(),
+            endpoint: 1,
+            epoch_key: [0xAB; 16],
+        };
+        provision_node(&mut conn, &p).await.unwrap();
+
+        // group-key-map の write_tlv を検証: (10, 60) のみ（置換）
+        let writes: Vec<_> = conn
+            .written_tlv()
+            .iter()
+            .filter(|(ep, cl, attr, _)| *ep == 0 && *cl == 0x003F && *attr == 0x0000)
+            .collect();
+        assert_eq!(writes.len(), 1, "must write group-key-map exactly once");
+        let expected_tlv = encode_group_key_map_tlv(&vec![(10, 60)]);
+        assert_eq!(
+            writes[0].3, expected_tlv,
+            "group-key-map must contain only (10, 60) after replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_node_preserves_other_groups_mappings() {
+        // 既存 map に groupId=11→keyset 61 がある状態で groupId=10/keyset 60 を provision:
+        // 書かれた map は {11→61, 10→60} の2件（他グループ温存）。
+        let mut conn = FakeConn::scripted()
+            .with_read(
+                0,
+                0x003F,
+                0x0000,
+                serde_json::json!([{"1": 11, "2": 61}]), // 既存 11→61
+            )
+            .with_read(
+                0,
+                0x001F,
+                0x0000,
+                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
+            );
+        let p = ProvisionNodeParams {
+            group_id: 10,
+            keyset_id: 60,
+            name: "grp10".into(),
+            endpoint: 1,
+            epoch_key: [0xAB; 16],
+        };
+        provision_node(&mut conn, &p).await.unwrap();
+
+        // group-key-map の write_tlv を検証: (11, 61) と (10, 60) の両方
+        let writes: Vec<_> = conn
+            .written_tlv()
+            .iter()
+            .filter(|(ep, cl, attr, _)| *ep == 0 && *cl == 0x003F && *attr == 0x0000)
+            .collect();
+        assert_eq!(writes.len(), 1, "must write group-key-map exactly once");
+        // 期待値は両エントリ（順序は後で書いた 10,60 がリスト末尾）
+        let expected_tlv = encode_group_key_map_tlv(&vec![(11, 61), (10, 60)]);
+        assert_eq!(
+            writes[0].3, expected_tlv,
+            "group-key-map must preserve (11, 61) and add (10, 60)"
+        );
+    }
 }
