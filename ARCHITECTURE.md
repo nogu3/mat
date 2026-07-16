@@ -586,9 +586,25 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     read-merge-write 化**（chip-tool 経路の全置換より安全な意図的改善）。
     (6) 判定中核 **`classify_write` / `classify_invoke`** は `mat-core::ids`
     に一本化し mat/matd で共有。バージョンは 0.18.0。受け入れ基準は
-    5 項目（spec 参照）。実機 E2E ハーネス `task e2e:m8a:real`
-    （`scripts/e2e-m8a-real.sh`）は実装済みだが、このタスクでは未実施 —
-    別途実施後、結果をここに追記して最終化する。
+    5 項目（spec 参照）。**実機 E2E 合格（2026-07-16 夜、jarvis）**:
+    検証 11 項目全 PASS — 直経路 native の read 汎用/write（読み返し+null
+    後始末）/未対応型 write の parse_error 拒否/invoke 汎用/describe（chip-tool
+    経路と構造一致）/diag thread（主要キー一致 — field-id テーブルの実機実証）/
+    open-window/grant 冪等（2回目全ノード unchanged）/provision --rebind +
+    groupcast N/N（Matter 状態で 7/7 確認）、matd 経由の同 op native
+    （`chip-tool ws raw response` ログ不在 = 実トラフィックゼロの実アサーション）、
+    `MAT_IFACE` 未設定のフォールバック健全性（同項目を chip-tool 経路で全通過）。
+    ACL は全 7 ノードで前後とも 2 エントリのまま（provision×3・grant×4 を経て
+    汚染・重複ゼロ — IsFabricFiltered 修正の実機実証）。**実機知見 2 点**:
+    ① 本番 matd（native）が group counter の flock を保持している間は one-shot
+    native の group 送信は設計どおり chip-tool へフォールバックする — E2E で
+    native group 送信を実証するには事前に `systemctl restart matd` で flock を
+    解放しておくこと（M7 E2E 時は本番がまだ 0.16.0 で顕在化しなかった）。
+    ② E2E 中の chip-tool spawn 群が g/gdc を進めるため、送信経路を跨ぐと
+    counter 窓の逆転で silent drop が起きる（既知の混在知見の再確認。matd
+    再起動で回復）。フォールバック検証はメッシュ不調の node を避けて実施
+    （node の一過性 CASE 失敗 ×2 で 2 回中断 → 検証 1〜10 は同一走行で PASS、
+    検証 11 は同ハーネスから抽出した同一手順を安定 node で PASS）。
 
 ---
 
