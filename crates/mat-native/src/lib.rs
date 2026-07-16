@@ -44,7 +44,65 @@ pub trait NodeConn: Send {
         cluster: u32,
         command: u32,
         fields: Option<Vec<u8>>,
+        timed: bool,
     ) -> Result<(), MatError>;
+    /// 単一属性を任意形状（scalar/struct/array/list）で JSON 読み取る。
+    async fn read_json(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Result<serde_json::Value, MatError>;
+    /// クラスタ内の全属性をワイルドカード読み取る
+    /// （`(attribute_id, value)` を先勝ち順で返す）。
+    async fn read_cluster(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+    ) -> Result<Vec<(u32, serde_json::Value)>, MatError>;
+    /// 単一属性へ 1 個の TLV 要素（任意トップレベルタグ）を書き込む。
+    async fn write_tlv(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        data_tlv: Vec<u8>,
+        timed: bool,
+    ) -> Result<(), MatError>;
+}
+
+/// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
+const TIMED_REQUEST_MS: u16 = 10_000;
+
+/// `mat_core::ids::ScalarValue` → `mat_controller::im::ImValue`。mat-core は
+/// mat-controller に依存しない設計のため、両者を知る mat-native がここで橋渡しする。
+pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> ImValue {
+    use mat_core::ids::ScalarValue as S;
+    match v {
+        S::Bool(b) => ImValue::Bool(*b),
+        S::UInt(n) => ImValue::Uint(*n),
+        S::Int(n) => ImValue::Int(*n),
+        S::Str(s) => ImValue::Utf8(s.clone()),
+        S::Bytes(b) => ImValue::Bytes(b.clone()),
+        S::Null => ImValue::Null,
+    }
+}
+
+/// `ScalarValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
+/// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
+pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
+    use mat_controller::tlv::{Tag, Writer};
+    use mat_core::ids::ScalarValue as S;
+    let mut w = Writer::new();
+    match v {
+        S::Bool(b) => w.put_bool(Tag::Anonymous, *b),
+        S::UInt(n) => w.put_uint(Tag::Anonymous, *n),
+        S::Int(n) => w.put_int(Tag::Anonymous, *n),
+        S::Str(s) => w.put_str(Tag::Anonymous, s),
+        S::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
+        S::Null => w.put_null(Tag::Anonymous),
+    }
+    w.finish()
 }
 
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
@@ -219,12 +277,65 @@ impl NodeConn for SessionConn {
         cluster: u32,
         command: u32,
         fields: Option<Vec<u8>>,
+        timed: bool,
     ) -> Result<(), MatError> {
-        self.session
-            .invoke(endpoint, cluster, command, fields.as_deref(), &self.mrp)
-            .await
-            .map_err(map_session_err)?;
+        if timed {
+            self.session
+                .invoke_for_data(
+                    endpoint,
+                    cluster,
+                    command,
+                    fields.as_deref(),
+                    Some(TIMED_REQUEST_MS),
+                    &self.mrp,
+                )
+                .await
+                .map_err(map_session_err)?;
+        } else {
+            self.session
+                .invoke(endpoint, cluster, command, fields.as_deref(), &self.mrp)
+                .await
+                .map_err(map_session_err)?;
+        }
         Ok(())
+    }
+
+    async fn read_json(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Result<serde_json::Value, MatError> {
+        self.session
+            .read_attribute_json(endpoint, cluster, attribute, &self.mrp)
+            .await
+            .map_err(map_session_err)
+    }
+
+    async fn read_cluster(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+    ) -> Result<Vec<(u32, serde_json::Value)>, MatError> {
+        self.session
+            .read_cluster_json(endpoint, cluster, &self.mrp)
+            .await
+            .map_err(map_session_err)
+    }
+
+    async fn write_tlv(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        data_tlv: Vec<u8>,
+        timed: bool,
+    ) -> Result<(), MatError> {
+        let timed_ms = timed.then_some(TIMED_REQUEST_MS);
+        self.session
+            .write_attribute_tlv(endpoint, cluster, attribute, &data_tlv, timed_ms, &self.mrp)
+            .await
+            .map_err(map_session_err)
     }
 }
 
@@ -244,6 +355,42 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generic_read_write_via_fake() {
+        use crate::test_support::FakeEstablisher;
+        let engine = Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let mut conn = engine.establisher.establish(5).await.unwrap();
+        // fake は read_json に固定値を返す（test_support 拡張で定義）。
+        let v = conn.read_json(1, 0x0008, 0x0000).await.unwrap();
+        assert!(v.is_number());
+        conn.write_tlv(
+            1,
+            0x0008,
+            0x0011,
+            scalar_to_tlv(&mat_core::ids::ScalarValue::UInt(128)),
+            false,
+        )
+        .await
+        .unwrap();
+        let all = conn.read_cluster(1, 0x0006).await.unwrap();
+        assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn scalar_conversions() {
+        use mat_controller::im::ImValue;
+        use mat_core::ids::ScalarValue as S;
+        assert_eq!(scalar_to_im(&S::Bool(true)), ImValue::Bool(true));
+        assert_eq!(scalar_to_im(&S::UInt(7)), ImValue::Uint(7));
+        // scalar_to_tlv は Reader で読み戻して値一致を確認。
+        let b = scalar_to_tlv(&S::Str("x".into()));
+        let mut r = mat_controller::tlv::Reader::new(&b);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            mat_controller::tlv::Value::Utf8("x")
+        ));
+    }
 
     #[tokio::test]
     async fn build_fails_cleanly_without_kvs() {

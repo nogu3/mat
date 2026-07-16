@@ -137,14 +137,14 @@ impl NativeBackend {
 
     pub async fn on(&self, node_id: u64, endpoint: u16) -> Result<(), MatError> {
         self.with_session(node_id, |c| {
-            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None, false)
         })
         .await
     }
 
     pub async fn off(&self, node_id: u64, endpoint: u16) -> Result<(), MatError> {
         self.with_session(node_id, |c| {
-            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None)
+            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None, false)
         })
         .await
     }
@@ -165,6 +165,7 @@ impl NativeBackend {
                 CLUSTER_COLOR_CONTROL,
                 CMD_MOVE_TO_HUE_AND_SATURATION,
                 Some(fields.clone()),
+                false,
             )
         })
         .await
@@ -184,6 +185,7 @@ impl NativeBackend {
                 CLUSTER_COLOR_CONTROL,
                 CMD_MOVE_TO_COLOR_TEMPERATURE,
                 Some(fields.clone()),
+                false,
             )
         })
         .await

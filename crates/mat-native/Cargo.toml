@@ -14,6 +14,7 @@ test-support = ["dep:base64ct"]
 mat-core.workspace = true
 mat-controller.workspace = true
 async-trait.workspace = true
+serde_json.workspace = true
 tokio = { version = "1", features = ["sync", "net", "time", "rt", "macros"] }
 tracing.workspace = true
 base64ct = { version = "1", features = ["alloc"], optional = true }
