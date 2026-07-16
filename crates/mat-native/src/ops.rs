@@ -603,7 +603,7 @@ mod tests {
             .filter(|(ep, cl, attr, _)| *ep == 0 && *cl == 0x003F && *attr == 0x0000)
             .collect();
         assert_eq!(writes.len(), 1, "must write group-key-map exactly once");
-        let expected_tlv = encode_group_key_map_tlv(&vec![(10, 60)]);
+        let expected_tlv = encode_group_key_map_tlv(&[(10, 60)]);
         assert_eq!(
             writes[0].3, expected_tlv,
             "group-key-map must contain only (10, 60) after replacement"
@@ -644,7 +644,7 @@ mod tests {
             .collect();
         assert_eq!(writes.len(), 1, "must write group-key-map exactly once");
         // 期待値は両エントリ（順序は後で書いた 10,60 がリスト末尾）
-        let expected_tlv = encode_group_key_map_tlv(&vec![(11, 61), (10, 60)]);
+        let expected_tlv = encode_group_key_map_tlv(&[(11, 61), (10, 60)]);
         assert_eq!(
             writes[0].3, expected_tlv,
             "group-key-map must preserve (11, 61) and add (10, 60)"
