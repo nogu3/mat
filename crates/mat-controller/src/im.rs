@@ -4,12 +4,14 @@
 //! ReadRequest/ReportData, single-command InvokeRequest/InvokeResponse, and
 //! StatusResponse. No subscriptions, no batched paths, no chunking.
 
-use crate::tlv::{Element, Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{copy_value, Element, Reader, Tag, TlvError, Value, Writer};
 
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
 pub const OPCODE_READ_REQUEST: u8 = 0x02;
 pub const OPCODE_REPORT_DATA: u8 = 0x05;
+pub const OPCODE_WRITE_REQUEST: u8 = 0x06;
+pub const OPCODE_WRITE_RESPONSE: u8 = 0x07;
 pub const OPCODE_INVOKE_REQUEST: u8 = 0x08;
 pub const OPCODE_INVOKE_RESPONSE: u8 = 0x09;
 pub const OPCODE_TIMED_REQUEST: u8 = 0x0A;
@@ -682,53 +684,6 @@ pub fn merge_reports(msgs: &[ReportDataMessage]) -> Vec<(u32, serde_json::Value)
         .collect()
 }
 
-/// Deep-copies one TLV element (and, if a container, its full subtree) from
-/// `r` into `w`, re-tagging only the top-level element as `tag`. Used to
-/// splice a caller-provided, already-encoded CommandFields element into an
-/// InvokeRequest without `tlv::Writer` needing a raw-append escape hatch.
-fn copy_retagged(w: &mut Writer, r: &mut Reader, tag: Tag) -> Result<(), TlvError> {
-    let el = r.next()?.ok_or(TlvError::Truncated)?;
-    copy_value(w, r, tag, el.value)
-}
-
-fn copy_value(w: &mut Writer, r: &mut Reader, tag: Tag, value: Value) -> Result<(), TlvError> {
-    match value {
-        Value::Int(v) => w.put_int(tag, v),
-        Value::Uint(v) => w.put_uint(tag, v),
-        Value::Bool(v) => w.put_bool(tag, v),
-        Value::F32(v) => w.put_f32(tag, v),
-        Value::F64(v) => w.put_f64(tag, v),
-        Value::Utf8(v) => w.put_str(tag, v),
-        Value::Bytes(v) => w.put_bytes(tag, v),
-        Value::Null => w.put_null(tag),
-        Value::StructStart => {
-            w.start_struct(tag);
-            return copy_container(w, r);
-        }
-        Value::ArrayStart => {
-            w.start_array(tag);
-            return copy_container(w, r);
-        }
-        Value::ListStart => {
-            w.start_list(tag);
-            return copy_container(w, r);
-        }
-        Value::ContainerEnd => {}
-    }
-    Ok(())
-}
-
-fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
-    loop {
-        let el = r.next()?.ok_or(TlvError::Truncated)?;
-        if el.value == Value::ContainerEnd {
-            w.end_container();
-            return Ok(());
-        }
-        copy_value(w, r, el.tag, el.value)?;
-    }
-}
-
 /// CommandFields for colorcontrol MoveToHueAndSaturation (cluster spec
 /// §3.2.11.7): `{0: hue, 1: saturation, 2: transition_time (0.1 s units),
 /// 3: options_mask, 4: options_override}`. Options are fixed to 0 (execute
@@ -796,9 +751,7 @@ fn encode_invoke_request_inner(
     w.put_uint(Tag::Context(2), u64::from(command));
     w.end_container(); // CommandPath
     if let Some(fields) = fields_tlv {
-        let mut fr = Reader::new(fields);
-        copy_retagged(&mut w, &mut fr, Tag::Context(1))
-            .expect("fields_tlv must be one well-formed TLV element");
+        w.put_raw_element(Tag::Context(1), fields);
     }
     w.end_container(); // CommandDataIB
     w.end_container(); // InvokeRequests
@@ -869,9 +822,7 @@ pub fn encode_group_invoke_request(
     w.put_uint(Tag::Context(2), u64::from(command));
     w.end_container();
     if let Some(fields) = fields_tlv {
-        let mut fr = Reader::new(fields);
-        copy_retagged(&mut w, &mut fr, Tag::Context(1))
-            .expect("fields_tlv must be one well-formed TLV element");
+        w.put_raw_element(Tag::Context(1), fields);
     }
     w.end_container();
     w.end_container();
@@ -1176,6 +1127,136 @@ pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
         }
     }
     status.ok_or(ImError::Malformed("status response without status"))
+}
+
+/// Encodes an `ImValue` scalar as one standalone, well-formed TLV element
+/// (tag is discarded by the caller — `encode_write_request` immediately
+/// splices it via `Writer::put_raw_element`).
+fn encode_im_value(value: &ImValue) -> Vec<u8> {
+    let mut w = Writer::new();
+    match value {
+        ImValue::Bool(b) => w.put_bool(Tag::Anonymous, *b),
+        ImValue::Uint(u) => w.put_uint(Tag::Anonymous, *u),
+        ImValue::Int(i) => w.put_int(Tag::Anonymous, *i),
+        ImValue::Utf8(s) => w.put_str(Tag::Anonymous, s),
+        ImValue::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
+        ImValue::Null => w.put_null(Tag::Anonymous),
+    }
+    w.finish()
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) の共通本体。`timed` が TimedRequest
+/// フィールドの値になる。公開関数 `encode_write_request_tlv` /
+/// `encode_write_request_tlv_timed` はどちらもこれを呼ぶだけの薄いラッパで、
+/// `encode_invoke_request` / `encode_invoke_request_timed` と同じ手筋。
+fn encode_write_request_inner(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+    timed: bool,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), false); // SuppressResponse
+    w.put_bool(Tag::Context(1), timed); // TimedRequest
+    w.start_array(Tag::Context(2)); // WriteRequests
+    w.start_struct(Tag::Anonymous); // AttributeDataIB
+    w.start_list(Tag::Context(1)); // AttributePathIB
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    w.put_uint(Tag::Context(4), u64::from(attribute));
+    w.end_container(); // AttributePathIB
+    w.put_raw_element(Tag::Context(2), data_tlv); // Data
+    w.end_container(); // AttributeDataIB
+    w.end_container(); // WriteRequests
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) for a single attribute path.
+/// TimedRequest is always `false` — see `encode_write_request_tlv_timed` for
+/// the timed variant (spec §8.5, タイムド呼び出し). `data_tlv` must be one
+/// complete, well-formed TLV element (any top-level tag; it is re-tagged) —
+/// the attribute's `Data` value.
+pub fn encode_write_request_tlv(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+) -> Vec<u8> {
+    encode_write_request_inner(endpoint, cluster, attribute, data_tlv, false)
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) with TimedRequest = true. Must be
+/// sent on the same exchange as a preceding `encode_timed_request` whose
+/// StatusResponse(SUCCESS) has already been received (spec §8.5.1). Same
+/// `data_tlv` contract as `encode_write_request_tlv`.
+pub fn encode_write_request_tlv_timed(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+) -> Vec<u8> {
+    encode_write_request_inner(endpoint, cluster, attribute, data_tlv, true)
+}
+
+/// Scalar sugar over `encode_write_request_tlv`: encodes `value` as TLV and
+/// splices it in as the `Data` element. M2-scope values only (see `ImValue`).
+pub fn encode_write_request(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    value: &ImValue,
+) -> Vec<u8> {
+    encode_write_request_tlv(endpoint, cluster, attribute, &encode_im_value(value))
+}
+
+/// WriteResponseMessage (spec §8.9.2.4): `{0: [AttributeStatusIB, ...], 255:
+/// revision}`. Only the first `AttributeStatusIB`'s status is interpreted
+/// (M8a scope: one attribute per write). Reuses `decode_attribute_status_ib`
+/// (same `{0: Path, 1: StatusIB{0: status, ...}}` shape as a WriteResponses
+/// entry).
+pub fn decode_write_response(payload: &[u8]) -> Result<u8, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated write response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ArrayStart) => {
+                // WriteResponses
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated write responses"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            status = Some(decode_attribute_status_ib(&mut r)?);
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed("unexpected element in write responses"))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    status.ok_or(ImError::Malformed(
+        "write response without AttributeStatusIB",
+    ))
 }
 
 #[cfg(test)]
@@ -1776,6 +1857,43 @@ mod tests {
             matches!(err, ImError::Malformed(_)),
             "Expected Malformed error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn write_request_roundtrip_scalar() {
+        let b = encode_write_request(1, 0x0008, 0x0011, &ImValue::Uint(128));
+        // 形の検証: WriteRequests(2) 配列の中に AttributeDataIB があり、
+        // path(ep=1, cluster=8, attr=0x11) と Data(Context2)=128 を含む。
+        let mut r = Reader::new(&b);
+        let (mut saw_ep, mut saw_data) = (false, false);
+        while let Some(el) = r.next().unwrap() {
+            if el.tag == Tag::Context(2) && el.value == Value::Uint(128) {
+                saw_data = true;
+            }
+            if el.tag == Tag::Context(2) && el.value == Value::Uint(1) {
+                saw_ep = true;
+            }
+        }
+        assert!(saw_ep && saw_data);
+    }
+
+    #[test]
+    fn decode_write_response_returns_first_status() {
+        // WriteResponse { 0: [ AttrStatusIB{0: path, 1: StatusIB{0: 0}} ] }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(0));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0)); // path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        assert_eq!(decode_write_response(&w.finish()).unwrap(), 0);
     }
 
     #[test]
