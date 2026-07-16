@@ -166,3 +166,31 @@ native 有効運用中）。本 spec は **M8（chip-tool 完全廃止）の
 - `diag node` の IM 部分の native 化（M8c で再訪 — 今回は probe のみ）。
 - commissioned 台帳読みの変更（外部依存なし、対象外）。
 - avahi-browse / chip-tool 経路の削除（M8c の完全撤去で実施）。
+
+## 実装後の設計転換（2026-07-17、実機 E2E 由来 — ユーザー承認済み）
+
+実機 E2E（jarvis）で本 spec §2-3 の「probe = `browse_operational` 列挙 +
+node_id 照合」が 2 回 FAIL し、以下へ転換した（出力スキーマ・フォール
+バック規則・受け入れ基準は不変）:
+
+1. **probe は台帳ノードごとの targeted `resolve_operational` を並行実行**
+   （`JoinSet`、per-node timeout 3 秒、CFID は KVS 読みから計算、マーカー
+   `probe executed (native resolve)`）。根拠: Thread mesh の advertising
+   proxy は保持 instance をサービス型 PTR 列挙に全部載せない（集約応答
+   1428B/29PTR/TC で切れ、Known-Answer suppression 実装後も node 6/8/9 の
+   PTR はワイヤに一切出ない — tcpdump 実証）。同じ proxy が targeted 解決
+   には答える（native read 成功で実証）。avahi は常駐キャッシュ（PTR TTL
+   75 分）で見えているだけで、キャッシュなし one-shot 列挙では構造的に
+   再現不能。`browse_operational` / `OperationalInstance` は撤去。
+2. **commissionable browse（列挙が本質）には RFC 6762 §7.1/§7.2 の
+   Known-Answer suppression を実装**（再送クエリに既知 PTR を同梱、MTU
+   超過時は TC 継続分割）、`MAX_INSTANCES` 32→128（実レジストリはマルチ
+   fabric の stale 込みで 30 件超）。
+3. probe が KVS を**読む**ようになる（CFID 計算。書込はなし — 設計
+   ルール 4 不変）。KVS 不備・iface 不備は従来どおり warn + avahi
+   フォールバック。
+4. ハーネスに `MAT_E2E_ASSUME_YES=1`（非対話 confirm の明示口 — ssh が
+   stdin を消費するためパイプでは代替不能）。
+
+実機 E2E 合格: 2026-07-17、検証 1〜5 全 GREEN（検証 2 は玄関ライト非広告
+のため設計どおり WARN + 確認続行）。

@@ -540,6 +540,46 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   - **M8b（0.19.0）— discover native 化**: mDNS browse
     （`_matter._tcp` operational + `_matterc._udp` commissionable）+ probe
     reachability。既存 `dnssd.rs`（operational 解決）の browse 拡張。
+    **実装済み**: (1) **dnssd browse**（`mat-controller::dnssd`）: one-shot
+    legacy unicast mDNS で `_matterc._udp`（commissionable）/ `_matter._tcp`
+    （operational）の PTR を列挙し、instance ごとに SRV/TXT/AAAA を畳み込む。
+    resolve 系と違い早期 return せず固定 window（`BROWSE_WINDOW` = 3 秒、
+    CLI フラグ化なし）で打ち切り、クエリは 1 秒間隔で再送、フォローアップ
+    質問は 1 メッセージ 8 件ずつに分割、受信バッファ 9000 byte。flood 耐性
+    キャップ（instance 32 件 / AAAA プール 64 件）、他プロトコルの壊れた
+    データグラムは読み捨てて継続。operational は announce のみ（SRV/AAAA
+    が期限内に揃わない）でも addresses 空で保持し、commissionable は素材
+    ゼロなら skip。browse は現在 **commissionable 専用**（下記実機知見で
+    operational 側は targeted resolve に転換し、`browse_operational` は
+    撤去済み）。(2) **`mat::probe::mdns` の native 化 = 台帳ノードごとの
+    targeted `resolve_operational` を並行実行**（`tokio::task::JoinSet`、
+    per-node timeout 3 秒、CFID は KVS（読み取りのみ）から計算。マーカー
+    ログ `probe executed (native resolve)`）。IO エラー（iface 解決失敗・
+    全ノード送信失敗）は warn ログ + `avahi-browse` フォールバック。
+    `discover --probe` と `diag node --deep` の両方が対象（`diag node` の
+    他チェックは引き続き chip-tool 経由 — IM 自体の native 化は M8c）。
+    (3) **`mat discover` の commissionable 探索の native 化**: `MAT_IFACE`
+    設定時は native `browse_commissionable` を既存 `DiscoveredDevice`
+    スキーマへそのまま写す（JSON はバイト一致）。IO エラー時は warn ログ +
+    chip-tool フォールバック。(4) **フォールバック規則はどちらも共通**:
+    フォールバックは IO エラー時のみ、探索/probe が 0 件なのは正常で
+    フォールバックしない。(5) discover/probe は matd プロトコルの対象外の
+    まま（one-shot 直経路のみ）。(6) **dead API 掃除**: M8a で呼び出し
+    ゼロになった matd `NativeBackend::ensure_group_acl` を削除。バージョン
+    は 0.19.0。**実機 E2E 合格（2026-07-17、jarvis、検証 1〜5 全 GREEN**
+    — 検証 2 の commissionable は玄関ライト非広告のため設計どおり WARN +
+    確認続行）。**★実機知見（E2E 中に 2 回 FAIL して確定した設計転換）**:
+    ① Thread mesh の advertising proxy は保持全 instance をサービス型 PTR
+    列挙に載せない — 集約応答は 1 データグラム（実測 1428B / 29 PTR / TC
+    ビット）で切れ、しかも Known-Answer suppression（RFC 6762 §7.1/7.2、
+    今回 browse に実装済み・維持）を入れても**残りのノードはワイヤに一切
+    出ない**（node 6/8/9 で tcpdump 実証）。一方 targeted な instance
+    解決には同じ proxy が正しく答える（native read で実証）。avahi-browse
+    が「全部見える」のは常駐デーモンの長期キャッシュ（PTR TTL 75 分）に
+    よるもので、キャッシュなし one-shot の列挙では構造的に再現できない。
+    → **probe は列挙+照合ではなく targeted resolve が正**（CFID+node_id は
+    既知）。② 列挙が本質の commissionable browse には KA suppression +
+    `MAX_INSTANCES` 128 を適用（マルチ fabric の実レジストリは 30 件超）。
   - **M8c（0.20.0）— commission native 化 + chip-tool 完全撤去**: 本番
     `mat commission` の native 化、KVS 書込所有、native 既定化、
     runner.rs / chip-tool 分岐 / fake-chip-tool テスト基盤 / Docker の

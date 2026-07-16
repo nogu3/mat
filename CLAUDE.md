@@ -87,9 +87,13 @@ falling back to `parse_error` + `1`.
   `invoke` (via the `mat-core::ids` name→ID table, scalar types only) plus
   `describe`/`diag thread`/`open-window`/`group provision`/`group grant`/
   `group invoke`; unresolvable names and list/struct/float fields still fall
-  back to `chip-tool` (or `parse_error` for the latter). Nothing above this
-  list changes when native is unset — see README for the exact op list and
-  fallback rules.
+  back to `chip-tool` (or `parse_error` for the latter). As of M8b, `discover`
+  (commissionable browse) and the mDNS probe (`discover --probe` / `diag node
+  --deep`) also go native under `MAT_IFACE` (`mat-controller::dnssd`), direct
+  path only — never through `matd`; fallback to chip-tool/`avahi-browse`
+  fires only on an I/O error, never on a zero-result browse. Nothing above
+  this list changes when native is unset — see README for the exact op list
+  and fallback rules.
 - `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
 - The backend is replaceable: `mat` couples to it only through `mat`'s own JSON
   schema. Keep all backend specifics inside the child-runner adapter so a future
