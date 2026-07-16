@@ -69,6 +69,35 @@ pub(crate) enum NativeOp {
         transition: u16,
         endpoint: u16,
     },
+    ReadAttr {
+        node_id: u64,
+        endpoint: u16,
+        cluster_in: String,
+        attribute_in: String,
+        cluster: u32,
+        attribute: u32,
+    },
+    WriteAttr {
+        node_id: u64,
+        endpoint: u16,
+        cluster_in: String,
+        attribute_in: String,
+        cluster: u32,
+        attribute: u32,
+        value_in: String,
+        value: mat_core::ids::ScalarValue,
+        timed: bool,
+    },
+    InvokeGeneric {
+        node_id: u64,
+        endpoint: u16,
+        cluster_in: String,
+        command_in: String,
+        cluster: u32,
+        command: u32,
+        fields_tlv: Option<Vec<u8>>,
+        timed: bool,
+    },
 }
 
 pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
@@ -197,8 +226,159 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 endpoint: *endpoint,
             })
         }
+        // 汎用 read/write/invoke（M8a）: classify_strict の判定を再利用し、値の
+        // 符号化不能（Err）はここでは黙って None（chip-tool 直路）に丸める —
+        // その Err を明示的に拒否（即 parse_error）したい呼び出し側は
+        // `classify_strict` を直接使う（`try_run` がそうしている）。
+        _ => classify_strict(command)?.ok(),
+    }
+}
+
+/// 汎用形の分類: None = 非対象（chip-tool へ）、Some(Ok) = native 実行、
+/// Some(Err) = native 対象だが値が符号化不能 → 即 parse_error（spec 決定3:
+/// フォールバックせず明示拒否。chip-tool なら通る形をあえて拒むのは
+/// opt-in（MAT_IFACE）下の意図した縮小）。
+pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatError>> {
+    match command {
+        Command::Read {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+        } => {
+            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
+            let attr = mat_core::ids::resolve_attribute(cluster_id, attribute)?;
+            Some(Ok(NativeOp::ReadAttr {
+                node_id: node_id.id(),
+                endpoint: endpoint.id(),
+                cluster_in: cluster.clone(),
+                attribute_in: attribute.clone(),
+                cluster: cluster_id,
+                attribute: attr.id,
+            }))
+        }
+        Command::Write {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            value,
+        } => {
+            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
+            let attr = mat_core::ids::resolve_attribute(cluster_id, attribute)?;
+            let timed = attr.def.map(|d| d.timed_write).unwrap_or(false);
+            let parsed = match attr.def {
+                Some(def) => mat_core::ids::parse_scalar_typed(value, def.ty),
+                None => Ok(mat_core::ids::parse_scalar_inferred(value)),
+            };
+            let scalar = match parsed {
+                Ok(v) => v,
+                Err(msg) => {
+                    return Some(Err(MatError::parse_error(format!(
+                        "write {cluster}/{attribute}: {msg}"
+                    ))));
+                }
+            };
+            Some(Ok(NativeOp::WriteAttr {
+                node_id: node_id.id(),
+                endpoint: endpoint.id(),
+                cluster_in: cluster.clone(),
+                attribute_in: attribute.clone(),
+                cluster: cluster_id,
+                attribute: attr.id,
+                value_in: value.clone(),
+                value: scalar,
+                timed,
+            }))
+        }
+        Command::Invoke {
+            node_id,
+            endpoint,
+            cluster,
+            command: command_name,
+            args,
+        } => {
+            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
+            let cmd = mat_core::ids::resolve_command(cluster_id, command_name)?;
+            match cmd.def {
+                Some(def) => {
+                    if args.len() > def.fields.len() {
+                        return Some(Err(MatError::parse_error(format!(
+                            "invoke {cluster}/{command_name}: too many arguments ({} > {})",
+                            args.len(),
+                            def.fields.len()
+                        ))));
+                    }
+                    let mut values = Vec::with_capacity(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        match mat_core::ids::parse_scalar_typed(arg, def.fields[i].ty) {
+                            Ok(v) => values.push(v),
+                            Err(msg) => {
+                                return Some(Err(MatError::parse_error(format!(
+                                    "invoke {cluster}/{command_name} arg {i} ({}): {msg}",
+                                    def.fields[i].name
+                                ))));
+                            }
+                        }
+                    }
+                    let fields_tlv = if values.is_empty() {
+                        None
+                    } else {
+                        Some(encode_command_fields(&values))
+                    };
+                    Some(Ok(NativeOp::InvokeGeneric {
+                        node_id: node_id.id(),
+                        endpoint: endpoint.id(),
+                        cluster_in: cluster.clone(),
+                        command_in: command_name.clone(),
+                        cluster: cluster_id,
+                        command: cmd.id,
+                        fields_tlv,
+                        timed: def.timed,
+                    }))
+                }
+                // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
+                // 対象外（chip-tool へ）。引数なしのみ native（fields_tlv=None）。
+                None => {
+                    if !args.is_empty() {
+                        return None;
+                    }
+                    Some(Ok(NativeOp::InvokeGeneric {
+                        node_id: node_id.id(),
+                        endpoint: endpoint.id(),
+                        cluster_in: cluster.clone(),
+                        command_in: command_name.clone(),
+                        cluster: cluster_id,
+                        command: cmd.id,
+                        fields_tlv: None,
+                        timed: false,
+                    }))
+                }
+            }
+        }
         _ => None,
     }
+}
+
+/// invoke のコマンド引数（スカラー値の列）を CommandFields TLV へ。context tag
+/// は引数添字（`CmdDef::fields` の添字と一致、ids.rs のコメント参照）。
+fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
+    use mat_controller::tlv::{Tag, Writer};
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    for (i, v) in args.iter().enumerate() {
+        let tag = Tag::Context(i as u8);
+        match v {
+            mat_core::ids::ScalarValue::Bool(b) => w.put_bool(tag, *b),
+            mat_core::ids::ScalarValue::UInt(u) => w.put_uint(tag, *u),
+            mat_core::ids::ScalarValue::Int(x) => w.put_int(tag, *x),
+            mat_core::ids::ScalarValue::Str(s) => w.put_str(tag, s),
+            mat_core::ids::ScalarValue::Bytes(b) => w.put_bytes(tag, b),
+            mat_core::ids::ScalarValue::Null => w.put_null(tag),
+        }
+    }
+    w.end_container();
+    w.finish()
 }
 
 enum Executed {
@@ -222,7 +402,15 @@ pub(crate) fn try_run(
     store_path: &Path,
     cfg: &Config,
 ) -> Option<Result<(), MatError>> {
-    let op = classify(command)?;
+    let op = match classify(command) {
+        Some(op) => op,
+        None => match classify_strict(command)? {
+            Ok(op) => op,
+            // 値が符号化不能（非スカラー型等）: フォールバックせず即 parse_error
+            // （spec 決定3。chip-tool 側では通る形をあえて拒む opt-in の縮小）。
+            Err(e) => return Some(Err(e)),
+        },
+    };
     match execute(&op, store_path, cfg) {
         Ok(Executed::Done) => Some(Ok(())),
         Ok(Executed::Fallback) => None,
@@ -240,7 +428,10 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
         | NativeOp::Off { node_id, .. }
         | NativeOp::ReadOnOff { node_id, .. }
         | NativeOp::Color { node_id, .. }
-        | NativeOp::ColorTemp { node_id, .. } => Some(*node_id),
+        | NativeOp::ColorTemp { node_id, .. }
+        | NativeOp::ReadAttr { node_id, .. }
+        | NativeOp::WriteAttr { node_id, .. }
+        | NativeOp::InvokeGeneric { node_id, .. } => Some(*node_id),
         NativeOp::GroupOnOff { .. }
         | NativeOp::GroupColor { .. }
         | NativeOp::GroupColorTemp { .. } => None,
@@ -477,6 +668,69 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 }
             }
         }
+        NativeOp::ReadAttr {
+            node_id,
+            endpoint,
+            cluster_in,
+            attribute_in,
+            cluster,
+            attribute,
+        } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            let v = conn.read_json(*endpoint, *cluster, *attribute).await?;
+            crate::commands::read::emit_read_success(
+                *node_id,
+                *endpoint,
+                cluster_in,
+                attribute_in,
+                v,
+            );
+        }
+        NativeOp::WriteAttr {
+            node_id,
+            endpoint,
+            cluster_in,
+            attribute_in,
+            cluster,
+            attribute,
+            value_in,
+            value,
+            timed,
+        } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            conn.write_tlv(
+                *endpoint,
+                *cluster,
+                *attribute,
+                mat_native::scalar_to_tlv(value),
+                *timed,
+            )
+            .await?;
+            crate::commands::write::emit_write_success(
+                *node_id,
+                *endpoint,
+                cluster_in,
+                attribute_in,
+                value_in,
+            );
+        }
+        NativeOp::InvokeGeneric {
+            node_id,
+            endpoint,
+            cluster_in,
+            command_in,
+            cluster,
+            command,
+            fields_tlv,
+            timed,
+        } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            conn.invoke(*endpoint, *cluster, *command, fields_tlv.clone(), *timed)
+                .await?;
+            crate::commands::invoke::emit_invoke_success(
+                *node_id, *endpoint, cluster_in, command_in,
+            );
+        }
     }
     Ok(RunOutcome::Done)
 }
@@ -517,15 +771,17 @@ mod tests {
             attribute: "on-off".into(),
         };
         assert!(matches!(classify(&read), Some(NativeOp::ReadOnOff { .. })));
-        // 汎用 read（onoff on-off 以外）は非対象 —— matd の is_native_hotpath とパリティ。
-        let other = Command::Read {
+        // 汎用 read（onoff on-off 以外）で名前解決できるものは M8a Task7 で native
+        // 対象に拡張された（`generic_read_is_native_when_names_resolve` 参照）。
+        // 名前解決できないものは引き続き非対象 —— matd の is_native_hotpath とパリティ。
+        let unresolvable = Command::Read {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
-            cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            cluster: "nosuchcluster".into(),
+            attribute: "x".into(),
         };
-        assert!(classify(&other).is_none());
-        // discover / describe / write / diag 等は非対象。
+        assert!(classify(&unresolvable).is_none());
+        // discover / describe 等は非対象。
         assert!(classify(&Command::Discover { probe: false }).is_none());
     }
 
@@ -718,5 +974,90 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn generic_read_is_native_when_names_resolve() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        let read = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into(),
+        };
+        assert!(matches!(
+            classify(&read),
+            Some(NativeOp::ReadAttr {
+                cluster: 0x0008,
+                attribute: 0x0000,
+                ..
+            })
+        ));
+        // 未知クラスタ名は chip-tool へ（互換）。
+        let unknown = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "nosuch".into(),
+            attribute: "x".into(),
+        };
+        assert!(classify(&unknown).is_none());
+        // 数値直指定も native。
+        let byid = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "0x0008".into(),
+            attribute: "0".into(),
+        };
+        assert!(matches!(classify(&byid), Some(NativeOp::ReadAttr { .. })));
+    }
+
+    #[test]
+    fn write_scalar_native_and_list_rejected() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        let w = Command::Write {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "on-level".into(),
+            value: "128".into(),
+        };
+        assert!(matches!(classify(&w), Some(NativeOp::WriteAttr { .. })));
+        // list 型（acl）への汎用 write は parse_error（classify_strict 経由で確認）。
+        let acl = Command::Write {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "accesscontrol".into(),
+            attribute: "acl".into(),
+            value: "[]".into(),
+        };
+        let err = classify_strict(&acl).unwrap().unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::ParseError);
+        assert!(err.detail.contains("list"), "{}", err.detail);
+    }
+
+    #[test]
+    fn generic_invoke_scalar_args_native_and_bad_args_rejected() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        let inv = Command::Invoke {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            command: "move-to-level".into(),
+            args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+        };
+        assert!(matches!(
+            classify(&inv),
+            Some(NativeOp::InvokeGeneric { .. })
+        ));
+        // struct field を要求するコマンド（key-set-write）への引数 → parse_error。
+        let ks = Command::Invoke {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "groupkeymanagement".into(),
+            command: "key-set-write".into(),
+            args: vec!["{}".into()],
+        };
+        let err = classify_strict(&ks).unwrap().unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::ParseError);
     }
 }
