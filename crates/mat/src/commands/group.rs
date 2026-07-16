@@ -418,7 +418,9 @@ pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), M
     let mut updated: Vec<u64> = Vec::new();
     let mut unchanged: Vec<u64> = Vec::new();
     for &node_id in node_ids {
-        if ensure_group_acl(&chip, node_id, group_id)? {
+        if ensure_group_acl(&chip, node_id, group_id)
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?
+        {
             updated.push(node_id);
         } else {
             unchanged.push(node_id);
