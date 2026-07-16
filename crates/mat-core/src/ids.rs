@@ -185,4 +185,25 @@ mod tests {
         assert_eq!(parse_num("-1"), None);
         assert_eq!(parse_num("on-off"), None);
     }
+
+    #[test]
+    fn global_attributes_resolve_on_every_cluster() {
+        // global ZCL 属性は全クラスタで名前解決できる（chip-tool は全クラスタで受ける）。
+        for cluster in [0x0006u32, 0x0300, 0x0035, 0x001D] {
+            let a = resolve_attribute(cluster, "feature-map").unwrap();
+            assert_eq!(a.id, 0xFFFC);
+            assert_eq!(a.def.unwrap().ty, TypeTag::UInt);
+            let a = resolve_attribute(cluster, "cluster-revision").unwrap();
+            assert_eq!(a.id, 0xFFFD);
+            let a = resolve_attribute(cluster, "attribute-list").unwrap();
+            assert_eq!(a.id, 0xFFFB);
+            assert_eq!(a.def.unwrap().ty, TypeTag::List);
+        }
+    }
+
+    #[test]
+    fn numeric_ids_beyond_u32_are_rejected() {
+        assert!(resolve_attribute(0x0006, "0x100000001").is_none());
+        assert_eq!(resolve_cluster("0x100000001"), None);
+    }
 }
