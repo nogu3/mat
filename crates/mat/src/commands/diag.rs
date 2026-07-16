@@ -108,6 +108,20 @@ pub fn thread(store_path: &Path, node_id: u64, endpoint: u16) -> Result<(), MatE
         }));
     }
 
+    emit_diag_thread_success(node_id, endpoint, thread, unavailable);
+    Ok(())
+}
+
+/// `diag thread` の成功 JSON を stdout へ emit する。chip-tool 経路と native
+/// 直経路（`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+/// `unavailable` は空なら省略する（native 経路では通常空 — `ops::diag_thread`
+/// のコメント参照）。
+pub(crate) fn emit_diag_thread_success(
+    node_id: u64,
+    endpoint: u16,
+    thread: Map<String, Value>,
+    unavailable: Vec<Value>,
+) {
     let mut body = Map::new();
     body.insert("node_id".to_string(), json!(node_id));
     body.insert("endpoint".to_string(), json!(endpoint));
@@ -116,7 +130,6 @@ pub fn thread(store_path: &Path, node_id: u64, endpoint: u16) -> Result<(), MatE
         body.insert("unavailable".to_string(), Value::Array(unavailable));
     }
     output::emit(Value::Object(body));
-    Ok(())
 }
 
 /// 失敗属性を `unavailable` に記録し、最初の失敗を保持する（全滅時の伝播用）。
