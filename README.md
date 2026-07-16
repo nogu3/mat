@@ -72,8 +72,9 @@ mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 
 }
 ```
 
-With `--probe`, each `commissioned` node is checked against live mDNS
-(`avahi-browse _matter._tcp`, one browse for all nodes) and annotated:
+With `--probe`, each `commissioned` node is checked against a live mDNS
+browse — native one-shot browse when `MAT_IFACE` is set (M8b), `avahi-browse
+_matter._tcp` otherwise, one browse for all nodes — and annotated:
 
 - `reachable: true` — advertising now; `address` is the live-resolved value
   (may differ from the ledger).
@@ -288,7 +289,7 @@ where `mat invoke` would only return a bare `timeout` / `session_failed`.
 ```bash
 # diag node --node <node_id> [--endpoint EP] [--deep]   (EP defaults to 0)
 mat diag node --node 5            # chip-tool only (fast)
-mat diag node --node 5 --deep     # also probe ping6 + mDNS (avahi-browse)
+mat diag node --node 5 --deep     # also probe ping6 + mDNS (native if MAT_IFACE set, else avahi-browse)
 ```
 
 ```json
@@ -314,8 +315,9 @@ mat diag node --node 5 --deep     # also probe ping6 + mDNS (avahi-browse)
 > mDNS evidence that distinguishes them. Like `diag thread` it returns **partial
 > results** (skipped/failed checks go under `unavailable`) and **always exits
 > `0`** with a verdict, even when the node is fully unreachable — the value is in
-> the classification, not an exit code. `--deep` shells out to `ping6` and
-> `avahi-browse` (override with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
+> the classification, not an exit code. `--deep` shells out to `ping6` and,
+> unless `MAT_IFACE` is set (native browse, M8b), `avahi-browse` (override
+> with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
 >
 > `mdns.advertised_self_fabric` is whether the node advertises on **our** fabric
 > specifically (vs. `advertised_any_fabric`, which is any fabric). It needs our
@@ -596,8 +598,10 @@ matd --iface thread0 &
   `matd` socket protocol at all (by design — these are rare, session-lifetime
   doesn't matter for them) and never get routed to `matd` even when it's
   running; `mat` always handles them on its own direct path (native if
-  `MAT_IFACE` is set, chip-tool otherwise). `diag node`, `discover`, and
-  `commission` remain chip-tool-only in M8a (unaffected by this milestone).
+  `MAT_IFACE` is set, chip-tool otherwise). `diag node` and `discover` gained
+  a native option in M8b — but only on `mat`'s own one-shot direct path (see
+  below); `matd` still never carries these ops. `commission` remains
+  chip-tool-only until M8c.
   Because of this, `chip-tool` is only spawned lazily on the first op that
   needs it: a workload that only ever hits native-eligible ops never spawns
   `chip-tool` at all, and `matd` can start even if `chip-tool` isn't
@@ -683,7 +687,7 @@ chip-tool.
   matd's group traffic for the duration — unicast ops are fine to leave
   running).
 
-### `mat`'s native direct path (Phase 5 M7, extended in M8a)
+### `mat`'s native direct path (Phase 5 M7, extended in M8a, M8b)
 
 Set `MAT_IFACE=<thread mesh iface>` (or pass the global `--iface <name>`) to
 let `mat`'s own one-shot **direct** path — not `matd` — run its hotpath ops
@@ -713,6 +717,17 @@ An attribute or command field that the name table knows to be `list` /
 names the type); it does not silently fall back to chip-tool. Unknown
 cluster/attribute/command names (not in the generated table) still fall back
 to chip-tool as before.
+
+As of M8b, `MAT_IFACE` also governs two ops that are **not** part of the
+`matd` protocol at all and never route through `matd`: `discover`'s
+commissionable-device browse (native `browse_commissionable`, mapped into the
+same `DiscoveredDevice` JSON schema byte-for-byte) and the mDNS probe shared
+by `discover --probe` and `diag node --deep` (native `browse_operational`).
+Both fall back to their pre-M8b mechanism (`chip-tool` for discover,
+`avahi-browse` for the probe) only on an I/O error from the native browse —
+finding zero commissionable devices / operational instances is a normal
+result and never triggers a fallback. `commission` remains chip-tool-only
+until M8c.
 
 ```bash
 mat --iface thread0 on --node 5

@@ -540,6 +540,33 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   - **M8b（0.19.0）— discover native 化**: mDNS browse
     （`_matter._tcp` operational + `_matterc._udp` commissionable）+ probe
     reachability。既存 `dnssd.rs`（operational 解決）の browse 拡張。
+    **実装済み**: (1) **dnssd browse**（`mat-controller::dnssd`）: one-shot
+    legacy unicast mDNS で `_matterc._udp`（commissionable）/ `_matter._tcp`
+    （operational）の PTR を列挙し、instance ごとに SRV/TXT/AAAA を畳み込む。
+    resolve 系と違い早期 return せず固定 window（`BROWSE_WINDOW` = 3 秒、
+    CLI フラグ化なし）で打ち切り、クエリは 1 秒間隔で再送、フォローアップ
+    質問は 1 メッセージ 8 件ずつに分割、受信バッファ 9000 byte。flood 耐性
+    キャップ（instance 32 件 / AAAA プール 64 件）、他プロトコルの壊れた
+    データグラムは読み捨てて継続。operational は announce のみ（SRV/AAAA
+    が期限内に揃わない）でも addresses 空で保持し、commissionable は素材
+    ゼロなら skip。(2) **`mat::probe::mdns(iface)` の native 化**:
+    `MAT_IFACE`（`--iface`）設定時は native `browse_operational`（マーカー
+    ログ `probe executed (native browse)`）、IO エラー時は warn ログ +
+    `avahi-browse` フォールバック。`discover --probe` と `diag node --deep`
+    の両方が対象（`diag node` の他チェックは引き続き chip-tool 経由 —
+    `diag node` の IM 自体の native 化は M8c）。(3) **`mat discover` の
+    commissionable 探索の native 化**: `MAT_IFACE` 設定時は native
+    `browse_commissionable` を既存 `DiscoveredDevice` スキーマへそのまま
+    写す（JSON はバイト一致）。IO エラー時は warn ログ + chip-tool
+    フォールバック。(4) **フォールバック規則はどちらも共通**: フォール
+    バックは IO エラー時のみ、探索/probe が 0 件なのは正常でフォール
+    バックしない。(5) discover/probe は matd プロトコルの対象外のまま
+    （one-shot 直経路のみ。engine/KVS/credentials 不要、UDP ソケット +
+    ifindex のみで完結）。(6) **dead API 掃除**: M8a で呼び出しゼロに
+    なった matd `NativeBackend::ensure_group_acl` を削除。バージョンは
+    0.19.0。**実機 E2E は別途実施後に追記**（ハーネス
+    `scripts/e2e-m8b-real.sh` / `task e2e:m8b:real`、5 項目、jarvis +
+    `MAT_E2E_HOST`/`MAT_E2E_NODES` 要）。
   - **M8c（0.20.0）— commission native 化 + chip-tool 完全撤去**: 本番
     `mat commission` の native 化、KVS 書込所有、native 既定化、
     runner.rs / chip-tool 分岐 / fake-chip-tool テスト基盤 / Docker の
