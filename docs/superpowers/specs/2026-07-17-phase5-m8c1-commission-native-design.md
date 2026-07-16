@@ -15,8 +15,12 @@ chip-tool フォールバックが生きているため撤退可能。
 - **M8c-1（本 spec、0.20.0）— commission native 化**: 既存 fabric 上の
   `mat commission` を M6a（on-network）/ M6b（BLE+Thread）実装へ配線。
   **KVS 書込なし**（commissioning は既存 fabric 上では KVS 書込を必要と
-  しない — node 台帳は mat の store、デバイス側 NOC 発行は既存 read 系
-  API で足りる）。attestation PAA 対応、`CommissioningError`→`ErrorKind`
+  しない — node 台帳は mat の store、デバイス側 NOC 発行は read 系 API で
+  足りる。ただし **read 側に追加が 1 つ要る**: AddNOC でデバイスへ渡す
+  IPK は **epoch** 鍵であり、現行 `kvs.rs` は operational しか公開して
+  いない（`f/<idx>/k/0` の永続鍵は M5 実機実証で operational）。epoch の
+  KVS 内の所在を上流 v1.4.2.0 の永続形式から確定して読み出しを追加する —
+  実装計画 Task 2。KVS に epoch が無いと確定した場合は設計再検討）。attestation PAA 対応、`CommissioningError`→`ErrorKind`
   写像の追従（M6b fix-later の解消）、chip-tool フォールバック維持。
 - **M8c-2（0.21.0）— KVS group 書込所有 + diag node 再訪**: controller 側
   `groupsettings`（chip-tool interactive）の native 化 = keyset / group
