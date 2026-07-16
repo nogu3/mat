@@ -28,9 +28,9 @@ rustix = { version = "1", features = ["fs"] }
 tracing = { workspace = true }
 bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 

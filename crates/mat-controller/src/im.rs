@@ -4,7 +4,7 @@
 //! ReadRequest/ReportData, single-command InvokeRequest/InvokeResponse, and
 //! StatusResponse. No subscriptions, no batched paths, no chunking.
 
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{Element, Reader, Tag, TlvError, Value, Writer};
 
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
@@ -319,6 +319,344 @@ pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
         value,
         status,
     })
+}
+
+/// 1 AttributeReportIB のデコード結果（汎用形）。`decode_report_data`（M2,
+/// 単一属性・スカラーのみ）とは独立の新 API — 既存 API は無改変。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeReport {
+    pub endpoint: Option<u16>,
+    pub attribute: Option<u32>,
+    /// path に ListIndex(null) があれば true（チャンク化 list の item 追記）。
+    pub list_append: bool,
+    /// AttributeDataIB の Data 要素を JSON 化したもの（status レポートなら None）。
+    pub data: Option<serde_json::Value>,
+    pub status: Option<u8>,
+}
+
+/// ReportDataMessage (spec §8.9.2) の汎用デコード結果。複数 AttributeReportIB・
+/// チャンク（MoreChunkedMessages）・list 追記に対応する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportDataMessage {
+    pub reports: Vec<AttributeReport>,
+    pub more_chunks: bool,
+    pub suppress_response: bool,
+}
+
+/// TLV 単一要素（コンテナ含む）を JSON へ。`first` は既に読んだ先頭要素。
+/// JSON 化規約（固定）: Bool→bool, Uint/Int→number, F32/F64→number,
+/// Utf8→string, Bytes→小文字hex文字列, Null→null, Array/List→JSON array,
+/// Struct→JSON object（キーは context tag 番号の10進文字列。名前付けは
+/// 上位層の責務）。
+fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Value, ImError> {
+    use serde_json::Value as J;
+    Ok(match first.value {
+        Value::Bool(b) => J::Bool(b),
+        Value::Uint(u) => J::from(u),
+        Value::Int(i) => J::from(i),
+        Value::F32(f) => serde_json::json!(f),
+        Value::F64(f) => serde_json::json!(f),
+        Value::Utf8(s) => J::String(s.to_string()),
+        Value::Bytes(b) => J::String(hex_lower(b)),
+        Value::Null => J::Null,
+        Value::ArrayStart | Value::ListStart => {
+            let mut items = Vec::new();
+            loop {
+                let el = r.next()?.ok_or(ImError::Malformed("truncated array"))?;
+                if el.value == Value::ContainerEnd {
+                    break;
+                }
+                items.push(tlv_element_to_json(r, el)?);
+            }
+            J::Array(items)
+        }
+        Value::StructStart => {
+            let mut map = serde_json::Map::new();
+            loop {
+                let el = r.next()?.ok_or(ImError::Malformed("truncated struct"))?;
+                if el.value == Value::ContainerEnd {
+                    break;
+                }
+                let key = match el.tag {
+                    Tag::Context(n) => n.to_string(),
+                    _ => continue, // 想定外タグはスキップ（前方互換）
+                };
+                map.insert(key, tlv_element_to_json(r, el)?);
+            }
+            J::Object(map)
+        }
+        Value::ContainerEnd => return Err(ImError::Malformed("dangling container end")),
+    })
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// AttributePathIB (spec §8.9.2.2, list) のうち endpoint(Context 2) /
+/// attribute(Context 4) / ListIndex(Context 5, `Null` ならチャンク化 list
+/// への item 追記) を拾う。他フィールド（Node/Cluster/DataVersion 等）は
+/// 読み飛ばす。呼び出し側は path を開く `ListStart` を既に読んでいる前提。
+fn decode_attribute_path_ib(r: &mut Reader) -> Result<(Option<u16>, Option<u32>, bool), ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute path"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(2), Value::Uint(v)) => {
+                endpoint = Some(
+                    u16::try_from(v).map_err(|_| ImError::Malformed("endpoint out of range"))?,
+                );
+            }
+            (Tag::Context(4), Value::Uint(v)) => {
+                attribute = Some(
+                    u32::try_from(v)
+                        .map_err(|_| ImError::Malformed("attribute id out of range"))?,
+                );
+            }
+            (Tag::Context(5), Value::Null) => list_append = true,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((endpoint, attribute, list_append))
+}
+
+/// AttributeStatusIB (spec §8.9.2.2): `{0: Path, 1: StatusIB{0: status, ...}}`,
+/// path も拾う汎用版（`decode_attribute_status_ib` の M2 版とは独立— 既存
+/// API 無改変のため別関数にした）。呼び出し側は AttributeReportIB の
+/// anonymous `StructStart`（tag 0）を既に読んでいる前提。
+fn decode_attribute_status_ib_full(
+    r: &mut Reader,
+) -> Result<(Option<u16>, Option<u32>, u8), ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute status"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ListStart) => {
+                let (ep, attr, _) = decode_attribute_path_ib(r)?;
+                endpoint = ep;
+                attribute = attr;
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                // StatusIB
+                loop {
+                    let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+                    match (e2.tag, e2.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (Tag::Context(0), Value::Uint(v)) => {
+                            status = Some(u8::try_from(v).map_err(|_| {
+                                ImError::Malformed("attribute status code out of range")
+                            })?);
+                        }
+                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                            skip_container(r)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    let status = status.ok_or(ImError::Malformed("attribute status without StatusIB"))?;
+    Ok((endpoint, attribute, status))
+}
+
+/// `decode_attribute_data_ib_full` の戻り値: (endpoint, attribute,
+/// list_append, data).
+type AttributeDataFields = (Option<u16>, Option<u32>, bool, Option<serde_json::Value>);
+
+/// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`,
+/// path も拾い Data を JSON 化する汎用版（`decode_attribute_data_ib` の M2
+/// 版とは独立）。呼び出し側は AttributeReportIB の anonymous `StructStart`
+/// （tag 1）を既に読んでいる前提。
+fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
+    let mut data = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ListStart) => {
+                let (ep, attr, la) = decode_attribute_path_ib(r)?;
+                endpoint = ep;
+                attribute = attr;
+                list_append = la;
+            }
+            (Tag::Context(2), _) => {
+                data = Some(tlv_element_to_json(r, el)?);
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((endpoint, attribute, list_append, data))
+}
+
+/// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`,
+/// 汎用版（path/JSON も拾う。`decode_attribute_report_ib` の M2 版とは独立）。
+/// 呼び出し側は開く anonymous `StructStart` を既に読んでいる前提。
+fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
+    let mut data = None;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute report"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                let (ep, attr, s) = decode_attribute_status_ib_full(r)?;
+                endpoint = ep;
+                attribute = attr;
+                status = Some(s);
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                let (ep, attr, la, d) = decode_attribute_data_ib_full(r)?;
+                endpoint = ep;
+                attribute = attr;
+                list_append = la;
+                data = d;
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(AttributeReport {
+        endpoint,
+        attribute,
+        list_append,
+        data,
+        status,
+    })
+}
+
+/// ReportDataMessage (spec §8.9.2) の汎用デコード。すべての AttributeReportIB
+/// を読み（M2 の `decode_report_data` と違い最初の 1 件に限らない）、
+/// MoreChunkedMessages(tag 3) はチャンク未完了フラグとしてそのまま
+/// `more_chunks` へ反映するだけで拒否しない（チャンク統合は
+/// `merge_reports` の責務）。
+pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut reports = Vec::new();
+    let mut more_chunks = false;
+    let mut suppress_response = false;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated report data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // AttributeReportIBs: every entry, not just the first.
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated attribute reports"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart => {
+                            reports.push(decode_attribute_report_ib_full(&mut r)?);
+                        }
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in attribute reports",
+                            ))
+                        }
+                    }
+                }
+            }
+            (Tag::Context(3), Value::Bool(b)) => more_chunks = b,
+            (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(ReportDataMessage {
+        reports,
+        more_chunks,
+        suppress_response,
+    })
+}
+
+/// ReadRequestMessage (spec §8.9.2) の wildcard 版: AttributePathIB から
+/// attribute を省略し、cluster 内の全属性を要求する。
+pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(0)); // AttributeRequests
+    w.start_list(Tag::Anonymous); // AttributePathIB
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    w.end_container(); // AttributePathIB
+    w.end_container(); // AttributeRequests
+    w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// 複数 ReportDataMessage・リスト追記を統合し attribute id → JSON 値へ。
+/// 同一 attribute の非追記レポートは最後のものが勝つ（Replace）。追記
+/// （`list_append`）は既存値が JSON array ならそこへ push する（既存値が
+/// array でない異常系は 1 要素の array から作り直す）。status のみの
+/// レポート（`data: None`）は結果に出ない。出力順は最初に登場した順。
+pub fn merge_reports(msgs: &[ReportDataMessage]) -> Vec<(u32, serde_json::Value)> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut map: std::collections::HashMap<u32, serde_json::Value> =
+        std::collections::HashMap::new();
+    for m in msgs {
+        for rep in &m.reports {
+            let Some(attr) = rep.attribute else { continue };
+            let Some(data) = rep.data.clone() else {
+                continue; // status-only は値なし
+            };
+            if rep.list_append {
+                match map.entry(attr).or_insert_with(|| serde_json::json!([])) {
+                    serde_json::Value::Array(items) => items.push(data),
+                    slot => *slot = serde_json::json!([data]), // 追記が先に来た異常系
+                }
+            } else {
+                map.insert(attr, data);
+            }
+            if !order.contains(&attr) {
+                order.push(attr);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|a| map.remove(&a).map(|v| (a, v)))
+        .collect()
 }
 
 /// Deep-copies one TLV element (and, if a container, its full subtree) from
@@ -1264,5 +1602,125 @@ mod tests {
         w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
         w.end_container();
         assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn decode_report_data_message_multiple_ibs_and_types() {
+        // ReportData { 1: [ AttrReport{1: Data{1: path(ep,cl,attr), 2: data}},
+        //                   AttrReport{...} ], 4: suppress }
+        // を Writer で組み、bool と list-of-struct の 2 属性が JSON になること。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReports
+                                        // 属性1: on-off = true
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeDataIB
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // AttributePathIB
+        w.put_uint(Tag::Context(2), 1); // endpoint
+        w.put_uint(Tag::Context(3), 0x0006);
+        w.put_uint(Tag::Context(4), 0x0000);
+        w.end_container();
+        w.put_bool(Tag::Context(2), true); // Data
+        w.end_container();
+        w.end_container();
+        // 属性2: 構造体1件のリスト
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        w.start_list(Tag::Context(1));
+        w.put_uint(Tag::Context(2), 0);
+        w.put_uint(Tag::Context(3), 0x0035);
+        w.put_uint(Tag::Context(4), 0x0007); // neighbor-table
+        w.end_container();
+        w.start_array(Tag::Context(2)); // Data: array of struct
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 42);
+        w.put_int(Tag::Context(1), -60);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container(); // AttributeReports
+        w.put_bool(Tag::Context(4), true); // SuppressResponse
+        w.end_container();
+        let msg = decode_report_data_message(&w.finish()).unwrap();
+        assert!(msg.suppress_response);
+        assert!(!msg.more_chunks);
+        assert_eq!(msg.reports.len(), 2);
+        assert_eq!(msg.reports[0].attribute, Some(0x0000));
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(true)));
+        assert_eq!(msg.reports[1].attribute, Some(0x0007));
+        assert_eq!(
+            msg.reports[1].data,
+            Some(serde_json::json!([{"0": 42, "1": -60}]))
+        );
+    }
+
+    #[test]
+    fn merge_reports_joins_chunked_list_appends() {
+        // msg1: neighbor-table = []（Replace）+ more_chunks
+        // msg2: ListIndex null の追記 IB × 2
+        // → 統合結果は 2 要素の array。
+        fn path(w: &mut Writer, attr: u32, append: bool) {
+            w.start_list(Tag::Context(1));
+            w.put_uint(Tag::Context(2), 0);
+            w.put_uint(Tag::Context(3), 0x0035);
+            w.put_uint(Tag::Context(4), u64::from(attr));
+            if append {
+                w.put_null(Tag::Context(5)); // ListIndex = null → 追記
+            }
+            w.end_container();
+        }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        path(&mut w, 0x0007, false);
+        w.start_array(Tag::Context(2));
+        w.end_container(); // 空 array（replace）
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages
+        w.end_container();
+        let m1 = decode_report_data_message(&w.finish()).unwrap();
+        assert!(m1.more_chunks);
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        for v in [7u64, 8u64] {
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(1));
+            path(&mut w, 0x0007, true);
+            w.put_uint(Tag::Context(2), v); // Data = list item
+            w.end_container();
+            w.end_container();
+        }
+        w.end_container();
+        w.end_container();
+        let m2 = decode_report_data_message(&w.finish()).unwrap();
+        assert_eq!(m2.reports.len(), 2);
+        assert!(m2.reports[0].list_append);
+
+        let merged = merge_reports(&[m1, m2]);
+        assert_eq!(merged, vec![(0x0007, serde_json::json!([7, 8]))]);
+    }
+
+    #[test]
+    fn encode_read_request_cluster_omits_attribute() {
+        let b = encode_read_request_cluster(1, 0x0035);
+        let mut r = Reader::new(&b);
+        let mut saw_attr_tag = false;
+        while let Some(el) = r.next().unwrap() {
+            if el.tag == Tag::Context(4) {
+                saw_attr_tag = true;
+            }
+        }
+        assert!(
+            !saw_attr_tag,
+            "wildcard read must omit the attribute path field"
+        );
     }
 }
