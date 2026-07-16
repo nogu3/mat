@@ -14,7 +14,7 @@ use mat_core::store::Store;
 use mat_native::group::GroupOutcome;
 use mat_native::{Engine, NativeConfig};
 
-use crate::cli::{Command, GroupCommand};
+use crate::cli::{Command, DiagCommand, GroupCommand};
 
 pub(crate) struct Config<'a> {
     pub iface: &'a str,
@@ -98,6 +98,26 @@ pub(crate) enum NativeOp {
         fields_tlv: Option<Vec<u8>>,
         timed: bool,
     },
+    Describe {
+        node_id: u64,
+    },
+    DiagThread {
+        node_id: u64,
+        endpoint: u16,
+    },
+    OpenWindow {
+        node_id: u64,
+        timeout: u32,
+        iteration: u32,
+        discriminator: u16,
+    },
+}
+
+/// `mat open-window` の discriminator 未指定時の決定的補完（12-bit に収める）。
+/// main.rs（chip-tool 経路の既定値算出）と `classify`（native 直経路の対象値
+/// 算出）の両方が使う共有式 —— 経路によって既定値がずれないようにする。
+pub(crate) fn resolve_discriminator(node_id: u64, discriminator: Option<u16>) -> u16 {
+    discriminator.unwrap_or((node_id % 4096) as u16)
 }
 
 pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
@@ -226,6 +246,31 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 endpoint: *endpoint,
             })
         }
+        // describe / diag thread / open-window（M8a Task8）: 値の符号化を
+        // 伴わない読み取り専用 op なので、classify_strict と違い常に
+        // Some/None（Err にはならない）。
+        Command::Describe { node_id } => Some(NativeOp::Describe {
+            node_id: node_id.id(),
+        }),
+        Command::Diag {
+            action: DiagCommand::Thread { node_id, endpoint },
+        } => Some(NativeOp::DiagThread {
+            node_id: node_id.id(),
+            endpoint: endpoint.id(),
+        }),
+        // `Diag Node` は probe（ping6/avahi-browse）混在のため対象外
+        // （chip-tool 経路のまま。M8b/M8c で再訪）。
+        Command::OpenWindow {
+            node_id,
+            timeout,
+            iteration,
+            discriminator,
+        } => Some(NativeOp::OpenWindow {
+            node_id: node_id.id(),
+            timeout: *timeout,
+            iteration: *iteration,
+            discriminator: resolve_discriminator(node_id.id(), *discriminator),
+        }),
         // 汎用 read/write/invoke（M8a）: classify_strict の判定を再利用し、値の
         // 符号化不能（Err）はここでは黙って None（chip-tool 直路）に丸める —
         // その Err を明示的に拒否（即 parse_error）したい呼び出し側は
@@ -431,7 +476,10 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
         | NativeOp::ColorTemp { node_id, .. }
         | NativeOp::ReadAttr { node_id, .. }
         | NativeOp::WriteAttr { node_id, .. }
-        | NativeOp::InvokeGeneric { node_id, .. } => Some(*node_id),
+        | NativeOp::InvokeGeneric { node_id, .. }
+        | NativeOp::Describe { node_id, .. }
+        | NativeOp::DiagThread { node_id, .. }
+        | NativeOp::OpenWindow { node_id, .. } => Some(*node_id),
         NativeOp::GroupOnOff { .. }
         | NativeOp::GroupColor { .. }
         | NativeOp::GroupColorTemp { .. } => None,
@@ -731,6 +779,54 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 *node_id, *endpoint, cluster_in, command_in,
             );
         }
+        NativeOp::Describe { node_id } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            let endpoints = mat_native::ops::describe(&mut *conn).await?;
+            crate::commands::describe::emit_describe_success(*node_id, &endpoints);
+        }
+        NativeOp::DiagThread { node_id, endpoint } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            let snap = mat_native::ops::diag_thread(&mut *conn, *endpoint).await?;
+            // wildcard read は per-attribute の失敗を出さないため native 経路の
+            // unavailable は通常空だが、スキーマ整合のため chip-tool 経路と同じ
+            // 形（{"attribute", "kind"}）へ変換して渡す。
+            let unavailable: Vec<serde_json::Value> = snap
+                .unavailable
+                .iter()
+                .map(|(attr, kind)| {
+                    serde_json::json!({
+                        "attribute": attr,
+                        "kind": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect();
+            crate::commands::diag::emit_diag_thread_success(
+                *node_id,
+                *endpoint,
+                snap.fields,
+                unavailable,
+            );
+        }
+        NativeOp::OpenWindow {
+            node_id,
+            timeout,
+            iteration,
+            discriminator,
+        } => {
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            // timeout は chip-tool 経路と同じ u32 CLI 値、window API は u16
+            // （spec 上 window timeout は 16-bit）。飽和させて渡す。
+            let timeout_u16 = u16::try_from(*timeout).unwrap_or(u16::MAX);
+            let (manual_code, qr_payload) = conn
+                .open_window(timeout_u16, *discriminator, *iteration)
+                .await?;
+            crate::commands::open_window::emit_open_window_success(
+                *node_id,
+                &manual_code,
+                &qr_payload,
+                *timeout,
+            );
+        }
     }
     Ok(RunOutcome::Done)
 }
@@ -781,7 +877,8 @@ mod tests {
             attribute: "x".into(),
         };
         assert!(classify(&unresolvable).is_none());
-        // discover / describe 等は非対象。
+        // discover は非対象（describe は M8a Task8 で native 対象化
+        // — `describe_diag_thread_open_window_shapes_are_native` 参照）。
         assert!(classify(&Command::Discover { probe: false }).is_none());
     }
 
@@ -1059,5 +1156,93 @@ mod tests {
         };
         let err = classify_strict(&ks).unwrap().unwrap_err();
         assert_eq!(err.kind, mat_core::error::ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn describe_diag_thread_open_window_shapes_are_native() {
+        use crate::cli::DiagCommand;
+        use mat_core::alias::{EndpointRef, NodeRef};
+        let describe = Command::Describe {
+            node_id: NodeRef::Id(5),
+        };
+        assert!(matches!(
+            classify(&describe),
+            Some(NativeOp::Describe { node_id: 5 })
+        ));
+
+        let diag_thread = Command::Diag {
+            action: DiagCommand::Thread {
+                node_id: NodeRef::Id(5),
+                endpoint: EndpointRef::Id(0),
+            },
+        };
+        assert!(matches!(
+            classify(&diag_thread),
+            Some(NativeOp::DiagThread {
+                node_id: 5,
+                endpoint: 0
+            })
+        ));
+
+        // `diag node` は probe 混在のため引き続き非対象（chip-tool 直）。
+        let diag_node = Command::Diag {
+            action: DiagCommand::Node {
+                node_id: NodeRef::Id(5),
+                endpoint: EndpointRef::Id(0),
+                deep: false,
+            },
+        };
+        assert!(classify(&diag_node).is_none());
+
+        // discriminator 明示指定はそのまま使う。
+        let ow = Command::OpenWindow {
+            node_id: NodeRef::Id(5),
+            timeout: 180,
+            iteration: 1000,
+            discriminator: Some(3840),
+        };
+        assert!(matches!(
+            classify(&ow),
+            Some(NativeOp::OpenWindow {
+                node_id: 5,
+                timeout: 180,
+                iteration: 1000,
+                discriminator: 3840,
+            })
+        ));
+        // discriminator 未指定は node_id % 4096 で決定的に補完（main.rs と同じ式）。
+        let ow_default = Command::OpenWindow {
+            node_id: NodeRef::Id(5),
+            timeout: 180,
+            iteration: 1000,
+            discriminator: None,
+        };
+        assert!(matches!(
+            classify(&ow_default),
+            Some(NativeOp::OpenWindow {
+                discriminator: 5,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_window_runs_via_fake_and_emits_codes() {
+        // fake 経由で run_op(OpenWindow) が establish → open_window → emit まで
+        // 完走することを確認する（emit 先の stdout 内容そのものは
+        // `emit_open_window_success` の既存ユニットテストで担保済み）。
+        use mat_native::test_support::FakeEstablisher;
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        run_op(
+            &engine,
+            &NativeOp::OpenWindow {
+                node_id: 5,
+                timeout: 180,
+                iteration: 1000,
+                discriminator: 3840,
+            },
+        )
+        .await
+        .unwrap();
     }
 }

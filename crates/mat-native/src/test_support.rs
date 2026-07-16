@@ -2,6 +2,7 @@
 //! `mat_native::test_support::*`（feature `test-support`、または自 crate
 //! テスト時）で使う。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -15,10 +16,62 @@ use crate::{Establisher, NodeConn};
 
 /// 送信 1 回目に `fail_kind` で失敗するよう設定できる fake セッション。
 /// `sent` は `&mut self` 下でのみ触るので素の `usize` で足りる（atomic 不要）。
+///
+/// `reads`/`clusters` は `scripted()` + `with_read`/`with_cluster` で流し込む
+/// プリセット応答（ops.rs のテスト等が使う）。未登録の `(endpoint, cluster,
+/// attribute)` / `(endpoint, cluster)` は従来どおりの固定値へフォールバック
+/// する — 既存テスト（`fail_first_send` 等）の挙動は不変。
 pub struct FakeConn {
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
     pub sent: usize,
+    reads: HashMap<(u16, u32, u32), serde_json::Value>,
+    clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
+}
+
+impl Default for FakeConn {
+    fn default() -> Self {
+        Self {
+            fail_first_send: false,
+            fail_kind: ErrorKind::Timeout,
+            sent: 0,
+            reads: HashMap::new(),
+            clusters: HashMap::new(),
+        }
+    }
+}
+
+impl FakeConn {
+    /// 呼ばれた `(endpoint, cluster, attribute)` / `(endpoint, cluster)` に
+    /// 応じたプリセット応答を返す fake を作る（`with_read`/`with_cluster` で
+    /// 登録）。未登録の呼び出しは既存の固定値応答にフォールバックする。
+    pub fn scripted() -> Self {
+        Self::default()
+    }
+
+    /// `read_json(endpoint, cluster, attribute)` の応答を1件登録する。
+    pub fn with_read(
+        mut self,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        value: serde_json::Value,
+    ) -> Self {
+        self.reads.insert((endpoint, cluster, attribute), value);
+        self
+    }
+
+    /// `read_cluster(endpoint, cluster)` の応答（wildcard read の結果）を
+    /// 1件登録する。
+    pub fn with_cluster(
+        mut self,
+        endpoint: u16,
+        cluster: u32,
+        rows: Vec<(u32, serde_json::Value)>,
+    ) -> Self {
+        self.clusters.insert((endpoint, cluster), rows);
+        self
+    }
 }
 
 #[async_trait]
@@ -44,18 +97,24 @@ impl NodeConn for FakeConn {
 
     async fn read_json(
         &mut self,
-        _endpoint: u16,
-        _cluster: u32,
-        _attribute: u32,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
     ) -> Result<serde_json::Value, MatError> {
+        if let Some(v) = self.reads.get(&(endpoint, cluster, attribute)) {
+            return Ok(v.clone());
+        }
         Ok(json!(1))
     }
 
     async fn read_cluster(
         &mut self,
-        _endpoint: u16,
-        _cluster: u32,
+        endpoint: u16,
+        cluster: u32,
     ) -> Result<Vec<(u32, serde_json::Value)>, MatError> {
+        if let Some(rows) = self.clusters.get(&(endpoint, cluster)) {
+            return Ok(rows.clone());
+        }
         Ok(vec![(0u32, json!(true))])
     }
 
@@ -73,6 +132,20 @@ impl NodeConn for FakeConn {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         Ok(())
+    }
+
+    async fn open_window(
+        &mut self,
+        _timeout_s: u16,
+        discriminator: u16,
+        _iterations: u32,
+    ) -> Result<(String, String), MatError> {
+        // 固定文字列: manual_code は11桁数字風、qr_payload は "MT:" 始まり
+        // （brief 記載どおり — 実 setup code とのバイト整合は問わないテスト用）。
+        Ok((
+            "34970112332".to_string(),
+            format!("MT:FAKE0{discriminator:04X}QR0"),
+        ))
     }
 }
 
@@ -103,7 +176,7 @@ impl Establisher for FakeEstablisher {
         Ok(Box::new(FakeConn {
             fail_first_send: self.fail_first_send && n == 0,
             fail_kind: self.fail_kind,
-            sent: 0,
+            ..Default::default()
         }))
     }
 }
