@@ -3,11 +3,26 @@
 //!
 //! Scope: resolve one `<CompressedFabricId>-<NodeId>._matter._tcp.local`
 //! instance to IPv6 addresses + port + MRP intervals (TXT `SII`/`SAI`).
-//! No browsing, no advertising, no cache: send a legacy unicast query
-//! (source port ≠ 5353, so responders reply straight back to us), fold
-//! responses until SRV + at least one AAAA for its target are in hand.
-//! TXT is folded when it arrives in the same responses but is not waited
-//! for — MRP falls back to the spec default interval without it.
+//! No advertising, no cache: send a legacy unicast query (source port ≠
+//! 5353, so responders reply straight back to us), fold responses until
+//! SRV + at least one AAAA for its target are in hand. TXT is folded when
+//! it arrives in the same responses but is not waited for — MRP falls back
+//! to the spec default interval without it.
+//!
+//! M8b adds one-shot browse (`browse_commissionable`): same legacy unicast
+//! transport, but enumerating PTR answers for a whole service type and
+//! folding SRV/TXT/AAAA per instance until a fixed window ([`BROWSE_WINDOW`])
+//! expires — no early return, still no cache. Commissionable discovery is
+//! inherently enumeration (unknown targets), so browse stays there.
+//! Operational *reachability* (the mDNS probe) is NOT enumeration-based:
+//! real-mesh wire evidence (2026-07-17) showed advertising proxies simply
+//! not answering `_matter._tcp` PTR enumeration for some registered
+//! instances (even after known-answer suppression), while targeted resolve
+//! of those same instances (`resolve_operational`, the path CASE already
+//! uses) succeeds. So the probe now runs concurrent `resolve_operational`
+//! calls against the ledger's known (CompressedFabricId, NodeId) pairs
+//! instead of browsing `_matter._tcp` and matching results — see
+//! `crates/mat/src/probe.rs`. `browse_operational` was removed accordingly.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
@@ -150,6 +165,122 @@ fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
     out
 }
 
+/// Byte budget per packet for [`encode_ptr_query_with_known`] (comfortably
+/// under a typical path MTU; real responders truncated at ~1428B — see the
+/// module doc's known-answer-suppression note).
+const KNOWN_ANSWER_PACKET_BUDGET: usize = 1400;
+
+/// PTR クエリ + Known-Answer リストを 1..N 個のパケットに符号化する
+/// (RFC 6762 §7.2)。KA が 1 パケットに収まらない場合は分割し、最後以外の
+/// パケットに TC を立てる（responder は TC の間、応答を保留して継続を待つ）。
+/// 2 パケット目以降は question 数 0 の KA 継続パケット。
+///
+/// レコードの owner name は、そのパケット内でオフセット 12 に置かれた名前
+/// （パケット 1 なら question 名そのもの、継続パケットならその中の最初の
+/// レコードが literal に書く service 名）への圧縮ポインタ (`0xC0 0x0C`) で
+/// 表す。継続パケットの最初のレコードだけは、指す先がまだ無いので service
+/// 名を literal に書く（以後のレコードはそれを指せる）。rdata（instance の
+/// 完全名）は先頭ラベルを literal に書き、残り（service 名の tail）は同じ
+/// オフセット 12 への圧縮ポインタで表す。
+///
+/// 既知 instance が 0 件のときは旧来の単発クエリ（TC 無し、1 パケット）に
+/// 退化する。
+fn encode_ptr_query_with_known(service: &str, known: &[(String, u32)]) -> Vec<Vec<u8>> {
+    if known.is_empty() {
+        return vec![encode_query(0, &[(service, TYPE_PTR)])];
+    }
+
+    let mut qname = Vec::new();
+    push_name(&mut qname, service);
+    let mut question = qname.clone();
+    question.extend_from_slice(&TYPE_PTR.to_be_bytes());
+    question.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    // 各 KA の "tail"（type+class+ttl+rdlength+rdata）を先に組み立てる。
+    // owner name（ポインタ or literal）はパケット内の位置に依存するため、
+    // グループ分けの段階で別途足す。
+    let suffix = format!(".{service}");
+    let mut ka_tails: Vec<Vec<u8>> = Vec::new();
+    for (name, ttl) in known {
+        if name.len() <= suffix.len() {
+            continue; // 防御的スキップ: service の下位名の形になっていない
+        }
+        let (label, tail) = name.split_at(name.len() - suffix.len());
+        if !tail.eq_ignore_ascii_case(&suffix) || label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        let mut rec = Vec::with_capacity(2 + 2 + 4 + 2 + 1 + label.len() + 2);
+        rec.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        rec.extend_from_slice(&CLASS_IN.to_be_bytes());
+        rec.extend_from_slice(&ttl.to_be_bytes());
+        let rdlen = (1 + label.len() + 2) as u16;
+        rec.extend_from_slice(&rdlen.to_be_bytes());
+        rec.push(label.len() as u8);
+        rec.extend_from_slice(label.as_bytes());
+        rec.extend_from_slice(&[0xC0, 0x0C]); // rdata: service 名 tail への圧縮ポインタ
+        ka_tails.push(rec);
+    }
+
+    if ka_tails.is_empty() {
+        return vec![encode_query(0, &[(service, TYPE_PTR)])];
+    }
+
+    // グループ分け: 各パケットの owner name コストは
+    // - パケット 1 のレコード: 常に 2B ポインタ（question が既にオフセット 12 にある）
+    // - 継続パケットの最初のレコード: qname.len()B literal（後続の指す先を作る）
+    // - 継続パケットの 2 個目以降: 2B ポインタ
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut current_size = 12 + question.len();
+    for (idx, tail) in ka_tails.iter().enumerate() {
+        loop {
+            let gi = groups.len() - 1;
+            let is_packet0 = gi == 0;
+            let is_first_in_group = groups[gi].is_empty();
+            let name_len = if is_packet0 || !is_first_in_group {
+                2
+            } else {
+                qname.len()
+            };
+            let rec_len = name_len + tail.len();
+            if groups[gi].is_empty() || current_size + rec_len <= KNOWN_ANSWER_PACKET_BUDGET {
+                groups[gi].push(idx);
+                current_size += rec_len;
+                break;
+            }
+            groups.push(Vec::new());
+            current_size = 12;
+        }
+    }
+
+    let n = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, idxs)| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u16.to_be_bytes()); // id
+            let flags: u16 = if i + 1 < n { 0x0200 } else { 0 };
+            out.extend_from_slice(&flags.to_be_bytes());
+            let qdcount: u16 = if i == 0 { 1 } else { 0 };
+            out.extend_from_slice(&qdcount.to_be_bytes());
+            out.extend_from_slice(&(idxs.len() as u16).to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
+            if i == 0 {
+                out.extend_from_slice(&question);
+            }
+            for (j, &idx) in idxs.iter().enumerate() {
+                if i == 0 || j > 0 {
+                    out.extend_from_slice(&[0xC0, 0x0C]);
+                } else {
+                    out.extend_from_slice(&qname);
+                }
+                out.extend_from_slice(&ka_tails[idx]);
+            }
+            out
+        })
+        .collect()
+}
+
 /// Reads a possibly-compressed name starting at `pos`. Returns the dotted
 /// name and the offset just past the name *at its original location*.
 /// Pointer chains are hop-bounded to reject compression loops.
@@ -201,6 +332,7 @@ enum RData {
 struct Record {
     name: String,
     rdata: RData,
+    ttl: u32,
 }
 
 /// Smallest possible record: 1-byte root name + type(2) + class(2) +
@@ -257,6 +389,13 @@ fn be16(buf: &[u8], pos: usize) -> Result<u16, DnssdError> {
     Ok(u16::from_be_bytes(b.try_into().expect("2 bytes")))
 }
 
+fn be32(buf: &[u8], pos: usize) -> Result<u32, DnssdError> {
+    let b = buf
+        .get(pos..pos + 4)
+        .ok_or(DnssdError::Malformed("truncated"))?;
+    Ok(u32::from_be_bytes(b.try_into().expect("4 bytes")))
+}
+
 /// Parses the answer + authority + additional records of one DNS message.
 /// Record classes are ignored (mDNS is IN-only; the cache-flush bit lives in
 /// the class field and must not break parsing).
@@ -279,6 +418,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     for _ in 0..total {
         let (name, p) = read_name(buf, pos)?;
         let rtype = be16(buf, p)?;
+        let ttl = be32(buf, p + 4)?;
         let rdlen = usize::from(be16(buf, p + 8)?);
         let rdata_pos = p + 10;
         let rdata = buf
@@ -330,7 +470,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             }
             _ => RData::Other,
         };
-        records.push(Record { name, rdata });
+        records.push(Record { name, rdata, ttl });
         pos = rdata_pos + rdlen;
     }
     Ok(records)
@@ -618,6 +758,319 @@ pub async fn resolve_commissionable(
     Err(DnssdError::Timeout {
         instance: instance.unwrap_or(subtype),
     })
+}
+
+// ── browse（M8b: discover native 化）───────────────────────────────────
+
+/// browse の収集ウィンドウ。resolve と違い「全員から集める」ため早期 return
+/// せず、この時間で打ち切る。
+pub const BROWSE_WINDOW: Duration = Duration::from_secs(3);
+/// browse が追跡する instance 数の上限（偽装 flood でメモリを伸ばさない —
+/// MAX_AAAA と同思想）。実機の複数 fabric レジストリは 32 を上回る
+/// （2026-07 実機観測: 29+ instance が単一 TC 切り捨て応答に収まらず、かつ
+/// 古い fabric の残留 entry も含め 32 を超過）ため 128 に拡張。
+/// 128 × 約 100B は依然として無視できるフラッド上限。
+const MAX_INSTANCES: usize = 128;
+/// browse 中の AAAA 候補プール上限（instance 横断で共有）。
+const MAX_BROWSE_AAAA: usize = 64;
+/// フォローアップクエリ 1 メッセージあたりの質問数上限（MTU 超え回避）。
+const MAX_QUESTIONS_PER_MSG: usize = 8;
+
+/// `_matterc._udp` で見つかった commissionable 1 台分（TXT パース済み）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommissionableInstance {
+    /// SRV target から末尾 `.local` を除いた形。
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    /// 非 link-local 優先でソート、dedup 済み。
+    pub addresses: Vec<Ipv6Addr>,
+    /// TXT `D`（long discriminator）。
+    pub discriminator: Option<u32>,
+    /// TXT `VP`（`<vendor>+<product>`、product は省略され得る）。
+    pub vendor_id: Option<u32>,
+    pub product_id: Option<u32>,
+}
+
+/// finish() が返す、サービス種別に依存しない 1 instance 分の素材。
+/// instance の完全名は commissionable では不要（operational 側の label 解析
+/// —`parse_operational_label`— が M8b で撤去され、この構造体の唯一の消費者
+/// だった）ため持たない。
+struct FoldedInstance {
+    port: Option<u16>,
+    target: Option<String>,
+    txt: Vec<Vec<u8>>,
+    /// SRV target に一致した AAAA（非 link-local 優先ソート、dedup 済み）。
+    addresses: Vec<Ipv6Addr>,
+}
+
+#[derive(Default)]
+struct InstanceFold {
+    srv: Option<(u16, String)>,
+    txt: Option<Vec<Vec<u8>>>,
+    /// この instance を紹介した PTR レコードの TTL（重複 PTR は最新を残す）。
+    /// Known-Answer suppression の再送クエリに載せる値。
+    ttl: u32,
+}
+
+/// browse の畳み込み状態。データグラム単位で [`fold`](Self::fold) に食わせ、
+/// window 満了後に [`finish`](Self::finish) で取り出す。
+struct BrowseFold {
+    /// 例 "_matterc._udp.local"（大文字小文字無視で照合）。
+    service: String,
+    /// key = instance 完全名。到着順・dedup・MAX_INSTANCES で打ち止め。
+    instances: Vec<(String, InstanceFold)>,
+    /// hostname → アドレスのプール（instance 横断で共有し、finish 時に
+    /// SRV target 名で引く）。
+    aaaa: Vec<(String, Ipv6Addr)>,
+}
+
+impl BrowseFold {
+    fn new(service: &str) -> Self {
+        BrowseFold {
+            service: service.to_string(),
+            instances: Vec::new(),
+            aaaa: Vec::new(),
+        }
+    }
+
+    /// 1 データグラム分を畳み込む。PTR を先に全部拾ってから SRV/TXT/AAAA を
+    /// 処理する 2 パス（同一データグラム内のレコード順に依存しない）。
+    fn fold(&mut self, records: &[Record]) {
+        for r in records {
+            if let RData::Ptr(inst) = &r.rdata {
+                if !r.name.eq_ignore_ascii_case(&self.service) {
+                    continue;
+                }
+                if let Some((_, f)) = self
+                    .instances
+                    .iter_mut()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(inst))
+                {
+                    // 重複 PTR: TTL は最新のものを残す。
+                    f.ttl = r.ttl;
+                } else if self.instances.len() < MAX_INSTANCES {
+                    let f = InstanceFold {
+                        ttl: r.ttl,
+                        ..InstanceFold::default()
+                    };
+                    self.instances.push((inst.clone(), f));
+                }
+            }
+        }
+        for r in records {
+            match &r.rdata {
+                RData::Srv { port, target } => {
+                    if let Some((_, f)) = self
+                        .instances
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&r.name))
+                    {
+                        f.srv = Some((*port, target.clone()));
+                    }
+                }
+                RData::Txt(strings) => {
+                    if let Some((_, f)) = self
+                        .instances
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&r.name))
+                    {
+                        f.txt = Some(strings.clone());
+                    }
+                }
+                RData::Aaaa(addr)
+                    if self.aaaa.len() < MAX_BROWSE_AAAA
+                        && !self
+                            .aaaa
+                            .iter()
+                            .any(|(n, a)| a == addr && n.eq_ignore_ascii_case(&r.name)) =>
+                {
+                    self.aaaa.push((r.name.clone(), *addr));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// まだ足りない素材へのフォローアップ質問 (name, qtype)。
+    fn pending_questions(&self) -> Vec<(String, u16)> {
+        let mut out = Vec::new();
+        for (name, f) in &self.instances {
+            if f.srv.is_none() {
+                out.push((name.clone(), TYPE_SRV));
+            }
+            if f.txt.is_none() {
+                out.push((name.clone(), TYPE_TXT));
+            }
+            if let Some((_, target)) = &f.srv {
+                if !self
+                    .aaaa
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(target))
+                {
+                    out.push((target.clone(), TYPE_AAAA));
+                }
+            }
+        }
+        out
+    }
+
+    /// Known-Answer suppression（RFC 6762 §7.1）用に、既知 instance の
+    /// (完全名, TTL) を返す。再送クエリの answer セクションに載せると
+    /// responder は載っていない残りだけを返すため、単一データグラムに
+    /// 収まらない大きなレジストリ（実機で 29 PTR + TC 切り捨てを実証）でも
+    /// 再送のたびに続きが取れる。
+    fn known_answers(&self) -> Vec<(String, u32)> {
+        self.instances
+            .iter()
+            .filter(|(_, f)| f.ttl != 0) // TTL 0 は goodbye — KA に載せない（RFC 6762）。
+            .map(|(name, f)| (name.clone(), f.ttl))
+            .collect()
+    }
+
+    fn finish(self) -> Vec<FoldedInstance> {
+        let pool = self.aaaa;
+        self.instances
+            .into_iter()
+            .map(|(_name, f)| {
+                let (port, target) = match f.srv {
+                    Some((p, t)) => (Some(p), Some(t)),
+                    None => (None, None),
+                };
+                let mut addresses: Vec<Ipv6Addr> = Vec::new();
+                if let Some(t) = &target {
+                    for (n, a) in &pool {
+                        if n.eq_ignore_ascii_case(t) && !addresses.contains(a) {
+                            addresses.push(*a);
+                        }
+                    }
+                    addresses.sort_by_key(is_link_local);
+                }
+                FoldedInstance {
+                    port,
+                    target,
+                    txt: f.txt.unwrap_or_default(),
+                    addresses,
+                }
+            })
+            .collect()
+    }
+}
+
+/// One-shot legacy unicast mDNS browse: `service`（例 "_matterc._udp.local"）
+/// の PTR を列挙し、instance ごとに SRV/TXT/AAAA を畳み込む。resolve_* と
+/// 違い早期 return せず `window` 満了まで収集する（全員から集めるため、
+/// 実行時間 = window で固定）。クエリは 1 秒間隔で再送。
+async fn browse(
+    scope_id: u32,
+    service: &str,
+    window: Duration,
+) -> Result<Vec<FoldedInstance>, DnssdError> {
+    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(DnssdError::Io)?;
+    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let mut fold = BrowseFold::new(service);
+    let deadline = Instant::now() + window;
+    let mut next_send = Instant::now();
+    // browse 応答は resolve より大きくなり得る（複数 instance の additional
+    // 同梱）ため、受信バッファは mDNS の実質上限まで取る。
+    let mut buf = vec![0u8; 9000];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= next_send {
+            for q in encode_ptr_query_with_known(service, &fold.known_answers()) {
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            }
+            let pending = fold.pending_questions();
+            for chunk in pending.chunks(MAX_QUESTIONS_PER_MSG) {
+                let qs: Vec<(&str, u16)> = chunk.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+                let q = encode_query(0, &qs);
+                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            }
+            next_send = now + QUERY_RESEND_INTERVAL;
+        }
+        let wait = deadline.min(next_send).saturating_duration_since(now);
+        let Ok(recv) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await else {
+            continue;
+        };
+        let (n, _) = recv.map_err(DnssdError::Io)?;
+        // 他人の壊れたデータグラムで browse を中断しない。
+        let Ok(records) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        fold.fold(&records);
+    }
+    Ok(fold.finish())
+}
+
+/// `_matterc._udp` の全 commissionable を列挙する（spec §4.3.1）。
+/// 0 件は正常（周囲に commissioning モードのデバイスが無い）。
+pub async fn browse_commissionable(
+    scope_id: u32,
+    window: Duration,
+) -> Result<Vec<CommissionableInstance>, DnssdError> {
+    Ok(browse(scope_id, "_matterc._udp.local", window)
+        .await?
+        .iter()
+        .filter_map(commissionable_from_fold)
+        .collect())
+}
+
+/// TXT から文字列値（key は大文字小文字無視）を取り出す。
+fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
+    for s in strings {
+        let Ok(s) = std::str::from_utf8(s) else {
+            continue;
+        };
+        let Some((k, v)) = s.split_once('=') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case(key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// TXT `VP`（`<vendor>+<product>`、product 省略可、10 進）を分解する。
+fn split_vp(vp: &str) -> (Option<u32>, Option<u32>) {
+    match vp.split_once('+') {
+        Some((v, p)) => (v.parse().ok(), p.parse().ok()),
+        None => (vp.parse().ok(), None),
+    }
+}
+
+/// SRV target（例 "HOST01.local"）→ hostname（末尾 ".local" を除去）。
+fn hostname_from_target(target: &str) -> String {
+    target.strip_suffix(".local").unwrap_or(target).to_string()
+}
+
+/// 畳み込んだ素材 → commissionable。素材ゼロ（PTR しか見えず SRV/TXT/AAAA が
+/// 期限内に揃わなかった）は None（chip-tool 経路の空エントリ skip と同じ扱い）。
+fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance> {
+    let discriminator = txt_u32(&f.txt, "D");
+    let (vendor_id, product_id) = txt_str(&f.txt, "VP").map(split_vp).unwrap_or((None, None));
+    let c = CommissionableInstance {
+        hostname: f.target.as_deref().map(hostname_from_target),
+        port: f.port,
+        addresses: f.addresses.clone(),
+        discriminator,
+        vendor_id,
+        product_id,
+    };
+    if c.hostname.is_none()
+        && c.port.is_none()
+        && c.addresses.is_empty()
+        && c.discriminator.is_none()
+        && c.vendor_id.is_none()
+        && c.product_id.is_none()
+    {
+        return None;
+    }
+    Some(c)
 }
 
 #[cfg(test)]
@@ -1044,5 +1497,323 @@ mod tests {
             .find(|r| r.name == ptr_name)
             .expect("should have PTR record");
         assert!(matches!(ptr.rdata, RData::Other));
+    }
+
+    /// browse 用の合成応答: PTR(service→instance) + SRV/TXT/AAAA を 1 メッセージに
+    /// 詰める（additional 同梱の行儀良い responder 相当）。`records` で個別に
+    /// 抜き差しできるよう、載せるレコード種を引数で選ぶ。
+    #[allow(clippy::too_many_arguments)]
+    fn synth_browse_response(
+        service: &str,
+        instance: &str,
+        with_srv: Option<(u16, &str)>,
+        with_txt: Option<&[&str]>,
+        with_aaaa: Option<(&str, Ipv6Addr)>,
+    ) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0u16.to_be_bytes()); // id
+        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // QR|AA
+        msg.extend_from_slice(&0u16.to_be_bytes()); // qd
+        let mut count: u16 = 1; // PTR
+        if with_srv.is_some() {
+            count += 1;
+        }
+        if with_txt.is_some() {
+            count += 1;
+        }
+        if with_aaaa.is_some() {
+            count += 1;
+        }
+        msg.extend_from_slice(&count.to_be_bytes()); // an
+        msg.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
+                                              // PTR: service -> instance
+        push_name(&mut msg, service);
+        msg.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+        msg.extend_from_slice(&[0, 0, 0, 120]);
+        let mut ptr_rdata = Vec::new();
+        push_name(&mut ptr_rdata, instance);
+        msg.extend_from_slice(&(ptr_rdata.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&ptr_rdata);
+        if let Some((port, target)) = with_srv {
+            push_name(&mut msg, instance);
+            msg.extend_from_slice(&TYPE_SRV.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            let mut rdata = vec![0, 0, 0, 0]; // priority/weight
+            rdata.extend_from_slice(&port.to_be_bytes());
+            push_name(&mut rdata, target);
+            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&rdata);
+        }
+        if let Some(strings) = with_txt {
+            push_name(&mut msg, instance);
+            msg.extend_from_slice(&TYPE_TXT.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            let mut rdata = Vec::new();
+            for s in strings {
+                rdata.push(s.len() as u8);
+                rdata.extend_from_slice(s.as_bytes());
+            }
+            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&rdata);
+        }
+        if let Some((host, addr)) = with_aaaa {
+            push_name(&mut msg, host);
+            msg.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            msg.extend_from_slice(&16u16.to_be_bytes());
+            msg.extend_from_slice(&addr.octets());
+        }
+        msg
+    }
+
+    const MC: &str = "_matterc._udp.local";
+
+    #[test]
+    fn browse_fold_collects_two_instances_from_bundled_responses() {
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let a2: Ipv6Addr = "fd00::2".parse().unwrap();
+        let d1 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=3840", "VP=65521+32768"]),
+            Some(("h1.local", a1)),
+        );
+        let d2 = synth_browse_response(
+            MC,
+            &format!("INST2.{MC}"),
+            Some((5541, "h2.local")),
+            Some(&["D=100"]),
+            Some(("h2.local", a2)),
+        );
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&parse_message(&d1).unwrap());
+        fold.fold(&parse_message(&d2).unwrap());
+        let out = fold.finish();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].port, Some(5540));
+        assert_eq!(out[0].addresses, vec![a1]);
+        assert_eq!(out[1].port, Some(5541));
+        assert_eq!(out[1].addresses, vec![a2]);
+    }
+
+    #[test]
+    fn browse_fold_is_order_independent_within_a_datagram() {
+        // SRV/TXT/AAAA が PTR より前に並んでいても畳み込める（fold は 2 パス）。
+        // synth は PTR を先頭に置くので、parse 結果を並べ替えて食わせる。
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let d = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", a1)),
+        );
+        let mut records = parse_message(&d).unwrap();
+        records.reverse(); // PTR が最後
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&records);
+        let out = fold.finish();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].port, Some(5540));
+        assert_eq!(out[0].addresses, vec![a1]);
+    }
+
+    #[test]
+    fn browse_fold_dedupes_instances_and_caps_growth() {
+        let mut fold = BrowseFold::new(MC);
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        fold.fold(&parse_message(&d).unwrap());
+        fold.fold(&parse_message(&d).unwrap()); // 同じ PTR を 2 回
+        assert_eq!(fold.instances.len(), 1);
+        for i in 0..(MAX_INSTANCES + 5) {
+            let d = synth_browse_response(MC, &format!("X{i}.{MC}"), None, None, None);
+            fold.fold(&parse_message(&d).unwrap());
+        }
+        assert_eq!(fold.instances.len(), MAX_INSTANCES);
+    }
+
+    #[test]
+    fn browse_fold_ignores_records_for_other_services() {
+        // 同じ網に有線 LAN プリンタ等がいても混ざらない。
+        let mut fold = BrowseFold::new(MC);
+        let d = synth_browse_response(
+            "_ipp._tcp.local",
+            "printer._ipp._tcp.local",
+            Some((631, "printer.local")),
+            None,
+            None,
+        );
+        fold.fold(&parse_message(&d).unwrap());
+        assert!(fold.instances.is_empty());
+    }
+
+    #[test]
+    fn browse_finish_sorts_link_local_after_global_through_fold() {
+        // AAAA を link-local → global の順で食わせても、finish() は
+        // 非 link-local 優先で返す（--probe の live_address は先頭を使う）。
+        let ll: Ipv6Addr = "fe80::10".parse().unwrap();
+        let global: Ipv6Addr = "fd00::10".parse().unwrap();
+        let mut fold = BrowseFold::new(MC);
+        let d1 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", ll)),
+        );
+        let d2 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", global)),
+        );
+        fold.fold(&parse_message(&d1).unwrap());
+        fold.fold(&parse_message(&d2).unwrap());
+        let out = fold.finish();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addresses, vec![global, ll]);
+    }
+
+    #[test]
+    fn browse_pending_questions_lists_missing_srv_txt_aaaa() {
+        let mut fold = BrowseFold::new(MC);
+        // PTR のみ → SRV と TXT を要求。
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        fold.fold(&parse_message(&d).unwrap());
+        let q = fold.pending_questions();
+        assert!(q.contains(&(format!("INST1.{MC}"), TYPE_SRV)));
+        assert!(q.contains(&(format!("INST1.{MC}"), TYPE_TXT)));
+        // SRV が来たら target の AAAA を要求（プールにまだ無い）。
+        let d = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            None,
+        );
+        fold.fold(&parse_message(&d).unwrap());
+        let q = fold.pending_questions();
+        assert!(q.contains(&("h1.local".to_string(), TYPE_AAAA)));
+        assert!(!q.iter().any(|(_, t)| *t == TYPE_SRV));
+    }
+
+    #[test]
+    fn commissionable_from_fold_parses_txt_hostname_and_sorts_addresses() {
+        let global: Ipv6Addr = "fd00::10".parse().unwrap();
+        let ll: Ipv6Addr = "fe80::10".parse().unwrap();
+        let f = FoldedInstance {
+            port: Some(5540),
+            target: Some("HOST01.local".to_string()),
+            txt: vec![b"D=3840".to_vec(), b"VP=65521+32768".to_vec()],
+            addresses: vec![global, ll],
+        };
+        let c = commissionable_from_fold(&f).unwrap();
+        assert_eq!(c.hostname.as_deref(), Some("HOST01"));
+        assert_eq!(c.port, Some(5540));
+        assert_eq!(c.discriminator, Some(3840));
+        assert_eq!(c.vendor_id, Some(65521));
+        assert_eq!(c.product_id, Some(32768));
+        assert_eq!(c.addresses, vec![global, ll]);
+    }
+
+    #[test]
+    fn commissionable_from_fold_accepts_vendor_only_vp_and_skips_empty() {
+        let f = FoldedInstance {
+            port: None,
+            target: None,
+            txt: vec![b"VP=65521".to_vec()],
+            addresses: vec![],
+        };
+        let c = commissionable_from_fold(&f).unwrap();
+        assert_eq!(c.vendor_id, Some(65521));
+        assert_eq!(c.product_id, None);
+        // 素材ゼロ（PTR しか見えなかった instance）は出さない。
+        let empty = FoldedInstance {
+            port: None,
+            target: None,
+            txt: vec![],
+            addresses: vec![],
+        };
+        assert!(commissionable_from_fold(&empty).is_none());
+    }
+
+    #[test]
+    fn record_ttl_is_parsed() {
+        // synth_browse_response uses TTL 120 (bytes [0,0,0,120]) — fold の
+        // known_answers() 経由で PTR レコードの ttl が取り出せることを確認。
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&parse_message(&d).unwrap());
+        assert_eq!(fold.known_answers(), vec![(format!("INST1.{MC}"), 120)]);
+    }
+
+    #[test]
+    fn known_answer_query_degenerates_without_known() {
+        let pkts = encode_ptr_query_with_known(MC, &[]);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0], encode_query(0, &[(MC, TYPE_PTR)]));
+    }
+
+    #[test]
+    fn known_answer_query_roundtrips_through_parser() {
+        // KA 2 件入りクエリを自前 parse_message で読み戻し、answer の PTR が
+        // 完全名で復元される（圧縮ポインタの検証）。
+        let known = vec![
+            (format!("INST1.{MC}"), 120u32),
+            (format!("INST2.{MC}"), 99u32),
+        ];
+        let pkts = encode_ptr_query_with_known(MC, &known);
+        assert_eq!(pkts.len(), 1);
+        let records = parse_message(&pkts[0]).unwrap();
+        let ptrs: Vec<_> = records
+            .iter()
+            .filter_map(|r| match &r.rdata {
+                RData::Ptr(n) if r.name.eq_ignore_ascii_case(MC) => Some((n.clone(), r.ttl)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ptrs.len(), 2);
+        assert_eq!(ptrs[0], (format!("INST1.{MC}"), 120));
+        assert_eq!(ptrs[1], (format!("INST2.{MC}"), 99));
+    }
+
+    #[test]
+    fn known_answer_query_splits_and_sets_tc() {
+        // 1400B を超える KA（長いラベルで水増し）が複数パケットに割れ、
+        // 最後以外に TC が立ち、全 KA が失われず分配される。
+        let known: Vec<(String, u32)> = (0..60)
+            .map(|i| (format!("INSTANCE-{i:04}-{}.{MC}", "X".repeat(20)), 120))
+            .collect();
+        let pkts = encode_ptr_query_with_known(MC, &known);
+        assert!(pkts.len() >= 2);
+        for p in &pkts {
+            assert!(p.len() <= 1400);
+        }
+        for p in &pkts[..pkts.len() - 1] {
+            assert_eq!(
+                u16::from_be_bytes([p[2], p[3]]) & 0x0200,
+                0x0200,
+                "TC on non-last"
+            );
+        }
+        let last = pkts.last().unwrap();
+        assert_eq!(u16::from_be_bytes([last[2], last[3]]) & 0x0200, 0);
+        let total: usize = pkts
+            .iter()
+            .map(|p| {
+                parse_message(p)
+                    .unwrap()
+                    .iter()
+                    .filter(|r| matches!(r.rdata, RData::Ptr(_)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(total, 60);
     }
 }

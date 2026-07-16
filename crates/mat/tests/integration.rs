@@ -23,6 +23,7 @@ fn mat(store: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("mat").unwrap();
     c.env("MAT_CHIP_TOOL_BIN", fake_chip_tool())
         .env("MAT_MATD", "0")
+        .env_remove("MAT_IFACE")
         .arg("--store")
         .arg(store);
     c
@@ -69,6 +70,22 @@ fn discover_with_missing_chip_tool_exits_12() {
         .assert()
         .code(12)
         .stderr(predicate::str::contains("child_not_found"));
+}
+
+#[test]
+fn discover_native_bogus_iface_falls_back_to_chip_tool() {
+    // 存在しない iface 名 → iface_index が即失敗 → warn + chip-tool フォール
+    // バックで commissionable が従来どおり出る。
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .arg("discover")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"commissionable\""))
+        .stdout(predicate::str::contains("192.0.2.10"))
+        .stderr(predicate::str::contains("falling back to chip-tool"));
 }
 
 #[test]
@@ -1555,6 +1572,41 @@ fn discover_probe_with_missing_avahi_reports_reachable_null() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"reachable\":null"));
+}
+
+#[test]
+fn discover_probe_native_lo_falls_back_to_avahi() {
+    // lo は IFF_MULTICAST 無し = ifindex 1 への multicast 送信はどの環境でも
+    // 失敗する（既知）→ native の targeted resolve が IO エラー → warn + avahi
+    // フォールバックで従来どおりの結果になる。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_IFACE", "lo")
+        .env("MAT_LOG", "warn")
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .env("FAKE_AVAHI_ADDR", "192.0.2.99")
+        .args(["discover", "--probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"reachable\":true"))
+        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""))
+        .stderr(predicate::str::contains("falling back to avahi-browse"));
+}
+
+#[test]
+fn diag_deep_native_bogus_iface_falls_back_to_avahi() {
+    // 存在しない iface 名 → iface_index が即失敗 → warn + avahi フォール
+    // バック（native 分岐のもう一方の入口も決定的に通す）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
+        .args(["diag", "node", "--node", "5", "--deep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"advertised_any_fabric\""))
+        .stderr(predicate::str::contains("falling back to avahi-browse"));
 }
 
 // ---- alias 解決（aliases.toml） ----
