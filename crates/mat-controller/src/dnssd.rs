@@ -1540,6 +1540,34 @@ mod tests {
     }
 
     #[test]
+    fn browse_finish_sorts_link_local_after_global_through_fold() {
+        // AAAA を link-local → global の順で食わせても、finish() は
+        // 非 link-local 優先で返す（--probe の live_address は先頭を使う）。
+        let ll: Ipv6Addr = "fe80::10".parse().unwrap();
+        let global: Ipv6Addr = "fd00::10".parse().unwrap();
+        let mut fold = BrowseFold::new(MC);
+        let d1 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", ll)),
+        );
+        let d2 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", global)),
+        );
+        fold.fold(&parse_message(&d1).unwrap());
+        fold.fold(&parse_message(&d2).unwrap());
+        let out = fold.finish();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addresses, vec![global, ll]);
+    }
+
+    #[test]
     fn browse_pending_questions_lists_missing_srv_txt_aaaa() {
         let mut fold = BrowseFold::new(MC);
         // PTR のみ → SRV と TXT を要求。
