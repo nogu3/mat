@@ -24,34 +24,27 @@ use mat_core::output;
 use mat_core::parse::operation_succeeded;
 use mat_core::store::Store;
 
-/// `mat group provision` — 各ノードへ鍵束・マッピングを焼き、コントローラ側 group
-/// state も設定する。
-#[allow(clippy::too_many_arguments)]
-pub fn provision(
-    store_path: &Path,
+/// コントローラ側 group state（groupsettings 系: add-group → add-keysets →
+/// （rebind: unbind-keyset）→ bind-keyset）。chip-tool 直経路の `provision` と
+/// native 直経路（`native_direct::NativeOp::GroupProvision`）が共有する —
+/// M8a では controller 側 group state（KVS 書込）は引き続き chip-tool 側の
+/// 責務（KVS 書込所有の分割は M8c）。epoch key はここで解決（明示指定を検証
+/// または未指定ならランダム生成）し hex 文字列で返す — デバイス側
+/// KeySetWrite にも同じ鍵を使う必要があるため。
+pub(crate) fn provision_controller_state(
+    chip: &ChipTool,
     group_id: u16,
-    node_ids: &[u64],
     keyset_id: u16,
     name: &str,
-    endpoint: u16,
     epoch_key: Option<&str>,
     rebind: bool,
-) -> Result<(), MatError> {
-    let store = Store::open(store_path)?;
-    // 全ノードが commission 済みであることを先に確認（1つでも未登録なら exit 11）。
-    for &node_id in node_ids {
-        store.require_node(node_id)?;
-    }
-
+) -> Result<String, MatError> {
     // epoch key を決定: 明示指定があれば検証して採用、無ければランダム生成。
     let epoch_key = resolve_epoch_key(epoch_key)?;
 
-    let chip = ChipTool::new(store.root());
-
-    // 1) コントローラ側 group state（ローカル操作、ネットワーク不要）。
-    //    add-group → add-keysets → bind-keyset。鍵はコントローラとデバイスで一致が必須。
+    // add-group → add-keysets → bind-keyset。鍵はコントローラとデバイスで一致が必須。
     run_step(
-        &chip,
+        chip,
         vec![
             "groupsettings".into(),
             "add-group".into(),
@@ -61,7 +54,7 @@ pub fn provision(
         &format!("groupsettings add-group {name}"),
     )?;
     run_step(
-        &chip,
+        chip,
         // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
         // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
         // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
@@ -98,7 +91,7 @@ pub fn provision(
         }
     }
     run_step(
-        &chip,
+        chip,
         vec![
             "groupsettings".into(),
             "bind-keyset".into(),
@@ -107,6 +100,33 @@ pub fn provision(
         ],
         &format!("groupsettings bind-keyset {group_id}"),
     )?;
+    Ok(epoch_key)
+}
+
+/// `mat group provision` — 各ノードへ鍵束・マッピングを焼き、コントローラ側 group
+/// state も設定する。
+#[allow(clippy::too_many_arguments)]
+pub fn provision(
+    store_path: &Path,
+    group_id: u16,
+    node_ids: &[u64],
+    keyset_id: u16,
+    name: &str,
+    endpoint: u16,
+    epoch_key: Option<&str>,
+    rebind: bool,
+) -> Result<(), MatError> {
+    let store = Store::open(store_path)?;
+    // 全ノードが commission 済みであることを先に確認（1つでも未登録なら exit 11）。
+    for &node_id in node_ids {
+        store.require_node(node_id)?;
+    }
+
+    let chip = ChipTool::new(store.root());
+
+    // 1) コントローラ側 group state（ローカル操作、ネットワーク不要）。
+    let epoch_key =
+        provision_controller_state(&chip, group_id, keyset_id, name, epoch_key, rebind)?;
 
     // 2) 各デバイスへ provision（unicast, acknowledged）。最初の失敗で停止する
     //    （部分結果を stdout に出さず、stdout の純度を保つ）。
@@ -174,6 +194,19 @@ pub fn provision(
         ensure_group_acl(&chip, node_id, group_id)?;
     }
 
+    emit_provision_success(group_id, keyset_id, name, endpoint, node_ids, rebind);
+    Ok(())
+}
+
+/// `provision` の出力部（直経路 native からも共有 — M8a Task9）。
+pub(crate) fn emit_provision_success(
+    group_id: u16,
+    keyset_id: u16,
+    name: &str,
+    endpoint: u16,
+    node_ids: &[u64],
+    rebind: bool,
+) {
     let mut body = json!({
         "group_id": group_id,
         "keyset_id": keyset_id,
@@ -189,7 +222,6 @@ pub fn provision(
             json!("rebound keyset binding; if matd is running, restart it to reload group state");
     }
     output::emit(body);
-    Ok(())
 }
 
 /// groupcast の送信部（出力なし）。invoke / color-temp / color ショートカットで共有。
@@ -393,6 +425,17 @@ pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), M
         }
     }
 
+    emit_grant_success(group_id, node_ids, &updated, &unchanged);
+    Ok(())
+}
+
+/// `grant` の出力部（直経路 native からも共有 — M8a Task9）。
+pub(crate) fn emit_grant_success(
+    group_id: u16,
+    node_ids: &[u64],
+    updated: &[u64],
+    unchanged: &[u64],
+) {
     output::emit(json!({
         "group_id": group_id,
         "nodes": node_ids,
@@ -400,7 +443,6 @@ pub fn grant(store_path: &Path, group_id: u16, node_ids: &[u64]) -> Result<(), M
         "unchanged": unchanged,
         "status": "granted",
     }));
-    Ok(())
 }
 
 /// ローカル group state ステップ（groupsettings 系）を実行し、失敗を分類する。

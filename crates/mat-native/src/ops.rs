@@ -8,6 +8,13 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use mat_controller::im::{
+    encode_add_group_fields, encode_group_key_map_tlv, encode_key_set_write_fields, ATTR_ACL,
+    ATTR_GROUP_KEY_MAP, CLUSTER_ACCESS_CONTROL, CLUSTER_GROUPS, CLUSTER_GROUP_KEY_MANAGEMENT,
+    CMD_ADD_GROUP, CMD_KEY_SET_WRITE,
+};
+use mat_controller::tlv::{Tag, Writer};
+use mat_core::acl::{entries_from_im_json, merge_group_entry, AclEntry};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::ids::resolve_attribute;
 
@@ -199,6 +206,215 @@ fn rename_struct_fields(v: Value, table: &[(u8, &str)]) -> Value {
     }
 }
 
+/// 1 ノード分のデバイス側 group provision に必要な材料一式。
+pub struct ProvisionNodeParams {
+    pub group_id: u16,
+    pub keyset_id: u16,
+    pub name: String,
+    /// AddGroup を実行するエンドポイント（KeySetWrite / group-key-map / ACL は
+    /// 常に ep0 — Matter spec 上これらは Node-wide なクラスタのため）。
+    pub endpoint: u16,
+    pub epoch_key: [u8; 16],
+}
+
+/// `mat_core::group::resolve_epoch_key` が返す 32 桁 hex 文字列（16 バイト）を
+/// `[u8;16]` へ。呼び出し前提は「resolve_epoch_key が返した値そのもの」（検証
+/// 済み・小文字 32 桁）だが、形式が崩れていた場合は呼び出し側のバグとして
+/// `ParseError` を返す（panic させない）。
+pub fn epoch_key_from_hex(hex: &str) -> Result<[u8; 16], MatError> {
+    if hex.len() != 32 {
+        return Err(MatError::parse_error(format!(
+            "epoch key must be 32 hex chars (16 bytes), got {} chars",
+            hex.len()
+        )));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| MatError::parse_error(format!("invalid epoch key hex: {hex}")))?;
+    }
+    Ok(out)
+}
+
+/// provision の 1 ステップに失敗した際、どのステップかを detail に残す
+/// （chip-tool 経路の `run_node_step` と同粒度 — `commands/group.rs` 参照）。
+fn provision_step_err(e: MatError, step: &str) -> MatError {
+    MatError::new(
+        e.kind,
+        format!("provision step '{step}' failed: {}", e.detail),
+    )
+}
+
+/// group-key-map 属性（list of `GroupKeyMapStruct`）の read JSON を
+/// `(groupId, groupKeySetID)` 列へ。fabricIndex（254）等の他フィールドは
+/// 無視する（groupId/groupKeySetID 以外はここで再現する必要が無い）。
+fn parse_group_key_map(v: &Value) -> Result<Vec<(u16, u16)>, MatError> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| MatError::parse_error(format!("group-key-map is not an array: {v}")))?;
+    arr.iter()
+        .map(|item| {
+            let obj = item.as_object().ok_or_else(|| {
+                MatError::parse_error(format!("group-key-map entry is not an object: {item}"))
+            })?;
+            let group_id = obj
+                .get("1")
+                .and_then(Value::as_u64)
+                .and_then(|n| u16::try_from(n).ok())
+                .ok_or_else(|| {
+                    MatError::parse_error(format!(
+                        "group-key-map entry missing/invalid groupId: {item}"
+                    ))
+                })?;
+            let keyset_id = obj
+                .get("2")
+                .and_then(Value::as_u64)
+                .and_then(|n| u16::try_from(n).ok())
+                .ok_or_else(|| {
+                    MatError::parse_error(format!(
+                        "group-key-map entry missing/invalid groupKeySetID: {item}"
+                    ))
+                })?;
+            Ok((group_id, keyset_id))
+        })
+        .collect()
+}
+
+/// `AclEntry` 列を `AccessControlEntryStruct` 列の Data TLV へ（write_tlv に
+/// 渡す形）。ACL write は全置換のため、呼び出し側は read-merge 済みの最終形を
+/// 渡すこと。
+fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for e in entries {
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(e.privilege));
+        w.put_uint(Tag::Context(2), u64::from(e.auth_mode));
+        w.start_array(Tag::Context(3));
+        for s in &e.subjects {
+            w.put_uint(Tag::Anonymous, *s);
+        }
+        w.end_container();
+        match &e.targets {
+            None => w.put_null(Tag::Context(4)),
+            Some(targets) => {
+                w.start_array(Tag::Context(4));
+                for t in targets {
+                    w.start_struct(Tag::Anonymous);
+                    match t.cluster {
+                        Some(c) => w.put_uint(Tag::Context(0), u64::from(c)),
+                        None => w.put_null(Tag::Context(0)),
+                    }
+                    match t.endpoint {
+                        Some(ep) => w.put_uint(Tag::Context(1), u64::from(ep)),
+                        None => w.put_null(Tag::Context(1)),
+                    }
+                    match t.device_type {
+                        Some(d) => w.put_uint(Tag::Context(2), u64::from(d)),
+                        None => w.put_null(Tag::Context(2)),
+                    }
+                    w.end_container();
+                }
+                w.end_container();
+            }
+        }
+        w.put_uint(Tag::Context(254), u64::from(e.fabric_index));
+        w.end_container();
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// 1 ノード分のデバイス側 provision: KeySetWrite → group-key-map
+/// read-merge-write → AddGroup → ACL read-merge-write。失敗はどのステップかを
+/// detail に含めて即 Err（chip-tool 経路の `run_node_step` と同粒度）。
+///
+/// 宛先エンドポイント: KeySetWrite / group-key-map / ACL は ep0
+/// （GroupKeyManagement・AccessControl は Node-wide、AddGroup のみ
+/// `p.endpoint` — chip-tool 経路の argv と同じ、`commands/group.rs` 参照）。
+pub async fn provision_node(
+    conn: &mut dyn NodeConn,
+    p: &ProvisionNodeParams,
+) -> Result<(), MatError> {
+    // KeySetWrite（timed 不要 — resolve_command(0x003F, "key-set-write") の
+    // timed フラグは false）。
+    let fields = encode_key_set_write_fields(p.keyset_id, &p.epoch_key);
+    conn.invoke(
+        0,
+        CLUSTER_GROUP_KEY_MANAGEMENT,
+        CMD_KEY_SET_WRITE,
+        Some(fields),
+        false,
+    )
+    .await
+    .map_err(|e| provision_step_err(e, "key-set-write"))?;
+
+    // group-key-map: 全置換 write なので read-merge-write（chip-tool 経路の
+    // 単一要素 write は実は他 group のマッピングを消していた可能性がある —
+    // native ではここで改善する）。
+    let current = conn
+        .read_json(0, CLUSTER_GROUP_KEY_MANAGEMENT, ATTR_GROUP_KEY_MAP)
+        .await
+        .map_err(|e| provision_step_err(e, "group-key-map read"))?;
+    let mut entries =
+        parse_group_key_map(&current).map_err(|e| provision_step_err(e, "group-key-map read"))?;
+    match entries.iter_mut().find(|(g, _)| *g == p.group_id) {
+        Some(slot) => slot.1 = p.keyset_id,
+        None => entries.push((p.group_id, p.keyset_id)),
+    }
+    let tlv = encode_group_key_map_tlv(&entries);
+    conn.write_tlv(
+        0,
+        CLUSTER_GROUP_KEY_MANAGEMENT,
+        ATTR_GROUP_KEY_MAP,
+        tlv,
+        false,
+    )
+    .await
+    .map_err(|e| provision_step_err(e, "group-key-map write"))?;
+
+    // AddGroup（指定エンドポイント、timed 不要）。
+    let fields = encode_add_group_fields(p.group_id, &p.name);
+    conn.invoke(
+        p.endpoint,
+        CLUSTER_GROUPS,
+        CMD_ADD_GROUP,
+        Some(fields),
+        false,
+    )
+    .await
+    .map_err(|e| provision_step_err(e, "groups add-group"))?;
+
+    // ACL: groupcast は authMode=Group で届くため、Group エントリが無いと
+    // デバイスが黙って捨てる（commissioning が作るのは CASE 管理者エントリだけ）。
+    ensure_group_acl(conn, p.group_id).await?;
+    Ok(())
+}
+
+/// ACL の read-merge-write（provision の最終ステップ / `mat group grant` の
+/// 本体）。戻り値: write した = true / 既に Group エントリがあり skip = false
+/// （冪等）。
+///
+/// ACL の attribute write は全置換なので、write は必ず「read できたリスト +
+/// 追記」のみ。read が失敗・解釈不能なら絶対に write しない（管理者エントリを
+/// 失うとデバイスが管理不能になるため — `mat_core::acl` モジュール冒頭のコメント
+/// と同じ方針）。
+pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<bool, MatError> {
+    let current = conn
+        .read_json(0, CLUSTER_ACCESS_CONTROL, ATTR_ACL)
+        .await
+        .map_err(|e| provision_step_err(e, "acl read"))?;
+    let entries = entries_from_im_json(&current).map_err(|e| provision_step_err(e, "acl read"))?;
+    let Some(merged) = merge_group_entry(&entries, group_id) else {
+        return Ok(false); // 既に Group エントリがある。write 不要（冪等）。
+    };
+    let tlv = encode_acl_entries_tlv(&merged);
+    conn.write_tlv(0, CLUSTER_ACCESS_CONTROL, ATTR_ACL, tlv, false)
+        .await
+        .map_err(|e| provision_step_err(e, "acl write"))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +515,57 @@ mod tests {
         let mut conn = FailingConn;
         let err = diag_thread(&mut conn, 1).await.expect_err("must propagate");
         assert_eq!(err.kind, ErrorKind::Unreachable);
+    }
+
+    // M8a Task9: group provision / grant のデバイス側ステップ。
+
+    #[tokio::test]
+    async fn provision_node_runs_steps_in_order() {
+        let mut conn = FakeConn::scripted()
+            .with_read(0, 0x003F, 0x0000, serde_json::json!([])) // group-key-map read
+            .with_read(
+                0,
+                0x001F,
+                0x0000,
+                serde_json::json!([ // acl read（管理者のみ）
+                    {"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
+            );
+        let p = ProvisionNodeParams {
+            group_id: 10,
+            keyset_id: 60,
+            name: "grp10".into(),
+            endpoint: 1,
+            epoch_key: [0xAB; 16],
+        };
+        provision_node(&mut conn, &p).await.unwrap();
+        let calls = conn.calls();
+        // KeySetWrite invoke → group-key-map read → write → AddGroup invoke →
+        // acl read → acl write の順。
+        assert!(calls[0].starts_with("invoke(0,0x003F"), "{calls:?}"); // ep0 宛
+        assert!(calls.iter().any(|c| c.starts_with("write_tlv(0,0x003F")));
+        assert!(calls.iter().any(|c| c.starts_with("invoke(1,0x0004")));
+        assert!(
+            calls.last().unwrap().starts_with("write_tlv(0,0x001F"),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_group_acl_is_idempotent_when_entry_exists() {
+        let mut conn = FakeConn::scripted().with_read(
+            0,
+            0x001F,
+            0x0000,
+            serde_json::json!([
+                {"1": 5, "2": 2, "3": [1], "4": null, "254": 2},
+                {"1": 3, "2": 3, "3": [10], "4": null, "254": 2}  // 既に Group エントリ
+            ]),
+        );
+        let wrote = ensure_group_acl(&mut conn, 10).await.unwrap();
+        assert!(!wrote);
+        assert!(
+            !conn.calls().iter().any(|c| c.starts_with("write_tlv")),
+            "must not write when the Group entry already exists"
+        );
     }
 }
