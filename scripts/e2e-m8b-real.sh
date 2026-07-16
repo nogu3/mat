@@ -98,6 +98,12 @@ confirm() {
   # $1 = 目視確認を促す文面
   echo ""
   echo ">>> $1"
+  # 非対話実行（コントローラが事前にユーザー確認を済ませた上での起動）用の
+  # 明示スイッチ。stdin へのパイプは途中の ssh が食い尽くすため使えない。
+  if [ "${MAT_E2E_ASSUME_YES:-0}" = "1" ]; then
+    echo ">>> (MAT_E2E_ASSUME_YES=1: 自動確認で続行)"
+    return
+  fi
   read -r -p ">>> 確認できたら Enter で続行 (Ctrl-C で中断): " _
 }
 
