@@ -169,7 +169,12 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     w.put_uint(Tag::Context(4), u64::from(attribute));
     w.end_container(); // AttributePathIB
     w.end_container(); // AttributeRequests
-    w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+                       // IsFabricFiltered = true: matches chip-tool's read default. This is the
+                       // precondition for mat-native's ACL / group-key-map read-merge-write
+                       // (ensure_group_acl / provision_node in mat-native::ops) not pulling in
+                       // other fabrics' entries on multi-admin devices (e.g. a Home Assistant
+                       // fabric alongside ours) — see mat_core::acl::merge_group_entry's doc.
+    w.put_bool(Tag::Context(3), true); // IsFabricFiltered
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
@@ -659,7 +664,9 @@ pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
     w.put_uint(Tag::Context(3), u64::from(cluster));
     w.end_container(); // AttributePathIB
     w.end_container(); // AttributeRequests
-    w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+                       // IsFabricFiltered = true: matches chip-tool's read default. See
+                       // encode_read_request's comment above for the rationale.
+    w.put_bool(Tag::Context(3), true); // IsFabricFiltered
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
@@ -1363,9 +1370,13 @@ mod tests {
         );
         assert_eq!(els[6].value, Value::ContainerEnd); // list
         assert_eq!(els[7].value, Value::ContainerEnd); // array
+                                                       // IsFabricFiltered must be true: matches chip-tool's read default, and
+                                                       // is the precondition for ensure_group_acl / provision_node's
+                                                       // read-merge-write (mat-native) not pulling in other fabrics' ACL /
+                                                       // group-key-map entries on multi-admin devices.
         assert_eq!(
             (els[8].tag, els[8].value),
-            (Tag::Context(3), Value::Bool(false))
+            (Tag::Context(3), Value::Bool(true))
         );
         assert_eq!(
             (els[9].tag, els[9].value),
@@ -1896,6 +1907,36 @@ mod tests {
             !saw_attr_tag,
             "wildcard read must omit the attribute path field"
         );
+    }
+
+    #[test]
+    fn encode_read_request_cluster_is_fabric_filtered() {
+        // struct{ 0: array[ list{2,3} ], 3: true, 255: 12 } — same top-level
+        // shape as encode_read_request but without the attribute (Context(4))
+        // path field. Depth-track so the AttributePathIB's own Context(3)
+        // (cluster id, a Uint) at depth 3 is never mistaken for the outer
+        // struct's Context(3) (IsFabricFiltered, a Bool) at depth 1.
+        let b = encode_read_request_cluster(1, 0x0035);
+        let mut r = Reader::new(&b);
+        let mut depth = 0i32;
+        let mut found = false;
+        while let Some(el) = r.next().unwrap() {
+            match el.value {
+                Value::ContainerEnd => depth -= 1,
+                Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                    depth += 1;
+                }
+                Value::Bool(b) if el.tag == Tag::Context(3) && depth == 1 => {
+                    found = true;
+                    assert!(
+                        b,
+                        "IsFabricFiltered must be true (matches chip-tool's read default)"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(found, "IsFabricFiltered field not found at top level");
     }
 
     #[test]
