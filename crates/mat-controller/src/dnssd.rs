@@ -620,6 +620,278 @@ pub async fn resolve_commissionable(
     })
 }
 
+// ── browse（M8b: discover native 化）───────────────────────────────────
+
+/// browse の収集ウィンドウ。resolve と違い「全員から集める」ため早期 return
+/// せず、この時間で打ち切る。
+pub const BROWSE_WINDOW: Duration = Duration::from_secs(3);
+/// browse が追跡する instance 数の上限（偽装 flood でメモリを伸ばさない —
+/// MAX_AAAA と同思想）。
+#[allow(dead_code)]
+const MAX_INSTANCES: usize = 32;
+/// browse 中の AAAA 候補プール上限（instance 横断で共有）。
+#[allow(dead_code)]
+const MAX_BROWSE_AAAA: usize = 64;
+/// フォローアップクエリ 1 メッセージあたりの質問数上限（MTU 超え回避）。
+#[allow(dead_code)]
+const MAX_QUESTIONS_PER_MSG: usize = 8;
+
+/// `_matterc._udp` で見つかった commissionable 1 台分（TXT パース済み）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommissionableInstance {
+    /// SRV target から末尾 `.local` を除いた形。
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    /// 非 link-local 優先でソート、dedup 済み。
+    pub addresses: Vec<Ipv6Addr>,
+    /// TXT `D`（long discriminator）。
+    pub discriminator: Option<u32>,
+    /// TXT `VP`（`<vendor>+<product>`、product は省略され得る）。
+    pub vendor_id: Option<u32>,
+    pub product_id: Option<u32>,
+}
+
+/// `_matter._tcp` で見つかった operational 1 台分。SRV/AAAA が期限内に揃わなく
+/// ても PTR が見えた instance は返す（announce のみ = addresses 空 — 到達性
+/// 判定側の「広告あり・アドレス未解決」セマンティクスを保存するため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalInstance {
+    /// 16 桁大文字 hex。
+    pub compressed_fabric: String,
+    pub node_id: u64,
+    pub addresses: Vec<Ipv6Addr>,
+}
+
+/// finish() が返す、サービス種別に依存しない 1 instance 分の素材。
+#[allow(dead_code)]
+struct FoldedInstance {
+    /// instance の完全名（先頭ラベルが instance 名）。
+    name: String,
+    port: Option<u16>,
+    target: Option<String>,
+    txt: Vec<Vec<u8>>,
+    /// SRV target に一致した AAAA（非 link-local 優先ソート、dedup 済み）。
+    addresses: Vec<Ipv6Addr>,
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct InstanceFold {
+    srv: Option<(u16, String)>,
+    txt: Option<Vec<Vec<u8>>>,
+}
+
+/// browse の畳み込み状態。データグラム単位で [`fold`](Self::fold) に食わせ、
+/// window 満了後に [`finish`](Self::finish) で取り出す。
+#[allow(dead_code)]
+struct BrowseFold {
+    /// 例 "_matterc._udp.local"（大文字小文字無視で照合）。
+    service: String,
+    /// key = instance 完全名。到着順・dedup・MAX_INSTANCES で打ち止め。
+    instances: Vec<(String, InstanceFold)>,
+    /// hostname → アドレスのプール（instance 横断で共有し、finish 時に
+    /// SRV target 名で引く）。
+    aaaa: Vec<(String, Ipv6Addr)>,
+}
+
+#[allow(dead_code)]
+impl BrowseFold {
+    fn new(service: &str) -> Self {
+        BrowseFold {
+            service: service.to_string(),
+            instances: Vec::new(),
+            aaaa: Vec::new(),
+        }
+    }
+
+    /// 1 データグラム分を畳み込む。PTR を先に全部拾ってから SRV/TXT/AAAA を
+    /// 処理する 2 パス（同一データグラム内のレコード順に依存しない）。
+    fn fold(&mut self, records: &[Record]) {
+        for r in records {
+            if let RData::Ptr(inst) = &r.rdata {
+                if r.name.eq_ignore_ascii_case(&self.service)
+                    && self.instances.len() < MAX_INSTANCES
+                    && !self
+                        .instances
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case(inst))
+                {
+                    self.instances.push((inst.clone(), InstanceFold::default()));
+                }
+            }
+        }
+        for r in records {
+            match &r.rdata {
+                RData::Srv { port, target } => {
+                    if let Some((_, f)) = self
+                        .instances
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&r.name))
+                    {
+                        f.srv = Some((*port, target.clone()));
+                    }
+                }
+                RData::Txt(strings) => {
+                    if let Some((_, f)) = self
+                        .instances
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&r.name))
+                    {
+                        f.txt = Some(strings.clone());
+                    }
+                }
+                RData::Aaaa(addr)
+                    if self.aaaa.len() < MAX_BROWSE_AAAA
+                        && !self
+                            .aaaa
+                            .iter()
+                            .any(|(n, a)| a == addr && n.eq_ignore_ascii_case(&r.name)) =>
+                {
+                    self.aaaa.push((r.name.clone(), *addr));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// まだ足りない素材へのフォローアップ質問 (name, qtype)。
+    fn pending_questions(&self) -> Vec<(String, u16)> {
+        let mut out = Vec::new();
+        for (name, f) in &self.instances {
+            if f.srv.is_none() {
+                out.push((name.clone(), TYPE_SRV));
+            }
+            if f.txt.is_none() {
+                out.push((name.clone(), TYPE_TXT));
+            }
+            if let Some((_, target)) = &f.srv {
+                if !self
+                    .aaaa
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(target))
+                {
+                    out.push((target.clone(), TYPE_AAAA));
+                }
+            }
+        }
+        out
+    }
+
+    fn finish(self) -> Vec<FoldedInstance> {
+        let pool = self.aaaa;
+        self.instances
+            .into_iter()
+            .map(|(name, f)| {
+                let (port, target) = match f.srv {
+                    Some((p, t)) => (Some(p), Some(t)),
+                    None => (None, None),
+                };
+                let mut addresses: Vec<Ipv6Addr> = Vec::new();
+                if let Some(t) = &target {
+                    for (n, a) in &pool {
+                        if n.eq_ignore_ascii_case(t) && !addresses.contains(a) {
+                            addresses.push(*a);
+                        }
+                    }
+                    addresses.sort_by_key(is_link_local);
+                }
+                FoldedInstance {
+                    name,
+                    port,
+                    target,
+                    txt: f.txt.unwrap_or_default(),
+                    addresses,
+                }
+            })
+            .collect()
+    }
+}
+
+/// TXT から文字列値（key は大文字小文字無視）を取り出す。
+#[allow(dead_code)]
+fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
+    for s in strings {
+        let Ok(s) = std::str::from_utf8(s) else {
+            continue;
+        };
+        let Some((k, v)) = s.split_once('=') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case(key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// TXT `VP`（`<vendor>+<product>`、product 省略可、10 進）を分解する。
+#[allow(dead_code)]
+fn split_vp(vp: &str) -> (Option<u32>, Option<u32>) {
+    match vp.split_once('+') {
+        Some((v, p)) => (v.parse().ok(), p.parse().ok()),
+        None => (vp.parse().ok(), None),
+    }
+}
+
+/// SRV target（例 "HOST01.local"）→ hostname（末尾 ".local" を除去）。
+#[allow(dead_code)]
+fn hostname_from_target(target: &str) -> String {
+    target.strip_suffix(".local").unwrap_or(target).to_string()
+}
+
+/// instance 完全名の先頭ラベル `<CFID 16hex>-<NodeId 16hex>` をパースする。
+/// 形式外は None（他プロトコル / 他サービスの流れ弾）。
+#[allow(dead_code)]
+fn parse_operational_label(name: &str) -> Option<(String, u64)> {
+    let label = name.split('.').next()?;
+    let (cfid, node) = label.split_once('-')?;
+    if cfid.len() != 16 || node.len() != 16 {
+        return None;
+    }
+    if !cfid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let node_id = u64::from_str_radix(node, 16).ok()?;
+    Some((cfid.to_ascii_uppercase(), node_id))
+}
+
+/// 畳み込んだ素材 → commissionable。素材ゼロ（PTR しか見えず SRV/TXT/AAAA が
+/// 期限内に揃わなかった）は None（chip-tool 経路の空エントリ skip と同じ扱い）。
+#[allow(dead_code)]
+fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance> {
+    let discriminator = txt_u32(&f.txt, "D");
+    let (vendor_id, product_id) = txt_str(&f.txt, "VP").map(split_vp).unwrap_or((None, None));
+    let c = CommissionableInstance {
+        hostname: f.target.as_deref().map(hostname_from_target),
+        port: f.port,
+        addresses: f.addresses.clone(),
+        discriminator,
+        vendor_id,
+        product_id,
+    };
+    if c.hostname.is_none()
+        && c.port.is_none()
+        && c.addresses.is_empty()
+        && c.discriminator.is_none()
+        && c.vendor_id.is_none()
+        && c.product_id.is_none()
+    {
+        return None;
+    }
+    Some(c)
+}
+
+/// 畳み込んだ素材 → operational。announce のみ（addresses 空）でも返す。
+#[allow(dead_code)]
+fn operational_from_fold(f: &FoldedInstance) -> Option<OperationalInstance> {
+    let (compressed_fabric, node_id) = parse_operational_label(&f.name)?;
+    Some(OperationalInstance {
+        compressed_fabric,
+        node_id,
+        addresses: f.addresses.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,5 +1316,259 @@ mod tests {
             .find(|r| r.name == ptr_name)
             .expect("should have PTR record");
         assert!(matches!(ptr.rdata, RData::Other));
+    }
+
+    /// browse 用の合成応答: PTR(service→instance) + SRV/TXT/AAAA を 1 メッセージに
+    /// 詰める（additional 同梱の行儀良い responder 相当）。`records` で個別に
+    /// 抜き差しできるよう、載せるレコード種を引数で選ぶ。
+    #[allow(clippy::too_many_arguments)]
+    fn synth_browse_response(
+        service: &str,
+        instance: &str,
+        with_srv: Option<(u16, &str)>,
+        with_txt: Option<&[&str]>,
+        with_aaaa: Option<(&str, Ipv6Addr)>,
+    ) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0u16.to_be_bytes()); // id
+        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // QR|AA
+        msg.extend_from_slice(&0u16.to_be_bytes()); // qd
+        let mut count: u16 = 1; // PTR
+        if with_srv.is_some() {
+            count += 1;
+        }
+        if with_txt.is_some() {
+            count += 1;
+        }
+        if with_aaaa.is_some() {
+            count += 1;
+        }
+        msg.extend_from_slice(&count.to_be_bytes()); // an
+        msg.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
+                                              // PTR: service -> instance
+        push_name(&mut msg, service);
+        msg.extend_from_slice(&TYPE_PTR.to_be_bytes());
+        msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+        msg.extend_from_slice(&[0, 0, 0, 120]);
+        let mut ptr_rdata = Vec::new();
+        push_name(&mut ptr_rdata, instance);
+        msg.extend_from_slice(&(ptr_rdata.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&ptr_rdata);
+        if let Some((port, target)) = with_srv {
+            push_name(&mut msg, instance);
+            msg.extend_from_slice(&TYPE_SRV.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            let mut rdata = vec![0, 0, 0, 0]; // priority/weight
+            rdata.extend_from_slice(&port.to_be_bytes());
+            push_name(&mut rdata, target);
+            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&rdata);
+        }
+        if let Some(strings) = with_txt {
+            push_name(&mut msg, instance);
+            msg.extend_from_slice(&TYPE_TXT.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            let mut rdata = Vec::new();
+            for s in strings {
+                rdata.push(s.len() as u8);
+                rdata.extend_from_slice(s.as_bytes());
+            }
+            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&rdata);
+        }
+        if let Some((host, addr)) = with_aaaa {
+            push_name(&mut msg, host);
+            msg.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 120]);
+            msg.extend_from_slice(&16u16.to_be_bytes());
+            msg.extend_from_slice(&addr.octets());
+        }
+        msg
+    }
+
+    const MC: &str = "_matterc._udp.local";
+    const MO: &str = "_matter._tcp.local";
+
+    #[test]
+    fn browse_fold_collects_two_instances_from_bundled_responses() {
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let a2: Ipv6Addr = "fd00::2".parse().unwrap();
+        let d1 = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=3840", "VP=65521+32768"]),
+            Some(("h1.local", a1)),
+        );
+        let d2 = synth_browse_response(
+            MC,
+            &format!("INST2.{MC}"),
+            Some((5541, "h2.local")),
+            Some(&["D=100"]),
+            Some(("h2.local", a2)),
+        );
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&parse_message(&d1).unwrap());
+        fold.fold(&parse_message(&d2).unwrap());
+        let out = fold.finish();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].port, Some(5540));
+        assert_eq!(out[0].addresses, vec![a1]);
+        assert_eq!(out[1].port, Some(5541));
+        assert_eq!(out[1].addresses, vec![a2]);
+    }
+
+    #[test]
+    fn browse_fold_is_order_independent_within_a_datagram() {
+        // SRV/TXT/AAAA が PTR より前に並んでいても畳み込める（fold は 2 パス）。
+        // synth は PTR を先頭に置くので、parse 結果を並べ替えて食わせる。
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let d = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            Some(("h1.local", a1)),
+        );
+        let mut records = parse_message(&d).unwrap();
+        records.reverse(); // PTR が最後
+        let mut fold = BrowseFold::new(MC);
+        fold.fold(&records);
+        let out = fold.finish();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].port, Some(5540));
+        assert_eq!(out[0].addresses, vec![a1]);
+    }
+
+    #[test]
+    fn browse_fold_dedupes_instances_and_caps_growth() {
+        let mut fold = BrowseFold::new(MC);
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        fold.fold(&parse_message(&d).unwrap());
+        fold.fold(&parse_message(&d).unwrap()); // 同じ PTR を 2 回
+        assert_eq!(fold.instances.len(), 1);
+        for i in 0..(MAX_INSTANCES + 5) {
+            let d = synth_browse_response(MC, &format!("X{i}.{MC}"), None, None, None);
+            fold.fold(&parse_message(&d).unwrap());
+        }
+        assert_eq!(fold.instances.len(), MAX_INSTANCES);
+    }
+
+    #[test]
+    fn browse_fold_ignores_records_for_other_services() {
+        // 同じ網に有線 LAN プリンタ等がいても混ぎらない。
+        let mut fold = BrowseFold::new(MC);
+        let d = synth_browse_response(
+            "_ipp._tcp.local",
+            "printer._ipp._tcp.local",
+            Some((631, "printer.local")),
+            None,
+            None,
+        );
+        fold.fold(&parse_message(&d).unwrap());
+        assert!(fold.instances.is_empty());
+    }
+
+    #[test]
+    fn browse_pending_questions_lists_missing_srv_txt_aaaa() {
+        let mut fold = BrowseFold::new(MC);
+        // PTR のみ → SRV と TXT を要求。
+        let d = synth_browse_response(MC, &format!("INST1.{MC}"), None, None, None);
+        fold.fold(&parse_message(&d).unwrap());
+        let q = fold.pending_questions();
+        assert!(q.contains(&(format!("INST1.{MC}"), TYPE_SRV)));
+        assert!(q.contains(&(format!("INST1.{MC}"), TYPE_TXT)));
+        // SRV が来たら target の AAAA を要求（プールにまだ無い）。
+        let d = synth_browse_response(
+            MC,
+            &format!("INST1.{MC}"),
+            Some((5540, "h1.local")),
+            Some(&["D=1"]),
+            None,
+        );
+        fold.fold(&parse_message(&d).unwrap());
+        let q = fold.pending_questions();
+        assert!(q.contains(&("h1.local".to_string(), TYPE_AAAA)));
+        assert!(!q.iter().any(|(_, t)| *t == TYPE_SRV));
+    }
+
+    #[test]
+    fn commissionable_from_fold_parses_txt_hostname_and_sorts_addresses() {
+        let global: Ipv6Addr = "fd00::10".parse().unwrap();
+        let ll: Ipv6Addr = "fe80::10".parse().unwrap();
+        let f = FoldedInstance {
+            name: format!("INST1.{MC}"),
+            port: Some(5540),
+            target: Some("HOST01.local".to_string()),
+            txt: vec![b"D=3840".to_vec(), b"VP=65521+32768".to_vec()],
+            addresses: vec![global, ll],
+        };
+        let c = commissionable_from_fold(&f).unwrap();
+        assert_eq!(c.hostname.as_deref(), Some("HOST01"));
+        assert_eq!(c.port, Some(5540));
+        assert_eq!(c.discriminator, Some(3840));
+        assert_eq!(c.vendor_id, Some(65521));
+        assert_eq!(c.product_id, Some(32768));
+        assert_eq!(c.addresses, vec![global, ll]);
+    }
+
+    #[test]
+    fn commissionable_from_fold_accepts_vendor_only_vp_and_skips_empty() {
+        let f = FoldedInstance {
+            name: format!("INST1.{MC}"),
+            port: None,
+            target: None,
+            txt: vec![b"VP=65521".to_vec()],
+            addresses: vec![],
+        };
+        let c = commissionable_from_fold(&f).unwrap();
+        assert_eq!(c.vendor_id, Some(65521));
+        assert_eq!(c.product_id, None);
+        // 素材ゼロ（PTR しか見えなかった instance）は出さない。
+        let empty = FoldedInstance {
+            name: format!("INST2.{MC}"),
+            port: None,
+            target: None,
+            txt: vec![],
+            addresses: vec![],
+        };
+        assert!(commissionable_from_fold(&empty).is_none());
+    }
+
+    #[test]
+    fn operational_from_fold_parses_label_and_keeps_announce_only() {
+        let f = FoldedInstance {
+            name: format!("00AABB1122CC3344-000000000000000B.{MO}"),
+            port: Some(5540),
+            target: None,
+            txt: vec![],
+            addresses: vec![],
+        };
+        let o = operational_from_fold(&f).unwrap();
+        assert_eq!(o.compressed_fabric, "00AABB1122CC3344");
+        assert_eq!(o.node_id, 0x0B);
+        assert!(o.addresses.is_empty()); // announce のみ → 空で返す（skip しない）
+    }
+
+    #[test]
+    fn operational_from_fold_rejects_malformed_labels() {
+        for bad in [
+            format!("shortname.{MO}"),
+            format!("GGGGBB1122CC3344-000000000000000B.{MO}"), // 非 hex
+            format!("00AABB1122CC3344.{MO}"),                  // '-' 無し
+            format!("00AABB1122CC3344-0B.{MO}"),               // 桁不足
+        ] {
+            let f = FoldedInstance {
+                name: bad,
+                port: None,
+                target: None,
+                txt: vec![],
+                addresses: vec![],
+            };
+            assert!(operational_from_fold(&f).is_none());
+        }
     }
 }
