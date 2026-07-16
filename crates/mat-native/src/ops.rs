@@ -207,6 +207,7 @@ fn rename_struct_fields(v: Value, table: &[(u8, &str)]) -> Value {
 }
 
 /// 1 ノード分のデバイス側 group provision に必要な材料一式。
+#[derive(Clone)]
 pub struct ProvisionNodeParams {
     pub group_id: u16,
     pub keyset_id: u16,

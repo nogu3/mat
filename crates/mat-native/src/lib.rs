@@ -115,6 +115,30 @@ pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
     w.finish()
 }
 
+/// invoke のコマンド引数（スカラー値の列）を CommandFields TLV へ。context tag
+/// は引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` の
+/// コメント参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`)
+/// の両方が使う共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
+pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
+    use mat_controller::tlv::{Tag, Writer};
+    use mat_core::ids::ScalarValue as S;
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    for (i, v) in args.iter().enumerate() {
+        let tag = Tag::Context(i as u8);
+        match v {
+            S::Bool(b) => w.put_bool(tag, *b),
+            S::UInt(n) => w.put_uint(tag, *n),
+            S::Int(n) => w.put_int(tag, *n),
+            S::Str(s) => w.put_str(tag, s),
+            S::Bytes(b) => w.put_bytes(tag, b),
+            S::Null => w.put_null(tag),
+        }
+    }
+    w.end_container();
+    w.finish()
+}
+
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
 #[async_trait]
 pub trait Establisher: Send + Sync {
@@ -435,6 +459,19 @@ mod tests {
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::Utf8("x")
         ));
+    }
+
+    #[test]
+    fn encode_command_fields_uses_positional_context_tags() {
+        use mat_core::ids::ScalarValue as S;
+        let tlv = encode_command_fields(&[S::UInt(128), S::UInt(0)]);
+        let mut r = mat_controller::tlv::Reader::new(&tlv);
+        let el = r.next().unwrap().unwrap();
+        assert!(matches!(el.value, mat_controller::tlv::Value::StructStart));
+        // 空引数は空 struct（要素 0 個）にエンコードされる。
+        let empty = encode_command_fields(&[]);
+        let mut r2 = mat_controller::tlv::Reader::new(&empty);
+        assert!(r2.next().unwrap().is_some());
     }
 
     #[tokio::test]
