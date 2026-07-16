@@ -169,8 +169,9 @@ fn main() -> ExitCode {
             iteration,
             discriminator,
         } => {
-            // discriminator 未指定なら node_id から決定的に算出（12-bit に収める）。
-            let disc = discriminator.unwrap_or_else(|| (node_id.id() % 4096) as u16);
+            // discriminator 未指定なら node_id から決定的に算出（12-bit に収める、
+            // native 直経路 classify と同じ共有式）。
+            let disc = native_direct::resolve_discriminator(node_id.id(), *discriminator);
             commands::open_window::run(&store_path, node_id.id(), *timeout, *iteration, disc)
         }
         Command::Group { action } => match action {

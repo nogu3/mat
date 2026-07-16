@@ -90,9 +90,15 @@ async fn commission_factory_device_over_ble_thread() {
 
     // 3) native open-window → 本番 join 用コードを表示
     eprintln!("== 3/4 open-commissioning-window (300s)");
-    let window = commissioning::open_commissioning_window(&mut session, 300, &cfg)
-        .await
-        .expect("open window");
+    let window = commissioning::open_commissioning_window(
+        &mut session,
+        300,
+        commissioning::random_discriminator(),
+        1000,
+        &cfg,
+    )
+    .await
+    .expect("open window");
     eprintln!(
         "== 本番復帰: 別端末で `mat commission <target> {}` を 5 分以内に実行",
         window.manual_code

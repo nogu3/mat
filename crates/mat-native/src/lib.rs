@@ -19,6 +19,7 @@ use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
 
 pub mod group;
+pub mod ops;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -69,6 +70,15 @@ pub trait NodeConn: Send {
         data_tlv: Vec<u8>,
         timed: bool,
     ) -> Result<(), MatError>;
+    /// Enhanced Commissioning Method で一時 commissioning window を開く。
+    /// `(manual_code, qr_payload)` を返す（`SecureSession` は `NodeConn` に
+    /// 隠蔽されているため、window を開く操作もここに生やす）。
+    async fn open_window(
+        &mut self,
+        timeout_s: u16,
+        discriminator: u16,
+        iterations: u32,
+    ) -> Result<(String, String), MatError>;
 }
 
 /// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
@@ -337,6 +347,24 @@ impl NodeConn for SessionConn {
             .await
             .map_err(map_session_err)
     }
+
+    async fn open_window(
+        &mut self,
+        timeout_s: u16,
+        discriminator: u16,
+        iterations: u32,
+    ) -> Result<(String, String), MatError> {
+        let window = mat_controller::commissioning::open_commissioning_window(
+            &mut self.session,
+            timeout_s,
+            discriminator,
+            iterations,
+            &self.mrp,
+        )
+        .await
+        .map_err(map_commission_err)?;
+        Ok((window.manual_code, window.qr_payload))
+    }
 }
 
 /// SecureSession のエラーを mat の ErrorKind へ写像する（経路によらず分類を揃える）。
@@ -348,6 +376,23 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
         SessionError::Im(_) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
+        _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
+    }
+}
+
+/// `open_commissioning_window`（既存 CASE セッション上の invoke）のエラーを
+/// mat の ErrorKind へ写像する。実質的な失敗経路は `Session`（invoke の
+/// SessionError と同分類）と `CommandStatus`（デバイスが拒否）に限られる
+/// （PASE/attestation 等は既存 operational セッション上では発生しない）が、
+/// 網羅性のため他 variant も `Other` へ落とす。
+fn map_commission_err(e: mat_controller::commissioning::CommissionError) -> MatError {
+    use mat_controller::commissioning::CommissionError;
+    match e {
+        CommissionError::Session(se) => map_session_err(se),
+        CommissionError::CommandStatus { .. } => {
+            MatError::new(ErrorKind::DeviceRejected, format!("native: {e}"))
+        }
+        CommissionError::Timeout(_) => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
     }
 }

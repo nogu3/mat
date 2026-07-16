@@ -80,9 +80,15 @@ async fn commission_control_multi_admin() {
     assert_eq!(v, ImValue::Bool(true));
 
     // ④ native open-window → 第二 admin (fabric B) として commission
-    let window = commissioning::open_commissioning_window(&mut session, 180, &cfg)
-        .await
-        .expect("open window");
+    let window = commissioning::open_commissioning_window(
+        &mut session,
+        180,
+        commissioning::random_discriminator(),
+        1000,
+        &cfg,
+    )
+    .await
+    .expect("open window");
     eprintln!(
         "window: manual={} qr={}",
         window.manual_code, window.qr_payload

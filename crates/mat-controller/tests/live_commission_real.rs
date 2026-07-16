@@ -122,9 +122,15 @@ async fn commission_second_fabric_and_remove() {
 
     // 3/7: native open-commissioning-window（本番 fabric セッション上）。
     eprintln!("== 3/7 open-commissioning-window (180s)");
-    let window = commissioning::open_commissioning_window(&mut prod_session, 180, &mrp)
-        .await
-        .expect("open commissioning window");
+    let window = commissioning::open_commissioning_window(
+        &mut prod_session,
+        180,
+        commissioning::random_discriminator(),
+        1000,
+        &mrp,
+    )
+    .await
+    .expect("open commissioning window");
     eprintln!(
         "window opened: discriminator={} passcode={} manual={} qr={}",
         window.discriminator, window.passcode, window.manual_code, window.qr_payload
