@@ -254,7 +254,8 @@ fn read_thread_signal(
     })
 }
 
-/// `--deep` の補助プローブ。ping6（IP生存）と avahi-browse（mDNS広告）を実施。
+/// `--deep` の補助プローブ。ping6（IP生存）と mDNS 広告確認（iface 指定時は
+/// native browse、未指定・失敗時は avahi-browse）を実施。
 fn deep_probes(
     checks: &mut Checks,
     unavailable: &mut Vec<Value>,
