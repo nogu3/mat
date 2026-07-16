@@ -113,8 +113,10 @@ native 有効運用中）。本 spec は **M8（chip-tool 完全廃止）の
   完全一致）。未設定時は chip-tool（無変更）。
 - tokio runtime は既存 native 直経路（`native_direct::try_run`）と同じく
   current-thread を都度構築。
-- `VP` の `vid+pid` 分解・hostname 整形などの変換は `mat-core` に置いて
-  ユニットテスト（副作用なし層）。
+- `VP` の `vid+pid` 分解・hostname 整形など TXT/DNS 由来のパースは
+  `dnssd.rs`（mat-controller）に置いてユニットテスト（mat-core は
+  mat-controller に依存できないため、プロトコル由来のパースは backend crate
+  側に置く — 設計ルール1とも整合）。mat 側は構造体の写しのみ。
 
 ### 4. エラー処理
 
@@ -127,8 +129,9 @@ native 有効運用中）。本 spec は **M8（chip-tool 完全廃止）の
 - `dnssd.rs` ユニット: 合成メッセージ fold（複数 instance の PTR 列挙、
   additional 同梱/非同梱、dedup、announce のみ、instance 名パース不能 skip、
   flood ガード）。
-- `mat-core` ユニット: browse 結果 → `DiscoveredDevice` / `MatterInstance`
-  写像（`VP` 分解、hostname 整形含む）。
+- 変換ユニット: browse 結果 → `DiscoveredDevice` / `MatterInstance` 写像
+  （`VP` 分解・hostname 整形は `dnssd.rs` 側、構造体の写しは mat 側で
+  それぞれユニットテスト）。
 - 統合テスト（fake-chip-tool）: `MAT_IFACE` 未設定の従来経路が完全無変更で
   あることの回帰。
 - native browse のループ本体は socket 実物が要るため実機 E2E で実証
