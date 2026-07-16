@@ -946,7 +946,10 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
             let mut unchanged: Vec<u64> = Vec::new();
             for &node_id in node_ids {
                 let mut conn = engine.establisher.establish(node_id).await?;
-                if mat_native::ops::ensure_group_acl(&mut *conn, *group_id).await? {
+                if mat_native::ops::ensure_group_acl(&mut *conn, *group_id)
+                    .await
+                    .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?
+                {
                     updated.push(node_id);
                 } else {
                     unchanged.push(node_id);
