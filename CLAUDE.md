@@ -82,8 +82,13 @@ falling back to `parse_error` + `1`.
 
 - Route selection is per-op: matd auto-discovery (unchanged) -> native direct
   (`mat-native`, only when `MAT_IFACE`/`MAT_MATD_IFACE` is set and the op is
-  in the native hotpath) -> direct `chip-tool`. Nothing above this list
-  changes when native is unset — see README for the exact op list and
+  in the native hotpath) -> direct `chip-tool`. As of Phase 5 M8a the native
+  hotpath widened from the M4/M5/M7 fixed shapes to generic `read`/`write`/
+  `invoke` (via the `mat-core::ids` name→ID table, scalar types only) plus
+  `describe`/`diag thread`/`open-window`/`group provision`/`group grant`/
+  `group invoke`; unresolvable names and list/struct/float fields still fall
+  back to `chip-tool` (or `parse_error` for the latter). Nothing above this
+  list changes when native is unset — see README for the exact op list and
   fallback rules.
 - `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
 - The backend is replaceable: `mat` couples to it only through `mat`'s own JSON

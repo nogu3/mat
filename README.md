@@ -556,7 +556,7 @@ permanently hot core for never paying a cold start.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
-### matd's native backend (Phase 5 M4)
+### matd's native backend (Phase 5 M4, extended in M8a)
 
 Set `MAT_MATD_IFACE=<thread mesh iface>` (or pass `matd --iface <name>`) to let
 `matd` handle its hotpath ops — `on` / `off` / `color`
@@ -564,8 +564,13 @@ Set `MAT_MATD_IFACE=<thread mesh iface>` (or pass `matd --iface <name>`) to let
 `read`ing the `onoff` cluster's `on-off` attribute — in-process, over a warm
 CASE session held by the embedded Matter controller (crate `mat-controller`,
 Phase 5's from-scratch native backend), instead of going through the
-`chip-tool interactive server`. Leave it unset and nothing changes: every op
-still goes through chip-tool, exactly as before.
+`chip-tool interactive server`. As of M8a, the same warm-session treatment
+also covers generic `read` (any cluster/attribute), `write`, generic `invoke`,
+`describe`, generic `group invoke` (any cluster/command, resolved through the
+same name→ID table `mat`'s direct path uses), and `group provision`'s
+device-side steps (its controller-side `groupsettings` bookkeeping stays on
+chip-tool until M8c). Leave `MAT_MATD_IFACE` unset and nothing changes: every
+op still goes through chip-tool, exactly as before.
 
 ```bash
 matd --iface thread0 &
@@ -583,11 +588,18 @@ matd --iface thread0 &
 - If native construction fails (e.g. the credential store can't be read),
   `matd` logs a warning and falls back to chip-tool for everything — it does
   not refuse to start.
-- Everything outside the hotpath — `write`, `describe`, arbitrary
-  cluster `read`/`invoke`, and `group provision` / generic `group invoke`
-  (non-onoff, or onoff with arguments) — still goes through chip-tool.
+- Generic `write` / `group invoke` reject known list/struct/float
+  attributes or command fields with `parse_error` up front, same rule as
+  `mat`'s direct path (see M8a below); unknown names still fall back to
+  chip-tool.
+- `diag thread`, `open-window`, and `group grant` are **not** part of the
+  `matd` socket protocol at all (by design — these are rare, session-lifetime
+  doesn't matter for them) and never get routed to `matd` even when it's
+  running; `mat` always handles them on its own direct path (native if
+  `MAT_IFACE` is set, chip-tool otherwise). `diag node`, `discover`, and
+  `commission` remain chip-tool-only in M8a (unaffected by this milestone).
   Because of this, `chip-tool` is only spawned lazily on the first op that
-  needs it: a workload that only ever hits the native hotpath never spawns
+  needs it: a workload that only ever hits native-eligible ops never spawns
   `chip-tool` at all, and `matd` can start even if `chip-tool` isn't
   installed.
 - Error kinds and exit codes are identical regardless of path: mDNS
@@ -597,14 +609,20 @@ matd --iface thread0 &
   `MAT_E2E_NODE_ID` / `MAT_E2E_IFACE`; designed to run against a separate
   socket/port so it doesn't disturb a production `matd`).
 
-### matd's native groupcast (Phase 5 M5)
+### matd's native groupcast (Phase 5 M5, extended in M8a)
 
 With native enabled (`MAT_MATD_IFACE` set and the native backend built
-successfully), `matd` also handles its three group-send ops in-process
-instead of going through chip-tool: `group invoke` for onoff `on`/`off`/
-`toggle` with no extra arguments, `group color`, and `group color-temp`.
-`group provision` and any other `group invoke` (non-onoff cluster, or onoff
-with arguments) are unaffected — they always go through chip-tool.
+successfully), `matd` also handles its group-send ops in-process instead of
+going through chip-tool: `group color`, `group color-temp`, and `group
+invoke`. Through M7, `group invoke` only went native for onoff `on`/`off`/
+`toggle` with no extra arguments; as of M8a it's generic — any
+cluster/command the name→ID table (or a numeric id) can resolve, subject to
+the same scalar-only type rule as `mat`'s direct path (list/struct/float
+fields are rejected with `parse_error`, not silently sent as chip-tool).
+`group provision`'s device-side steps go native too (its controller-side
+`groupsettings` bookkeeping stays on chip-tool until M8c); any group send
+whose cluster/command name can't be resolved at all still falls back to
+chip-tool.
 
 - Each send re-reads the group's operational credentials from the chip-tool
   KVS (derived GroupKeyMap -> keyset GKH + operational key), so a
@@ -649,12 +667,11 @@ with arguments) are unaffected — they always go through chip-tool.
   warns about. Normally you don't need `MAT_MATD=0` at all: with `matd`
   running, route priority already sends every group op to it first.
 - **Caveat: this also happens *within* a single `matd`, for group sends
-  outside the three native-eligible shapes.** Only `group invoke` for onoff
-  `on`/`off`/`toggle` with no extra arguments, `group color`, and `group
-  color-temp` go native; any other group send (e.g. `group invoke <g>
-  levelcontrol move-to-level ...`, or onoff `group invoke` with extra
-  arguments) still goes through chip-tool even while native is active. If a
-  group has members that also receive native-driven groupcasts, that
+  outside the native-eligible set.** As of M8a, `group invoke` is native for
+  any resolvable cluster/command with scalar (or no) arguments, plus `group
+  color` and `group color-temp` — but a `group invoke` naming an unknown
+  cluster/command still falls back to chip-tool even while native is active.
+  If a group has members that also receive native-driven groupcasts, that
   chip-tool-routed send uses chip-tool's counter, which can already be
   behind native's jumped-ahead counter for the same source node id (the
   counter window is per-source-node, across all groups) — those devices can
@@ -666,7 +683,7 @@ with arguments) are unaffected — they always go through chip-tool.
   matd's group traffic for the duration — unicast ops are fine to leave
   running).
 
-### `mat`'s native direct path (Phase 5 M7)
+### `mat`'s native direct path (Phase 5 M7, extended in M8a)
 
 Set `MAT_IFACE=<thread mesh iface>` (or pass the global `--iface <name>`) to
 let `mat`'s own one-shot **direct** path — not `matd` — run its hotpath ops
@@ -674,9 +691,28 @@ in-process too, over the same `mat-native` engine that backs `matd`'s native
 backend above (M4/M5): `on` / `off` / `color` / `color-temp` / `read`ing the
 `onoff` cluster's `on-off` attribute, and the three group-send shapes
 (`group invoke` for onoff `on`/`off`/`toggle` with no extra arguments,
-`group color`, `group color-temp`). Leave it unset and nothing changes: every
-op still goes through chip-tool, exactly as before — opt-in, the same shape
-as `matd`'s `MAT_MATD_IFACE`.
+`group color`, `group color-temp`). As of M8a, native also covers generic
+`read` (any cluster/attribute, by name via the checked-in name→ID table or by
+numeric id), generic `write`, generic `invoke`, `describe`, `diag thread`
+(`diag node` is out of scope for M8a), `open-window`, device-side
+`group provision` / `group grant`, and generic `group invoke` (any
+cluster/command, not just the M7 onoff-with-no-args shape). Controller-side
+group settings (`groupsettings`) stay on chip-tool until M8c. Leave `MAT_IFACE`
+unset and nothing changes: every op still goes through chip-tool, exactly as
+before — opt-in, the same shape as `matd`'s `MAT_MATD_IFACE`. `matd` gets the
+same M8a treatment for `read`/`write`/`invoke`/`describe`/`group invoke`/
+`group provision`, but `diag thread`, `open-window`, and `group grant` are not
+part of the `matd` socket protocol at all (by design, unrelated to M8a) — for
+those three, `matd` is never in the picture even if it's running, and route
+priority is just native direct (`MAT_IFACE`) -> chip-tool direct.
+
+Generic `write` / `invoke` only encode **scalar** JSON→TLV types (bool / int /
+uint / enum / bitmap / string / octstr — bytes as a `hex:`-prefixed string).
+An attribute or command field that the name table knows to be `list` /
+`struct` / `float` is rejected up front with `parse_error` (the error detail
+names the type); it does not silently fall back to chip-tool. Unknown
+cluster/attribute/command names (not in the generated table) still fall back
+to chip-tool as before.
 
 ```bash
 mat --iface thread0 on --node 5
@@ -846,7 +882,12 @@ stdout/stderr to classify into `3` / `4` / `5` / `6`. If it cannot classify, exi
   and `device_rejected` (the device answered and refused); typically retryable.
 - `child_failed` — `chip-tool` exited with failure (unclassified, exit 1)
 - `commission_failed` — commissioning failed (unclassified, exit 1)
-- `parse_error` — could not parse `chip-tool` output (exit 1)
+- `parse_error` — could not parse `chip-tool` output (exit 1); on the native
+  path (Phase 5 M8a) this kind is also returned when a generic `write` /
+  `invoke` names a known attribute or command field whose type is
+  `list` / `struct` / `float` — those are not supported by the scalar-only
+  JSON→TLV encoder, and the request is rejected up front rather than
+  forwarded to chip-tool.
 - `other` — anything else (exit 1)
 
 ## Backend (chip-tool)
