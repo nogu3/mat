@@ -73,6 +73,22 @@ fn discover_with_missing_chip_tool_exits_12() {
 }
 
 #[test]
+fn discover_native_bogus_iface_falls_back_to_chip_tool() {
+    // 存在しない iface 名 → iface_index が即失敗 → warn + chip-tool フォール
+    // バックで commissionable が従来どおり出る。
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .arg("discover")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"commissionable\""))
+        .stdout(predicate::str::contains("192.0.2.10"))
+        .stderr(predicate::str::contains("falling back to chip-tool"));
+}
+
+#[test]
 fn commission_success_updates_store_and_shows_in_discover() {
     let store = TempDir::new().unwrap();
 

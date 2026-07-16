@@ -9,6 +9,8 @@
 //!
 //! commissionable 探索は認証情報不要のため、store 無しでも動く（無ければ空ストアを
 //! bootstrap し、commissioned は空配列になる）。
+//!
+//! iface（MAT_IFACE）設定時は commissionable / probe とも native browse（M8b）。
 
 use std::path::Path;
 
@@ -19,6 +21,7 @@ use mat_core::diag::MatterInstance;
 use mat_core::error::MatError;
 use mat_core::output;
 use mat_core::parse::parse_commissionables;
+use mat_core::parse::DiscoveredDevice;
 use mat_core::reachability::resolve;
 use mat_core::store::Store;
 
@@ -27,13 +30,36 @@ pub fn run(store_path: &Path, probe: bool, iface: Option<&str>) -> Result<(), Ma
     // open ではなく open_or_init（無ければ空ストアを bootstrap）。commissioned は
     // 台帳から読むが、空ストアなら空配列になるだけ。
     let store = Store::open_or_init(store_path)?;
-    let chip = ChipTool::new(store.root());
 
-    // commissionable 探索。chip-tool は探索を時間で打ち切るため非 0 終了もあり得る。
-    // ここでは exit code で失敗扱いにせず、得られた行をパースする（child_not_found
-    // = exit 12 だけは run() がエラーで返す）。
-    let out = chip.run(["discover", "commissionables"])?;
-    let commissionable = parse_commissionables(&out.stdout);
+    // commissionable 探索: iface 指定時は native browse（M8b）、IO 失敗は
+    // warn + chip-tool フォールバック（read-only なので二重実行の害なし）。
+    // 結果 0 件は正常であり chip-tool に fall back しない（平常時に毎回
+    // 二重スキャンしないため）。
+    let native = match iface {
+        Some(i) => match native_commissionables(i) {
+            Ok(list) => Some(list),
+            Err(e) => {
+                tracing::warn!(
+                    iface = i,
+                    error = %e,
+                    "native commissionable browse failed; falling back to chip-tool"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let commissionable = match native {
+        Some(list) => list,
+        None => {
+            let chip = ChipTool::new(store.root());
+            // chip-tool は探索を時間で打ち切るため非 0 終了もあり得る。exit code で
+            // 失敗扱いにせず、得られた行をパースする（child_not_found = exit 12
+            // だけは run() がエラーで返す）。
+            let out = chip.run(["discover", "commissionables"])?;
+            parse_commissionables(&out.stdout)
+        }
+    };
 
     let mut devices = Vec::new();
     for d in &commissionable {
@@ -99,4 +125,32 @@ pub fn run(store_path: &Path, probe: bool, iface: Option<&str>) -> Result<(), Ma
 
     output::emit(json!({ "devices": devices }));
     Ok(())
+}
+
+/// native commissionable browse（M8b）→ 既存 `DiscoveredDevice` へ写す
+/// （既存 Serialize で出力スキーマ完全一致）。
+fn native_commissionables(
+    iface: &str,
+) -> Result<Vec<DiscoveredDevice>, Box<dyn std::error::Error>> {
+    let scope_id = mat_controller::dnssd::iface_index(iface)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let list = rt.block_on(mat_controller::dnssd::browse_commissionable(
+        scope_id,
+        mat_controller::dnssd::BROWSE_WINDOW,
+    ))?;
+    tracing::info!(devices = list.len(), "discover executed (native browse)");
+    Ok(list.into_iter().map(to_discovered).collect())
+}
+
+fn to_discovered(c: mat_controller::dnssd::CommissionableInstance) -> DiscoveredDevice {
+    DiscoveredDevice {
+        hostname: c.hostname,
+        addresses: c.addresses.iter().map(|a| a.to_string()).collect(),
+        port: c.port,
+        discriminator: c.discriminator,
+        vendor_id: c.vendor_id,
+        product_id: c.product_id,
+    }
 }
