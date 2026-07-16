@@ -147,6 +147,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m8a-real.sh
 
+  e2e:m8b:real:
+    desc: "M8b 実機 E2E: discover/probe+diag--deep native化+構造一致+フォールバック健全性 (要 MAT_E2E_HOST/NODES)"
+    cmds:
+      - bash scripts/e2e-m8b-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
