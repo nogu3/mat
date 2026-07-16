@@ -27,6 +27,21 @@ pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
 pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
 pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
 pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
+/// GroupKeyManagement cluster (spec §11.2.7). `KeySetWrite` provisions a
+/// device's epoch key for a `GroupKeySetID`.
+pub const CLUSTER_GROUP_KEY_MANAGEMENT: u32 = 0x003F;
+pub const CMD_KEY_SET_WRITE: u32 = 0x00;
+/// `group-key-map` attribute (list of `GroupKeyMapStruct`): maps a `GroupId`
+/// to the `GroupKeySetID` used to decrypt its groupcast traffic.
+pub const ATTR_GROUP_KEY_MAP: u32 = 0x0000;
+/// Groups cluster (spec §1.3). `AddGroup` binds an endpoint into a group.
+pub const CLUSTER_GROUPS: u32 = 0x0004;
+pub const CMD_ADD_GROUP: u32 = 0x00;
+/// AccessControl cluster (spec §11.1). `acl` is the fabric-scoped list of
+/// `AccessControlEntryStruct` a device consults to authorize incoming
+/// requests (including groupcast, which arrives with `authMode = Group`).
+pub const CLUSTER_ACCESS_CONTROL: u32 = 0x001F;
+pub const ATTR_ACL: u32 = 0x0000;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -716,6 +731,61 @@ pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: 
     w.put_uint(Tag::Context(1), u64::from(transition_time_ds));
     w.put_uint(Tag::Context(2), 0);
     w.put_uint(Tag::Context(3), 0);
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for GroupKeyManagement KeySetWrite (cluster spec §11.2.8.4):
+/// `{0: GroupKeySetStruct{0: GroupKeySetID(u16), 1: GroupKeySecurityPolicy(0
+/// = TrustFirst), 2: EpochKey0(16B octstr), 3: EpochStartTime0(u64, epoch-us),
+/// 4: EpochKey1(null), 5: EpochStartTime1(null), 6: EpochKey2(null), 7:
+/// EpochStartTime2(null)}}`. Only a single active epoch (0) is provisioned —
+/// matches the chip-tool `groupkeymanagement key-set-write` JSON this mirrors
+/// (`commands/group.rs`'s `key_set` object). `epochStartTime0` is fixed to 1
+/// (matching `mat_core::group::EPOCH_START_TIME`, which the controller-side
+/// `groupsettings add-keysets` validityTime must also match).
+pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_struct(Tag::Context(0)); // GroupKeySet
+    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.put_uint(Tag::Context(1), 0); // GroupKeySecurityPolicy: TrustFirst
+    w.put_bytes(Tag::Context(2), epoch_key);
+    w.put_uint(Tag::Context(3), 1); // EpochStartTime0
+    w.put_null(Tag::Context(4));
+    w.put_null(Tag::Context(5));
+    w.put_null(Tag::Context(6));
+    w.put_null(Tag::Context(7));
+    w.end_container();
+    w.end_container();
+    w.finish()
+}
+
+/// `group-key-map` attribute Data TLV (list of `GroupKeyMapStruct{1: GroupId,
+/// 2: GroupKeySetID}`, spec §11.2.7.6) — the write is a **full replace**, so
+/// callers must pass the final merged list (existing entries + the one being
+/// added/updated), not just the delta. `fabricIndex` (field 254) is omitted:
+/// the server substitutes it from the write's accessing fabric.
+pub fn encode_group_key_map_tlv(entries: &[(u16, u16)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (group_id, keyset_id) in entries {
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(*group_id));
+        w.put_uint(Tag::Context(2), u64::from(*keyset_id));
+        w.end_container();
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for Groups AddGroup (cluster spec §1.3.6.1): `{0:
+/// GroupID(u16), 1: GroupName(str, <= 16 chars per spec, unchecked here)}`.
+pub fn encode_add_group_fields(group_id: u16, name: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(group_id));
+    w.put_str(Tag::Context(1), name);
     w.end_container();
     w.finish()
 }
@@ -1940,5 +2010,43 @@ mod tests {
         assert_eq!(msg.reports.len(), 1);
         let data = msg.reports[0].data.as_ref().unwrap();
         assert_eq!(data.get("0").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    // M8a Task9: group provision デバイス側専用エンコーダ。
+
+    #[test]
+    fn key_set_write_fields_shape() {
+        let f = encode_key_set_write_fields(60, &[0xAB; 16]);
+        let mut r = Reader::new(&f);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        // field 0 = GroupKeySetStruct: {0: 60, 1: 0, 2: "abab..", 3: 1, 4..7: null}
+        assert_eq!(j["0"]["0"], serde_json::json!(60));
+        assert_eq!(j["0"]["1"], serde_json::json!(0));
+        assert_eq!(j["0"]["2"], serde_json::json!("ab".repeat(16)));
+        assert_eq!(j["0"]["3"], serde_json::json!(1));
+        assert!(j["0"]["4"].is_null() && j["0"]["7"].is_null());
+    }
+
+    #[test]
+    fn group_key_map_tlv_is_list_of_structs() {
+        let t = encode_group_key_map_tlv(&[(10, 60), (11, 61)]);
+        let mut r = Reader::new(&t);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!([{"1": 10, "2": 60}, {"1": 11, "2": 61}])
+        );
+    }
+
+    #[test]
+    fn add_group_fields_shape() {
+        let f = encode_add_group_fields(10, "grp10");
+        let mut r = Reader::new(&f);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(j["0"], serde_json::json!(10));
+        assert_eq!(j["1"], serde_json::json!("grp10"));
     }
 }

@@ -273,6 +273,16 @@ pub fn acl_entries_from_ws_value(value: &Value) -> Result<Vec<AclEntry>, MatErro
     arr.iter().map(ws_entry).collect()
 }
 
+/// native（IM）直経路の `AccessControlEntryStruct` 列 —— `tlv_to_json` の数値
+/// キー規約（`{1: privilege, 2: authMode, 3: subjects, 4: targets, 254:
+/// fabricIndex}`）から `AclEntry` 列へ。この規約は `acl_entries_from_ws_value`
+/// が読む matd（ws）応答と同一（どちらも同じ IM 数値キー慣習）なので、検証
+/// ロジックを重複させず委譲する。解釈不能なら `ParseError`（read できなければ
+/// write しない既存方針、モジュール冒頭のコメント参照）。
+pub fn entries_from_im_json(v: &Value) -> Result<Vec<AclEntry>, MatError> {
+    acl_entries_from_ws_value(v)
+}
+
 /// TOO ログパーサ（`too_log_unknown_key_inside_entry_is_parse_error` 等）と同じ
 /// fail-closed を ws 変換にも適用する: 既知キー以外が 1 つでもあれば `ParseError`。
 /// 黙って落とすと、chip-tool が将来フィールドを追加したときに劣化したエントリを
@@ -638,6 +648,25 @@ mod tests {
         let v = json!([{"1":5,"2":2,"3":[1],"4":[{"0":6,"1":1,"2":null,"9":1}],"254":1}]);
         let err = acl_entries_from_ws_value(&v).expect_err("unknown target field must fail closed");
         assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    // M8a Task9: native (IM) read の数値キー JSON → AclEntry。ws 値と同一の
+    // 数値キー規約（どちらも tlv_to_json / IM の慣習）なので acl_entries_from_ws_value
+    // にそのまま委譲する。
+
+    #[test]
+    fn entries_from_im_json_maps_numeric_keys() {
+        let v = serde_json::json!([
+            {"1": 5, "2": 2, "3": [112233445566u64], "4": null, "254": 2}
+        ]);
+        let e = entries_from_im_json(&v).unwrap();
+        assert_eq!(e[0].privilege, 5);
+        assert_eq!(e[0].auth_mode, 2);
+        assert_eq!(e[0].subjects, vec![112233445566]);
+        assert!(e[0].targets.is_none());
+        assert_eq!(e[0].fabric_index, 2);
+        // 解釈不能（privilege 欠落）は Err — read できなければ write しない方針の要。
+        assert!(entries_from_im_json(&serde_json::json!([{"2": 2}])).is_err());
     }
 
     /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。

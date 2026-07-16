@@ -27,6 +27,10 @@ pub struct FakeConn {
     pub sent: usize,
     reads: HashMap<(u16, u32, u32), serde_json::Value>,
     clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
+    /// `invoke`/`write_tlv` の呼び出し記録（M8a Task9）。順序・宛先の検証用
+    /// — `"invoke(ep,0xCCCC,0xCCCC)"` / `"write_tlv(ep,0xCCCC,0xCCCC)"` 形
+    /// （cluster/command/attribute は `{:#06X}` — 4桁ゼロ埋め大文字 hex）。
+    calls: Vec<String>,
 }
 
 impl Default for FakeConn {
@@ -37,6 +41,7 @@ impl Default for FakeConn {
             sent: 0,
             reads: HashMap::new(),
             clusters: HashMap::new(),
+            calls: Vec::new(),
         }
     }
 }
@@ -47,6 +52,11 @@ impl FakeConn {
     /// 登録）。未登録の呼び出しは既存の固定値応答にフォールバックする。
     pub fn scripted() -> Self {
         Self::default()
+    }
+
+    /// `invoke`/`write_tlv` の呼び出し記録を順序どおりに返す（M8a Task9）。
+    pub fn calls(&self) -> &[String] {
+        &self.calls
     }
 
     /// `read_json(endpoint, cluster, attribute)` の応答を1件登録する。
@@ -86,12 +96,14 @@ impl NodeConn for FakeConn {
     }
     async fn invoke(
         &mut self,
-        _endpoint: u16,
-        _cluster: u32,
-        _command: u32,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
         _fields: Option<Vec<u8>>,
         _timed: bool,
     ) -> Result<(), MatError> {
+        self.calls
+            .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
         Ok(())
     }
 
@@ -120,9 +132,9 @@ impl NodeConn for FakeConn {
 
     async fn write_tlv(
         &mut self,
-        _endpoint: u16,
-        _cluster: u32,
-        _attribute: u32,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
         _data_tlv: Vec<u8>,
         _timed: bool,
     ) -> Result<(), MatError> {
@@ -131,6 +143,9 @@ impl NodeConn for FakeConn {
         if self.fail_first_send && n == 0 {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
+        self.calls.push(format!(
+            "write_tlv({endpoint},{cluster:#06X},{attribute:#06X})"
+        ));
         Ok(())
     }
 

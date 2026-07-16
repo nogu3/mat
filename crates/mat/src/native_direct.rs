@@ -14,6 +14,8 @@ use mat_core::store::Store;
 use mat_native::group::GroupOutcome;
 use mat_native::{Engine, NativeConfig};
 
+use mat_core::alias::NodeRef;
+
 use crate::cli::{Command, DiagCommand, GroupCommand};
 
 pub(crate) struct Config<'a> {
@@ -68,6 +70,33 @@ pub(crate) enum NativeOp {
         mireds: u16,
         transition: u16,
         endpoint: u16,
+    },
+    /// group への汎用 invoke（onoff on/off/toggle 引数なし以外 — M8a Task9）。
+    /// `GroupOnOff` と違い cluster/command を名前解決した任意コマンドを送る。
+    GroupInvokeGeneric {
+        group_id: u16,
+        cluster_in: String,
+        command_in: String,
+        cluster: u32,
+        command: u32,
+        fields_tlv: Option<Vec<u8>>,
+        endpoint: u16,
+    },
+    /// `mat group provision`（M8a Task9）: コントローラ側 group state は
+    /// chip-tool のまま（KVS 書込所有は M8c）、デバイス側 4 ステップのみ native。
+    GroupProvision {
+        group_id: u16,
+        node_ids: Vec<u64>,
+        keyset_id: u16,
+        name: String,
+        endpoint: u16,
+        epoch_key: Option<String>,
+        rebind: bool,
+    },
+    /// `mat group grant`（M8a Task9）: 各ノードへ ACL read-merge-write のみ。
+    GroupGrant {
+        group_id: u16,
+        node_ids: Vec<u64>,
     },
     ReadAttr {
         node_id: u64,
@@ -177,10 +206,12 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 transition: *transition,
             })
         }
-        // group 送信 3 形。matd の native_group_params と完全パリティ:
-        // GroupInvoke は onoff の引数なし on/off/toggle のみ native。
-        // GroupColor / GroupColorTemp は常に native 対象。provision / grant は
-        // 常に chip-tool 直（対象外 → None）。
+        // group 送信 3 形 + provision/grant（M8a Task9 でデバイス側 native 化）。
+        // GroupInvoke は onoff の引数なし on/off/toggle のみここで直接
+        // NativeOp::GroupOnOff にする（cluster/command 名前解決を経ない専用
+        // 高速路）。それ以外（cluster != onoff / args 非空）の group invoke は
+        // 下の classify_strict（GroupInvokeGeneric）に委ねる。
+        // GroupColor / GroupColorTemp は常に native 対象。
         Command::Group {
             action:
                 GroupCommand::Invoke {
@@ -246,6 +277,42 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 endpoint: *endpoint,
             })
         }
+        // provision / grant（M8a Task9）: デバイス側 4 ステップ（KeySetWrite /
+        // group-key-map / AddGroup / ACL）を native 化。コントローラ側
+        // groupsettings（chip-tool の KVS 書込）は変わらず chip-tool 側で行う
+        // （`run_op` の `NativeOp::GroupProvision` 実装を参照。KVS 書込所有の
+        // 分割は M8c）。name 未指定時の既定補完（`grp<id>`）は main.rs の
+        // chip-tool 経路と同じ式を共有する。
+        Command::Group {
+            action:
+                GroupCommand::Provision {
+                    group_id,
+                    node_ids,
+                    keyset_id,
+                    name,
+                    endpoint,
+                    epoch_key,
+                    rebind,
+                },
+        } => {
+            let gid = group_id.id();
+            let resolved_name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
+            Some(NativeOp::GroupProvision {
+                group_id: gid,
+                node_ids: node_ids.iter().map(NodeRef::id).collect(),
+                keyset_id: *keyset_id,
+                name: resolved_name,
+                endpoint: *endpoint,
+                epoch_key: epoch_key.clone(),
+                rebind: *rebind,
+            })
+        }
+        Command::Group {
+            action: GroupCommand::Grant { group_id, node_ids },
+        } => Some(NativeOp::GroupGrant {
+            group_id: group_id.id(),
+            node_ids: node_ids.iter().map(NodeRef::id).collect(),
+        }),
         // describe / diag thread / open-window（M8a Task8）: 値の符号化を
         // 伴わない読み取り専用 op なので、classify_strict と違い常に
         // Some/None（Err にはならない）。
@@ -401,6 +468,78 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                 }
             }
         }
+        // group invoke の汎用形（M8a Task9）: `classify` の GroupOnOff 専用
+        // ショートカット（onoff 引数なし on/off/toggle）に当たらなかった
+        // group invoke がここに落ちる —— 汎用 invoke と同じ規則（cluster/command
+        // 名前解決可 + 引数スカラー化可 → native、非スカラー引数は即
+        // parse_error、名前解決不能は None で chip-tool へ）。宛先エンドポイント
+        // が無い（group-scoped）以外は `Command::Invoke` と同型。
+        Command::Group {
+            action:
+                GroupCommand::Invoke {
+                    group_id,
+                    cluster,
+                    command: command_name,
+                    args,
+                    endpoint,
+                },
+        } => {
+            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
+            let cmd = mat_core::ids::resolve_command(cluster_id, command_name)?;
+            match cmd.def {
+                Some(def) => {
+                    if args.len() > def.fields.len() {
+                        return Some(Err(MatError::parse_error(format!(
+                            "group invoke {cluster}/{command_name}: too many arguments ({} > {})",
+                            args.len(),
+                            def.fields.len()
+                        ))));
+                    }
+                    let mut values = Vec::with_capacity(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        match mat_core::ids::parse_scalar_typed(arg, def.fields[i].ty) {
+                            Ok(v) => values.push(v),
+                            Err(msg) => {
+                                return Some(Err(MatError::parse_error(format!(
+                                    "group invoke {cluster}/{command_name} arg {i} ({}): {msg}",
+                                    def.fields[i].name
+                                ))));
+                            }
+                        }
+                    }
+                    let fields_tlv = if values.is_empty() {
+                        None
+                    } else {
+                        Some(encode_command_fields(&values))
+                    };
+                    Some(Ok(NativeOp::GroupInvokeGeneric {
+                        group_id: group_id.id(),
+                        cluster_in: cluster.clone(),
+                        command_in: command_name.clone(),
+                        cluster: cluster_id,
+                        command: cmd.id,
+                        fields_tlv,
+                        endpoint: *endpoint,
+                    }))
+                }
+                // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
+                // 対象外（chip-tool へ）。引数なしのみ native（fields_tlv=None）。
+                None => {
+                    if !args.is_empty() {
+                        return None;
+                    }
+                    Some(Ok(NativeOp::GroupInvokeGeneric {
+                        group_id: group_id.id(),
+                        cluster_in: cluster.clone(),
+                        command_in: command_name.clone(),
+                        cluster: cluster_id,
+                        command: cmd.id,
+                        fields_tlv: None,
+                        endpoint: *endpoint,
+                    }))
+                }
+            }
+        }
         _ => None,
     }
 }
@@ -482,7 +621,17 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
         | NativeOp::OpenWindow { node_id, .. } => Some(*node_id),
         NativeOp::GroupOnOff { .. }
         | NativeOp::GroupColor { .. }
-        | NativeOp::GroupColorTemp { .. } => None,
+        | NativeOp::GroupColorTemp { .. }
+        | NativeOp::GroupInvokeGeneric { .. } => None,
+        // provision / grant は複数ノード宛（`node_id: Option<u64>` に収まらない）
+        // ので、ここで別途 require_node する（chip-tool 経路の `provision`/
+        // `grant` と同じ「1つでも未 commission なら exit 11」）。
+        NativeOp::GroupProvision { node_ids, .. } | NativeOp::GroupGrant { node_ids, .. } => {
+            for &id in node_ids {
+                store.require_node(id)?;
+            }
+            None
+        }
     };
     if let Some(id) = node_id {
         store.require_node(id)?;
@@ -510,7 +659,7 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
                 return Ok(Executed::Fallback);
             }
         };
-        match run_op(&engine, op).await? {
+        match run_op(&engine, op, store.root()).await? {
             RunOutcome::Done => Ok(Executed::Done),
             RunOutcome::Fallback => Ok(Executed::Fallback),
         }
@@ -520,8 +669,10 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
 /// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。unicast 4 形は
 /// 常に `Done`。group 3 形は `engine.group` 未設定 / `GroupOutcome::Unavailable`
 /// のとき `Fallback` を返し、chip-tool 直へ譲る（matd の native_group_params
-/// と対の判定を CLI 直経路で再現）。
-async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> {
+/// と対の判定を CLI 直経路で再現）。`store_root` は `GroupProvision` がコントローラ側
+/// group state（chip-tool 経由、KVS 書込所有は M8c まで chip-tool）を実行するのに使う
+/// —— 他の op には無関係（未使用でも警告にならないよう Group* 系のみが読む）。
+async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<RunOutcome, MatError> {
     use mat_controller::im;
     match op {
         NativeOp::On { node_id, endpoint } => {
@@ -715,6 +866,93 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                     return Ok(RunOutcome::Fallback);
                 }
             }
+        }
+        NativeOp::GroupInvokeGeneric {
+            group_id,
+            cluster_in,
+            command_in,
+            cluster,
+            command,
+            fields_tlv,
+            endpoint,
+        } => {
+            let Some(ctx) = &engine.group else {
+                tracing::warn!("native group context not configured; falling back to chip-tool");
+                return Ok(RunOutcome::Fallback);
+            };
+            match mat_native::group::send(ctx, *group_id, *cluster, *command, fields_tlv.clone())
+                .await?
+            {
+                GroupOutcome::Sent => {
+                    crate::commands::group::emit_invoke_sent(
+                        *group_id, cluster_in, command_in, *endpoint,
+                    );
+                }
+                GroupOutcome::Unavailable(reason) => {
+                    tracing::warn!(
+                        group_id,
+                        reason,
+                        "native group send unavailable; falling back to chip-tool"
+                    );
+                    return Ok(RunOutcome::Fallback);
+                }
+            }
+        }
+        NativeOp::GroupProvision {
+            group_id,
+            node_ids,
+            keyset_id,
+            name,
+            endpoint,
+            epoch_key,
+            rebind,
+        } => {
+            // 1) コントローラ側 group state（chip-tool、KVS 書込所有は M8c まで
+            //    chip-tool 側 —— native 化しない）。デバイス側と同じ epoch key を
+            //    使う必要があるため、解決結果（hex 文字列）を受け取る。
+            let chip = crate::runner::ChipTool::new(store_root);
+            let epoch_key_hex = crate::commands::group::provision_controller_state(
+                &chip,
+                *group_id,
+                *keyset_id,
+                name,
+                epoch_key.as_deref(),
+                *rebind,
+            )?;
+            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
+
+            // 2) 各デバイスへ provision（native, unicast）。最初の失敗で停止
+            //    （chip-tool 経路と同じ fail-fast、部分結果を stdout に出さない）。
+            for &node_id in node_ids {
+                let mut conn = engine.establisher.establish(node_id).await?;
+                let p = mat_native::ops::ProvisionNodeParams {
+                    group_id: *group_id,
+                    keyset_id: *keyset_id,
+                    name: name.clone(),
+                    endpoint: *endpoint,
+                    epoch_key: epoch_key_bytes,
+                };
+                mat_native::ops::provision_node(&mut *conn, &p)
+                    .await
+                    .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            }
+
+            crate::commands::group::emit_provision_success(
+                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind,
+            );
+        }
+        NativeOp::GroupGrant { group_id, node_ids } => {
+            let mut updated: Vec<u64> = Vec::new();
+            let mut unchanged: Vec<u64> = Vec::new();
+            for &node_id in node_ids {
+                let mut conn = engine.establisher.establish(node_id).await?;
+                if mat_native::ops::ensure_group_acl(&mut *conn, *group_id).await? {
+                    updated.push(node_id);
+                } else {
+                    unchanged.push(node_id);
+                }
+            }
+            crate::commands::group::emit_grant_success(*group_id, node_ids, &updated, &unchanged);
         }
         NativeOp::ReadAttr {
             node_id,
@@ -932,9 +1170,12 @@ mod tests {
     }
 
     #[test]
-    fn group_onoff_no_args_is_native_but_generic_group_invoke_is_not() {
+    fn group_onoff_generic_provision_and_grant_are_all_native() {
+        // M8a Task9: provision/grant のデバイス側 + 汎用 group invoke も native
+        // 対象になった（旧テスト名 `..._is_not` は M7 当時の逆の期待だった —
+        // 実態に合わせて改名）。
         use crate::cli::GroupCommand;
-        use mat_core::alias::GroupRef;
+        use mat_core::alias::{GroupRef, NodeRef};
         let native = Command::Group {
             action: GroupCommand::Invoke {
                 group_id: GroupRef::Id(10),
@@ -948,7 +1189,9 @@ mod tests {
             classify(&native),
             Some(NativeOp::GroupOnOff { group_id: 10, .. })
         ));
-        // 引数付き / onoff 以外は chip-tool へ（matd と同じ counter 混在 warn 対象外の形）。
+        // 引数付き / onoff 以外の group invoke も、cluster/command 名前解決 +
+        // 引数スカラー化ができれば native 対象（M8a Task9、classify_strict の
+        // GroupInvokeGeneric 経由）。
         let generic = Command::Group {
             action: GroupCommand::Invoke {
                 group_id: GroupRef::Id(10),
@@ -958,15 +1201,49 @@ mod tests {
                 endpoint: 1,
             },
         };
-        assert!(classify(&generic).is_none());
-        // provision / grant は常に chip-tool 直。
+        assert!(matches!(
+            classify(&generic),
+            Some(NativeOp::GroupInvokeGeneric {
+                group_id: 10,
+                fields_tlv: Some(_),
+                ..
+            })
+        ));
+        // provision / grant のデバイス側ステップも native 対象（コントローラ側
+        // groupsettings は M8c まで chip-tool のまま — `run_op` 参照）。
         let grant = Command::Group {
             action: GroupCommand::Grant {
                 group_id: GroupRef::Id(10),
-                node_ids: vec![],
+                node_ids: vec![NodeRef::Id(5), NodeRef::Id(6)],
             },
         };
-        assert!(classify(&grant).is_none());
+        assert!(matches!(
+            classify(&grant),
+            Some(NativeOp::GroupGrant { group_id: 10, node_ids }) if node_ids == vec![5, 6]
+        ));
+        let provision = Command::Group {
+            action: GroupCommand::Provision {
+                group_id: GroupRef::Id(10),
+                node_ids: vec![NodeRef::Id(5)],
+                keyset_id: 60,
+                name: None,
+                endpoint: 1,
+                epoch_key: None,
+                rebind: false,
+            },
+        };
+        assert!(matches!(
+            classify(&provision),
+            Some(NativeOp::GroupProvision {
+                group_id: 10,
+                keyset_id: 60,
+                ref name,
+                endpoint: 1,
+                epoch_key: None,
+                rebind: false,
+                ..
+            }) if name == "grp10"
+        ));
     }
 
     #[test]
@@ -1025,6 +1302,7 @@ mod tests {
                 command: "toggle",
                 endpoint: 1,
             },
+            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1051,6 +1329,7 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
+            Path::new("/nonexistent-store"),
         )
         .await
         .expect_err("timeout must surface");
@@ -1068,6 +1347,7 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
+            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1241,6 +1521,7 @@ mod tests {
                 iteration: 1000,
                 discriminator: 3840,
             },
+            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
