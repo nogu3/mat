@@ -105,6 +105,92 @@ pub fn resolve_command(cluster: u32, input: &str) -> Option<CmdRef> {
     })
 }
 
+/// write / invoke 引数のスカラー値（mat-controller の ImValue と同形。
+/// mat-core は mat-controller に依存できないため別型で持ち、mat-native 側で写す）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarValue {
+    Bool(bool),
+    UInt(u64),
+    Int(i64),
+    Str(String),
+    Bytes(Vec<u8>),
+    Null,
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let h = s
+        .strip_prefix("hex:")
+        .ok_or("bytes value must use hex: prefix")?;
+    if h.len() % 2 != 0 {
+        return Err(format!("odd-length hex literal: {s:?}"));
+    }
+    (0..h.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| format!("invalid hex literal: {s:?}"))
+        })
+        .collect()
+}
+
+/// 型タグに従って CLI 入力文字列をスカラーへ。Err は人間可読の理由
+/// （そのまま parse_error detail に使える）。
+pub fn parse_scalar_typed(input: &str, ty: TypeTag) -> Result<ScalarValue, String> {
+    let s = input.trim();
+    if s == "null" {
+        return Ok(ScalarValue::Null); // nullable 属性の消去 write。
+    }
+    match ty {
+        TypeTag::Bool => match s {
+            "true" | "1" => Ok(ScalarValue::Bool(true)),
+            "false" | "0" => Ok(ScalarValue::Bool(false)),
+            _ => Err(format!("not a bool literal: {s:?}")),
+        },
+        TypeTag::UInt => parse_num(s)
+            .map(ScalarValue::UInt)
+            .ok_or(format!("not an unsigned integer: {s:?}")),
+        TypeTag::Int => s
+            .parse::<i64>()
+            .map(ScalarValue::Int)
+            .map_err(|_| format!("not an integer: {s:?}")),
+        TypeTag::Str => Ok(ScalarValue::Str(s.to_string())),
+        TypeTag::Bytes => parse_hex_bytes(s).map(ScalarValue::Bytes),
+        TypeTag::List => Err(
+            "this attribute is a list type; generic native write supports scalars only (M8a)"
+                .into(),
+        ),
+        TypeTag::Struct => Err(
+            "this attribute is a struct type; generic native write supports scalars only (M8a)"
+                .into(),
+        ),
+        TypeTag::Float => {
+            Err("float attributes are not supported by generic native write (M8a)".into())
+        }
+        TypeTag::Unknown => Err("attribute type unknown; cannot encode value".into()),
+    }
+}
+
+/// 数値 ID 直指定（def 無し）用: JSON リテラル風に型推定する。
+/// true/false→Bool, null→Null, 整数→UInt(負なら Int), "hex:AABB"→Bytes, その他→Str。
+pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
+    let s = input.trim();
+    match s {
+        "true" => return ScalarValue::Bool(true),
+        "false" => return ScalarValue::Bool(false),
+        "null" => return ScalarValue::Null,
+        _ => {}
+    }
+    if let Ok(b) = parse_hex_bytes(s) {
+        return ScalarValue::Bytes(b);
+    }
+    if let Some(u) = parse_num(s) {
+        return ScalarValue::UInt(u);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return ScalarValue::Int(i);
+    }
+    ScalarValue::Str(s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +291,50 @@ mod tests {
     fn numeric_ids_beyond_u32_are_rejected() {
         assert!(resolve_attribute(0x0006, "0x100000001").is_none());
         assert_eq!(resolve_cluster("0x100000001"), None);
+    }
+
+    #[test]
+    fn parse_scalar_typed_scalars() {
+        use ScalarValue as V;
+        assert_eq!(parse_scalar_typed("true", TypeTag::Bool), Ok(V::Bool(true)));
+        assert_eq!(parse_scalar_typed("0", TypeTag::Bool), Ok(V::Bool(false)));
+        assert_eq!(parse_scalar_typed("1", TypeTag::Bool), Ok(V::Bool(true)));
+        assert_eq!(parse_scalar_typed("128", TypeTag::UInt), Ok(V::UInt(128)));
+        assert_eq!(parse_scalar_typed("0x80", TypeTag::UInt), Ok(V::UInt(128)));
+        assert_eq!(parse_scalar_typed("-5", TypeTag::Int), Ok(V::Int(-5)));
+        assert_eq!(
+            parse_scalar_typed("hello", TypeTag::Str),
+            Ok(V::Str("hello".into()))
+        );
+        assert_eq!(
+            parse_scalar_typed("hex:d0d1", TypeTag::Bytes),
+            Ok(V::Bytes(vec![0xd0, 0xd1]))
+        );
+        assert_eq!(parse_scalar_typed("null", TypeTag::UInt), Ok(V::Null));
+    }
+
+    #[test]
+    fn parse_scalar_typed_rejects_unsupported_and_bad_literals() {
+        assert!(parse_scalar_typed("[]", TypeTag::List).is_err());
+        assert!(parse_scalar_typed("{}", TypeTag::Struct).is_err());
+        assert!(parse_scalar_typed("1.5", TypeTag::Float).is_err()); // float write は M8a 未対応
+        assert!(parse_scalar_typed("abc", TypeTag::UInt).is_err());
+        assert!(parse_scalar_typed("xyz", TypeTag::Bool).is_err());
+        assert!(parse_scalar_typed("hex:zz", TypeTag::Bytes).is_err());
+        assert!(parse_scalar_typed("1", TypeTag::Unknown).is_err());
+        // エラーメッセージは型名を含む（spec 受け入れ5: AI が判断できる detail）。
+        let e = parse_scalar_typed("[]", TypeTag::List).unwrap_err();
+        assert!(e.contains("list"), "{e}");
+    }
+
+    #[test]
+    fn parse_scalar_inferred_literals() {
+        use ScalarValue as V;
+        assert_eq!(parse_scalar_inferred("true"), V::Bool(true));
+        assert_eq!(parse_scalar_inferred("null"), V::Null);
+        assert_eq!(parse_scalar_inferred("42"), V::UInt(42));
+        assert_eq!(parse_scalar_inferred("-1"), V::Int(-1));
+        assert_eq!(parse_scalar_inferred("hex:00ff"), V::Bytes(vec![0, 0xff]));
+        assert_eq!(parse_scalar_inferred("foo"), V::Str("foo".into()));
     }
 }
