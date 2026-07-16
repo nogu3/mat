@@ -191,6 +191,87 @@ impl NativeBackend {
         .await
     }
 
+    /// 単一属性を任意形状で JSON 読み取る（汎用 read、M8a Task10）。
+    pub async fn read_json(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Result<serde_json::Value, MatError> {
+        self.with_session(node_id, move |c| c.read_json(endpoint, cluster, attribute))
+            .await
+    }
+
+    /// 単一属性へ 1 個の TLV 要素を書き込む（汎用 write、M8a Task10）。
+    pub async fn write_tlv(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        data_tlv: Vec<u8>,
+        timed: bool,
+    ) -> Result<(), MatError> {
+        self.with_session(node_id, move |c| {
+            c.write_tlv(endpoint, cluster, attribute, data_tlv.clone(), timed)
+        })
+        .await
+    }
+
+    /// 任意のクラスタコマンドを実行する（汎用 invoke、M8a Task10）。
+    pub async fn invoke_generic(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields: Option<Vec<u8>>,
+        timed: bool,
+    ) -> Result<(), MatError> {
+        self.with_session(node_id, move |c| {
+            c.invoke(endpoint, cluster, command, fields.clone(), timed)
+        })
+        .await
+    }
+
+    /// ノードを introspect する（`mat describe` 相当、M8a Task10）。
+    pub async fn describe(&self, node_id: u64) -> Result<Vec<(u16, Vec<u64>)>, MatError> {
+        self.with_session(node_id, |c| Box::pin(mat_native::ops::describe(c.as_mut())))
+            .await
+    }
+
+    /// group provision のデバイス側 4 ステップを 1 ノードへ実行する
+    /// （`mat group provision` のデバイス側相当、M8a Task10）。
+    ///
+    /// `p` は closure ごとに clone して `async move` ブロックへ渡す ——
+    /// `with_session` の `F: for<'a> Fn(...) -> Pin<Box<dyn Future + 'a>>` は
+    /// 戻り値の Future が `'a`（= 引数の conn の借用）以外の外部借用を持てない
+    /// （closure 環境への参照は self の匿名生存期間に縛られ 'a と無関係なため
+    /// コンパイルが通らない）。値を async ブロックへ move すれば Future 自身が
+    /// 所有するため 'a のみで閉じる。
+    pub async fn provision_node(
+        &self,
+        node_id: u64,
+        p: &mat_native::ops::ProvisionNodeParams,
+    ) -> Result<(), MatError> {
+        let p = p.clone();
+        self.with_session(node_id, move |c| {
+            let p = p.clone();
+            Box::pin(async move { mat_native::ops::provision_node(c.as_mut(), &p).await })
+        })
+        .await
+    }
+
+    /// ACL の read-merge-write（`mat group grant` の本体、M8a Task10）。
+    /// 戻り値: write した = true / 既に Group エントリがあり skip = false。
+    pub async fn ensure_group_acl(&self, node_id: u64, group_id: u16) -> Result<bool, MatError> {
+        self.with_session(node_id, move |c| {
+            Box::pin(mat_native::ops::ensure_group_acl(c.as_mut(), group_id))
+        })
+        .await
+    }
+
     /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
     /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
     /// （socket）だけを Err にする。

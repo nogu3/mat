@@ -191,6 +191,124 @@ pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
     ScalarValue::Str(s.to_string())
 }
 
+/// 汎用 write の分類結果（mat 直経路 `native_direct::classify_strict` の
+/// `Command::Write` 判定を移設・一本化 — M8a Task10）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteClass {
+    /// native で実行可能。`attribute` は数値 ID、`value` は型に沿って符号化済みの
+    /// スカラー。
+    Native {
+        attribute: u32,
+        value: ScalarValue,
+        timed: bool,
+    },
+    /// cluster/attribute 名は解決できたが値が符号化不能（list/struct/float 等）。
+    /// 呼び出し側は chip-tool へフォールバックせず即 parse_error を返すこと
+    /// （spec 決定: opt-in 下の意図した縮小）。
+    Reject(String),
+    /// cluster/attribute 名を解決できない（chip-tool へフォールバック）。
+    NotNative,
+}
+
+/// write op の分類: cluster/attribute 名を解決し、値を属性の型（数値直指定なら
+/// 推定型）でスカラー化する。挙動は移設元（`native_direct::classify_strict` の
+/// `Command::Write` 腕）と同一 — エラーメッセージ文言も維持。
+pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass {
+    let Some(cluster_id) = resolve_cluster(cluster) else {
+        return WriteClass::NotNative;
+    };
+    let Some(attr) = resolve_attribute(cluster_id, attribute) else {
+        return WriteClass::NotNative;
+    };
+    let timed = attr.def.map(|d| d.timed_write).unwrap_or(false);
+    let parsed = match attr.def {
+        Some(def) => parse_scalar_typed(value, def.ty),
+        None => Ok(parse_scalar_inferred(value)),
+    };
+    match parsed {
+        Ok(v) => WriteClass::Native {
+            attribute: attr.id,
+            value: v,
+            timed,
+        },
+        Err(msg) => WriteClass::Reject(format!("write {cluster}/{attribute}: {msg}")),
+    }
+}
+
+/// 汎用 invoke の分類結果（mat 直経路 `native_direct::classify_strict` の
+/// `Command::Invoke` / `GroupCommand::Invoke` 判定を移設・一本化 — M8a Task10。
+/// 単体 invoke と group invoke の判定ロジックはこれまで ~50 行重複していた
+/// — この型がその一本化の受け皿）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum InvokeClass {
+    /// native で実行可能。`command` は数値 ID、`fields` は引数を位置順に
+    /// スカラー化した列（呼び出し側が CommandFields TLV へ符号化する）。
+    Native {
+        command: u32,
+        fields: Vec<ScalarValue>,
+        timed: bool,
+    },
+    /// cluster/command 名は解決できたが引数が符号化不能（多すぎる/非スカラー型）。
+    /// 呼び出し側は chip-tool へフォールバックせず即 parse_error を返すこと。
+    Reject(String),
+    /// cluster/command 名を解決できない（chip-tool へフォールバック）。
+    NotNative,
+}
+
+/// invoke op の分類: cluster/command 名を解決し、引数をコマンド定義の field 型で
+/// 順にスカラー化する。数値 ID 直指定（def なし）は引数なしのみ native
+/// （引数ありは型不明のため非対象）。エラーメッセージ文言は移設元と同一
+/// （"invoke ..." プレフィックス — 旧 group invoke 経路の "group invoke ..."
+/// 文言とは統合により差異が生じるが、その文言を検査する既存テストは無い）。
+pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeClass {
+    let Some(cluster_id) = resolve_cluster(cluster) else {
+        return InvokeClass::NotNative;
+    };
+    let Some(cmd) = resolve_command(cluster_id, command) else {
+        return InvokeClass::NotNative;
+    };
+    match cmd.def {
+        Some(def) => {
+            if args.len() > def.fields.len() {
+                return InvokeClass::Reject(format!(
+                    "invoke {cluster}/{command}: too many arguments ({} > {})",
+                    args.len(),
+                    def.fields.len()
+                ));
+            }
+            let mut values = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                match parse_scalar_typed(arg, def.fields[i].ty) {
+                    Ok(v) => values.push(v),
+                    Err(msg) => {
+                        return InvokeClass::Reject(format!(
+                            "invoke {cluster}/{command} arg {i} ({}): {msg}",
+                            def.fields[i].name
+                        ));
+                    }
+                }
+            }
+            InvokeClass::Native {
+                command: cmd.id,
+                fields: values,
+                timed: def.timed,
+            }
+        }
+        // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
+        // 対象外（chip-tool へ）。引数なしのみ native。
+        None => {
+            if !args.is_empty() {
+                return InvokeClass::NotNative;
+            }
+            InvokeClass::Native {
+                command: cmd.id,
+                fields: Vec::new(),
+                timed: false,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +443,108 @@ mod tests {
         // エラーメッセージは型名を含む（spec 受け入れ5: AI が判断できる detail）。
         let e = parse_scalar_typed("[]", TypeTag::List).unwrap_err();
         assert!(e.contains("list"), "{e}");
+    }
+
+    #[test]
+    fn classify_write_native_for_known_scalar_attribute() {
+        let c = classify_write("levelcontrol", "on-level", "128");
+        assert_eq!(
+            c,
+            WriteClass::Native {
+                attribute: 0x0011,
+                value: ScalarValue::UInt(128),
+                timed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_write_not_native_for_unknown_names() {
+        assert_eq!(
+            classify_write("nosuchcluster", "x", "1"),
+            WriteClass::NotNative
+        );
+        assert_eq!(
+            classify_write("onoff", "nosuchattr", "1"),
+            WriteClass::NotNative
+        );
+    }
+
+    #[test]
+    fn classify_write_rejects_list_type_with_parse_error_message() {
+        let c = classify_write("accesscontrol", "acl", "[]");
+        match c {
+            WriteClass::Reject(msg) => {
+                assert!(msg.contains("list"), "{msg}");
+                assert!(msg.starts_with("write accesscontrol/acl:"), "{msg}");
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_invoke_native_for_known_command_with_scalar_args() {
+        let c = classify_invoke(
+            "levelcontrol",
+            "move-to-level",
+            &["128".into(), "0".into(), "0".into(), "0".into()],
+        );
+        assert_eq!(
+            c,
+            InvokeClass::Native {
+                command: 0x00,
+                fields: vec![
+                    ScalarValue::UInt(128),
+                    ScalarValue::UInt(0),
+                    ScalarValue::UInt(0),
+                    ScalarValue::UInt(0),
+                ],
+                timed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_invoke_not_native_for_unknown_names() {
+        assert_eq!(
+            classify_invoke("nosuchcluster", "x", &[]),
+            InvokeClass::NotNative
+        );
+        assert_eq!(
+            classify_invoke("onoff", "nosuchcmd", &[]),
+            InvokeClass::NotNative
+        );
+    }
+
+    #[test]
+    fn classify_invoke_rejects_too_many_or_non_scalar_args() {
+        // 引数過多。
+        let c = classify_invoke("onoff", "on", &["1".into()]);
+        match c {
+            InvokeClass::Reject(msg) => assert!(msg.contains("too many arguments"), "{msg}"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        // struct field を要求するコマンドへの引数。
+        let c = classify_invoke("groupkeymanagement", "key-set-write", &["{}".into()]);
+        assert!(matches!(c, InvokeClass::Reject(_)));
+    }
+
+    #[test]
+    fn classify_invoke_numeric_id_without_args_is_native() {
+        // 数値直指定（def なし）: 引数なしのみ native。
+        let c = classify_invoke("6", "1", &[]);
+        assert_eq!(
+            c,
+            InvokeClass::Native {
+                command: 1,
+                fields: vec![],
+                timed: false,
+            }
+        );
+        assert_eq!(
+            classify_invoke("6", "1", &["1".into()]),
+            InvokeClass::NotNative
+        );
     }
 
     #[test]

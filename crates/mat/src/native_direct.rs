@@ -369,111 +369,82 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                 attribute: attr.id,
             }))
         }
+        // 汎用 write（M8a Task7、M8a Task10 で classify_write へ一本化）:
+        // cluster/attribute 名の解決 + 値の型スカラー化は mat-core::ids に
+        // 集約されている（matd の native_op と判定を共有）。
         Command::Write {
             node_id,
             endpoint,
             cluster,
             attribute,
             value,
-        } => {
-            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
-            let attr = mat_core::ids::resolve_attribute(cluster_id, attribute)?;
-            let timed = attr.def.map(|d| d.timed_write).unwrap_or(false);
-            let parsed = match attr.def {
-                Some(def) => mat_core::ids::parse_scalar_typed(value, def.ty),
-                None => Ok(mat_core::ids::parse_scalar_inferred(value)),
-            };
-            let scalar = match parsed {
-                Ok(v) => v,
-                Err(msg) => {
-                    return Some(Err(MatError::parse_error(format!(
-                        "write {cluster}/{attribute}: {msg}"
-                    ))));
-                }
-            };
-            Some(Ok(NativeOp::WriteAttr {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
-                cluster_in: cluster.clone(),
-                attribute_in: attribute.clone(),
-                cluster: cluster_id,
-                attribute: attr.id,
-                value_in: value.clone(),
+        } => match mat_core::ids::classify_write(cluster, attribute, value) {
+            mat_core::ids::WriteClass::NotNative => None,
+            mat_core::ids::WriteClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::WriteClass::Native {
+                attribute: attr_id,
                 value: scalar,
                 timed,
-            }))
-        }
+            } => {
+                let cluster_id = mat_core::ids::resolve_cluster(cluster)
+                    .expect("classify_write already resolved this cluster name");
+                Some(Ok(NativeOp::WriteAttr {
+                    node_id: node_id.id(),
+                    endpoint: endpoint.id(),
+                    cluster_in: cluster.clone(),
+                    attribute_in: attribute.clone(),
+                    cluster: cluster_id,
+                    attribute: attr_id,
+                    value_in: value.clone(),
+                    value: scalar,
+                    timed,
+                }))
+            }
+        },
+        // 汎用 invoke（M8a Task7、M8a Task10 で classify_invoke へ一本化）:
+        // cluster/command 名の解決 + 引数の型スカラー化は mat-core::ids に
+        // 集約されている（matd の native_op と判定を共有）。
         Command::Invoke {
             node_id,
             endpoint,
             cluster,
             command: command_name,
             args,
-        } => {
-            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
-            let cmd = mat_core::ids::resolve_command(cluster_id, command_name)?;
-            match cmd.def {
-                Some(def) => {
-                    if args.len() > def.fields.len() {
-                        return Some(Err(MatError::parse_error(format!(
-                            "invoke {cluster}/{command_name}: too many arguments ({} > {})",
-                            args.len(),
-                            def.fields.len()
-                        ))));
-                    }
-                    let mut values = Vec::with_capacity(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        match mat_core::ids::parse_scalar_typed(arg, def.fields[i].ty) {
-                            Ok(v) => values.push(v),
-                            Err(msg) => {
-                                return Some(Err(MatError::parse_error(format!(
-                                    "invoke {cluster}/{command_name} arg {i} ({}): {msg}",
-                                    def.fields[i].name
-                                ))));
-                            }
-                        }
-                    }
-                    let fields_tlv = if values.is_empty() {
-                        None
-                    } else {
-                        Some(encode_command_fields(&values))
-                    };
-                    Some(Ok(NativeOp::InvokeGeneric {
-                        node_id: node_id.id(),
-                        endpoint: endpoint.id(),
-                        cluster_in: cluster.clone(),
-                        command_in: command_name.clone(),
-                        cluster: cluster_id,
-                        command: cmd.id,
-                        fields_tlv,
-                        timed: def.timed,
-                    }))
-                }
-                // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
-                // 対象外（chip-tool へ）。引数なしのみ native（fields_tlv=None）。
-                None => {
-                    if !args.is_empty() {
-                        return None;
-                    }
-                    Some(Ok(NativeOp::InvokeGeneric {
-                        node_id: node_id.id(),
-                        endpoint: endpoint.id(),
-                        cluster_in: cluster.clone(),
-                        command_in: command_name.clone(),
-                        cluster: cluster_id,
-                        command: cmd.id,
-                        fields_tlv: None,
-                        timed: false,
-                    }))
-                }
+        } => match mat_core::ids::classify_invoke(cluster, command_name, args) {
+            mat_core::ids::InvokeClass::NotNative => None,
+            mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::InvokeClass::Native {
+                command: cmd_id,
+                fields,
+                timed,
+            } => {
+                let cluster_id = mat_core::ids::resolve_cluster(cluster)
+                    .expect("classify_invoke already resolved this cluster name");
+                let fields_tlv = if fields.is_empty() {
+                    None
+                } else {
+                    Some(mat_native::encode_command_fields(&fields))
+                };
+                Some(Ok(NativeOp::InvokeGeneric {
+                    node_id: node_id.id(),
+                    endpoint: endpoint.id(),
+                    cluster_in: cluster.clone(),
+                    command_in: command_name.clone(),
+                    cluster: cluster_id,
+                    command: cmd_id,
+                    fields_tlv,
+                    timed,
+                }))
             }
-        }
-        // group invoke の汎用形（M8a Task9）: `classify` の GroupOnOff 専用
-        // ショートカット（onoff 引数なし on/off/toggle）に当たらなかった
-        // group invoke がここに落ちる —— 汎用 invoke と同じ規則（cluster/command
-        // 名前解決可 + 引数スカラー化可 → native、非スカラー引数は即
-        // parse_error、名前解決不能は None で chip-tool へ）。宛先エンドポイント
-        // が無い（group-scoped）以外は `Command::Invoke` と同型。
+        },
+        // group invoke の汎用形（M8a Task9、M8a Task10 で classify_invoke へ
+        // 一本化 — 単体 invoke と ~50 行重複していた判定ロジックの解消）:
+        // `classify` の GroupOnOff 専用ショートカット（onoff 引数なし
+        // on/off/toggle）に当たらなかった group invoke がここに落ちる。
+        // 宛先エンドポイントが無い（group-scoped）以外は `Command::Invoke` と
+        // 同型。エラーメッセージの "invoke ..." プレフィックスは一本化前の
+        // "group invoke ..." から差異が生じるが、その文言を検査する既存
+        // テストは無い（kind のみ検査）。
         Command::Group {
             action:
                 GroupCommand::Invoke {
@@ -483,86 +454,34 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                     args,
                     endpoint,
                 },
-        } => {
-            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
-            let cmd = mat_core::ids::resolve_command(cluster_id, command_name)?;
-            match cmd.def {
-                Some(def) => {
-                    if args.len() > def.fields.len() {
-                        return Some(Err(MatError::parse_error(format!(
-                            "group invoke {cluster}/{command_name}: too many arguments ({} > {})",
-                            args.len(),
-                            def.fields.len()
-                        ))));
-                    }
-                    let mut values = Vec::with_capacity(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        match mat_core::ids::parse_scalar_typed(arg, def.fields[i].ty) {
-                            Ok(v) => values.push(v),
-                            Err(msg) => {
-                                return Some(Err(MatError::parse_error(format!(
-                                    "group invoke {cluster}/{command_name} arg {i} ({}): {msg}",
-                                    def.fields[i].name
-                                ))));
-                            }
-                        }
-                    }
-                    let fields_tlv = if values.is_empty() {
-                        None
-                    } else {
-                        Some(encode_command_fields(&values))
-                    };
-                    Some(Ok(NativeOp::GroupInvokeGeneric {
-                        group_id: group_id.id(),
-                        cluster_in: cluster.clone(),
-                        command_in: command_name.clone(),
-                        cluster: cluster_id,
-                        command: cmd.id,
-                        fields_tlv,
-                        endpoint: *endpoint,
-                    }))
-                }
-                // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
-                // 対象外（chip-tool へ）。引数なしのみ native（fields_tlv=None）。
-                None => {
-                    if !args.is_empty() {
-                        return None;
-                    }
-                    Some(Ok(NativeOp::GroupInvokeGeneric {
-                        group_id: group_id.id(),
-                        cluster_in: cluster.clone(),
-                        command_in: command_name.clone(),
-                        cluster: cluster_id,
-                        command: cmd.id,
-                        fields_tlv: None,
-                        endpoint: *endpoint,
-                    }))
-                }
+        } => match mat_core::ids::classify_invoke(cluster, command_name, args) {
+            mat_core::ids::InvokeClass::NotNative => None,
+            mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::InvokeClass::Native {
+                command: cmd_id,
+                fields,
+                ..
+            } => {
+                let cluster_id = mat_core::ids::resolve_cluster(cluster)
+                    .expect("classify_invoke already resolved this cluster name");
+                let fields_tlv = if fields.is_empty() {
+                    None
+                } else {
+                    Some(mat_native::encode_command_fields(&fields))
+                };
+                Some(Ok(NativeOp::GroupInvokeGeneric {
+                    group_id: group_id.id(),
+                    cluster_in: cluster.clone(),
+                    command_in: command_name.clone(),
+                    cluster: cluster_id,
+                    command: cmd_id,
+                    fields_tlv,
+                    endpoint: *endpoint,
+                }))
             }
-        }
+        },
         _ => None,
     }
-}
-
-/// invoke のコマンド引数（スカラー値の列）を CommandFields TLV へ。context tag
-/// は引数添字（`CmdDef::fields` の添字と一致、ids.rs のコメント参照）。
-fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
-    use mat_controller::tlv::{Tag, Writer};
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    for (i, v) in args.iter().enumerate() {
-        let tag = Tag::Context(i as u8);
-        match v {
-            mat_core::ids::ScalarValue::Bool(b) => w.put_bool(tag, *b),
-            mat_core::ids::ScalarValue::UInt(u) => w.put_uint(tag, *u),
-            mat_core::ids::ScalarValue::Int(x) => w.put_int(tag, *x),
-            mat_core::ids::ScalarValue::Str(s) => w.put_str(tag, s),
-            mat_core::ids::ScalarValue::Bytes(b) => w.put_bytes(tag, b),
-            mat_core::ids::ScalarValue::Null => w.put_null(tag),
-        }
-    }
-    w.end_container();
-    w.finish()
 }
 
 enum Executed {
