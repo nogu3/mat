@@ -26,6 +26,10 @@ use crate::transport::{Transport, MAX_DATAGRAM};
 /// the device may be doing real work (e.g. actuating a relay) before replying.
 const IM_RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// チャンク読みの上限。実デバイスの wildcard read は数チャンクで収まる。
+/// 上限到達は「デバイスが more_chunks を返し続けている」異常で、打ち切って
+/// エラーにする（無限拘束の防止）。
+const MAX_REPORT_CHUNKS: usize = 64;
 /// MRP の全リトライを使い切るまでの待ち時間合計。reliable transport では
 /// 「同じ体感タイムアウト」で実応答を待つ予算として使う（`exchange.rs` の
 /// 同名関数と同じ計算——secure 経路にも同じゲーティングを対称に適用する）。
@@ -606,6 +610,11 @@ impl SecureSession {
                     let more = rd.more_chunks;
                     let suppress = rd.suppress_response;
                     msgs.push(rd);
+                    if msgs.len() > MAX_REPORT_CHUNKS {
+                        return Err(SessionError::Im(im::ImError::Malformed(
+                            "too many report chunks",
+                        )));
+                    }
                     if more {
                         // Chunk continuation: a StatusResponse(0) prompts
                         // the device to send the next chunk.
@@ -1812,6 +1821,93 @@ mod tests {
         assert!(matches!(
             err,
             SessionError::Im(crate::im::ImError::AttributeStatus(0x87))
+        ));
+        dev.await.unwrap();
+    }
+    /// デバイスが報告チャンク上限を超えて more_chunks を返し続ける場合、
+    /// `collect_reports` はエラーで打ち切る（無限拘束防止）。
+    #[tokio::test]
+    async fn read_cluster_json_aborts_on_endless_chunks() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        const ATTR: u32 = 0x0005;
+
+        let dev = tokio::spawn(async move {
+            // ReadRequest -> stream of ReportData chunks (all with MoreChunkedMessages=true)
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.protocol_id, crate::im::PROTOCOL_ID_IM);
+            assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+
+            // Send 70 chunks, each with more_chunks=true
+            for chunk_idx in 0..70 {
+                let resp = device_datagram(
+                    p.exchange_id,
+                    crate::im::PROTOCOL_ID_IM,
+                    crate::im::OPCODE_REPORT_DATA,
+                    if chunk_idx == 0 {
+                        Some(h.message_counter)
+                    } else {
+                        None
+                    },
+                    true,
+                    9999 + chunk_idx,
+                    &report_data_message_attr(
+                        1,
+                        crate::im::CLUSTER_ON_OFF,
+                        ATTR,
+                        chunk_idx as u64,
+                        true, // more_chunks = true for all chunks
+                        false,
+                    ),
+                );
+                device.send_to(&resp, from).await.unwrap();
+
+                // Drain standalone ack for needs_ack=true
+                let mut ack_buf = [0u8; MAX_DATAGRAM];
+                let ack_recv = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    device.recv_from(&mut ack_buf),
+                )
+                .await;
+                if ack_recv.is_err() {
+                    break; // controller already errored
+                }
+
+                // Wait for StatusResponse prompt (if not the last chunk)
+                let mut prompt_buf = [0u8; MAX_DATAGRAM];
+                let prompt_recv = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    device.recv_from(&mut prompt_buf),
+                )
+                .await;
+                if prompt_recv.is_err() {
+                    break; // controller stopped
+                }
+            }
+        });
+
+        let err = s
+            .read_cluster_json(1, crate::im::CLUSTER_ON_OFF, &fast_cfg())
+            .await
+            .unwrap_err();
+
+        // Should fail with "too many report chunks"
+        assert!(matches!(
+            err,
+            SessionError::Im(crate::im::ImError::Malformed("too many report chunks"))
         ));
         dev.await.unwrap();
     }
