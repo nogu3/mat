@@ -1293,6 +1293,23 @@ impl CommissioningFabric {
         })
     }
 
+    /// chip-tool KVS の自己発行資材から、**既存 fabric** 上で commissioning
+    /// するための CommissioningFabric を組む。`generate`（新規 fabric）と
+    /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は **epoch** 側 —
+    /// operational を渡すとデバイス側の KDF 導出が二重になり CASE が壊れる。
+    /// epoch は KVS に永続されない（chip-tool は既定定数を毎回投入）ため
+    /// 引数で受ける。呼び出し側は `fabric::verify_default_ipk_epoch` の
+    /// ガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡すこと。
+    pub fn from_materials(m: crate::kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self {
+        Self {
+            rcac_tlv: m.rcac,
+            root_private_key: m.root_private_key,
+            fabric_id: m.fabric_id,
+            ipk_epoch,
+            admin_node_id: m.node_id,
+        }
+    }
+
     /// controller 自身の CASE 用 credentials（NOC 自己発行を再利用）。
     ///
     /// AddNOC でデバイスに渡す IPK は **epoch** 側（`self.ipk_epoch`、
@@ -1734,5 +1751,21 @@ mod tests {
         let (status2, text2) = decode_network_config_response(&w2.finish()).unwrap();
         assert_eq!(status2, 5);
         assert_eq!(text2, None);
+    }
+
+    #[test]
+    fn commissioning_fabric_from_materials_maps_fields() {
+        let m = crate::kvs::SelfIssueMaterials {
+            rcac: vec![0x15, 0x01, 0x02],
+            root_private_key: [7u8; 32],
+            ipk_operational: [8u8; 16],
+            node_id: 0xAA55,
+            fabric_id: 0xFAB2,
+        };
+        let f = CommissioningFabric::from_materials(m, [9u8; 16]);
+        assert_eq!(f.rcac_tlv, vec![0x15, 0x01, 0x02]);
+        assert_eq!(f.fabric_id, 0xFAB2);
+        assert_eq!(f.ipk_epoch, [9u8; 16]);
+        assert_eq!(f.admin_node_id, 0xAA55);
     }
 }
