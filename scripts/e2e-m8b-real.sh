@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Phase 5 M8b 受け入れ: `mat discover` / `mat discover --probe` / `mat diag node
 # --deep` の mDNS プローブ（commissionable 探索・到達性判定）が MAT_IFACE 設定時
-# に chip-tool / avahi-browse を一切 spawn せず native browse（mat-controller
-# ::dnssd）だけで完走すること、出力 JSON スキーマが chip-tool 経路と一致する
-# こと、MAT_IFACE 未設定時のフォールバックが健全であることを jarvis 上で検証
-# する（本番 systemd matd, port 9100 には触れない — discover/diag は常に直経路
-# で matd 非対応 op のため、そもそも matd を経由しない）。
+# に chip-tool / avahi-browse を一切 spawn せず native（mat-controller::dnssd）
+# だけで完走すること、出力 JSON スキーマが chip-tool 経路と一致すること、
+# MAT_IFACE 未設定時のフォールバックが健全であることを jarvis 上で検証する
+# （本番 systemd matd, port 9100 には触れない — discover/diag は常に直経路で
+# matd 非対応 op のため、そもそも matd を経由しない）。commissionable 探索は
+# native browse のまま、probe（到達性判定）は台帳ノードごとの targeted resolve
+# 並行実行（実機の advertising proxy が一部ノードの PTR 列挙に応答しないため
+# — 2026-07-17 実機解析、詳細は crates/mat/src/probe.rs）。
 #
 # 骨格は scripts/e2e-m8a-real.sh を流用（trap 後始末 / stderr への PASS/FAIL /
 # 実ノード ID を環境変数で注入しハードコードしない / cross-build → ssh cat 転送
@@ -20,7 +23,7 @@
 # reachable:null（probe 内部で拾って None を返すだけでコマンド自体は失敗しない
 # ため）になるので、コマンドが成功し reachable:true が返ること自体が純 native
 # の証明になる（marker grep より強い）。加えて positive marker（`discover
-# executed (native browse)` / `probe executed (native browse)`、`MAT_LOG=info`
+# executed (native browse)` / `probe executed (native resolve)`、`MAT_LOG=info`
 # 必須 — info レベルなので既定の warn フィルタでは出ない）も grep する。
 #
 # 検証項目（brief 通し番号）:
@@ -156,7 +159,7 @@ run_chip() {
   ssh "$MAT_E2E_HOST" "${envs[@]}" /tmp/mat-m8b "$@" 2>"$LAST_STDERR_FILE"
 }
 
-# 検証5: 存在しない iface 名 → native browse が IO エラーで即 fallback。
+# 検証5: 存在しない iface 名 → native 実行（iface_index）が IO エラーで即 fallback。
 run_fallback() {
   local envs=(MAT_MATD=0 MAT_LOG=info MAT_IFACE=mat-e2e-bogus-iface)
   [ -n "$CHIP_TOOL_BIN" ] && envs+=("MAT_CHIP_TOOL_BIN=$CHIP_TOOL_BIN")
@@ -182,8 +185,8 @@ assert_no_fallback() {
   fi
 }
 
-# positive 実証: probe.rs::native / discover.rs::native_commissionables が
-# 成功時に出す "... executed (native browse)" を直接 grep する
+# positive 実証: probe.rs::resolve_ledger_nodes / discover.rs::native_commissionables
+# が成功時に出す "... executed (native browse/resolve)" を直接 grep する
 # （assert_no_fallback だけでは、warn ゼロのまま静かに fallback するような
 # 将来的な回帰を検出できないための二重チェック。M8a Task11 の教訓を踏襲）。
 # $1 = grep パターン, $2 = 説明（省略可）
@@ -200,7 +203,7 @@ NATIVE_OUT=$(run_native_full "${STORE_ARG[@]}" discover --probe)
 echo "$NATIVE_OUT"
 assert_no_fallback "discover --probe (native, 外部バイナリ無効化)"
 assert_native_marker "discover executed (native browse)" "discover --probe (native)"
-assert_native_marker "probe executed (native browse)" "discover --probe (native)"
+assert_native_marker "probe executed (native resolve)" "discover --probe (native)"
 
 for n in "${NODE_ARR[@]}"; do
   ENTRY=$(printf '%s' "$NATIVE_OUT" | jq -c --argjson n "$n" \
@@ -249,7 +252,7 @@ if grep -q "falling back to avahi-browse" "$LAST_STDERR_FILE"; then
   cat "$LAST_STDERR_FILE" >&2
   exit 1
 fi
-assert_native_marker "probe executed (native browse)" "diag node --deep (native mdns)"
+assert_native_marker "probe executed (native resolve)" "diag node --deep (native mdns)"
 
 ANY_FABRIC=$(printf '%s' "$DIAG_OUT" | jq -r '.checks.mdns.advertised_any_fabric')
 SELF_FABRIC=$(printf '%s' "$DIAG_OUT" | jq -r '.checks.mdns.advertised_self_fabric')

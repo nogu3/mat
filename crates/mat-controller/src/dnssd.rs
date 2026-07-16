@@ -9,10 +9,20 @@
 //! it arrives in the same responses but is not waited for — MRP falls back
 //! to the spec default interval without it.
 //!
-//! M8b adds one-shot browse (`browse_commissionable` / `browse_operational`):
-//! same legacy unicast transport, but enumerating PTR answers for a whole
-//! service type and folding SRV/TXT/AAAA per instance until a fixed window
-//! ([`BROWSE_WINDOW`]) expires — no early return, still no cache.
+//! M8b adds one-shot browse (`browse_commissionable`): same legacy unicast
+//! transport, but enumerating PTR answers for a whole service type and
+//! folding SRV/TXT/AAAA per instance until a fixed window ([`BROWSE_WINDOW`])
+//! expires — no early return, still no cache. Commissionable discovery is
+//! inherently enumeration (unknown targets), so browse stays there.
+//! Operational *reachability* (the mDNS probe) is NOT enumeration-based:
+//! real-mesh wire evidence (2026-07-17) showed advertising proxies simply
+//! not answering `_matter._tcp` PTR enumeration for some registered
+//! instances (even after known-answer suppression), while targeted resolve
+//! of those same instances (`resolve_operational`, the path CASE already
+//! uses) succeeds. So the probe now runs concurrent `resolve_operational`
+//! calls against the ledger's known (CompressedFabricId, NodeId) pairs
+//! instead of browsing `_matter._tcp` and matching results — see
+//! `crates/mat/src/probe.rs`. `browse_operational` was removed accordingly.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
@@ -781,21 +791,11 @@ pub struct CommissionableInstance {
     pub product_id: Option<u32>,
 }
 
-/// `_matter._tcp` で見つかった operational 1 台分。SRV/AAAA が期限内に揃わなく
-/// ても PTR が見えた instance は返す（announce のみ = addresses 空 — 到達性
-/// 判定側の「広告あり・アドレス未解決」セマンティクスを保存するため）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperationalInstance {
-    /// 16 桁大文字 hex。
-    pub compressed_fabric: String,
-    pub node_id: u64,
-    pub addresses: Vec<Ipv6Addr>,
-}
-
 /// finish() が返す、サービス種別に依存しない 1 instance 分の素材。
+/// instance の完全名は commissionable では不要（operational 側の label 解析
+/// —`parse_operational_label`— が M8b で撤去され、この構造体の唯一の消費者
+/// だった）ため持たない。
 struct FoldedInstance {
-    /// instance の完全名（先頭ラベルが instance 名）。
-    name: String,
     port: Option<u16>,
     target: Option<String>,
     txt: Vec<Vec<u8>>,
@@ -930,7 +930,7 @@ impl BrowseFold {
         let pool = self.aaaa;
         self.instances
             .into_iter()
-            .map(|(name, f)| {
+            .map(|(_name, f)| {
                 let (port, target) = match f.srv {
                     Some((p, t)) => (Some(p), Some(t)),
                     None => (None, None),
@@ -945,7 +945,6 @@ impl BrowseFold {
                     addresses.sort_by_key(is_link_local);
                 }
                 FoldedInstance {
-                    name,
                     port,
                     target,
                     txt: f.txt.unwrap_or_default(),
@@ -1019,19 +1018,6 @@ pub async fn browse_commissionable(
         .collect())
 }
 
-/// `_matter._tcp` の全 operational instance を列挙する（spec §4.3）。
-/// announce のみ（SRV/AAAA 未解決）の instance も addresses 空で含める。
-pub async fn browse_operational(
-    scope_id: u32,
-    window: Duration,
-) -> Result<Vec<OperationalInstance>, DnssdError> {
-    Ok(browse(scope_id, "_matter._tcp.local", window)
-        .await?
-        .iter()
-        .filter_map(operational_from_fold)
-        .collect())
-}
-
 /// TXT から文字列値（key は大文字小文字無視）を取り出す。
 fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
     for s in strings {
@@ -1061,21 +1047,6 @@ fn hostname_from_target(target: &str) -> String {
     target.strip_suffix(".local").unwrap_or(target).to_string()
 }
 
-/// instance 完全名の先頭ラベル `<CFID 16hex>-<NodeId 16hex>` をパースする。
-/// 形式外は None（他プロトコル / 他サービスの流れ弾）。
-fn parse_operational_label(name: &str) -> Option<(String, u64)> {
-    let label = name.split('.').next()?;
-    let (cfid, node) = label.split_once('-')?;
-    if cfid.len() != 16 || node.len() != 16 {
-        return None;
-    }
-    if !cfid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let node_id = u64::from_str_radix(node, 16).ok()?;
-    Some((cfid.to_ascii_uppercase(), node_id))
-}
-
 /// 畳み込んだ素材 → commissionable。素材ゼロ（PTR しか見えず SRV/TXT/AAAA が
 /// 期限内に揃わなかった）は None（chip-tool 経路の空エントリ skip と同じ扱い）。
 fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance> {
@@ -1099,16 +1070,6 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
         return None;
     }
     Some(c)
-}
-
-/// 畳み込んだ素材 → operational。announce のみ（addresses 空）でも返す。
-fn operational_from_fold(f: &FoldedInstance) -> Option<OperationalInstance> {
-    let (compressed_fabric, node_id) = parse_operational_label(&f.name)?;
-    Some(OperationalInstance {
-        compressed_fabric,
-        node_id,
-        addresses: f.addresses.clone(),
-    })
 }
 
 #[cfg(test)]
@@ -1609,7 +1570,6 @@ mod tests {
     }
 
     const MC: &str = "_matterc._udp.local";
-    const MO: &str = "_matter._tcp.local";
 
     #[test]
     fn browse_fold_collects_two_instances_from_bundled_responses() {
@@ -1747,7 +1707,6 @@ mod tests {
         let global: Ipv6Addr = "fd00::10".parse().unwrap();
         let ll: Ipv6Addr = "fe80::10".parse().unwrap();
         let f = FoldedInstance {
-            name: format!("INST1.{MC}"),
             port: Some(5540),
             target: Some("HOST01.local".to_string()),
             txt: vec![b"D=3840".to_vec(), b"VP=65521+32768".to_vec()],
@@ -1765,7 +1724,6 @@ mod tests {
     #[test]
     fn commissionable_from_fold_accepts_vendor_only_vp_and_skips_empty() {
         let f = FoldedInstance {
-            name: format!("INST1.{MC}"),
             port: None,
             target: None,
             txt: vec![b"VP=65521".to_vec()],
@@ -1776,47 +1734,12 @@ mod tests {
         assert_eq!(c.product_id, None);
         // 素材ゼロ（PTR しか見えなかった instance）は出さない。
         let empty = FoldedInstance {
-            name: format!("INST2.{MC}"),
             port: None,
             target: None,
             txt: vec![],
             addresses: vec![],
         };
         assert!(commissionable_from_fold(&empty).is_none());
-    }
-
-    #[test]
-    fn operational_from_fold_parses_label_and_keeps_announce_only() {
-        let f = FoldedInstance {
-            name: format!("00AABB1122CC3344-000000000000000B.{MO}"),
-            port: Some(5540),
-            target: None,
-            txt: vec![],
-            addresses: vec![],
-        };
-        let o = operational_from_fold(&f).unwrap();
-        assert_eq!(o.compressed_fabric, "00AABB1122CC3344");
-        assert_eq!(o.node_id, 0x0B);
-        assert!(o.addresses.is_empty()); // announce のみ → 空で返す（skip しない）
-    }
-
-    #[test]
-    fn operational_from_fold_rejects_malformed_labels() {
-        for bad in [
-            format!("shortname.{MO}"),
-            format!("GGGGBB1122CC3344-000000000000000B.{MO}"), // 非 hex
-            format!("00AABB1122CC3344.{MO}"),                  // '-' 無し
-            format!("00AABB1122CC3344-0B.{MO}"),               // 桁不足
-        ] {
-            let f = FoldedInstance {
-                name: bad,
-                port: None,
-                target: None,
-                txt: vec![],
-                addresses: vec![],
-            };
-            assert!(operational_from_fold(&f).is_none());
-        }
     }
 
     #[test]

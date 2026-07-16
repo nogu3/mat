@@ -1577,8 +1577,8 @@ fn discover_probe_with_missing_avahi_reports_reachable_null() {
 #[test]
 fn discover_probe_native_lo_falls_back_to_avahi() {
     // lo は IFF_MULTICAST 無し = ifindex 1 への multicast 送信はどの環境でも
-    // 失敗する（既知）→ native browse が IO エラー → warn + avahi フォール
-    // バックで従来どおりの結果になる。
+    // 失敗する（既知）→ native の targeted resolve が IO エラー → warn + avahi
+    // フォールバックで従来どおりの結果になる。
     let store = store_with_node5();
     mat(store.path())
         .env("MAT_IFACE", "lo")

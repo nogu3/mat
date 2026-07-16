@@ -1,27 +1,51 @@
-//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時は native browse
-//! （`mat-controller::dnssd`、M8b）、未設定・IO 失敗時は `avahi-browse` に
-//! フォールバック。プロセス起動（avahi）と socket I/O を伴うため副作用なしの
-//! `mat-core` ではなくバイナリ側に置く。`diag node --deep` と
-//! `discover --probe` が共有する。
+//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時は native の**台帳ノードごとの
+//! targeted resolve 並行実行**（`mat-controller::dnssd::resolve_operational`、
+//! M8b）、未設定・IO 失敗時は `avahi-browse` にフォールバック。
+//!
+//! M8b で列挙(browse)ベースから切り替えた: 実機の advertising proxy は一部の
+//! 登録済み instance（例: node 6/8/9）について `_matter._tcp` の PTR 列挙に
+//! 一切応答しない（KA suppression 後も、tcpdump で確認）一方、targeted な
+//! resolve（CASE が使うのと同じ経路）は同ノードに成功する（native read 実証
+//! 済み、2026-07-17）。probe は対象ノードの CFID/NodeId が既知なので、列挙で
+//! 発見する必要がなく、resolve を並行実行すれば十分。
+//!
+//! プロセス起動（avahi）と socket I/O を伴うため副作用なしの `mat-core` では
+//! なくバイナリ側に置く。`diag node --deep` と `discover --probe` が共有する。
 
 use std::ffi::OsString;
 use std::process::Command as StdCommand;
+use std::time::Duration;
 
+use mat_controller::{dnssd, fabric, kvs};
 use mat_core::diag::{parse_avahi_matter, MatterInstance};
 use mat_core::error::{ErrorKind, MatError};
 
-/// `_matter._tcp` インスタンスを列挙する。iface 指定時は native browse、
-/// IO 失敗は warn + avahi-browse フォールバック（read-only なので二重実行の
-/// 害なし）。結果 0 件は正常（フォールバックしない）。
-pub fn mdns(iface: Option<&str>) -> Result<Vec<MatterInstance>, MatError> {
-    if let Some(iface) = iface {
-        match native(iface) {
+/// native probe の入力。probe は CFID 計算のため KVS（読み取りのみ）を使う。
+pub struct NativeProbe<'a> {
+    pub iface: &'a str,
+    pub fabric_index: u8,
+    pub issuer_index: u8,
+    pub store_root: &'a std::path::Path,
+    /// 到達性を判定したい台帳ノード（diag は対象 1 ノードのみ）。
+    pub node_ids: &'a [u64],
+}
+
+/// 1 ノードあたりの resolve タイムアウト。全ノード並行実行のため、
+/// 台帳が何ノードあっても総所要時間はおよそこの値に収まる。
+const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `_matter._tcp` の到達性を判定する。iface 指定時は native の targeted
+/// resolve 並行実行、IO 失敗は warn + avahi-browse フォールバック（read-only
+/// なので二重実行の害なし）。結果 0 件は正常（フォールバックしない）。
+pub fn mdns(native: Option<NativeProbe<'_>>) -> Result<Vec<MatterInstance>, MatError> {
+    if let Some(p) = native {
+        match resolve_ledger_nodes(&p) {
             Ok(list) => return Ok(list),
             Err(e) => {
                 tracing::warn!(
-                    iface,
+                    iface = p.iface,
                     error = %e,
-                    "native mDNS browse failed; falling back to avahi-browse"
+                    "native mDNS probe failed; falling back to avahi-browse"
                 );
             }
         }
@@ -29,29 +53,90 @@ pub fn mdns(iface: Option<&str>) -> Result<Vec<MatterInstance>, MatError> {
     avahi()
 }
 
-/// native browse（M8b）。エラーは呼び出し側が avahi へフォールバックする。
-fn native(iface: &str) -> Result<Vec<MatterInstance>, Box<dyn std::error::Error>> {
-    let scope_id = mat_controller::dnssd::iface_index(iface)?;
+/// 台帳ノードそれぞれへ `resolve_operational` を並行実行する（M8b）。
+/// エラーは呼び出し側が avahi へフォールバックする。
+fn resolve_ledger_nodes(
+    p: &NativeProbe<'_>,
+) -> Result<Vec<MatterInstance>, Box<dyn std::error::Error>> {
+    let scope_id = dnssd::iface_index(p.iface)?;
+
+    let materials = kvs::read_self_issue_materials(
+        &p.store_root.join("chip_tool_config.alpha.ini"),
+        &p.store_root.join("chip_tool_config.ini"),
+        p.fabric_index,
+        p.issuer_index,
+    )?;
+    let creds = fabric::FabricCredentials::from_self_issued(materials)?;
+    let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+
+    if p.node_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let list = rt.block_on(mat_controller::dnssd::browse_operational(
-        scope_id,
-        mat_controller::dnssd::BROWSE_WINDOW,
-    ))?;
-    tracing::info!(instances = list.len(), "probe executed (native browse)");
-    Ok(list.into_iter().map(to_matter_instance).collect())
+    let results: Vec<(u64, Result<dnssd::ResolvedNode, dnssd::DnssdError>)> = rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for &node_id in p.node_ids {
+            set.spawn(async move {
+                let res =
+                    dnssd::resolve_operational(scope_id, &cfid, node_id, PROBE_RESOLVE_TIMEOUT)
+                        .await;
+                (node_id, res)
+            });
+        }
+        let mut out = Vec::with_capacity(p.node_ids.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(pair) => out.push(pair),
+                Err(e) => tracing::debug!(error = %e, "probe: resolve task join failed"),
+            }
+        }
+        out
+    });
+
+    // 全ノードが Io エラーだった場合のみフォールバックさせる（例: MAT_IFACE=lo
+    // では multicast send 自体が全ノードで失敗する）。混在時は成功分を返す
+    // （個々の Timeout/Malformed は「不達」として扱い、全滅ではない）。
+    let all_io_err = !results.is_empty()
+        && results
+            .iter()
+            .all(|(_, r)| matches!(r, Err(dnssd::DnssdError::Io(_))));
+    if all_io_err {
+        return Err("all ledger node resolves failed with an I/O error".into());
+    }
+
+    let cfid_hex = cfid_hex(&cfid);
+    let mut list = Vec::new();
+    for (node_id, res) in results {
+        match res {
+            Ok(node) => list.push(MatterInstance {
+                compressed_fabric: cfid_hex.clone(),
+                node_id,
+                addresses: node.addresses.iter().map(|a| a.to_string()).collect(),
+            }),
+            Err(dnssd::DnssdError::Timeout { .. }) => {
+                tracing::debug!(node_id, "probe: node did not resolve within the deadline");
+            }
+            Err(e) => {
+                tracing::debug!(node_id, error = %e, "probe: node resolve failed");
+            }
+        }
+    }
+
+    tracing::info!(
+        resolved = list.len(),
+        probed = p.node_ids.len(),
+        "probe executed (native resolve)"
+    );
+    Ok(list)
 }
 
-/// browse 結果 → 既存の診断データモデルへの写し。到達性判定
-/// （`mat_core::reachability::resolve`）と diag の self-fabric 照合は
-/// この型を経由するため無改変で動く。
-fn to_matter_instance(o: mat_controller::dnssd::OperationalInstance) -> MatterInstance {
-    MatterInstance {
-        compressed_fabric: o.compressed_fabric,
-        node_id: o.node_id,
-        addresses: o.addresses.iter().map(|a| a.to_string()).collect(),
-    }
+/// compressed fabric id → 16 桁大文字 hex（`MatterInstance::compressed_fabric`
+/// / diag の self-fabric 照合が期待する形）。
+fn cfid_hex(cfid: &[u8; 8]) -> String {
+    cfid.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// `avahi-browse -rt _matter._tcp` を実行して `_matter._tcp` インスタンスを得る。
@@ -84,14 +169,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_matter_instance_stringifies_addresses() {
-        let o = mat_controller::dnssd::OperationalInstance {
-            compressed_fabric: "00AABB1122CC3344".to_string(),
-            node_id: 5,
-            addresses: vec!["fd00::10".parse().unwrap()],
-        };
-        let m = to_matter_instance(o);
-        assert_eq!(m.node_id, 5);
-        assert_eq!(m.addresses, vec!["fd00::10".to_string()]);
+    fn cfid_hex_formats_16_uppercase_hex() {
+        let cfid: [u8; 8] = [0x00, 0xAA, 0xBB, 0x11, 0x22, 0xCC, 0x33, 0x44];
+        assert_eq!(cfid_hex(&cfid), "00AABB1122CC3344");
     }
 }
