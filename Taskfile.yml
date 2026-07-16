@@ -142,6 +142,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m7.sh
 
+  e2e:m8a:real:
+    desc: "M8a 実機 E2E: 汎用IM native直経路+matd+フォールバック健全性+型拒否 (要 MAT_E2E_HOST/IFACE/NODE/GROUP_NODES)"
+    cmds:
+      - bash scripts/e2e-m8a-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
