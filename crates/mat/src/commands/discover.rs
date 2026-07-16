@@ -22,7 +22,7 @@ use mat_core::parse::parse_commissionables;
 use mat_core::reachability::resolve;
 use mat_core::store::Store;
 
-pub fn run(store_path: &Path, probe: bool) -> Result<(), MatError> {
+pub fn run(store_path: &Path, probe: bool, iface: Option<&str>) -> Result<(), MatError> {
     // discover の commissionable 探索は認証情報不要。store 無しでも動くべきなので
     // open ではなく open_or_init（無ければ空ストアを bootstrap）。commissioned は
     // 台帳から読むが、空ストアなら空配列になるだけ。
@@ -49,7 +49,7 @@ pub fn run(store_path: &Path, probe: bool) -> Result<(), MatError> {
     // --probe: commissioned ノードのライブ到達性を判定するため mDNS を 1 回だけ
     // ブラウズする。None = 未実施 or 実施不能（後者は reachable:null）。
     let instances: Option<Vec<MatterInstance>> = if probe {
-        match crate::probe::mdns() {
+        match crate::probe::mdns(iface) {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(
