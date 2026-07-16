@@ -34,6 +34,15 @@
 # こと（group send counter 混在の実機知見 — 以後不達になり matd 再起動でしか
 # 回復しない）。unicast コマンドは併用してよい。
 #
+# 前提（2026-07-16 実機 E2E の知見）: 本番 matd（native 有効）が group counter の
+# flock を保持している間、one-shot native の group 送信は設計どおり chip-tool へ
+# フォールバックし検証 9 が FAIL する。**実行前に `sudo systemctl restart matd`
+# で flock を解放しておくこと**（matd は group op を受けるまで lazy なので
+# 再起動後に group 送信さえしなければ保持しない）。また E2E 中の chip-tool
+# spawn 群が g/gdc を進めるため、本番 matd の in-memory counter が窓の下に
+# 落ちて group 送信が silent drop になり得る — E2E 完了後にもう一度 matd を
+# 再起動すること（rebind 後の再読込も兼ねる）。
+#
 # 必須 env: MAT_E2E_HOST（ssh 先。repo は public のため既定値を置かない）
 #           MAT_E2E_IFACE（native warm session が使う Thread mesh iface 名）
 #           MAT_E2E_NODE（unicast 対象の commission 済み node_id。単一ノード。
