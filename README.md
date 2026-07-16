@@ -316,8 +316,8 @@ mat diag node --node 5 --deep     # also probe ping6 + mDNS (native if MAT_IFACE
 > results** (skipped/failed checks go under `unavailable`) and **always exits
 > `0`** with a verdict, even when the node is fully unreachable — the value is in
 > the classification, not an exit code. `--deep` shells out to `ping6` and,
-> unless `MAT_IFACE` is set (native browse, M8b), `avahi-browse` (override
-> with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
+> unless `MAT_IFACE` is set (native targeted mDNS resolve, M8b),
+> `avahi-browse` (override with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
 >
 > `mdns.advertised_self_fabric` is whether the node advertises on **our** fabric
 > specifically (vs. `advertised_any_fabric`, which is any fabric). It needs our
@@ -722,12 +722,16 @@ As of M8b, `MAT_IFACE` also governs two ops that are **not** part of the
 `matd` protocol at all and never route through `matd`: `discover`'s
 commissionable-device browse (native `browse_commissionable`, mapped into the
 same `DiscoveredDevice` JSON schema byte-for-byte) and the mDNS probe shared
-by `discover --probe` and `diag node --deep` (native `browse_operational`).
-Both fall back to their pre-M8b mechanism (`chip-tool` for discover,
-`avahi-browse` for the probe) only on an I/O error from the native browse —
-finding zero commissionable devices / operational instances is a normal
-result and never triggers a fallback. `commission` remains chip-tool-only
-until M8c.
+by `discover --probe` and `diag node --deep` (native **targeted
+`resolve_operational` per ledger node, run concurrently** — not an
+enumeration: real Thread meshes have advertising proxies that answer direct
+instance queries but omit instances from service-type PTR enumeration, so
+enumerate-and-match under-reports; `avahi-browse` only avoids this because
+its daemon holds a long-lived cache). Both fall back to their pre-M8b
+mechanism (`chip-tool` for discover, `avahi-browse` for the probe) only on
+an I/O error from the native path — zero commissionable devices / zero
+reachable nodes is a normal result and never triggers a fallback.
+`commission` remains chip-tool-only until M8c.
 
 ```bash
 mat --iface thread0 on --node 5
