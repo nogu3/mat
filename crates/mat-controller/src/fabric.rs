@@ -29,6 +29,30 @@ pub fn derive_ipk_operational(epoch_key: &[u8; 16], compressed_fabric_id: &[u8; 
     out
 }
 
+/// chip-tool（connectedhomeip）の既定 IPK **epoch** 鍵。
+///
+/// 上流 v1.4.2.0 `src/lib/support/TestGroupData.h`
+/// `DefaultIpkValue::GetDefaultIpk` の値 = ASCII "temporary ipk 01"。
+/// chip-tool は epoch を KVS に永続せず、commissioner 初期化のたびに
+/// この定数を投入して operational へ導出・永続する（`f/<idx>/k/0` ctx6）。
+/// よって chip-tool が作った fabric の epoch は常にこの値 — ただし盲信は
+/// せず、使用前に必ず [`verify_default_ipk_epoch`] で per-fabric 検証する。
+pub const CHIP_TOOL_DEFAULT_IPK_EPOCH: [u8; 16] = *b"temporary ipk 01";
+
+/// この fabric の epoch IPK が chip-tool 既定定数であることを、KVS の
+/// 導出済み operational との KDF 一致で検証する。一致 = AddNOC に
+/// [`CHIP_TOOL_DEFAULT_IPK_EPOCH`] を使ってよいことの数学的証明。
+/// 不一致（非 chip-tool fabric / IPK ローテーション済み）なら native
+/// commission は引き受けず chip-tool にフォールバックさせること。
+pub fn verify_default_ipk_epoch(
+    root_public_key: &[u8; 65],
+    fabric_id: u64,
+    ipk_operational: &[u8; 16],
+) -> bool {
+    let cfid = compressed_fabric_id(root_public_key, fabric_id);
+    derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid) == *ipk_operational
+}
+
 /// CASE destination identifier (spec §4.14.2.1.2). Fabric id / node id are
 /// little-endian here (unlike the big-endian salt above).
 pub fn case_destination_id(
@@ -349,5 +373,19 @@ mod tests {
             FabricCredentials::from_raw(raw),
             Err(FabricError::OpKeyMismatch)
         ));
+    }
+
+    #[test]
+    fn default_ipk_epoch_guard_accepts_derived_operational() {
+        // 定数 epoch から導出した operational を持つ fabric はガード通過。
+        let cfid = compressed_fabric_id(&ROOT_PUB, FABRIC_ID);
+        let operational = derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid);
+        assert!(verify_default_ipk_epoch(&ROOT_PUB, FABRIC_ID, &operational));
+    }
+
+    #[test]
+    fn default_ipk_epoch_guard_rejects_foreign_operational() {
+        // 定数由来でない operational（IPK ローテーション済み等）は拒否。
+        assert!(!verify_default_ipk_epoch(&ROOT_PUB, FABRIC_ID, &[0x42; 16]));
     }
 }
