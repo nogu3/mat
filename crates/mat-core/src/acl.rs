@@ -66,6 +66,14 @@ pub fn group_acl_entry(group_id: u16, fabric_index: u8) -> AclEntry {
 /// ので、弱いエントリの隣に強いエントリを足すのは正当な修復）。fabricIndex は
 /// 既存エントリの先頭から引き継ぐ（read 値をそのまま渡す方針。エントリ 0 件は
 /// 起きない想定だが、その場合は 0 — サーバ側で置換される）。
+///
+/// **前提**: `entries` は fabric-filtered read（IsFabricFiltered=true）で得た
+/// **自 fabric のみ**のエントリである前提（呼び出し元 `mat-native::ops::
+/// ensure_group_acl` が渡す read 結果は `mat-controller::im::
+/// encode_read_request` 経由で常にこれを満たす）。非フィルタの集合を渡すと、
+/// 他 fabric の Group エントリを「付与済み」と誤認して冪等 skip し、自 fabric
+/// に Group ACL が無いまま groupcast が届かなくなる（マルチ admin デバイス、
+/// 例えば jarvis fabric + Home Assistant fabric 併存で顕在化）。
 pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {
     let gid = u64::from(group_id);
     if entries.iter().any(|e| {
