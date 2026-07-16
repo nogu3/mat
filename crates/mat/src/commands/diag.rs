@@ -149,7 +149,13 @@ fn record_failure(
 }
 
 /// `mat diag node` — 到達不能の根本原因を層別チェックで分類する。
-pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Result<(), MatError> {
+pub fn node(
+    store_path: &Path,
+    node_id: u64,
+    endpoint: u16,
+    deep: bool,
+    iface: Option<&str>,
+) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     let rec = store.require_node(node_id)?;
     let address = rec.address.clone();
@@ -186,7 +192,14 @@ pub fn node(store_path: &Path, node_id: u64, endpoint: u16, deep: bool) -> Resul
     }
 
     if deep {
-        deep_probes(&mut checks, &mut unavailable, node_id, address, self_cfid);
+        deep_probes(
+            &mut checks,
+            &mut unavailable,
+            node_id,
+            address,
+            self_cfid,
+            iface,
+        );
     } else {
         unavailable.push(json!({ "check": "ip", "kind": "skipped_no_deep" }));
         unavailable.push(json!({ "check": "mdns", "kind": "skipped_no_deep" }));
@@ -248,6 +261,7 @@ fn deep_probes(
     node_id: u64,
     address: Option<String>,
     self_cfid: Option<String>,
+    iface: Option<&str>,
 ) {
     // ip: ping6
     match address.as_deref() {
@@ -268,8 +282,8 @@ fn deep_probes(
         None => unavailable.push(json!({ "check": "ip", "kind": "no_address_in_store" })),
     }
 
-    // mdns: avahi-browse
-    match crate::probe::mdns() {
+    // mdns: native browse（iface 指定時）または avahi-browse
+    match crate::probe::mdns(iface) {
         Ok(instances) => {
             // アドレスベースで照合（ストアの address が Some の場合）。
             // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。

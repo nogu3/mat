@@ -83,7 +83,9 @@ fn main() -> ExitCode {
     }
 
     let result = match &command {
-        Command::Discover { probe } => commands::discover::run(&store_path, *probe),
+        Command::Discover { probe } => {
+            commands::discover::run(&store_path, *probe, args.iface.as_deref())
+        }
         Command::Commission {
             target,
             setup_code,
@@ -258,7 +260,13 @@ fn main() -> ExitCode {
                 node_id,
                 endpoint,
                 deep,
-            } => commands::diag::node(&store_path, node_id.id(), endpoint.id(), *deep),
+            } => commands::diag::node(
+                &store_path,
+                node_id.id(),
+                endpoint.id(),
+                *deep,
+                args.iface.as_deref(),
+            ),
         },
     };
 
