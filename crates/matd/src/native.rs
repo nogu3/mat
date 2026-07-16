@@ -263,15 +263,6 @@ impl NativeBackend {
         .await
     }
 
-    /// ACL の read-merge-write（`mat group grant` の本体、M8a Task10）。
-    /// 戻り値: write した = true / 既に Group エントリがあり skip = false。
-    pub async fn ensure_group_acl(&self, node_id: u64, group_id: u16) -> Result<bool, MatError> {
-        self.with_session(node_id, move |c| {
-            Box::pin(mat_native::ops::ensure_group_acl(c.as_mut(), group_id))
-        })
-        .await
-    }
-
     /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
     /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
     /// （socket）だけを Err にする。
