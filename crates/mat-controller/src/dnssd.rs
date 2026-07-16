@@ -676,7 +676,6 @@ struct FoldedInstance {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct InstanceFold {
     srv: Option<(u16, String)>,
     txt: Option<Vec<Vec<u8>>>,
