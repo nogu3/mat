@@ -77,6 +77,7 @@ def parse_files(root_dir: str):
         sys.exit(f"no xml under {xml_dir}")
     enums, bitmaps, structs = set(), set(), set()
     cluster_elems = []
+    global_elems = []
     for f in files:
         tree = ET.parse(f)
         for e in tree.getroot().iter("enum"):
@@ -87,7 +88,33 @@ def parse_files(root_dir: str):
             structs.add(e.get("name", ""))
         for c in tree.getroot().iter("cluster"):
             cluster_elems.append(c)
-    return cluster_elems, enums, bitmaps, structs
+        for g in tree.getroot().iter("global"):
+            global_elems.append(g)
+    return cluster_elems, global_elems, enums, bitmaps, structs
+
+
+def parse_global_attrs(global_elems, enums, bitmaps, structs):
+    # global-attributes.xml: <configurator><global><attribute side="server" .../></global></configurator>.
+    # ClusterRevision(0xFFFD) / FeatureMap(0xFFFC) / AttributeList(0xFFFB) /
+    # AcceptedCommandList(0xFFF9) / GeneratedCommandList(0xFFF8) は全クラスタ共通で、
+    # <cluster> 側の attribute イテレーションには現れない。ここで一度だけ集める。
+    attrs = []
+    for g in global_elems:
+        for a in g.iter("attribute"):
+            if a.get("side", "server") != "server":
+                continue
+            an = attr_name(a)
+            acode = a.get("code")
+            if not an or acode is None:
+                continue
+            ty = a.get("type", "")
+            entry = a.get("entryType")
+            tag = "List" if (entry or ty.lower() == "array") \
+                else type_tag(ty, enums, bitmaps, structs)
+            attrs.append((kebab(an), int(acode, 0), tag,
+                          a.get("writable", "false") == "true",
+                          a.get("mustUseTimedWrite", "false") == "true"))
+    return attrs
 
 
 def attr_name(a) -> str:
@@ -103,7 +130,8 @@ def attr_name(a) -> str:
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    cluster_elems, enums, bitmaps, structs = parse_files(sys.argv[1])
+    cluster_elems, global_elems, enums, bitmaps, structs = parse_files(sys.argv[1])
+    global_attrs = parse_global_attrs(global_elems, enums, bitmaps, structs)
     clusters = {}
     for c in cluster_elems:
         name = c.findtext("name", "").strip()
@@ -143,7 +171,10 @@ def main():
         key = cluster_key(name)
         # 同一クラスタが複数ファイルに現れる場合は先勝ち（chip 配下は一意のはず）。
         if key not in clusters:
-            clusters[key] = (cid, sorted(set(attrs)), sorted({
+            # global ZCL 属性（FeatureMap 等）を全クラスタの attrs に合流。
+            # 0xFFF8-0xFFFD は予約域なのでクラスタ固有属性と ID が衝突することはない。
+            all_attrs = attrs + global_attrs
+            clusters[key] = (cid, sorted(set(all_attrs)), sorted({
                 (n, i, t, tuple(f)) for (n, i, t, f) in cmds}))
     emit(clusters)
 

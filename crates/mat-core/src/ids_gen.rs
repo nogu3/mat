@@ -6,11 +6,16 @@
 use super::ids::{AttrDef, ClusterDef, CmdDef, FieldDef, TypeTag};
 
 static ATTRS_ACCESSCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "access-control-entries-per-fabric", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "acl", id: 0x0000, ty: TypeTag::List, writable: true, timed_write: false },
     AttrDef { name: "arl", id: 0x0006, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "commissioning-arl", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "extension", id: 0x0001, ty: TypeTag::List, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "subjects-per-access-control-entry", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "targets-per-access-control-entry", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
@@ -18,6 +23,11 @@ static CMDS_ACCESSCONTROL: &[CmdDef] = &[
     CmdDef { name: "review-fabric-restrictions", id: 0x00, timed: false, fields: &[FieldDef { name: "arl", ty: TypeTag::List, optional: false }] },
 ];
 static ATTRS_ACCOUNTLOGIN: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_ACCOUNTLOGIN: &[CmdDef] = &[
     CmdDef { name: "get-setup-pin", id: 0x00, timed: true, fields: &[FieldDef { name: "temp-account-identifier", ty: TypeTag::Str, optional: false }] },
@@ -25,8 +35,13 @@ static CMDS_ACCOUNTLOGIN: &[CmdDef] = &[
     CmdDef { name: "logout", id: 0x03, timed: true, fields: &[FieldDef { name: "node", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_ACTIONS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "action-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "endpoint-lists", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "setup-url", id: 0x0002, ty: TypeTag::Str, writable: false, timed_write: false },
 ];
 static CMDS_ACTIONS: &[CmdDef] = &[
@@ -44,9 +59,14 @@ static CMDS_ACTIONS: &[CmdDef] = &[
     CmdDef { name: "stop-action", id: 0x04, timed: false, fields: &[FieldDef { name: "action-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "invoke-id", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_ACTIVATEDCARBONFILTERMONITORING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "change-indication", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "condition", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "degradation-direction", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "in-place-indicator", id: 0x0003, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "last-changed-time", id: 0x0004, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "replacement-product-list", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
@@ -55,8 +75,13 @@ static CMDS_ACTIVATEDCARBONFILTERMONITORING: &[CmdDef] = &[
     CmdDef { name: "reset-condition", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_ADMINISTRATORCOMMISSIONING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "admin-fabric-index", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "admin-vendor-id", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "window-status", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_ADMINISTRATORCOMMISSIONING: &[CmdDef] = &[
@@ -65,15 +90,25 @@ static CMDS_ADMINISTRATORCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "revoke-commissioning", id: 0x02, timed: true, fields: &[] },
 ];
 static ATTRS_AIRQUALITY: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "air-quality", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_AIRQUALITY: &[CmdDef] = &[
 ];
 static ATTRS_APPLICATIONBASIC: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "allowed-vendor-list", id: 0x0007, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "application", id: 0x0004, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "application-name", id: 0x0002, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "application-version", id: 0x0006, ty: TypeTag::Str, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "product-id", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "status", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "vendor-id", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -82,8 +117,13 @@ static ATTRS_APPLICATIONBASIC: &[AttrDef] = &[
 static CMDS_APPLICATIONBASIC: &[CmdDef] = &[
 ];
 static ATTRS_APPLICATIONLAUNCHER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "catalog-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-app", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_APPLICATIONLAUNCHER: &[CmdDef] = &[
     CmdDef { name: "hide-app", id: 0x02, timed: false, fields: &[FieldDef { name: "application", ty: TypeTag::Struct, optional: true }] },
@@ -91,7 +131,12 @@ static CMDS_APPLICATIONLAUNCHER: &[CmdDef] = &[
     CmdDef { name: "stop-app", id: 0x01, timed: false, fields: &[FieldDef { name: "application", ty: TypeTag::Struct, optional: true }] },
 ];
 static ATTRS_AUDIOOUTPUT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-output", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "output-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_AUDIOOUTPUT: &[CmdDef] = &[
@@ -99,8 +144,13 @@ static CMDS_AUDIOOUTPUT: &[CmdDef] = &[
     CmdDef { name: "select-output", id: 0x00, timed: false, fields: &[FieldDef { name: "index", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_BALLASTCONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "ballast-factor-adjustment", id: 0x0015, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "ballast-status", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "intrinsic-ballast-factor", id: 0x0014, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "lamp-alarm-mode", id: 0x0034, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "lamp-burn-hours", id: 0x0033, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -117,9 +167,14 @@ static ATTRS_BALLASTCONFIGURATION: &[AttrDef] = &[
 static CMDS_BALLASTCONFIGURATION: &[CmdDef] = &[
 ];
 static ATTRS_BASICINFORMATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "capability-minima", id: 0x0013, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "configuration-version", id: 0x0018, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "data-model-revision", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hardware-version", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "hardware-version-string", id: 0x0008, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "local-config-disabled", id: 0x0010, ty: TypeTag::Bool, writable: true, timed_write: false },
@@ -145,22 +200,37 @@ static ATTRS_BASICINFORMATION: &[AttrDef] = &[
 static CMDS_BASICINFORMATION: &[CmdDef] = &[
 ];
 static ATTRS_BINDING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "binding", id: 0x0000, ty: TypeTag::List, writable: true, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_BINDING: &[CmdDef] = &[
 ];
 static ATTRS_BOOLEANSTATE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "state-value", id: 0x0000, ty: TypeTag::Bool, writable: false, timed_write: false },
 ];
 static CMDS_BOOLEANSTATE: &[CmdDef] = &[
 ];
 static ATTRS_BOOLEANSTATECONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "alarms-active", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "alarms-enabled", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "alarms-supported", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "alarms-suppressed", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-sensitivity-level", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "default-sensitivity-level", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "sensor-fault", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "supported-sensitivity-levels", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
@@ -169,7 +239,12 @@ static CMDS_BOOLEANSTATECONFIGURATION: &[CmdDef] = &[
     CmdDef { name: "suppress-alarm", id: 0x00, timed: false, fields: &[FieldDef { name: "alarms-to-suppress", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_BRIDGEDDEVICEBASICINFORMATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "configuration-version", id: 0x0018, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hardware-version", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "hardware-version-string", id: 0x0008, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "manufacturing-date", id: 0x000b, ty: TypeTag::Str, writable: false, timed_write: false },
@@ -192,7 +267,12 @@ static CMDS_BRIDGEDDEVICEBASICINFORMATION: &[CmdDef] = &[
     CmdDef { name: "keep-active", id: 0x80, timed: false, fields: &[FieldDef { name: "stay-active-duration", ty: TypeTag::UInt, optional: false }, FieldDef { name: "timeout-ms", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "dptz-streams", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-presets", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "mptz-position", id: 0x0000, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "mptz-presets", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
@@ -212,10 +292,15 @@ static CMDS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "mptz-set-position", id: 0x00, timed: false, fields: &[FieldDef { name: "pan", ty: TypeTag::Int, optional: true }, FieldDef { name: "tilt", ty: TypeTag::Int, optional: true }, FieldDef { name: "zoom", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_CAMERAAVSTREAMMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "allocated-audio-streams", id: 0x0010, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "allocated-snapshot-streams", id: 0x0011, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "allocated-video-streams", id: 0x000f, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-frame-rate", id: 0x000c, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hard-privacy-mode-on", id: 0x0015, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "hdr-mode-enabled", id: 0x000d, ty: TypeTag::Bool, writable: true, timed_write: false },
     AttrDef { name: "image-flip-horizontal", id: 0x0023, ty: TypeTag::Bool, writable: true, timed_write: false },
@@ -267,8 +352,13 @@ static CMDS_CAMERAAVSTREAMMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "video-stream-modify", id: 0x05, timed: false, fields: &[FieldDef { name: "video-stream-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "watermark-enabled", ty: TypeTag::Bool, optional: true }, FieldDef { name: "osd-enabled", ty: TypeTag::Bool, optional: true }] },
 ];
 static ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -282,8 +372,13 @@ static ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -297,8 +392,13 @@ static ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_CHANNEL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "channel-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-channel", id: 0x0002, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "lineup", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
 ];
 static CMDS_CHANNEL: &[CmdDef] = &[
@@ -310,7 +410,12 @@ static CMDS_CHANNEL: &[CmdDef] = &[
     CmdDef { name: "skip-channel", id: 0x03, timed: false, fields: &[FieldDef { name: "count", ty: TypeTag::Int, optional: false }] },
 ];
 static ATTRS_CHIME: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "enabled", id: 0x0002, ty: TypeTag::Bool, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "installed-chime-sounds", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "selected-chime", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
 ];
@@ -318,8 +423,13 @@ static CMDS_CHIME: &[CmdDef] = &[
     CmdDef { name: "play-chime-sound", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_CLOSURECONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "countdown-time", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-error-list", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "latch-control-modes", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "main-state", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "overall-current-state", id: 0x0003, ty: TypeTag::Struct, writable: false, timed_write: false },
@@ -331,7 +441,12 @@ static CMDS_CLOSURECONTROL: &[CmdDef] = &[
     CmdDef { name: "stop", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_CLOSUREDIMENSION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-state", id: 0x0000, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "limit-range", id: 0x0006, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "modulation-type", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "overflow", id: 0x0009, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -348,6 +463,9 @@ static CMDS_CLOSUREDIMENSION: &[CmdDef] = &[
     CmdDef { name: "step", id: 0x01, timed: false, fields: &[FieldDef { name: "direction", ty: TypeTag::UInt, optional: false }, FieldDef { name: "number-of-steps", ty: TypeTag::UInt, optional: false }, FieldDef { name: "speed", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_COLORCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "color-mode", id: 0x0008, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "color-point-b-intensity", id: 0x003c, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "color-point-bx", id: 0x003a, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -366,6 +484,8 @@ static ATTRS_COLORCONTROL: &[AttrDef] = &[
     AttrDef { name: "current-x", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-y", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "drift-compensation", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "number-of-primaries", id: 0x0010, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "options", id: 0x000f, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "primary1-intensity", id: 0x0013, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -405,6 +525,11 @@ static CMDS_COLORCONTROL: &[CmdDef] = &[
     CmdDef { name: "step-saturation", id: 0x05, timed: false, fields: &[FieldDef { name: "step-mode", ty: TypeTag::UInt, optional: false }, FieldDef { name: "step-size", ty: TypeTag::UInt, optional: false }, FieldDef { name: "transition-time", ty: TypeTag::UInt, optional: false }, FieldDef { name: "options-mask", ty: TypeTag::UInt, optional: false }, FieldDef { name: "options-override", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_COMMISSIONERCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-device-categories", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_COMMISSIONERCONTROL: &[CmdDef] = &[
@@ -412,6 +537,11 @@ static CMDS_COMMISSIONERCONTROL: &[CmdDef] = &[
     CmdDef { name: "request-commissioning-approval", id: 0x00, timed: false, fields: &[FieldDef { name: "request-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "vendor-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "product-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "label", ty: TypeTag::Str, optional: true }] },
 ];
 static ATTRS_COMMODITYMETERING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "measurement-type", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "metered-quantity", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "metered-quantity-timestamp", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -419,8 +549,13 @@ static ATTRS_COMMODITYMETERING: &[AttrDef] = &[
 static CMDS_COMMODITYMETERING: &[CmdDef] = &[
 ];
 static ATTRS_COMMODITYPRICE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "currency", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "current-price", id: 0x0002, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "price-forecast", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "tariff-unit", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
@@ -429,7 +564,10 @@ static CMDS_COMMODITYPRICE: &[CmdDef] = &[
     CmdDef { name: "get-detailed-price-request", id: 0x00, timed: false, fields: &[FieldDef { name: "details", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_COMMODITYTARIFF: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "calendar-periods", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-day", id: 0x0007, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "current-day-entry", id: 0x0009, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "current-day-entry-date", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -438,6 +576,8 @@ static ATTRS_COMMODITYTARIFF: &[AttrDef] = &[
     AttrDef { name: "day-patterns", id: 0x0004, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "default-randomization-offset", id: 0x0011, ty: TypeTag::Int, writable: false, timed_write: false },
     AttrDef { name: "default-randomization-type", id: 0x0012, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "individual-days", id: 0x0006, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "next-day", id: 0x0008, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "next-day-entry", id: 0x000b, ty: TypeTag::Struct, writable: false, timed_write: false },
@@ -454,13 +594,23 @@ static CMDS_COMMODITYTARIFF: &[CmdDef] = &[
     CmdDef { name: "get-tariff-component", id: 0x00, timed: false, fields: &[FieldDef { name: "tariff-component-id", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_CONTENTAPPOBSERVER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_CONTENTAPPOBSERVER: &[CmdDef] = &[
     CmdDef { name: "content-app-message", id: 0x00, timed: false, fields: &[FieldDef { name: "data", ty: TypeTag::Str, optional: true }, FieldDef { name: "encoding-hint", ty: TypeTag::Str, optional: false }] },
 ];
 static ATTRS_CONTENTCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "block-unrated", id: 0x0007, ty: TypeTag::Bool, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "enabled", id: 0x0000, ty: TypeTag::Bool, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "on-demand-rating-threshold", id: 0x0002, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "on-demand-ratings", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "remaining-screen-time", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -482,6 +632,11 @@ static CMDS_CONTENTCONTROL: &[CmdDef] = &[
 ];
 static ATTRS_CONTENTLAUNCHER: &[AttrDef] = &[
     AttrDef { name: "accept-header", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-streaming-protocols", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_CONTENTLAUNCHER: &[CmdDef] = &[
@@ -489,9 +644,14 @@ static CMDS_CONTENTLAUNCHER: &[CmdDef] = &[
     CmdDef { name: "launch-url", id: 0x01, timed: false, fields: &[FieldDef { name: "content-url", ty: TypeTag::Str, optional: false }, FieldDef { name: "display-string", ty: TypeTag::Str, optional: true }, FieldDef { name: "branding-information", ty: TypeTag::Struct, optional: true }] },
 ];
 static ATTRS_DESCRIPTOR: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "client-list", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "device-type-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "endpoint-unique-id", id: 0x0005, ty: TypeTag::Str, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "parts-list", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "server-list", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "tag-list", id: 0x0004, ty: TypeTag::List, writable: false, timed_write: false },
@@ -501,10 +661,15 @@ static CMDS_DESCRIPTOR: &[CmdDef] = &[
 static ATTRS_DEVICEENERGYMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "abs-max-power", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "abs-min-power", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "esa-can-generate", id: 0x0001, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "esa-state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "esa-type", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "forecast", id: 0x0006, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "opt-out-state", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "power-adjustment-capability", id: 0x0005, ty: TypeTag::Struct, writable: false, timed_write: false },
 ];
@@ -519,18 +684,33 @@ static CMDS_DEVICEENERGYMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "start-time-adjust-request", id: 0x02, timed: false, fields: &[FieldDef { name: "requested-start-time", ty: TypeTag::UInt, optional: false }, FieldDef { name: "cause", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_DEVICEENERGYMANAGEMENTMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_DEVICEENERGYMANAGEMENTMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_DIAGNOSTICLOGS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_DIAGNOSTICLOGS: &[CmdDef] = &[
     CmdDef { name: "retrieve-logs-request", id: 0x00, timed: false, fields: &[FieldDef { name: "intent", ty: TypeTag::UInt, optional: false }, FieldDef { name: "requested-protocol", ty: TypeTag::UInt, optional: false }, FieldDef { name: "transfer-file-designator", ty: TypeTag::Str, optional: true }] },
 ];
 static ATTRS_DISHWASHERALARM: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "latch", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "mask", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -541,13 +721,19 @@ static CMDS_DISHWASHERALARM: &[CmdDef] = &[
     CmdDef { name: "reset", id: 0x00, timed: false, fields: &[FieldDef { name: "alarms", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_DISHWASHERMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_DISHWASHERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_DOORLOCK: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "actuator-enabled", id: 0x0002, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "aliro-ble-advertising-version", id: 0x0086, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "aliro-expedited-transaction-supported-protocol-versions", id: 0x0083, ty: TypeTag::List, writable: false, timed_write: false },
@@ -556,7 +742,9 @@ static ATTRS_DOORLOCK: &[AttrDef] = &[
     AttrDef { name: "aliro-reader-group-sub-identifier", id: 0x0082, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "aliro-reader-verification-key", id: 0x0080, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "aliro-supported-bleuwb-protocol-versions", id: 0x0085, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "auto-relock-time", id: 0x0023, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "credential-rules-support", id: 0x001b, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "default-configuration-register", id: 0x0027, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "door-closed-events", id: 0x0005, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -567,6 +755,8 @@ static ATTRS_DOORLOCK: &[AttrDef] = &[
     AttrDef { name: "enable-one-touch-locking", id: 0x0029, ty: TypeTag::Bool, writable: true, timed_write: false },
     AttrDef { name: "enable-privacy-mode-button", id: 0x002b, ty: TypeTag::Bool, writable: true, timed_write: false },
     AttrDef { name: "expiring-user-timeout", id: 0x0035, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "language", id: 0x0021, ty: TypeTag::Str, writable: true, timed_write: false },
     AttrDef { name: "led-settings", id: 0x0022, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "local-programming-features", id: 0x002c, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -618,35 +808,55 @@ static CMDS_DOORLOCK: &[CmdDef] = &[
     CmdDef { name: "unlock-with-timeout", id: 0x03, timed: true, fields: &[FieldDef { name: "timeout", ty: TypeTag::UInt, optional: false }, FieldDef { name: "pin-code", ty: TypeTag::Bytes, optional: true }] },
 ];
 static ATTRS_ECOSYSTEMINFORMATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "device-directory", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "location-directory", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_ECOSYSTEMINFORMATION: &[CmdDef] = &[
 ];
 static ATTRS_ELECTRICALENERGYMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "accuracy", id: 0x0000, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "cumulative-energy-exported", id: 0x0002, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "cumulative-energy-imported", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "cumulative-energy-reset", id: 0x0005, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "periodic-energy-exported", id: 0x0004, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "periodic-energy-imported", id: 0x0003, ty: TypeTag::Struct, writable: false, timed_write: false },
 ];
 static CMDS_ELECTRICALENERGYMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_ELECTRICALGRIDCONDITIONS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-conditions", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "forecast-conditions", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "local-generation-available", id: 0x0000, ty: TypeTag::Bool, writable: true, timed_write: false },
 ];
 static CMDS_ELECTRICALGRIDCONDITIONS: &[CmdDef] = &[
 ];
 static ATTRS_ELECTRICALPOWERMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "accuracy", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-current", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "active-power", id: 0x0008, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "apparent-current", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "apparent-power", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "frequency", id: 0x000e, ty: TypeTag::Int, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "harmonic-currents", id: 0x000f, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "harmonic-phases", id: 0x0010, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "neutral-current", id: 0x0012, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -664,12 +874,17 @@ static ATTRS_ELECTRICALPOWERMEASUREMENT: &[AttrDef] = &[
 static CMDS_ELECTRICALPOWERMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_ENERGYEVSE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "approximate-ev-efficiency", id: 0x0027, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "battery-capacity", id: 0x0031, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "charging-enabled-until", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "circuit-capacity", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "discharging-enabled-until", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "fault-state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "maximum-charge-current", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "maximum-discharge-current", id: 0x0008, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "minimum-charge-current", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -698,25 +913,40 @@ static CMDS_ENERGYEVSE: &[CmdDef] = &[
     CmdDef { name: "start-diagnostics", id: 0x04, timed: true, fields: &[] },
 ];
 static ATTRS_ENERGYEVSEMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_ENERGYEVSEMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_ENERGYPREFERENCE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-energy-balance", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "current-low-power-mode-sensitivity", id: 0x0004, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "energy-balances", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "energy-priorities", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "low-power-mode-sensitivities", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_ENERGYPREFERENCE: &[CmdDef] = &[
 ];
 static ATTRS_ETHERNETNETWORKDIAGNOSTICS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "carrier-detect", id: 0x0007, ty: TypeTag::Bool, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "collision-count", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "full-duplex", id: 0x0001, ty: TypeTag::Bool, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "overrun-count", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "packet-rx-count", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "packet-tx-count", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -728,9 +958,14 @@ static CMDS_ETHERNETNETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_FANCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "airflow-direction", id: 0x000b, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "fan-mode", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "fan-mode-sequence", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "percent-current", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "percent-setting", id: 0x0002, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "rock-setting", id: 0x0008, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -745,17 +980,32 @@ static CMDS_FANCONTROL: &[CmdDef] = &[
     CmdDef { name: "step", id: 0x00, timed: false, fields: &[FieldDef { name: "direction", ty: TypeTag::UInt, optional: false }, FieldDef { name: "wrap", ty: TypeTag::Bool, optional: true }, FieldDef { name: "lowest-off", ty: TypeTag::Bool, optional: true }] },
 ];
 static ATTRS_FAULTINJECTION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_FAULTINJECTION: &[CmdDef] = &[
     CmdDef { name: "fail-at-fault", id: 0x00, timed: false, fields: &[FieldDef { name: "type", ty: TypeTag::UInt, optional: false }, FieldDef { name: "id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "num-calls-to-skip", ty: TypeTag::UInt, optional: false }, FieldDef { name: "num-calls-to-fail", ty: TypeTag::UInt, optional: false }, FieldDef { name: "take-mutex", ty: TypeTag::Bool, optional: false }] },
     CmdDef { name: "fail-randomly-at-fault", id: 0x01, timed: false, fields: &[FieldDef { name: "type", ty: TypeTag::UInt, optional: false }, FieldDef { name: "id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "percentage", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_FIXEDLABEL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "label-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_FIXEDLABEL: &[CmdDef] = &[
 ];
 static ATTRS_FLOWMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-measured-value", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -764,8 +1014,13 @@ static ATTRS_FLOWMEASUREMENT: &[AttrDef] = &[
 static CMDS_FLOWMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -779,8 +1034,13 @@ static ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_GENERALCOMMISSIONING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "basic-commissioning-info", id: 0x0001, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "breadcrumb", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "location-capability", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "network-recovery-reason", id: 0x000b, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "recovery-identifier", id: 0x000a, ty: TypeTag::Bytes, writable: false, timed_write: false },
@@ -799,10 +1059,15 @@ static CMDS_GENERALCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "set-tc-acknowledgements", id: 0x06, timed: false, fields: &[FieldDef { name: "tc-version", ty: TypeTag::UInt, optional: false }, FieldDef { name: "tc-user-response", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_GENERALDIAGNOSTICS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-hardware-faults", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-network-faults", id: 0x0007, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-radio-faults", id: 0x0006, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "boot-reason", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "network-interfaces", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "reboot-count", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "test-event-triggers-enabled", id: 0x0008, ty: TypeTag::Bool, writable: false, timed_write: false },
@@ -815,6 +1080,11 @@ static CMDS_GENERALDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "time-snapshot", id: 0x01, timed: false, fields: &[] },
 ];
 static ATTRS_GROUPKEYMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "group-key-map", id: 0x0000, ty: TypeTag::List, writable: true, timed_write: false },
     AttrDef { name: "group-table", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-group-keys-per-fabric", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -827,6 +1097,11 @@ static CMDS_GROUPKEYMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "key-set-write", id: 0x00, timed: false, fields: &[FieldDef { name: "group-key-set", ty: TypeTag::Struct, optional: false }] },
 ];
 static ATTRS_GROUPS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "name-support", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_GROUPS: &[CmdDef] = &[
@@ -838,9 +1113,14 @@ static CMDS_GROUPS: &[CmdDef] = &[
     CmdDef { name: "view-group", id: 0x01, timed: false, fields: &[FieldDef { name: "group-id", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_HEPAFILTERMONITORING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "change-indication", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "condition", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "degradation-direction", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "in-place-indicator", id: 0x0003, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "last-changed-time", id: 0x0004, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "replacement-product-list", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
@@ -849,9 +1129,14 @@ static CMDS_HEPAFILTERMONITORING: &[CmdDef] = &[
     CmdDef { name: "reset-condition", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_ICDMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-mode-duration", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "active-mode-threshold", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "clients-supported-per-fabric", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "icd-counter", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "idle-mode-duration", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "maximum-check-in-back-off", id: 0x0009, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -866,6 +1151,11 @@ static CMDS_ICDMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "unregister-client", id: 0x02, timed: false, fields: &[FieldDef { name: "check-in-node-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "verification-key", ty: TypeTag::Bytes, optional: true }] },
 ];
 static ATTRS_IDENTIFY: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "identify-time", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "identify-type", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
@@ -874,6 +1164,11 @@ static CMDS_IDENTIFY: &[CmdDef] = &[
     CmdDef { name: "trigger-effect", id: 0x40, timed: false, fields: &[FieldDef { name: "effect-identifier", ty: TypeTag::UInt, optional: false }, FieldDef { name: "effect-variant", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_ILLUMINANCEMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "light-sensor-type", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -883,7 +1178,12 @@ static ATTRS_ILLUMINANCEMEASUREMENT: &[AttrDef] = &[
 static CMDS_ILLUMINANCEMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_JOINTFABRICADMINISTRATOR: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "administrator-fabric-index", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_JOINTFABRICADMINISTRATOR: &[CmdDef] = &[
     CmdDef { name: "add-icac", id: 0x02, timed: false, fields: &[FieldDef { name: "icac-value", ty: TypeTag::Bytes, optional: false }] },
@@ -894,13 +1194,18 @@ static CMDS_JOINTFABRICADMINISTRATOR: &[CmdDef] = &[
     CmdDef { name: "transfer-anchor-request", id: 0x05, timed: false, fields: &[] },
 ];
 static ATTRS_JOINTFABRICDATASTORE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "admin-list", id: 0x0007, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "anchor-node-id", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "anchor-root-ca", id: 0x0000, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "anchor-vendor-id", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "endpoint-binding-list", id: 0x000a, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "endpoint-group-id-list", id: 0x0009, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "friendly-name", id: 0x0003, ty: TypeTag::Str, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "group-key-set-list", id: 0x0004, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "group-list", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "node-acl-list", id: 0x000c, ty: TypeTag::List, writable: false, timed_write: false },
@@ -932,17 +1237,32 @@ static CMDS_JOINTFABRICDATASTORE: &[CmdDef] = &[
     CmdDef { name: "update-node", id: 0x0b, timed: false, fields: &[FieldDef { name: "node-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "friendly-name", ty: TypeTag::Str, optional: false }] },
 ];
 static ATTRS_KEYPADINPUT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_KEYPADINPUT: &[CmdDef] = &[
     CmdDef { name: "send-key", id: 0x00, timed: false, fields: &[FieldDef { name: "key-code", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_LAUNDRYDRYERCONTROLS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "selected-dryness-level", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "supported-dryness-levels", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_LAUNDRYDRYERCONTROLS: &[CmdDef] = &[
 ];
 static ATTRS_LAUNDRYWASHERCONTROLS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "number-of-rinses", id: 0x0002, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "spin-speed-current", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "spin-speeds", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
@@ -951,16 +1271,26 @@ static ATTRS_LAUNDRYWASHERCONTROLS: &[AttrDef] = &[
 static CMDS_LAUNDRYWASHERCONTROLS: &[CmdDef] = &[
 ];
 static ATTRS_LAUNDRYWASHERMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_LAUNDRYWASHERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_LEVELCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-frequency", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-level", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "default-move-rate", id: 0x0014, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-frequency", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-level", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-frequency", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -985,18 +1315,33 @@ static CMDS_LEVELCONTROL: &[CmdDef] = &[
     CmdDef { name: "stop-with-on-off", id: 0x07, timed: false, fields: &[FieldDef { name: "options-mask", ty: TypeTag::UInt, optional: false }, FieldDef { name: "options-override", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_LOCALIZATIONCONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-locale", id: 0x0000, ty: TypeTag::Str, writable: true, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-locales", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_LOCALIZATIONCONFIGURATION: &[CmdDef] = &[
 ];
 static ATTRS_LOWPOWER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_LOWPOWER: &[CmdDef] = &[
     CmdDef { name: "sleep", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_MEDIAINPUT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-input", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "input-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_MEDIAINPUT: &[CmdDef] = &[
@@ -1006,12 +1351,17 @@ static CMDS_MEDIAINPUT: &[CmdDef] = &[
     CmdDef { name: "show-input-status", id: 0x01, timed: false, fields: &[] },
 ];
 static ATTRS_MEDIAPLAYBACK: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-audio-track", id: 0x0007, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "active-text-track", id: 0x0009, ty: TypeTag::Struct, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "available-audio-tracks", id: 0x0008, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "available-text-tracks", id: 0x000a, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-state", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "duration", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "playback-speed", id: 0x0004, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "sampled-position", id: 0x0003, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "seek-range-end", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1035,7 +1385,12 @@ static CMDS_MEDIAPLAYBACK: &[CmdDef] = &[
     CmdDef { name: "stop", id: 0x02, timed: false, fields: &[] },
 ];
 static ATTRS_MESSAGES: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-message-i-ds", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "messages", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_MESSAGES: &[CmdDef] = &[
@@ -1043,6 +1398,11 @@ static CMDS_MESSAGES: &[CmdDef] = &[
     CmdDef { name: "present-messages-request", id: 0x00, timed: false, fields: &[FieldDef { name: "message-id", ty: TypeTag::Bytes, optional: false }, FieldDef { name: "priority", ty: TypeTag::UInt, optional: false }, FieldDef { name: "message-control", ty: TypeTag::UInt, optional: false }, FieldDef { name: "start-time", ty: TypeTag::UInt, optional: false }, FieldDef { name: "duration", ty: TypeTag::UInt, optional: false }, FieldDef { name: "message-text", ty: TypeTag::Str, optional: false }, FieldDef { name: "responses", ty: TypeTag::List, optional: true }] },
 ];
 static ATTRS_METERIDENTIFICATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "meter-serial-number", id: 0x0002, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "meter-type", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "point-of-delivery", id: 0x0001, ty: TypeTag::Str, writable: false, timed_write: false },
@@ -1052,7 +1412,12 @@ static ATTRS_METERIDENTIFICATION: &[AttrDef] = &[
 static CMDS_METERIDENTIFICATION: &[CmdDef] = &[
 ];
 static ATTRS_MICROWAVEOVENCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "cook-time", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-cook-time", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-power", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-power", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1067,14 +1432,24 @@ static CMDS_MICROWAVEOVENCONTROL: &[CmdDef] = &[
     CmdDef { name: "set-cooking-parameters", id: 0x00, timed: false, fields: &[FieldDef { name: "cook-mode", ty: TypeTag::UInt, optional: true }, FieldDef { name: "cook-time", ty: TypeTag::UInt, optional: true }, FieldDef { name: "power-setting", ty: TypeTag::UInt, optional: true }, FieldDef { name: "watt-setting-index", ty: TypeTag::UInt, optional: true }, FieldDef { name: "start-after-setting", ty: TypeTag::Bool, optional: true }] },
 ];
 static ATTRS_MICROWAVEOVENMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_MICROWAVEOVENMODE: &[CmdDef] = &[
 ];
 static ATTRS_MODESELECT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "description", id: 0x0000, ty: TypeTag::Str, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "on-mode", id: 0x0005, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "standard-namespace", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "start-up-mode", id: 0x0004, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -1084,7 +1459,12 @@ static CMDS_MODESELECT: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_NETWORKCOMMISSIONING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "connect-max-time-seconds", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "interface-enabled", id: 0x0004, ty: TypeTag::Bool, writable: true, timed_write: false },
     AttrDef { name: "last-connect-error-value", id: 0x0007, ty: TypeTag::Int, writable: false, timed_write: false },
     AttrDef { name: "last-network-id", id: 0x0006, ty: TypeTag::Bytes, writable: false, timed_write: false },
@@ -1106,8 +1486,13 @@ static CMDS_NETWORKCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "scan-networks", id: 0x00, timed: false, fields: &[FieldDef { name: "ssid", ty: TypeTag::Bytes, optional: true }, FieldDef { name: "breadcrumb", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1121,6 +1506,11 @@ static ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_OCCUPANCYSENSING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hold-time", id: 0x0003, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "hold-time-limits", id: 0x0004, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "occupancy", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1139,6 +1529,11 @@ static ATTRS_OCCUPANCYSENSING: &[AttrDef] = &[
 static CMDS_OCCUPANCYSENSING: &[CmdDef] = &[
 ];
 static ATTRS_ONOFF: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "global-scene-control", id: 0x4000, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "off-wait-time", id: 0x4002, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "on-off", id: 0x0000, ty: TypeTag::Bool, writable: false, timed_write: false },
@@ -1154,9 +1549,14 @@ static CMDS_ONOFF: &[CmdDef] = &[
     CmdDef { name: "toggle", id: 0x02, timed: false, fields: &[] },
 ];
 static ATTRS_OPERATIONALCREDENTIALS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "commissioned-fabrics", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-fabric-index", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "fabrics", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "no-cs", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-fabrics", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "trusted-root-certificates", id: 0x0004, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1174,8 +1574,13 @@ static CMDS_OPERATIONALCREDENTIALS: &[CmdDef] = &[
     CmdDef { name: "update-noc", id: 0x07, timed: false, fields: &[FieldDef { name: "noc-value", ty: TypeTag::Bytes, optional: false }, FieldDef { name: "icac-value", ty: TypeTag::Bytes, optional: true }] },
 ];
 static ATTRS_OPERATIONALSTATE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "countdown-time", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-phase", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "operational-error", id: 0x0005, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "operational-state", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "operational-state-list", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1188,6 +1593,11 @@ static CMDS_OPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "stop", id: 0x01, timed: false, fields: &[] },
 ];
 static ATTRS_OTASOFTWAREUPDATEPROVIDER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_OTASOFTWAREUPDATEPROVIDER: &[CmdDef] = &[
     CmdDef { name: "apply-update-request", id: 0x02, timed: false, fields: &[FieldDef { name: "update-token", ty: TypeTag::Bytes, optional: false }, FieldDef { name: "new-version", ty: TypeTag::UInt, optional: false }] },
@@ -1195,7 +1605,12 @@ static CMDS_OTASOFTWAREUPDATEPROVIDER: &[CmdDef] = &[
     CmdDef { name: "query-image", id: 0x00, timed: false, fields: &[FieldDef { name: "vendor-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "product-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "software-version", ty: TypeTag::UInt, optional: false }, FieldDef { name: "protocols-supported", ty: TypeTag::List, optional: false }, FieldDef { name: "hardware-version", ty: TypeTag::UInt, optional: true }, FieldDef { name: "location", ty: TypeTag::Str, optional: true }, FieldDef { name: "requestor-can-consent", ty: TypeTag::Bool, optional: true }, FieldDef { name: "metadata-for-provider", ty: TypeTag::Bytes, optional: true }] },
 ];
 static ATTRS_OTASOFTWAREUPDATEREQUESTOR: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "default-ota-providers", id: 0x0000, ty: TypeTag::List, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "update-possible", id: 0x0001, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "update-state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "update-state-progress", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1204,8 +1619,13 @@ static CMDS_OTASOFTWAREUPDATEREQUESTOR: &[CmdDef] = &[
     CmdDef { name: "announce-ota-provider", id: 0x00, timed: false, fields: &[FieldDef { name: "provider-node-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "vendor-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "announcement-reason", ty: TypeTag::UInt, optional: false }, FieldDef { name: "metadata-for-node", ty: TypeTag::Bytes, optional: true }, FieldDef { name: "endpoint", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_OVENCAVITYOPERATIONALSTATE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "countdown-time", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-phase", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "operational-error", id: 0x0005, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "operational-state", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "operational-state-list", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1216,15 +1636,25 @@ static CMDS_OVENCAVITYOPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "stop", id: 0x01, timed: false, fields: &[] },
 ];
 static ATTRS_OVENMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_OVENMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_OZONECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1238,8 +1668,13 @@ static ATTRS_OZONECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_OZONECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_PM10CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1253,8 +1688,13 @@ static ATTRS_PM10CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_PM10CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_PM1CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1268,8 +1708,13 @@ static ATTRS_PM1CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_PM1CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_PM25CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1283,9 +1728,11 @@ static ATTRS_PM25CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_PM25CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_POWERSOURCE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-bat-charge-faults", id: 0x001e, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-bat-faults", id: 0x0012, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-wired-faults", id: 0x000a, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "bat-ansi-designation", id: 0x0015, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "bat-approved-chemistry", id: 0x0017, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "bat-capacity", id: 0x0018, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1304,8 +1751,11 @@ static ATTRS_POWERSOURCE: &[AttrDef] = &[
     AttrDef { name: "bat-time-remaining", id: 0x000d, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "bat-time-to-full-charge", id: 0x001b, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "bat-voltage", id: 0x000b, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "description", id: 0x0002, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "endpoint-list", id: 0x001f, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "order", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "status", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "wired-assessed-current", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1319,17 +1769,32 @@ static ATTRS_POWERSOURCE: &[AttrDef] = &[
 static CMDS_POWERSOURCE: &[CmdDef] = &[
 ];
 static ATTRS_POWERSOURCECONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "sources", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_POWERSOURCECONFIGURATION: &[CmdDef] = &[
 ];
 static ATTRS_POWERTOPOLOGY: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-endpoints", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "available-endpoints", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_POWERTOPOLOGY: &[CmdDef] = &[
 ];
 static ATTRS_PRESSUREMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Int, writable: false, timed_write: false },
     AttrDef { name: "max-scaled-value", id: 0x0012, ty: TypeTag::Int, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Int, writable: false, timed_write: false },
@@ -1343,26 +1808,51 @@ static ATTRS_PRESSUREMEASUREMENT: &[AttrDef] = &[
 static CMDS_PRESSUREMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_PROXYCONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_PROXYCONFIGURATION: &[CmdDef] = &[
 ];
 static ATTRS_PROXYDISCOVERY: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_PROXYDISCOVERY: &[CmdDef] = &[
 ];
 static ATTRS_PROXYVALID: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_PROXYVALID: &[CmdDef] = &[
 ];
 static ATTRS_PULSEWIDTHMODULATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_PULSEWIDTHMODULATION: &[CmdDef] = &[
 ];
 static ATTRS_PUMPCONFIGURATIONANDCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "capacity", id: 0x0013, ty: TypeTag::Int, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "control-mode", id: 0x0021, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "effective-control-mode", id: 0x0012, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "effective-operation-mode", id: 0x0011, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "lifetime-energy-consumed", id: 0x0017, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "lifetime-running-hours", id: 0x0015, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "max-comp-pressure", id: 0x0006, ty: TypeTag::Int, writable: false, timed_write: false },
@@ -1386,7 +1876,12 @@ static ATTRS_PUMPCONFIGURATIONANDCONTROL: &[AttrDef] = &[
 static CMDS_PUMPCONFIGURATIONANDCONTROL: &[CmdDef] = &[
 ];
 static ATTRS_PUSHAVSTREAMTRANSPORT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-connections", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-formats", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_PUSHAVSTREAMTRANSPORT: &[CmdDef] = &[
@@ -1398,8 +1893,13 @@ static CMDS_PUSHAVSTREAMTRANSPORT: &[CmdDef] = &[
     CmdDef { name: "set-transport-status", id: 0x04, timed: false, fields: &[FieldDef { name: "connection-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "transport-status", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_RADONCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1413,6 +1913,11 @@ static ATTRS_RADONCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 static CMDS_RADONCONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_REFRIGERATORALARM: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "mask", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "supported", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1420,13 +1925,23 @@ static ATTRS_REFRIGERATORALARM: &[AttrDef] = &[
 static CMDS_REFRIGERATORALARM: &[CmdDef] = &[
 ];
 static ATTRS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_RELATIVEHUMIDITYMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-measured-value", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1435,15 +1950,25 @@ static ATTRS_RELATIVEHUMIDITYMEASUREMENT: &[AttrDef] = &[
 static CMDS_RELATIVEHUMIDITYMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_RVCCLEANMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_RVCCLEANMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_RVCOPERATIONALSTATE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "countdown-time", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-phase", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "operational-error", id: 0x0005, ty: TypeTag::Struct, writable: false, timed_write: false },
     AttrDef { name: "operational-state", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "operational-state-list", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1455,21 +1980,36 @@ static CMDS_RVCOPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "resume", id: 0x03, timed: false, fields: &[] },
 ];
 static ATTRS_RVCRUNMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_RVCRUNMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_SAMPLEMEI: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "flip-flop", id: 0x0000, ty: TypeTag::Bool, writable: true, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_SAMPLEMEI: &[CmdDef] = &[
     CmdDef { name: "add-arguments", id: 0x02, timed: false, fields: &[FieldDef { name: "arg1", ty: TypeTag::UInt, optional: false }, FieldDef { name: "arg2", ty: TypeTag::UInt, optional: false }] },
     CmdDef { name: "ping", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_SCENESMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "fabric-scene-info", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "scene-table-size", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_SCENESMANAGEMENT: &[CmdDef] = &[
@@ -1483,8 +2023,13 @@ static CMDS_SCENESMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "view-scene", id: 0x01, timed: false, fields: &[FieldDef { name: "group-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "scene-id", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_SERVICEAREA: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-area", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "estimated-end-time", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "progress", id: 0x0005, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "selected-areas", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-areas", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1495,13 +2040,18 @@ static CMDS_SERVICEAREA: &[CmdDef] = &[
     CmdDef { name: "skip-area", id: 0x02, timed: false, fields: &[FieldDef { name: "skipped-area", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_SMOKECOALARM: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "battery-alert", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "co-state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "contamination-state", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "device-muted", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "end-of-service-alert", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "expiry-date", id: 0x000c, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "expressed-state", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hardware-fault-alert", id: 0x0006, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "interconnect-co-alarm", id: 0x0009, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "interconnect-smoke-alarm", id: 0x0008, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1513,35 +2063,60 @@ static CMDS_SMOKECOALARM: &[CmdDef] = &[
     CmdDef { name: "self-test-request", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_SOFTWAREDIAGNOSTICS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-heap-free", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-heap-high-watermark", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-heap-used", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "thread-metrics", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_SOFTWAREDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-watermarks", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_SOILMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "soil-moisture-measured-value", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "soil-moisture-measurement-limits", id: 0x0000, ty: TypeTag::Struct, writable: false, timed_write: false },
 ];
 static CMDS_SOILMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_SWITCH: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-position", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "multi-press-max", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "number-of-positions", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
 ];
 static CMDS_SWITCH: &[CmdDef] = &[
 ];
 static ATTRS_TARGETNAVIGATOR: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-target", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "target-list", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_TARGETNAVIGATOR: &[CmdDef] = &[
     CmdDef { name: "navigate-target", id: 0x00, timed: false, fields: &[FieldDef { name: "target", ty: TypeTag::UInt, optional: false }, FieldDef { name: "data", ty: TypeTag::Str, optional: true }] },
 ];
 static ATTRS_TEMPERATURECONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-temperature", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-temperature", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "selected-temperature-level", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1553,6 +2128,11 @@ static CMDS_TEMPERATURECONTROL: &[CmdDef] = &[
     CmdDef { name: "set-temperature", id: 0x00, timed: false, fields: &[FieldDef { name: "target-temperature", ty: TypeTag::UInt, optional: true }, FieldDef { name: "target-temperature-level", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_TEMPERATUREMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "min-measured-value", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1573,10 +2153,15 @@ static ATTRS_THERMOSTAT: &[AttrDef] = &[
     AttrDef { name: "ac-louver-position", id: 0x0045, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "ac-refrigerant-type", id: 0x0042, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "ac-type", id: 0x0040, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-preset-handle", id: 0x004e, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "active-schedule-handle", id: 0x004f, ty: TypeTag::Bytes, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "control-sequence-of-operation", id: 0x001b, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "emergency-heat-delta", id: 0x003a, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hvac-system-type-configuration", id: 0x0009, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "local-temperature", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "local-temperature-calibration", id: 0x0010, ty: TypeTag::Int, writable: true, timed_write: false },
@@ -1632,6 +2217,11 @@ static CMDS_THERMOSTAT: &[CmdDef] = &[
     CmdDef { name: "setpoint-raise-lower", id: 0x00, timed: false, fields: &[FieldDef { name: "mode", ty: TypeTag::UInt, optional: false }, FieldDef { name: "amount", ty: TypeTag::Int, optional: false }] },
 ];
 static ATTRS_THERMOSTATUSERINTERFACECONFIGURATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "keypad-lockout", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "schedule-programming-visibility", id: 0x0002, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "temperature-display-mode", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -1639,9 +2229,14 @@ static ATTRS_THERMOSTATUSERINTERFACECONFIGURATION: &[AttrDef] = &[
 static CMDS_THERMOSTATUSERINTERFACECONFIGURATION: &[CmdDef] = &[
 ];
 static ATTRS_THREADBORDERROUTERMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-dataset-timestamp", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "border-agent-id", id: 0x0001, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "border-router-name", id: 0x0000, ty: TypeTag::Str, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "interface-enabled", id: 0x0003, ty: TypeTag::Bool, writable: false, timed_write: false },
     AttrDef { name: "pending-dataset-timestamp", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "thread-version", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1653,18 +2248,23 @@ static CMDS_THREADBORDERROUTERMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "set-pending-dataset-request", id: 0x04, timed: true, fields: &[FieldDef { name: "pending-dataset", ty: TypeTag::Bytes, optional: false }] },
 ];
 static ATTRS_THREADNETWORKDIAGNOSTICS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-network-faults-list", id: 0x003e, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-timestamp", id: 0x0038, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "attach-attempt-count", id: 0x0012, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "better-partition-attach-attempt-count", id: 0x0014, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "channel", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "channel-page0-mask", id: 0x003c, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "child-role-count", id: 0x000f, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "data-version", id: 0x000b, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "delay", id: 0x003a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "detached-role-count", id: 0x000e, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "ext-address", id: 0x003f, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "extended-pan-id", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "leader-role-count", id: 0x0011, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "leader-router-id", id: 0x000d, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "mesh-local-prefix", id: 0x0005, ty: TypeTag::Bytes, writable: false, timed_write: false },
@@ -1723,6 +2323,11 @@ static CMDS_THREADNETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_THREADNETWORKDIRECTORY: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "preferred-extended-pan-id", id: 0x0000, ty: TypeTag::Bytes, writable: true, timed_write: false },
     AttrDef { name: "thread-network-table-size", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "thread-networks", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1733,13 +2338,23 @@ static CMDS_THREADNETWORKDIRECTORY: &[CmdDef] = &[
     CmdDef { name: "remove-network", id: 0x01, timed: true, fields: &[FieldDef { name: "extended-pan-id", ty: TypeTag::Bytes, optional: false }] },
 ];
 static ATTRS_TIMEFORMATLOCALIZATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "active-calendar-type", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "hour-format", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "supported-calendar-types", id: 0x0002, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_TIMEFORMATLOCALIZATION: &[CmdDef] = &[
 ];
 static ATTRS_TIMER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "set-time", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "time-remaining", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "timer-state", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1751,9 +2366,14 @@ static CMDS_TIMER: &[CmdDef] = &[
     CmdDef { name: "set-timer", id: 0x00, timed: false, fields: &[FieldDef { name: "new-time", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_TIMESYNCHRONIZATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "default-ntp", id: 0x0004, ty: TypeTag::Str, writable: false, timed_write: false },
     AttrDef { name: "dst-offset", id: 0x0006, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "dst-offset-list-max-size", id: 0x000b, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "granularity", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "local-time", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "ntp-server-available", id: 0x0009, ty: TypeTag::Bool, writable: false, timed_write: false },
@@ -1773,6 +2393,11 @@ static CMDS_TIMESYNCHRONIZATION: &[CmdDef] = &[
     CmdDef { name: "set-utc-time", id: 0x00, timed: false, fields: &[FieldDef { name: "utc-time", ty: TypeTag::UInt, optional: false }, FieldDef { name: "granularity", ty: TypeTag::UInt, optional: false }, FieldDef { name: "time-source", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_TLSCERTIFICATEMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-client-certificates", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-root-certificates", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "provisioned-client-certificates", id: 0x0003, ty: TypeTag::List, writable: false, timed_write: false },
@@ -1790,6 +2415,11 @@ static CMDS_TLSCERTIFICATEMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "tls-client-csr", id: 0x07, timed: false, fields: &[FieldDef { name: "nonce", ty: TypeTag::Bytes, optional: false }] },
 ];
 static ATTRS_TLSCLIENTMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-provisioned", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "provisioned-endpoints", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
 ];
@@ -1799,8 +2429,13 @@ static CMDS_TLSCLIENTMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "remove-endpoint", id: 0x04, timed: false, fields: &[FieldDef { name: "endpoint-id", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value", id: 0x0005, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "average-measured-value-window", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-value", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-measured-value", id: 0x0002, ty: TypeTag::Float, writable: false, timed_write: false },
     AttrDef { name: "measured-value", id: 0x0000, ty: TypeTag::Float, writable: false, timed_write: false },
@@ -1814,12 +2449,19 @@ static ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[AttrDef] =
 static CMDS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
 static ATTRS_UNITLOCALIZATION: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-temperature-units", id: 0x0001, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "temperature-unit", id: 0x0000, ty: TypeTag::UInt, writable: true, timed_write: false },
 ];
 static CMDS_UNITLOCALIZATION: &[CmdDef] = &[
 ];
 static ATTRS_UNITTESTING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "bitmap16", id: 0x0002, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "bitmap32", id: 0x0003, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "bitmap64", id: 0x0004, ty: TypeTag::UInt, writable: true, timed_write: false },
@@ -1827,15 +2469,18 @@ static ATTRS_UNITTESTING: &[AttrDef] = &[
     AttrDef { name: "boolean", id: 0x0000, ty: TypeTag::Bool, writable: true, timed_write: false },
     AttrDef { name: "char-string", id: 0x001e, ty: TypeTag::Str, writable: true, timed_write: false },
     AttrDef { name: "cluster-error-boolean", id: 0x0032, ty: TypeTag::Bool, writable: true, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "enum-attr", id: 0x0024, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "enum16", id: 0x0016, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "enum8", id: 0x0015, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "epoch-s", id: 0x0021, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "epoch-us", id: 0x0020, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "failure-int32-u", id: 0x3001, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "float-double", id: 0x0018, ty: TypeTag::Float, writable: true, timed_write: false },
     AttrDef { name: "float-single", id: 0x0017, ty: TypeTag::Float, writable: true, timed_write: false },
     AttrDef { name: "general-error-boolean", id: 0x0031, ty: TypeTag::Bool, writable: true, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "global-enum", id: 0x0033, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "global-struct", id: 0x0034, ty: TypeTag::Struct, writable: true, timed_write: false },
     AttrDef { name: "int16s", id: 0x000e, ty: TypeTag::Int, writable: true, timed_write: false },
@@ -1941,16 +2586,26 @@ static CMDS_UNITTESTING: &[CmdDef] = &[
     CmdDef { name: "timed-invoke-request", id: 0x12, timed: true, fields: &[] },
 ];
 static ATTRS_USERLABEL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "label-list", id: 0x0000, ty: TypeTag::List, writable: true, timed_write: false },
 ];
 static CMDS_USERLABEL: &[CmdDef] = &[
 ];
 static ATTRS_VALVECONFIGURATIONANDCONTROL: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "auto-close-time", id: 0x0002, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-level", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-state", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "default-open-duration", id: 0x0001, ty: TypeTag::UInt, writable: true, timed_write: false },
     AttrDef { name: "default-open-level", id: 0x0008, ty: TypeTag::UInt, writable: true, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "level-step", id: 0x000a, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "open-duration", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "remaining-duration", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1963,14 +2618,24 @@ static CMDS_VALVECONFIGURATIONANDCONTROL: &[CmdDef] = &[
     CmdDef { name: "open", id: 0x00, timed: false, fields: &[FieldDef { name: "open-duration", ty: TypeTag::UInt, optional: true }, FieldDef { name: "target-level", ty: TypeTag::UInt, optional: true }] },
 ];
 static ATTRS_WAKEONLAN: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "link-local-address", id: 0x0001, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "mac-address", id: 0x0000, ty: TypeTag::Str, writable: false, timed_write: false },
 ];
 static CMDS_WAKEONLAN: &[CmdDef] = &[
 ];
 static ATTRS_WATERHEATERMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "boost-state", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "estimated-heat-required", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "heat-demand", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "heater-types", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "tank-percentage", id: 0x0004, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -1981,14 +2646,24 @@ static CMDS_WATERHEATERMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "cancel-boost", id: 0x01, timed: false, fields: &[] },
 ];
 static ATTRS_WATERHEATERMODE: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-mode", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "supported-modes", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_WATERHEATERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: TypeTag::UInt, optional: false }] },
 ];
 static ATTRS_WEBRTCTRANSPORTPROVIDER: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-sessions", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_WEBRTCTRANSPORTPROVIDER: &[CmdDef] = &[
     CmdDef { name: "end-session", id: 0x06, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "reason", ty: TypeTag::UInt, optional: false }] },
@@ -1998,7 +2673,12 @@ static CMDS_WEBRTCTRANSPORTPROVIDER: &[CmdDef] = &[
     CmdDef { name: "solicit-offer", id: 0x00, timed: false, fields: &[FieldDef { name: "stream-usage", ty: TypeTag::UInt, optional: false }, FieldDef { name: "originating-endpoint-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "video-stream-id", ty: TypeTag::UInt, optional: true }, FieldDef { name: "audio-stream-id", ty: TypeTag::UInt, optional: true }, FieldDef { name: "ice-servers", ty: TypeTag::List, optional: true }, FieldDef { name: "ice-transport-policy", ty: TypeTag::Str, optional: true }, FieldDef { name: "metadata-enabled", ty: TypeTag::Bool, optional: true }] },
 ];
 static ATTRS_WEBRTCTRANSPORTREQUESTOR: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-sessions", id: 0x0000, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
 ];
 static CMDS_WEBRTCTRANSPORTREQUESTOR: &[CmdDef] = &[
     CmdDef { name: "answer", id: 0x01, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "sdp", ty: TypeTag::Str, optional: false }] },
@@ -2007,11 +2687,16 @@ static CMDS_WEBRTCTRANSPORTREQUESTOR: &[CmdDef] = &[
     CmdDef { name: "offer", id: 0x00, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: TypeTag::UInt, optional: false }, FieldDef { name: "sdp", ty: TypeTag::Str, optional: false }, FieldDef { name: "ice-servers", ty: TypeTag::List, optional: true }, FieldDef { name: "ice-transport-policy", ty: TypeTag::Str, optional: true }] },
 ];
 static ATTRS_WIFINETWORKDIAGNOSTICS: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "beacon-lost-count", id: 0x0005, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "beacon-rx-count", id: 0x0006, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "bssid", id: 0x0000, ty: TypeTag::Bytes, writable: false, timed_write: false },
     AttrDef { name: "channel-number", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-max-rate", id: 0x000b, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "overrun-count", id: 0x000c, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "packet-multicast-rx-count", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "packet-multicast-tx-count", id: 0x0008, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -2025,6 +2710,11 @@ static CMDS_WIFINETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_WIFINETWORKMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "passphrase-surrogate", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "ssid", id: 0x0000, ty: TypeTag::Bytes, writable: false, timed_write: false },
 ];
@@ -2032,6 +2722,9 @@ static CMDS_WIFINETWORKMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "network-passphrase-request", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_WINDOWCOVERING: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "config-status", id: 0x0007, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-position-lift", id: 0x0003, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-position-lift-percent100ths", id: 0x000e, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -2040,6 +2733,8 @@ static ATTRS_WINDOWCOVERING: &[AttrDef] = &[
     AttrDef { name: "current-position-tilt-percent100ths", id: 0x000f, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "current-position-tilt-percentage", id: 0x0009, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "end-product-type", id: 0x000d, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "installed-closed-limit-lift", id: 0x0011, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "installed-closed-limit-tilt", id: 0x0013, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "installed-open-limit-lift", id: 0x0010, ty: TypeTag::UInt, writable: false, timed_write: false },
@@ -2065,6 +2760,11 @@ static CMDS_WINDOWCOVERING: &[CmdDef] = &[
     CmdDef { name: "up-or-open", id: 0x00, timed: false, fields: &[] },
 ];
 static ATTRS_ZONEMANAGEMENT: &[AttrDef] = &[
+    AttrDef { name: "accepted-command-list", id: 0xfff9, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "attribute-list", id: 0xfffb, ty: TypeTag::List, writable: false, timed_write: false },
+    AttrDef { name: "cluster-revision", id: 0xfffd, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "feature-map", id: 0xfffc, ty: TypeTag::UInt, writable: false, timed_write: false },
+    AttrDef { name: "generated-command-list", id: 0xfff8, ty: TypeTag::List, writable: false, timed_write: false },
     AttrDef { name: "max-user-defined-zones", id: 0x0000, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "max-zones", id: 0x0001, ty: TypeTag::UInt, writable: false, timed_write: false },
     AttrDef { name: "sensitivity", id: 0x0005, ty: TypeTag::UInt, writable: true, timed_write: false },
