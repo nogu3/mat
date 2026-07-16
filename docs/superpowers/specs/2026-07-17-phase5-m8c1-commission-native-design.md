@@ -162,3 +162,25 @@ chip-tool フォールバックが生きているため撤退可能。
 - matd への commission op 追加（恒久的に対象外）。
 - BLE ビルドの既定有効化（M8c-3 で判断。M8c-1 は cross gnu の opt-in
   ビルドで E2E する）。
+
+## 設計再検討の結果: epoch IPK（2026-07-17、Task 2 調査 — ユーザー承認済み）
+
+実装計画 Task 2 の調査（上流 v1.4.2.0 ソース、引用は task-2-report 参照）で
+**epoch IPK は chip-tool の KVS に永続されていない**と確定した。chip-tool は
+commissioner 初期化のたびにコンパイル時定数 **`"temporary ipk 01"`**
+（`TestGroupData.h` `DefaultIpkValue::GetDefaultIpk`）を epoch として投入し、
+`SetKeySet` が operational へ導出したものだけを `f/<idx>/k/0`（ctx6）に
+永続する（M5 実機知見と完全整合）。
+
+**採用: 定数 + 実行時ガード方式。**
+- `CHIP_TOOL_DEFAULT_IPK_EPOCH = *b"temporary ipk 01"` を出典コメント付きで
+  `mat-controller` に定義。
+- native commission 時、`derive_ipk_operational(定数, CFID) == KVS の
+  ipk_operational` を必ず検証。一致 = この fabric の epoch が定数であることの
+  数学的証明 → AddNOC に使用。不一致（非 chip-tool fabric / IPK ローテー
+  ション済み）→ `Unavailable` として chip-tool フォールバック（盲目的な
+  定数埋め込みにしない）。
+- `kvs.rs` は無変更（`SelfIssueMaterials.ipk_epoch` 追加は不要になった）。
+  `CommissioningFabric::from_materials` は epoch を引数で受ける。
+- M8c-3 の fabric bootstrap では mat 自身がランダム epoch を生成・永続して
+  この定数依存から脱却する（M8c-3 spec の必須項目に追加）。
