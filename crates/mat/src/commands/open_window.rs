@@ -71,11 +71,22 @@ pub fn run(
         }
     };
 
+    emit_open_window_success(node_id, &manual_code, &qr_payload, timeout);
+    Ok(())
+}
+
+/// `open-window` の成功 JSON を stdout へ emit する。chip-tool 経路と native
+/// 直経路（`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+pub(crate) fn emit_open_window_success(
+    node_id: u64,
+    manual_code: &str,
+    qr_payload: &str,
+    timeout: u32,
+) {
     output::emit(json!({
         "node_id": node_id,
         "manual_code": manual_code,
         "qr_payload": qr_payload,
         "expires_at": output::expires_in(i64::from(timeout)),
     }));
-    Ok(())
 }

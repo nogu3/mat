@@ -531,6 +531,80 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   互換をどのバージョン範囲で保証するか」は未解決のまま **M8**（chip-tool
   完全廃止: write/describe/diag/discover/commission の native 化、汎用
   name→ID テーブル、KVS 書込所有、バイナリ撤去）に送る。
+- **M8（chip-tool 完全廃止、ユーザー決定 2026-07-16）**: 規模が大きいため
+  M6a/M6b と同様にサブマイルストーンへ 3 分割。各段で実機 E2E 合格を受け入れ
+  条件とし、M8a/M8b までは chip-tool フォールバックが生きているため撤退可能。
+  設計は `docs/superpowers/specs/2026-07-16-phase5-m8a-generic-im-native-design.md`
+  （冒頭に M8 全体分割と横断決定を記録）。
+  - **M8a（本節、0.18.0）— 汎用 IM native 化**。
+  - **M8b（0.19.0）— discover native 化**: mDNS browse
+    （`_matter._tcp` operational + `_matterc._udp` commissionable）+ probe
+    reachability。既存 `dnssd.rs`（operational 解決）の browse 拡張。
+  - **M8c（0.20.0）— commission native 化 + chip-tool 完全撤去**: 本番
+    `mat commission` の native 化、KVS 書込所有、native 既定化、
+    runner.rs / chip-tool 分岐 / fake-chip-tool テスト基盤 / Docker の
+    chip-tool・`MAT_CHIP_TOOL_BIN` の全削除。
+  - **横断決定（主に M8c で実施）**: ① KVS 書込所有は chip-tool INI 形式を
+    継続（既存 `kvs.rs` リーダと実機 fabric データを流用、flock 排他で mat が
+    書く。chip-tool 撤去後は mat が唯一のライター）。② name→ID は全クラスタ
+    生成テーブル（M8a で実施、下記）。③ BLE は本番ビルドで feature `ble` を
+    既定有効化（M8c。bluer は D-Bus 経由なので musl でもリンク可の見込み —
+    musl×bluer ビルド検証を M8c 最初のタスクに）。④ native を既定化
+    （`MAT_IFACE` 未設定でも動作。group 送信の iface は自動選択 + 設定で
+    上書き、multicast egress の罠があるため自動選択の設計は M8c spec で詰める）
+    し、chip-tool 経路をコード・Docker イメージとも全削除（M8c）。
+  - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
+    （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
+    XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・
+    ネットワーク不要。140 クラスタ / 属性 1844 / コマンド 371、global ZCL
+    属性 5 種は全クラスタに合流。cluster/attribute/command 名→ID・型タグ・
+    フィールド順序と逆引きを保持。数値 ID 直指定は全経路で常に許可、
+    cluster/attribute の意味論は従来どおり chip-tool 記法のまま
+    — CLAUDE.md の「Cluster / attribute names stay chip-tool notation」は
+    不変）。(2) **IM 拡張**（`mat-controller`）: WriteRequest/WriteResponse
+    の encode/decode（timed write は M6a 実装済みの
+    `encode_timed_request` を流用）、attribute wildcard read（cluster 内
+    全属性の一括 read、describe/diag が使う）、チャンク/リスト追記対応
+    ReportData、TLV→JSON（深さ上限 32、チャンク上限 64）。(3) **native 化
+    op**（経路優先順位・失敗分岐は M7 と同型）: `read`（汎用形）/ `write` /
+    `invoke`（汎用形）/ `describe` / `group invoke`（汎用形）/
+    `group provision`（コントローラ側 groupsettings は M8c まで chip-tool、
+    デバイス側 4 ステップのみ native のハイブリッド）は one-shot 直経路
+    （`MAT_IFACE`）と matd（`MAT_MATD_IFACE`）の**両方**に配線。
+    `diag thread`（`diag node` は対象外、M8c で再訪）/ `open-window`
+    （M6b 実装済みの配線のみ）/ `group grant`（デバイス側のみ）は
+    matd プロトコルが元々扱わない op 群のため（warm session の恩恵が薄い
+    稀な操作、M8a 以前からの設計）one-shot 直経路 `MAT_IFACE` のみに配線 —
+    matd 経由では従来どおり常に chip-tool（`mat` 側が `matd` に op を送らず
+    直接処理する）。(4) **JSON→TLV の型サポートはスカラーのみ**（bool/int/uint/
+    enum/bitmap/string/octstr、bytes は `hex:` 形式）。既知名で list/struct/
+    float を指定した汎用 write/invoke は `parse_error` で明示拒否。未知名は
+    従来どおり chip-tool にフォールバック。list/struct 書込が要る
+    group provision/grant（KeySetWrite・GroupKeyMap write・binding
+    write・ACL read-modify-write）は生成テーブルに依存しない専用エンコーダ
+    （`group.rs`/`acl.rs` の延長）。(5) **group-key-map はデバイス側で
+    read-merge-write 化**（chip-tool 経路の全置換より安全な意図的改善）。
+    (6) 判定中核 **`classify_write` / `classify_invoke`** は `mat-core::ids`
+    に一本化し mat/matd で共有。バージョンは 0.18.0。受け入れ基準は
+    5 項目（spec 参照）。**実機 E2E 合格（2026-07-16 夜、jarvis）**:
+    検証 11 項目全 PASS — 直経路 native の read 汎用/write（読み返し+null
+    後始末）/未対応型 write の parse_error 拒否/invoke 汎用/describe（chip-tool
+    経路と構造一致）/diag thread（主要キー一致 — field-id テーブルの実機実証）/
+    open-window/grant 冪等（2回目全ノード unchanged）/provision --rebind +
+    groupcast N/N（Matter 状態で 7/7 確認）、matd 経由の同 op native
+    （`chip-tool ws raw response` ログ不在 = 実トラフィックゼロの実アサーション）、
+    `MAT_IFACE` 未設定のフォールバック健全性（同項目を chip-tool 経路で全通過）。
+    ACL は全 7 ノードで前後とも 2 エントリのまま（provision×3・grant×4 を経て
+    汚染・重複ゼロ — IsFabricFiltered 修正の実機実証）。**実機知見 2 点**:
+    ① 本番 matd（native）が group counter の flock を保持している間は one-shot
+    native の group 送信は設計どおり chip-tool へフォールバックする — E2E で
+    native group 送信を実証するには事前に `systemctl restart matd` で flock を
+    解放しておくこと（M7 E2E 時は本番がまだ 0.16.0 で顕在化しなかった）。
+    ② E2E 中の chip-tool spawn 群が g/gdc を進めるため、送信経路を跨ぐと
+    counter 窓の逆転で silent drop が起きる（既知の混在知見の再確認。matd
+    再起動で回復）。フォールバック検証はメッシュ不調の node を避けて実施
+    （node の一過性 CASE 失敗 ×2 で 2 回中断 → 検証 1〜10 は同一走行で PASS、
+    検証 11 は同ハーネスから抽出した同一手順を安定 node で PASS）。
 
 ---
 

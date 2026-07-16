@@ -4,12 +4,14 @@
 //! ReadRequest/ReportData, single-command InvokeRequest/InvokeResponse, and
 //! StatusResponse. No subscriptions, no batched paths, no chunking.
 
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{copy_value, Element, Reader, Tag, TlvError, Value, Writer};
 
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
 pub const OPCODE_READ_REQUEST: u8 = 0x02;
 pub const OPCODE_REPORT_DATA: u8 = 0x05;
+pub const OPCODE_WRITE_REQUEST: u8 = 0x06;
+pub const OPCODE_WRITE_RESPONSE: u8 = 0x07;
 pub const OPCODE_INVOKE_REQUEST: u8 = 0x08;
 pub const OPCODE_INVOKE_RESPONSE: u8 = 0x09;
 pub const OPCODE_TIMED_REQUEST: u8 = 0x0A;
@@ -25,6 +27,21 @@ pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
 pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
 pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
 pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
+/// GroupKeyManagement cluster (spec §11.2.7). `KeySetWrite` provisions a
+/// device's epoch key for a `GroupKeySetID`.
+pub const CLUSTER_GROUP_KEY_MANAGEMENT: u32 = 0x003F;
+pub const CMD_KEY_SET_WRITE: u32 = 0x00;
+/// `group-key-map` attribute (list of `GroupKeyMapStruct`): maps a `GroupId`
+/// to the `GroupKeySetID` used to decrypt its groupcast traffic.
+pub const ATTR_GROUP_KEY_MAP: u32 = 0x0000;
+/// Groups cluster (spec §1.3). `AddGroup` binds an endpoint into a group.
+pub const CLUSTER_GROUPS: u32 = 0x0004;
+pub const CMD_ADD_GROUP: u32 = 0x00;
+/// AccessControl cluster (spec §11.1). `acl` is the fabric-scoped list of
+/// `AccessControlEntryStruct` a device consults to authorize incoming
+/// requests (including groupcast, which arrives with `authMode = Group`).
+pub const CLUSTER_ACCESS_CONTROL: u32 = 0x001F;
+pub const ATTR_ACL: u32 = 0x0000;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -152,7 +169,12 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     w.put_uint(Tag::Context(4), u64::from(attribute));
     w.end_container(); // AttributePathIB
     w.end_container(); // AttributeRequests
-    w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+                       // IsFabricFiltered = true: matches chip-tool's read default. This is the
+                       // precondition for mat-native's ACL / group-key-map read-merge-write
+                       // (ensure_group_acl / provision_node in mat-native::ops) not pulling in
+                       // other fabrics' entries on multi-admin devices (e.g. a Home Assistant
+                       // fabric alongside ours) — see mat_core::acl::merge_group_entry's doc.
+    w.put_bool(Tag::Context(3), true); // IsFabricFiltered
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
@@ -321,51 +343,367 @@ pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
     })
 }
 
-/// Deep-copies one TLV element (and, if a container, its full subtree) from
-/// `r` into `w`, re-tagging only the top-level element as `tag`. Used to
-/// splice a caller-provided, already-encoded CommandFields element into an
-/// InvokeRequest without `tlv::Writer` needing a raw-append escape hatch.
-fn copy_retagged(w: &mut Writer, r: &mut Reader, tag: Tag) -> Result<(), TlvError> {
-    let el = r.next()?.ok_or(TlvError::Truncated)?;
-    copy_value(w, r, tag, el.value)
+/// 1 AttributeReportIB のデコード結果（汎用形）。`decode_report_data`（M2,
+/// 単一属性・スカラーのみ）とは独立の新 API — 既存 API は無改変。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeReport {
+    pub endpoint: Option<u16>,
+    pub attribute: Option<u32>,
+    /// path に ListIndex(null) があれば true（チャンク化 list の item 追記）。
+    pub list_append: bool,
+    /// AttributeDataIB の Data 要素を JSON 化したもの（status レポートなら None）。
+    pub data: Option<serde_json::Value>,
+    pub status: Option<u8>,
 }
 
-fn copy_value(w: &mut Writer, r: &mut Reader, tag: Tag, value: Value) -> Result<(), TlvError> {
-    match value {
-        Value::Int(v) => w.put_int(tag, v),
-        Value::Uint(v) => w.put_uint(tag, v),
-        Value::Bool(v) => w.put_bool(tag, v),
-        Value::F32(v) => w.put_f32(tag, v),
-        Value::F64(v) => w.put_f64(tag, v),
-        Value::Utf8(v) => w.put_str(tag, v),
-        Value::Bytes(v) => w.put_bytes(tag, v),
-        Value::Null => w.put_null(tag),
+/// ReportDataMessage (spec §8.9.2) の汎用デコード結果。複数 AttributeReportIB・
+/// チャンク（MoreChunkedMessages）・list 追記に対応する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportDataMessage {
+    pub reports: Vec<AttributeReport>,
+    pub more_chunks: bool,
+    pub suppress_response: bool,
+}
+
+/// TLV 単一要素（コンテナ含む）を JSON へ。`first` は既に読んだ先頭要素。
+/// JSON 化規約（固定）: Bool→bool, Uint/Int→number, F32/F64→number,
+/// Utf8→string, Bytes→小文字hex文字列, Null→null, Array/List→JSON array,
+/// Struct→JSON object（キーは context tag 番号の10進文字列。名前付けは
+/// 上位層の責務）。
+fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Value, ImError> {
+    tlv_element_to_json_impl(r, first, 0)
+}
+
+fn tlv_element_to_json_impl(
+    r: &mut Reader,
+    first: Element,
+    depth: usize,
+) -> Result<serde_json::Value, ImError> {
+    const MAX_DEPTH: usize = 32;
+    if depth > MAX_DEPTH {
+        return Err(ImError::Malformed("tlv nesting too deep"));
+    }
+
+    use serde_json::Value as J;
+    Ok(match first.value {
+        Value::Bool(b) => J::Bool(b),
+        Value::Uint(u) => J::from(u),
+        Value::Int(i) => J::from(i),
+        Value::F32(f) => serde_json::json!(f),
+        Value::F64(f) => serde_json::json!(f),
+        Value::Utf8(s) => J::String(s.to_string()),
+        Value::Bytes(b) => J::String(hex_lower(b)),
+        Value::Null => J::Null,
+        Value::ArrayStart | Value::ListStart => {
+            let mut items = Vec::new();
+            loop {
+                let el = r.next()?.ok_or(ImError::Malformed("truncated array"))?;
+                if el.value == Value::ContainerEnd {
+                    break;
+                }
+                items.push(tlv_element_to_json_impl(r, el, depth + 1)?);
+            }
+            J::Array(items)
+        }
         Value::StructStart => {
-            w.start_struct(tag);
-            return copy_container(w, r);
+            let mut map = serde_json::Map::new();
+            loop {
+                let el = r.next()?.ok_or(ImError::Malformed("truncated struct"))?;
+                if el.value == Value::ContainerEnd {
+                    break;
+                }
+                let key = match el.tag {
+                    Tag::Context(n) => n.to_string(),
+                    _ => {
+                        // 想定外タグはスキップ（前方互換）。ただしそれがコンテナ開始ならば
+                        // 中身を読み飛ばす（そうでないと兄弟フィールドの解釈が壊れる）。
+                        if matches!(
+                            el.value,
+                            Value::StructStart | Value::ArrayStart | Value::ListStart
+                        ) {
+                            skip_container(r)?;
+                        }
+                        continue;
+                    }
+                };
+                map.insert(key, tlv_element_to_json_impl(r, el, depth + 1)?);
+            }
+            J::Object(map)
         }
-        Value::ArrayStart => {
-            w.start_array(tag);
-            return copy_container(w, r);
-        }
-        Value::ListStart => {
-            w.start_list(tag);
-            return copy_container(w, r);
-        }
-        Value::ContainerEnd => {}
-    }
-    Ok(())
+        Value::ContainerEnd => return Err(ImError::Malformed("dangling container end")),
+    })
 }
 
-fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
+fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// AttributePathIB (spec §8.9.2.2, list) のうち endpoint(Context 2) /
+/// attribute(Context 4) / ListIndex(Context 5, `Null` ならチャンク化 list
+/// への item 追記) を拾う。他フィールド（Node/Cluster/DataVersion 等）は
+/// 読み飛ばす。呼び出し側は path を開く `ListStart` を既に読んでいる前提。
+fn decode_attribute_path_ib(r: &mut Reader) -> Result<(Option<u16>, Option<u32>, bool), ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
     loop {
-        let el = r.next()?.ok_or(TlvError::Truncated)?;
-        if el.value == Value::ContainerEnd {
-            w.end_container();
-            return Ok(());
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute path"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(2), Value::Uint(v)) => {
+                endpoint = Some(
+                    u16::try_from(v).map_err(|_| ImError::Malformed("endpoint out of range"))?,
+                );
+            }
+            (Tag::Context(4), Value::Uint(v)) => {
+                attribute = Some(
+                    u32::try_from(v)
+                        .map_err(|_| ImError::Malformed("attribute id out of range"))?,
+                );
+            }
+            (Tag::Context(5), Value::Null) => list_append = true,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
         }
-        copy_value(w, r, el.tag, el.value)?;
     }
+    Ok((endpoint, attribute, list_append))
+}
+
+/// AttributeStatusIB (spec §8.9.2.2): `{0: Path, 1: StatusIB{0: status, ...}}`,
+/// path も拾う汎用版（`decode_attribute_status_ib` の M2 版とは独立— 既存
+/// API 無改変のため別関数にした）。呼び出し側は AttributeReportIB の
+/// anonymous `StructStart`（tag 0）を既に読んでいる前提。
+fn decode_attribute_status_ib_full(
+    r: &mut Reader,
+) -> Result<(Option<u16>, Option<u32>, u8), ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute status"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ListStart) => {
+                let (ep, attr, _) = decode_attribute_path_ib(r)?;
+                endpoint = ep;
+                attribute = attr;
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                // StatusIB
+                loop {
+                    let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+                    match (e2.tag, e2.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (Tag::Context(0), Value::Uint(v)) => {
+                            status = Some(u8::try_from(v).map_err(|_| {
+                                ImError::Malformed("attribute status code out of range")
+                            })?);
+                        }
+                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                            skip_container(r)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    let status = status.ok_or(ImError::Malformed("attribute status without StatusIB"))?;
+    Ok((endpoint, attribute, status))
+}
+
+/// `decode_attribute_data_ib_full` の戻り値: (endpoint, attribute,
+/// list_append, data).
+type AttributeDataFields = (Option<u16>, Option<u32>, bool, Option<serde_json::Value>);
+
+/// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`,
+/// path も拾い Data を JSON 化する汎用版（`decode_attribute_data_ib` の M2
+/// 版とは独立）。呼び出し側は AttributeReportIB の anonymous `StructStart`
+/// （tag 1）を既に読んでいる前提。
+fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
+    let mut data = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ListStart) => {
+                let (ep, attr, la) = decode_attribute_path_ib(r)?;
+                endpoint = ep;
+                attribute = attr;
+                list_append = la;
+            }
+            (Tag::Context(2), _) => {
+                data = Some(tlv_element_to_json(r, el)?);
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((endpoint, attribute, list_append, data))
+}
+
+/// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`,
+/// 汎用版（path/JSON も拾う。`decode_attribute_report_ib` の M2 版とは独立）。
+/// 呼び出し側は開く anonymous `StructStart` を既に読んでいる前提。
+fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, ImError> {
+    let mut endpoint = None;
+    let mut attribute = None;
+    let mut list_append = false;
+    let mut data = None;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute report"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::StructStart) => {
+                let (ep, attr, s) = decode_attribute_status_ib_full(r)?;
+                endpoint = ep;
+                attribute = attr;
+                status = Some(s);
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                let (ep, attr, la, d) = decode_attribute_data_ib_full(r)?;
+                endpoint = ep;
+                attribute = attr;
+                list_append = la;
+                data = d;
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(AttributeReport {
+        endpoint,
+        attribute,
+        list_append,
+        data,
+        status,
+    })
+}
+
+/// ReportDataMessage (spec §8.9.2) の汎用デコード。すべての AttributeReportIB
+/// を読み（M2 の `decode_report_data` と違い最初の 1 件に限らない）、
+/// MoreChunkedMessages(tag 3) はチャンク未完了フラグとしてそのまま
+/// `more_chunks` へ反映するだけで拒否しない（チャンク統合は
+/// `merge_reports` の責務）。
+pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut reports = Vec::new();
+    let mut more_chunks = false;
+    let mut suppress_response = false;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated report data"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::ArrayStart) => {
+                // AttributeReportIBs: every entry, not just the first.
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated attribute reports"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart => {
+                            reports.push(decode_attribute_report_ib_full(&mut r)?);
+                        }
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in attribute reports",
+                            ))
+                        }
+                    }
+                }
+            }
+            (Tag::Context(3), Value::Bool(b)) => more_chunks = b,
+            (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(ReportDataMessage {
+        reports,
+        more_chunks,
+        suppress_response,
+    })
+}
+
+/// ReadRequestMessage (spec §8.9.2) の wildcard 版: AttributePathIB から
+/// attribute を省略し、cluster 内の全属性を要求する。
+pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(0)); // AttributeRequests
+    w.start_list(Tag::Anonymous); // AttributePathIB
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    w.end_container(); // AttributePathIB
+    w.end_container(); // AttributeRequests
+                       // IsFabricFiltered = true: matches chip-tool's read default. See
+                       // encode_read_request's comment above for the rationale.
+    w.put_bool(Tag::Context(3), true); // IsFabricFiltered
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// 複数 ReportDataMessage・リスト追記を統合し attribute id → JSON 値へ。
+/// 同一 attribute の非追記レポートは最後のものが勝つ（Replace）。追記
+/// （`list_append`）は既存値が JSON array ならそこへ push する（既存値が
+/// array でない異常系は 1 要素の array から作り直す）。status のみの
+/// レポート（`data: None`）は結果に出ない。出力順は最初に登場した順。
+pub fn merge_reports(msgs: &[ReportDataMessage]) -> Vec<(u32, serde_json::Value)> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut map: std::collections::HashMap<u32, serde_json::Value> =
+        std::collections::HashMap::new();
+    for m in msgs {
+        for rep in &m.reports {
+            let Some(attr) = rep.attribute else { continue };
+            let Some(data) = rep.data.clone() else {
+                continue; // status-only は値なし
+            };
+            if rep.list_append {
+                match map.entry(attr).or_insert_with(|| serde_json::json!([])) {
+                    serde_json::Value::Array(items) => items.push(data),
+                    slot => *slot = serde_json::json!([data]), // 追記が先に来た異常系
+                }
+            } else {
+                map.insert(attr, data);
+            }
+            if !order.contains(&attr) {
+                order.push(attr);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|a| map.remove(&a).map(|v| (a, v)))
+        .collect()
 }
 
 /// CommandFields for colorcontrol MoveToHueAndSaturation (cluster spec
@@ -404,6 +742,61 @@ pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: 
     w.finish()
 }
 
+/// CommandFields for GroupKeyManagement KeySetWrite (cluster spec §11.2.8.4):
+/// `{0: GroupKeySetStruct{0: GroupKeySetID(u16), 1: GroupKeySecurityPolicy(0
+/// = TrustFirst), 2: EpochKey0(16B octstr), 3: EpochStartTime0(u64, epoch-us),
+/// 4: EpochKey1(null), 5: EpochStartTime1(null), 6: EpochKey2(null), 7:
+/// EpochStartTime2(null)}}`. Only a single active epoch (0) is provisioned —
+/// matches the chip-tool `groupkeymanagement key-set-write` JSON this mirrors
+/// (`commands/group.rs`'s `key_set` object). `epochStartTime0` is fixed to 1
+/// (matching `mat_core::group::EPOCH_START_TIME`, which the controller-side
+/// `groupsettings add-keysets` validityTime must also match).
+pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_struct(Tag::Context(0)); // GroupKeySet
+    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.put_uint(Tag::Context(1), 0); // GroupKeySecurityPolicy: TrustFirst
+    w.put_bytes(Tag::Context(2), epoch_key);
+    w.put_uint(Tag::Context(3), 1); // EpochStartTime0
+    w.put_null(Tag::Context(4));
+    w.put_null(Tag::Context(5));
+    w.put_null(Tag::Context(6));
+    w.put_null(Tag::Context(7));
+    w.end_container();
+    w.end_container();
+    w.finish()
+}
+
+/// `group-key-map` attribute Data TLV (list of `GroupKeyMapStruct{1: GroupId,
+/// 2: GroupKeySetID}`, spec §11.2.7.6) — the write is a **full replace**, so
+/// callers must pass the final merged list (existing entries + the one being
+/// added/updated), not just the delta. `fabricIndex` (field 254) is omitted:
+/// the server substitutes it from the write's accessing fabric.
+pub fn encode_group_key_map_tlv(entries: &[(u16, u16)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (group_id, keyset_id) in entries {
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(*group_id));
+        w.put_uint(Tag::Context(2), u64::from(*keyset_id));
+        w.end_container();
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for Groups AddGroup (cluster spec §1.3.6.1): `{0:
+/// GroupID(u16), 1: GroupName(str, <= 16 chars per spec, unchecked here)}`.
+pub fn encode_add_group_fields(group_id: u16, name: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(group_id));
+    w.put_str(Tag::Context(1), name);
+    w.end_container();
+    w.finish()
+}
+
 /// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
 /// フィールド（タイムド呼び出し、spec §8.5）の値になる。公開関数
 /// `encode_invoke_request` / `encode_invoke_request_timed` はどちらもこれを
@@ -435,9 +828,7 @@ fn encode_invoke_request_inner(
     w.put_uint(Tag::Context(2), u64::from(command));
     w.end_container(); // CommandPath
     if let Some(fields) = fields_tlv {
-        let mut fr = Reader::new(fields);
-        copy_retagged(&mut w, &mut fr, Tag::Context(1))
-            .expect("fields_tlv must be one well-formed TLV element");
+        w.put_raw_element(Tag::Context(1), fields);
     }
     w.end_container(); // CommandDataIB
     w.end_container(); // InvokeRequests
@@ -508,9 +899,7 @@ pub fn encode_group_invoke_request(
     w.put_uint(Tag::Context(2), u64::from(command));
     w.end_container();
     if let Some(fields) = fields_tlv {
-        let mut fr = Reader::new(fields);
-        copy_retagged(&mut w, &mut fr, Tag::Context(1))
-            .expect("fields_tlv must be one well-formed TLV element");
+        w.put_raw_element(Tag::Context(1), fields);
     }
     w.end_container();
     w.end_container();
@@ -817,6 +1206,136 @@ pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
     status.ok_or(ImError::Malformed("status response without status"))
 }
 
+/// Encodes an `ImValue` scalar as one standalone, well-formed TLV element
+/// (tag is discarded by the caller — `encode_write_request` immediately
+/// splices it via `Writer::put_raw_element`).
+fn encode_im_value(value: &ImValue) -> Vec<u8> {
+    let mut w = Writer::new();
+    match value {
+        ImValue::Bool(b) => w.put_bool(Tag::Anonymous, *b),
+        ImValue::Uint(u) => w.put_uint(Tag::Anonymous, *u),
+        ImValue::Int(i) => w.put_int(Tag::Anonymous, *i),
+        ImValue::Utf8(s) => w.put_str(Tag::Anonymous, s),
+        ImValue::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
+        ImValue::Null => w.put_null(Tag::Anonymous),
+    }
+    w.finish()
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) の共通本体。`timed` が TimedRequest
+/// フィールドの値になる。公開関数 `encode_write_request_tlv` /
+/// `encode_write_request_tlv_timed` はどちらもこれを呼ぶだけの薄いラッパで、
+/// `encode_invoke_request` / `encode_invoke_request_timed` と同じ手筋。
+fn encode_write_request_inner(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+    timed: bool,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), false); // SuppressResponse
+    w.put_bool(Tag::Context(1), timed); // TimedRequest
+    w.start_array(Tag::Context(2)); // WriteRequests
+    w.start_struct(Tag::Anonymous); // AttributeDataIB
+    w.start_list(Tag::Context(1)); // AttributePathIB
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    w.put_uint(Tag::Context(4), u64::from(attribute));
+    w.end_container(); // AttributePathIB
+    w.put_raw_element(Tag::Context(2), data_tlv); // Data
+    w.end_container(); // AttributeDataIB
+    w.end_container(); // WriteRequests
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) for a single attribute path.
+/// TimedRequest is always `false` — see `encode_write_request_tlv_timed` for
+/// the timed variant (spec §8.5, タイムド呼び出し). `data_tlv` must be one
+/// complete, well-formed TLV element (any top-level tag; it is re-tagged) —
+/// the attribute's `Data` value.
+pub fn encode_write_request_tlv(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+) -> Vec<u8> {
+    encode_write_request_inner(endpoint, cluster, attribute, data_tlv, false)
+}
+
+/// WriteRequestMessage (spec §8.9.2.4) with TimedRequest = true. Must be
+/// sent on the same exchange as a preceding `encode_timed_request` whose
+/// StatusResponse(SUCCESS) has already been received (spec §8.5.1). Same
+/// `data_tlv` contract as `encode_write_request_tlv`.
+pub fn encode_write_request_tlv_timed(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    data_tlv: &[u8],
+) -> Vec<u8> {
+    encode_write_request_inner(endpoint, cluster, attribute, data_tlv, true)
+}
+
+/// Scalar sugar over `encode_write_request_tlv`: encodes `value` as TLV and
+/// splices it in as the `Data` element. M2-scope values only (see `ImValue`).
+pub fn encode_write_request(
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    value: &ImValue,
+) -> Vec<u8> {
+    encode_write_request_tlv(endpoint, cluster, attribute, &encode_im_value(value))
+}
+
+/// WriteResponseMessage (spec §8.9.2.4): `{0: [AttributeStatusIB, ...], 255:
+/// revision}`. Only the first `AttributeStatusIB`'s status is interpreted
+/// (M8a scope: one attribute per write). Reuses `decode_attribute_status_ib`
+/// (same `{0: Path, 1: StatusIB{0: status, ...}}` shape as a WriteResponses
+/// entry).
+pub fn decode_write_response(payload: &[u8]) -> Result<u8, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut status = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated write response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ArrayStart) => {
+                // WriteResponses
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated write responses"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            status = Some(decode_attribute_status_ib(&mut r)?);
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed("unexpected element in write responses"))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    status.ok_or(ImError::Malformed(
+        "write response without AttributeStatusIB",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,9 +1370,13 @@ mod tests {
         );
         assert_eq!(els[6].value, Value::ContainerEnd); // list
         assert_eq!(els[7].value, Value::ContainerEnd); // array
+                                                       // IsFabricFiltered must be true: matches chip-tool's read default, and
+                                                       // is the precondition for ensure_group_acl / provision_node's
+                                                       // read-merge-write (mat-native) not pulling in other fabrics' ACL /
+                                                       // group-key-map entries on multi-admin devices.
         assert_eq!(
             (els[8].tag, els[8].value),
-            (Tag::Context(3), Value::Bool(false))
+            (Tag::Context(3), Value::Bool(true))
         );
         assert_eq!(
             (els[9].tag, els[9].value),
@@ -1264,5 +1787,307 @@ mod tests {
         w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
         w.end_container();
         assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn decode_report_data_message_multiple_ibs_and_types() {
+        // ReportData { 1: [ AttrReport{1: Data{1: path(ep,cl,attr), 2: data}},
+        //                   AttrReport{...} ], 4: suppress }
+        // を Writer で組み、bool と list-of-struct の 2 属性が JSON になること。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // AttributeReports
+                                        // 属性1: on-off = true
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeDataIB
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // AttributePathIB
+        w.put_uint(Tag::Context(2), 1); // endpoint
+        w.put_uint(Tag::Context(3), 0x0006);
+        w.put_uint(Tag::Context(4), 0x0000);
+        w.end_container();
+        w.put_bool(Tag::Context(2), true); // Data
+        w.end_container();
+        w.end_container();
+        // 属性2: 構造体1件のリスト
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        w.start_list(Tag::Context(1));
+        w.put_uint(Tag::Context(2), 0);
+        w.put_uint(Tag::Context(3), 0x0035);
+        w.put_uint(Tag::Context(4), 0x0007); // neighbor-table
+        w.end_container();
+        w.start_array(Tag::Context(2)); // Data: array of struct
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 42);
+        w.put_int(Tag::Context(1), -60);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container(); // AttributeReports
+        w.put_bool(Tag::Context(4), true); // SuppressResponse
+        w.end_container();
+        let msg = decode_report_data_message(&w.finish()).unwrap();
+        assert!(msg.suppress_response);
+        assert!(!msg.more_chunks);
+        assert_eq!(msg.reports.len(), 2);
+        assert_eq!(msg.reports[0].attribute, Some(0x0000));
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(true)));
+        assert_eq!(msg.reports[1].attribute, Some(0x0007));
+        assert_eq!(
+            msg.reports[1].data,
+            Some(serde_json::json!([{"0": 42, "1": -60}]))
+        );
+    }
+
+    #[test]
+    fn merge_reports_joins_chunked_list_appends() {
+        // msg1: neighbor-table = []（Replace）+ more_chunks
+        // msg2: ListIndex null の追記 IB × 2
+        // → 統合結果は 2 要素の array。
+        fn path(w: &mut Writer, attr: u32, append: bool) {
+            w.start_list(Tag::Context(1));
+            w.put_uint(Tag::Context(2), 0);
+            w.put_uint(Tag::Context(3), 0x0035);
+            w.put_uint(Tag::Context(4), u64::from(attr));
+            if append {
+                w.put_null(Tag::Context(5)); // ListIndex = null → 追記
+            }
+            w.end_container();
+        }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        path(&mut w, 0x0007, false);
+        w.start_array(Tag::Context(2));
+        w.end_container(); // 空 array（replace）
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages
+        w.end_container();
+        let m1 = decode_report_data_message(&w.finish()).unwrap();
+        assert!(m1.more_chunks);
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        for v in [7u64, 8u64] {
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(1));
+            path(&mut w, 0x0007, true);
+            w.put_uint(Tag::Context(2), v); // Data = list item
+            w.end_container();
+            w.end_container();
+        }
+        w.end_container();
+        w.end_container();
+        let m2 = decode_report_data_message(&w.finish()).unwrap();
+        assert_eq!(m2.reports.len(), 2);
+        assert!(m2.reports[0].list_append);
+
+        let merged = merge_reports(&[m1, m2]);
+        assert_eq!(merged, vec![(0x0007, serde_json::json!([7, 8]))]);
+    }
+
+    #[test]
+    fn encode_read_request_cluster_omits_attribute() {
+        let b = encode_read_request_cluster(1, 0x0035);
+        let mut r = Reader::new(&b);
+        let mut saw_attr_tag = false;
+        while let Some(el) = r.next().unwrap() {
+            if el.tag == Tag::Context(4) {
+                saw_attr_tag = true;
+            }
+        }
+        assert!(
+            !saw_attr_tag,
+            "wildcard read must omit the attribute path field"
+        );
+    }
+
+    #[test]
+    fn encode_read_request_cluster_is_fabric_filtered() {
+        // struct{ 0: array[ list{2,3} ], 3: true, 255: 12 } — same top-level
+        // shape as encode_read_request but without the attribute (Context(4))
+        // path field. Depth-track so the AttributePathIB's own Context(3)
+        // (cluster id, a Uint) at depth 3 is never mistaken for the outer
+        // struct's Context(3) (IsFabricFiltered, a Bool) at depth 1.
+        let b = encode_read_request_cluster(1, 0x0035);
+        let mut r = Reader::new(&b);
+        let mut depth = 0i32;
+        let mut found = false;
+        while let Some(el) = r.next().unwrap() {
+            match el.value {
+                Value::ContainerEnd => depth -= 1,
+                Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                    depth += 1;
+                }
+                Value::Bool(b) if el.tag == Tag::Context(3) && depth == 1 => {
+                    found = true;
+                    assert!(
+                        b,
+                        "IsFabricFiltered must be true (matches chip-tool's read default)"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(found, "IsFabricFiltered field not found at top level");
+    }
+
+    #[test]
+    fn tlv_to_json_rejects_pathological_nesting() {
+        // Construct deeply nested TLV (100 levels) to test stack overflow protection.
+        // ArrayStart × 100 without matching ContainerEnd should fail with Malformed
+        // when depth limit (32) is exceeded.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        w.start_list(Tag::Context(1));
+        w.put_uint(Tag::Context(4), 1);
+        w.end_container();
+        // Data (Context(2)) with 100 nested arrays
+        for _ in 0..100 {
+            w.start_array(Tag::Context(2));
+        }
+        for _ in 0..100 {
+            w.end_container();
+        }
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        let err = decode_report_data_message(&w.finish()).unwrap_err();
+        assert!(
+            matches!(err, ImError::Malformed(_)),
+            "Expected Malformed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_request_roundtrip_scalar() {
+        let b = encode_write_request(1, 0x0008, 0x0011, &ImValue::Uint(128));
+        // 形の検証: WriteRequests(2) 配列の中に AttributeDataIB があり、
+        // path(ep=1, cluster=8, attr=0x11) と Data(Context2)=128 を含む。
+        let mut r = Reader::new(&b);
+        let (mut saw_ep, mut saw_data) = (false, false);
+        while let Some(el) = r.next().unwrap() {
+            if el.tag == Tag::Context(2) && el.value == Value::Uint(128) {
+                saw_data = true;
+            }
+            if el.tag == Tag::Context(2) && el.value == Value::Uint(1) {
+                saw_ep = true;
+            }
+        }
+        assert!(saw_ep && saw_data);
+    }
+
+    #[test]
+    fn decode_write_response_returns_first_status() {
+        // WriteResponse { 0: [ AttrStatusIB{0: path, 1: StatusIB{0: 0}} ] }
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(0));
+        w.start_struct(Tag::Anonymous);
+        w.start_list(Tag::Context(0)); // path
+        w.end_container();
+        w.start_struct(Tag::Context(1)); // StatusIB
+        w.put_uint(Tag::Context(0), 0);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        assert_eq!(decode_write_response(&w.finish()).unwrap(), 0);
+    }
+
+    #[test]
+    fn tlv_to_json_skips_noncontext_container_fields_safely() {
+        // Struct with a non-Context (anonymous) container followed by a Context field.
+        // Must safely skip the anonymous struct without misinterpreting the next field.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous); // Data struct
+        w.start_struct(Tag::Anonymous); // Unexpected anonymous child struct
+        w.put_uint(Tag::Context(9), 99); // Some data inside
+        w.end_container(); // End anonymous struct
+        w.put_uint(Tag::Context(0), 7); // Following Context field
+        w.end_container(); // End Data struct
+        let bytes = w.finish();
+
+        // Wrap in a full ReportDataMessage to test via decode_report_data_message
+        let mut full_msg = Writer::new();
+        full_msg.start_struct(Tag::Anonymous);
+        full_msg.start_array(Tag::Context(1)); // AttributeReportIBs
+        full_msg.start_struct(Tag::Anonymous); // AttributeReportIB
+        full_msg.start_struct(Tag::Context(1)); // AttributeDataIB
+        full_msg.put_uint(Tag::Context(0), 1); // DataVersion
+        full_msg.start_list(Tag::Context(1)); // Path
+        full_msg.put_uint(Tag::Context(2), 0);
+        full_msg.put_uint(Tag::Context(3), 0x0006);
+        full_msg.put_uint(Tag::Context(4), 0x0000);
+        full_msg.end_container();
+        // The Data field with mixed anonymous/context tags
+        let mut data_reader = Reader::new(&bytes);
+        let data_el = data_reader.next().unwrap().unwrap();
+        copy_value(
+            &mut full_msg,
+            &mut data_reader,
+            Tag::Context(2),
+            data_el.value,
+        )
+        .expect("valid TLV");
+        full_msg.end_container(); // AttributeDataIB
+        full_msg.end_container(); // AttributeReportIB
+        full_msg.end_container(); // AttributeReportIBs
+        full_msg.end_container(); // outer struct
+
+        let msg = decode_report_data_message(&full_msg.finish()).unwrap();
+        assert_eq!(msg.reports.len(), 1);
+        let data = msg.reports[0].data.as_ref().unwrap();
+        assert_eq!(data.get("0").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    // M8a Task9: group provision デバイス側専用エンコーダ。
+
+    #[test]
+    fn key_set_write_fields_shape() {
+        let f = encode_key_set_write_fields(60, &[0xAB; 16]);
+        let mut r = Reader::new(&f);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        // field 0 = GroupKeySetStruct: {0: 60, 1: 0, 2: "abab..", 3: 1, 4..7: null}
+        assert_eq!(j["0"]["0"], serde_json::json!(60));
+        assert_eq!(j["0"]["1"], serde_json::json!(0));
+        assert_eq!(j["0"]["2"], serde_json::json!("ab".repeat(16)));
+        assert_eq!(j["0"]["3"], serde_json::json!(1));
+        assert!(j["0"]["4"].is_null() && j["0"]["7"].is_null());
+    }
+
+    #[test]
+    fn group_key_map_tlv_is_list_of_structs() {
+        let t = encode_group_key_map_tlv(&[(10, 60), (11, 61)]);
+        let mut r = Reader::new(&t);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!([{"1": 10, "2": 60}, {"1": 11, "2": 61}])
+        );
+    }
+
+    #[test]
+    fn add_group_fields_shape() {
+        let f = encode_add_group_fields(10, "grp10");
+        let mut r = Reader::new(&f);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(j["0"], serde_json::json!(10));
+        assert_eq!(j["1"], serde_json::json!("grp10"));
     }
 }

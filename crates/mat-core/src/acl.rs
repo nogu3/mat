@@ -66,6 +66,14 @@ pub fn group_acl_entry(group_id: u16, fabric_index: u8) -> AclEntry {
 /// ので、弱いエントリの隣に強いエントリを足すのは正当な修復）。fabricIndex は
 /// 既存エントリの先頭から引き継ぐ（read 値をそのまま渡す方針。エントリ 0 件は
 /// 起きない想定だが、その場合は 0 — サーバ側で置換される）。
+///
+/// **前提**: `entries` は fabric-filtered read（IsFabricFiltered=true）で得た
+/// **自 fabric のみ**のエントリである前提（呼び出し元 `mat-native::ops::
+/// ensure_group_acl` が渡す read 結果は `mat-controller::im::
+/// encode_read_request` 経由で常にこれを満たす）。非フィルタの集合を渡すと、
+/// 他 fabric の Group エントリを「付与済み」と誤認して冪等 skip し、自 fabric
+/// に Group ACL が無いまま groupcast が届かなくなる（マルチ admin デバイス、
+/// 例えば jarvis fabric + Home Assistant fabric 併存で顕在化）。
 pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {
     let gid = u64::from(group_id);
     if entries.iter().any(|e| {
@@ -271,6 +279,16 @@ pub fn acl_entries_from_ws_value(value: &Value) -> Result<Vec<AclEntry>, MatErro
         .as_array()
         .ok_or_else(|| MatError::parse_error(format!("ACL ws value is not an array: {value}")))?;
     arr.iter().map(ws_entry).collect()
+}
+
+/// native（IM）直経路の `AccessControlEntryStruct` 列 —— `tlv_to_json` の数値
+/// キー規約（`{1: privilege, 2: authMode, 3: subjects, 4: targets, 254:
+/// fabricIndex}`）から `AclEntry` 列へ。この規約は `acl_entries_from_ws_value`
+/// が読む matd（ws）応答と同一（どちらも同じ IM 数値キー慣習）なので、検証
+/// ロジックを重複させず委譲する。解釈不能なら `ParseError`（read できなければ
+/// write しない既存方針、モジュール冒頭のコメント参照）。
+pub fn entries_from_im_json(v: &Value) -> Result<Vec<AclEntry>, MatError> {
+    acl_entries_from_ws_value(v)
 }
 
 /// TOO ログパーサ（`too_log_unknown_key_inside_entry_is_parse_error` 等）と同じ
@@ -638,6 +656,25 @@ mod tests {
         let v = json!([{"1":5,"2":2,"3":[1],"4":[{"0":6,"1":1,"2":null,"9":1}],"254":1}]);
         let err = acl_entries_from_ws_value(&v).expect_err("unknown target field must fail closed");
         assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    // M8a Task9: native (IM) read の数値キー JSON → AclEntry。ws 値と同一の
+    // 数値キー規約（どちらも tlv_to_json / IM の慣習）なので acl_entries_from_ws_value
+    // にそのまま委譲する。
+
+    #[test]
+    fn entries_from_im_json_maps_numeric_keys() {
+        let v = serde_json::json!([
+            {"1": 5, "2": 2, "3": [112233445566u64], "4": null, "254": 2}
+        ]);
+        let e = entries_from_im_json(&v).unwrap();
+        assert_eq!(e[0].privilege, 5);
+        assert_eq!(e[0].auth_mode, 2);
+        assert_eq!(e[0].subjects, vec![112233445566]);
+        assert!(e[0].targets.is_none());
+        assert_eq!(e[0].fabric_index, 2);
+        // 解釈不能（privilege 欠落）は Err — read できなければ write しない方針の要。
+        assert!(entries_from_im_json(&serde_json::json!([{"2": 2}])).is_err());
     }
 
     /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。

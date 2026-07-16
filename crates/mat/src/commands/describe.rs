@@ -37,14 +37,24 @@ pub fn run(store_path: &Path, node_id: u64) -> Result<(), MatError> {
     let mut out_endpoints = Vec::new();
     for ep in endpoints {
         let clusters = descriptor_list(&chip, node_id, ep, "server-list")?;
-        out_endpoints.push(json!({ "endpoint": ep, "clusters": clusters }));
+        out_endpoints.push((ep, clusters));
     }
 
+    emit_describe_success(node_id, &out_endpoints);
+    Ok(())
+}
+
+/// `describe` の成功 JSON を stdout へ emit する。chip-tool 経路と native 直経路
+/// （`native_direct`）の両方から呼ばれる単一ソース（スキーマ不変）。
+pub(crate) fn emit_describe_success(node_id: u64, endpoints: &[(u16, Vec<u64>)]) {
+    let out_endpoints: Vec<serde_json::Value> = endpoints
+        .iter()
+        .map(|(ep, clusters)| json!({ "endpoint": ep, "clusters": clusters }))
+        .collect();
     output::emit(json!({
         "node_id": node_id,
         "endpoints": out_endpoints,
     }));
-    Ok(())
 }
 
 /// `chip-tool descriptor read <list> <node> <ep>` を実行し ID リストを返す。

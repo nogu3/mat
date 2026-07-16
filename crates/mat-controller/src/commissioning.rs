@@ -1155,6 +1155,16 @@ fn random_valid_passcode() -> u32 {
     }
 }
 
+/// 12-bit discriminator を乱数で引く。`open_commissioning_window` の呼び出し
+/// 元（CLI 未指定時の補完、ライブ E2E ハーネス）が使う共通ヘルパー
+/// （M8a Task8: discriminator は呼び出し側指定になったため、旧来の内部乱数
+/// 生成をここへ切り出した——挙動は不変）。
+pub fn random_discriminator() -> u16 {
+    let mut disc_b = [0u8; 2];
+    getrandom::getrandom(&mut disc_b).expect("os rng");
+    u16::from_le_bytes(disc_b) & 0x0FFF
+}
+
 /// [`open_commissioning_window`] が生成した一時 window の設定コード一式。
 pub struct OpenedWindow {
     pub passcode: u32,
@@ -1169,18 +1179,21 @@ pub struct OpenedWindow {
 /// window を開く。既存の operational CASE セッション上で
 /// `AdministratorCommissioning::OpenCommissioningWindow` を送る——PASE は使
 /// わない（対象デバイスは既にこの fabric にコミッショニング済み）。
+///
+/// `discriminator` / `iterations` は呼び出し側が指定する（M8a Task8:
+/// 直経路 CLI の `--discriminator` / `--iteration` を尊重するため。従来は
+/// 内部で乱数 disc / 固定 1000 を生成していた —— その既定値が要る呼び出し元
+/// は [`random_discriminator`] を使う）。
 pub async fn open_commissioning_window(
     session: &mut SecureSession,
     timeout_s: u16,
+    discriminator: u16,
+    iterations: u32,
     cfg: &MrpConfig,
 ) -> Result<OpenedWindow, CommissionError> {
     let passcode = random_valid_passcode();
-    let mut disc_b = [0u8; 2];
-    getrandom::getrandom(&mut disc_b).expect("os rng");
-    let discriminator = u16::from_le_bytes(disc_b) & 0x0FFF;
     let mut salt = [0u8; 32];
     getrandom::getrandom(&mut salt).expect("os rng");
-    let iterations = 1000u32; // spec §3.9: PBKDF_MINIMUM=1000
     let verifier = crate::spake2p::compute_verifier(passcode, &salt, iterations);
     // OpenCommissioningWindow は timed invoke 必須（spec §11.19.8.1）。
     let resp = session
