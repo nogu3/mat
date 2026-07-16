@@ -4,7 +4,7 @@
 
 **Goal:** `MAT_IFACE` 設定時、`mat commission` が chip-tool を spawn せず native（M6a on-network / M6b BLE+Thread）で完走する（0.20.0）。
 
-**Architecture:** `kvs.rs` に epoch IPK 読み出しを追加 → `CommissioningFabric::from_materials`（既存 fabric への commission を可能にする）→ `mat-native::commission` ラッパー（発見・経路選択・ErrorKind 写像）→ mat 側 `commands/commission.rs` の native 分岐、の4層。BLE は feature `ble` を mat → mat-native → mat-controller に貫通。spec: `docs/superpowers/specs/2026-07-17-phase5-m8c1-commission-native-design.md`。
+**Architecture:** 既定 epoch IPK 定数 + KDF ガード（fabric.rs — epoch は KVS 非永続と上流実証済み）→ `CommissioningFabric::from_materials`（既存 fabric への commission を可能にする）→ `mat-native::commission` ラッパー（発見・経路選択・ErrorKind 写像）→ mat 側 `commands/commission.rs` の native 分岐、の4層。BLE は feature `ble` を mat → mat-native → mat-controller に貫通。spec: `docs/superpowers/specs/2026-07-17-phase5-m8c1-commission-native-design.md`。
 
 **Tech Stack:** Rust (workspace)、bluer (feature ble、cross gnu ビルド)、bash（実機 E2E）。
 
@@ -66,94 +66,86 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: kvs.rs — epoch IPK の所在調査と読み出し
+### Task 2: 既定 epoch IPK 定数 + 実行時ガード（調査済み・設計確定）
 
-**最重要・最リスクのタスク。** 既存 fabric への commission は AddNOC で
-**epoch IPK** をデバイスに渡す必要がある（デバイスが自分で operational を
-KDF 導出する）。現行 `kvs.rs` は `f/<idx>/k/0` keyset blob の第1エントリ鍵を
-**operational** として読んでいる（M5 実機実証: その鍵 + ctx5 の GKH で
-groupcast が通る = 永続鍵は operational）。しかし chip-tool 自身が同じ KVS で
-commission できている以上、**epoch はどこかに永続されているはず**。
+**（2026-07-17 改訂）** 当初の「KVS から epoch を読み出す」は調査の結果
+不成立と確定した（上流 v1.4.2.0: epoch はコンパイル時定数
+`"temporary ipk 01"`（`TestGroupData.h` `DefaultIpkValue::GetDefaultIpk`）で、
+KVS には導出済み operational（`f/<idx>/k/0` ctx6）しか永続されない —
+`.superpowers/sdd/task-2-report.md` に引用あり）。ユーザー承認済みの新方式:
+**定数 + 実行時ガード**。
 
 **Files:**
-- Modify: `crates/mat-controller/src/kvs.rs`
-- （調査用参照のみ）connectedhomeip v1.4.2.0 の
-  `src/credentials/GroupDataProviderImpl.cpp`（`KeySetData` の
-  Serialize/Deserialize と storage key の組み立て）、
-  `src/lib/support/DefaultStorageKeyAllocator.h`（`FabricKeyset` 等の
-  storage key 書式）
+- Modify: `crates/mat-controller/src/fabric.rs`
 
 **Interfaces:**
-- Consumes: 既存 `parse_keyset_first_entry` / `read_self_issue_materials` /
-  `fabric::derive_ipk_operational(epoch, cfid)`。
-- Produces（Task 3 が使う）: `SelfIssueMaterials` に **`pub ipk_epoch:
-  [u8; 16]`** を追加し `read_self_issue_materials` が埋める。
+- Consumes: 既存 `derive_ipk_operational(epoch, cfid)` / `compressed_fabric_id`。
+- Produces（Task 3/4 が使う）:
+  - `pub const CHIP_TOOL_DEFAULT_IPK_EPOCH: [u8; 16]`（fabric.rs）
+  - `pub fn verify_default_ipk_epoch(root_public_key: &[u8; 65], fabric_id: u64, ipk_operational: &[u8; 16]) -> bool`
 
-- [ ] **Step 1: 上流の永続形式を確定する**
+- [ ] **Step 1: 失敗するテストを書く**
 
-connectedhomeip **v1.4.2.0 タグ**のソースで以下を読む（ローカル checkout が
-無ければ GitHub の raw URL を WebFetch/curl で取得。ネットワーク不可なら
-`scripts/gen-ids.py` が使った checkout の残骸を探す）:
-
-1. `DefaultStorageKeyAllocator.h` — `FabricKeyset(fabric, keyset)` が
-   `f/%x/k/%x` であること、他に keyset を持つ storage key が無いか。
-2. `GroupDataProviderImpl.cpp` — `KeySetData::Save/Load` が TLV で何を
-   書くか。**確認ポイント: 永続されるのは epoch キーそのものか、導出済み
-   operational か、両方か**。（既存 `parse_keyset_first_entry` は
-   ctx tag 5 = hash / ctx tag 6 = key を読んでいる — このタグ割当を上流の
-   `TagKey()`/`TagKeyHash()` 等と突き合わせ、**start_time など読んでいない
-   フィールドに epoch が入っていないか**を見る。）
-
-結論を `kvs.rs` の doc コメントに引用付きで固定する（後続が再調査しなくて
-よいように、上流ファイル名・タグ番号を明記）。
-
-- [ ] **Step 2: 失敗するテストを書く**
-
-判明した形式に合わせ、合成 blob でのユニットテストを書く。**自己整合
-チェックを必ず含める**: 合成 blob に epoch と operational の両方が入る形式
-なら、`derive_ipk_operational(epoch, cfid) == operational` が成り立つ
-フィクスチャを組み、リーダが取り出した `ipk_epoch` からの導出が
-`ipk_operational` と一致することを assert（タグの取り違えを構造的に検出
-する）。
+`fabric.rs` の `mod tests` に追記:
 
 ```rust
     #[test]
-    fn self_issue_materials_expose_ipk_epoch_consistent_with_operational() {
-        // 合成 keyset blob（Step 1 で確定した上流形式に従う）から epoch を
-        // 読み出し、operational との KDF 整合を確認する。cfid は
-        // フィクスチャの root 公開鍵 + fabric id から計算する。
-        // （具体的な blob バイト列は Step 1 の確定形式で組む — 既存
-        // parse_keyset 系テストのフィクスチャ構築ヘルパを流用）
-        let m = read_self_issue_materials(&alpha_path, &main_path, 1, 0).unwrap();
-        let cfid = fabric::compressed_fabric_id(&root_public_key, m.fabric_id);
-        assert_eq!(
-            fabric::derive_ipk_operational(&m.ipk_epoch, &cfid),
-            m.ipk_operational
-        );
+    fn default_ipk_epoch_guard_accepts_derived_operational() {
+        // 定数 epoch から導出した operational を持つ fabric はガード通過。
+        let cfid = compressed_fabric_id(&ROOT_PUB, FABRIC_ID);
+        let operational = derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid);
+        assert!(verify_default_ipk_epoch(&ROOT_PUB, FABRIC_ID, &operational));
+    }
+
+    #[test]
+    fn default_ipk_epoch_guard_rejects_foreign_operational() {
+        // 定数由来でない operational（IPK ローテーション済み等）は拒否。
+        assert!(!verify_default_ipk_epoch(&ROOT_PUB, FABRIC_ID, &[0x42; 16]));
     }
 ```
 
-Run: `cargo test -p mat-controller kvs 2>&1 | tail -5` → FAIL（`ipk_epoch`
-フィールド未定義）。
+（`ROOT_PUB` / `FABRIC_ID` は既存テストのフィクスチャ定数を流用。無ければ
+既存 `derives_spec_compressed_fabric_id` テストが使う値を参照。）
 
-- [ ] **Step 3: 実装**
+Run: `cargo test -p mat-controller fabric 2>&1 | tail -3` → FAIL（未定義）。
 
-`SelfIssueMaterials` に `pub ipk_epoch: [u8; 16]` を追加し、
-`read_self_issue_materials` で Step 1 の形式に従って抽出する（`Debug` impl
-は `[REDACTED]` — 既存の秘匿方針に従う）。既存の `ipk_operational` の読みは
-**変更しない**（CASE 経路の回帰ゼロ）。
+- [ ] **Step 2: 実装**
 
-**エスカレーション条件**: Step 1 の調査で「KVS に epoch が存在しない」と
-確定した場合は実装せず **BLOCKED で報告**（既存 fabric への native
-commission の設計前提が崩れるため、コントローラ/ユーザーの設計判断が要る）。
+`fabric.rs` に追加（`derive_ipk_operational` の近く）:
 
-- [ ] **Step 4: テスト + Commit**
+```rust
+/// chip-tool（connectedhomeip）の既定 IPK **epoch** 鍵。
+///
+/// 上流 v1.4.2.0 `src/lib/support/TestGroupData.h`
+/// `DefaultIpkValue::GetDefaultIpk` の値 = ASCII "temporary ipk 01"。
+/// chip-tool は epoch を KVS に永続せず、commissioner 初期化のたびに
+/// この定数を投入して operational へ導出・永続する（`f/<idx>/k/0` ctx6）。
+/// よって chip-tool が作った fabric の epoch は常にこの値 — ただし盲信は
+/// せず、使用前に必ず [`verify_default_ipk_epoch`] で per-fabric 検証する。
+pub const CHIP_TOOL_DEFAULT_IPK_EPOCH: [u8; 16] = *b"temporary ipk 01";
+
+/// この fabric の epoch IPK が chip-tool 既定定数であることを、KVS の
+/// 導出済み operational との KDF 一致で検証する。一致 = AddNOC に
+/// [`CHIP_TOOL_DEFAULT_IPK_EPOCH`] を使ってよいことの数学的証明。
+/// 不一致（非 chip-tool fabric / IPK ローテーション済み）なら native
+/// commission は引き受けず chip-tool にフォールバックさせること。
+pub fn verify_default_ipk_epoch(
+    root_public_key: &[u8; 65],
+    fabric_id: u64,
+    ipk_operational: &[u8; 16],
+) -> bool {
+    let cfid = compressed_fabric_id(root_public_key, fabric_id);
+    derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid) == *ipk_operational
+}
+```
+
+- [ ] **Step 3: テスト + Commit**
 
 ```bash
-cargo fmt && cargo test -p mat-controller kvs 2>&1 | tail -5
+cargo fmt && cargo test -p mat-controller fabric 2>&1 | tail -3
 cargo clippy -p mat-controller --all-targets -- -D warnings 2>&1 | tail -3
-git add crates/mat-controller/src/kvs.rs
-git commit -m "feat(mat-controller): kvs から epoch IPK を読み出す（既存fabricへのAddNOCに必須） (M8c-1 Task2)
+git add crates/mat-controller/src/fabric.rs
+git commit -m "feat(mat-controller): chip-tool既定epoch IPK定数+KDFガード（epochはKVS非永続と上流実証） (M8c-1 Task2)
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -166,9 +158,11 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Modify: `crates/mat-controller/src/commissioning.rs`
 
 **Interfaces:**
-- Consumes: `SelfIssueMaterials`（Task 2 で `ipk_epoch` 追加済み）。
+- Consumes: `SelfIssueMaterials`（無変更）+ Task 2 の epoch 定数。
 - Produces（Task 4 が使う）:
-  `impl CommissioningFabric { pub fn from_materials(m: kvs::SelfIssueMaterials) -> Self }`
+  `impl CommissioningFabric { pub fn from_materials(m: kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self }`
+  （epoch は KVS に無いため引数で受ける — 呼び出し側が Task 2 のガード通過後に
+  `CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡す）
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -181,11 +175,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
             rcac: vec![0x15, 0x01, 0x02],
             root_private_key: [7u8; 32],
             ipk_operational: [8u8; 16],
-            ipk_epoch: [9u8; 16],
             node_id: 0xAA55,
             fabric_id: 0xFAB2,
         };
-        let f = CommissioningFabric::from_materials(m);
+        let f = CommissioningFabric::from_materials(m, [9u8; 16]);
         assert_eq!(f.rcac_tlv, vec![0x15, 0x01, 0x02]);
         assert_eq!(f.fabric_id, 0xFAB2);
         assert_eq!(f.ipk_epoch, [9u8; 16]);
@@ -207,15 +200,17 @@ Run: `cargo test -p mat-controller commissioning_fabric_from 2>&1 | tail -3`
 ```rust
     /// chip-tool KVS の自己発行資材から、**既存 fabric** 上で commissioning
     /// するための CommissioningFabric を組む。`generate`（新規 fabric）と
-    /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は epoch 側
-    /// （`m.ipk_epoch`）— operational を渡すとデバイス側の KDF 導出が
-    /// 二重になり CASE が壊れる。
-    pub fn from_materials(m: crate::kvs::SelfIssueMaterials) -> Self {
+    /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は **epoch** 側 —
+    /// operational を渡すとデバイス側の KDF 導出が二重になり CASE が壊れる。
+    /// epoch は KVS に永続されない（chip-tool は既定定数を毎回投入）ため
+    /// 引数で受ける。呼び出し側は `fabric::verify_default_ipk_epoch` の
+    /// ガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡すこと。
+    pub fn from_materials(m: crate::kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self {
         Self {
             rcac_tlv: m.rcac,
             root_private_key: m.root_private_key,
             fabric_id: m.fabric_id,
-            ipk_epoch: m.ipk_epoch,
+            ipk_epoch,
             admin_node_id: m.node_id,
         }
     }
@@ -459,7 +454,31 @@ pub async fn commission(
         Ok(m) => m,
         Err(e) => return Ok(CommissionAttempt::Unavailable(format!("kvs: {e}"))),
     };
-    let fabric = CommissioningFabric::from_materials(materials);
+    // epoch IPK ガード（Task 2）: この fabric の epoch が chip-tool 既定
+    // 定数であることを、KVS の導出済み operational との KDF 一致で検証。
+    // 不一致（非 chip-tool fabric / IPK ローテーション済み）は native では
+    // 引き受けない。root 公開鍵が要るため一度 FabricCredentials を組む
+    // （SelfIssueMaterials が Clone でなければ read をもう一度呼ぶ — INI の
+    // 再読みは安価）。
+    let creds = match mat_controller::fabric::FabricCredentials::from_self_issued(
+        /* materials 相当（Clone or 再読） */
+    ) {
+        Ok(c) => c,
+        Err(e) => return Ok(CommissionAttempt::Unavailable(format!("self-issue: {e}"))),
+    };
+    if !mat_controller::fabric::verify_default_ipk_epoch(
+        &creds.root_public_key,
+        creds.fabric_id,
+        &creds.ipk_operational,
+    ) {
+        return Ok(CommissionAttempt::Unavailable(
+            "fabric IPK is not the chip-tool default epoch; native commission unsupported until M8c-3".into(),
+        ));
+    }
+    let fabric = CommissioningFabric::from_materials(
+        materials,
+        mat_controller::fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH,
+    );
 
     // 発見と経路選択（mDNS → BLE）。
     let (passcode, target) = match code {
