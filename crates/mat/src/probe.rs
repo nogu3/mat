@@ -58,6 +58,11 @@ pub fn mdns(native: Option<NativeProbe<'_>>) -> Result<Vec<MatterInstance>, MatE
 fn resolve_ledger_nodes(
     p: &NativeProbe<'_>,
 ) -> Result<Vec<MatterInstance>, Box<dyn std::error::Error>> {
+    // 台帳が空なら何も解決しない（KVS も socket も不要）。
+    if p.node_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
     let scope_id = dnssd::iface_index(p.iface)?;
 
     let materials = kvs::read_self_issue_materials(
@@ -68,10 +73,6 @@ fn resolve_ledger_nodes(
     )?;
     let creds = fabric::FabricCredentials::from_self_issued(materials)?;
     let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
-
-    if p.node_ids.is_empty() {
-        return Ok(vec![]);
-    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

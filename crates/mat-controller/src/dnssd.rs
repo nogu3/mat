@@ -922,6 +922,7 @@ impl BrowseFold {
     fn known_answers(&self) -> Vec<(String, u32)> {
         self.instances
             .iter()
+            .filter(|(_, f)| f.ttl != 0) // TTL 0 は goodbye — KA に載せない（RFC 6762）。
             .map(|(name, f)| (name.clone(), f.ttl))
             .collect()
     }
