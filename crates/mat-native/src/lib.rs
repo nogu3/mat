@@ -21,6 +21,7 @@ use mat_core::error::{ErrorKind, MatError};
 pub mod commission;
 pub mod group;
 pub mod group_settings;
+pub mod iface_select;
 pub mod ops;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
