@@ -761,47 +761,62 @@ async fn group_provision(
 
     let epoch_key = resolve_epoch_key(epoch_key.as_deref())?;
 
-    // 1) コントローラ側 group state（ローカル操作、ネットワーク不要、常に chip-tool）。
-    group_step(
-        backend,
-        &format!("groupsettings add-group {name} {group_id}"),
-    )
-    .await?;
-    // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
-    // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
-    // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
-    // EPOCH_START_TIME（=デバイス側 epochStartTime0）と一致させる。実機 E2E で確定。
-    group_step(
-        backend,
-        &format!(
-            "groupsettings add-keysets {keyset_id} {KEY_SECURITY_POLICY} {EPOCH_START_TIME} hex:{epoch_key}"
-        ),
-    )
-    .await?;
-    if *rebind {
-        // 既存グループの keyset binding を解除してから bind し直す（issue #5）。
-        // best-effort: 「未 bind なのに unbind」を区別せず失敗を無視する（unbind が
-        // 本当に必要で失敗したケースは直後の bind-keyset が従来どおり落ちるので、
-        // 検知はそちらに委ねる）。
-        if let Err(e) = group_step(
+    // 1) コントローラ側 group state。native の KVS 書込資材（M8c-2）があれば
+    //    chip-tool を介さず直接書く。無ければ従来どおり chip-tool ws（M8a まで
+    //    のハイブリッド形 — native 無効時・テスト注入時）。
+    let native_gs = native.and_then(|n| n.group_settings_ctx());
+    if let Some(gs) = native_gs {
+        let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key)?;
+        mat_native::group_settings::write_group_provision(
+            gs,
+            *group_id,
+            *keyset_id,
+            name,
+            &epoch_key_bytes,
+            *rebind,
+        )?;
+    } else {
+        group_step(
             backend,
-            &format!("groupsettings unbind-keyset {group_id} {keyset_id}"),
+            &format!("groupsettings add-group {name} {group_id}"),
         )
-        .await
-        {
-            tracing::debug!(
-                group_id,
-                keyset_id,
-                error = %e.detail,
-                "groupsettings unbind-keyset failed; ignored (best-effort rebind)"
-            );
+        .await?;
+        // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
+        // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
+        // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
+        // EPOCH_START_TIME（=デバイス側 epochStartTime0）と一致させる。実機 E2E で確定。
+        group_step(
+            backend,
+            &format!(
+                "groupsettings add-keysets {keyset_id} {KEY_SECURITY_POLICY} {EPOCH_START_TIME} hex:{epoch_key}"
+            ),
+        )
+        .await?;
+        if *rebind {
+            // 既存グループの keyset binding を解除してから bind し直す（issue #5）。
+            // best-effort: 「未 bind なのに unbind」を区別せず失敗を無視する（unbind が
+            // 本当に必要で失敗したケースは直後の bind-keyset が従来どおり落ちるので、
+            // 検知はそちらに委ねる）。
+            if let Err(e) = group_step(
+                backend,
+                &format!("groupsettings unbind-keyset {group_id} {keyset_id}"),
+            )
+            .await
+            {
+                tracing::debug!(
+                    group_id,
+                    keyset_id,
+                    error = %e.detail,
+                    "groupsettings unbind-keyset failed; ignored (best-effort rebind)"
+                );
+            }
         }
+        group_step(
+            backend,
+            &format!("groupsettings bind-keyset {group_id} {keyset_id}"),
+        )
+        .await?;
     }
-    group_step(
-        backend,
-        &format!("groupsettings bind-keyset {group_id} {keyset_id}"),
-    )
-    .await?;
 
     // native 有効時は、デバイス側 4 ステップ共通の epoch key バイト列を
     // 1 回だけ用意する（ループ内で毎回 hex デコードしない）。
@@ -882,14 +897,22 @@ async fn group_provision(
         }
     }
 
-    Ok(json!({
+    let mut body = json!({
         "group_id": group_id,
         "keyset_id": keyset_id,
         "name": name,
         "endpoint": endpoint,
         "nodes": node_ids,
         "status": "provisioned",
-    }))
+    });
+    if native_gs.is_some() {
+        // matd 自身の warm chip-tool は古い group 状態をメモリに持ったまま —
+        // fallback op が chip-tool に流れる構成なら再起動で再読込させる。
+        body["note"] = json!(
+            "controller group state written natively to kvs; if matd is running, restart it to reload group state"
+        );
+    }
+    Ok(body)
 }
 
 /// group provision の 1 ステップ。失敗（results 内エラー）なら分類して返す。
@@ -1636,6 +1659,39 @@ mod tests {
         port
     }
 
+    /// controller 側 group state が native KVS 書込へ渡った場合、groupsettings
+    /// 系の ws コマンドが一切飛ばないことを検証する fake ws。groupsettings 行を
+    /// 受信したら panic する（native ctx 有効時はデバイス側コマンドも native 経由
+    /// になるため、本来このソケットには一切トラフィックが来ない — 来た場合は
+    /// テストを確実に失敗させる）。
+    async fn spawn_fake_ws_failing_on_groupsettings() -> u16 {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut ws = accept_async(stream).await.unwrap();
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if let Message::Text(line) = msg {
+                            assert!(
+                                !line.starts_with("groupsettings "),
+                                "groupsettings ws command sent despite native group_settings_ctx being present: {line}"
+                            );
+                            let resp = json!({ "cmd": line, "results": [], "logs": [] });
+                            ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
     /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
     /// JSON（空リスト／管理者エントリのみ）を返す scripted `FakeConn` を確立する
     /// establisher（`ops.rs` の `provision_node_runs_steps_in_order` と同じ
@@ -1683,6 +1739,45 @@ mod tests {
             .unwrap();
         assert_eq!(body["status"], "provisioned");
         assert_eq!(body["nodes"], json!([1]));
+    }
+
+    /// M8c-2 Task6: native group_settings_ctx がある場合、controller 側 group
+    /// state は chip-tool ws（groupsettings 系）を一切経由せず native KVS に直接
+    /// 書かれる。デバイス側は従来どおり native（ScriptedEstablisher）。ws に
+    /// groupsettings 行が飛べば fake ws が panic し、テストが失敗する。
+    #[tokio::test]
+    async fn group_provision_writes_controller_state_natively_when_ctx_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let gs = mat_native::group_settings::GroupSettingsCtx {
+            main_ini: ini.clone(),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        };
+        let native = NativeBackend::with_parts_gs(Box::new(ScriptedEstablisher), None, Some(gs));
+
+        let port = spawn_fake_ws_failing_on_groupsettings().await;
+        let backend = ChipToolBackend::connect(port, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        let (_dir2, store_path) = make_store();
+        let op = Op::GroupProvision {
+            group_id: 99,
+            node_ids: vec![1],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        };
+        let body = group_provision(&op, &backend, Some(&native), &store_path)
+            .await
+            .unwrap();
+        assert_eq!(body["status"], "provisioned");
+        assert!(body["note"].as_str().unwrap().contains("restart"), "{body}");
+        assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
     }
 
     #[tokio::test]
