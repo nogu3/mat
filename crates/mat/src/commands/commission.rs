@@ -160,7 +160,7 @@ fn record_success(
 
 /// 偶数桁の hex 文字列 → bytes。
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) || s.is_empty() {
+    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -238,6 +238,12 @@ mod tests {
     #[test]
     fn decode_hex_parses_valid_bytes() {
         assert_eq!(decode_hex("0e08"), Some(vec![0x0e, 0x08]));
+    }
+
+    #[test]
+    fn decode_hex_rejects_non_ascii_without_panicking() {
+        // 偶数バイト長の非ASCII（"aéa" = 4バイト）でも panic せず None。
+        assert_eq!(decode_hex("aéa"), None);
     }
 
     #[test]
