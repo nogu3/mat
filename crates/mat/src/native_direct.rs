@@ -1059,7 +1059,7 @@ pub(crate) fn diag_im_probe(
 }
 
 async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> DiagImProbe {
-    use mat_core::ids::resolve_attribute;
+    use mat_core::ids::{resolve_attribute, resolve_cluster};
     // cfid は build 済みエンジンでは常に Some（with_parts 注入時のみ呼び出し側が保証）。
     let cfid = engine
         .group_settings
@@ -1068,47 +1068,27 @@ async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> Di
         .expect("built engine always carries group_settings");
     let self_cfid = format!("{:016X}", u64::from_be_bytes(cfid));
 
-    const CLUSTER_DESCRIPTOR: u32 = 0x001D;
-    const ATTR_PARTS_LIST: u32 = 0x0003;
-    const CLUSTER_THREAD_DIAG: u32 = 0x0035;
+    // descriptor / parts-list は mat-core::ids 表から解決する（プロトコル知識を
+    // 重複ハードコードしない）。表に無ければここで Other へフォールバックする —
+    // 現行の名前表には常に載っているため通常到達しない。
+    let descriptor_parts =
+        resolve_cluster("descriptor").zip(resolve_attribute(0x001D, "parts-list").map(|a| a.id));
 
     let (resolved, op_kind, thread) = match engine.establisher.establish(node_id).await {
         Err(e) => (false, Some(e.kind), Err(e.kind)),
         Ok(mut conn) => {
-            let op = conn.read_json(0, CLUSTER_DESCRIPTOR, ATTR_PARTS_LIST).await;
-            let (resolved, op_kind) = match op {
-                Ok(_) => (true, None),
-                Err(e) => (false, Some(e.kind)),
-            };
-            let nt_attr = resolve_attribute(CLUSTER_THREAD_DIAG, "neighbor-table").map(|a| a.id);
-            let rr_attr = resolve_attribute(CLUSTER_THREAD_DIAG, "routing-role").map(|a| a.id);
-            let thread = match nt_attr {
-                None => Err(mat_core::error::ErrorKind::Other),
-                Some(id) => match conn.read_json(endpoint, CLUSTER_THREAD_DIAG, id).await {
-                    Err(e) => Err(e.kind),
-                    Ok(v) => {
-                        let rows = v.as_array().cloned().unwrap_or_default();
-                        // struct のキーは field id の10進文字列（"5" = Lqi）。
-                        let best_lqi = rows
-                            .iter()
-                            .filter_map(|r| r.get("5").and_then(serde_json::Value::as_u64))
-                            .map(|v| v as u8)
-                            .max();
-                        let routing_role = match rr_attr {
-                            None => None,
-                            Some(id) => conn
-                                .read_json(endpoint, CLUSTER_THREAD_DIAG, id)
-                                .await
-                                .ok()
-                                .and_then(|v| v.as_i64()),
-                        };
-                        Ok(mat_core::diag::ThreadCheck {
-                            neighbor_count: rows.len(),
-                            best_lqi,
-                            routing_role,
-                        })
-                    }
+            let (resolved, op_kind) = match descriptor_parts {
+                None => (false, Some(mat_core::error::ErrorKind::Other)),
+                Some((cluster, attr)) => match conn.read_json(0, cluster, attr).await {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(e.kind)),
                 },
+            };
+            // thread シグナルの field-id 知識（NEIGHBOR_TABLE_FIELDS 等）は
+            // mat-native::ops に閉じている（CLAUDE.md 設計ルール1）。
+            let thread = match mat_native::ops::diag_thread(&mut *conn, endpoint).await {
+                Err(e) => Err(e.kind),
+                Ok(snap) => mat_native::ops::thread_check_from_snapshot(&snap).map_err(|e| e.kind),
             };
             (resolved, op_kind, thread)
         }
@@ -1632,8 +1612,11 @@ mod tests {
 
     /// `diag_im_with_engine` の scripted establisher: parts-list（descriptor,
     /// ep0）は既定応答（`FakeConn` の未登録フォールバック `json!(1)`）で
-    /// resolved=true になる。neighbor-table（0x0035/0x0007, ep1）だけ
-    /// 構造体配列で明示応答し、best_lqi を検証可能にする。
+    /// resolved=true になる。thread シグナルは `mat_native::ops::diag_thread`
+    /// 経由（`read_cluster` の wildcard read 1発）に変わったため、
+    /// neighbor-table（0x0035/0x0007, ep1）は `with_cluster` で構造体配列を
+    /// 明示応答する（field id "5" = Lqi、ops.rs の `NEIGHBOR_TABLE_FIELDS` で
+    /// 改名される）。
     struct ScriptedImEstablisher;
     #[async_trait::async_trait]
     impl mat_native::Establisher for ScriptedImEstablisher {
@@ -1642,11 +1625,10 @@ mod tests {
             _node_id: u64,
         ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
             use mat_native::test_support::FakeConn;
-            Ok(Box::new(FakeConn::scripted().with_read(
+            Ok(Box::new(FakeConn::scripted().with_cluster(
                 1,
                 0x0035,
-                0x0007,
-                serde_json::json!([{"5": 200}, {"5": 100}]),
+                vec![(0x0007, serde_json::json!([{"5": 200}, {"5": 100}]))],
             )))
         }
     }
