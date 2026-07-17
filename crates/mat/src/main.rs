@@ -62,10 +62,24 @@ fn main() -> ExitCode {
         matd_client::Route::Direct => {}
     }
 
-    // native 直経路（M7）: MAT_IFACE 設定時、対象 op なら mat-controller で
-    // in-process 実行。None は chip-tool 直へフォールスルー。
-    let native_cfg = args.iface.as_deref().map(|iface| native_direct::Config {
-        iface,
+    // native 直経路: MAT_IFACE 設定時はその iface、未設定なら自動検出
+    // （M8c-3 native 既定化）。自動検出の候補 0 / 複数はハードエラー
+    // （chip-tool へ黙って落とさない — spec 設計 3）。
+    let iface_owned: String = match &args.iface {
+        Some(i) => i.clone(),
+        None => match mat_native::iface_select::autodetect() {
+            Ok(i) => {
+                tracing::info!(iface = %i, "iface auto-selected (native default)");
+                i
+            }
+            Err(e) => {
+                e.emit();
+                return ExitCode::from(e.kind.exit_code());
+            }
+        },
+    };
+    let native_cfg = Some(native_direct::Config {
+        iface: &iface_owned,
         fabric_index: args.fabric_index,
         issuer_index: args.issuer_index,
     });
