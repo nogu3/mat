@@ -1368,7 +1368,7 @@ impl CommissioningFabric {
 /// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
 /// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
 /// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
-/// | `Discovery(_)`                                           | 通常はワイヤ未接触 —`mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない。PASE 開始後の稀な発生（`commission_on_network` の pre-resolve と PASE の間で対象が消える競合）だけ呼び出し側が個別に `unreachable` へ override する | 5 (override 時) |
+/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない | ―     |
 /// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
 /// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
 ///
