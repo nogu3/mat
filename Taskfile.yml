@@ -157,6 +157,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m8c1-real.sh
 
+  e2e:m8c2:real:
+    desc: "M8c-2 実機 E2E: native groupsettings KVS書込 + diag node (要 jarvis + MAT_E2E_HOST)"
+    cmds:
+      - bash scripts/e2e-m8c2-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:

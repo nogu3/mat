@@ -20,6 +20,7 @@ use mat_core::error::{ErrorKind, MatError};
 
 pub mod commission;
 pub mod group;
+pub mod group_settings;
 pub mod ops;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -152,6 +153,7 @@ pub trait Establisher: Send + Sync {
 pub struct Engine {
     pub establisher: Box<dyn Establisher>,
     pub group: Option<group::GroupCtx>,
+    pub group_settings: Option<group_settings::GroupSettingsCtx>,
 }
 
 /// 手動 `Debug`: `Box<dyn Establisher>` / group ctx は `Debug` を持たず、
@@ -203,6 +205,12 @@ impl Engine {
         // establisher に creds/transport を move する前に、group 送信に要る値を控える。
         let fabric_id = creds.fabric_id;
         let node_id = creds.node_id;
+        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+        let group_settings = group_settings::GroupSettingsCtx {
+            main_ini: main_ini.clone(),
+            fabric_index: cfg.fabric_index,
+            cfid,
+        };
         let transport = Arc::new(transport);
         let group = group::GroupCtx {
             main_ini,
@@ -223,12 +231,21 @@ impl Engine {
             transport: Arc::new(Transport::Udp(Arc::clone(&transport))),
             scope_id,
         };
-        Ok(Self::with_parts(Box::new(establisher), Some(group)))
+        Ok(Self {
+            establisher: Box::new(establisher),
+            group: Some(group),
+            group_settings: Some(group_settings),
+        })
     }
 
-    /// テスト用: 任意の Establisher / group ctx を注入する。
+    /// テスト用: 任意の Establisher / group ctx を注入する。group_settings は
+    /// None（テストは pub フィールドへ直接代入して注入する）。
     pub fn with_parts(establisher: Box<dyn Establisher>, group: Option<group::GroupCtx>) -> Self {
-        Self { establisher, group }
+        Self {
+            establisher,
+            group,
+            group_settings: None,
+        }
     }
 }
 

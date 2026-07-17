@@ -927,9 +927,10 @@ checksum = "baee0bbc17ce759db233beb01648088061bf678383130602a298e6998eedb2d8"
 
 [[package]]
 name = "mat"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "mat-controller",
  "mat-core",
@@ -944,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "mat-controller"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "aes",
  "base64ct",
@@ -961,6 +962,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -968,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "mat-core"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -981,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "mat-native"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -1004,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "matd"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
