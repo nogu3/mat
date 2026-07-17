@@ -1685,8 +1685,15 @@ mod tests {
     #[tokio::test]
     async fn open_window_runs_via_fake_and_emits_codes() {
         // fake 経由で run_op(OpenWindow) が establish → open_window → emit まで
-        // 完走することを確認する（emit 先の stdout 内容そのものは
-        // `emit_open_window_success` の既存ユニットテストで担保済み）。
+        // 完走することを確認する。`emit_open_window_success` は `println!`
+        // ベース（`mat_core::output::emit`）で戻り値を返さないため、この
+        // ユニットテストでは「最後まで panic/Err せず走り切ること」までを
+        // 保証する（stdout の実際の JSON 内容は、これまで chip-tool 統合
+        // テストの `open_window_returns_codes` が担っていたが、M8c-3 Task3
+        // で chip-tool のダミー実行体ごと撤去した。プロセス stdout を安全に
+        // キャプチャする手段が無い（`#[test]` は並行実行され、生 fd
+        // リダイレクトは他テストの出力を巻き込む）ため、ここでは完走のみを
+        // 保証する — 詳細は Task3 の報告を参照）。
         use mat_native::test_support::FakeEstablisher;
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(
@@ -1700,5 +1707,84 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── M8c-3 Task3: read/write/invoke/describe の run_op 完走確認 ──────────
+    //
+    // これまで chip-tool 統合テスト（`read_parses_value` / `write_reports_success`
+    // / `invoke_reports_success` / `describe_lists_endpoints_and_clusters`）が
+    // 担っていた「成功系が最後まで走ること」の代替。stdout の JSON 内容自体は
+    // `emit_read_success` 等が `println!` 直書き（戻り値なし）で、プロセス
+    // stdout を安全にキャプチャする手段がこのテストバイナリに無いため検証
+    // できない（`open_window_runs_via_fake_and_emits_codes` のコメント参照）。
+    // ここでは `classify()` が実際に出す `NativeOp`（＝本番と同じ cluster/
+    // attribute の数値解決）をそのまま `run_op` に通し、`FakeConn` 応答で
+    // 最後まで `Ok(RunOutcome::Done)` になることを保証する。
+
+    #[tokio::test]
+    async fn run_op_read_attr_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let read = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into(),
+        };
+        let op = classify(&read).expect("levelcontrol/current-level resolves natively");
+        assert!(matches!(op, NativeOp::ReadAttr { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let outcome = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn run_op_write_attr_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let write = Command::Write {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "on-level".into(),
+            value: "128".into(),
+        };
+        let op = classify(&write).expect("levelcontrol/on-level resolves natively");
+        assert!(matches!(op, NativeOp::WriteAttr { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let outcome = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn run_op_invoke_generic_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let inv = Command::Invoke {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            command: "move-to-level".into(),
+            args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+        };
+        let op = classify(&inv).expect("levelcontrol/move-to-level resolves natively");
+        assert!(matches!(op, NativeOp::InvokeGeneric { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let outcome = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn run_op_describe_completes_via_native() {
+        use mat_core::alias::NodeRef;
+        use mat_native::test_support::FakeEstablisher;
+        let describe = Command::Describe {
+            node_id: NodeRef::Id(5),
+        };
+        let op = classify(&describe).expect("describe is native");
+        assert!(matches!(op, NativeOp::Describe { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let outcome = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Done));
     }
 }

@@ -1,5 +1,14 @@
-//! matd 自動発見の統合テスト。fake matd（tmp の UnixListener）と fake chip-tool で
-//! 経路選択（自動 / MAT_MATD=0 / stale socket / 非対応 op）を検証する。実 matd 不要。
+//! matd 自動発見の統合テスト。fake matd（tmp の UnixListener）で経路選択
+//! （自動 / MAT_MATD=0 / stale socket / 非対応 op）を検証する。実 matd も
+//! chip-tool も不要（M8c-3 Task3: chip-tool ダミー実行体への依存を撤去）。
+//!
+//! matd 経由で完結する経路（`auto_routes_*`）は `matd_client::dispatch_auto`
+//! が op 交換直後に応答を返すため、そもそも native/chip-tool 直経路に
+//! 到達しない。直経路へフォールバックする経路（`auto_falls_back_*` /
+//! `mat_matd_zero_forces_direct_even_with_live_matd`）は、未 commission な
+//! node（99）への `read` を使い、「直経路に落ちて `Store::require_node` まで
+//! 到達した」ことを exit 11 で確認する（backend 成功までは要らない —
+//! backend 成功系の JSON は `native_direct.rs` のユニットテスト側の責務）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -10,18 +19,13 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn fake_chip_tool() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("fake-chip-tool.sh")
-}
-
 /// 自動検出モード（MAT_MATD 未設定）の mat。probe 先は MAT_MATD_SOCKET で tmp に
-/// 固定し、開発機で実 matd が動いていても拾わないようにする。
+/// 固定し、開発機で実 matd が動いていても拾わないようにする。`MAT_IFACE=lo` は
+/// `crates/mat/tests/integration.rs` の `mat()` と同じ理由（Task4 の native
+/// 既定化に向けた決定性の固定）。
 fn mat_auto(store: &Path, socket: &Path) -> Command {
     let mut c = Command::cargo_bin("mat").unwrap();
-    c.env("MAT_CHIP_TOOL_BIN", fake_chip_tool())
+    c.env("MAT_IFACE", "lo")
         .env("MAT_MATD_SOCKET", socket)
         .env_remove("MAT_MATD")
         .arg("--store")
@@ -29,31 +33,15 @@ fn mat_auto(store: &Path, socket: &Path) -> Command {
     c
 }
 
-/// 直経路（MAT_MATD=0）の mat。ストア準備用。
-fn mat_direct(store: &Path) -> Command {
-    let mut c = Command::cargo_bin("mat").unwrap();
-    c.env("MAT_CHIP_TOOL_BIN", fake_chip_tool())
-        .env("MAT_MATD", "0")
-        .arg("--store")
-        .arg(store);
-    c
-}
-
-/// fake chip-tool 直経路で node 5 を commission 済みにしたストア。
+/// node 5 が commission 済みのストアを直接構築する（chip-tool を経由しない —
+/// `mat_core::store::Store` の `nodes.json` スキーマに直接書く）。
 fn store_with_node5() -> TempDir {
     let store = TempDir::new().unwrap();
-    mat_direct(store.path())
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-            "--node",
-            "5",
-        ])
-        .assert()
-        .success();
+    std::fs::write(
+        store.path().join("nodes.json"),
+        r#"{"version":1,"nodes":{"5":{"node_id":5,"address":"192.0.2.10","commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
+    )
+    .unwrap();
     store
 }
 
@@ -95,7 +83,8 @@ fn auto_routes_to_live_matd() {
         .success()
         .stdout(predicate::str::contains("\"via\":\"fake-matd\""));
 
-    // fake matd に read op が届いている（= matd 経路で実行された）。
+    // fake matd に read op が届いている（= matd 経由で実行された。native/
+    // chip-tool 直経路には触れていない）。
     let req = matd.join().unwrap();
     assert!(req.contains("\"op\":\"read\""), "request line: {req}");
 }
@@ -145,24 +134,26 @@ fn auto_routes_color_with_converted_values() {
 
 #[test]
 fn auto_falls_back_when_socket_missing() {
+    // socket を bind しない = 接続失敗 → 直経路へフォールバック。node 99 は
+    // 台帳に無いので、直経路（native 直 or 旧 chip-tool 経路のどちらでも
+    // 共通）の require_node で exit 11 になる — chip-tool 成功応答は要らない。
     let store = store_with_node5();
     let dir = TempDir::new().unwrap();
-    let socket = dir.path().join("matd.sock"); // bind しない = 存在しないパス
+    let socket = dir.path().join("matd.sock");
 
     mat_auto(store.path(), &socket)
         .args([
             "read",
             "--node",
-            "5",
+            "99",
             "--cluster",
             "onoff",
             "--attribute",
             "on-off",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
 }
 
 #[test]
@@ -178,15 +169,15 @@ fn auto_falls_back_on_stale_socket() {
         .args([
             "read",
             "--node",
-            "5",
+            "99",
             "--cluster",
             "onoff",
             "--attribute",
             "on-off",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""));
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
 }
 
 #[test]
@@ -201,30 +192,35 @@ fn mat_matd_zero_forces_direct_even_with_live_matd() {
         .args([
             "read",
             "--node",
-            "5",
+            "99",
             "--cluster",
             "onoff",
             "--attribute",
             "on-off",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"))
         .stdout(predicate::str::contains("fake-matd").not());
 }
 
 #[test]
 fn auto_keeps_unsupported_ops_on_direct_path() {
-    let store = TempDir::new().unwrap(); // discover は空ストアで動く
+    // open-window は matd 非対応 op（discover / commission / open-window /
+    // diag と同じ扱い、`crates/mat/src/matd_client.rs` の `to_op()` 参照）。
+    // 生きた listener を用意しても probe されないはず（probe されると backlog
+    // に接続だけ成功し応答待ちでハングしてテストが失敗する）。node 99 は
+    // 台帳に無いので、直経路に落ちたことは require_node の exit 11 で確認する
+    // （バックエンド成功可否には依存しない — 環境の mDNS/multicast 可否で
+    // 結果が揺れないようにするため、discover ではなくこちらを使う）。
+    let store = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();
     let socket = dir.path().join("matd.sock");
-    // 生きた listener。自動モードでも discover は probe されず直経路のはず
-    // （probe されると backlog に接続だけ成功し応答待ちでハングしてテストが失敗する）。
     let _listener = UnixListener::bind(&socket).unwrap();
 
     mat_auto(store.path(), &socket)
-        .arg("discover")
+        .args(["open-window", "--node", "99"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"devices\""));
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
 }

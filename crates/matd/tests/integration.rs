@@ -887,9 +887,10 @@ async fn recv_failure_is_not_retried_and_recovers_lazily() {
     assert_eq!(log.lock().await.len(), 2);
 }
 
-/// Spawn モード検証用の fake chip-tool（寝るだけのシェルスクリプト）を用意し、
-/// MAT_CHIP_TOOL_BIN に設定する。ws は fake サーバが別途待ち受けるので、子は引数を
-/// 無視して寝ていればよい。
+/// Spawn モード検証用の子プロセス実行体（寝るだけのシェルスクリプト）を
+/// 用意し、`MAT_CHIP_TOOL_BIN` に設定する。ws は fake サーバが別途待ち受ける
+/// ので、子は引数を無視して寝ていればよい（PID 生存/respawn の検証にしか
+/// 使わない — この子の stdout/stderr は一切パースしない）。
 ///
 /// env はプロセスグローバルなので、パスは**固定**（temp_dir 直下）・内容は全テスト共通・
 /// 削除しない。これで Spawn モードの複数テストが並行しても互いに無害（同じ値を
@@ -898,9 +899,9 @@ async fn recv_failure_is_not_retried_and_recovers_lazily() {
 /// `exec` 必須: sh の子として sleep を残すと、子（sh）を kill したとき orphan の
 /// sleep がテストバイナリの stdout パイプを掴んだまま 300 秒生き残り、
 /// `cargo test | ...` のパイプ読み手が EOF を貰えず固まる。
-fn setup_fake_child_bin() -> PathBuf {
+fn setup_sleeping_child_bin() -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::temp_dir().join("matd-test-fake-chip-tool.sh");
+    let path = std::env::temp_dir().join("matd-test-spawn-child.sh");
     std::fs::write(&path, "#!/bin/sh\nexec sleep 300\n").unwrap();
     let mut perm = std::fs::metadata(&path).unwrap().permissions();
     perm.set_mode(0o755);
@@ -917,7 +918,7 @@ fn setup_fake_child_bin() -> PathBuf {
 #[tokio::test]
 async fn spawn_mode_preserves_child_and_respawns_dead_child() {
     let tmp = tempfile::tempdir().unwrap();
-    setup_fake_child_bin();
+    setup_sleeping_child_bin();
 
     // 1 回だけ応答なし切断 → 以降正常、の fake（Task 2 のものを流用）。
     let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
@@ -977,7 +978,7 @@ async fn spawn_mode_preserves_child_and_respawns_dead_child() {
 #[tokio::test]
 async fn spawn_mode_does_not_spawn_child_until_first_command() {
     let tmp = tempfile::tempdir().unwrap();
-    setup_fake_child_bin();
+    setup_sleeping_child_bin();
 
     let (port, _log) = spawn_fake_ws_no_reply_then_ok(0).await;
     let store = tmp.path().join("store");
@@ -1002,7 +1003,7 @@ async fn spawn_mode_does_not_spawn_child_until_first_command() {
 #[tokio::test]
 async fn two_consecutive_recv_failures_tear_down_child() {
     let tmp = tempfile::tempdir().unwrap();
-    setup_fake_child_bin();
+    setup_sleeping_child_bin();
 
     let (port, _log) = spawn_fake_ws_no_reply_then_ok(2).await;
     let store = tmp.path().join("store");
@@ -1036,7 +1037,7 @@ async fn two_consecutive_recv_failures_tear_down_child() {
 #[tokio::test]
 async fn reap_kills_child_even_without_ws() {
     let tmp = tempfile::tempdir().unwrap();
-    setup_fake_child_bin();
+    setup_sleeping_child_bin();
 
     let (port, _log) = spawn_fake_ws_no_reply_then_ok(1).await;
     let store = tmp.path().join("store");
