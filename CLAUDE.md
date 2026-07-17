@@ -95,7 +95,16 @@ falling back to `parse_error` + `1`.
   `commission` also goes native under `MAT_IFACE` (`mat-native::commission`,
   auto mDNS→BLE route selection), direct path only; fallback to chip-tool
   fires only pre-PASE (wire untouched) — a failure after PASE starts is
-  never retried via chip-tool. Nothing above this list changes when native
+  never retried via chip-tool. As of M8c-2, `group provision`'s
+  controller-side group state (`groupsettings` equivalent) is also native
+  when `MAT_IFACE`/`MAT_MATD_IFACE` is set — `mat` writes it straight into
+  the chip-tool-compatible KVS (`mat-controller::group_settings`, flock
+  exclusion, tmp+rename atomic replace), on both the direct path and via
+  `matd` (resolves the M8a hybrid, where only the device-side steps were
+  native). `diag node`'s IM part (operational check + thread signals) is
+  native too, direct path only. Only unresolved KVS materials fall back to
+  chip-tool; a write failure (including a flock `WouldBlock`) is a hard
+  error and never falls back. Nothing above this list changes when native
   is unset — see README for the exact op list and fallback rules.
 - `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
 - The backend is replaceable: `mat` couples to it only through `mat`'s own JSON
