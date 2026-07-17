@@ -364,6 +364,8 @@ if ! [[ "$NATIVE_COUNTER" =~ ^[0-9]+$ ]]; then
   echo "WARN: 検証5(b) スキップ — $REMOTE_STORE/native_group_counter が読めない/数値でない (got '$NATIVE_COUNTER')" >&2
 elif ! ssh -n "$MAT_E2E_HOST" "grep -q '^g/gdc=' '$REMOTE_STORE/chip_tool_config.ini'"; then
   echo "WARN: 検証5(b) スキップ — $REMOTE_STORE/chip_tool_config.ini に g/gdc 行が無い" >&2
+elif ! ssh -n "$MAT_E2E_HOST" "test -f '$REMOTE_STORE/chip_tool_config.ini.bak-m8c2'"; then
+  echo "WARN: 検証5(b) スキップ — KVS バックアップが実在しない; sed による g/gdc 書換は実行しません（(a) が主検証）" >&2
 else
   NEW_GDC=$((NATIVE_COUNTER + 4096))
   GDC_B64=$(ssh -n "$MAT_E2E_HOST" "python3 -c \"import base64,struct;print(base64.b64encode(struct.pack('<I', $NEW_GDC)).decode())\"" 2>/dev/null) || GDC_B64=""
