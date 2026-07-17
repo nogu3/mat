@@ -91,9 +91,12 @@ falling back to `parse_error` + `1`.
   (commissionable browse) and the mDNS probe (`discover --probe` / `diag node
   --deep`) also go native under `MAT_IFACE` (`mat-controller::dnssd`), direct
   path only — never through `matd`; fallback to chip-tool/`avahi-browse`
-  fires only on an I/O error, never on a zero-result browse. Nothing above
-  this list changes when native is unset — see README for the exact op list
-  and fallback rules.
+  fires only on an I/O error, never on a zero-result browse. As of M8c-1,
+  `commission` also goes native under `MAT_IFACE` (`mat-native::commission`,
+  auto mDNS→BLE route selection), direct path only; fallback to chip-tool
+  fires only pre-PASE (wire untouched) — a failure after PASE starts is
+  never retried via chip-tool. Nothing above this list changes when native
+  is unset — see README for the exact op list and fallback rules.
 - `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
 - The backend is replaceable: `mat` couples to it only through `mat`'s own JSON
   schema. Keep all backend specifics inside the child-runner adapter so a future
