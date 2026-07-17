@@ -580,19 +580,93 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     → **probe は列挙+照合ではなく targeted resolve が正**（CFID+node_id は
     既知）。② 列挙が本質の commissionable browse には KA suppression +
     `MAX_INSTANCES` 128 を適用（マルチ fabric の実レジストリは 30 件超）。
-  - **M8c（0.20.0）— commission native 化 + chip-tool 完全撤去**: 本番
-    `mat commission` の native 化、KVS 書込所有、native 既定化、
-    runner.rs / chip-tool 分岐 / fake-chip-tool テスト基盤 / Docker の
-    chip-tool・`MAT_CHIP_TOOL_BIN` の全削除。
-  - **横断決定（主に M8c で実施）**: ① KVS 書込所有は chip-tool INI 形式を
-    継続（既存 `kvs.rs` リーダと実機 fabric データを流用、flock 排他で mat が
-    書く。chip-tool 撤去後は mat が唯一のライター）。② name→ID は全クラスタ
-    生成テーブル（M8a で実施、下記）。③ BLE は本番ビルドで feature `ble` を
-    既定有効化（M8c。bluer は D-Bus 経由なので musl でもリンク可の見込み —
-    musl×bluer ビルド検証を M8c 最初のタスクに）。④ native を既定化
-    （`MAT_IFACE` 未設定でも動作。group 送信の iface は自動選択 + 設定で
-    上書き、multicast egress の罠があるため自動選択の設計は M8c spec で詰める）
-    し、chip-tool 経路をコード・Docker イメージとも全削除（M8c）。
+  - **M8c（chip-tool 完全撤去、ユーザー決定 2026-07-17 に 3 分割）**: 規模が
+    大きいため M8a/M8b と同様にサブマイルストーンへ分割。各段で実機 E2E 合格
+    を受け入れ条件とし、M8c-2 までは chip-tool フォールバックが生きているため
+    撤退可能。設計は
+    `docs/superpowers/specs/2026-07-17-phase5-m8c1-commission-native-design.md`
+    （冒頭に M8c 全体分割とビルド検証スパイクの結果を記録）。
+    - **M8c-1（本節、0.20.0）— commission native 化**: 既存 fabric 上の
+      `mat commission` を M6a（on-network）/ M6b（BLE+Thread）実装へ配線。
+      KVS 書込なし（既存 fabric 上の commission は read 系 API で足りる）。
+    - **M8c-2（0.21.0）— KVS group 書込所有 + diag node 再訪**: controller
+      側 `groupsettings`（chip-tool interactive）の native 化 = keyset /
+      group table を mat が chip-tool INI 形式 KVS へ flock 排他で書く。
+      matd provision のハイブリッド（M8a）解消。`diag node` の IM 部分
+      native 化。
+    - **M8c-3（0.22.0）— native 既定化 + chip-tool 完全撤去**: 初回 fabric
+      bootstrap（root CA 生成 + KVS 新規作成。chip-tool が同じ KVS を読む
+      間は「実 chip-tool も受理できる新規 fabric」という互換問題を抱える
+      ため、chip-tool 撤去後に回すのが安全）、`MAT_IFACE` 未設定でも
+      native（group 送信 iface の自動選択 — multicast egress の罠、
+      tailscale0 が経路解決で勝つ問題の設計をここで詰める）、runner.rs /
+      chip-tool 分岐 / fake-chip-tool テスト基盤の置換 / Docker・repo 直下
+      バイナリ・`MAT_CHIP_TOOL_BIN` の全削除、avahi-browse 撤去、BLE ビルド
+      既定化の判断。
+  - **横断決定（M8c 全体）**: ① KVS 書込所有は chip-tool INI 形式を継続
+    （既存 `kvs.rs` リーダと実機 fabric データを流用、flock 排他で mat が
+    書く。chip-tool 撤去後は mat が唯一のライター。M8c-2）。② name→ID は
+    全クラスタ生成テーブル（M8a で実施済み）。③ BLE 本番既定化 —
+    musl×bluer ビルド検証スパイク（M8c-1 冒頭で実施）の結果は
+    **現状ビルド不可**: bluer → dbus → `libdbus-sys` が pkg-config で
+    libdbus を見つけられず失敗、vendored ビルドの道はあるが aarch64-musl の
+    C クロスツールチェーンが未整備。M8c-1 は確立済みの代替（M6b、
+    `cross build --target aarch64-unknown-linux-gnu --features ble`、
+    jarvis の glibc/libdbus-1.so.3 で動作実績あり）を使い、musl 経路は
+    BLE なしのまま無変更で残す。gnu 一本化 / musl+gnu 二本立て / vendored
+    整備のどれにするかは **M8c-3 で判断**。④ native を既定化（`MAT_IFACE`
+    未設定でも動作。group 送信の iface は自動選択 + 設定で上書き、
+    multicast egress の罠があるため自動選択の設計は M8c-3 spec で詰める）
+    し、chip-tool 経路をコード・Docker イメージとも全削除（M8c-3）。
+  - **M8c-1 実装済み**: (1) **epoch IPK 設計転換**（起草時点の計画は KVS
+    から epoch を読み出す想定だったが、上流 connectedhomeip v1.4.2.0
+    `TestGroupData.h`（`DefaultIpkValue::GetDefaultIpk`）の実証で epoch は
+    KVS に永続されない（chip-tool は commissioner 初期化のたびに定数
+    "temporary ipk 01" を投入し、KDF 導出した *operational* 鍵だけを
+    `f/<idx>/k/0` に永続する）と判明したため、既定定数
+    `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` + 実行時 KDF ガード
+    `verify_default_ipk_epoch`（root_public_key・fabric_id・KVS の
+    ipk_operational から `compressed_fabric_id`→`derive_ipk_operational` の
+    一致を検証）へ設計転換。不一致（IPK ローテーション済み / chip-tool 産
+    でない fabric）は native が引き受けず chip-tool フォールバック。
+    (2) `CommissioningFabric::from_materials`（`generate()`＝新規 fabric
+    パスと対をなす、既存 fabric の `SelfIssueMaterials` から commission 用
+    コンテキストを組む新設 API）。(3) **`mat-native::commission`**（薄い
+    ラッパー、プロトコル本体は mat-controller）: iface 解決→KVS 読み出し→
+    epoch ガード→`CommissioningFabric` 構築（ここまで失敗は全てワイヤ
+    未接触＝`Unavailable`）→発見＝**自動 mDNS→BLE**（QR は
+    `resolve_commissionable`（long discriminator、5 秒 timeout）で
+    on-network、timeout なら feature `ble` かつ `--thread-dataset`/
+    `MAT_THREAD_DATASET` 指定時のみ BLE スキャン→`commission_ble_thread`
+    へ；manual code は `browse_commissionable`+short discriminator フィルタ
+    — 0 件は未発見でフォールバック、2 件以上は曖昧エラー（chip-tool でも
+    同じ曖昧さのためフォールバックしない）、manual code に BLE 経路は無く
+    mDNS miss は直接フォールバック）→on-network/BLE 実行。(4) **フォール
+    バック境界**: ワイヤ未接触（iface/KVS/epoch ガード/発見の空振り、
+    `commission_on_network` 内部の事前 resolve 後の狭い競合窓での再空振り
+    含む、レビュー修正で `Discovery` エラーも `Unavailable` に是正済み）は
+    chip-tool フォールバック可、PASE 開始後の失敗は即エラー（二重
+    commission 回避、unicast native の「フォールバックしない」と同じ理屈）。
+    (5) **ErrorKind 写像**（M6b fix-later の解消）: Timeout→timeout /
+    Attestation・Noc・CommandStatus→device_rejected / NetworkConfig→
+    unreachable / Malformed・Csr→parse_error / 他（Ble 含む）→
+    commission_failed。(6) CLI: 新引数 `--thread-dataset`（env
+    `MAT_THREAD_DATASET`、BLE 経路のみ使用）、PAA と同型解決順の
+    `MAT_CD_SIGNER_STORE`→`<store>/cd-signer-store`（無くても続行、CD 検証
+    は warn のみ、M6b 決定どおり）。マーカーログ
+    `commission executed (native on-network)` /
+    `(native ble-thread)`（成功時 info）、`falling back to chip-tool`
+    （フォールバック時 warn）。(7) **feature `ble` 貫通**: mat→mat-native→
+    mat-controller の 3 層に伝播、musl ビルドは BLE 分岐がコンパイル時に
+    消え「このビルドは BLE 非対応」という `Unavailable` にフォールバック
+    （ハードエラーにしない）。(8) matd への配線なし（commission は恒久的に
+    matd 対象外、diag thread/open-window/group grant と同じ理由）。
+    (9) 実機 E2E ハーネス `scripts/e2e-m8c1-real.sh` /
+    `task e2e:m8c1:real` 新設（要 jarvis + 玄関ライト + BLE、setup code は
+    実行時人力入力、chip-tool バイナリ不在下での成功を持って純 native 実行
+    の証明とする方式は M8a Task11 の二重チェック流儀を踏襲）。バージョンは
+    0.20.0。**実機 E2E は別途実施後に追記**（本節はコードレビュー・
+    `task check` 合格までを記録）。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・
