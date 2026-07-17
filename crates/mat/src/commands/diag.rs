@@ -164,32 +164,53 @@ pub fn node(
     let mut checks = Checks::default();
     let mut unavailable: Vec<Value> = Vec::new();
 
-    // operational: 軽量な descriptor read（ep0、全ノード共通）で解決を試す。
-    let op_out = chip.run([
-        "descriptor".to_string(),
-        "read".to_string(),
-        "parts-list".to_string(),
-        node_id.to_string(),
-        "0".to_string(),
-    ])?; // ChildNotFound はここで伝播（診断不能）。
-         // chip-tool は CFID シグナル（[FP] Compressed FabricId 行 / [DIS] の <CFID>-<NodeId>
-         // インスタンス名）を stdout に出す（実機実測; stderr は空のことがある）。fake は stderr
-         // に出すため、両ストリームを結合して走査しバックエンド差に頑健化する。
-    let op_logs = format!("{}\n{}", op_out.stdout, op_out.stderr);
-    let self_cfid = parse_operational_instance_cfid(&op_logs, node_id)
-        .or_else(|| parse_compressed_fabric_id(&op_logs));
-    let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
-    let resolved = op_kind.is_none() && op_out.success();
-    checks.operational = Some(OperationalCheck {
-        resolved,
-        kind: op_kind,
-    });
+    // IM 部分（operational + thread）: native 資材があれば native（M8c-2）、
+    // 構築失敗・未設定は従来の chip-tool 経路。
+    let native_im = native
+        .and_then(|cfg| crate::native_direct::diag_im_probe(cfg, store.root(), node_id, endpoint));
+    let self_cfid: Option<String> = match native_im {
+        Some(p) => {
+            checks.operational = Some(OperationalCheck {
+                resolved: p.resolved,
+                kind: p.op_kind,
+            });
+            match p.thread {
+                Ok(tc) => checks.thread = Some(tc),
+                Err(kind) => unavailable.push(json!({ "check": "thread", "kind": kind })),
+            }
+            Some(p.self_cfid)
+        }
+        None => {
+            // operational: 軽量な descriptor read（ep0、全ノード共通）で解決を試す。
+            let op_out = chip.run([
+                "descriptor".to_string(),
+                "read".to_string(),
+                "parts-list".to_string(),
+                node_id.to_string(),
+                "0".to_string(),
+            ])?; // ChildNotFound はここで伝播（診断不能）。
+                 // chip-tool は CFID シグナル（[FP] Compressed FabricId 行 / [DIS] の <CFID>-<NodeId>
+                 // インスタンス名）を stdout に出す（実機実測; stderr は空のことがある）。fake は
+                 // stderr に出すため、両ストリームを結合して走査しバックエンド差に頑健化する。
+            let op_logs = format!("{}\n{}", op_out.stdout, op_out.stderr);
+            let self_cfid = parse_operational_instance_cfid(&op_logs, node_id)
+                .or_else(|| parse_compressed_fabric_id(&op_logs));
+            let op_kind = classify_failure(&op_out.stdout, &op_out.stderr);
+            let resolved = op_kind.is_none() && op_out.success();
+            checks.operational = Some(OperationalCheck {
+                resolved,
+                kind: op_kind,
+            });
 
-    // thread: neighbor-table の LQI と routing-role（部分結果可）。
-    match read_thread_signal(&chip, node_id, endpoint) {
-        Ok(tc) => checks.thread = Some(tc),
-        Err(e) => unavailable.push(json!({ "check": "thread", "kind": e.kind })),
-    }
+            // thread: neighbor-table の LQI と routing-role（部分結果可）。
+            match read_thread_signal(&chip, node_id, endpoint) {
+                Ok(tc) => checks.thread = Some(tc),
+                Err(e) => unavailable.push(json!({ "check": "thread", "kind": e.kind })),
+            }
+
+            self_cfid
+        }
+    };
 
     if deep {
         deep_probes(
