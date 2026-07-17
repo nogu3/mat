@@ -665,8 +665,20 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     `task e2e:m8c1:real` 新設（要 jarvis + 玄関ライト + BLE、setup code は
     実行時人力入力、chip-tool バイナリ不在下での成功を持って純 native 実行
     の証明とする方式は M8a Task11 の二重チェック流儀を踏襲）。バージョンは
-    0.20.0。**実機 E2E は別途実施後に追記**（本節はコードレビュー・
-    `task check` 合格までを記録）。
+    0.20.0。**実機 E2E 合格（2026-07-17、jarvis）**: 玄関ライト
+    （Nanoleaf、disc 3841 / vid 0x4442 / pid 0x68）を `MAT_CHIP_TOOL_BIN=
+    /nonexistent` 下で native BLE+Thread commission → BLE scan→BTP→PASE→
+    attestation→CSR→NOC→Thread 参加→operational mDNS→CASE→
+    CommissioningComplete まで chip-tool 無しで完走（マーカー
+    `commission executed (native ble-thread)`、node 15 として台帳記録、
+    native on/off 往復成功）。フォールバック健全性も実証: BLE 未検出時に
+    `Unavailable(ble scan: btp timeout)` → `falling back to chip-tool` warn +
+    exit 12（未接触失敗のフォールバック規則どおり）。★実機知見: 玄関ライトを
+    先に Matter ペアリングモード（commissioning window）に入れておくこと —
+    window が閉じていると BLE に `_matterc`(0xFFF6) 広告が出ず native は
+    設計どおり Unavailable になる（btmon で 0xFFF6 の有無を事前確認可）。
+    この E2E で玄関ライトは mat fabric に復帰（M6b 以来の fabric 無し状態が
+    解消）。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・
