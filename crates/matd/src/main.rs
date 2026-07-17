@@ -140,8 +140,8 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
                 i
             }
             Err(e) => {
-                tracing::error!(kind = ?e.kind, detail = %e.detail, "iface autodetect failed; refusing to start (set MAT_MATD_IFACE)");
-                std::process::exit(1);
+                e.emit();
+                std::process::exit(e.kind.exit_code() as i32);
             }
         },
     };
