@@ -91,7 +91,16 @@ fn main() -> ExitCode {
             setup_code,
             node_id,
             alias,
-        } => commands::commission::run(&store_path, target, setup_code, *node_id, alias.as_deref()),
+            thread_dataset,
+        } => commands::commission::run(
+            &store_path,
+            target,
+            setup_code,
+            *node_id,
+            alias.as_deref(),
+            native_cfg.as_ref(),
+            thread_dataset.as_deref(),
+        ),
         Command::Read {
             node_id,
             endpoint,

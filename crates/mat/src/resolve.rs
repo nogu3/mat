@@ -26,6 +26,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             setup_code,
             node_id,
             alias,
+            thread_dataset,
         } => {
             // 名前の妥当性・重複は commission 開始前に検証する（開始後に alias
             // 書き込みだけ失敗する中途半端な状態を作らない）。
@@ -37,6 +38,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 setup_code,
                 node_id,
                 alias,
+                thread_dataset,
             }
         }
         Command::Read {

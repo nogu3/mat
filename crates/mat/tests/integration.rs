@@ -202,6 +202,52 @@ fn commission_auto_assigns_node_id() {
         .stdout(predicate::str::contains("\"node_id\":1"));
 }
 
+#[test]
+fn commission_native_bogus_iface_falls_back_to_chip_tool() {
+    // 存在しない iface → 資材構築前に iface_index が失敗 → warn +
+    // chip-tool フォールバックで従来どおり成功する。
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            // parse_code が先に走るため、資材構築（iface_index）失敗の検証には
+            // 構文的に正当な QR payload が要る（"MT:FAKE" は base38 として不正
+            // で parse 段階の Err になり iface チェックまで届かない）。
+            "MT:-24J0AFN00KA0648G00",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"success\""))
+        .stderr(predicate::str::contains("falling back to chip-tool"));
+}
+
+#[test]
+fn commission_thread_dataset_arg_is_accepted() {
+    // --thread-dataset は BLE 経路（native）専用だが、chip-tool フォール
+    // バック時も引数としては受理される（exit 2 にならない）。
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:-24J0AFN00KA0648G00",
+            "--thread-dataset",
+            "0e080000000000010000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"success\""));
+}
+
 /// node 5 を commission 済みにしたストアを用意する（Phase 1 操作系の前提）。
 fn store_with_node5() -> TempDir {
     let store = TempDir::new().unwrap();

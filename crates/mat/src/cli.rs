@@ -88,6 +88,15 @@ pub enum Command {
         /// 純数字・使用済みの名前は commission 開始前に exit 2。
         #[arg(long, value_name = "NAME")]
         alias: Option<String>,
+        /// BLE+Thread commissioning 用の Thread active operational dataset
+        /// （hex）。native 経路（MAT_IFACE）で mDNS に見つからないデバイスを
+        /// BLE で commission するときに必須。chip-tool 経路では未使用。
+        #[arg(
+            long = "thread-dataset",
+            env = "MAT_THREAD_DATASET",
+            value_name = "HEX"
+        )]
+        thread_dataset: Option<String>,
     },
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
