@@ -29,3 +29,4 @@ predicates.workspace = true
 tempfile.workspace = true
 mat-native = { workspace = true, features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt"] }
+async-trait.workspace = true

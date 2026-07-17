@@ -930,6 +930,7 @@ name = "mat"
 version = "0.21.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "mat-controller",
  "mat-core",

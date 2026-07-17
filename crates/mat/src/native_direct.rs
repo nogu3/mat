@@ -578,7 +578,7 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
                 return Ok(Executed::Fallback);
             }
         };
-        match run_op(&engine, op, store.root()).await? {
+        match run_op(&engine, op).await? {
             RunOutcome::Done => Ok(Executed::Done),
             RunOutcome::Fallback => Ok(Executed::Fallback),
         }
@@ -588,10 +588,9 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
 /// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。unicast 4 形は
 /// 常に `Done`。group 3 形は `engine.group` 未設定 / `GroupOutcome::Unavailable`
 /// のとき `Fallback` を返し、chip-tool 直へ譲る（matd の native_group_params
-/// と対の判定を CLI 直経路で再現）。`store_root` は `GroupProvision` がコントローラ側
-/// group state（chip-tool 経由、KVS 書込所有は M8c まで chip-tool）を実行するのに使う
-/// —— 他の op には無関係（未使用でも警告にならないよう Group* 系のみが読む）。
-async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<RunOutcome, MatError> {
+/// と対の判定を CLI 直経路で再現）。`GroupProvision` も同様に `engine.group_settings`
+/// 未設定（M8c-2: native KVS 書込ができない ctx 未構成）で `Fallback` を返す。
+async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> {
     use mat_controller::im;
     match op {
         NativeOp::On { node_id, endpoint } => {
@@ -826,22 +825,28 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
             epoch_key,
             rebind,
         } => {
-            // 1) コントローラ側 group state（chip-tool、KVS 書込所有は M8c まで
-            //    chip-tool 側 —— native 化しない）。デバイス側と同じ epoch key を
-            //    使う必要があるため、解決結果（hex 文字列）を受け取る。
-            let chip = crate::runner::ChipTool::new(store_root);
-            let epoch_key_hex = crate::commands::group::provision_controller_state(
-                &chip,
+            // 1) コントローラ側 group state（M8c-2: native KVS 書込）。ctx 未構成
+            //    はワイヤ・KVS とも未接触なので chip-tool へフォールバック
+            //    （group 送信の ctx 判定と対）。書込エラーは hard error
+            //    （ラッパー側 doc 参照 — flock WouldBlock 含む）。
+            let Some(gs) = &engine.group_settings else {
+                tracing::warn!(
+                    "native group settings context not configured; falling back to chip-tool"
+                );
+                return Ok(RunOutcome::Fallback);
+            };
+            let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key.as_deref())?;
+            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
+            mat_native::group_settings::write_group_provision(
+                gs,
                 *group_id,
                 *keyset_id,
                 name,
-                epoch_key.as_deref(),
+                &epoch_key_bytes,
                 *rebind,
             )?;
-            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
 
-            // 2) 各デバイスへ provision（native, unicast）。最初の失敗で停止
-            //    （chip-tool 経路と同じ fail-fast、部分結果を stdout に出さない）。
+            // 2) 各デバイスへ provision（native, unicast）— M8a のまま。
             for &node_id in node_ids {
                 let mut conn = engine.establisher.establish(node_id).await?;
                 let p = mat_native::ops::ProvisionNodeParams {
@@ -862,7 +867,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                 "group provision executed (native direct)"
             );
             crate::commands::group::emit_provision_success(
-                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind,
+                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind, true,
             );
         }
         NativeOp::GroupGrant { group_id, node_ids } => {
@@ -1245,7 +1250,6 @@ mod tests {
                 command: "toggle",
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1272,7 +1276,6 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .expect_err("timeout must surface");
@@ -1290,7 +1293,6 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1449,6 +1451,80 @@ mod tests {
         ));
     }
 
+    /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
+    /// JSON（空リスト／管理者エントリのみ）を返す scripted establisher
+    /// （matd の `ScriptedEstablisher`, `crates/matd/src/server.rs` 1639 行付近
+    /// と同型のフィクスチャ）。
+    struct ScriptedEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for ScriptedEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            use mat_native::test_support::FakeConn;
+            Ok(Box::new(
+                FakeConn::scripted()
+                    .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
+                    .with_read(
+                        0,
+                        0x001F,
+                        0x0000,
+                        serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
+                    ),
+            ))
+        }
+    }
+
+    fn scripted_establisher() -> ScriptedEstablisher {
+        ScriptedEstablisher
+    }
+
+    #[tokio::test]
+    async fn run_op_group_provision_writes_controller_state_to_kvs_natively() {
+        // engine: fake establisher + group_settings ctx（一時 ini）。
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let mut engine = Engine::with_parts(Box::new(scripted_establisher()), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: ini.clone(),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        });
+        let op = NativeOp::GroupProvision {
+            group_id: 99,
+            node_ids: vec![5],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: Some("42".repeat(16)),
+            rebind: false,
+        };
+        let out = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(out, RunOutcome::Done));
+        // コントローラ側 state が chip-tool spawn なしで KVS に入っている。
+        assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_op_group_provision_falls_back_when_ctx_missing() {
+        let engine = Engine::with_parts(Box::new(scripted_establisher()), None); // ctx なし
+        let op = NativeOp::GroupProvision {
+            group_id: 99,
+            node_ids: vec![5],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        };
+        assert!(matches!(
+            run_op(&engine, &op).await.unwrap(),
+            RunOutcome::Fallback
+        ));
+    }
+
     #[tokio::test]
     async fn open_window_runs_via_fake_and_emits_codes() {
         // fake 経由で run_op(OpenWindow) が establish → open_window → emit まで
@@ -1464,7 +1540,6 @@ mod tests {
                 iteration: 1000,
                 discriminator: 3840,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
