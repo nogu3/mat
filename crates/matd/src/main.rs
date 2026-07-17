@@ -48,8 +48,8 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     idle_timeout: u64,
 
-    /// native warm session に使う Thread mesh の iface 名。未指定なら native を無効化し
-    /// 全 op を chip-tool へ回す（安全フォールバック）。
+    /// native warm session に使う Thread mesh の iface 名。未指定なら自動検出
+    /// （M8c-3 native 既定化。曖昧なら起動拒否）。
     #[arg(long, env = "MAT_MATD_IFACE")]
     iface: Option<String>,
 
@@ -128,29 +128,39 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         ChipToolBackend::spawn(&store_path, cli.port, idle).await?
     };
 
-    // native warm session バックエンド（iface 指定時のみ）。構築失敗は致命にせず、
-    // chip-tool フォールバックへ落とす（native が実機でコケても matd は無停止）。
-    let native = match &cli.iface {
-        Some(iface) => {
-            let cfg = matd::native::NativeConfig {
-                store: store_path.clone(),
-                iface: iface.clone(),
-                fabric_index: cli.fabric_index,
-                issuer_index: cli.issuer_index,
-            };
-            match matd::native::NativeBackend::build(&cfg).await {
-                Ok(b) => {
-                    tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
-                    Some(Arc::new(b))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e.detail, "native backend build failed; falling back to chip-tool for all ops");
-                    None
-                }
+    // native warm session バックエンド。iface は env / --iface、未設定なら自動
+    // 検出（M8c-3 native 既定化）。自動検出の候補 0 / 複数は起動拒否 —
+    // 全 op が死ぬ設定不備なので per-op エラーではなく fail-fast にする
+    // （jarvis の systemd unit は env 設定済みで影響なし）。
+    let iface: String = match &cli.iface {
+        Some(i) => i.clone(),
+        None => match mat_native::iface_select::autodetect() {
+            Ok(i) => {
+                tracing::info!(iface = %i, "iface auto-selected (matd native default)");
+                i
             }
+            Err(e) => {
+                tracing::error!(kind = ?e.kind, detail = %e.detail, "iface autodetect failed; refusing to start (set MAT_MATD_IFACE)");
+                std::process::exit(1);
+            }
+        },
+    };
+
+    // native 構築失敗は致命にせず、chip-tool フォールバックへ落とす（native が
+    // 実機でコケても matd は無停止。Stage 1 ではここは温存）。
+    let cfg = matd::native::NativeConfig {
+        store: store_path.clone(),
+        iface: iface.clone(),
+        fabric_index: cli.fabric_index,
+        issuer_index: cli.issuer_index,
+    };
+    let native = match matd::native::NativeBackend::build(&cfg).await {
+        Ok(b) => {
+            tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
+            Some(Arc::new(b))
         }
-        None => {
-            tracing::info!("MAT_MATD_IFACE unset; native backend disabled (chip-tool only)");
+        Err(e) => {
+            tracing::warn!(error = %e.detail, "native backend build failed; falling back to chip-tool for all ops");
             None
         }
     };
