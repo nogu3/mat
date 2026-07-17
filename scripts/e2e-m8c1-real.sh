@@ -83,7 +83,12 @@
 #             chip-tool のパス。未指定なら ssh 先 PATH 任せ）
 #           MAT_E2E_ASSUME_YES=1（確認プロンプトを自動化。検証4 は危険側の
 #             操作のため、この場合は既定でスキップ側に倒す — 下記 confirm_yn
-#             実装参照。setup code のプロンプトだけは対象外 — 人力入力必須）
+#             実装参照）
+#           MAT_E2E_SETUP_CODE（玄関ライトの QR ペイロード "MT:..."。非対話
+#             実行用。未設定なら実行時プロンプト。repo にはコミットしない）
+#           MAT_E2E_THREAD_DATASET（active operational dataset の hex。network
+#             key を含む秘匿値 — repo にコミットしない。BR ホストの
+#             `ot-ctl dataset active -x` か HA OTBR の Web UI/SSH アドオンから）
 # ローカル要件: cross（docker 経由の aarch64-unknown-linux-gnu クロスビルド。
 #   Cross.toml が arm64 libdbus の pre-build を設定済み）、jq（JSON 抽出に
 #   使う。ローカル側で実行する。ssh 先（jarvis）には不要）
@@ -245,11 +250,20 @@ fi
 echo "Thread dataset OK (${#THREAD_DATASET} hex chars)"
 
 echo ""
-echo ">>> 玄関ライトの setup code を QR ペイロード（\"MT:...\"）で入力してください。"
+echo ">>> 玄関ライトの setup code を QR ペイロード（\"MT:...\"）で指定してください。"
 echo ">>> manual code（11/21桁）は BLE 経路が無いため本検証には使えません。"
-echo ">>> デバイス印字の QR は repo にコミットしません（このプロンプト入力のみ）。"
-read -r -p ">>> setup code: " SETUP_CODE
-[ -n "$SETUP_CODE" ] || { echo "FAIL: setup code が空" >&2; exit 1; }
+echo ">>> デバイス印字の QR は repo にコミットしません（env/プロンプト入力のみ）。"
+# MAT_E2E_SETUP_CODE（env 注入）を優先。未設定なら対話プロンプト。
+# 非対話実行（バックグラウンド + パイプ）では read が途中の ssh に stdin を
+# 食われて空振りするため、その場合は env で渡すこと。
+SETUP_CODE="${MAT_E2E_SETUP_CODE:-}"
+if [ -z "$SETUP_CODE" ]; then
+  read -r -p ">>> setup code: " SETUP_CODE
+fi
+case "$SETUP_CODE" in
+  MT:*) : ;;
+  *) echo "FAIL: setup code は QR ペイロード（MT:...）である必要があります: '$SETUP_CODE'" >&2; exit 1 ;;
+esac
 
 COMMISSION_OUT=$(run_native_ble "${STORE_ARG[@]}" commission --target "ble-thread" --setup-code "$SETUP_CODE")
 echo "$COMMISSION_OUT"
