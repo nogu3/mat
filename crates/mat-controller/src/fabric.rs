@@ -20,13 +20,27 @@ pub fn compressed_fabric_id(root_public_key: &[u8; 65], fabric_id: u64) -> [u8; 
 /// **epoch と operational は別物、取り違え厳禁**: AddNOC でデバイスに渡す
 /// のは epoch 側の IPK（fabric 全体で共有される groupKeySet の鍵）。CASE の
 /// destination id 計算（`case_destination_id`）や Sigma で使うのは、ここで
-/// 導出する operational 側。
+/// 導出する operational 側。この KDF は任意 group keyset の epoch→operational
+/// に共通で、M8c-2 の group_settings も使用する。
 pub fn derive_ipk_operational(epoch_key: &[u8; 16], compressed_fabric_id: &[u8; 8]) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(compressed_fabric_id), epoch_key);
     let mut out = [0u8; 16];
     hk.expand(b"GroupKey v1.0", &mut out)
         .expect("16 bytes is a valid hkdf-sha256 output length");
     out
+}
+
+/// operational group key から GKH（Group Key Hash = group session id、spec
+/// §4.15.2: Crypto_KDF(operational, salt=なし, info="GroupKeyHash", 16bit)
+/// → big-endian u16）を導出する。ワイヤの group session id と、chip-tool KVS
+/// KeySetData（`f/<idx>/k/<ksid>` ctx5 hash）に永続される値がこれ。
+/// 上流 v1.4.2.0 `CHIPCryptoPAL.cpp` `DeriveGroupSessionId` と同一。
+pub fn derive_group_session_id(operational_key: &[u8; 16]) -> u16 {
+    let hk = Hkdf::<Sha256>::new(None, operational_key);
+    let mut out = [0u8; 2];
+    hk.expand(b"GroupKeyHash", &mut out)
+        .expect("2 bytes is a valid hkdf-sha256 output length");
+    u16::from_be_bytes(out)
 }
 
 /// chip-tool（connectedhomeip）の既定 IPK **epoch** 鍵。
@@ -387,5 +401,14 @@ mod tests {
     fn default_ipk_epoch_guard_rejects_foreign_operational() {
         // 定数由来でない operational（IPK ローテーション済み等）は拒否。
         assert!(!verify_default_ipk_epoch(&ROOT_PUB, FABRIC_ID, &[0x42; 16]));
+    }
+
+    #[test]
+    fn group_session_id_is_deterministic_and_key_dependent() {
+        let a = derive_group_session_id(&[1u8; 16]);
+        let b = derive_group_session_id(&[1u8; 16]);
+        let c = derive_group_session_id(&[2u8; 16]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

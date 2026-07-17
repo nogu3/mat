@@ -71,6 +71,7 @@ pub enum KvsError {
         group_id: u16,
     },
     BadCounter(&'static str),
+    Locked,
 }
 
 impl std::fmt::Display for KvsError {
@@ -109,6 +110,7 @@ impl std::fmt::Display for KvsError {
                 )
             }
             KvsError::BadCounter(reason) => write!(f, "kvs key \"g/gdc\": {reason}"),
+            KvsError::Locked => write!(f, "kvs: locked by another process"),
         }
     }
 }
@@ -631,6 +633,138 @@ pub fn read_group_data_counter(path: &Path) -> Result<Option<u32>, KvsError> {
     }
 }
 
+/// chip-tool INI KVS への書込トランザクション（M8c-2）。
+///
+/// open で sidecar `<ini>.lock` に advisory flock（NonBlocking exclusive、
+/// `group.rs` の counter と同流儀 — 本体は tmp+rename で置換されるので本体
+/// fd への flock は無効化される）を取り、ファイル全行をメモリへ読む。
+/// set/remove は [Default] セクション内の行だけを操作し（既存行は in-place
+/// 置換、新規は末尾追記、書式は chip-tool inipp と同じ `key=value`）、他の
+/// 行は byte 単位で保全する。commit が tmp+fsync+rename の原子置換。
+/// ロックは Drop まで保持（commit を呼ばなければ何も書かれない）。
+pub struct KvsTxn {
+    path: std::path::PathBuf,
+    lines: Vec<String>,
+    /// [Default] セクション内の行範囲（`lines` の添字、[start, end)）。
+    default_start: usize,
+    default_end: usize,
+    _lock: std::fs::File,
+}
+
+impl KvsTxn {
+    pub fn open(path: &Path) -> Result<Self, KvsError> {
+        use rustix::fs::{flock, FlockOperation};
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(std::path::PathBuf::from(lock_path))
+            .map_err(KvsError::Io)?;
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            if e == rustix::io::Errno::WOULDBLOCK {
+                KvsError::Locked
+            } else {
+                KvsError::Io(std::io::Error::other(e))
+            }
+        })?;
+        let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        // [Default] セクション境界を行単位で確定。
+        let mut default_start = None;
+        let mut default_end = lines.len();
+        for (i, line) in lines.iter().enumerate() {
+            match default_start {
+                None => {
+                    if line.trim() == "[Default]" {
+                        default_start = Some(i + 1);
+                    }
+                }
+                Some(_) => {
+                    if line.trim_start().starts_with('[') {
+                        default_end = i;
+                        break;
+                    }
+                }
+            }
+        }
+        let default_start = default_start.ok_or(KvsError::SectionMissing)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines,
+            default_start,
+            default_end,
+            _lock: lock,
+        })
+    }
+
+    /// [Default] 内で key の行を探す（先頭 `=` で分割し両側 trim — 読み側
+    /// `lookup` と同じ寛容さ）。
+    fn find(&self, key: &str) -> Option<usize> {
+        (self.default_start..self.default_end).find(|&i| {
+            self.lines[i]
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == key)
+        })
+    }
+
+    /// key の値を base64 デコードして返す。無い・空は None（読み側
+    /// `decode_b64` と同じ扱い）。
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvsError> {
+        use base64ct::{Base64, Encoding};
+        match self.find(key) {
+            None => Ok(None),
+            Some(i) => {
+                let v = self.lines[i]
+                    .split_once('=')
+                    .expect("find matched")
+                    .1
+                    .trim();
+                if v.is_empty() {
+                    return Ok(None);
+                }
+                Base64::decode_vec(v)
+                    .map(Some)
+                    .map_err(|_| KvsError::BadBase64(key.to_string()))
+            }
+        }
+    }
+
+    pub fn set(&mut self, key: &str, value: &[u8]) {
+        use base64ct::{Base64, Encoding};
+        let line = format!("{key}={}", Base64::encode_string(value));
+        match self.find(key) {
+            Some(i) => self.lines[i] = line,
+            None => {
+                self.lines.insert(self.default_end, line);
+                self.default_end += 1;
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        if let Some(i) = self.find(key) {
+            self.lines.remove(i);
+            self.default_end -= 1;
+        }
+    }
+
+    /// tmp + fsync + rename の原子置換（`group.rs` counter の persist と同流儀）。
+    pub fn commit(self) -> Result<(), KvsError> {
+        use std::io::Write;
+        let tmp = self.path.with_extension("ini.tmp");
+        let mut f = std::fs::File::create(&tmp).map_err(KvsError::Io)?;
+        let mut body = self.lines.join("\n");
+        body.push('\n');
+        f.write_all(body.as_bytes()).map_err(KvsError::Io)?;
+        f.sync_all().map_err(KvsError::Io)?;
+        std::fs::rename(&tmp, &self.path).map_err(KvsError::Io)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,5 +1237,66 @@ mod tests {
             Err(KvsError::BadCounter(_))
         ));
         std::fs::remove_file(bad).ok();
+    }
+
+    // ---- M8c-2: KvsTxn ----
+
+    fn tmp_ini(lines: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&p, lines).unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn kvs_txn_set_get_roundtrip_and_preserves_unrelated_lines() {
+        let (_d, p) = tmp_ini("[Default]\ng/gdc=AQAAAA==\n");
+        let mut txn = KvsTxn::open(&p).unwrap();
+        assert_eq!(txn.get("nope").unwrap(), None);
+        txn.set("f/2/g", &[0x15, 0x18]);
+        assert_eq!(txn.get("f/2/g").unwrap().unwrap(), vec![0x15, 0x18]);
+        txn.commit().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        // 無関係キーは保全、新キーは [Default] 内に chip-tool inipp 形式（key=value）で追記。
+        assert!(text.contains("g/gdc=AQAAAA=="), "{text}");
+        assert!(text.contains("f/2/g=FRg="), "{text}");
+        // 再読込でも読める（自作 reader との整合）。
+        let txn2 = KvsTxn::open(&p).unwrap();
+        assert_eq!(txn2.get("f/2/g").unwrap().unwrap(), vec![0x15, 0x18]);
+    }
+
+    #[test]
+    fn kvs_txn_set_replaces_existing_line_in_place() {
+        let (_d, p) = tmp_ini("[Default]\nf/2/g=AAAA\nother=x\n");
+        let mut txn = KvsTxn::open(&p).unwrap();
+        txn.set("f/2/g", &[1]);
+        txn.commit().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("f/2/g=").count(), 1, "{text}");
+        assert!(text.contains("other=x"));
+    }
+
+    #[test]
+    fn kvs_txn_remove_deletes_line() {
+        let (_d, p) = tmp_ini("[Default]\nf/2/gk/1=AAAA\nkeep=y\n");
+        let mut txn = KvsTxn::open(&p).unwrap();
+        txn.remove("f/2/gk/1");
+        txn.commit().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("f/2/gk/1"), "{text}");
+        assert!(text.contains("keep=y"));
+    }
+
+    #[test]
+    fn kvs_txn_open_fails_without_default_section() {
+        let (_d, p) = tmp_ini("[Other]\nk=v\n");
+        assert!(matches!(KvsTxn::open(&p), Err(KvsError::SectionMissing)));
+    }
+
+    #[test]
+    fn kvs_txn_second_open_would_block() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        let _held = KvsTxn::open(&p).unwrap();
+        assert!(matches!(KvsTxn::open(&p), Err(KvsError::Locked)));
     }
 }
