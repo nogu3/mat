@@ -18,6 +18,7 @@ use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
 
+pub mod commission;
 pub mod group;
 pub mod ops;
 #[cfg(any(test, feature = "test-support"))]

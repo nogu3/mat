@@ -1293,6 +1293,23 @@ impl CommissioningFabric {
         })
     }
 
+    /// chip-tool KVS の自己発行資材から、**既存 fabric** 上で commissioning
+    /// するための CommissioningFabric を組む。`generate`（新規 fabric）と
+    /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は **epoch** 側 —
+    /// operational を渡すとデバイス側の KDF 導出が二重になり CASE が壊れる。
+    /// epoch は KVS に永続されない（chip-tool は既定定数を毎回投入）ため
+    /// 引数で受ける。呼び出し側は `fabric::verify_default_ipk_epoch` の
+    /// ガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡すこと。
+    pub fn from_materials(m: crate::kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self {
+        Self {
+            rcac_tlv: m.rcac,
+            root_private_key: m.root_private_key,
+            fabric_id: m.fabric_id,
+            ipk_epoch,
+            admin_node_id: m.node_id,
+        }
+    }
+
     /// controller 自身の CASE 用 credentials（NOC 自己発行を再利用）。
     ///
     /// AddNOC でデバイスに渡す IPK は **epoch** 側（`self.ipk_epoch`、
@@ -1342,22 +1359,24 @@ impl CommissioningFabric {
 
 // --- errors ---
 
-/// commissioning フロー全体のエラー。呼び出し側（CLI 層）は spec 決定
-/// (M6a 決定 5 + M6b 決定 4) の対応表でこれを `ErrorKind` / exit code に
-/// マップする:
+/// commissioning フロー全体のエラー。呼び出し側 `mat-native::commission`
+/// （M8c-1 Task4 `kind_of`）がこれを `ErrorKind` / exit code へ写像する:
 ///
-/// | variant                                             | kind               | exit |
-/// |------------------------------------------------------|--------------------|------|
-/// | `Attestation(_)` / `Pase(PaseError::ConfirmMismatch)` | `device_rejected`  | 4    |
-/// | `Discovery(_)` / `Timeout(_)`                         | `timeout`          | 3    |
-/// | `Case(_)`                                             | `session_failed`   | 6    |
-/// | `Ble { step: "scan", .. }`                            | `timeout`          | 3    |
-/// | `Ble { step: "bluez-session"\|"adapter"\|"gatt"\|    | `unreachable`      | 5    |
-/// |   "btp-handshake"\|"udp-bind", .. }`                 |                    |      |
-/// | `NetworkConfig { .. }`                                | `commission_failed`| 1    |
-/// | 上記以外すべて（`Pase` の非 ConfirmMismatch variant、  | `commission_failed`| 1    |
-/// | `Csr` / `Noc` / `CommandStatus` / `Malformed` /       |                    |      |
-/// | `Cert` / `Fabric` / `Session`）                       |                    |      |
+/// | variant                                               | kind                | exit |
+/// |--------------------------------------------------------|---------------------|------|
+/// | `Timeout(_)`                                            | `timeout`           | 3    |
+/// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
+/// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
+/// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
+/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない | ―     |
+/// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
+/// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
+///
+/// `Ble { step: "scan", .. }` は `kind_of` を経由しない — `find_commissionable`
+/// の空振り（デバイスが見えない）はワイヤ未接触なので、呼び出し側
+/// (`mat-native::commission` の `ble_path`) が個別に検出して `Unavailable`
+/// にする。BLE/BTP のそれ以外の失敗（`bluez-session` / `adapter` / `gatt` /
+/// `btp-handshake` / `udp-bind`）は他の variant と同様 `commission_failed`。
 #[derive(Debug)]
 pub enum CommissionError {
     Discovery(crate::dnssd::DnssdError),
@@ -1734,5 +1753,21 @@ mod tests {
         let (status2, text2) = decode_network_config_response(&w2.finish()).unwrap();
         assert_eq!(status2, 5);
         assert_eq!(text2, None);
+    }
+
+    #[test]
+    fn commissioning_fabric_from_materials_maps_fields() {
+        let m = crate::kvs::SelfIssueMaterials {
+            rcac: vec![0x15, 0x01, 0x02],
+            root_private_key: [7u8; 32],
+            ipk_operational: [8u8; 16],
+            node_id: 0xAA55,
+            fabric_id: 0xFAB2,
+        };
+        let f = CommissioningFabric::from_materials(m, [9u8; 16]);
+        assert_eq!(f.rcac_tlv, vec![0x15, 0x01, 0x02]);
+        assert_eq!(f.fabric_id, 0xFAB2);
+        assert_eq!(f.ipk_epoch, [9u8; 16]);
+        assert_eq!(f.admin_node_id, 0xAA55);
     }
 }

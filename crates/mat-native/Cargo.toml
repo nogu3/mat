@@ -9,6 +9,10 @@ description = "Shared native backend engine (mat one-shot / matd resident) on ma
 [features]
 # 他 crate のテストから fake / fixture を使うための注入面。
 test-support = ["dep:base64ct"]
+# BLE Thread commissioning（mat-controller の同名 feature を透過。bluer は
+# libdbus にリンクするため隔離 — 本番 mat/matd の musl クロスビルドはこの
+# feature を使わない）。
+ble = ["mat-controller/ble"]
 
 [dependencies]
 mat-core.workspace = true

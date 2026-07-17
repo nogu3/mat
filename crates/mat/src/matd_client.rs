@@ -612,6 +612,7 @@ mod tests {
             setup_code: "MT:DUMMY".into(),
             node_id: None,
             alias: None,
+            thread_dataset: None,
         })
         .is_err());
     }

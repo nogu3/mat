@@ -10,6 +10,9 @@ repository.workspace = true
 name = "mat"
 path = "src/main.rs"
 
+[features]
+ble = ["mat-native/ble"]
+
 [dependencies]
 mat-core.workspace = true
 mat-controller.workspace = true

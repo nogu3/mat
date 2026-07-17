@@ -594,14 +594,15 @@ matd --iface thread0 &
   attributes or command fields with `parse_error` up front, same rule as
   `mat`'s direct path (see M8a below); unknown names still fall back to
   chip-tool.
-- `diag thread`, `open-window`, and `group grant` are **not** part of the
-  `matd` socket protocol at all (by design — these are rare, session-lifetime
-  doesn't matter for them) and never get routed to `matd` even when it's
+- `diag thread`, `open-window`, `group grant`, and `commission` are **not**
+  part of the `matd` socket protocol at all (by design — these are rare,
+  session-lifetime doesn't matter for them, and `commission` in particular
+  has no warm session to reuse) and never get routed to `matd` even when it's
   running; `mat` always handles them on its own direct path (native if
   `MAT_IFACE` is set, chip-tool otherwise). `diag node` and `discover` gained
-  a native option in M8b — but only on `mat`'s own one-shot direct path (see
-  below); `matd` still never carries these ops. `commission` remains
-  chip-tool-only until M8c.
+  a native option in M8b, and `commission` in M8c-1 — all three only on
+  `mat`'s own one-shot direct path (see below); `matd` still never carries
+  these ops.
   Because of this, `chip-tool` is only spawned lazily on the first op that
   needs it: a workload that only ever hits native-eligible ops never spawns
   `chip-tool` at all, and `matd` can start even if `chip-tool` isn't
@@ -731,7 +732,41 @@ its daemon holds a long-lived cache). Both fall back to their pre-M8b
 mechanism (`chip-tool` for discover, `avahi-browse` for the probe) only on
 an I/O error from the native path — zero commissionable devices / zero
 reachable nodes is a normal result and never triggers a fallback.
-`commission` remains chip-tool-only until M8c.
+
+As of M8c-1, `MAT_IFACE` also covers `commission` (still direct-only, never
+routed to `matd` — see above). Route selection within native is automatic,
+mirroring the existing `pairing code`-only UX (no new flag to pick a
+transport): for a QR payload (`MT:...`), `mat` first tries an mDNS lookup
+(`resolve_commissionable` on the long discriminator, 5s timeout) for
+**on-network** commissioning; if that times out, and the build has the `ble`
+feature and `--thread-dataset`/`MAT_THREAD_DATASET` was given, it falls
+through to a BLE scan + **BLE+Thread** commissioning (M6b's
+`commission_ble_thread`). A manual code has no BLE path (BLE needs the QR's
+long discriminator): `mat` instead runs `browse_commissionable` and filters
+by the code's short discriminator — zero matches falls back to chip-tool,
+2+ matches is an ambiguity error (not a silent pick), and either way a
+manual-code mDNS miss goes straight to the chip-tool fallback rather than
+attempting BLE. Before any of this, the fabric's **epoch IPK** — the key
+`AddNOC` hands the device, distinct from the KDF-derived *operational* key
+that's the only one persisted in the KVS — is checked against chip-tool's own
+fixed compile-time default via a KDF verification; a mismatch (IPK rotated,
+or the fabric wasn't created by chip-tool) is native-unsupported and falls
+back to chip-tool. New flags: `--thread-dataset <hex>` (env
+`MAT_THREAD_DATASET`) supplies the Thread active operational dataset for the
+BLE path; `MAT_CD_SIGNER_STORE` (falling back to `<store>/cd-signer-store`)
+resolves the CD signer trust store the same way `MAT_PAA_TRUST_STORE` /
+`<store>/paa-trust-store` resolve the PAA one (absent = warn-only, per M6b).
+**Fallback boundary is stricter than the other native ops above**: any
+failure before the wire is touched (interface/KVS/epoch-guard failure, or the
+device simply isn't found via mDNS or BLE) returns `Unavailable` and falls
+back to chip-tool; once PASE has started, a failure is returned as-is and
+`mat` does **not** retry via chip-tool for that call — re-running a
+partially-commissioned device through a second commissioner risks a
+duplicate or inconsistent commission. The `ble` feature must be compiled in
+for the BLE branch (`mat`/`mat-native`/`mat-controller` all gate it); without
+it, a network miss on a QR payload still falls back to chip-tool cleanly
+(no "BLE unsupported" hard error — the build just skips straight to the
+fallback).
 
 ```bash
 mat --iface thread0 on --node 5
