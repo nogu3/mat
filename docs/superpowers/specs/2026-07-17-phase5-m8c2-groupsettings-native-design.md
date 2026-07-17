@@ -64,24 +64,42 @@ chip-tool `groupsettings` の永続形式を上流ソース
 - **KeyMapData**: { ctx1: group_id, ctx2: keyset_id, ctx3: next }
 - **KeySetData**: { ctx1: policy, ctx2: keys_count, ctx3: array[ struct{
   ctx4: start_time (u64), ctx5: hash (u16, GKH = group session id),
-  ctx6: encryption_key (16B) } ], ctx7: next }。**永続されるのは operational
-  （導出済み）鍵。epoch 鍵と privacy key は永続されない**（privacy は
-  Deserialize 時に都度導出）。
+  ctx6: encryption_key (16B) } ], ctx7: next }。**配列は常に 3 スロット**
+  （`KeySet::kEpochKeysMax`。keys_count 超の未使用スロットは
+  start_time=0 / hash=0 / 16B ゼロ埋めで書かれる — Serialize を直読して
+  確定）。**永続されるのは operational（導出済み）鍵。epoch 鍵と
+  privacy key は永続されない**（privacy は Deserialize 時に都度導出）。
+
+### 番兵値・リンク終端（上流ソース直読で確定、2026-07-17 追補）
+
+- keyset のリンク終端 = `kInvalidKeysetId` = **0xFFFF**（keyset_id 0 = IPK は
+  **有効な id** なので 0 は終端に使えない）。空 fabric の first_keyset も
+  0xFFFF。
+- group / keymap のリンク終端 = **0**（kUndefinedGroupId / LinkedData の
+  next=0）。空 fabric の first_group / first_map = 0。fabric リストの終端 =
+  kUndefinedFabricIndex = 0。
+- GroupData の first_endpoint は endpoint 無しのとき `kInvalidEndpointId` =
+  **0xFFFF**。
+- リスト走査は**カウント回数で終わる**（終端値は保険）— 読み書きとも
+  count を正とする。
 
 ### 書込セマンティクス
 
 - **add-group** = `SetGroupInfo`: GroupData 新規作成（endpoint なし）、
-  linked list は **head 挿入**（`group.next = fabric.first_group;
-  fabric.first_group = group_id; group_count++`）、fabric を FabricList に
-  登録（未登録なら）。既存 group への再実行は内容更新のみ（count 不変）。
+  linked list は **末尾挿入**（`SetGroupInfoAt` の Insert last 分岐を直読して
+  確定 — 空なら `fabric.first_group = group_id`、非空なら末尾レコードの
+  `next = group_id`。group_count++。**当初の要約「head 挿入」は誤りだった**）。
+  fabric を FabricList に登録（未登録なら、こちらは head 挿入）。既存 group
+  への再実行は名前更新のみ（count・リンク不変）。
 - **add-keysets** = `SetKeySet`: 各 epoch 鍵から operational を導出して
-  KeySetData を書く。FabricData は head 挿入（first_keyset 更新 +
-  keyset_count++）。既存 keyset の再実行は内容更新のみ。
+  KeySetData を書く。こちらは **head 挿入**（`keyset.next =
+  fabric.first_keyset; fabric.first_keyset = keyset_id; keyset_count++`）。
+  既存 keyset の再実行は内容更新のみ（next 維持）。
 - **bind-keyset** = `SetGroupKeyAt(index=現 map 数)`: KeyMapData の storage
-  id は **max_id + 1** 割当（連番でも group_id でもない）。**末尾に連結**
-  （prev.next = new id、先頭なら fabric.first_map = id）。map_count++。
-  既存 (group_id, keyset_id) と重複する bind は **Duplicate エラー**
-  （rebind で unbind が先に要る現行挙動の由来）。
+  id は **max_id + 1** 割当（連番でも group_id でもない、kMinLinkId=1 起点）。
+  **末尾に連結**（prev.next = new id、先頭なら fabric.first_map = id）。
+  map_count++。既存 (group_id, keyset_id) と重複する bind は
+  **Duplicate エラー**（rebind で unbind が先に要る現行挙動の由来）。
 - **unbind-keyset** = 走査で該当 (group_id, keyset_id) を探して
   `RemoveGroupKeyAt`: linked list 繋ぎ替えのみ（prev.next = removed.next /
   先頭なら fabric.first_map = removed.next）、map_count--。**id の再割当・
