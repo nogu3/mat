@@ -783,6 +783,45 @@ impl KvsTxn {
     }
 }
 
+/// mat 専用の epoch IPK 永続キー（M8c-3）。chip-tool の名前空間
+/// （`f/<idx>/...` / `g/...` / `ExampleOpCredsCAKey<n>` 等）と衝突しない
+/// `mat/` プレフィクスを使う。chip-tool は未知キーを無視するため、
+/// Stage 1（chip-tool 共存期）でも安全。値は 16 バイトの epoch 鍵の base64。
+pub fn mat_ipk_epoch_key(fabric_index: u8) -> String {
+    format!("mat/f/{fabric_index}/ipk-epoch")
+}
+
+/// mat が永続した epoch IPK を読む。キー無し = `Ok(None)`（未採用 —
+/// 呼び出し側は既定定数の検証採用にフォールバック）。16 バイト以外の値は
+/// 不正データとして `KvsError::BadKeyset`（既存の「不正データ」系バリアント
+/// を流用 — 新規バリアントは追加しない）。
+pub fn read_mat_ipk_epoch(main_ini: &Path, fabric_index: u8) -> Result<Option<[u8; 16]>, KvsError> {
+    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    match decode_b64(sec, &mat_ipk_epoch_key(fabric_index))? {
+        None => Ok(None),
+        Some(v) => {
+            let arr: [u8; 16] = v.try_into().map_err(|_| KvsError::BadKeyset {
+                fabric_index,
+                reason: "mat ipk epoch must be 16 bytes",
+            })?;
+            Ok(Some(arr))
+        }
+    }
+}
+
+/// mat の epoch IPK を KVS へ永続する（`KvsTxn` 経由、flock 排他・
+/// tmp+rename 原子置換 — M8c-2 と同じ規律）。
+pub fn write_mat_ipk_epoch(
+    main_ini: &Path,
+    fabric_index: u8,
+    epoch: &[u8; 16],
+) -> Result<(), KvsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    txn.set(&mat_ipk_epoch_key(fabric_index), epoch);
+    txn.commit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1397,28 @@ mod tests {
         txn.commit().unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert_eq!(text, "[Default]\ng/gdc=AQAAAA==");
+    }
+
+    // ---- M8c-3 Task 6: mat-epoch キー ----
+
+    #[test]
+    fn mat_ipk_epoch_roundtrip_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        assert_eq!(read_mat_ipk_epoch(&ini, 1).unwrap(), None);
+        let epoch = [0xA5u8; 16];
+        write_mat_ipk_epoch(&ini, 1, &epoch).unwrap();
+        assert_eq!(read_mat_ipk_epoch(&ini, 1).unwrap(), Some(epoch));
+        // 別 fabric index は独立
+        assert_eq!(read_mat_ipk_epoch(&ini, 2).unwrap(), None);
+        // 16 バイト以外は KvsError（手で壊す）
+        let text = std::fs::read_to_string(&ini).unwrap();
+        std::fs::write(
+            &ini,
+            text.replace(&base64ct::Base64::encode_string(&epoch), "AAAA"),
+        )
+        .unwrap();
+        assert!(read_mat_ipk_epoch(&ini, 1).is_err());
     }
 }

@@ -5,7 +5,10 @@
 //! フォールバック境界（spec 案A）: ワイヤ未接触（資材構築失敗・デバイス
 //! 未発見）だけが `Unavailable` = chip-tool へフォールバック可。PASE 開始後
 //! の失敗は Err — chip-tool での自動再実行は二重 commission を招くため
-//! 呼び出し側でもフォールバックしないこと。
+//! 呼び出し側でもフォールバックしないこと。**例外（M8c-3）**: epoch IPK 解決
+//! （[`resolve_ipk_epoch`]）の失敗はワイヤ未接触でも Err — KVS 不整合や
+//! 非 chip-tool fabric を chip-tool へ静かに委ねない、という spec 承認済みの
+//! 挙動変更（M8c-1 時点では `Unavailable` だった）。
 
 use mat_controller::commissioning::{
     self, CommissionError, CommissionParams, CommissionTarget, CommissioningFabric,
@@ -115,6 +118,62 @@ fn pick_by_short(
     pick_by_short_strict(list, short).ok().flatten()
 }
 
+/// epoch IPK 解決（M8c-3 spec 設計 2）: ① KVS の mat-epoch キー →
+/// ② 無ければ chip-tool 既定定数を KDF ガードで検証し、その場で KVS へ
+/// 採用永続（adopt）→ 使用。③ 不一致は store_parse ハードエラー。
+/// この解決はフォールバックさせない（採用永続の書込失敗も hard error —
+/// flock 規律は M8c-2 と同じ）。M8c-1 の「不一致 → Unavailable（フォール
+/// バック）」からの挙動変更（spec 承認済み）。
+///
+/// ネットワークに触れないため（KVS の読み書きのみ）ユニットテスト可能 —
+/// `commission()` 全体を走らせると mDNS に出てしまうのでここへ切り出した。
+fn resolve_ipk_epoch(
+    main_ini: &std::path::Path,
+    fabric_index: u8,
+    creds: &fabric::FabricCredentials,
+) -> Result<[u8; 16], MatError> {
+    match kvs::read_mat_ipk_epoch(main_ini, fabric_index) {
+        Err(e) => Err(MatError::new(
+            ErrorKind::StoreParse,
+            format!("kvs ipk epoch: {e}"),
+        )),
+        Ok(Some(epoch)) => {
+            // 永続済み epoch と KVS operational の整合を毎回検証（片方だけ
+            // 書き換わった不整合ストアで commission しない）。
+            let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+            if fabric::derive_ipk_operational(&epoch, &cfid) != creds.ipk_operational {
+                return Err(MatError::new(
+                    ErrorKind::StoreParse,
+                    "kvs ipk epoch does not derive the stored operational key (inconsistent store)"
+                        .to_string(),
+                ));
+            }
+            Ok(epoch)
+        }
+        Ok(None) => {
+            if !fabric::verify_default_ipk_epoch(
+                &creds.root_public_key,
+                creds.fabric_id,
+                &creds.ipk_operational,
+            ) {
+                return Err(MatError::new(
+                    ErrorKind::StoreParse,
+                    "fabric IPK epoch unknown: not persisted and not the chip-tool default (rotated or foreign fabric)".to_string(),
+                ));
+            }
+            kvs::write_mat_ipk_epoch(main_ini, fabric_index, &fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH)
+                .map_err(|e| {
+                    MatError::new(
+                        ErrorKind::StoreParse,
+                        format!("kvs ipk epoch adopt write: {e}"),
+                    )
+                })?;
+            tracing::info!(fabric_index, "ipk epoch adopted (kvs)");
+            Ok(fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH)
+        }
+    }
+}
+
 pub async fn commission(
     cfg: &NativeConfig,
     req: &CommissionRequest,
@@ -134,28 +193,19 @@ pub async fn commission(
             Ok(m) => m,
             Err(e) => return Ok(CommissionAttempt::Unavailable(format!("kvs: {e}"))),
         };
-    // epoch IPK ガード（Task 2）: この fabric の epoch が chip-tool 既定
-    // 定数であることを、KVS の導出済み operational との KDF 一致で検証。
-    // 不一致（非 chip-tool fabric / IPK ローテーション済み）は native では
-    // 引き受けない。root 公開鍵が要るため一度 `FabricCredentials` を組む
-    // ——`kvs::SelfIssueMaterials` は既に `#[derive(Clone)]`
-    // 済み（秘密鍵を持つ型に Clone をここで新規に足すわけではない）ので、
-    // 安価な INI 再読みではなく `materials.clone()` で賄う。
+    // epoch IPK 解決（M8c-3）には fabric の root 公開鍵が要るため一度
+    // `FabricCredentials` を組む——`kvs::SelfIssueMaterials` は既に
+    // `#[derive(Clone)]` 済み（秘密鍵を持つ型に Clone をここで新規に足す
+    // わけではない）ので、安価な INI 再読みではなく `materials.clone()`
+    // で賄う。
     let creds = match fabric::FabricCredentials::from_self_issued(materials.clone()) {
         Ok(c) => c,
         Err(e) => return Ok(CommissionAttempt::Unavailable(format!("self-issue: {e}"))),
     };
-    if !fabric::verify_default_ipk_epoch(
-        &creds.root_public_key,
-        creds.fabric_id,
-        &creds.ipk_operational,
-    ) {
-        return Ok(CommissionAttempt::Unavailable(
-            "fabric IPK is not the chip-tool default epoch; native commission unsupported until M8c-3".into(),
-        ));
-    }
-    let commissioning_fabric =
-        CommissioningFabric::from_materials(materials, fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH);
+    // 不一致（非 chip-tool fabric / IPK ローテーション済み）は Err —
+    // フォールバックしない（resolve_ipk_epoch のドキュメント参照）。
+    let ipk_epoch = resolve_ipk_epoch(&main_ini, cfg.fabric_index, &creds)?;
+    let commissioning_fabric = CommissioningFabric::from_materials(materials, ipk_epoch);
 
     // 発見と経路選択（mDNS → BLE）。
     let (passcode, target) = match code {
@@ -398,5 +448,81 @@ mod tests {
             vendor_id: None,
             product_id: None,
         }
+    }
+
+    // ---- M8c-3 Task 6: resolve_ipk_epoch ----
+
+    const FAKE_ROOT_PUB: [u8; 65] = [0xAA; 65];
+    const FAKE_FABRIC_ID: u64 = 0x1122_3344_5566_7788;
+
+    /// テスト専用の最小 `FabricCredentials`: `resolve_ipk_epoch` は
+    /// `root_public_key` / `fabric_id` / `ipk_operational` しか見ないため、
+    /// cert/opkey 系フィールドはダミーで埋める（証明書パースを経由しない）。
+    fn fake_creds(ipk_operational: [u8; 16]) -> fabric::FabricCredentials {
+        fabric::FabricCredentials {
+            rcac_tlv: vec![],
+            icac_tlv: None,
+            noc_tlv: vec![],
+            op_public_key: [0u8; 65],
+            op_private_key: [0u8; 32],
+            ipk_operational,
+            node_id: 1,
+            fabric_id: FAKE_FABRIC_ID,
+            root_public_key: FAKE_ROOT_PUB,
+        }
+    }
+
+    fn tmp_main_ini() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&p, "[Default]\n").unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn resolve_ipk_epoch_adopts_and_persists_default_when_key_absent() {
+        let (_dir, ini) = tmp_main_ini();
+        let cfid = fabric::compressed_fabric_id(&FAKE_ROOT_PUB, FAKE_FABRIC_ID);
+        let ipk_operational =
+            fabric::derive_ipk_operational(&fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid);
+        let creds = fake_creds(ipk_operational);
+
+        let epoch = resolve_ipk_epoch(&ini, 1, &creds).unwrap();
+        assert_eq!(epoch, fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH);
+        // KVS へ採用永続されている。
+        assert_eq!(
+            kvs::read_mat_ipk_epoch(&ini, 1).unwrap(),
+            Some(fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH)
+        );
+    }
+
+    #[test]
+    fn resolve_ipk_epoch_reads_persisted_epoch_without_rewriting() {
+        let (_dir, ini) = tmp_main_ini();
+        // 定数とは別のランダム epoch を先に永続しておく。
+        let epoch = [0x11u8; 16];
+        kvs::write_mat_ipk_epoch(&ini, 1, &epoch).unwrap();
+        let cfid = fabric::compressed_fabric_id(&FAKE_ROOT_PUB, FAKE_FABRIC_ID);
+        let ipk_operational = fabric::derive_ipk_operational(&epoch, &cfid);
+        let creds = fake_creds(ipk_operational);
+
+        let before = std::fs::read_to_string(&ini).unwrap();
+        let got = resolve_ipk_epoch(&ini, 1, &creds).unwrap();
+        assert_eq!(got, epoch);
+        // 追記なし（採用永続の書込は起きない）。
+        let after = std::fs::read_to_string(&ini).unwrap();
+        assert_eq!(before, after, "read path must not rewrite the KVS");
+    }
+
+    #[test]
+    fn resolve_ipk_epoch_rejects_operational_unrelated_to_default() {
+        let (_dir, ini) = tmp_main_ini();
+        // epoch キー無し + operational が定数由来でも永続済みでもない値。
+        let creds = fake_creds([0x99u8; 16]);
+
+        let err = resolve_ipk_epoch(&ini, 1, &creds).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreParse);
+        // 採用永続もされない。
+        assert_eq!(kvs::read_mat_ipk_epoch(&ini, 1).unwrap(), None);
     }
 }
