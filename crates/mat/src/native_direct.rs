@@ -1017,6 +1017,111 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
     Ok(RunOutcome::Done)
 }
 
+/// `mat diag node` の IM 部分（operational チェック + thread シグナル）を
+/// native で実行した結果（M8c-2）。CFID はログパースではなく fabric 資材
+/// から直接計算するため、native 経路では cfid_unavailable の系が消える。
+pub(crate) struct DiagImProbe {
+    pub resolved: bool,
+    pub op_kind: Option<mat_core::error::ErrorKind>,
+    pub self_cfid: String,
+    pub thread: Result<mat_core::diag::ThreadCheck, mat_core::error::ErrorKind>,
+}
+
+/// `diag_im_probe` の入口。None = エンジン構築失敗 → 呼び出し側が
+/// chip-tool 経路へフォールバックする（`try_run`/`execute` の
+/// native direct build 失敗と同じ判定形）。
+pub(crate) fn diag_im_probe(
+    cfg: &Config<'_>,
+    store_root: &Path,
+    node_id: u64,
+    endpoint: u16,
+) -> Option<DiagImProbe> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let native_cfg = NativeConfig {
+            store: store_root.to_path_buf(),
+            iface: cfg.iface.to_string(),
+            fabric_index: cfg.fabric_index,
+            issuer_index: cfg.issuer_index,
+        };
+        let engine = match Engine::build(&native_cfg).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e.detail, "native diag build failed; falling back to chip-tool");
+                return None;
+            }
+        };
+        Some(diag_im_with_engine(&engine, node_id, endpoint).await)
+    })
+}
+
+async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> DiagImProbe {
+    use mat_core::ids::resolve_attribute;
+    // cfid は build 済みエンジンでは常に Some（with_parts 注入時のみ呼び出し側が保証）。
+    let cfid = engine
+        .group_settings
+        .as_ref()
+        .map(|g| g.cfid)
+        .expect("built engine always carries group_settings");
+    let self_cfid = format!("{:016X}", u64::from_be_bytes(cfid));
+
+    const CLUSTER_DESCRIPTOR: u32 = 0x001D;
+    const ATTR_PARTS_LIST: u32 = 0x0003;
+    const CLUSTER_THREAD_DIAG: u32 = 0x0035;
+
+    let (resolved, op_kind, thread) = match engine.establisher.establish(node_id).await {
+        Err(e) => (false, Some(e.kind), Err(e.kind)),
+        Ok(mut conn) => {
+            let op = conn.read_json(0, CLUSTER_DESCRIPTOR, ATTR_PARTS_LIST).await;
+            let (resolved, op_kind) = match op {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e.kind)),
+            };
+            let nt_attr = resolve_attribute(CLUSTER_THREAD_DIAG, "neighbor-table").map(|a| a.id);
+            let rr_attr = resolve_attribute(CLUSTER_THREAD_DIAG, "routing-role").map(|a| a.id);
+            let thread = match nt_attr {
+                None => Err(mat_core::error::ErrorKind::Other),
+                Some(id) => match conn.read_json(endpoint, CLUSTER_THREAD_DIAG, id).await {
+                    Err(e) => Err(e.kind),
+                    Ok(v) => {
+                        let rows = v.as_array().cloned().unwrap_or_default();
+                        // struct のキーは field id の10進文字列（"5" = Lqi）。
+                        let best_lqi = rows
+                            .iter()
+                            .filter_map(|r| r.get("5").and_then(serde_json::Value::as_u64))
+                            .map(|v| v as u8)
+                            .max();
+                        let routing_role = match rr_attr {
+                            None => None,
+                            Some(id) => conn
+                                .read_json(endpoint, CLUSTER_THREAD_DIAG, id)
+                                .await
+                                .ok()
+                                .and_then(|v| v.as_i64()),
+                        };
+                        Ok(mat_core::diag::ThreadCheck {
+                            neighbor_count: rows.len(),
+                            best_lqi,
+                            routing_role,
+                        })
+                    }
+                },
+            };
+            (resolved, op_kind, thread)
+        }
+    };
+    tracing::info!(node_id, "diag node executed (native)");
+    DiagImProbe {
+        resolved,
+        op_kind,
+        self_cfid,
+        thread,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,6 +1628,76 @@ mod tests {
             run_op(&engine, &op).await.unwrap(),
             RunOutcome::Fallback
         ));
+    }
+
+    /// `diag_im_with_engine` の scripted establisher: parts-list（descriptor,
+    /// ep0）は既定応答（`FakeConn` の未登録フォールバック `json!(1)`）で
+    /// resolved=true になる。neighbor-table（0x0035/0x0007, ep1）だけ
+    /// 構造体配列で明示応答し、best_lqi を検証可能にする。
+    struct ScriptedImEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for ScriptedImEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            use mat_native::test_support::FakeConn;
+            Ok(Box::new(FakeConn::scripted().with_read(
+                1,
+                0x0035,
+                0x0007,
+                serde_json::json!([{"5": 200}, {"5": 100}]),
+            )))
+        }
+    }
+
+    struct FailingImEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for FailingImEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            Err(MatError::new(
+                mat_core::error::ErrorKind::Unreachable,
+                "fake unreachable",
+            ))
+        }
+    }
+
+    fn failing_establisher() -> FailingImEstablisher {
+        FailingImEstablisher
+    }
+
+    #[tokio::test]
+    async fn diag_im_with_engine_reads_operational_and_thread_natively() {
+        let mut engine = Engine::with_parts(Box::new(ScriptedImEstablisher), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: std::path::PathBuf::from("/nonexistent"),
+            fabric_index: 2,
+            cfid: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        });
+        let p = diag_im_with_engine(&engine, 5, 1).await;
+        assert!(p.resolved);
+        assert_eq!(p.op_kind, None);
+        assert_eq!(p.self_cfid, "1122334455667788");
+        let t = p.thread.expect("thread check");
+        assert!(t.neighbor_count >= 1);
+        assert_eq!(t.best_lqi, Some(200));
+    }
+
+    #[tokio::test]
+    async fn diag_im_with_engine_reports_establish_failure_as_unresolved() {
+        let mut engine = Engine::with_parts(Box::new(failing_establisher()), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: std::path::PathBuf::from("/nonexistent"),
+            fabric_index: 2,
+            cfid: [1u8; 8],
+        });
+        let p = diag_im_with_engine(&engine, 5, 1).await;
+        assert!(!p.resolved);
+        assert_eq!(p.op_kind, Some(mat_core::error::ErrorKind::Unreachable));
+        assert!(p.thread.is_err());
     }
 
     #[tokio::test]

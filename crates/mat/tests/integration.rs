@@ -1655,6 +1655,25 @@ fn diag_deep_native_bogus_iface_falls_back_to_avahi() {
         .stderr(predicate::str::contains("falling back to avahi-browse"));
 }
 
+#[test]
+fn diag_node_im_native_bogus_iface_falls_back_to_chip_tool() {
+    // 存在しない iface 名 → diag_im_probe 側の Engine::build も同じく
+    // iface_index で即失敗 → warn + chip-tool フォールバックで従来出力
+    // （verdict 等）が変わらず出ることを確認する（M8c-2 Task7）。
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_IFACE", "mat-test-no-such-iface")
+        .env("MAT_LOG", "warn")
+        .args(["diag", "node", "--node", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verdict\":\"ok\""))
+        .stdout(predicate::str::contains("\"checks\""))
+        .stderr(predicate::str::contains(
+            "native diag build failed; falling back to chip-tool",
+        ));
+}
+
 // ---- alias 解決（aliases.toml） ----
 
 /// node 5 commission 済み + aliases.toml を置いたストア。
