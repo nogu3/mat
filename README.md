@@ -1005,7 +1005,6 @@ stdout/stderr to classify into `3` / `4` / `5` / `6`. If it cannot classify, exi
 
 ## Backend (chip-tool)
 
-## Backend (chip-tool)
 
 For local runs, put `chip-tool` on your `PATH`. Override the full path with
 `MAT_CHIP_TOOL_BIN`. Building `chip-tool` is heavy, so a Docker image with it
