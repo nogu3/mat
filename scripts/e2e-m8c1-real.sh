@@ -232,15 +232,17 @@ assert_native_marker() {
 }
 
 echo "== 3/6 検証2: Thread dataset 取得 → native BLE+Thread commission（玄関ライト）"
-echo "-- jarvis の OTBR から Thread active operational dataset を取得"
-OT_RAW=$(ssh -n "$MAT_E2E_HOST" sudo ot-ctl dataset active -x)
-THREAD_DATASET=$(printf '%s\n' "$OT_RAW" | tr -d '\r' | grep -Eo '^[0-9a-fA-F]+$' | head -n1)
-if [ -z "$THREAD_DATASET" ]; then
-  echo "FAIL: sudo ot-ctl dataset active -x の出力から hex dataset を抽出できない:" >&2
-  printf '%s\n' "$OT_RAW" >&2
+# jarvis は border router では**ない**（BR 群は LAN 上の別デバイス）ため
+# ot-ctl は使えない。M6b と同じく MAT_E2E_THREAD_DATASET（active operational
+# dataset の hex、network key を含む秘匿値 — repo にコミットしない）で注入する。
+# 取得例: BR ホストで `sudo ot-ctl dataset active -x`、または HA の Thread
+# 統合（OTBR アドオン）から。
+THREAD_DATASET=$(printf '%s' "${MAT_E2E_THREAD_DATASET:-}" | tr -d '\r\n ')
+if ! printf '%s' "$THREAD_DATASET" | grep -Eq '^[0-9a-fA-F]+$'; then
+  echo "FAIL: MAT_E2E_THREAD_DATASET (hex の Thread active operational dataset) が必要" >&2
   exit 1
 fi
-echo "Thread dataset 取得 OK (${#THREAD_DATASET} hex chars)"
+echo "Thread dataset OK (${#THREAD_DATASET} hex chars)"
 
 echo ""
 echo ">>> 玄関ライトの setup code を QR ペイロード（\"MT:...\"）で入力してください。"
