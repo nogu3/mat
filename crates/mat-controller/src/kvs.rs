@@ -648,6 +648,8 @@ pub struct KvsTxn {
     /// [Default] セクション内の行範囲（`lines` の添字、[start, end)）。
     default_start: usize,
     default_end: usize,
+    /// 元ファイルが末尾改行で終わっていたか（CRLF/LF 保全のため）。
+    trailing_newline: bool,
     _lock: std::fs::File,
 }
 
@@ -671,7 +673,21 @@ impl KvsTxn {
             }
         })?;
         let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        // 末尾改行の有無を記録（commit で復元するため）。
+        let trailing_newline = text.ends_with('\n');
+        // split('\n') で分割して各行の \r を保持（lines() は \r を剥がす）。text
+        // が \n で終わるとき split の最終要素は必ず空文字列という幻の要素になる
+        // （そうでないと split/join が恒等 round-trip にならない）。この幻要素を
+        // 残したままだと commit 側の push('\n') と二重になり無変更 commit でも
+        // 末尾に空行が増え、さらに [Default] が最終セクションのとき
+        // default_end がその幻要素を含んで set() の追記位置がずれる。よって
+        // trailing_newline のときは末尾の空要素を pop で取り除く（空文字列の
+        // ときだけ pop するので空ファイル・"[Default]\n" だけのファイルでも
+        // panic しない）。
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        if trailing_newline && lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
         // [Default] セクション境界を行単位で確定。
         let mut default_start = None;
         let mut default_end = lines.len();
@@ -696,6 +712,7 @@ impl KvsTxn {
             lines,
             default_start,
             default_end,
+            trailing_newline,
             _lock: lock,
         })
     }
@@ -713,7 +730,6 @@ impl KvsTxn {
     /// key の値を base64 デコードして返す。無い・空は None（読み側
     /// `decode_b64` と同じ扱い）。
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvsError> {
-        use base64ct::{Base64, Encoding};
         match self.find(key) {
             None => Ok(None),
             Some(i) => {
@@ -733,7 +749,6 @@ impl KvsTxn {
     }
 
     pub fn set(&mut self, key: &str, value: &[u8]) {
-        use base64ct::{Base64, Encoding};
         let line = format!("{key}={}", Base64::encode_string(value));
         match self.find(key) {
             Some(i) => self.lines[i] = line,
@@ -752,12 +767,15 @@ impl KvsTxn {
     }
 
     /// tmp + fsync + rename の原子置換（`group.rs` counter の persist と同流儀）。
+    /// 末尾改行スタイルを元ファイルに合わせる（CRLF/LF/no-newline を保全）。
     pub fn commit(self) -> Result<(), KvsError> {
         use std::io::Write;
         let tmp = self.path.with_extension("ini.tmp");
         let mut f = std::fs::File::create(&tmp).map_err(KvsError::Io)?;
         let mut body = self.lines.join("\n");
-        body.push('\n');
+        if self.trailing_newline && !self.lines.is_empty() {
+            body.push('\n');
+        }
         f.write_all(body.as_bytes()).map_err(KvsError::Io)?;
         f.sync_all().map_err(KvsError::Io)?;
         std::fs::rename(&tmp, &self.path).map_err(KvsError::Io)?;
@@ -1257,12 +1275,24 @@ mod tests {
         assert_eq!(txn.get("f/2/g").unwrap().unwrap(), vec![0x15, 0x18]);
         txn.commit().unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
-        // 無関係キーは保全、新キーは [Default] 内に chip-tool inipp 形式（key=value）で追記。
-        assert!(text.contains("g/gdc=AQAAAA=="), "{text}");
-        assert!(text.contains("f/2/g=FRg="), "{text}");
+        // 無関係キーは保全、新キーは [Default] 末尾に chip-tool inipp 形式
+        // （key=value）で追記、余計な空行は入らない。
+        assert_eq!(text, "[Default]\ng/gdc=AQAAAA==\nf/2/g=FRg=\n", "{text}");
         // 再読込でも読める（自作 reader との整合）。
         let txn2 = KvsTxn::open(&p).unwrap();
         assert_eq!(txn2.get("f/2/g").unwrap().unwrap(), vec![0x15, 0x18]);
+    }
+
+    #[test]
+    fn kvs_txn_noop_commit_is_byte_identical() {
+        // レビュー指摘: split('\n') が生む幻の末尾空要素を pop で除去しないと、
+        // 何も変更しない commit でも join+push('\n') が末尾に空行を増やす。
+        let (_d, p) = tmp_ini("[Default]\ng/gdc=AQAAAA==\n");
+        let original = std::fs::read_to_string(&p).unwrap();
+        let txn = KvsTxn::open(&p).unwrap();
+        txn.commit().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text, original, "no-op commit must be byte-identical");
     }
 
     #[test]
@@ -1272,8 +1302,7 @@ mod tests {
         txn.set("f/2/g", &[1]);
         txn.commit().unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(text.matches("f/2/g=").count(), 1, "{text}");
-        assert!(text.contains("other=x"));
+        assert_eq!(text, "[Default]\nf/2/g=AQ==\nother=x\n", "{text}");
     }
 
     #[test]
@@ -1283,8 +1312,7 @@ mod tests {
         txn.remove("f/2/gk/1");
         txn.commit().unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(!text.contains("f/2/gk/1"), "{text}");
-        assert!(text.contains("keep=y"));
+        assert_eq!(text, "[Default]\nkeep=y\n", "{text}");
     }
 
     #[test]
@@ -1298,5 +1326,37 @@ mod tests {
         let (_d, p) = tmp_ini("[Default]\n");
         let _held = KvsTxn::open(&p).unwrap();
         assert!(matches!(KvsTxn::open(&p), Err(KvsError::Locked)));
+    }
+
+    #[test]
+    fn kvs_txn_preserves_crlf_bytes_of_unrelated_lines() {
+        // CRLF 末尾の無関係キーが byte 単位で保全されること、且つ
+        // \r 付き行を読むときも正しく値を取り出せること。
+        let (_d, p) = tmp_ini("[Default]\r\ng/gdc=AQAAAA==\r\n");
+        let mut txn = KvsTxn::open(&p).unwrap();
+        // \r 付き行から値を正しく読める
+        assert_eq!(txn.get("g/gdc").unwrap().unwrap(), vec![1, 0, 0, 0]);
+        // 新キーを set
+        txn.set("new/key", &[1]);
+        txn.commit().unwrap();
+        // ファイル内容を確認: \r 付き行は byte 保全、追記行は LF のみ、末尾
+        // 改行は元スタイル（改行あり）を踏襲。
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            text, "[Default]\r\ng/gdc=AQAAAA==\r\nnew/key=AQ==\n",
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn kvs_txn_preserves_missing_trailing_newline() {
+        // 末尾改行なしのファイルで、何も変更しない commit 後に
+        // ファイル内容が byte 一致すること（末尾改行が付かないこと）。
+        let (_d, p) = tmp_ini("[Default]\ng/gdc=AQAAAA==");
+        // 何も変更しない
+        let txn = KvsTxn::open(&p).unwrap();
+        txn.commit().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text, "[Default]\ng/gdc=AQAAAA==");
     }
 }
