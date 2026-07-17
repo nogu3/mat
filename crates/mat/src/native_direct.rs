@@ -578,7 +578,7 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
                 return Ok(Executed::Fallback);
             }
         };
-        match run_op(&engine, op, store.root()).await? {
+        match run_op(&engine, op).await? {
             RunOutcome::Done => Ok(Executed::Done),
             RunOutcome::Fallback => Ok(Executed::Fallback),
         }
@@ -588,10 +588,9 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
 /// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。unicast 4 形は
 /// 常に `Done`。group 3 形は `engine.group` 未設定 / `GroupOutcome::Unavailable`
 /// のとき `Fallback` を返し、chip-tool 直へ譲る（matd の native_group_params
-/// と対の判定を CLI 直経路で再現）。`store_root` は `GroupProvision` がコントローラ側
-/// group state（chip-tool 経由、KVS 書込所有は M8c まで chip-tool）を実行するのに使う
-/// —— 他の op には無関係（未使用でも警告にならないよう Group* 系のみが読む）。
-async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<RunOutcome, MatError> {
+/// と対の判定を CLI 直経路で再現）。`GroupProvision` も同様に `engine.group_settings`
+/// 未設定（M8c-2: native KVS 書込ができない ctx 未構成）で `Fallback` を返す。
+async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> {
     use mat_controller::im;
     match op {
         NativeOp::On { node_id, endpoint } => {
@@ -826,22 +825,28 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
             epoch_key,
             rebind,
         } => {
-            // 1) コントローラ側 group state（chip-tool、KVS 書込所有は M8c まで
-            //    chip-tool 側 —— native 化しない）。デバイス側と同じ epoch key を
-            //    使う必要があるため、解決結果（hex 文字列）を受け取る。
-            let chip = crate::runner::ChipTool::new(store_root);
-            let epoch_key_hex = crate::commands::group::provision_controller_state(
-                &chip,
+            // 1) コントローラ側 group state（M8c-2: native KVS 書込）。ctx 未構成
+            //    はワイヤ・KVS とも未接触なので chip-tool へフォールバック
+            //    （group 送信の ctx 判定と対）。書込エラーは hard error
+            //    （ラッパー側 doc 参照 — flock WouldBlock 含む）。
+            let Some(gs) = &engine.group_settings else {
+                tracing::warn!(
+                    "native group settings context not configured; falling back to chip-tool"
+                );
+                return Ok(RunOutcome::Fallback);
+            };
+            let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key.as_deref())?;
+            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
+            mat_native::group_settings::write_group_provision(
+                gs,
                 *group_id,
                 *keyset_id,
                 name,
-                epoch_key.as_deref(),
+                &epoch_key_bytes,
                 *rebind,
             )?;
-            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
 
-            // 2) 各デバイスへ provision（native, unicast）。最初の失敗で停止
-            //    （chip-tool 経路と同じ fail-fast、部分結果を stdout に出さない）。
+            // 2) 各デバイスへ provision（native, unicast）— M8a のまま。
             for &node_id in node_ids {
                 let mut conn = engine.establisher.establish(node_id).await?;
                 let p = mat_native::ops::ProvisionNodeParams {
@@ -862,7 +867,7 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
                 "group provision executed (native direct)"
             );
             crate::commands::group::emit_provision_success(
-                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind,
+                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind, true,
             );
         }
         NativeOp::GroupGrant { group_id, node_ids } => {
@@ -1010,6 +1015,91 @@ async fn run_op(engine: &Engine, op: &NativeOp, store_root: &Path) -> Result<Run
         }
     }
     Ok(RunOutcome::Done)
+}
+
+/// `mat diag node` の IM 部分（operational チェック + thread シグナル）を
+/// native で実行した結果（M8c-2）。CFID はログパースではなく fabric 資材
+/// から直接計算するため、native 経路では cfid_unavailable の系が消える。
+pub(crate) struct DiagImProbe {
+    pub resolved: bool,
+    pub op_kind: Option<mat_core::error::ErrorKind>,
+    pub self_cfid: String,
+    pub thread: Result<mat_core::diag::ThreadCheck, mat_core::error::ErrorKind>,
+}
+
+/// `diag_im_probe` の入口。None = エンジン構築失敗 → 呼び出し側が
+/// chip-tool 経路へフォールバックする（`try_run`/`execute` の
+/// native direct build 失敗と同じ判定形）。
+pub(crate) fn diag_im_probe(
+    cfg: &Config<'_>,
+    store_root: &Path,
+    node_id: u64,
+    endpoint: u16,
+) -> Option<DiagImProbe> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let native_cfg = NativeConfig {
+            store: store_root.to_path_buf(),
+            iface: cfg.iface.to_string(),
+            fabric_index: cfg.fabric_index,
+            issuer_index: cfg.issuer_index,
+        };
+        let engine = match Engine::build(&native_cfg).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e.detail, "native diag build failed; falling back to chip-tool");
+                return None;
+            }
+        };
+        Some(diag_im_with_engine(&engine, node_id, endpoint).await)
+    })
+}
+
+async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> DiagImProbe {
+    use mat_core::ids::{resolve_attribute, resolve_cluster};
+    // cfid は build 済みエンジンでは常に Some（with_parts 注入時のみ呼び出し側が保証）。
+    let cfid = engine
+        .group_settings
+        .as_ref()
+        .map(|g| g.cfid)
+        .expect("built engine always carries group_settings");
+    let self_cfid = format!("{:016X}", u64::from_be_bytes(cfid));
+
+    // descriptor / parts-list は mat-core::ids 表から解決する（プロトコル知識を
+    // 重複ハードコードしない）。表に無ければここで Other へフォールバックする —
+    // 現行の名前表には常に載っているため通常到達しない。
+    let descriptor_parts =
+        resolve_cluster("descriptor").zip(resolve_attribute(0x001D, "parts-list").map(|a| a.id));
+
+    let (resolved, op_kind, thread) = match engine.establisher.establish(node_id).await {
+        Err(e) => (false, Some(e.kind), Err(e.kind)),
+        Ok(mut conn) => {
+            let (resolved, op_kind) = match descriptor_parts {
+                None => (false, Some(mat_core::error::ErrorKind::Other)),
+                Some((cluster, attr)) => match conn.read_json(0, cluster, attr).await {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(e.kind)),
+                },
+            };
+            // thread シグナルの field-id 知識（NEIGHBOR_TABLE_FIELDS 等）は
+            // mat-native::ops に閉じている（CLAUDE.md 設計ルール1）。
+            let thread = match mat_native::ops::diag_thread(&mut *conn, endpoint).await {
+                Err(e) => Err(e.kind),
+                Ok(snap) => mat_native::ops::thread_check_from_snapshot(&snap).map_err(|e| e.kind),
+            };
+            (resolved, op_kind, thread)
+        }
+    };
+    tracing::info!(node_id, "diag node executed (native)");
+    DiagImProbe {
+        resolved,
+        op_kind,
+        self_cfid,
+        thread,
+    }
 }
 
 #[cfg(test)]
@@ -1245,7 +1335,6 @@ mod tests {
                 command: "toggle",
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1272,7 +1361,6 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .expect_err("timeout must surface");
@@ -1290,7 +1378,6 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();
@@ -1449,6 +1536,152 @@ mod tests {
         ));
     }
 
+    /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
+    /// JSON（空リスト／管理者エントリのみ）を返す scripted establisher
+    /// （matd の `ScriptedEstablisher`, `crates/matd/src/server.rs` 1639 行付近
+    /// と同型のフィクスチャ）。
+    struct ScriptedEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for ScriptedEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            use mat_native::test_support::FakeConn;
+            Ok(Box::new(
+                FakeConn::scripted()
+                    .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
+                    .with_read(
+                        0,
+                        0x001F,
+                        0x0000,
+                        serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
+                    ),
+            ))
+        }
+    }
+
+    fn scripted_establisher() -> ScriptedEstablisher {
+        ScriptedEstablisher
+    }
+
+    #[tokio::test]
+    async fn run_op_group_provision_writes_controller_state_to_kvs_natively() {
+        // engine: fake establisher + group_settings ctx（一時 ini）。
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let mut engine = Engine::with_parts(Box::new(scripted_establisher()), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: ini.clone(),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        });
+        let op = NativeOp::GroupProvision {
+            group_id: 99,
+            node_ids: vec![5],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: Some("42".repeat(16)),
+            rebind: false,
+        };
+        let out = run_op(&engine, &op).await.unwrap();
+        assert!(matches!(out, RunOutcome::Done));
+        // コントローラ側 state が chip-tool spawn なしで KVS に入っている。
+        assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_op_group_provision_falls_back_when_ctx_missing() {
+        let engine = Engine::with_parts(Box::new(scripted_establisher()), None); // ctx なし
+        let op = NativeOp::GroupProvision {
+            group_id: 99,
+            node_ids: vec![5],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        };
+        assert!(matches!(
+            run_op(&engine, &op).await.unwrap(),
+            RunOutcome::Fallback
+        ));
+    }
+
+    /// `diag_im_with_engine` の scripted establisher: parts-list（descriptor,
+    /// ep0）は既定応答（`FakeConn` の未登録フォールバック `json!(1)`）で
+    /// resolved=true になる。thread シグナルは `mat_native::ops::diag_thread`
+    /// 経由（`read_cluster` の wildcard read 1発）に変わったため、
+    /// neighbor-table（0x0035/0x0007, ep1）は `with_cluster` で構造体配列を
+    /// 明示応答する（field id "5" = Lqi、ops.rs の `NEIGHBOR_TABLE_FIELDS` で
+    /// 改名される）。
+    struct ScriptedImEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for ScriptedImEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            use mat_native::test_support::FakeConn;
+            Ok(Box::new(FakeConn::scripted().with_cluster(
+                1,
+                0x0035,
+                vec![(0x0007, serde_json::json!([{"5": 200}, {"5": 100}]))],
+            )))
+        }
+    }
+
+    struct FailingImEstablisher;
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for FailingImEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            Err(MatError::new(
+                mat_core::error::ErrorKind::Unreachable,
+                "fake unreachable",
+            ))
+        }
+    }
+
+    fn failing_establisher() -> FailingImEstablisher {
+        FailingImEstablisher
+    }
+
+    #[tokio::test]
+    async fn diag_im_with_engine_reads_operational_and_thread_natively() {
+        let mut engine = Engine::with_parts(Box::new(ScriptedImEstablisher), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: std::path::PathBuf::from("/nonexistent"),
+            fabric_index: 2,
+            cfid: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        });
+        let p = diag_im_with_engine(&engine, 5, 1).await;
+        assert!(p.resolved);
+        assert_eq!(p.op_kind, None);
+        assert_eq!(p.self_cfid, "1122334455667788");
+        let t = p.thread.expect("thread check");
+        assert!(t.neighbor_count >= 1);
+        assert_eq!(t.best_lqi, Some(200));
+    }
+
+    #[tokio::test]
+    async fn diag_im_with_engine_reports_establish_failure_as_unresolved() {
+        let mut engine = Engine::with_parts(Box::new(failing_establisher()), None);
+        engine.group_settings = Some(mat_native::group_settings::GroupSettingsCtx {
+            main_ini: std::path::PathBuf::from("/nonexistent"),
+            fabric_index: 2,
+            cfid: [1u8; 8],
+        });
+        let p = diag_im_with_engine(&engine, 5, 1).await;
+        assert!(!p.resolved);
+        assert_eq!(p.op_kind, Some(mat_core::error::ErrorKind::Unreachable));
+        assert!(p.thread.is_err());
+    }
+
     #[tokio::test]
     async fn open_window_runs_via_fake_and_emits_codes() {
         // fake 経由で run_op(OpenWindow) が establish → open_window → emit まで
@@ -1464,7 +1697,6 @@ mod tests {
                 iteration: 1000,
                 discriminator: 3840,
             },
-            Path::new("/nonexistent-store"),
         )
         .await
         .unwrap();

@@ -589,11 +589,12 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     - **M8c-1（本節、0.20.0）— commission native 化**: 既存 fabric 上の
       `mat commission` を M6a（on-network）/ M6b（BLE+Thread）実装へ配線。
       KVS 書込なし（既存 fabric 上の commission は read 系 API で足りる）。
-    - **M8c-2（0.21.0）— KVS group 書込所有 + diag node 再訪**: controller
-      側 `groupsettings`（chip-tool interactive）の native 化 = keyset /
-      group table を mat が chip-tool INI 形式 KVS へ flock 排他で書く。
-      matd provision のハイブリッド（M8a）解消。`diag node` の IM 部分
-      native 化。
+    - **M8c-2（本節、0.21.0）— KVS group 書込所有 + diag node 再訪**:
+      controller 側 `groupsettings`（chip-tool interactive）の native 化 =
+      keyset / group table を mat が chip-tool INI 形式 KVS へ flock 排他で
+      書く。matd provision のハイブリッド（M8a）解消。`diag node` の IM
+      部分 native 化。**実装済み（本文後段、実機 E2E 未実施 — ハーネス
+      `scripts/e2e-m8c2-real.sh` / `task e2e:m8c2:real` 用意済み）**。
     - **M8c-3（0.22.0）— native 既定化 + chip-tool 完全撤去**: 初回 fabric
       bootstrap（root CA 生成 + KVS 新規作成。chip-tool が同じ KVS を読む
       間は「実 chip-tool も受理できる新規 fabric」という互換問題を抱える
@@ -679,6 +680,87 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     設計どおり Unavailable になる（btmon で 0xFFF6 の有無を事前確認可）。
     この E2E で玄関ライトは mat fabric に復帰（M6b 以来の fabric 無し状態が
     解消）。
+  - **M8c-2 実装済み**: 設計は
+    `docs/superpowers/specs/2026-07-17-phase5-m8c2-groupsettings-native-design.md`。
+    (1) **`KvsTxn`**（`mat-controller::kvs`）: chip-tool の `chip_tool_config.ini`
+    を flock 排他（non-blocking exclusive、他プロセス保持中は `KvsError::Locked`
+    即エラー）+ 読み・変更・commit は tmp ファイルへ書いてから rename する
+    原子置換で書く汎用トランザクション。値は INI 内 base64 の TLV バイト列
+    （既存 KVS リーダと同じ表現）。GKH（Group Key Hash = group session id）の
+    HKDF-SHA256 導出（`derive_group_session_id`、salt なし・info
+    `"GroupKeyHash"`、上流 v1.4.2.0 `CHIPCryptoPAL.cpp
+    DeriveGroupSessionId` と同一）を `mat-controller::fabric` に追加。
+    (2) **`mat-controller::group_settings`**: `write_group_provision` が
+    chip-tool `groupsettings add-group`/`add-keysets`/`(unbind-keyset)`/
+    `bind-keyset` 相当の 5 レコード（`g/gfl`, `f/<idx>/g`,
+    `f/<idx>/g/<gid>`, `f/<idx>/gk/<id>`, `f/<idx>/k/<ksid>`）を 1 回の
+    `KvsTxn`（＝1 flock 区間）内で読み・変更・commit まで完結させる。上流
+    v1.4.2.0 `GroupDataProviderImpl` と同じリンク規律を再現（group リストは
+    末尾挿入・終端 0、keyset リストは head 挿入・終端 `0xFFFF`（id 0 は IPK
+    で有効値）、keymap は末尾連結・id は sparse に `max+1`、走査は count が
+    正）。上流との意図的な差分は 2 つ: ①リンク切れ・解釈不能レコードは
+    黙って進まず `GroupSettingsError::Corrupt`（不整合ストアをこれ以上
+    悪化させない）。②新規 `GroupData` の `first_endpoint` は常に
+    `kInvalidEndpointId`（`0xFFFF`）— 上流は直前に走査した他レコードの値が
+    漏れ込むが `endpoint_count=0` のとき読者はこの欄を見ないため互換に
+    影響しない。`rebind: bool` は chip-tool と同じ意味論（無しで既存 bind
+    と衝突すると `DuplicateBind`＝「`--rebind` で解消」を指す detail 付き
+    エラー、有りは best-effort unbind→bind）。
+    (3) **`mat-native::group_settings`**: 薄いラッパー
+    `GroupSettingsCtx { main_ini, fabric_index, cfid }` +
+    `write_group_provision`。`GroupSettingsError` は全て `ErrorKind::Other`
+    の hard error に写像（フォールバック可否の判断はここでは行わない —
+    呼び出し側は「ctx 未構成（KVS 資材が解決できていない）」のときだけ
+    フォールバックし、書込を試みた後の失敗（`DuplicateBind` /
+    flock `WouldBlock` 含む）は常にそのままエラーとして返す）。
+    (4) **配線**: 直経路（`native_direct.rs::run_op`
+    `NativeOp::GroupProvision`）は `engine.group_settings` が `None`
+    （ctx 未構成＝ワイヤ・KVS とも未接触）なら chip-tool へフォールバック、
+    `Some` なら chip-tool を一切 spawn せず native KVS へ書いてからデバイス
+    側 4 ステップ（M8a のまま・native unicast）を実行する。matd
+    （`server.rs::group_provision`）も対称: `NativeBackend::group_settings_ctx()`
+    が `Some` ならコントローラ側を native 書込に、`None`（native 無効・
+    テスト注入等）なら従来どおり chip-tool ws 経由の 4 コマンドに完全に
+    フォールバックする（M8a のハイブリッド — デバイス側のみ native・
+    コントローラ側は常に chip-tool — を解消）。matd 側はテストで実証:
+    `groupsettings` で始まる ws コマンドを受信したら panic する fake ws を
+    用意し、native ctx 存在時にそのソケットへ一切トラフィックが飛ばない
+    ことを確認。出力: native 書込のときは `--rebind` の有無によらず常に
+    `"note": "controller group state written natively to kvs; if matd is
+    running, restart it to reload group state"`（`emit_provision_success`
+    に `native_kvs: bool` を追加、chip-tool 経路の出力・note は無変更）。
+    (5) **`diag node` の IM native 化**（直経路のみ — `diag node` は matd
+    プロトコル対象外のまま、`--deep` の ping6/mDNS は M8b のまま無変更）:
+    `native_direct::diag_im_probe`/`diag_im_with_engine` が 1 CASE
+    セッションで operational（descriptor/parts-list read、
+    `mat-core::ids` の名前表から解決）と thread シグナルの両方を賄う。
+    thread の field-id 知識（`NEIGHBOR_TABLE_FIELDS` 等）はプロトコル知識を
+    `mat` command 層に持ち込まないよう `mat-native::ops::diag_thread` /
+    `thread_check_from_snapshot` 経由に一本化（Task7 レビュー修正、
+    CLAUDE.md 設計ルール1）。self-CFID はログパースをやめ、
+    エンジンが保持する fabric 資材（`engine.group_settings.cfid`）から直接
+    計算する — native 経路では `cfid_unavailable` の系がそもそも発生しない
+    （chip-tool 経路は従来どおりログ由来）。エンジン構築失敗は
+    `diag_im_probe` が `None` を返し、呼び出し側が chip-tool 経路へ
+    フォールバックする（他 native op の構築失敗フォールバックと同型）。
+    (6) 実機 E2E ハーネス `scripts/e2e-m8c2-real.sh` / `task e2e:m8c2:real`
+    新設（jarvis、living_lights の 2 台・既定 node 8/9 を使い捨てグループ
+    99 に入れて検証。M8a/M8b/M8c-1 と同じ二重チェック方式 —
+    `MAT_CHIP_TOOL_BIN=/nonexistent` での chip-tool spawn ゼロ強制 +
+    positive marker（`group provision controller state written (native
+    kvs)` / `group provision executed (native direct)` / `diag node
+    executed (native)`）grep + `assert_no_fallback`）。検証項目: native
+    provision（chip-tool spawn ゼロ、note 付き）/ native groupcast
+    往復（各ノード on-off 反転を native read で確認）/ `--rebind`
+    再実行が成功・`--rebind` 無しの再実行が `use --rebind` 誘導の detail
+    で失敗（exit 1 = `ErrorKind::Other`）/ chip-tool 互換（mat が書いた
+    KVS を実 `chip-tool groupsettings show-groups`/`show-keysets` が読める
+    ことの実証）/ `diag node --deep` の operational・thread が native で
+    完走 / `MAT_IFACE` 未設定時の chip-tool 経路健全性。ハーネスは KVS
+    バックアップを取ってから走らせる前提（Task8 レビュー修正で `g/gdc`
+    書換をバックアップ実在ガードで保護 — バックアップが無い状態で誤って
+    破壊的な書換に入らないようにする安全策）。バージョンは 0.21.0。
+    **実機 E2E は本タスクの範囲外（未実施）**。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・

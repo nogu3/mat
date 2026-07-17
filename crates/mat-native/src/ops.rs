@@ -164,6 +164,37 @@ pub async fn diag_thread(
     })
 }
 
+/// diag node の thread シグナル: `ThreadSnapshot` から `ThreadCheck`
+/// （隣接数 / 最良 LQI / routing role）を導出する。`neighbor_table` が
+/// 読めていない（wildcard に含まれず Null、または属性自体が cluster に無い）
+/// 場合は Err（chip-tool 経路の「neighbor-table が読めなければ thread check
+/// 不可」と同義）。
+pub fn thread_check_from_snapshot(
+    snap: &ThreadSnapshot,
+) -> Result<mat_core::diag::ThreadCheck, MatError> {
+    let rows = snap
+        .fields
+        .get("neighbor_table")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MatError::new(
+                ErrorKind::Other,
+                "neighbor-table not reported by node (unsupported cluster or read failed)",
+            )
+        })?;
+    let best_lqi = rows
+        .iter()
+        .filter_map(|r| r.get("Lqi").and_then(Value::as_u64))
+        .map(|v| v as u8)
+        .max();
+    let routing_role = snap.fields.get("routing_role").and_then(Value::as_i64);
+    Ok(mat_core::diag::ThreadCheck {
+        neighbor_count: rows.len(),
+        best_lqi,
+        routing_role,
+    })
+}
+
 fn table_fields_for(attr_name: &str) -> &'static [(u8, &'static str)] {
     if attr_name == "neighbor-table" {
         NEIGHBOR_TABLE_FIELDS
@@ -457,6 +488,45 @@ mod tests {
         // 返らなかった属性は null。
         assert_eq!(snap.fields["network_name"], serde_json::Value::Null);
         assert!(snap.unavailable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_check_from_snapshot_computes_max_lqi_and_routing_role() {
+        // diag_thread → thread_check_from_snapshot の連結。neighbor-table 2行
+        // （field id "5" = Lqi）から best_lqi = max、routing-role はそのまま数値化。
+        let mut conn = FakeConn::scripted().with_cluster(
+            1,
+            0x0035,
+            vec![
+                (0x0001, serde_json::json!(2)), // routing-role
+                (
+                    0x0007,
+                    serde_json::json!([
+                        {"0": 42, "5": 120},
+                        {"0": 43, "5": 200},
+                    ]),
+                ), // neighbor-table, 2 rows
+            ],
+        );
+        let snap = diag_thread(&mut conn, 1).await.unwrap();
+        let check = thread_check_from_snapshot(&snap).unwrap();
+        assert_eq!(check.neighbor_count, 2);
+        assert_eq!(check.best_lqi, Some(200));
+        assert_eq!(check.routing_role, Some(2));
+    }
+
+    #[tokio::test]
+    async fn thread_check_from_snapshot_errs_when_neighbor_table_missing() {
+        // neighbor-table 属性がデバイスから返らない（wildcard に含まれない）
+        // ケース = null。chip-tool 経路の「読めなければ thread check 不可」と同義。
+        let mut conn = FakeConn::scripted().with_cluster(
+            1,
+            0x0035,
+            vec![(0x0001, serde_json::json!(2))], // routing-role のみ
+        );
+        let snap = diag_thread(&mut conn, 1).await.unwrap();
+        let err = thread_check_from_snapshot(&snap).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
     }
 
     #[tokio::test]

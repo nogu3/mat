@@ -71,6 +71,24 @@ impl NativeBackend {
         Self::from_engine(mat_native::Engine::with_parts(establisher, group))
     }
 
+    /// テスト用: with_parts + group_settings 注入。
+    #[cfg(test)]
+    pub(crate) fn with_parts_gs(
+        establisher: Box<dyn Establisher>,
+        group: Option<GroupCtx>,
+        gs: Option<mat_native::group_settings::GroupSettingsCtx>,
+    ) -> Self {
+        let mut engine = mat_native::Engine::with_parts(establisher, group);
+        engine.group_settings = gs;
+        Self::from_engine(engine)
+    }
+
+    /// controller 側 group state の KVS 書込資材（M8c-2）。None = native 構築が
+    /// 未完（テスト注入等）— 呼び出し側は chip-tool ws へフォールバックする。
+    pub fn group_settings_ctx(&self) -> Option<&mat_native::group_settings::GroupSettingsCtx> {
+        self.engine.group_settings.as_ref()
+    }
+
     /// この node の per-node slot（`Arc<Mutex<Option<..>>>`）を得る。外側ロックは
     /// slot 取得の間だけ保持して即解放する（ノード間の並行性を保つ）。
     async fn slot(&self, node_id: u64) -> NodeSlot {
@@ -379,5 +397,27 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, GroupOutcome::Unavailable(_)));
+    }
+
+    #[test]
+    fn group_settings_ctx_reflects_injected_value() {
+        let gs = mat_native::group_settings::GroupSettingsCtx {
+            main_ini: std::path::PathBuf::from("/tmp/does-not-exist.ini"),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        };
+        let backend =
+            NativeBackend::with_parts_gs(Box::new(FakeEstablisher::default()), None, Some(gs));
+        let ctx = backend
+            .group_settings_ctx()
+            .expect("injected group_settings must be reflected");
+        assert_eq!(ctx.fabric_index, 2);
+        assert_eq!(ctx.cfid, [7u8; 8]);
+    }
+
+    #[test]
+    fn group_settings_ctx_is_none_without_injection() {
+        let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        assert!(backend.group_settings_ctx().is_none());
     }
 }
