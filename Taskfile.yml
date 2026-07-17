@@ -152,6 +152,11 @@ tasks:
     cmds:
       - bash scripts/e2e-m8b-real.sh
 
+  e2e:m8c1:real:
+    desc: "M8c-1 実機 E2E: native commission (要 jarvis + MAT_E2E_HOST)"
+    cmds:
+      - bash scripts/e2e-m8c1-real.sh
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
     cmds:
