@@ -34,7 +34,7 @@ pub struct Cli {
 
     /// one-shot 直経路を native（mat-controller 内蔵）で実行する場合の
     /// Thread mesh iface 名（例: eth0）。未設定なら自動検出（up・multicast・
-    /// 非 P2P・IPv6 link-local の一意候補。曖昧ならエラー）。明示指定で
+    /// 非 P2P・非 loopback・IPv6 link-local の一意候補。曖昧ならエラー）。明示指定で
     /// 上書き。対象 op は README の native hotpath 一覧を参照（M8a で汎用
     /// read/write/invoke/describe 等、M8b で discover と mDNS probe に拡大）。
     /// matd 稼働中は matd 自動発見が優先される。
