@@ -480,3 +480,48 @@ fn commission_with_all_digit_alias_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
+
+// ── native 既定化（M8c-3 Task4）: MAT_IFACE 未設定は autodetect に入る ──────
+
+/// `mat()` ヘルパーは `MAT_IFACE=lo` を固定するため、このテストだけ env を
+/// 外して autodetect を発火させる。候補数は環境依存（CI/開発機で 0 個も
+/// 複数個もあり得る）なので、成功可否ではなく「autodetect が実際に走った
+/// 証拠が stderr に出ること」を assert する: マーカー
+/// `iface auto-selected (native default)`（候補一意 → native 経路へ進み、
+/// 別の理由で失敗するケース）か、autodetect 自身のエラー（候補 0 /
+/// 複数、kind `other`）のどちらか。単に `"error"` を含むだけでは
+/// chip-tool 不在（exit 12）でも通ってしまい無意味なため、どちらの経路
+/// にも共通する証拠として `iface` という語の出現を要求する。
+#[test]
+fn no_iface_env_reaches_autodetect_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("mat").unwrap();
+    cmd.env_remove("MAT_IFACE")
+        .env("MAT_MATD", "0")
+        .arg("--store")
+        .arg(dir.path())
+        .args([
+            "read",
+            "--node",
+            "1",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ]);
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"error\""),
+        "structured error expected: {stderr}"
+    );
+    // autodetect が実際に走った証拠: 成功時の info marker か、autodetect
+    // 自身の失敗（候補 0/複数）のどちらか。chip-tool 不在の
+    // child_not_found（native 未経由）ではこの語は出ない。
+    assert!(
+        stderr.contains("iface auto-selected (native default)")
+            || stderr.contains("iface autodetect"),
+        "expected evidence that iface autodetect ran: {stderr}"
+    );
+}

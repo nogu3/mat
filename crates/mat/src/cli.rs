@@ -33,10 +33,11 @@ pub struct Cli {
     pub matd: Option<Option<PathBuf>>,
 
     /// one-shot 直経路を native（mat-controller 内蔵）で実行する場合の
-    /// Thread mesh iface 名（例: eth0）。未設定なら従来どおり chip-tool 直
-    /// （probe は avahi-browse）。対象 op は README の native hotpath 一覧を
-    /// 参照（M8a で汎用 read/write/invoke/describe 等、M8b で discover と
-    /// mDNS probe に拡大）。matd 稼働中は matd 自動発見が優先される。
+    /// Thread mesh iface 名（例: eth0）。未設定なら自動検出（up・multicast・
+    /// 非 P2P・IPv6 link-local の一意候補。曖昧ならエラー）。明示指定で
+    /// 上書き。対象 op は README の native hotpath 一覧を参照（M8a で汎用
+    /// read/write/invoke/describe 等、M8b で discover と mDNS probe に拡大）。
+    /// matd 稼働中は matd 自動発見が優先される。
     #[arg(long, global = true, env = "MAT_IFACE", value_name = "IFACE")]
     pub iface: Option<String>,
 
