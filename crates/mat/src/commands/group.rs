@@ -194,11 +194,15 @@ pub fn provision(
         ensure_group_acl(&chip, node_id, group_id)?;
     }
 
-    emit_provision_success(group_id, keyset_id, name, endpoint, node_ids, rebind);
+    emit_provision_success(group_id, keyset_id, name, endpoint, node_ids, rebind, false);
     Ok(())
 }
 
-/// `provision` の出力部（直経路 native からも共有 — M8a Task9）。
+/// `provision` の出力部（直経路 native からも共有 — M8a Task9、M8c-2 Task5 で
+/// `native_kvs` を追加）。`native_kvs=true` はコントローラ側 group state を
+/// native KVS 直書きで済ませた経路（`native_direct::NativeOp::GroupProvision`）
+/// —— rebind の有無によらず常に同じ note（KVS を直接触った旨と matd 再起動の
+/// 案内）。chip-tool 経路は従来どおり `native_kvs=false` を渡し出力不変。
 pub(crate) fn emit_provision_success(
     group_id: u16,
     keyset_id: u16,
@@ -206,6 +210,7 @@ pub(crate) fn emit_provision_success(
     endpoint: u16,
     node_ids: &[u64],
     rebind: bool,
+    native_kvs: bool,
 ) {
     let mut body = json!({
         "group_id": group_id,
@@ -215,7 +220,12 @@ pub(crate) fn emit_provision_success(
         "nodes": node_ids,
         "status": "provisioned",
     });
-    if rebind {
+    if native_kvs {
+        // native は rebind の有無によらず KVS を直接書くので常にこの note。
+        body["note"] = json!(
+            "controller group state written natively to kvs; if matd is running, restart it to reload group state"
+        );
+    } else if rebind {
         // 直経路の rebind は matd の warm chip-tool が旧 group 状態をメモリに
         // 持ったままになるため、稼働中なら再起動が要る（storage は更新済み）。
         body["note"] =
