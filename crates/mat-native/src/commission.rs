@@ -208,12 +208,14 @@ pub async fn commission(
         }
     };
 
-    // on-network 実行（ここから先はワイヤ接触 — 失敗は Err）。
-    let transport = std::sync::Arc::new(
-        UdpTransport::bind()
-            .await
-            .map_err(|e| MatError::new(ErrorKind::Other, format!("udp bind: {e}")))?,
-    );
+    // UDP bind はローカルのエフェメラルポート取得のみ — ワイヤ未接触なので
+    // 失敗は Unavailable（chip-tool フォールバック可）。on-network 実行は
+    // ここから先（commission_on_network 呼び出し）が実ワイヤ接触で、そちらの
+    // 失敗は Err。
+    let transport = match UdpTransport::bind().await {
+        Ok(t) => std::sync::Arc::new(t),
+        Err(e) => return Ok(CommissionAttempt::Unavailable(format!("udp bind: {e}"))),
+    };
     let dev = match commissioning::commission_on_network(
         transport,
         &commissioning_fabric,

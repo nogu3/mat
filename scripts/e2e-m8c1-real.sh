@@ -155,7 +155,7 @@ LAST_STDERR_FILE=$(mktemp)
 
 cleanup() {
   echo "== cleanup: ssh 先の一時バイナリ削除 ($MAT_E2E_HOST) =="
-  ssh "$MAT_E2E_HOST" "rm -f $REMOTE_BIN" || true
+  ssh -n "$MAT_E2E_HOST" "rm -f $REMOTE_BIN" || true
   rm -f "$LAST_STDERR_FILE"
 }
 trap cleanup EXIT
@@ -176,7 +176,7 @@ STORE_ARG=()
 
 # 検証2: native BLE+Thread commission の純 native 実証。chip-tool 不在。
 run_native_ble() {
-  ssh "$MAT_E2E_HOST" \
+  ssh -n "$MAT_E2E_HOST" \
     MAT_MATD=0 MAT_LOG=info "MAT_IFACE=$IFACE" "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
     "MAT_THREAD_DATASET=$THREAD_DATASET" \
     MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c1-chip-tool \
@@ -187,7 +187,7 @@ run_native_ble() {
 # 純 native 実証。chip-tool 不在（thread-dataset は不要 — BLE 経路を試させ
 # ないことで on-network 経路の判定を汚さない）。
 run_native() {
-  ssh "$MAT_E2E_HOST" \
+  ssh -n "$MAT_E2E_HOST" \
     MAT_MATD=0 MAT_LOG=info "MAT_IFACE=$IFACE" "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
     MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c1-chip-tool \
     "$REMOTE_BIN" "$@" 2>"$LAST_STDERR_FILE"
@@ -197,13 +197,13 @@ run_native() {
 run_chip() {
   local envs=(MAT_MATD=0 MAT_LOG=info)
   [ -n "$CHIP_TOOL_BIN" ] && envs+=("MAT_CHIP_TOOL_BIN=$CHIP_TOOL_BIN")
-  ssh "$MAT_E2E_HOST" "${envs[@]}" "$REMOTE_BIN" "$@" 2>"$LAST_STDERR_FILE"
+  ssh -n "$MAT_E2E_HOST" "${envs[@]}" "$REMOTE_BIN" "$@" 2>"$LAST_STDERR_FILE"
 }
 
 # 検証5(b): 存在しない iface 名 + chip-tool 不在 → フォールバック境界の実証
 # （iface_index 解決失敗 = ワイヤ未接触、どのデバイスにも触れない）。
 run_fallback() {
-  ssh "$MAT_E2E_HOST" \
+  ssh -n "$MAT_E2E_HOST" \
     MAT_MATD=0 MAT_LOG=info MAT_IFACE=mat-e2e-m8c1-bogus-iface "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
     MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c1-chip-tool \
     "$REMOTE_BIN" "$@" 2>"$LAST_STDERR_FILE"
@@ -233,7 +233,7 @@ assert_native_marker() {
 
 echo "== 3/6 検証2: Thread dataset 取得 → native BLE+Thread commission（玄関ライト）"
 echo "-- jarvis の OTBR から Thread active operational dataset を取得"
-OT_RAW=$(ssh "$MAT_E2E_HOST" sudo ot-ctl dataset active -x)
+OT_RAW=$(ssh -n "$MAT_E2E_HOST" sudo ot-ctl dataset active -x)
 THREAD_DATASET=$(printf '%s\n' "$OT_RAW" | tr -d '\r' | grep -Eo '^[0-9a-fA-F]+$' | head -n1)
 if [ -z "$THREAD_DATASET" ]; then
   echo "FAIL: sudo ot-ctl dataset active -x の出力から hex dataset を抽出できない:" >&2
