@@ -346,7 +346,11 @@ echo "$SHOW_KEYSETS_OUT"
 # assert_grep は BRE（grep -q、-E 無し）なので、数字境界を要る ERE alternation
 # はここだけ直接 grep -Eq で書く（"9" のような短い ID が別の数の部分文字列に
 # 誤マッチしないよう境界を要求する）。
-if ! printf '%s' "$SHOW_KEYSETS_OUT" | grep -Eq "(^|[^0-9])$KEYSET([^0-9]|\$)"; then
+# ★実機実測（2026-07-17 run1）: chip-tool v1.4.2.0 の show-keysets は KeySet Id
+# を hex（`0x63`）で表示する（show-groups の group/keyset id も同様。group は
+# 名前 grep なので影響なし）。10進と hex の両対応で判定する。
+KEYSET_HEX=$(printf '0x%x' "$KEYSET")
+if ! printf '%s' "$SHOW_KEYSETS_OUT" | grep -Eq "(^|[^0-9])$KEYSET([^0-9]|\$)|$KEYSET_HEX([^0-9a-fA-F]|\$)"; then
   echo "FAIL: chip-tool groupsettings show-keysets に keyset $KEYSET（=mat が native KVS に書いた keyset）が現れない:" >&2
   printf '%s\n' "$SHOW_KEYSETS_OUT" >&2
   exit 1
