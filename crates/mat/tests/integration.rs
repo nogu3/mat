@@ -498,6 +498,7 @@ fn no_iface_env_reaches_autodetect_not_panic() {
     let mut cmd = Command::cargo_bin("mat").unwrap();
     cmd.env_remove("MAT_IFACE")
         .env("MAT_MATD", "0")
+        .env("MAT_LOG", "info")
         .arg("--store")
         .arg(dir.path())
         .args([
