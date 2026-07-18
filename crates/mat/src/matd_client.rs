@@ -307,6 +307,9 @@ fn to_op(command: &Command) -> Result<Value, String> {
         Command::Commission { .. } => return Err(unsupported("commission")),
         Command::OpenWindow { .. } => return Err(unsupported("open-window")),
         Command::Diag { .. } => return Err(unsupported("diag")),
+        // fabric bootstrap は main.rs が経路解決より前に処理するため、
+        // ここへは到達しない（網羅 match を保つためだけの腕）。
+        Command::Fabric { .. } => return Err(unsupported("fabric")),
     };
     Ok(op)
 }

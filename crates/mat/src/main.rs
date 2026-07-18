@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, DiagCommand, GroupCommand};
+use cli::{Cli, Command, DiagCommand, FabricAction, GroupCommand};
 use mat_core::alias::NodeRef;
 use mat_core::error::ErrorKind;
 use mat_core::store::Store;
@@ -43,6 +43,29 @@ fn main() -> ExitCode {
             };
         }
     };
+
+    // fabric bootstrap（M8c-3）: ネットワーク・backend 未接触のローカル完結処理
+    // なので、iface 自動検出（下のブロック）にも matd 経路にも巻き込まない —
+    // ここで最優先 dispatch する。
+    if let Command::Fabric { action } = &command {
+        let FabricAction::Init {
+            fabric_id,
+            admin_node_id,
+        } = action;
+        return match commands::fabric::run_init(
+            &store_path,
+            *fabric_id,
+            *admin_node_id,
+            args.fabric_index,
+            args.issuer_index,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                e.emit();
+                ExitCode::from(e.kind.exit_code())
+            }
+        };
+    }
 
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
@@ -291,6 +314,9 @@ fn main() -> ExitCode {
                 native_cfg.as_ref(),
             ),
         },
+        // Command::Fabric は上の早期 return で必ず処理済み（ここには来ない —
+        // 網羅 match を保つためだけの腕）。
+        Command::Fabric { .. } => unreachable!("Command::Fabric handled before route dispatch"),
     };
 
     match result {
