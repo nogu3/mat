@@ -603,6 +603,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                command = "on",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "on");
         }
         NativeOp::Off { node_id, endpoint } => {
@@ -615,11 +621,23 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                command = "off",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "off");
         }
         NativeOp::ReadOnOff { node_id, endpoint } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
             let v = conn.read_onoff(*endpoint).await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                attribute = "on-off",
+                "read executed (native direct)"
+            );
             crate::commands::read::emit_read_success(
                 *node_id,
                 *endpoint,
@@ -648,6 +666,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "colorcontrol",
+                command = "move-to-hue-and-saturation",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_color_success(*node_id, *endpoint, color, *transition);
         }
         NativeOp::ColorTemp {
@@ -667,6 +691,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "colorcontrol",
+                command = "move-to-color-temperature",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_color_temp_success(
                 *node_id,
                 *endpoint,
