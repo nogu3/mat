@@ -735,8 +735,24 @@ stage2_main() {
   if confirm_yn "検証3（cross-fabric commission、node=$NODE への open-window+commission+新fabricのRemoveFabricを伴う）を実行しますか"; then
     echo "-- open-window（元 fabric、node=$NODE、STORE_ARG=${STORE_ARG[*]:-<default>}）"
     local OW_OUT OW_MANUAL_CODE
-    OW_OUT=$(run_native_default "${STORE_ARG[@]}" open-window -n "$NODE") \
-      || { echo "FAIL: open-window (cross-fabric prep) が失敗した" >&2; exit 1; }
+    # op_sweep（検証1）で既に開いた commissioning window（180s有効期間）がまだ閉じていない場合、
+    # ここでの open-window はデバイスから device_rejected (rc=4, IM status 0x02) を返す。
+    # 初回 open の window 失効まで最大 45s×5 回リトライで対応する。
+    local ow_attempt ow_ok=0
+    for ow_attempt in 1 2 3 4 5; do
+      if OW_OUT=$(run_native_default "${STORE_ARG[@]}" open-window -n "$NODE"); then
+        ow_ok=1
+        break
+      fi
+      if [ "$ow_attempt" -lt 5 ]; then
+        echo "WARN: open-window rejected (prior commissioning window likely still open from the op sweep), waiting 45s and retrying ($ow_attempt/5)" >&2
+        sleep 45
+      fi
+    done
+    if [ "$ow_ok" != "1" ]; then
+      echo "FAIL: open-window (cross-fabric prep) が失敗した" >&2
+      exit 1
+    fi
     echo "$OW_OUT"
     assert_no_fallback "open-window (cross-fabric prep)"
     OW_MANUAL_CODE=$(printf '%s' "$OW_OUT" | jq -r '.manual_code')
