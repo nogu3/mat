@@ -830,6 +830,13 @@ stage2_main() {
   task docker:build
   echo "PASS: 検証5 task check 全通過 + docker:build 成功" >&2
 
+  echo "== 後片付け（使い捨て group $GROUP、best-effort）"
+  # 注意: cleanup_disposable_group の controller-side 部分は chip-tool を ssh 先
+  # PATH で探すため、STAGE=2 の PATH=/usr/bin:/bin 環境下では失敗・WARN-skip が
+  # 想定内です。デバイス側の native remove-group が実効部分で、controller-side の
+  # KVS groupsettings 残留は次回 provision の pre-clean で処理されます（m8c1/m8c2 参照）。
+  cleanup_disposable_group
+
   echo "== e2e:m8c3:real STAGE=2 PASS（検証1〜5 GREEN。検証3 は上記ログの PASS/SKIP を確認、検証4 は静的実証 — ライブ BLE は gate1 記録参照）"
 }
 
