@@ -99,8 +99,8 @@ pub fn to_chip_write_json(entries: &[AclEntry]) -> String {
 /// 解釈する。
 ///
 /// 想定形（NeighborTable 等と同じ DataModelLogger の list-of-struct 整形。ただし
-/// Subjects / Targets の**ネストしたリスト**を含むため `parse_struct_list` では
-/// 表現できず専用パーサとする）:
+/// Subjects / Targets の**ネストしたリスト**を含むため汎用の list-of-struct パーサ
+/// では表現できず専用パーサとする）:
 /// ```text
 ///   ACL: 2 entries
 ///     [1]: {

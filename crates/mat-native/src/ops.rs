@@ -50,8 +50,8 @@ pub async fn describe(conn: &mut dyn NodeConn) -> Result<Vec<(u16, Vec<u64>)>, M
     Ok(out)
 }
 
-/// JSON 配列から数値要素のみを u64 化して集める（chip-tool 経路の
-/// `parse_id_list` と同じ寛容さ: 配列でない/数値でない要素はスキップ）。
+/// JSON 配列から数値要素のみを u64 化して集める（配列でない/数値でない
+/// 要素はスキップする寛容な変換）。
 fn parse_id_list_json(v: &Value) -> Vec<u64> {
     match v.as_array() {
         Some(items) => items.iter().filter_map(Value::as_u64).collect(),

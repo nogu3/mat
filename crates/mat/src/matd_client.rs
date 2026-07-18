@@ -1,17 +1,19 @@
 //! mat → matd クライアント経路。
 //!
 //! 経路は 3 状態: `--matd` / `MAT_MATD=truthy` で**強制 matd**（接続失敗はエラー、
-//! フォールバック無し）、`MAT_MATD=falsy` で**強制直 chip-tool**、どちらも無ければ
+//! フォールバック無し）、`MAT_MATD=falsy` で**強制 native 直経路**、どちらも無ければ
 //! **自動検出**（既定ソケットへ connect を試み、matd がいればそちら、いなければ
-//! 直経路にフォールバック）。`MAT_MATD_SOCKET` は「どのソケットか」の指定のみで
+//! native 直経路にフォールバック）。`MAT_MATD_SOCKET` は「どのソケットか」の指定のみで
 //! 経路は変えない。
 //!
 //! matd は unix socket 上で newline-delimited JSON を喋る（1 行 = 1 リクエスト = 1
 //! レスポンス）。ここはサブコマンドを matd の op JSON に変換して 1 行送り、返ってきた
 //! 1 行（mat スキーマ）を stdout（成功）/ stderr（エラー）へ出すだけの薄い口。
 //!
-//! mat 本体は同期コードなので接続も std の [`UnixStream`] を使う（tokio / ws は
-//! matd 内部 ⇔ chip-tool 用で、上流 ⇔ matd は unix socket）。chip-tool には触れない。
+//! mat 本体は同期コードなので接続も std の [`UnixStream`] を使う（tokio は matd 内部
+//! の native エンジン用で、上流 ⇔ matd は unix socket）。M8c-3 で chip-tool は撤去済み
+//! — この経路も native 直経路も、プロトコルは全て mat-controller / mat-native
+//! （in-process）が担う。
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
@@ -33,9 +35,9 @@ pub enum Route {
     /// 非対応 op は exit 2。フォールバックしない。
     Forced(PathBuf),
     /// 既定（どちらも未設定）: socket へ connect を試み、成功なら matd、
-    /// 失敗なら直 chip-tool にフォールバック。
+    /// 失敗なら mat 自身の native 直経路にフォールバック。
     Auto(PathBuf),
-    /// 明示無効化（`MAT_MATD=falsy`）: 常に直 chip-tool。probe もしない。
+    /// 明示無効化（`MAT_MATD=falsy`）: 常に native 直経路。probe もしない。
     Direct,
 }
 
@@ -111,7 +113,7 @@ pub fn dispatch(socket: &Path, command: &Command) -> ExitCode {
 }
 
 /// 自動検出モードのディスパッチ。matd 経路で完結した場合のみ `Some(exit code)`。
-/// `None` = 呼び出し側が直 chip-tool 経路で実行すべき（matd 非対応 op / connect 失敗）。
+/// `None` = 呼び出し側が native 直経路で実行すべき（matd 非対応 op / connect 失敗）。
 ///
 /// connect した stream をそのまま本リクエストに使う（probe 後の再接続はしない）ので、
 /// フォールバックが起きるのは 1 バイトも送る前だけ。接続後のエラーは matd 経路の
@@ -302,7 +304,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 op
             }
         },
-        // matd は warm CASE セッション層。これらは chip-tool 直経路でしか実行できない。
+        // matd は warm CASE セッション層。これらは native 直経路でしか実行できない。
         Command::Discover { .. } => return Err(unsupported("discover")),
         Command::Commission { .. } => return Err(unsupported("commission")),
         Command::OpenWindow { .. } => return Err(unsupported("open-window")),

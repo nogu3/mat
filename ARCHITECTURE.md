@@ -4,9 +4,12 @@ This document explains why `mat` is built the way it is. For how to use it, see
 [README.md](./README.md). For the rules an AI agent must follow when working in
 this repo, see [CLAUDE.md](./CLAUDE.md).
 
-`mat` is a CLI for controlling Matter devices. It calls a Matter controller
-(`chip-tool` for now) as a subprocess, and turns its long text output into one
-clean JSON object per command.
+`mat` is a CLI for controlling Matter devices. It drives a native,
+from-scratch Rust Matter controller (crate `mat-controller`, in this
+workspace) in-process and returns pure structured JSON, normalized to `mat`'s
+own schema — one clean JSON object per command. (`chip-tool` was the backend
+through Phase 5 M8c-2; it was fully retired in 0.22.0 / M8c-3 — see
+["Backend: native"](#backend-native-chip-tool-retired-in-0220) below.)
 
 `mat` is AI-native and UNIX-friendly:
 - stdout is pure structured JSON (one command = one JSON object).
@@ -22,8 +25,9 @@ above it is not `mat`'s concern.
 ## What `mat` does and does not do
 
 ### `mat` is responsible for
-- A consistent wrapper UX over a Matter controller (`chip-tool`).
-- Turning the controller's verbose text into `mat`'s JSON schema.
+- A consistent UX over a native Matter controller (`mat-controller`, driven
+  in-process — no external controller subprocess).
+- Emitting the result in `mat`'s own JSON schema.
 - Managing fabric credentials (Root CA, our own NOC, commissioned nodes) in a
   local key-value store (KVS).
 - Commissioning: joining a fabric and sharing devices with other admins.
@@ -33,7 +37,7 @@ above it is not `mat`'s concern.
   numeric `node_id`. Mapping human-facing names is out of scope — with one
   narrow exception: if an optional `<store>/aliases.toml` exists, the CLI
   layer resolves node / group / endpoint aliases to numbers right after arg
-  parsing, before dispatch. The wire and the backend (`chip-tool` / `matd`)
+  parsing, before dispatch. The wire and the backend (native / `matd`)
   always see numbers; a missing file is exactly the traditional behavior.
   Cluster / command / attribute names are unaffected (chip-tool notation
   only, no aliasing).
@@ -98,7 +102,7 @@ The one place Thread shows up in the command set is read-only diagnostics:
 routing, neighbor/route tables, counters). This stays inside the rules above —
 it is plain Matter attribute reads against one device, not Thread network
 management, and there is no Border Router access. It is one-shot like every
-other `mat` command and runs only on the direct chip-tool path (not via
+other `mat` command and runs only on the native direct path (not via
 `--matd`).
 
 ---
@@ -109,9 +113,12 @@ other `mat` command and runs only on the direct chip-tool path (not via
 like Home Assistant or Apple Home. A Matter device can belong to many fabrics at
 once (multi-admin), so `mat` can run alongside them.
 
-### Two ways to commission (both use `chip-tool pairing code`)
-A Matter setup code (QR or 11-digit) can be passed the same way to
-`chip-tool pairing code <node-id> <code>`. Only the source differs.
+### Two ways to commission (native, `mat commission`)
+A Matter setup code (QR or 11-digit) is passed the same way to
+`mat commission --target <host-or-ip> --setup-code <code>` (native PASE;
+`mat-native::commission` auto-selects on-network mDNS vs. BLE+Thread — see
+["Backend: native"](#backend-native-chip-tool-retired-in-0220)). Only the
+source of the code differs.
 
 1. **First commission** (a factory-reset device): use the printed setup code.
 2. **Multi-admin join** (a device already commissioned by another admin): the
@@ -125,8 +132,8 @@ the issued code."
 
 ### Sharing your own devices (`mat open-window`)
 To share a device that `mat` owns with another controller (Alexa / Apple /
-Google), `mat` can open a commissioning window (a wrap of
-`chip-tool pairing open-commissioning-window`).
+Google), `mat` can open a commissioning window (native `OpenCommissioningWindow`
+over the existing operational session).
 
 - The JSON output includes **both** `manual_code` (11-digit) and `qr_payload`
   (the `MT:...` string): `{ "node_id", "manual_code", "qr_payload", "expires_at" }`.
@@ -149,55 +156,61 @@ Google), `mat` can open a commissioning window (a wrap of
 
 ---
 
-## Backend: `chip-tool`
+## Backend: native (chip-tool retired in 0.22.0)
 
-The rule is "if an official CLI exists for a protocol, use it; do not write your
-own." `chip-tool` is CSA's official reference implementation.
+`mat`'s backend is a **native, from-scratch Rust Matter controller** (crate
+`mat-controller`, driven through the shared `mat-native` engine) — TLV, CASE,
+IM, groupcast, mDNS, and commissioning (on-network + BLE+Thread) all run
+in-process. There is no `chip-tool` (or any other external controller)
+subprocess.
 
-### Why `chip-tool`
-1. **Groupcast is effectively only possible with `chip-tool` today.** It has the
-   full path for Group Key Management and group commands.
-2. **Highest spec completeness.** New clusters and features land here first, so
-   even niche devices are likely to work.
-3. **Easy to debug.** Matter forums, issues, and official docs are all written in
-   `chip-tool` commands. Sharing the backend means you do not get lost figuring
-   out whether the fault is yours or the device's.
-4. **Fits the subprocess model.** Launch a native binary and exit.
+- **Route selection is per-op:** matd auto-discovery (if a `matd` answers the
+  probed socket) -> `mat`'s own native direct path. See README's
+  [Routing through `matd`](./README.md#routing-through-matd) and
+  [Native backend internals](./README.md#native-backend-internals) for
+  interface autodetect (`MAT_IFACE` / `MAT_MATD_IFACE`), fabric index, warm
+  vs. one-shot sessions, the shared groupcast counter, epoch adoption, and the
+  scalar-only generic write/invoke rule.
+- **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK). A fabric
+  first created by `chip-tool` is handled by verifying its fixed epoch
+  against the KVS materials and adopting it (persisted to
+  `mat/f/<idx>/ipk-epoch`), so pre-M8c-3 fabrics keep working.
+- `mat` is the sole owner/writer of the persistent Matter KVS (chip-tool INI
+  compatible form: keysets, operational credentials, group tables, the
+  group-send counter) — see [Credential store](#credential-store-kvs) below.
 
-### The one remaining cost: fragile output parsing
-`chip-tool` has log-style text output, which `mat` must turn into JSON. A version
-change can break the parser.
-
-- The `Data = ...` form for read/write/invoke is fairly regular. Pin it with
-  tests.
-- **`chip-tool` exit codes are coarse** (mostly `1` on failure; details are in the
-  log). So `mat` parses stdout/stderr to classify the failure kind (timeout /
-  unreachable / rejected) and maps it to `mat`'s own exit code / error kind.
-- Keep parser tests so an upstream update that breaks parsing is noticed.
+### History: why `chip-tool` first, and why it was retired
+Through Phase 5 M8c-2, `mat` drove CSA's reference `chip-tool` binary as a
+subprocess and turned its log-style text output into JSON. That was the
+pragmatic starting point: `chip-tool` had the fullest spec coverage (including
+groupcast, which had no other easy path), was easy to debug against (Matter
+forums and docs are all written in `chip-tool` commands), and fit a simple
+subprocess-and-exit model. The recurring cost was a fragile text parser (the
+`Data = ...` convention, coarse exit codes needing stdout/stderr
+reclassification) that had to be re-pinned against every `chip-tool` version.
+Phase 5 (decided 2026-07-10) replaced this piece by piece with a from-scratch
+Rust controller library, crate `mat-controller`, until milestone M8c-3
+(0.22.0) retired `chip-tool` entirely and deleted its text parsers — see the
+Phase 5 record below for the milestone-by-milestone history.
 
 ### The backend is replaceable (adapter boundary)
 `mat` couples to the backend through **only `mat`'s own JSON schema**.
-
-- Decided (2026-07-10): a from-scratch Rust controller library, crate
-  `mat-controller` in this workspace — see "Phase 5" below for the decision
-  record and milestones.
-- A replacement must be one adapter in the child-runner, with `mat`'s JSON schema
-  as the contract. Subcommands and output schema do not change.
+Subcommands and output schema do not change; a future replacement is still one
+adapter behind that schema (see "Phase 5" below for the current native
+backend's decision record and milestones).
 
 ---
 
 ## Design rules (must follow)
 
-1. **Protocol code lives only in the backend crate.** TLV, CASE, session
-   crypto, multicast routing — all of it belongs to `mat-controller`
-   (Phase 5) and nowhere else. The `mat` CLI and `matd` command layers
-   never speak the protocol; until Phase 5 lands they delegate everything
-   to `chip-tool`, which remains the production path.
-2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
-   it in `mat`'s schema. No human decoration (color, progress, interactive
-   prompts).
-3. **Diagnostics go to stderr as structured logs** (`tracing`). Do not swallow
-   `chip-tool`'s stderr; keep it at least at debug level.
+1. **Protocol code lives only in the backend crates.** TLV, CASE, session
+   crypto, multicast routing — all of it belongs to `mat-controller` /
+   `mat-native` (Phase 5) and nowhere else. The `mat` CLI and `matd` command
+   layers never speak the protocol. As of M8c-3 the native backend is the
+   only path (`chip-tool` is retired).
+2. **stdout is pure structured JSON only.** Emit the result in `mat`'s schema.
+   No human decoration (color, progress, interactive prompts).
+3. **Diagnostics go to stderr as structured logs** (`tracing`).
 4. **Hold no state except the credential KVS.** No session-cache DB, no daemon, no
    internal scheduler.
 
@@ -207,8 +220,10 @@ change can break the parser.
 
 ### Location and ownership
 - Default path: `$XDG_CONFIG_HOME/mat/` (default `~/.config/mat/`). It holds the
-  Root CA, the controller's keys/cert, commissioned nodes' ledger, and
-  `chip-tool`'s persistent storage.
+  Root CA, the controller's keys/cert, commissioned nodes' ledger, and the
+  Matter KVS (keysets, operational credentials, group tables, the group-send
+  counter) in `chip-tool`-compatible INI form — `mat` is the sole owner/writer
+  since M8c-3.
 - Override with `--store <path>` or the `MAT_STORE` env var.
 - **Credentials are never committed** (the repo is public). `.gitignore` excludes
   them.
@@ -229,26 +244,33 @@ This repo ships two binaries from one install:
           +---------------+----------------+
           v                                v
    mat  (one-shot; credential KVS only)   matd (resident; Phase 4)
-       \   Command::new("chip-tool")        \  warm CASE sessions / unix socket
+       \   mat-native::Engine (in-process)  \  warm mat-native::Engine(s) / unix socket
         \                                     \
          +------------------+------------------+
                             v
-   chip-tool ── real Matter devices (Thread / Wi-Fi / Ethernet)
+              mat-controller (TLV / CASE / IM / mDNS / commissioning,
+                              in-process — no subprocess)
+                            v
+        real Matter devices (Thread / Wi-Fi / Ethernet)
 ```
 
-- **`mat`** is the one-shot CLI. It spawns `chip-tool`, runs one command, and
-  exits. Design rule 4 (no daemon / cache inside `mat`) always holds.
-- **`matd`** is the resident binary (Phase 4). It keeps warm CASE (Sigma)
-  sessions so repeated Matter calls skip the handshake — the same model as ssh
-  `ControlMaster`/`ControlPersist`. `matd` is allowed to be resident precisely
-  because it is a **separate binary and layer**, not `mat`. `mat` **auto-detects**
-  a running `matd` by default (a connect probe on the default socket, falling
-  back to spawning `chip-tool` directly when nothing answers); `--matd`/
-  `MAT_MATD=1` force the matd path, `MAT_MATD=0` disables probing entirely.
+- **`mat`** is the one-shot CLI. It builds a native `mat-native::Engine`
+  in-process, runs one command, and exits. Design rule 4 (no daemon / cache
+  inside `mat`) always holds.
+- **`matd`** is the resident binary (Phase 4). It holds a warm native `Engine`
+  per node (CASE/Sigma sessions) so repeated Matter calls skip the handshake —
+  the same model as ssh `ControlMaster`/`ControlPersist`. `matd` is allowed to
+  be resident precisely because it is a **separate binary and layer**, not
+  `mat`. `mat` **auto-detects** a running `matd` by default (a connect probe on
+  the default socket, falling back to its own native direct path when nothing
+  answers); `--matd`/`MAT_MATD=1` force the matd path, `MAT_MATD=0` disables
+  probing entirely.
 
-Both binaries share a library crate `mat-core` (the `parse` / `output` / `error`
-/ `group` modules: chip-tool parsing, the JSON schema, exit-code classification,
-group key logic) so the fragile parts are maintained once.
+Both binaries share a library crate `mat-core` (the `parse` / `output` /
+`error` / `group` / `acl` modules: shared value normalization, the JSON
+schema, exit-code classification, group key logic) and the shared engine
+crate `mat-native` (built on the protocol library `mat-controller`), so the
+fragile parts are maintained once.
 
 ### Two kinds of groups
 There are two "groups." Do not confuse them or define them twice.

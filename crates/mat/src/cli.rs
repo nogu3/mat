@@ -24,19 +24,19 @@ pub struct Cli {
     /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ、無ければ既定パス
     /// （`$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`）。
     /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記の socket へ接続を
-    /// 試み、matd がいればそちら、いなければ直 chip-tool にフォールバック。
+    /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
     /// matd 対応は read/write/invoke/on/off/color-temp/color/describe/group のみ
-    /// （discover/commission/open-window/diag は常に直経路; 本フラグ明示時は exit 2）。
+    /// （discover/commission/open-window/diag/fabric は常に直経路; 本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
     /// one-shot 直経路を native（mat-controller 内蔵）で実行する場合の
     /// Thread mesh iface 名（例: eth0）。未設定なら自動検出（up・multicast・
     /// 非 P2P・非 loopback・IPv6 link-local の一意候補。曖昧ならエラー）。明示指定で
-    /// 上書き。対象 op は README の native hotpath 一覧を参照（M8a で汎用
-    /// read/write/invoke/describe 等、M8b で discover と mDNS probe に拡大）。
+    /// 上書き。M8c-3 で chip-tool が撤去され、native が全 op 共通の唯一の直経路
+    /// になった（詳細は README の Backend 節参照）。
     /// matd 稼働中は matd 自動発見が優先される。
     #[arg(long, global = true, env = "MAT_IFACE", value_name = "IFACE")]
     pub iface: Option<String>,
@@ -91,7 +91,7 @@ pub enum Command {
         alias: Option<String>,
         /// BLE+Thread commissioning 用の Thread active operational dataset
         /// （hex）。native 経路（MAT_IFACE）で mDNS に見つからないデバイスを
-        /// BLE で commission するときに必須。chip-tool 経路では未使用。
+        /// BLE で commission するときに必須。on-network commissioning では不要。
         #[arg(
             long = "thread-dataset",
             env = "MAT_THREAD_DATASET",
@@ -130,7 +130,7 @@ pub enum Command {
         /// 属性名（chip-tool 表記）。
         #[arg(short = 'a', long, value_name = "NAME")]
         attribute: String,
-        /// 書き込む値（chip-tool にそのまま渡す）。
+        /// 書き込む値（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(long, value_name = "VALUE")]
         value: String,
     },
@@ -149,7 +149,7 @@ pub enum Command {
         /// コマンド名（chip-tool 表記、例: `on` / `off` / `move-to-level`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（chip-tool にそのまま渡す）。
+        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -378,7 +378,7 @@ pub enum GroupCommand {
         /// コマンド名（chip-tool 表記、例: `on` / `off`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（chip-tool にそのまま渡す）。
+        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。
