@@ -1,6 +1,6 @@
 //! `mat discover` — commissionable / commissioned ノードを探索する。
 //!
-//! commissionable は `chip-tool discover commissionables` の mDNS 探索結果、
+//! commissionable は native mDNS browse（`mat-controller::dnssd`）の結果、
 //! commissioned は `mat` の台帳（KVS）から読む。両者を1つの `devices` 配列にまとめる。
 //!
 //! `--probe` 指定時は commissioned ノードそれぞれへ targeted resolve を並行実行して
@@ -12,18 +12,15 @@
 //! commissionable 探索は認証情報不要のため、store 無しでも動く（無ければ空ストアを
 //! bootstrap し、commissioned は空配列になる）。
 //!
-//! iface（MAT_IFACE）設定時は commissionable 探索は native browse のまま、probe は
-//! native targeted resolve（M8b）。
+//! commissionable 探索は native browse、probe は native targeted resolve（M8b）。
 
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::runner::ChipTool;
 use mat_core::diag::MatterInstance;
-use mat_core::error::MatError;
+use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
-use mat_core::parse::parse_commissionables;
 use mat_core::parse::DiscoveredDevice;
 use mat_core::reachability::resolve;
 use mat_core::store::Store;
@@ -38,36 +35,21 @@ pub fn run(
     // 台帳から読むが、空ストアなら空配列になるだけ。
     let store = Store::open_or_init(store_path)?;
 
-    // commissionable 探索: iface 指定時は native browse（M8b）、IO 失敗は
-    // warn + chip-tool フォールバック（read-only なので二重実行の害なし）。
-    // 結果 0 件は正常であり chip-tool に fall back しない（平常時に毎回
-    // 二重スキャンしないため）。
-    let iface = native.map(|c| c.iface);
-    let commissionable_native = match iface {
-        Some(i) => match native_commissionables(i) {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(
-                    iface = i,
-                    error = %e,
-                    "native commissionable browse failed; falling back to chip-tool"
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let commissionable = match commissionable_native {
-        Some(list) => list,
-        None => {
-            let chip = ChipTool::new(store.root());
-            // chip-tool は探索を時間で打ち切るため非 0 終了もあり得る。exit code で
-            // 失敗扱いにせず、得られた行をパースする（child_not_found = exit 12
-            // だけは run() がエラーで返す）。
-            let out = chip.run(["discover", "commissionables"])?;
-            parse_commissionables(&out.stdout)
-        }
-    };
+    // commissionable 探索は native browse 一本化（M8c-3 で chip-tool 経路撤去）。
+    // 結果 0 件は正常。IO 失敗はハードエラー（黙って落とさない — spec 設計3）。
+    // avahi 経路は Task 11 で扱う。
+    let iface = native.map(|c| c.iface).ok_or_else(|| {
+        MatError::new(
+            ErrorKind::Other,
+            "discover: native backend not configured (internal)",
+        )
+    })?;
+    let commissionable = native_commissionables(iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Unreachable,
+            format!("native commissionable browse failed on {iface}: {e}"),
+        )
+    })?;
 
     let mut devices = Vec::new();
     for d in &commissionable {

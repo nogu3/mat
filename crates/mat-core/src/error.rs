@@ -17,8 +17,12 @@ pub enum ErrorKind {
     /// 指定 node_id がストアに無い（未 commission）。
     NodeNotCommissioned,
     /// `chip-tool` バイナリが見つからない / 実行不可。
+    /// 0.22.0 以降 `mat` からは emit されない（chip-tool 撤去。exit code 12 の
+    /// マッピングと wire 互換のため variant は残置 — README で撤去を告知）。
     ChildNotFound,
     /// `chip-tool` が失敗終了（分類不能）。
+    /// 0.22.0 以降 `mat` からは emit されない（chip-tool 撤去。matd が Task 10 まで
+    /// 使用するため wire 互換で残置）。
     ChildFailed,
     /// commissioning に失敗。
     CommissionFailed,

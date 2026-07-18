@@ -126,7 +126,7 @@ pub fn dispatch_auto(socket: &Path, command: &Command) -> Option<ExitCode> {
             tracing::info!(
                 socket = %socket.display(),
                 error = %e,
-                "matd not reachable, falling back to direct chip-tool"
+                "matd not reachable, falling back to direct native backend"
             );
             return None;
         }
@@ -315,7 +315,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
 }
 
 fn unsupported(name: &str) -> String {
-    format!("`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct chip-tool path)")
+    format!("`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)")
 }
 
 /// matd へ接続して 1 行送り 1 行受け取る。接続/送受信の失敗は detail 文字列で返す。
