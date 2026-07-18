@@ -147,7 +147,10 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         Err(mut e) => {
             // mat 側の map_engine_build_error（crates/mat/src/native_direct.rs）と
             // 同様に `mat fabric init` への誘導を detail に足す（二重付与は避ける）。
-            if !e.detail.contains("mat fabric init") {
+            // store_missing の場合のみ誘導を追加（他の kind は事象特有）。
+            if e.kind == mat_core::error::ErrorKind::StoreMissing
+                && !e.detail.contains("mat fabric init")
+            {
                 e.detail = format!(
                     "{} — run `mat fabric init` to bootstrap the credential store",
                     e.detail

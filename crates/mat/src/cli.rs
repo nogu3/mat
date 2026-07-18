@@ -28,7 +28,7 @@ pub struct Cli {
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
     /// matd 対応は read/write/invoke/on/off/color-temp/color/describe/group のみ
-    /// （discover/commission/open-window/diag/fabric は常に直経路; 本フラグ明示時は exit 2）。
+    /// （discover/commission/open-window/diag/fabric は常に直経路; fabric 以外は本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
