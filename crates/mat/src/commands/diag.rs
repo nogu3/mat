@@ -8,8 +8,8 @@
 //! バックエンド実行は native 直経路（`native_direct`）が担う（M8c-3 で chip-tool
 //! 経路は撤去）。`diag thread` の emit（`emit_diag_thread_success`）は native 経路の
 //! 単一ソース。`diag node` は native IM probe（operational + thread）に加え、
-//! `--deep` の補助プローブ（ping6 / mDNS）をこのモジュールで実施する（avahi 経路は
-//! Task 11 で扱う）。
+//! `--deep` の補助プローブ（ping6 / native mDNS targeted resolve）をこのモジュール
+//! で実施する（Task 11 で avahi-browse フォールバックを撤去 — mDNS は dnssd 一本）。
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -83,7 +83,7 @@ pub fn node(
             node_id,
             address,
             self_cfid,
-            native,
+            cfg,
             store.root(),
         );
     } else {
@@ -115,14 +115,15 @@ pub fn node(
 }
 
 /// `--deep` の補助プローブ。ping6（IP生存）と mDNS 広告確認（native の targeted
-/// resolve、失敗時は avahi-browse — avahi 経路は Task 11 で扱う）を実施。
+/// resolve、mDNS は dnssd 一本 — Task 11 で avahi-browse フォールバックを撤去）
+/// を実施。
 fn deep_probes(
     checks: &mut Checks,
     unavailable: &mut Vec<Value>,
     node_id: u64,
     address: Option<String>,
     self_cfid: Option<String>,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
     store_root: &Path,
 ) {
     // ip: ping6
@@ -144,14 +145,14 @@ fn deep_probes(
         None => unavailable.push(json!({ "check": "ip", "kind": "no_address_in_store" })),
     }
 
-    // mdns: native targeted resolve（iface 指定時）または avahi-browse
-    match crate::probe::mdns(native.map(|c| crate::probe::NativeProbe {
-        iface: c.iface,
-        fabric_index: c.fabric_index,
-        issuer_index: c.issuer_index,
+    // mdns: native targeted resolve（dnssd 一本）
+    match crate::probe::mdns(crate::probe::NativeProbe {
+        iface: cfg.iface,
+        fabric_index: cfg.fabric_index,
+        issuer_index: cfg.issuer_index,
         store_root,
         node_ids: std::slice::from_ref(&node_id),
-    })) {
+    }) {
         Ok(instances) => {
             // アドレスベースで照合（ストアの address が Some の場合）。
             // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。

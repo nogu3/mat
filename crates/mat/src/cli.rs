@@ -328,7 +328,7 @@ pub enum DiagCommand {
         /// エンドポイント番号、または aliases.toml の endpoint alias（既定 0 — 診断は通常 ep0）。
         #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "0")]
         endpoint: EndpointRef,
-        /// 補助プローブ（ping6 / avahi-browse）も実施して深掘りする。
+        /// 補助プローブ（ping6 / native mDNS targeted resolve）も実施して深掘りする。
         #[arg(long)]
         deep: bool,
     },

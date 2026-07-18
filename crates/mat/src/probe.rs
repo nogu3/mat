@@ -1,6 +1,8 @@
-//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時は native の**台帳ノードごとの
+//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時、native の**台帳ノードごとの
 //! targeted resolve 並行実行**（`mat-controller::dnssd::resolve_operational`、
-//! M8b）、未設定・IO 失敗時は `avahi-browse` にフォールバック。
+//! M8b）を実施する。M8c-3 Task 11 で `avahi-browse` フォールバックを撤去 —
+//! mDNS は dnssd 一本で、I/O エラーもそのままエラーを返す（フォールバック先が
+//! 無い）。
 //!
 //! M8b で列挙(browse)ベースから切り替えた: 実機の advertising proxy は一部の
 //! 登録済み instance（例: node 6/8/9）について `_matter._tcp` の PTR 列挙に
@@ -9,15 +11,13 @@
 //! 済み、2026-07-17）。probe は対象ノードの CFID/NodeId が既知なので、列挙で
 //! 発見する必要がなく、resolve を並行実行すれば十分。
 //!
-//! プロセス起動（avahi）と socket I/O を伴うため副作用なしの `mat-core` では
-//! なくバイナリ側に置く。`diag node --deep` と `discover --probe` が共有する。
+//! socket I/O を伴うため副作用なしの `mat-core` ではなくバイナリ側に置く。
+//! `diag node --deep` と `discover --probe` が共有する。
 
-use std::ffi::OsString;
-use std::process::Command as StdCommand;
 use std::time::Duration;
 
 use mat_controller::{dnssd, fabric, kvs};
-use mat_core::diag::{parse_avahi_matter, MatterInstance};
+use mat_core::diag::MatterInstance;
 use mat_core::error::{ErrorKind, MatError};
 
 /// native probe の入力。probe は CFID 計算のため KVS（読み取りのみ）を使う。
@@ -34,27 +34,19 @@ pub struct NativeProbe<'a> {
 /// 台帳が何ノードあっても総所要時間はおよそこの値に収まる。
 const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// `_matter._tcp` の到達性を判定する。iface 指定時は native の targeted
-/// resolve 並行実行、IO 失敗は warn + avahi-browse フォールバック（read-only
-/// なので二重実行の害なし）。結果 0 件は正常（フォールバックしない）。
-pub fn mdns(native: Option<NativeProbe<'_>>) -> Result<Vec<MatterInstance>, MatError> {
-    if let Some(p) = native {
-        match resolve_ledger_nodes(&p) {
-            Ok(list) => return Ok(list),
-            Err(e) => {
-                tracing::warn!(
-                    iface = p.iface,
-                    error = %e,
-                    "native mDNS probe failed; falling back to avahi-browse"
-                );
-            }
-        }
-    }
-    avahi()
+/// `_matter._tcp` の到達性を判定する。native の targeted resolve を並行実行
+/// する。結果 0 件は正常（Ok(vec![])）。失敗（iface / 資材 / 全ノード I/O
+/// エラー）はそのままエラーを返す（フォールバック先が無い — Task 11）。
+pub fn mdns(p: NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
+    resolve_ledger_nodes(&p).map_err(|e| {
+        MatError::new(
+            ErrorKind::Unreachable,
+            format!("native mDNS probe failed on {}: {e}", p.iface),
+        )
+    })
 }
 
 /// 台帳ノードそれぞれへ `resolve_operational` を並行実行する（M8b）。
-/// エラーは呼び出し側が avahi へフォールバックする。
 fn resolve_ledger_nodes(
     p: &NativeProbe<'_>,
 ) -> Result<Vec<MatterInstance>, Box<dyn std::error::Error>> {
@@ -138,31 +130,6 @@ fn resolve_ledger_nodes(
 /// / diag の self-fabric 照合が期待する形）。
 fn cfid_hex(cfid: &[u8; 8]) -> String {
     cfid.iter().map(|b| format!("{b:02X}")).collect()
-}
-
-/// `avahi-browse -rt _matter._tcp` を実行して `_matter._tcp` インスタンスを得る。
-/// バイナリは `MAT_AVAHI_BROWSE_BIN` で上書き可。
-fn avahi() -> Result<Vec<MatterInstance>, MatError> {
-    let bin =
-        std::env::var_os("MAT_AVAHI_BROWSE_BIN").unwrap_or_else(|| OsString::from("avahi-browse"));
-    let out = StdCommand::new(&bin)
-        .args(["-rt", "_matter._tcp"])
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                MatError::child_not_found(format!("avahi-browse not found ({bin:?})"))
-            } else {
-                MatError::new(
-                    ErrorKind::Other,
-                    format!("avahi-browse spawn failed ({bin:?}): {e}"),
-                )
-            }
-        })?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let stderr_text = String::from_utf8_lossy(&out.stderr);
-    tracing::debug!(%text, "avahi-browse stdout");
-    tracing::debug!(%stderr_text, "avahi-browse stderr");
-    Ok(parse_avahi_matter(&text))
 }
 
 #[cfg(test)]
