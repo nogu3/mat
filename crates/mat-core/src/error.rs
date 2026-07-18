@@ -1,7 +1,8 @@
 //! `mat` 自身のエラー型と exit code マッピング。
 //!
-//! `chip-tool` は失敗時の exit code が粗い（おおむね `1`）ため、`mat` は
-//! stdout/stderr をパースして失敗種別を分類し、自身の `ErrorKind` にマップする。
+//! mat は native backend から構造化エラー（`ErrorKind` と詳細情報）を受け取る。
+//! 0.22.0 以降、chip-tool パーサは廃止された（フルスクラッチ Rust コントローラ
+//! `mat-controller` が backend を担当）。
 
 use serde::{Deserialize, Serialize};
 
