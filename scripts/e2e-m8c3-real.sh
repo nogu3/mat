@@ -330,6 +330,7 @@ stage1_main() {
     local rc=0
     local attempt=1
     while true; do
+      rc=0
       ssh -n "$MAT_E2E_HOST" env -u MAT_IFACE -u MAT_MATD_IFACE \
         MAT_MATD=0 MAT_LOG=info "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
         MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c3-chip-tool \
@@ -368,6 +369,7 @@ stage1_main() {
     local rc=0
     local attempt=1
     while true; do
+      rc=0
       ssh -n "$MAT_E2E_HOST" "$REMOTE_MAT_BIN" --matd "$SOCKET" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
       cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
 
