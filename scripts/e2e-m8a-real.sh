@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M8a 受け入れ: 汎用 Interaction Model（read/write/invoke 汎用形）と
 # describe / diag thread / open-window / group provision・grant・invoke 汎用形が
 # native 直経路（MAT_IFACE + MAT_FABRIC_INDEX）と matd 経由（MAT_MATD_IFACE 相当、

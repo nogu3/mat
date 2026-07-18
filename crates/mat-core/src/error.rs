@@ -17,8 +17,11 @@ pub enum ErrorKind {
     /// 指定 node_id がストアに無い（未 commission）。
     NodeNotCommissioned,
     /// `chip-tool` バイナリが見つからない / 実行不可。
-    /// 0.22.0 以降 `mat` からは emit されない（chip-tool 撤去。exit code 12 の
-    /// マッピングと wire 互換のため variant は残置 — README で撤去を告知）。
+    /// トップレベルの CLI エラーとしては 0.22.0 以降 emit されない（chip-tool
+    /// 撤去、exit code 12 は歴史的欠番）。`mat` は `diag node --deep` の内部で
+    /// ping6 バイナリ不在を `unavailable` 配列の `tool_missing` エントリへ
+    /// 吸収するためだけに構築する（exit 12 にはならない）。exit code 12 の
+    /// マッピングと wire 互換のため variant は残置 — README で撤去を告知。
     ChildNotFound,
     /// `chip-tool` が失敗終了（分類不能）。
     /// 0.22.0 以降どちらのバイナリからも emit されない — `mat`（M8c-3 Task9）に続き

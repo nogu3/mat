@@ -761,6 +761,66 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     書換をバックアップ実在ガードで保護 — バックアップが無い状態で誤って
     破壊的な書換に入らないようにする安全策）。バージョンは 0.21.0。
     **実機 E2E は本タスクの範囲外（未実施）**。
+  - **M8c-3 実装済み（0.22.0、native 既定化 + chip-tool 完全撤去 +
+    fabric bootstrap）**: 設計は
+    `docs/superpowers/specs/2026-07-17-phase5-m8c3-native-default-design.md`。
+    内部二段構え（撤去は不可逆なため間に実機 E2E ゲートを置く）。
+    - **Stage 1（native 既定化、フォールバック温存）**: (1) **iface 自動検出**
+      （`mat-native::iface_select`）— up（carrier 有）・MULTICAST・非 loopback・
+      非 POINTOPOINT（tun/tailscale 除外）・IPv6 link-local 保有の候補を
+      `/sys/class/net` + `/proc/net/if_inet6` から集め、ちょうど 1 つで採用、
+      0/2+ は kind `other` のハードエラー（候補列挙 + `set MAT_IFACE`）。
+      純関数 `select` を表駆動ユニットテスト。`MAT_IFACE`/`MAT_MATD_IFACE`
+      未設定でも native 経路に入る（env は明示上書きとして存続、matd は曖昧なら
+      起動拒否）。(2) **epoch 採用永続**（`mat-native::commission::resolve_ipk_epoch`）
+      — 解決順は (1) KVS の `mat/f/<idx>/ipk-epoch` 読み出し → (2) 無ければ既定定数を
+      `verify_default_ipk_epoch` で検証し一致ならその場で同キーへ採用永続（flock
+      書込、失敗はハードエラー）→ (3) 不一致は `store_parse` ハードエラー
+      （M8c-1 の「不一致→フォールバック」から恒久挙動へ前倒し）。
+    - **Stage 2（完全撤去 + fabric bootstrap）**: (1) **chip-tool / avahi-browse
+      経路の全削除**（`mat` の runner spawn・各コマンドの chip-tool 分岐・
+      `MAT_CHIP_TOOL_BIN`・probe/discover の avahi フォールバック、matd の
+      chip-tool ランナーとフォールバック分岐、`Data = ...` パーサ、
+      `fake-chip-tool.sh`、統合テストの chip-tool 依存 — Task 9/10/11）。exit
+      12（`ChildNotFound`）は歴史的欠番として予約（variant は wire 互換で残置、
+      `diag node --deep` が ping6 不在を `unavailable` 配列の `tool_missing`
+      へ吸収する内部用途のみ）。新 error kind は追加せず（iface 曖昧 = `other`、
+      KVS 系 = `store_missing`/`store_parse`）。(2) **`mat fabric init`**
+      （`crates/mat/src/commands/fabric.rs`、直経路のみ・ネットワーク未接触）—
+      `CommissioningFabric::generate` で root CA + fabric 資材、OS 乱数で 16 バイト
+      ランダム epoch IPK、chip-tool INI 互換 KVS を新規 bootstrap 書込
+      （`write_kvs_bootstrap`）。既存 KVS があれば拒否（`--force` 無し、再初期化は
+      手動 ini 削除）。出力は fabric 識別子のみ（鍵素材は stdout に出さない）。
+      他コマンドは KVS 不在なら `store_missing`（exit 10）+ detail に
+      `mat fabric init` 誘導。(3) **ビルド一本化**: deploy 標準を
+      `cross build --release --target aarch64-unknown-linux-gnu --features ble`
+      に統一（`task dist:arm64`）、musl deploy 経路と Cross.toml の musl 設定を
+      撤去。ローカル `task check` は host build・BLE なしのまま無変更。Docker は
+      chip-tool 焼込ステージ・avahi/dbus/glib/ssl runtime 依存を撤去し
+      mat/matd バイナリ + 最小 runtime（`debian:bookworm-slim` + ca-certificates）
+      にスリム化（`docker:test` は維持）。旧 E2E スクリプト（e2e-m2〜m8c2）は
+      歴史的アーカイブ注記を付けて残置（0.21.0 タグでのみ動作）、Taskfile の
+      対応タスクは削除し `e2e:m8c3:real` のみ残す。
+    - **実機 E2E ゲート 1（Stage 1、jarvis 実運用 fabric、env 未設定）**:
+      **GREEN**。全 op が native 完走・「falling back to chip-tool」発火ゼロ、
+      iface 自動検出が jarvis（eth0+tailscale0）で eth0 を一意選択、初回 native
+      commission で epoch 採用永続が発生し `mat/f/<idx>/ipk-epoch` が書かれ 2 回目
+      以降は KVS 読み出しで通ることを実測。**文書化した逸脱**: 受け入れ手順の
+      「RemoveFabric → on-network 再 commission」は NL68（玄関ライト）では構造的に
+      不可能（工場リセットせずに commissioning window を開く手段がデバイス側に
+      無い）ため、epoch の検証は手動 native commission を複数回走らせて採用永続の
+      冪等性・単調性を確認する形に置換した。**ゲート 2（chip-tool を PATH から
+      外した環境での最終受け入れ + `mat fabric init` 実機 + deploy 成果物の実機
+      動作）は Task 13 で実施予定（pending）**。
+    - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
+      デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
+      挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
+      scalar のみが仕様、汎用 write/invoke の後退を受容）。(3) IPK ローテーション
+      （全ノード KeySetWrite での epoch 完全移行 — 現状は既存 fabric の定数 epoch を
+      検証して採用永続するのみ）。(4) CASE の多アドレス試行（ゲート 1 で観測した
+      弱点: 1 ノードが複数 AAAA を広告するとき現状は 1 アドレスにしか CASE を
+      張らず、その経路が不調だと session_failed になる — 複数アドレスへ順次
+      試行する堅牢化）。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # M6b 実機 E2E — jarvis 上で実行する（BLE は WSL では動かない）。
 # 事前:
 #   1) sudo ot-ctl dataset active -x  → MAT_E2E_THREAD_DATASET

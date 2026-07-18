@@ -2,9 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-`mat` is a CLI for controlling Matter devices. It calls a Matter controller
-(`chip-tool`) as a subprocess and returns its long text output as **pure
-structured JSON**, normalized to `mat`'s own schema.
+`mat` is a CLI for controlling Matter devices. It drives a **from-scratch native
+Matter controller** (crate `mat-controller`, in this workspace) in-process and
+returns **pure structured JSON**, normalized to `mat`'s own schema. (`chip-tool`
+was the backend through Phase 5 M8c-2; as of **0.22.0** it is fully retired — see
+[Backend](#backend).)
 
 - stdout = one JSON object per command. No human decoration.
 - diagnostics go to stderr as structured logs (`tracing`).
@@ -15,27 +17,30 @@ does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Status
 
-Everything documented below is implemented: discover / commission, state
-operations (read / write / invoke / describe / on / off), multi-admin share
-(`open-window`), groupcast (`group provision` / `group invoke`), the resident
-daemon `matd` (warm CASE sessions, `mat --matd`), and `mat diag thread`. All of
-it passes the fake-chip-tool / fake-ws integration tests, and real-device E2E
-has confirmed commissioning, read/write/invoke, `matd`'s warm sessions, error
-classification, group provisioning, and `diag thread`. Group *delivery* is
-unacknowledged multicast by design, so per-device actuation cannot be confirmed
-from the controller side (see Groupcast below).
+Everything documented below is implemented on the native backend: discover /
+commission (on-network and BLE+Thread), first-fabric bootstrap (`fabric init`),
+state operations (read / write / invoke / describe / on / off), multi-admin
+share (`open-window`), groupcast (`group provision` / `group invoke`), the
+resident daemon `matd` (warm CASE sessions, `mat --matd`), and diagnostics
+(`diag thread` / `diag node`). It passes the fake-connection / binary
+integration tests, and real-device E2E (Phase 5 gate 1) has confirmed the full
+op sweep runs natively with no fallback. Group *delivery* is unacknowledged
+multicast by design, so per-device actuation cannot be confirmed from the
+controller side (see Groupcast below).
 
-The development roadmap (including the optional, not-started native-backend
-replacement) lives in [ARCHITECTURE.md](./ARCHITECTURE.md).
+The development roadmap and the Phase 5 native-backend record live in
+[ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Requirements
 
-- Rust (stable) and [Task](https://taskfile.dev) to build.
-- A `chip-tool` binary on your `PATH` (or set `MAT_CHIP_TOOL_BIN` to its full
-  path). Building `chip-tool` is heavy, so a Docker image with it baked in is
-  provided (see [Backend](#backend-chip-tool)).
+- Rust (stable) and [Task](https://taskfile.dev) to build. No external Matter
+  controller is needed — the backend is native and pure Rust.
 - Matter uses mDNS / IPv6 multicast, so on a real network the host must be able
-  to send and receive these.
+  to send and receive these. `mat` auto-detects the network interface (override
+  with `MAT_IFACE`; see [Backend](#backend)).
+- BLE commissioning (BLE+Thread) is an opt-in `ble` cargo feature (pulls in
+  `libdbus`); the default build and local `task check` do not need it. Deploy
+  builds enable it — see [Backend](#backend).
 
 ## Install
 
@@ -72,16 +77,16 @@ mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 
 }
 ```
 
-With `--probe`, each `commissioned` node is checked against a live mDNS
-browse — native one-shot browse when `MAT_IFACE` is set (M8b), `avahi-browse
-_matter._tcp` otherwise, one browse for all nodes — and annotated:
+With `--probe`, each `commissioned` node is checked against a live mDNS resolve
+(a native targeted `_matter._tcp` lookup per node, run concurrently) and
+annotated:
 
 - `reachable: true` — advertising now; `address` is the live-resolved value
   (may differ from the ledger).
 - `reachable: false` — not advertising; `address` is the last-known ledger
   value with `stale: true`.
-- `reachable: null` — the mDNS probe could not run (e.g. `avahi-browse`
-  missing); reachability is unknown. A diagnostic is logged to stderr.
+- `reachable: null` — the mDNS probe could not run (e.g. an interface I/O
+  error); reachability is unknown. A diagnostic is logged to stderr.
 
 ```json
 {
@@ -105,12 +110,46 @@ deeper single-node check use `mat diag node --deep`.
 { "timestamp": "2026-06-06T12:34:56+09:00", "node_id": 5, "status": "success" }
 ```
 
+#### First-fabric bootstrap (`fabric init`)
+
+Before the very first commission you need a fabric: a Root CA, the controller's
+operational identity, and a random-epoch IPK, all written into a fresh
+credential store. `mat fabric init` creates them (direct path only, no network
+touched — it just writes the KVS):
+
+```bash
+# fabric init [--fabric-id N] [--admin-node-id N]   (defaults: 1 / 112233)
+mat fabric init
+```
+
+```json
+{
+  "timestamp": "2026-06-06T12:34:56+09:00",
+  "store": "/home/you/.config/mat",
+  "fabric_id": 1,
+  "fabric_index": 1,
+  "compressed_fabric_id": "AAAAAAAAAAAAAAAA",
+  "admin_node_id": 112233
+}
+```
+
+- The generated IPK epoch is random (16 bytes from the OS CSPRNG), not
+  `chip-tool`'s old fixed `temporary ipk 01` constant. The key material never
+  appears on stdout — only the fabric identifiers.
+- **It refuses if the store already holds a KVS** (no `--force`); re-initialize
+  by deleting the store's `.ini` files by hand. Any other command run before
+  `fabric init` returns `store_missing` (exit 10) with a hint to run it.
+- If you are joining a fabric that was created by `chip-tool` (fixed-epoch),
+  you do **not** run `fabric init` — the first native `commission` verifies the
+  fixed epoch against the fabric's KVS materials and adopts it (see
+  [Backend](#backend), "epoch").
+
 #### Attestation / PAA trust store
 
 Production Matter devices ship a DAC signed by a **production PAA** (Product
-Attestation Authority). With only chip-tool's built-in development PAA,
-commissioning fails attestation (`device_rejected`, "Failed Device
-Attestation"). Point `mat` at a directory of PAA root certificates:
+Attestation Authority). Without the matching PAA root, commissioning fails
+attestation (`device_rejected`, "Failed Device Attestation"). Point `mat` at a
+directory of PAA root certificates:
 
 ```bash
 # Option 1: explicit env var
@@ -121,9 +160,11 @@ mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 
 ```
 
 Resolution order: `MAT_PAA_TRUST_STORE` > `<store>/paa-trust-store/`. If neither
-exists, `mat` passes no trust store and only chip-tool's development PAA applies
-(fine for test devices, not for retail ones). Get the certificates from
-connectedhomeip's `credentials/production/paa-root-certs/`.
+exists, `mat` trusts only the built-in development PAA (fine for test devices,
+not for retail ones). Get the certificates from connectedhomeip's
+`credentials/production/paa-root-certs/`. A CD (Certification Declaration) signer
+trust store resolves the same way via `MAT_CD_SIGNER_STORE` >
+`<store>/cd-signer-store/` (absent = CD verification is warn-only).
 
 ### State operations
 
@@ -148,7 +189,7 @@ mat read -n 5 -c onoff -a on-off                 # same, short aliases
 # Set a writable attribute
 mat write --node 5 --cluster levelcontrol --attribute on-level --value 128
 
-# Run a command: --command plus trailing chip-tool args
+# Run a command: --command plus trailing command args
 mat invoke --node 5 --cluster levelcontrol --command move-to-level 128 0 0 0
 
 # Introspect a node
@@ -196,7 +237,7 @@ On/Off command. `mat on` / `mat off` are shortcuts for this and **map to the
 Outputs:
 
 ```json
-// read — value is chip-tool's `Data = ...` normalized to bool/number/string/null
+// read — the attribute's TLV value normalized to bool/number/string/null
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "attribute": "on-off", "value": true }
 
 // write
@@ -224,8 +265,9 @@ Outputs:
 { "timestamp": "...", "node_id": 5, "endpoints": [ { "endpoint": 0, "clusters": [29, 31] }, { "endpoint": 1, "clusters": [6, 8] } ] }
 ```
 
-> `describe` calls chip-tool several times (parts-list plus each endpoint's
-> server-list), so it is slow, but it finishes in one shot.
+> `describe` issues several reads (parts-list plus each endpoint's
+> server-list) over one CASE session, so it does a bit of work, but it finishes
+> in one shot.
 
 ### Diagnostics
 
@@ -260,9 +302,10 @@ mat diag thread --node 5
 }
 ```
 
-> Field names inside `neighbor_table` / `route_table` are kept verbatim from
-> chip-tool (note `Lqi` in neighbors but `LQIIn` / `LQIOut` in routes), and
-> `routing_role` is the numeric enum (5 = Router) — `mat` does not resolve names.
+> Field names inside `neighbor_table` / `route_table` follow chip-tool's
+> field-name convention (note `Lqi` in neighbors but `LQIIn` / `LQIOut` in
+> routes), and `routing_role` is the numeric enum (5 = Router) — `mat` does not
+> resolve names.
 
 > How to read it: a flaky node usually has **few `neighbor_table` entries** or a
 > weak `AverageRssi` to its only neighbor (roughly: > -70 dBm healthy, < -85 dBm
@@ -277,9 +320,9 @@ mat diag thread --node 5
 > (`[{ "attribute": ..., "kind": ... }]`), and an unread field is `null` —
 > distinct from `[]`, which means a table was read and is genuinely empty (an
 > isolated node). If *every* read fails (node fully unreachable) it exits with
-> `unreachable` / `timeout` instead. Like `describe`, this calls chip-tool
-> several times but finishes in one shot. `mat diag` runs only on the direct
-> chip-tool path (not via `--matd`).
+> `unreachable` / `timeout` instead. Like `describe`, this reads several
+> attributes but finishes in one shot. `mat diag` runs only on the direct path
+> (not via `--matd`).
 
 `mat diag node --node <node_id>` answers a different question: **why can't I
 control this commissioned node?** It runs layered checks and classifies the
@@ -288,8 +331,8 @@ where `mat invoke` would only return a bare `timeout` / `session_failed`.
 
 ```bash
 # diag node --node <node_id> [--endpoint EP] [--deep]   (EP defaults to 0)
-mat diag node --node 5            # fast (native IM if MAT_IFACE set, else chip-tool)
-mat diag node --node 5 --deep     # also probe ping6 + mDNS (native if MAT_IFACE set, else avahi-browse)
+mat diag node --node 5            # fast (native IM: operational + thread checks)
+mat diag node --node 5 --deep     # also probe ping6 + native targeted mDNS
 ```
 
 ```json
@@ -309,39 +352,31 @@ mat diag node --node 5 --deep     # also probe ping6 + mDNS (native if MAT_IFACE
 
 > `verdict` is one of `ok`, `ip_unreachable`, `link_starved`, `fabric_missing`,
 > `not_advertised`, `unresolvable`, `session_failed`, `device_rejected`,
-> `unknown`. The default (chip-tool-only) path can't tell `link_starved` (weak
+> `unknown`. Without `--deep` the fast path can't tell `link_starved` (weak
 > Thread link, SRP not registered — **the fabric is intact**) apart from
 > `fabric_missing` (the device dropped our fabric); `--deep` adds the ping6 and
 > mDNS evidence that distinguishes them. Like `diag thread` it returns **partial
 > results** (skipped/failed checks go under `unavailable`) and **always exits
 > `0`** with a verdict, even when the node is fully unreachable — the value is in
-> the classification, not an exit code. `--deep` shells out to `ping6` and,
-> unless `MAT_IFACE` is set (native targeted mDNS resolve, M8b),
-> `avahi-browse` (override with `MAT_PING6_BIN` / `MAT_AVAHI_BROWSE_BIN`).
+> the classification, not an exit code. `--deep` shells out to `ping6` (override
+> with `MAT_PING6_BIN`) and does a native targeted mDNS resolve.
 >
-> As of M8c-2, the `operational` and `thread` checks themselves go native
-> when `MAT_IFACE` is set (direct path only — `diag node` is not part of the
-> `matd` protocol, same as before): one CASE session serves both, instead of
-> two separate `chip-tool` invocations. Unresolved native materials fall back
-> to the chip-tool-only behavior described below.
+> The `operational` and `thread` checks run natively over a single CASE session
+> (one session serves both). `diag node` is direct path only — it is not part
+> of the `matd` protocol.
 >
 > `mdns.advertised_self_fabric` is whether the node advertises on **our** fabric
 > specifically (vs. `advertised_any_fabric`, which is any fabric). It needs our
-> compressed-fabric-id: on the native path (M8c-2) `mat` computes this
-> directly from the fabric's KVS materials, so it is always available and the
-> `cfid_unavailable` case below cannot occur. On the chip-tool path, `mat`
-> instead reads it from the operational read's `chip-tool` logs — preferring
-> the resolved `<cfid>-<node>` instance name, falling back to the
-> `Compressed FabricId` line (both streams are scanned, since `chip-tool`
-> logs to stdout). When neither is available the field is omitted and a
-> `{"check": "mdns_self_fabric", "kind": "cfid_unavailable"}` entry appears under
-> `unavailable`.
+> compressed-fabric-id, which `mat` computes directly from the fabric's KVS
+> materials — so it is always available (the historical `cfid_unavailable` case,
+> from the old chip-tool-log-parsing path, cannot occur on the native path).
 
 ### Multi-admin share
 
 To share a `mat`-owned device with another controller (Alexa / Apple / Google),
-open a commissioning window and return a one-time issued code. This wraps
-`chip-tool pairing open-commissioning-window` (ECM = option 1).
+open a commissioning window and return a one-time issued code. This runs the
+Administrator Commissioning cluster's OpenCommissioningWindow (ECM) natively
+over a CASE session to the node.
 
 ```bash
 # open-window --node <node_id> [--timeout S] [--iteration N] [--discriminator D]
@@ -376,9 +411,11 @@ Output:
 Control many devices at once with a Matter **wire group**: a GroupId plus a key
 set is burned into each device, then a single multicast send hits all of them.
 This is the original motivation (no "popcorn effect" of lights turning on one by
-one). It wraps `chip-tool`'s group path (`groupsettings` / `groupkeymanagement` /
-`groups`); `mat` holds no group state of its own (it lives in chip-tool's
-storage). Logical group names ("the living-room lights") are out of scope —
+one). `mat` runs the whole path natively: the device-side Group Key Management /
+Groups writes over CASE, and the controller-side group state written straight
+into the credential KVS (`mat` is the sole owner/writer of that state, in
+chip-tool-compatible INI form). Logical group names ("the living-room lights")
+are out of scope —
 `mat` takes a numeric GroupId (`-g/--group` and `--nodes` also accept an
 alias from the optional `aliases.toml`, which is just a local nickname for the
 number; see [Aliases](#aliases-aliasestoml-optional)).
@@ -432,7 +469,7 @@ Outputs:
 - **`--epoch-key` is optional.** It is the 16-byte (32-hex) AES key shared by the
   group. Omit it and `mat` generates a random one (single-controller use); pass a
   fixed key only when several controllers must share the same wire group. The key
-  is never printed to stdout (it is a credential; it lives in chip-tool storage).
+  is never printed to stdout (it is a credential; it lives in the KVS).
 - `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
 - **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup / ACL
   write on every node) and **especially unstable on Thread** (multicast retransmits and
@@ -451,32 +488,29 @@ Outputs:
   write replaces the whole list; a blind write could drop the admin entry and
   make the device unmanageable).
 - **Adding a node to an existing group: `--rebind`.** The controller-side
-  `groupsettings` state persists across runs (chip-tool's own storage, or —
-  as of M8c-2, when the write goes native — the same KVS `mat` writes
+  group state persists across runs (in the credential KVS `mat` writes
   directly), so re-running provision on an existing group fails with a
-  duplicate-bind error (`Duplicate key id` on the chip-tool path, `use
-  --rebind` in the `detail` on the native path) — worse, the earlier
+  duplicate-bind error (`use --rebind` in the `detail`) — worse, the earlier
   keyset-add step has already rotated the controller's epoch key, leaving it
   out of sync with the devices (groupcast silently breaks). Without
   `--rebind` this failure is intentional (it stops you from rotating keys by
   accident). With `--rebind`, provision unbinds the keyset binding first
-  (best-effort; also safe on a brand-new group) and re-provisions cleanly —
-  same sequence on both the chip-tool and the native-KVS write. Three
-  rules: pass **all existing members plus the new node** to `--nodes` (a fresh
+  (best-effort; also safe on a brand-new group) and re-provisions cleanly.
+  Three rules: pass **all existing members plus the new node** to `--nodes` (a fresh
   epoch key is generated, so nodes left out stop receiving groupcasts), keep the
   **same `--keyset-id`** (the device keyset table holds max 3 entries and the
   IPK uses one), and confirm membership per node with
   `mat read -e 0 -c groupkeymanagement -a group-key-map`. After a direct-path
-  `--rebind`, restart `matd` if it is running (its warm chip-tool still holds
-  the old group state in memory; storage is already updated) — the output
-  `note` says so either way (see Outputs above).
+  `--rebind`, restart `matd` if it is running (it may still hold the old group
+  state in memory; the KVS is already updated) — the output `note` says so
+  (see Outputs above).
 - **`mat group grant` repairs older groups.** Groups provisioned before this
   step existed — including any provision routed through a `matd` ≤ 0.12, which
   does not run the ACL step — lack the entry and their groupcast is silently
-  ignored. The controller-side `groupsettings` state is not idempotent, so
-  provision cannot simply be re-run — use `provision --rebind` to re-run it on
-  an existing group; `grant` runs just the ACL step instead. It is always
-  direct chip-tool (`--matd` exits 2).
+  ignored. The controller-side group state is not idempotent, so provision
+  cannot simply be re-run — use `provision --rebind` to re-run it on an
+  existing group; `grant` runs just the ACL step instead. It is direct path
+  only (`--matd` exits 2).
 
 Color shortcuts for groups (same conversions as the single-node `mat
 color-temp` / `mat color`, delivered as an unacknowledged groupcast — the
@@ -493,13 +527,13 @@ mat group color --group 1 --hue 330 --sat 80
 
 ### Routing through `matd`
 
-By default each `mat` call spawns `chip-tool` and pays a fresh CASE handshake.
-With a running `matd` the call is routed through its warm session instead —
-same subcommands, same JSON on stdout, but the handshake is skipped on repeated
-calls. `mat` **auto-detects** `matd`: for supported subcommands it tries a
-connect on the default socket, uses `matd` when something answers, and silently
-falls back to the direct chip-tool path when nothing does (missing and stale
-sockets alike).
+Each `mat` call is a one-shot: it establishes CASE, runs the op, and discards
+the session. With a running `matd` the call is routed through its **warm**
+session instead — same subcommands, same JSON on stdout, but the handshake is
+skipped on repeated calls. `mat` **auto-detects** `matd`: for supported
+subcommands it tries a connect on the default socket, uses `matd` when something
+answers, and silently falls back to `mat`'s own native direct path when nothing
+does (missing and stale sockets alike).
 
 ```bash
 # Start the resident daemon (separate binary; see ARCHITECTURE.md / matd --help).
@@ -522,15 +556,13 @@ mat read --node 5 --cluster onoff --attribute on-off --matd
 mat --matd /run/mat/matd.sock on --node 5
 export MAT_MATD=1                       # same, for a whole shell session
 
-# Opt out (always direct chip-tool, no probing):
+# Opt out (always direct path, no probing):
 MAT_MATD=0 mat read --node 5 --cluster onoff --attribute on-off
 # export MAT_MATD_SOCKET=/run/mat/matd.sock   # pins which socket to probe/use
 ```
 
-Stop the daemon with `matd stop` — do **not** `kill` it, which orphans the child
-`chip-tool` holding the ws port. `matd stop` sends a shutdown request over the
-same socket and triggers a graceful teardown (child `chip-tool` killed, socket
-removed):
+Stop the daemon with `matd stop`, which sends a shutdown request over the same
+socket and triggers a graceful teardown (warm sessions dropped, socket removed):
 
 ```bash
 matd stop                             # default socket
@@ -541,19 +573,16 @@ Only one `matd` runs per socket: startup takes an exclusive `flock` on
 `<socket>.lock`, so a second launch on the same socket exits `1` with `matd
 already running (lock held at ...)` instead of silently hijacking it.
 
-`matd`'s child `chip-tool interactive server` burns ~100% of one CPU core the
-whole time it is alive — a busy-loop in its websocket service loop (upstream
-[project-chip/connectedhomeip#29971](https://github.com/project-chip/connectedhomeip/issues/29971),
-open since 2023). `matd` keeps the websocket alive with a periodic keepalive
-ping and preserves the warm child across transient socket errors, but the only
-way to stop the CPU burn is to let the idle reaper kill the child. Keep
-`--idle-timeout` moderate (default 300 s; 600–900 s is a reasonable ceiling) —
-do **not** raise it to "practically forever" unless you are happy trading a
-permanently hot core for never paying a cold start.
+`matd` is native and pure Rust — it speaks a plain unix-socket protocol and
+holds warm per-node CASE sessions in-process (a few KB each). There is no child
+process and no CPU busy-loop, so sessions are held indefinitely (no idle
+reaper). It **starts even with no fabric materials** — each op returns
+`store_missing` (exit 10) until you run `mat fabric init` — and refuses to start
+only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
 
 - Route selection: `--matd` / `MAT_MATD=<truthy>` **force** the matd path
   (connection failure is an error, no fallback). `MAT_MATD=<falsy>`
-  (`0`/`false`/`no`/`off`) forces the direct path, no probing. Otherwise
+  (`0`/`false`/`no`/`off`) forces `mat`'s own direct path, no probing. Otherwise
   (default) `mat` **auto-detects**: it probes the socket with a connect and
   falls back to the direct path when nobody answers. `MAT_MATD_SOCKET` just
   selects *which* socket in every mode.
@@ -564,311 +593,123 @@ permanently hot core for never paying a cold start.
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
   `color-temp` / `color` / `describe` / `group` (`provision` / `invoke` /
-  `color-temp` / `color`; `group grant` is always direct — see Groupcast
-  above). `discover` / `commission` / `open-window` / `diag` are direct-only:
-  auto-detection skips them silently; explicit `--matd` exits `2`.
-  The group color shortcuts (`group color-temp` and `group color`) require
-  matd ≥ 0.14; an older matd rejects the unknown op with a `parse_error`
-  (exit 1) and `mat` does not fall back to the direct path (no double execution).
-  `group provision --rebind` through matd needs matd ≥ 0.15: an older matd
-  silently ignores the unknown `rebind` field and fails at `bind-keyset`
-  (`Duplicate key id`) — same as running provision without the flag.
+  `color-temp` / `color`; `group grant` is direct only — see Groupcast
+  above). `discover` / `commission` / `fabric init` / `open-window` / `diag`
+  are direct-only: auto-detection skips them silently; explicit `--matd` exits
+  `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
-### matd's native backend (Phase 5 M4, extended in M8a, M8c-2)
+### Native backend internals
 
-Set `MAT_MATD_IFACE=<thread mesh iface>` (or pass `matd --iface <name>`) to let
-`matd` handle its hotpath ops — `on` / `off` / `color`
-(`move-to-hue-and-saturation`) / `color-temp` (`move-to-color-temperature`) /
-`read`ing the `onoff` cluster's `on-off` attribute — in-process, over a warm
-CASE session held by the embedded Matter controller (crate `mat-controller`,
-Phase 5's from-scratch native backend), instead of going through the
-`chip-tool interactive server`. As of M8a, the same warm-session treatment
-also covers generic `read` (any cluster/attribute), `write`, generic `invoke`,
-`describe`, generic `group invoke` (any cluster/command, resolved through the
-same name→ID table `mat`'s direct path uses), and `group provision`'s
-device-side steps. As of M8c-2, `group provision`'s controller-side
-`groupsettings` bookkeeping is native too — `matd` writes it straight into
-the chip-tool-compatible KVS (`mat-controller::group_settings`) instead of
-issuing `groupsettings` commands over the `chip-tool interactive server`,
-resolving the M8a hybrid (device-side native / controller-side chip-tool).
-When the native KVS-write materials aren't available, `matd` falls back to
-the old chip-tool-`groupsettings` path for the whole controller-state step;
-once it *is* available, a write failure is a hard error (no fallback — see
-Groupcast below). Leave `MAT_MATD_IFACE` unset and nothing changes: every
-op still goes through chip-tool, exactly as before.
+`mat` and `matd` share one engine (crate `mat-native`, sitting on the protocol
+library `mat-controller`). `matd` holds warm per-node CASE sessions; `mat`
+establishes → runs one op → discards (design rule 4). The stdout JSON schema is
+identical either way — the process only differs in session lifetime.
 
-```bash
-matd --iface thread0 &
-# or: MAT_MATD_IFACE=thread0 matd &
-```
+#### Interface selection
 
-- Native sessions are held per-node indefinitely once established (unlike
-  `chip-tool`, no busy-loop cost — a few KB per node). A send that exhausts
-  MRP retransmission (timeout) discards the session and does one automatic
-  mDNS re-resolve + re-CASE before failing.
-- If the fabric table index isn't `1` (e.g. sharing a fabric with another
-  admin), pass `--fabric-index <n>` (env `MAT_MATD_FABRIC_INDEX`). The CA
-  issuer index defaults to `0`; override with `--issuer-index` (env
-  `MAT_MATD_ISSUER_INDEX`).
-- If native construction fails (e.g. the credential store can't be read),
-  `matd` logs a warning and falls back to chip-tool for everything — it does
-  not refuse to start.
-- Generic `write` / `group invoke` reject known list/struct/float
-  attributes or command fields with `parse_error` up front, same rule as
-  `mat`'s direct path (see M8a below); unknown names still fall back to
-  chip-tool.
-- `diag thread`, `open-window`, `group grant`, and `commission` are **not**
-  part of the `matd` socket protocol at all (by design — these are rare,
-  session-lifetime doesn't matter for them, and `commission` in particular
-  has no warm session to reuse) and never get routed to `matd` even when it's
-  running; `mat` always handles them on its own direct path (native if
-  `MAT_IFACE` is set, chip-tool otherwise). `diag node` and `discover` gained
-  a native option in M8b, and `commission` in M8c-1 — all three only on
-  `mat`'s own one-shot direct path (see below); `matd` still never carries
-  these ops.
-  Because of this, `chip-tool` is only spawned lazily on the first op that
-  needs it: a workload that only ever hits native-eligible ops never spawns
-  `chip-tool` at all, and `matd` can start even if `chip-tool` isn't
-  installed.
-- Error kinds and exit codes are identical regardless of path: mDNS
-  resolution failure -> `unreachable`, CASE failure -> `session_failed`, MRP
-  exhaustion -> `timeout`, IM status rejection -> `device_rejected`.
-- Real-device acceptance harness: `task e2e:m4` (needs `MAT_E2E_HOST` /
-  `MAT_E2E_NODE_ID` / `MAT_E2E_IFACE`; designed to run against a separate
-  socket/port so it doesn't disturb a production `matd`).
+The engine needs the Thread-mesh network interface. `mat` **auto-detects** it
+every run (no stored state): the sole interface that is up (has carrier),
+multicast-capable, non-loopback, non-point-to-point (tunnels like `tailscale0`
+are excluded), and holds an IPv6 link-local address. If exactly one qualifies it
+is used; zero or two-or-more is a hard error (`other`) that lists the candidates
+and asks you to set the override.
 
-### matd's native groupcast (Phase 5 M5, extended in M8a)
+- `MAT_IFACE` (or the global `--iface <name>`) overrides autodetect for `mat`.
+- `MAT_MATD_IFACE` (or `matd --iface <name>`) overrides it for `matd`. These are
+  deliberately separate names for two different processes; `matd` refuses to
+  start on an ambiguous autodetect (a whole-daemon misconfiguration, so it
+  fail-fasts rather than erroring per-op).
 
-With native enabled (`MAT_MATD_IFACE` set and the native backend built
-successfully), `matd` also handles its group-send ops in-process instead of
-going through chip-tool: `group color`, `group color-temp`, and `group
-invoke`. Through M7, `group invoke` only went native for onoff `on`/`off`/
-`toggle` with no extra arguments; as of M8a it's generic — any
-cluster/command the name→ID table (or a numeric id) can resolve, subject to
-the same scalar-only type rule as `mat`'s direct path (list/struct/float
-fields are rejected with `parse_error`, not silently sent as chip-tool).
-`group provision`'s device-side steps go native too, and as of M8c-2 its
-controller-side `groupsettings` bookkeeping is native as well (see matd's
-native backend above); any group send whose cluster/command name can't be
-resolved at all still falls back to chip-tool.
+On jarvis (`eth0` + `tailscale0`) and WSL (`eth0`) exactly one candidate remains,
+so autodetect just works.
 
-- Each send re-reads the group's operational credentials from the chip-tool
-  KVS (derived GroupKeyMap -> keyset GKH + operational key), so a
-  `group provision --rebind` takes effect on the very next native send with
-  no matd restart needed.
-- The send is a single unacknowledged AES-CCM-sealed packet to the
-  site-local transient multicast address (`ff35::.../64` scope, hop limit
-  64) — same wire semantics as chip-tool's groupcast (no response, no MRP).
-- The send counter is persisted at `<store>/native_group_counter` (plain
-  decimal text, written ahead by 4096 so a crash never reuses a counter
-  value). On first use it jumps to ``max(own file, chip-tool's `g/gdc`) +
-  4096``, because native shares the same source node id as chip-tool and
-  therefore the same per-sender counter window on the receiving devices.
-  This file is opened with an exclusive `flock` (on `<path>.lock`, held for
-  the life of the process) and is **shared with `mat`'s own one-shot native
-  direct path** (Phase 5 M7, below) — whichever process holds the lock sends
-  with it; the other one finds it locked (`WouldBlock`) and falls back to
-  chip-tool for that group op instead of racing the same counter file.
-- If native can't send (group not provisioned, KVS incomplete, `g/gdc`
-  missing, etc.), `matd` logs a warning and falls back to chip-tool for that
-  op — it does not fail the request.
-- The response JSON is identical on both paths (same `group_sent_body`
-  schema as the direct/chip-tool group commands above).
-- With native disabled (`MAT_MATD_IFACE` unset, or native construction
-  failed), all group ops go through chip-tool exactly as before — no
-  behavior change.
-- **Recommendation: pick one group sender.** Once native groupcast is
-  active, send all groupcasts through native `matd` and stop sending them
-  through the direct `mat` (chip-tool) path. Native's counter jump-ahead at
-  startup only protects the *first* send after enabling native — it reads
-  chip-tool's `g/gdc` once and then advances independently. If you go back
-  to sending via direct chip-tool *after* native has been sending for a
-  while, chip-tool's counter is now behind native's and devices will drop
-  its groupcasts as stale/duplicate (the same counter-collision failure
-  mode as mixing two chip-tool senders). **Forcing the direct path with
-  `MAT_MATD=0` for group sends while a native `matd` is running is still
-  prohibited** even after Phase 5 M7 gave `mat` its own native group path:
-  `MAT_MATD=0` skips matd auto-discovery, so the send either goes through
-  `mat`'s own native path (flock-shared counter file — safe, see above) or,
-  if that's unavailable, straight to chip-tool — bypassing `matd`'s in-memory
-  counter state either way and reintroducing the same mixing this section
-  warns about. Normally you don't need `MAT_MATD=0` at all: with `matd`
-  running, route priority already sends every group op to it first.
-- **Caveat: this also happens *within* a single `matd`, for group sends
-  outside the native-eligible set.** As of M8a, `group invoke` is native for
-  any resolvable cluster/command with scalar (or no) arguments, plus `group
-  color` and `group color-temp` — but a `group invoke` naming an unknown
-  cluster/command still falls back to chip-tool even while native is active.
-  If a group has members that also receive native-driven groupcasts, that
-  chip-tool-routed send uses chip-tool's counter, which can already be
-  behind native's jumped-ahead counter for the same source node id (the
-  counter window is per-source-node, across all groups) — those devices can
-  silently drop it while `matd` still reports `"status": "sent"`. `matd`
-  logs a `tracing::warn!` when this happens, but routing is unchanged
-  (refusing the send is a product decision, not made here).
-- Real-device acceptance harness: `task e2e:m5` (needs
-  `MAT_E2E_HOST` / `MAT_E2E_IFACE` / `MAT_E2E_GROUP_NODES`; stop production
-  matd's group traffic for the duration — unicast ops are fine to leave
-  running).
+#### Fabric index, sessions, epoch
 
-### `mat`'s native direct path (Phase 5 M7, extended in M8a, M8b, M8c-1, M8c-2)
+- `MAT_FABRIC_INDEX` (default `1`) and `MAT_ISSUER_INDEX` (default `0`) select
+  the KVS fabric-table and CA-issuer entries for `mat`; `matd` mirrors them as
+  `MAT_MATD_FABRIC_INDEX` / `MAT_MATD_ISSUER_INDEX` (also `--fabric-index` /
+  `--issuer-index`). Pass the same values to both on the same host. If you share
+  a fabric with another admin the index is usually not `1`.
+- **Warm sessions** (matd only) are held per node indefinitely. A send that
+  exhausts MRP retransmission (timeout) discards the session and does one
+  automatic mDNS re-resolve + re-CASE before failing. `mat`'s one-shot session
+  can't be stale, so it never retries — a failure is reported as-is.
+- **Epoch (IPK).** `commission` needs the fabric's epoch IPK (the key `AddNOC`
+  hands the device — distinct from the KDF-derived *operational* key that is the
+  only one persisted). It is resolved in order: (1) the `mat`-owned KVS key
+  `mat/f/<idx>/ipk-epoch` if present; (2) otherwise the fixed chip-tool default
+  is checked against the fabric's KVS materials via a KDF guard, and on a match
+  it is **adopted and persisted** to that key (so a fabric first created by
+  chip-tool keeps working, and later commissions read the persisted value); (3)
+  a mismatch (rotated IPK, or a non-chip-tool fabric) is a `store_parse` hard
+  error. A fabric created by `mat fabric init` starts at case (1) with a random
+  epoch. Adoption happens on the first native commission — no separate step.
 
-Set `MAT_IFACE=<thread mesh iface>` (or pass the global `--iface <name>`) to
-let `mat`'s own one-shot **direct** path — not `matd` — run its hotpath ops
-in-process too, over the same `mat-native` engine that backs `matd`'s native
-backend above (M4/M5): `on` / `off` / `color` / `color-temp` / `read`ing the
-`onoff` cluster's `on-off` attribute, and the three group-send shapes
-(`group invoke` for onoff `on`/`off`/`toggle` with no extra arguments,
-`group color`, `group color-temp`). As of M8a, native also covers generic
-`read` (any cluster/attribute, by name via the checked-in name→ID table or by
-numeric id), generic `write`, generic `invoke`, `describe`, `diag thread`
-(`diag node` is out of scope for M8a), `open-window`, device-side
-`group provision` / `group grant`, and generic `group invoke` (any
-cluster/command, not just the M7 onoff-with-no-args shape). As of M8c-2,
-`group provision`'s controller-side group settings (`groupsettings`) are
-native too (see below). Leave `MAT_IFACE`
-unset and nothing changes: every op still goes through chip-tool, exactly as
-before — opt-in, the same shape as `matd`'s `MAT_MATD_IFACE`. `matd` gets the
-same M8a treatment for `read`/`write`/`invoke`/`describe`/`group invoke`/
-`group provision`, but `diag thread`, `open-window`, and `group grant` are not
-part of the `matd` socket protocol at all (by design, unrelated to M8a) — for
-those three, `matd` is never in the picture even if it's running, and route
-priority is just native direct (`MAT_IFACE`) -> chip-tool direct.
+#### Scalar-only generic write / invoke
 
-Generic `write` / `invoke` only encode **scalar** JSON→TLV types (bool / int /
-uint / enum / bitmap / string / octstr — bytes as a `hex:`-prefixed string).
-An attribute or command field that the name table knows to be `list` /
-`struct` / `float` is rejected up front with `parse_error` (the error detail
-names the type); it does not silently fall back to chip-tool. Unknown
-cluster/attribute/command names (not in the generated table) still fall back
-to chip-tool as before.
+Generic `write` / `invoke` (and `group invoke`) encode **scalar** JSON→TLV types
+only: bool / int / uint / enum / bitmap / string / octstr (bytes as a
+`hex:`-prefixed string). An attribute or command field the name table knows to be
+`list` / `struct` / `float` is rejected up front with `parse_error` (the detail
+names the type). This is a deliberate, documented limitation — the practical
+cases (onoff / level / color, and the ACL entry `group grant` appends) are all
+covered, and the numeric-ID escape hatch remains for names the generated table
+does not resolve (an unknown name is also a `parse_error`; pass the numeric id).
+The `group provision` / `grant` list/struct writes (KeySetWrite, GroupKeyMap,
+binding, ACL read-modify-write) use dedicated encoders, not the generic path.
 
-As of M8b, `MAT_IFACE` also governs two ops that are **not** part of the
-`matd` protocol at all and never route through `matd`: `discover`'s
-commissionable-device browse (native `browse_commissionable`, mapped into the
-same `DiscoveredDevice` JSON schema byte-for-byte) and the mDNS probe shared
-by `discover --probe` and `diag node --deep` (native **targeted
-`resolve_operational` per ledger node, run concurrently** — not an
-enumeration: real Thread meshes have advertising proxies that answer direct
-instance queries but omit instances from service-type PTR enumeration, so
-enumerate-and-match under-reports; `avahi-browse` only avoids this because
-its daemon holds a long-lived cache). Both fall back to their pre-M8b
-mechanism (`chip-tool` for discover, `avahi-browse` for the probe) only on
-an I/O error from the native path — zero commissionable devices / zero
-reachable nodes is a normal result and never triggers a fallback.
+#### Groupcast counter (shared between `mat` and `matd`)
 
-As of M8c-1, `MAT_IFACE` also covers `commission` (still direct-only, never
-routed to `matd` — see above). Route selection within native is automatic,
-mirroring the existing `pairing code`-only UX (no new flag to pick a
-transport): for a QR payload (`MT:...`), `mat` first tries an mDNS lookup
-(`resolve_commissionable` on the long discriminator, 5s timeout) for
-**on-network** commissioning; if that times out, and the build has the `ble`
-feature and `--thread-dataset`/`MAT_THREAD_DATASET` was given, it falls
-through to a BLE scan + **BLE+Thread** commissioning (M6b's
-`commission_ble_thread`). A manual code has no BLE path (BLE needs the QR's
-long discriminator): `mat` instead runs `browse_commissionable` and filters
-by the code's short discriminator — zero matches falls back to chip-tool,
-2+ matches is an ambiguity error (not a silent pick), and either way a
-manual-code mDNS miss goes straight to the chip-tool fallback rather than
-attempting BLE. Before any of this, the fabric's **epoch IPK** — the key
-`AddNOC` hands the device, distinct from the KDF-derived *operational* key
-that's the only one persisted in the KVS — is checked against chip-tool's own
-fixed compile-time default via a KDF verification; a mismatch (IPK rotated,
-or the fabric wasn't created by chip-tool) is native-unsupported and falls
-back to chip-tool. New flags: `--thread-dataset <hex>` (env
-`MAT_THREAD_DATASET`) supplies the Thread active operational dataset for the
-BLE path; `MAT_CD_SIGNER_STORE` (falling back to `<store>/cd-signer-store`)
-resolves the CD signer trust store the same way `MAT_PAA_TRUST_STORE` /
-`<store>/paa-trust-store` resolve the PAA one (absent = warn-only, per M6b).
-**Fallback boundary is stricter than the other native ops above**: any
-failure before the wire is touched (interface/KVS/epoch-guard failure, or the
-device simply isn't found via mDNS or BLE) returns `Unavailable` and falls
-back to chip-tool; once PASE has started, a failure is returned as-is and
-`mat` does **not** retry via chip-tool for that call — re-running a
-partially-commissioned device through a second commissioner risks a
-duplicate or inconsistent commission. The `ble` feature must be compiled in
-for the BLE branch (`mat`/`mat-native`/`mat-controller` all gate it); without
-it, a network miss on a QR payload still falls back to chip-tool cleanly
-(no "BLE unsupported" hard error — the build just skips straight to the
-fallback).
+Native groupcast is a single unacknowledged AES-CCM-sealed packet to the
+site-local transient multicast address (`ff35::.../64`, hop limit 64) — no
+response, no MRP. The per-sender counter is persisted at
+`<store>/native_group_counter` (plain decimal, written ahead by 4096 so a crash
+never reuses a value), opened under an exclusive `flock` on `<path>.lock` for the
+life of the process.
 
-As of M8c-2, `MAT_IFACE` also covers two more things. First, `group
-provision`'s controller-side `groupsettings` bookkeeping (the keyset table
-and group table chip-tool's `groupsettings add-group` / `add-keysets` /
-`bind-keyset` normally maintain): instead of shelling out to those chip-tool
-commands, `mat` writes the same records directly into the chip-tool-compatible
-KVS (`mat-controller::group_settings`, 5 records per bind, flock-exclusive
-read-modify-write with an atomic tmp+rename replace — see [Groupcast]
-(#groupcast) for the resulting output note and `--rebind` semantics, which are
-unchanged). This closes the M8a hybrid, where only the four device-side
-provisioning steps were native and the controller-side bookkeeping still went
-through chip-tool; it applies on both `mat`'s direct path and via `matd` (see
-matd's native backend above). Only unresolved KVS materials (store unreadable,
-fabric index not found, etc.) fall back to chip-tool for the whole
-controller-state step; once the write is attempted, a failure — including a
-`flock` `WouldBlock` from a concurrent writer — is a hard error and is never
-retried via chip-tool (the KVS may already have been touched, so a chip-tool
-retry could double-write or corrupt the group table). Second, `mat diag
-node`'s IM part (the `operational` check and the `thread` neighbor-table
-signals, run whenever `MAT_IFACE` is set, independent of `--deep`) is native:
-one CASE session serves both checks, and the self-fabric compressed-fabric-id
-is computed directly from the fabric's KVS materials instead of being parsed
-out of chip-tool's stdout logs — so the `cfid_unavailable` case documented
-above cannot occur on this path. `diag node`'s `--deep` probes (`ping6` /
-mDNS) are unchanged (mDNS was already native as of M8b); `diag node` stays
-off the `matd` protocol (direct path only), same as before M8c-2. Engine
-construction failure for either op falls back to chip-tool exactly like the
-other native ops above.
+- **`mat` and `matd` share this one file.** Whichever process holds the lock
+  sends with it; the other finds it locked (`WouldBlock`) and reports the group
+  op as unavailable rather than racing the counter. Because both send as the
+  same source node id, they share one per-sender counter window on the receiving
+  devices.
+- **Pick one group sender.** If a native `matd` is running, send all groupcasts
+  through it. Its warm engine re-reads the group's operational credentials from
+  the KVS on every send, so a `group provision --rebind` takes effect on the very
+  next send with no restart. Do not mix senders: once one has advanced the
+  counter, the other is behind, and devices silently drop its groupcasts as
+  stale/duplicate (a `tracing::warn!` is logged, but routing is unchanged —
+  refusing the send is a product decision, not made here). With `matd` running,
+  route priority already sends every group op to it first, so you normally never
+  reach for `MAT_MATD=0`.
+
+#### Ops that never route through `matd`
+
+`discover`, `commission`, `fabric init`, `open-window`, `diag thread` / `diag
+node`, and `group grant` are not part of the `matd` socket protocol at all (by
+design — rare, or no warm session to reuse). They always run on `mat`'s own
+one-shot direct path (native), even when a `matd` is running. `discover --probe`
+and `diag node --deep` do a native **targeted** mDNS resolve per ledger node
+(run concurrently), not a service-type enumeration: real Thread meshes have
+advertising proxies that answer direct instance queries but omit instances from
+PTR enumeration, so enumerate-and-match under-reports.
 
 ```bash
-mat --iface thread0 on --node 5
-# or: MAT_IFACE=thread0 MAT_FABRIC_INDEX=2 mat group invoke --group 10 --cluster onoff --command on
+mat --iface eth0 on --node 5
+# or: MAT_IFACE=eth0 MAT_FABRIC_INDEX=2 mat group invoke --group 10 --cluster onoff --command on
+matd --iface eth0 &      # or MAT_MATD_IFACE=eth0 matd &
 ```
-
-- **Route priority is per-op, evaluated in this order:** matd auto-discovery
-  (unchanged, tried first) -> native direct (`MAT_IFACE` set and the op is
-  one of the shapes above) -> chip-tool direct. A running `matd` on the
-  probed socket wins even with `MAT_IFACE` set — `MAT_IFACE` only matters
-  once matd isn't in the picture (stopped, or the op isn't matd-supported).
-- `MAT_IFACE` is a deliberately separate name from `matd`'s `MAT_MATD_IFACE`
-  — they configure different processes and are never meant to be inherited
-  into each other by accident.
-- `MAT_FABRIC_INDEX` (default `1`) and `MAT_ISSUER_INDEX` (default `0`)
-  mirror `matd`'s `--fabric-index` / `--issuer-index` and read the same KVS
-  fabric table — pass the same values you'd give `matd` on the same host.
-- **One-shot, no warm session, no retry.** Each call establishes CASE, runs
-  the one op, and discards the session — `mat` stays the same synchronous,
-  stateless binary it always was (design rule 4); the native engine only
-  runs inside a current-thread tokio runtime for the duration of that one
-  call. Unlike `matd`'s warm sessions, there is no automatic re-resolve +
-  re-CASE on timeout: a freshly-established session can't be stale, so a
-  failure is reported as-is.
-- **Failure handling mirrors `matd`'s M4/M5 fallback exactly:** engine
-  construction failure (KVS unreadable, iface not found, etc.) logs a
-  `tracing::warn!` and falls back to chip-tool direct for the whole command.
-  A unicast op that fails after the engine is built (timeout, IM rejection,
-  unreachable) is returned as that error immediately — it does **not** fall
-  back to chip-tool (no double execution, same reasoning as matd's
-  hotpath). A group send that can't go native (not provisioned, KVS
-  incomplete, `g/gdc` missing, or the counter file is locked by another
-  process — see the counter note above) falls back to chip-tool for that op,
-  same as `matd`'s M5 behavior.
-- stdout's JSON schema is identical on every path — this setting only
-  changes which process talks to the device, never what `mat` prints.
-- Implementation: `mat` and `matd` share the same engine (crate
-  `mat-native`, extracted from `matd`'s native module in M7) so the two
-  paths have structurally identical behavior; only session lifetime (warm vs
-  one-shot) differs.
 
 ## Credential store
 
 Resolution order: `--store <path>` > `$MAT_STORE` > `$XDG_CONFIG_HOME/mat` >
 `~/.config/mat`. It holds the Root CA, the controller's keys/cert, the
 commissioned-node ledger (`nodes.json`), the optional alias map
-(`aliases.toml`, below), and `chip-tool`'s persistent storage.
-**It is never committed** (excluded by `.gitignore`).
+(`aliases.toml`, below), and the persistent Matter KVS (chip-tool-compatible
+INI form — group keysets, operational credentials, the group-send counter;
+`mat` is its sole reader/writer). **It is never committed** (excluded by
+`.gitignore`).
 
 ## Aliases (`aliases.toml`, optional)
 
@@ -876,7 +717,7 @@ Numeric node / group / endpoint ids are easy to get wrong. If the file
 `<store>/aliases.toml` exists, `mat` resolves locally defined names to those
 numbers right after arg parsing — a purely local convenience. **Without the
 file, behavior is exactly the traditional numeric-only one.** The wire and the
-backend (`chip-tool` / `matd`) always receive numbers, and stdout keeps the
+backend (native engine / `matd`) always receive numbers, and stdout keeps the
 numeric schema (no alias echo-back).
 
 ```toml
@@ -952,7 +793,7 @@ mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 
 ```
 
 The name is validated **before** commissioning starts (all-digits / empty /
-already taken → exit `2`, before chip-tool is even launched), and it is written
+already taken → exit `2`, before any network op runs), and it is written
 to `aliases.toml` only on success (the file is created if absent). Without
 `--alias`, `commission` never touches `aliases.toml`. Deleting or renaming an
 alias is a hand edit of the file — there is no management subcommand.
@@ -967,48 +808,79 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 2 | CLI argument error (clap default) |
 | 10 | credential store missing / parse failure |
 | 11 | node_id not commissioned |
-| 12 | `chip-tool` not found / not runnable |
+| 12 | *(retired in 0.22.0 — historical vacancy)* |
 | 3 | timeout |
 | 4 | device rejected |
 | 5 | unreachable / network |
 | 6 | CASE session establishment failed |
 | 1 | other |
 
-`chip-tool` has coarse exit codes (mostly `1` on failure). `mat` parses
-stdout/stderr to classify into `3` / `4` / `5` / `6`. If it cannot classify, exit `1`.
+The native backend maps its own transport/IM outcomes onto `3` / `4` / `5` /
+`6`; anything it cannot classify is exit `1`.
 
 `kind` values (stable; callers may branch on these strings):
 
-- `store_missing` / `store_parse` — credential store missing / corrupt (exit 10)
+- `store_missing` / `store_parse` — credential store missing / corrupt (exit 10).
+  `store_missing` typically means you have not run `mat fabric init` yet.
 - `node_not_commissioned` — node_id not in the store (exit 11)
-- `child_not_found` — `chip-tool` binary not found / not runnable (exit 12)
 - `timeout` (exit 3) / `device_rejected` (exit 4) / `unreachable` (exit 5) —
-  classified from chip-tool output
+  classified from the native transport / IM result
 - `session_failed` — IP reachable but CASE (operational secure session) could not
   be established, e.g. an intermittent `CHIP Error 0x54 (Invalid CASE parameter)`
   during the Sigma exchange (exit 6). Distinct from `unreachable` (no IP route)
   and `device_rejected` (the device answered and refused); typically retryable.
-- `child_failed` — `chip-tool` exited with failure (unclassified, exit 1)
 - `commission_failed` — commissioning failed (unclassified, exit 1)
-- `parse_error` — could not parse `chip-tool` output (exit 1); on the native
-  path (Phase 5 M8a) this kind is also returned when a generic `write` /
-  `invoke` names a known attribute or command field whose type is
-  `list` / `struct` / `float` — those are not supported by the scalar-only
-  JSON→TLV encoder, and the request is rejected up front rather than
-  forwarded to chip-tool.
-- `other` — anything else (exit 1); on the native path (Phase 5 M8c-2) this
-  is also what a `group provision` KVS write returns once the write is
-  attempted and fails — including a duplicate bind (`detail` says
-  `use --rebind`) or the KVS being locked by a concurrent writer
-  (`flock` `WouldBlock`) — these are hard errors and are never retried via
-  chip-tool (unlike an unresolvable KVS, which falls back instead of erroring)
+- `parse_error` — this kind is returned when a generic `write` / `invoke` names
+  a known attribute or command field whose type is `list` / `struct` / `float`
+  (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
+  names a cluster / attribute / command the generated table does not know (pass
+  the numeric id instead).
+- `other` — anything else (exit 1); also what a `group provision` KVS write
+  returns once the write is attempted and fails — including a duplicate bind
+  (`detail` says `use --rebind`) or the KVS being locked by a concurrent writer
+  (`flock` `WouldBlock`). These are hard errors (the KVS may already be touched),
+  distinct from an unresolvable KVS, which surfaces as `store_missing` /
+  `store_parse`. Ambiguous interface autodetect is also `other`.
+- `child_not_found` (exit 12) / `child_failed` (exit 1) — **not emitted as
+  top-level errors since 0.22.0** (they classified chip-tool spawn/exit failures,
+  now removed). The variants and exit-code mapping are kept only for wire
+  compatibility with responses from older `mat` / `matd`. (`mat` still
+  constructs `child_not_found` internally to record a missing `ping6` as a
+  `tool_missing` entry inside `diag node --deep`'s `unavailable` array — this
+  never becomes exit 12.)
 
-## Backend (chip-tool)
+## Backend
 
+`mat`'s backend is a **native, from-scratch Rust Matter controller** (crate
+`mat-controller`, driven through the shared `mat-native` engine) — TLV, CASE,
+IM, groupcast, mDNS, and commissioning (on-network + BLE+Thread) are all
+in-process. There is no `chip-tool` (or any external controller) subprocess.
 
-For local runs, put `chip-tool` on your `PATH`. Override the full path with
-`MAT_CHIP_TOOL_BIN`. Building `chip-tool` is heavy, so a Docker image with it
-baked in is provided for x86_64 Linux hosts (see [Dockerfile](./Dockerfile)).
+- **Route selection is per-op:** matd auto-discovery (if a `matd` answers the
+  probed socket) → `mat`'s own native direct path. See
+  [Routing through `matd`](#routing-through-matd) and
+  [Native backend internals](#native-backend-internals) for interface
+  autodetect (`MAT_IFACE` / `MAT_MATD_IFACE` override), fabric index, warm vs
+  one-shot sessions, the shared groupcast counter, epoch adoption, and the
+  scalar-only generic write/invoke rule.
+- **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK); see
+  [that section](#first-fabric-bootstrap-fabric-init).
+
+Environment variables:
+
+| variable | purpose |
+|---|---|
+| `MAT_STORE` | credential store path (see resolution order above) |
+| `MAT_IFACE` | override interface autodetect for `mat`'s direct path |
+| `MAT_MATD_IFACE` | override interface autodetect for `matd` |
+| `MAT_FABRIC_INDEX` / `MAT_ISSUER_INDEX` | `mat` KVS fabric-table / CA-issuer index (default `1` / `0`) |
+| `MAT_MATD_FABRIC_INDEX` / `MAT_MATD_ISSUER_INDEX` | same for `matd` |
+| `MAT_MATD` / `MAT_MATD_SOCKET` | force / opt out of the matd path; pin its socket |
+| `MAT_PAA_TRUST_STORE` | directory of PAA root certs for attestation |
+| `MAT_CD_SIGNER_STORE` | CD signer trust store (warn-only if absent) |
+| `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission |
+| `MAT_PING6_BIN` | override the `ping6` binary used by `diag node --deep` |
+| `MAT_LOG` | `tracing` filter for stderr logs (e.g. `info`) |
 
 > Matter uses mDNS / IPv6 multicast, so running in Docker **requires host
 > networking** (`docker run --network host`). A bridge network cannot receive
@@ -1021,21 +893,22 @@ Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 ```bash
 task build            # release build -> target/release/{mat,matd}
 task install          # install both binaries into ~/.cargo/bin
-task run -- discover  # run (needs chip-tool on PATH)
-task test             # tests (incl. fake-chip-tool integration tests; no real chip-tool)
+task run -- discover  # run (native backend)
+task test             # tests (native FakeConn + binary integration; no real devices)
 task clippy           # lint (-D warnings)
 task fmt              # format
 task check            # CI equivalent (fmt:check + clippy + test)
 
-task docker:build     # image for x86_64 Linux (chip-tool baked in)
+task dist:arm64       # aarch64-gnu + BLE deploy build -> dist/arm64/{mat,matd}
+task docker:build     # slim x86_64 image (mat/matd only)
 task docker:run -- discover
 task docker:test      # no local toolchain needed
 ```
 
 CI (GitHub Actions, `.github/workflows/ci.yml`) runs the same fmt / clippy /
-test sequence as `task check` and does not need a real `chip-tool`. The tests
-use `crates/mat/tests/fixtures/fake-chip-tool.sh` (a stub that prints fixed
-text) via `MAT_CHIP_TOOL_BIN`, and `matd`'s tests use a fake websocket backend.
+test sequence as `task check`. The default build and CI do not use the `ble`
+cargo feature; deploy builds (`task dist:arm64`) enable it for BLE+Thread
+commissioning.
 
 ## Manual E2E (with real devices; not in CI)
 
@@ -1114,10 +987,11 @@ mat group invoke --group 1 --cluster onoff --command off
 > Groupcast is **unacknowledged**, so `group invoke` only confirms the send, not
 > delivery. If a light did not react, confirm it individually (`mat read --node 6 -c
 > onoff --attribute on-off`) and re-provision that node. Multicast is **especially weak on
-> Thread**; Wi-Fi / Ethernet lights are more reliable. The exact `key-set-write`
-> JSON, the `groupsettings add-keysets` policy value, and the group node-id form
-> are chip-tool-version dependent — if a chip-tool upgrade breaks provisioning,
-> this is the first place to check.
+> Thread**; Wi-Fi / Ethernet lights are more reliable. The KVS records `mat`
+> writes (keyset table, group table, GroupKeyMap) follow the connectedhomeip
+> v1.4.2.0 `GroupDataProviderImpl` link discipline, so a real `chip-tool` on the
+> same store can still read them — if a devices-side provisioning step regresses,
+> the group-settings writer is the first place to check.
 >
 > If **no** device reacts although provision reported success, suspect the
 > device ACL first: provisions made before the ACL step (or through an old
@@ -1128,7 +1002,7 @@ mat group invoke --group 1 --cluster onoff --command off
 ## Contributing
 
 Issues and pull requests are welcome. Before sending a PR, run `task check`
-(format check + clippy with `-D warnings` + tests); it needs no real `chip-tool`.
+(format check + clippy with `-D warnings` + tests); it needs no real devices.
 Please keep stdout pure JSON and follow the design rules in
 [ARCHITECTURE.md](./ARCHITECTURE.md).
 

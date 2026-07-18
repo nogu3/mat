@@ -319,8 +319,9 @@ pub enum DiagCommand {
     },
 
     /// commissioned ノードが「なぜ制御できないか」を層別チェックして verdict で返す。
-    /// 既定は chip-tool 完結。`--deep` で ping6 / mDNS ブラウズも実施し、
-    /// link_starved（弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
+    /// IM 部分（operational / thread）は native 完結（`MAT_IFACE` は自動検出、
+    /// 直経路のみ）。`--deep` で ping6 / mDNS ブラウズも実施し、link_starved
+    /// （弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
     Node {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]

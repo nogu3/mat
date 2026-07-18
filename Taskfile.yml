@@ -23,12 +23,12 @@ tasks:
       - cargo install --path crates/matd --force
 
   run:
-    desc: "実行（chip-tool が PATH 上に必要）。例: task run -- discover"
+    desc: "実行（native バックエンド。例: task run -- discover）"
     cmds:
       - cargo run -- {{.CLI_ARGS}}
 
   test:
-    desc: テスト（ダミー chip-tool 統合テスト含む。実 chip-tool 不要）
+    desc: テスト（native FakeConn + バイナリ統合テスト。実デバイス不要）
     cmds:
       - cargo test
 
@@ -54,113 +54,13 @@ tasks:
       - task: clippy
       - task: test
 
-  chip:extract:
-    desc: chip-tool を Docker でビルドし ./chip-tool に取り出す（Docker 経由せず直接実行用）
+  dist:arm64:
+    desc: "aarch64 gnu + BLE の deploy 成果物を ./dist/arm64/ に作る（jarvis 用標準ビルド）"
     cmds:
-      - docker build --target chip-builder -t mat-chip-builder .
-      - |
-        id=$(docker create mat-chip-builder)
-        docker cp "$id:/work/connectedhomeip/out/chip-tool" ./chip-tool
-        docker rm "$id"
-      - 'echo "取り出し完了: $PWD/chip-tool"'
-      - 'echo "ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3"'
-      - 'echo "実行: export MAT_CHIP_TOOL_BIN=$PWD/chip-tool"'
-
-  chip:extract:arm64:
-    desc: arm64(aarch64) 版 chip-tool + mat + matd をクロスビルドし ./dist/arm64/ に取り出す（Pi3 等実機へ scp 用）
-    cmds:
-      - docker build --target chip-builder-arm64 -t mat-chip-builder-arm64 .
-      - docker build --target mat-builder-arm64 -t mat-mat-builder-arm64 .
+      - cross build --release --target aarch64-unknown-linux-gnu --features ble
       - mkdir -p dist/arm64
-      - |
-        id=$(docker create mat-chip-builder-arm64)
-        docker cp "$id:/work/connectedhomeip/out/linux-arm64-chip-tool-clang/chip-tool" ./dist/arm64/chip-tool
-        docker rm "$id"
-      - |
-        id=$(docker create mat-mat-builder-arm64)
-        docker cp "$id:/src/target/aarch64-unknown-linux-gnu/release/mat" ./dist/arm64/mat
-        docker cp "$id:/src/target/aarch64-unknown-linux-gnu/release/matd" ./dist/arm64/matd
-        docker rm "$id"
-      - 'echo "取り出し完了: $PWD/dist/arm64/{chip-tool,mat,matd}"'
-      - 'echo "実機へ転送: scp dist/arm64/chip-tool dist/arm64/mat dist/arm64/matd <host>:~/"'
-      - 'echo "実機ランタイム依存: sudo apt-get install -y libssl3 libdbus-1-3 libglib2.0-0 libavahi-client3 avahi-daemon"'
-      - 'echo "実機実行: export MAT_CHIP_TOOL_BIN=~/chip-tool && ~/mat discover"'
-
-  chip:extract:app:
-    desc: chip-all-clusters-app（Phase 5 開発用の相手役デバイス）を Docker でビルドし ./chip-all-clusters-app に取り出す
-    cmds:
-      - docker build --target all-clusters-builder -t mat-all-clusters-builder .
-      - |
-        id=$(docker create mat-all-clusters-builder)
-        docker cp "$id:/work/connectedhomeip/out/all-clusters/chip-all-clusters-app" ./chip-all-clusters-app
-        docker rm "$id"
-      - 'echo "取り出し完了: $PWD/chip-all-clusters-app"'
-      - 'echo "起動: ./chip-all-clusters-app  （udp/5540 で待ち受け。KVS は /tmp/chip_kvs）"'
-
-  e2e:m1:
-    desc: M1 ライブ E2E（先に ./chip-all-clusters-app を起動しておく）
-    cmds:
-      - cargo test -p mat-controller --test live_all_clusters -- --ignored --nocapture
-
-  e2e:m2:
-    desc: M2b ライブ E2E（自己発行 NOC で CASE + onoff toggle/read。要 ./chip-tool と ./chip-all-clusters-app）
-    cmds:
-      - bash scripts/e2e-m2.sh
-
-  e2e:m3:
-    desc: M3 ライブ E2E（jarvis 相乗り。要 MAT_E2E_HOST / MAT_E2E_NODE_ID。実機で onoff+色変更）
-    cmds:
-      - bash scripts/e2e-m3.sh
-
-  e2e:m4:
-    desc: "M4 実機 E2E（native 有効 matd を jarvis で起動し socket 往復。要 MAT_E2E_HOST/NODE_ID/IFACE）"
-    cmds:
-      - bash scripts/e2e-m4.sh
-
-  e2e:m5:
-    desc: "M5 実機 E2E（native groupcast。要 MAT_E2E_HOST/IFACE/GROUP_NODES）"
-    cmds:
-      - bash scripts/e2e-m5.sh
-
-  e2e:m6:
-    desc: "M6a live E2E: native commissioning (all-clusters-app)"
-    cmds:
-      - bash scripts/e2e-m6.sh
-
-  e2e:m6:real:
-    desc: "M6a 実機 E2E（本番 fabric へ相乗り open-window→使い捨て第二fabricへnative commission→RemoveFabric撤収。要 MAT_E2E_HOST/NODE_ID）"
-    cmds:
-      - bash scripts/e2e-m6-real.sh
-
-  e2e:m6b:real:
-    desc: "M6b 実機 E2E（jarvis 上で実行。工場リセット済みデバイスを BLE+Thread で native commission→open-window→本番復帰→RemoveFabric。要 MAT_E2E_BLE_* / THREAD_DATASET / IFACE / PAA_DIR）"
-    cmds:
-      - bash scripts/e2e-m6b-real.sh
-
-  e2e:m7:
-    desc: "M7 受け入れ: one-shot 直経路 native + counter 共有 (要 MAT_E2E_HOST/IFACE/NODE_ID/GROUP_NODES)"
-    cmds:
-      - bash scripts/e2e-m7.sh
-
-  e2e:m8a:real:
-    desc: "M8a 実機 E2E: 汎用IM native直経路+matd+フォールバック健全性+型拒否 (要 MAT_E2E_HOST/IFACE/NODE/GROUP_NODES)"
-    cmds:
-      - bash scripts/e2e-m8a-real.sh
-
-  e2e:m8b:real:
-    desc: "M8b 実機 E2E: discover/probe+diag--deep native化+構造一致+フォールバック健全性 (要 MAT_E2E_HOST/NODES)"
-    cmds:
-      - bash scripts/e2e-m8b-real.sh
-
-  e2e:m8c1:real:
-    desc: "M8c-1 実機 E2E: native commission (要 jarvis + MAT_E2E_HOST)"
-    cmds:
-      - bash scripts/e2e-m8c1-real.sh
-
-  e2e:m8c2:real:
-    desc: "M8c-2 実機 E2E: native groupsettings KVS書込 + diag node (要 jarvis + MAT_E2E_HOST)"
-    cmds:
-      - bash scripts/e2e-m8c2-real.sh
+      - cp target/aarch64-unknown-linux-gnu/release/mat target/aarch64-unknown-linux-gnu/release/matd dist/arm64/
+      - 'echo "実機ランタイム依存: libdbus-1-3（BLE 用）。scp dist/arm64/{mat,matd} <host>:~/"'
 
   e2e:m8c3:real:
     desc: "M8c-3 実機 E2E（jarvis）。STAGE=1 既定 / STAGE=2 は撤去後の最終受け入れ"
@@ -168,9 +68,9 @@ tasks:
       - bash scripts/e2e-m8c3-real.sh
 
   docker:build:
-    desc: x86_64 Linux 向けイメージビルド（chip-tool 同梱）
+    desc: x86_64 Linux 向けイメージビルド（native、mat/matd のみ）
     cmds:
-      - docker build -t {{.IMAGE}} .
+      - docker build --target runtime -t {{.IMAGE}} .
 
   docker:run:
     desc: "Docker 実行（host networking 必須）。例: task docker:run -- discover"
