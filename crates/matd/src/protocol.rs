@@ -17,7 +17,7 @@ pub struct Request {
     pub op: Op,
 }
 
-/// 操作種別。chip-tool のサブコマンド体系に 1:1 で対応する。
+/// 操作種別。Matter クラスタコマンド体系に 1:1 で対応する。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -80,14 +80,8 @@ pub enum Op {
         transition: u16,
     },
     /// ノードのエンドポイント / クラスタを introspect する（Descriptor クラスタ）。
-    /// 1 リクエストで複数の chip-tool 読み出しに展開されるため [`to_cmdline`] は持たない。
-    ///
-    /// [`to_cmdline`]: Op::to_cmdline
     Describe { node_id: u64 },
     /// group（groupcast）を各ノードへ provision する。`mat group provision` 相当。
-    /// 複数ステップに展開されるため [`to_cmdline`] は持たない。
-    ///
-    /// [`to_cmdline`]: Op::to_cmdline
     GroupProvision {
         group_id: u16,
         node_ids: Vec<u64>,
@@ -138,10 +132,10 @@ pub enum Op {
         transition: u16,
         endpoint: u16,
     },
-    /// デーモン死活確認（chip-tool には触れない）。
+    /// デーモン死活確認（native backend には触れない）。
     Ping,
-    /// デーモンを停止する admin op（chip-tool には触れない）。`matd stop` が送る。
-    /// Ping と同じく node も cmdline も持たない。
+    /// デーモンを停止する admin op（native backend には触れない）。`matd stop` が送る。
+    /// Ping と同じく単一 node は持たない。
     Shutdown,
 }
 
@@ -168,73 +162,6 @@ impl Op {
             | Op::Shutdown => None,
         }
     }
-
-    /// chip-tool interactive server に送るコマンド行（バイナリ名を除いた argv）。
-    ///
-    /// one-shot の `chip-tool <cluster> <cmd> ... <node> <ep>` と同じ語順。chip-tool
-    /// は宛先 node_id / endpoint を**末尾**に取るので、コマンド引数はその前に置く。
-    pub fn to_cmdline(&self) -> Option<String> {
-        let line = match self {
-            Op::Read {
-                node_id,
-                endpoint,
-                cluster,
-                attribute,
-            } => format!("{cluster} read {attribute} {node_id} {endpoint}"),
-            Op::Write {
-                node_id,
-                endpoint,
-                cluster,
-                attribute,
-                value,
-            } => format!("{cluster} write {attribute} {value} {node_id} {endpoint}"),
-            Op::Invoke {
-                node_id,
-                endpoint,
-                cluster,
-                command,
-                args,
-            } => {
-                let mut parts = vec![cluster.clone(), command.clone()];
-                parts.extend(args.iter().cloned());
-                parts.push(node_id.to_string());
-                parts.push(endpoint.to_string());
-                parts.join(" ")
-            }
-            Op::On { node_id, endpoint } => format!("onoff on {node_id} {endpoint}"),
-            Op::Off { node_id, endpoint } => format!("onoff off {node_id} {endpoint}"),
-            // 引数は <mireds> <transition> <optionsMask> <optionsOverride>、宛先は末尾。
-            Op::ColorTemp {
-                node_id,
-                endpoint,
-                mireds,
-                transition,
-                ..
-            } => format!(
-                "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {node_id} {endpoint}"
-            ),
-            // 引数は <hue> <saturation> <transition> <optionsMask> <optionsOverride>、宛先は末尾。
-            Op::Color {
-                node_id,
-                endpoint,
-                hue_raw,
-                saturation_raw,
-                transition,
-                ..
-            } => format!(
-                "colorcontrol move-to-hue-and-saturation {hue_raw} {saturation_raw} {transition} 0 0 {node_id} {endpoint}"
-            ),
-            // 複合 op（複数コマンドに展開）と Ping は単一の cmdline を持たない。
-            Op::Describe { .. }
-            | Op::GroupProvision { .. }
-            | Op::GroupInvoke { .. }
-            | Op::GroupColorTemp { .. }
-            | Op::GroupColor { .. }
-            | Op::Ping
-            | Op::Shutdown => return None,
-        };
-        Some(line)
-    }
 }
 
 #[cfg(test)]
@@ -246,79 +173,88 @@ mod tests {
     }
 
     #[test]
-    fn read_request_parses_and_builds_cmdline() {
+    fn read_request_parses() {
         let r = parse(
             r#"{"id":7,"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}"#,
         );
         assert_eq!(r.id, Some(serde_json::json!(7)));
         assert_eq!(r.op.node_id(), Some(1));
-        assert_eq!(r.op.to_cmdline().unwrap(), "onoff read on-off 1 1");
+        assert!(matches!(
+            r.op,
+            Op::Read {
+                node_id: 1,
+                endpoint: 1,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn invoke_places_args_before_destination() {
+    fn invoke_parses_args_in_order() {
         let r = parse(
             r#"{"op":"invoke","node_id":2,"endpoint":1,"cluster":"levelcontrol","command":"move-to-level","args":["128","0","0","0"]}"#,
         );
-        // 引数は node_id/endpoint の前。誤って宛先扱いされると timeout する。
-        assert_eq!(
-            r.op.to_cmdline().unwrap(),
-            "levelcontrol move-to-level 128 0 0 0 2 1"
-        );
+        assert_eq!(r.op.node_id(), Some(2));
+        assert!(matches!(
+            r.op,
+            Op::Invoke { ref args, .. } if args == &["128", "0", "0", "0"]
+        ));
     }
 
     #[test]
-    fn write_request_builds_cmdline() {
+    fn write_request_parses() {
         let r = parse(
             r#"{"op":"write","node_id":4,"endpoint":1,"cluster":"levelcontrol","attribute":"on-level","value":"128"}"#,
         );
         assert_eq!(r.op.node_id(), Some(4));
-        assert_eq!(
-            r.op.to_cmdline().unwrap(),
-            "levelcontrol write on-level 128 4 1"
-        );
+        assert!(matches!(
+            r.op,
+            Op::Write { ref value, .. } if value == "128"
+        ));
     }
 
     #[test]
     fn on_off_shortcuts() {
         let on = parse(r#"{"op":"on","node_id":3,"endpoint":1}"#);
-        assert_eq!(on.op.to_cmdline().unwrap(), "onoff on 3 1");
+        assert_eq!(on.op.node_id(), Some(3));
+        assert!(matches!(on.op, Op::On { .. }));
         let off = parse(r#"{"op":"off","node_id":3,"endpoint":1}"#);
-        assert_eq!(off.op.to_cmdline().unwrap(), "onoff off 3 1");
+        assert!(matches!(off.op, Op::Off { .. }));
     }
 
     #[test]
-    fn color_temp_shortcut_builds_move_to_color_temperature_cmdline() {
-        // mireds は mat 側で換算済み。kelvin は応答エコー用で cmdline には乗らない。
+    fn color_temp_shortcut_parses() {
+        // mireds は mat 側で換算済み。kelvin は応答エコー用。
         let r = parse(
             r#"{"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2700,"transition":30}"#,
         );
         assert_eq!(r.op.node_id(), Some(6));
-        assert_eq!(
-            r.op.to_cmdline().unwrap(),
-            "colorcontrol move-to-color-temperature 370 30 0 0 6 1"
-        );
+        assert!(matches!(r.op, Op::ColorTemp { mireds: 370, .. }));
     }
 
     #[test]
-    fn color_shortcut_builds_move_to_hue_and_saturation_cmdline() {
+    fn color_shortcut_parses() {
         // hue_raw / saturation_raw は mat 側で換算済みの 0–254 値。hue / saturation
-        // （度・%）は応答エコー用で cmdline には乗らない。
+        // （度・%）は応答エコー用。
         let r = parse(
             r#"{"op":"color","node_id":6,"endpoint":1,"hue_raw":233,"saturation_raw":203,"hue":330,"saturation":80,"transition":30}"#,
         );
         assert_eq!(r.op.node_id(), Some(6));
-        assert_eq!(
-            r.op.to_cmdline().unwrap(),
-            "colorcontrol move-to-hue-and-saturation 233 203 30 0 0 6 1"
-        );
+        assert!(matches!(
+            r.op,
+            Op::Color {
+                hue_raw: 233,
+                saturation_raw: 203,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn ping_has_no_node_or_cmdline() {
+    fn ping_has_no_node() {
         let r = parse(r#"{"op":"ping"}"#);
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
+        assert!(matches!(r.op, Op::Ping));
     }
 
     #[test]
@@ -326,25 +262,22 @@ mod tests {
         let r = parse(
             r#"{"op":"invoke","node_id":1,"endpoint":1,"cluster":"identify","command":"identify"}"#,
         );
-        assert_eq!(r.op.to_cmdline().unwrap(), "identify identify 1 1");
+        assert!(matches!(r.op, Op::Invoke { ref args, .. } if args.is_empty()));
     }
 
     #[test]
-    fn describe_targets_node_but_has_no_cmdline() {
-        // describe は複数コマンドに展開されるため単一 cmdline を持たない。
+    fn describe_targets_node() {
         let r = parse(r#"{"op":"describe","node_id":5}"#);
         assert_eq!(r.op.node_id(), Some(5));
-        assert!(r.op.to_cmdline().is_none());
     }
 
     #[test]
-    fn group_provision_parses_and_has_no_single_node_or_cmdline() {
+    fn group_provision_parses_and_has_no_single_node() {
         let r = parse(
             r#"{"op":"group_provision","group_id":1,"node_ids":[1,2],"keyset_id":42,"name":"living","endpoint":1}"#,
         );
         // 複数ノードを個別に扱うため単一 node_id は持たない。
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
         // epoch_key は省略可。
         assert!(matches!(
             r.op,
@@ -375,27 +308,24 @@ mod tests {
             r#"{"op":"group_invoke","group_id":3,"cluster":"onoff","command":"on","endpoint":1}"#,
         );
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
         assert!(matches!(r.op, Op::GroupInvoke { ref args, .. } if args.is_empty()));
     }
 
     #[test]
-    fn shutdown_has_no_node_or_cmdline() {
-        // admin op。chip-tool には触れないので node_id も cmdline も持たない。
+    fn shutdown_has_no_node() {
+        // admin op。native backend には触れないので単一 node を持たない。
         let r = parse(r#"{"op":"shutdown"}"#);
         assert!(matches!(r.op, Op::Shutdown));
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
     }
 
     #[test]
-    fn group_color_temp_parses_with_no_node_or_cmdline() {
+    fn group_color_temp_parses_with_no_node() {
         let r = parse(
             r#"{"op":"group_color_temp","group_id":1,"mireds":370,"kelvin":2700,"transition":0,"endpoint":1}"#,
         );
         // multicast 宛で単一 node を持たず、group_invoke と同じく専用ハンドラで捌く。
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
     }
 
     #[test]
@@ -404,7 +334,6 @@ mod tests {
             r##"{"op":"group_color","group_id":1,"hue_raw":169,"saturation_raw":254,"hue":240,"saturation":100,"name":"blue","rgb":"#0000ff","endpoint":1}"##,
         );
         assert_eq!(r.op.node_id(), None);
-        assert!(r.op.to_cmdline().is_none());
         assert!(matches!(r.op, Op::GroupColor { name: Some(_), .. }));
         // name / rgb は省略可（--hue/--sat 生指定のとき）。
         let r = parse(
@@ -422,13 +351,17 @@ mod tests {
 
     #[test]
     fn color_accepts_optional_name_and_rgb_echo() {
-        // 単体 color も name / rgb エコーを受ける（cmdline には乗らない）。
+        // 単体 color も name / rgb エコーを受ける。
         let r = parse(
             r##"{"op":"color","node_id":6,"endpoint":1,"hue_raw":0,"saturation_raw":254,"hue":0,"saturation":100,"name":"red","rgb":"#ff0000"}"##,
         );
-        assert_eq!(
-            r.op.to_cmdline().unwrap(),
-            "colorcontrol move-to-hue-and-saturation 0 254 0 0 0 6 1"
-        );
+        assert!(matches!(
+            r.op,
+            Op::Color {
+                name: Some(ref n),
+                rgb: Some(ref rgb),
+                ..
+            } if n == "red" && rgb == "#ff0000"
+        ));
     }
 }

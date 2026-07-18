@@ -21,8 +21,10 @@ pub enum ErrorKind {
     /// マッピングと wire 互換のため variant は残置 — README で撤去を告知）。
     ChildNotFound,
     /// `chip-tool` が失敗終了（分類不能）。
-    /// 0.22.0 以降 `mat` からは emit されない（chip-tool 撤去。matd が Task 10 まで
-    /// 使用するため wire 互換で残置）。
+    /// 0.22.0 以降どちらのバイナリからも emit されない — `mat`（M8c-3 Task9）に続き
+    /// `matd`（M8c-3 Task10）も chip-tool 経路を完全撤去し、これが最後の emitter
+    /// だった。exit code 1 のマッピングと wire 互換のため variant 自体は残置する
+    /// （旧 `mat`/`matd` が返した過去の応答を deserialize できるように）。
     ChildFailed,
     /// commissioning に失敗。
     CommissionFailed,

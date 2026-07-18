@@ -1,9 +1,14 @@
 //! 上流ソケットサーバ。unix socket で newline-delimited JSON リクエストを受け、
-//! warm な chip-tool セッション（[`ChipToolBackend`]）に中継して応答を返す。
+//! native バックエンド（[`NativeBackend`]）へ中継して応答を返す。
 //!
 //! 応答は `mat` の one-shot CLI と同じく純粋な構造化 JSON（mat スキーマ + `timestamp`）。
 //! 人間装飾は混ぜない。node_id の解決可否は毎リクエスト KVS で確認する（常駐中に
 //! `mat commission` が台帳を更新しても拾えるよう、開きっぱなしにしない）。
+//!
+//! M8c-3: native がリクエスト処理の唯一の経路になった（chip-tool 経路を完全撤去）。
+//! 起動時の native 構築失敗（KVS 資材が読めない等）は matd を落とさず、以後の全
+//! リクエストへその構築エラーをそのまま返す（[`NativeState::Unavailable`]）——
+//! `mat fabric init` で資材を用意すれば `matd` を再起動して解消できる。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,26 +19,41 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use mat_controller::im;
-use mat_core::acl::{acl_entries_from_ws_value, merge_group_entry, to_chip_write_json};
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::group::{group_node_id, resolve_epoch_key, EPOCH_START_TIME, KEY_SECURITY_POLICY};
-use mat_core::normalize::classify_failure;
+use mat_core::group::resolve_epoch_key;
 use mat_core::output::now_iso8601;
 use mat_core::parse::normalize_value;
 use mat_core::store::Store;
 
-use crate::backend::ChipToolBackend;
 use crate::native::NativeBackend;
 use crate::protocol::{Op, Request};
+
+/// native backend の構築結果。起動時に一度だけ試み、失敗しても matd 自体は
+/// 常駐を続ける（M8c-3: KVS 不在でも起動し、後から `mat fabric init` できる
+/// ようにする）。各リクエストはこの結果を参照する — `Unavailable` は保持した
+/// 構築エラーをそのまま返す（store_missing/store_parse; mat 直経路の
+/// `native_direct::map_engine_build_error` と同じ一律化）。
+pub enum NativeState {
+    // Box: NativeBackend は MatError よりかなり大きく、素の enum は
+    // clippy::large_enum_variant に触れる。プロセス起動時に 1 回だけ作る値
+    // なので間接参照のコストは無視できる。
+    Ready(Box<NativeBackend>),
+    Unavailable(MatError),
+}
+
+impl NativeState {
+    fn is_ready(&self) -> bool {
+        matches!(self, NativeState::Ready(_))
+    }
+}
 
 /// ソケットを bind し、接続を受け付け続ける。`Ctrl-C` で抜ける。
 pub async fn serve(
     socket_path: &Path,
     store_path: PathBuf,
-    backend: Arc<ChipToolBackend>,
-    native: Option<Arc<NativeBackend>>,
+    native: NativeState,
 ) -> std::io::Result<()> {
-    tracing::info!(native = native.is_some(), "matd backends");
+    tracing::info!(native_ready = native.is_ready(), "matd backend");
     // 前回の残骸を掃除してから bind。
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
@@ -41,47 +61,20 @@ pub async fn serve(
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!(socket = %socket_path.display(), "matd listening");
 
-    // ControlPersist 風に、アイドルセッションを定期的に畳む reaper。チェック周期は
-    // アイドル基準の 1/4（最短 1 秒）。
-    let reaper = {
-        let backend = Arc::clone(&backend);
-        let tick = (backend.idle() / 4).max(std::time::Duration::from_secs(1));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tick).await;
-                backend.reap_if_idle().await;
-            }
-        })
-    };
-
-    // アイドル中も ws を生かす keepalive。chip-tool interactive server は 180 秒
-    // 無トラフィックで ws PING を送り、20 秒で PONG が無いと切断する（issue #7）。
-    // matd はコマンド実行中しか ws を poll しないため、アイドル中はこちらから定期的に
-    // 生存トラフィックを作る。reap とは独立（last_used は更新しない）。
-    let keepalive = {
-        let backend = Arc::clone(&backend);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(crate::backend::KEEPALIVE_INTERVAL).await;
-                backend.keepalive_tick().await;
-            }
-        })
-    };
-
     // shutdown op（`matd stop`）で serve ループを抜けるための通知。
     let shutdown = Arc::new(Notify::new());
 
+    let native = Arc::new(native);
     let store_path = Arc::new(store_path);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
-                let backend = Arc::clone(&backend);
-                let native = native.clone();
+                let native = Arc::clone(&native);
                 let store_path = Arc::clone(&store_path);
                 let shutdown = Arc::clone(&shutdown);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, backend, native, store_path, shutdown).await {
+                    if let Err(e) = handle_conn(stream, native, store_path, shutdown).await {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
                 });
@@ -97,10 +90,8 @@ pub async fn serve(
         }
     }
 
-    // graceful shutdown: reaper/keepalive を止め、chip-tool セッションを畳み、socket を消す。
-    reaper.abort();
-    keepalive.abort();
-    backend.shutdown().await;
+    // graceful shutdown: socket を消して抜ける（native セッションは warm 保持のみ
+    // で子プロセスを持たないため、明示的な teardown は不要）。
     let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
@@ -108,8 +99,7 @@ pub async fn serve(
 /// 1 接続。複数行のリクエストを順に処理し、各行に 1 行 JSON で応答する。
 async fn handle_conn(
     stream: UnixStream,
-    backend: Arc<ChipToolBackend>,
-    native: Option<Arc<NativeBackend>>,
+    native: Arc<NativeState>,
     store_path: Arc<PathBuf>,
     shutdown: Arc<Notify>,
 ) -> std::io::Result<()> {
@@ -120,8 +110,7 @@ async fn handle_conn(
         if line.trim().is_empty() {
             continue;
         }
-        let (response, is_shutdown) =
-            dispatch(&line, &backend, native.as_deref(), &store_path).await;
+        let (response, is_shutdown) = dispatch(&line, &native, &store_path).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
@@ -136,12 +125,7 @@ async fn handle_conn(
 }
 
 /// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
-async fn dispatch(
-    line: &str,
-    backend: &ChipToolBackend,
-    native: Option<&NativeBackend>,
-    store_path: &Path,
-) -> (Value, bool) {
+async fn dispatch(line: &str, native: &NativeState, store_path: &Path) -> (Value, bool) {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -157,7 +141,7 @@ async fn dispatch(
     let id = req.id.clone();
     let is_shutdown = matches!(req.op, Op::Shutdown);
 
-    let body = match run_op(&req.op, backend, native, store_path).await {
+    let body = match run_op(&req.op, native, store_path).await {
         Ok(mut body) => {
             // id をエコーし、timestamp を必ず付ける（mat スキーマ規約）。
             if let Value::Object(map) = &mut body {
@@ -175,98 +159,71 @@ async fn dispatch(
 }
 
 /// 操作を実行し、mat スキーマの成功ボディ（timestamp 抜き）を返す。応答は `mat` の
-/// one-shot CLI と同じ純粋スキーマで、chip-tool ws の生結果（`results`/`logs`）は
-/// 添付しない（logs は backend で除去済み、CLAUDE.md ルール 2「素通し禁止」）。
-async fn run_op(
-    op: &Op,
-    backend: &ChipToolBackend,
-    native: Option<&NativeBackend>,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    // native が有効かつホットパスなら native 経路（M4）。無効時は従来どおり全 op が
-    // chip-tool へ通る。
-    if let Some(native) = native {
-        if is_native_hotpath(op) {
-            return native_op(op, native, store_path).await;
-        }
-        match native_group_params(op) {
-            Some(Ok((group_id, cluster, command, fields))) => {
-                // chip-tool 経路と同じ前提チェック（store が開けること）。
-                // 注意: Unavailable でフォールバックした先の chip-tool 系関数
-                // （group_invoke 等）も同じ store を開き直す。意図的な二重
-                // open —両経路で同じ前提条件チェックにするためで、最適化して
-                // 片方を取り除かないこと。
+/// one-shot CLI と同じ純粋スキーマ。
+///
+/// M8c-3: native が唯一の経路。`NativeState::Unavailable`（起動時の構築失敗）は
+/// 全 op（Ping/Shutdown を除く）へそのエラーをそのまま返す。native 構築済みでも
+/// 名前解決できない cluster/attribute/command（chip-tool 互換の任意名を受けられた
+/// 旧経路の名残）は [`unresolved_op_error`] で即 parse_error にする — フォールバック
+/// 先が無いため（数値 ID は resolve 済みなので影響しない）。
+async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Value, MatError> {
+    // Ping / Shutdown は native に触れず即応。
+    match op {
+        Op::Ping => return Ok(json!({ "pong": true })),
+        Op::Shutdown => return Ok(json!({ "stopping": true })),
+        _ => {}
+    }
+
+    let native = match native {
+        NativeState::Ready(n) => n,
+        NativeState::Unavailable(e) => return Err(e.clone()),
+    };
+
+    if is_native_hotpath(op) {
+        return native_op(op, native, store_path).await;
+    }
+
+    if let Some(result) = native_group_params(op) {
+        return match result {
+            Ok((group_id, cluster, command, fields)) => {
+                // chip-tool 撤去前と同じ前提チェック（store が開けること）。
                 let _store = Store::open(store_path)?;
                 match native
                     .group_invoke(group_id, cluster, command, fields)
                     .await?
                 {
-                    crate::native::GroupOutcome::Sent => return Ok(group_sent_body(op)),
+                    crate::native::GroupOutcome::Sent => Ok(group_sent_body(op)),
                     crate::native::GroupOutcome::Unavailable(reason) => {
-                        tracing::warn!(
-                            %reason,
-                            "native group send unavailable; falling back to chip-tool"
-                        );
+                        Err(group_unavailable_error(&reason))
                     }
                 }
             }
-            // 名前は解決できたが引数が符号化不能 → chip-tool へは落とさず
-            // 即座に拒否（mat 側 classify_strict と同じ規則）。
-            Some(Err(e)) => return Err(e),
-            None => {
-                if let Some(group_id) = group_send_op_group_id(op) {
-                    // native は有効だが、この group 送信 op は native 対象外の
-                    // 形（cluster/command 名が解決できない）— chip-tool へ通る。
-                    // この経路は matd の native counter とは別に chip-tool
-                    // 自身の counter を使うため、native が既に counter を
-                    // 進めた後だと chip-tool の counter は同じ送信元 node id
-                    // の native より低くなり得る（counter 窓は送信元 node id
-                    // ごと・全 group 共通）。同じ group を native 経由でも
-                    // 受けているデバイスは、この送信を古い/重複として黙って
-                    // 捨てる可能性がある（レビュー指摘: intra-matd counter
-                    // mixing）。ルーティングは変えない（製品判断として拒否は
-                    // 見送り）— 観測性のためのログのみ。
-                    tracing::warn!(
-                        group_id,
-                        "group send op is outside native-eligible shapes; routing via chip-tool, \
-                         whose counter may now be BELOW native's jumped-ahead counter for this \
-                         source node id (counter window is per-source-node across all groups) — \
-                         devices that also receive native-driven groupcasts for this group may \
-                         silently drop this send (intra-matd counter mixing)"
-                    );
-                }
-            }
-        }
+            // 名前は解決できたが引数が符号化不能 → 即座に拒否（mat 側
+            // classify_strict と同じ規則）。
+            Err(e) => Err(e),
+        };
     }
+
     match op {
-        // Ping は chip-tool に触れず即応。
-        Op::Ping => Ok(json!({ "pong": true })),
-        // Shutdown は chip-tool に触れず即応。serve ループの終了は handle_conn が発火する。
-        Op::Shutdown => Ok(json!({ "stopping": true })),
-        Op::Describe { node_id } => {
-            require_node(store_path, *node_id)?;
-            describe(backend, *node_id).await
-        }
-        Op::GroupProvision { .. } => group_provision(op, backend, native, store_path).await,
-        Op::GroupInvoke { .. } => group_invoke(op, backend, store_path).await,
-        Op::GroupColorTemp { .. } | Op::GroupColor { .. } => {
-            group_color_op(op, backend, store_path).await
-        }
-        // 単一 cmdline に展開できる素の op。
-        _ => simple_op(op, backend, store_path).await,
+        Op::GroupProvision { .. } => group_provision(op, native, store_path).await,
+        // ここに来るのは Read/Write/Invoke/GroupInvoke で cluster/attribute/command
+        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Describe は常に
+        // is_native_hotpath、GroupColorTemp/GroupColor は native_group_params が
+        // 常に Some を返すため到達しない）。
+        _ => Err(unresolved_op_error()),
     }
 }
 
 /// この op を native warm session で処理するか（ホットパス）。それ以外は
-/// chip-tool ws にフォールバックする。
+/// [`unresolved_op_error`] で拒否する。
 ///
 /// Read/Write/Invoke/Describe の判定は mat-core::ids（`classify_write` /
 /// `classify_invoke` / `resolve_cluster` + `resolve_attribute`）に委ねる —
 /// mat 直経路の `native_direct::classify_strict` と同じ判定を共有する
-/// （M8a Task10）。cluster/attribute/command 名が解決できない（chip-tool
-/// 互換維持）場合のみ false、名前は解決できたが値が符号化不能（list 型等）な
-/// 場合は true のまま native_op へ進み、そこで即 parse_error を返す
-/// （フォールバックせず拒否する — spec 決定と同じ）。
+/// （M8a Task10）。cluster/attribute/command 名が解決できない場合のみ false、
+/// 名前は解決できたが値が符号化不能（list 型等）な場合は true のまま
+/// native_op へ進み、そこで即 parse_error を返す（M8c-3: フォールバック先が
+/// 無いため拒否する — spec 決定と同じ）。
 pub(crate) fn is_native_hotpath(op: &Op) -> bool {
     match op {
         Op::On { .. }
@@ -308,10 +265,10 @@ type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>);
 /// mat-core::ids の `classify_invoke` に通す（onoff 限定を撤廃 — M8a
 /// Task10、mat 直経路の `native_direct::classify_strict` の group invoke 腕と
 /// 同じ判定）。戻り値:
-/// - `None` — 非対象（cluster/command 名が解決できない）→ chip-tool へ。
+/// - `None` — 非対象（cluster/command 名が解決できない）→ [`unresolved_op_error`]。
 /// - `Some(Ok(params))` — native 送信対象。
-/// - `Some(Err(e))` — 名前は解決できたが引数が符号化不能 → chip-tool へは
-///   落とさず即座にそのエラーを返す（mat 側と同じ拒否規則）。
+/// - `Some(Err(e))` — 名前は解決できたが引数が符号化不能 → 即座にそのエラーを
+///   返す（mat 側と同じ拒否規則）。
 fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
     match op {
         Op::GroupInvoke {
@@ -372,20 +329,9 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
     }
 }
 
-/// この op が group 送信 op（`GroupInvoke`/`GroupColor`/`GroupColorTemp`）なら
-/// その `group_id` を返す。counter-mixing 警告（`run_op`）が対象 op を絞るのに使う。
-fn group_send_op_group_id(op: &Op) -> Option<u16> {
-    match op {
-        Op::GroupInvoke { group_id, .. }
-        | Op::GroupColor { group_id, .. }
-        | Op::GroupColorTemp { group_id, .. } => Some(*group_id),
-        _ => None,
-    }
-}
-
 /// native ホットパス op を warm session で実行し、成功 body を組む。
 async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result<Value, MatError> {
-    // commission 済みか毎回 KVS で確認する（chip-tool 経路と同じ挙動）。
+    // commission 済みか毎回 KVS で確認する。
     if let Some(node_id) = op.node_id() {
         require_node(store_path, node_id)?;
     }
@@ -511,8 +457,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
     }
 }
 
-/// Write op の成功 body（timestamp 抜き）。native/chip-tool 両経路で共有
-/// （JSON キーは経路によらず同一 — schema 安定が要件）。
+/// Write op の成功 body（timestamp 抜き）。
 fn write_success_body(op: &Op) -> Value {
     let Op::Write {
         node_id,
@@ -535,7 +480,7 @@ fn write_success_body(op: &Op) -> Value {
     })
 }
 
-/// Invoke op の成功 body（timestamp 抜き）。native/chip-tool 両経路で共有。
+/// Invoke op の成功 body（timestamp 抜き）。
 fn invoke_success_body(op: &Op) -> Value {
     let Op::Invoke {
         node_id,
@@ -556,10 +501,8 @@ fn invoke_success_body(op: &Op) -> Value {
     })
 }
 
-/// describe op の成功 body（timestamp 抜き）。native/chip-tool 両経路で共有
-/// （`endpoints` は (endpoint, clusters) の列 — chip-tool 経路の
-/// `descriptor_list` 積み上げと native 経路の `mat_native::ops::describe` が
-/// 同じ形に集約してからここに渡す）。
+/// describe op の成功 body（timestamp 抜き）。`endpoints` は (endpoint, clusters) の列
+/// （`mat_native::ops::describe` が集約した形をそのまま渡す）。
 fn describe_success_body(node_id: u64, endpoints: &[(u16, Vec<u64>)]) -> Value {
     let out_endpoints: Vec<Value> = endpoints
         .iter()
@@ -568,7 +511,7 @@ fn describe_success_body(node_id: u64, endpoints: &[(u16, Vec<u64>)]) -> Value {
     json!({ "node_id": node_id, "endpoints": out_endpoints })
 }
 
-/// native/chip-tool どちらの経路でも使う、ホットパス op の成功 body（timestamp 抜き）。
+/// ホットパス op の成功 body（timestamp 抜き）。
 fn hotpath_success_body(op: &Op, read_value: Option<Value>) -> Value {
     match op {
         Op::On { node_id, endpoint } => json!({
@@ -636,108 +579,18 @@ fn hotpath_success_body(op: &Op, read_value: Option<Value>) -> Value {
     }
 }
 
-/// 単一 chip-tool コマンドに対応する op（read/write/invoke/on/off）を実行する。
-async fn simple_op(
-    op: &Op,
-    backend: &ChipToolBackend,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    // node_id が解決できるか（= commission 済みか）を毎回 KVS で確認する。
-    if let Some(node_id) = op.node_id() {
-        require_node(store_path, node_id)?;
-    }
-
-    let cmdline = op.to_cmdline().expect("simple op always has a cmdline");
-    let result = backend.run_cmdline(&cmdline).await?;
-    ensure_ok(&result)?;
-
-    let body = match op {
-        Op::Read {
-            cluster, attribute, ..
-        } => {
-            let value = read_value(&result).ok_or_else(|| {
-                MatError::parse_error(format!(
-                    "no value in chip-tool ws result for read {cluster}/{attribute}"
-                ))
-            })?;
-            hotpath_success_body(op, Some(value))
-        }
-        Op::Write { .. } => write_success_body(op),
-        Op::Invoke { .. } => invoke_success_body(op),
-        Op::On { .. } | Op::Off { .. } | Op::ColorTemp { .. } | Op::Color { .. } => {
-            hotpath_success_body(op, None)
-        }
-        Op::Ping
-        | Op::Describe { .. }
-        | Op::GroupProvision { .. }
-        | Op::GroupInvoke { .. }
-        | Op::GroupColorTemp { .. }
-        | Op::GroupColor { .. }
-        | Op::Shutdown => {
-            unreachable!("handled by run_op")
-        }
-    };
-    Ok(body)
-}
-
-/// `describe` — Descriptor クラスタでノードを introspect する（`mat describe` 相当）。
-///
-/// エンドポイント 0 の `parts-list` で子エンドポイントを列挙し（0 自身を先頭に足す）、
-/// 各エンドポイントの `server-list` でクラスタ ID を読む。warm session なので one-shot
-/// の `mat describe` より各読み出しが速い。
-async fn describe(backend: &ChipToolBackend, node_id: u64) -> Result<Value, MatError> {
-    let parts = descriptor_list(backend, node_id, 0, "parts-list").await?;
-    let mut endpoints: Vec<u16> = vec![0];
-    for p in parts {
-        if let Ok(ep) = u16::try_from(p) {
-            if !endpoints.contains(&ep) {
-                endpoints.push(ep);
-            }
-        }
-    }
-
-    let mut out_endpoints = Vec::new();
-    for ep in endpoints {
-        let clusters = descriptor_list(backend, node_id, ep, "server-list").await?;
-        out_endpoints.push((ep, clusters));
-    }
-
-    Ok(describe_success_body(node_id, &out_endpoints))
-}
-
-/// `descriptor read <list> <node> <ep>` を ws で実行し、結果 value から ID 配列を取る。
-async fn descriptor_list(
-    backend: &ChipToolBackend,
-    node_id: u64,
-    endpoint: u16,
-    list: &str,
-) -> Result<Vec<u64>, MatError> {
-    let result = backend
-        .run_cmdline(&format!("descriptor read {list} {node_id} {endpoint}"))
-        .await?;
-    ensure_ok(&result)?;
-    Ok(id_list(&result))
-}
-
 /// `group_provision` — group の鍵束・マッピングを各ノードへ焼き、コントローラ側 group
 /// state も設定する（`mat group provision` 相当）。最初の失敗で停止する。
 ///
-/// コントローラ側 group state（groupsettings 系）は native の有無を問わず常に
-/// chip-tool ws（backend）—— KVS 書込所有の分割は M8c まで見送り。デバイス側
-/// 4 ステップ（KeySetWrite / group-key-map / AddGroup / ACL）は native 有効時
-/// のみ `mat_native::ops::provision_node`（warm unicast CASE）に置換する
-/// （M8a Task10。mat 直経路の `native_direct::run_op` の `GroupProvision` 腕と
-/// 同じ分割）。
-///
-/// NOTE: 鍵束 / GroupKeyMap は compact JSON を ws コマンド行に載せて渡す。chip-tool
-/// interactive server のトークナイザはこの compact JSON を 1 引数として扱う:
-/// key-set-write の compact JSON object は chip-tool ログに `Command:
-/// groupkeymanagement key-set-write {"epochKey0":..., "groupKeySetID":77} 5 0` と
-/// 丸ごと 1 トークンで渡り解釈される（空白なしが前提）。
+/// M8c-3: コントローラ側 group state（groupsettings 系）・デバイス側 4 ステップ
+/// （KeySetWrite / group-key-map / AddGroup / ACL）ともに常に native
+/// （`mat_native::group_settings::write_group_provision` /
+/// `mat_native::ops::provision_node`）— chip-tool へのフォールバックは撤去した。
+/// `group_settings_ctx()` が `None`（本番 `Engine::build` では常に `Some` —
+/// テスト注入時のみ起こり得る）は internal エラーとして拒否する。
 async fn group_provision(
     op: &Op,
-    backend: &ChipToolBackend,
-    native: Option<&NativeBackend>,
+    native: &NativeBackend,
     store_path: &Path,
 ) -> Result<Value, MatError> {
     let Op::GroupProvision {
@@ -760,206 +613,47 @@ async fn group_provision(
     }
 
     let epoch_key = resolve_epoch_key(epoch_key.as_deref())?;
+    let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key)?;
 
-    // 1) コントローラ側 group state。native の KVS 書込資材（M8c-2）があれば
-    //    chip-tool を介さず直接書く。無ければ従来どおり chip-tool ws（M8a まで
-    //    のハイブリッド形 — native 無効時・テスト注入時）。
-    let native_gs = native.and_then(|n| n.group_settings_ctx());
-    if let Some(gs) = native_gs {
-        let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key)?;
-        mat_native::group_settings::write_group_provision(
-            gs,
-            *group_id,
-            *keyset_id,
-            name,
-            &epoch_key_bytes,
-            *rebind,
-        )?;
-    } else {
-        group_step(
-            backend,
-            &format!("groupsettings add-group {name} {group_id}"),
-        )
-        .await?;
-        // chip-tool の add-keysets は `<keysetId> <keyPolicy> <validityTime> <EpochKey>`
-        // の4引数（add-group/bind-keyset と違い group 名は取らない。先頭に name を置くと
-        // keysetId と誤読し `Invalid argument keysetId` で落ちる）。validityTime は
-        // EPOCH_START_TIME（=デバイス側 epochStartTime0）と一致させる。実機 E2E で確定。
-        group_step(
-            backend,
-            &format!(
-                "groupsettings add-keysets {keyset_id} {KEY_SECURITY_POLICY} {EPOCH_START_TIME} hex:{epoch_key}"
-            ),
-        )
-        .await?;
-        if *rebind {
-            // 既存グループの keyset binding を解除してから bind し直す（issue #5）。
-            // best-effort: 「未 bind なのに unbind」を区別せず失敗を無視する（unbind が
-            // 本当に必要で失敗したケースは直後の bind-keyset が従来どおり落ちるので、
-            // 検知はそちらに委ねる）。
-            if let Err(e) = group_step(
-                backend,
-                &format!("groupsettings unbind-keyset {group_id} {keyset_id}"),
-            )
-            .await
-            {
-                tracing::debug!(
-                    group_id,
-                    keyset_id,
-                    error = %e.detail,
-                    "groupsettings unbind-keyset failed; ignored (best-effort rebind)"
-                );
-            }
-        }
-        group_step(
-            backend,
-            &format!("groupsettings bind-keyset {group_id} {keyset_id}"),
-        )
-        .await?;
-    }
-
-    // native 有効時は、デバイス側 4 ステップ共通の epoch key バイト列を
-    // 1 回だけ用意する（ループ内で毎回 hex デコードしない）。
-    let native_epoch_key = native
-        .map(|_| mat_native::ops::epoch_key_from_hex(&epoch_key))
-        .transpose()?;
+    // 1) コントローラ側 group state。
+    let gs = native
+        .group_settings_ctx()
+        .ok_or_else(group_ctx_unconfigured_error)?;
+    mat_native::group_settings::write_group_provision(
+        gs,
+        *group_id,
+        *keyset_id,
+        name,
+        &epoch_key_bytes,
+        *rebind,
+    )?;
 
     // 2) 各デバイスへ provision（unicast, acknowledged）。
     for &node_id in node_ids {
-        if let (Some(native), Some(epoch_key_bytes)) = (native, native_epoch_key) {
-            let p = mat_native::ops::ProvisionNodeParams {
-                group_id: *group_id,
-                keyset_id: *keyset_id,
-                name: name.clone(),
-                endpoint: *endpoint,
-                epoch_key: epoch_key_bytes,
-            };
-            native
-                .provision_node(node_id, &p)
-                .await
-                .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
-            continue;
-        }
-
-        let key_set = json!({
-            "groupKeySetID": keyset_id,
-            "groupKeySecurityPolicy": 0,
-            "epochKey0": epoch_key,
-            "epochStartTime0": 1,
-            "epochKey1": null,
-            "epochStartTime1": null,
-            "epochKey2": null,
-            "epochStartTime2": null,
-        });
-        group_step(
-            backend,
-            &format!("groupkeymanagement key-set-write {key_set} {node_id} 0"),
-        )
-        .await?;
-
-        let key_map = json!([{ "groupId": group_id, "groupKeySetID": keyset_id }]);
-        group_step(
-            backend,
-            &format!("groupkeymanagement write group-key-map {key_map} {node_id} 0"),
-        )
-        .await?;
-
-        group_step(
-            backend,
-            &format!("groups add-group {group_id} {name} {node_id} {endpoint}"),
-        )
-        .await?;
-
-        // 4) ACL: groupcast は authMode=Group で届くため、Group エントリが無いと
-        //    デバイスが黙って捨てる。read-merge-write（write は全置換なので
-        //    「read できたリスト + 追記」のみ。read 解釈不能なら write しない）。
-        let result = backend
-            .run_cmdline(&format!("accesscontrol read acl {node_id} 0"))
-            .await?;
-        ensure_ok(&result)?;
-        let value = read_value(&result).ok_or_else(|| {
-            MatError::parse_error(format!(
-                "no value in chip-tool ws result for acl read on node {node_id}"
-            ))
-        })?;
-        let entries = acl_entries_from_ws_value(&value).map_err(|e| {
-            MatError::new(e.kind, format!("acl read on node {node_id}: {}", e.detail))
-        })?;
-        if let Some(merged) = merge_group_entry(&entries, *group_id) {
-            group_step(
-                backend,
-                &format!(
-                    "accesscontrol write acl {} {node_id} 0",
-                    to_chip_write_json(&merged)
-                ),
-            )
-            .await?;
-        }
+        let p = mat_native::ops::ProvisionNodeParams {
+            group_id: *group_id,
+            keyset_id: *keyset_id,
+            name: name.clone(),
+            endpoint: *endpoint,
+            epoch_key: epoch_key_bytes,
+        };
+        native
+            .provision_node(node_id, &p)
+            .await
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
     }
 
-    let mut body = json!({
+    Ok(json!({
         "group_id": group_id,
         "keyset_id": keyset_id,
         "name": name,
         "endpoint": endpoint,
         "nodes": node_ids,
         "status": "provisioned",
-    });
-    if native_gs.is_some() {
-        // matd 自身の warm chip-tool は古い group 状態をメモリに持ったまま —
-        // fallback op が chip-tool に流れる構成なら再起動で再読込させる。
-        body["note"] = json!(
-            "controller group state written natively to kvs; if matd is running, restart it to reload group state"
-        );
-    }
-    Ok(body)
-}
-
-/// group provision の 1 ステップ。失敗（results 内エラー）なら分類して返す。
-async fn group_step(backend: &ChipToolBackend, line: &str) -> Result<(), MatError> {
-    let result = backend.run_cmdline(line).await?;
-    ensure_ok(&result)
-}
-
-/// `group_invoke` — group へ multicast でコマンドを送る（`mat group invoke` 相当）。
-///
-/// groupcast は unacknowledged。応答（per-device の成否）は取れないため、ws 応答が
-/// 返れば「送った」とだけ報告する（`ensure_ok` はしない）。
-async fn group_invoke(
-    op: &Op,
-    backend: &ChipToolBackend,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    let Op::GroupInvoke {
-        group_id,
-        cluster,
-        command,
-        args,
-        endpoint,
-    } = op
-    else {
-        unreachable!("group_invoke called with non-GroupInvoke op");
-    };
-
-    // 特定 node 宛ではないが、chip-tool の永続ストレージ（焼いた group 鍵）参照のため
-    // store は必要。
-    let _store = Store::open(store_path)?;
-
-    // invoke と同じ並び: `<cluster> <command> [args...] <宛先> <endpoint>`。宛先に
-    // group node-id を置くと chip-tool が multicast 送信する。
-    let mut parts = vec![cluster.clone(), command.clone()];
-    parts.extend(args.iter().cloned());
-    parts.push(group_node_id(*group_id));
-    parts.push(endpoint.to_string());
-    let _ = backend.run_cmdline(&parts.join(" ")).await?;
-
-    Ok(group_sent_body(op))
+    }))
 }
 
 /// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupColor`）の成功 body。
-/// chip-tool 経路（[`group_invoke`]/[`group_color_op`]）と native 経路
-/// （`run_op` の native group 分岐）の両方から呼ぶ — 応答スキーマは経路に
-/// よらず同一（DRY、CLAUDE.md ルール「素通し禁止」とは別に schema 安定が要件）。
 fn group_sent_body(op: &Op) -> Value {
     match op {
         Op::GroupInvoke {
@@ -1021,51 +715,6 @@ fn group_sent_body(op: &Op) -> Value {
     }
 }
 
-/// group 版 color-temp / color ショートカット（`mat group color-temp` / `mat group
-/// color` 相当）。groupcast なので group_invoke と同じく unacknowledged（ws 応答が
-/// 返れば "sent"）。換算は mat 側で済んでおり、ここは送信とエコーのみ。
-async fn group_color_op(
-    op: &Op,
-    backend: &ChipToolBackend,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    // 特定 node 宛ではないが、chip-tool の永続ストレージ（焼いた group 鍵）参照の
-    // ため store は必要。
-    let _store = Store::open(store_path)?;
-    match op {
-        Op::GroupColorTemp {
-            group_id,
-            mireds,
-            transition,
-            endpoint,
-            ..
-        } => {
-            let line = format!(
-                "colorcontrol move-to-color-temperature {mireds} {transition} 0 0 {} {endpoint}",
-                group_node_id(*group_id)
-            );
-            let _ = backend.run_cmdline(&line).await?;
-            Ok(group_sent_body(op))
-        }
-        Op::GroupColor {
-            group_id,
-            hue_raw,
-            saturation_raw,
-            transition,
-            endpoint,
-            ..
-        } => {
-            let line = format!(
-                "colorcontrol move-to-hue-and-saturation {hue_raw} {saturation_raw} {transition} 0 0 {} {endpoint}",
-                group_node_id(*group_id)
-            );
-            let _ = backend.run_cmdline(&line).await?;
-            Ok(group_sent_body(op))
-        }
-        _ => unreachable!("group_color_op called with non group color op"),
-    }
-}
-
 /// store を開いて node_id が commission 済みか確認する（常駐中の台帳更新を拾うよう
 /// 毎回開き直す）。
 fn require_node(store_path: &Path, node_id: u64) -> Result<(), MatError> {
@@ -1073,77 +722,31 @@ fn require_node(store_path: &Path, node_id: u64) -> Result<(), MatError> {
     Ok(())
 }
 
-/// chip-tool ws 結果 `results[0].value` を取り出す（実機 E2E で確定済みの形状）。
-fn read_value(result: &Value) -> Option<Value> {
-    result
-        .get("results")
-        .and_then(|r| r.get(0))
-        .and_then(|e| e.get("value"))
-        .cloned()
+/// 名前解決できない（未知の cluster/attribute/command 名）op のハードエラー。
+/// mat 直経路の `native_direct::unresolved_op_error` と同じ文言 —— M8c-3 で
+/// chip-tool 撤去によりフォールバック先が無くなったため、数値 ID 以外は拒否する。
+fn unresolved_op_error() -> MatError {
+    MatError::parse_error(
+        "unknown cluster/attribute/command name (or unsupported non-scalar type); \
+         numeric IDs are accepted",
+    )
 }
 
-/// `results[0].value` を ID 配列（u64）として読む。descriptor の list 属性用。
-fn id_list(result: &Value) -> Vec<u64> {
-    read_value(result)
-        .as_ref()
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_u64).collect())
-        .unwrap_or_default()
+/// group 送信不能（未 provision・KVS 不備等）。`mat_native::group::send` からの
+/// `Unavailable` 理由をそのまま detail に載せる（`mat group provision` 誘導を
+/// 含む）。mat 直経路の `native_direct::group_unavailable_error` と同じ kind。
+fn group_unavailable_error(reason: &str) -> MatError {
+    MatError::store_parse(format!("native group send unavailable: {reason}"))
 }
 
-/// chip-tool ws 結果にデバイス側エラーが載っていれば分類して `Err` にする。
-///
-/// 成功時 `results[i]` には `error` が無いか success ステータスが入る。失敗時の
-/// `error` 値（status 名/コード）を既存のテキスト分類 [`classify_failure`] に通し、
-/// 未知なら `device_rejected` にフォールバックする。
-///
-/// 失敗形状: 失敗した groupkeymanagement key-set-write は
-/// `{"results":[{"error":"FAILURE"}],"logs":[...]}` を返す。`error` は status 名の
-/// **文字列**（数値ではない）、キー名は `error`。`"FAILURE"` は `classify_failure`
-/// 未一致のため `device_rejected` に落ちる。
-///
-/// `FAILURE` の正体が discovery/resolution timeout のことがある（実体は探索段階で
-/// 落ちている）。そのシグナル（`CHIP Error 0x00000032` 等）は results ではなく ws の
-/// `logs` にしか出ないため、backend が落とす前にデコードして添えた `diag` を
-/// 分類器の stderr 側へ合流させ、直叩き経路と分類を一致させる（#1）。
-fn ensure_ok(result: &Value) -> Result<(), MatError> {
-    let Some(arr) = result.get("results").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    // backend が logs から抽出した分類用テキスト（無ければ空）。
-    let diag = result.get("diag").and_then(Value::as_str).unwrap_or("");
-    for entry in arr {
-        if let Some(err) = entry.get("error") {
-            if is_success_status(err) {
-                continue;
-            }
-            // 文字列なら status 名そのもの（例 `FAILURE`）を detail に使う。JSON の
-            // クオートを残さないことで AI 可読性を上げる（数値等は JSON 表現のまま）。
-            let detail = err
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| err.to_string());
-            let kind = classify_failure(&detail, diag).unwrap_or(ErrorKind::DeviceRejected);
-            return Err(MatError::new(
-                kind,
-                format!("chip-tool reported an error in the result: {detail}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// `error` フィールドが「成功」を意味するか（null / 0 / "SUCCESS"）。
-fn is_success_status(err: &Value) -> bool {
-    match err {
-        Value::Null => true,
-        Value::Number(n) => n.as_u64() == Some(0),
-        Value::String(s) => {
-            let u = s.to_ascii_uppercase();
-            matches!(u.as_str(), "0" | "0X0" | "0X00" | "SUCCESS")
-        }
-        _ => false,
-    }
+/// `group_settings_ctx` / group send コンテキスト未構成（本番 `Engine::build` では
+/// 常に `Some` なので実質到達しない — テスト注入時のみ）。mat 直経路の
+/// `native_direct::group_ctx_unconfigured_error` と同じ。
+fn group_ctx_unconfigured_error() -> MatError {
+    MatError::new(
+        ErrorKind::Other,
+        "native group context not configured (internal)",
+    )
 }
 
 /// エラー応答 `{"error":{"kind","detail"}, "id"?, "timestamp"}`。
@@ -1222,8 +825,8 @@ mod tests {
             args: vec![]
         }));
         assert!(is_native_hotpath(&Op::Describe { node_id: 1 }));
-        // 名前は解決できるが値が符号化不能（list 型）な write も、chip-tool へ
-        // 落とさず native_op で即 parse_error にするため hotpath=true のまま。
+        // 名前は解決できるが値が符号化不能（list 型）な write も、拒否せず
+        // native_op で即 parse_error にするため hotpath=true のまま。
         assert!(is_native_hotpath(&Op::Write {
             node_id: 1,
             endpoint: 1,
@@ -1234,8 +837,8 @@ mod tests {
     }
 
     #[test]
-    fn hotpath_routing_leaves_others_to_chip_tool() {
-        // 未知 cluster/attribute 名は chip-tool へ（互換維持）。
+    fn hotpath_routing_rejects_unresolved_names() {
+        // 未知 cluster/attribute 名は native 対象外 → run_op が unresolved_op_error。
         assert!(!is_native_hotpath(&Op::Read {
             node_id: 1,
             endpoint: 1,
@@ -1269,60 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_ok_passes_on_empty_results() {
-        // controller groupsettings 成功時の実機形（add-group/bind-keyset）。
-        let v = json!({ "results": [], "logs": [] });
-        assert!(ensure_ok(&v).is_ok());
-    }
-
-    #[test]
-    fn ensure_ok_passes_on_success_statuses() {
-        for ok in [json!(null), json!(0), json!("0x0"), json!("SUCCESS")] {
-            let v = json!({ "results": [{ "error": ok }] });
-            assert!(ensure_ok(&v).is_ok(), "expected success for {v}");
-        }
-    }
-
-    #[test]
-    fn ensure_ok_classifies_real_device_failure_shape() {
-        // 失敗 ws 形状: 失敗した key-set-write が `error` に status 名の**文字列**を返す。
-        let v = json!({ "results": [{ "error": "FAILURE" }], "logs": [] });
-        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
-        assert_eq!(err.kind, ErrorKind::DeviceRejected);
-        // 文字列値はクオートを剥がして detail に入れる。
-        assert!(
-            err.detail.contains("FAILURE") && !err.detail.contains("\"FAILURE\""),
-            "detail should carry bare status name, got: {}",
-            err.detail
-        );
-    }
-
-    #[test]
-    fn ensure_ok_reclassifies_failure_with_discovery_timeout_diag() {
-        // #1: matd 経由でも、results の `error` が汎用 `FAILURE` のときは backend が
-        // logs から抽出した分類用テキスト `diag` を参照し、discovery timeout を
-        // device_rejected ではなく timeout に分類する（直叩きと一致させる）。
-        let v = json!({
-            "results": [{ "error": "FAILURE" }],
-            "diag": "[DIS] operational discovery failed: \
-                     AddressResolve_DefaultImpl.cpp:124: CHIP Error 0x00000032: Timeout",
-        });
-        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
-        assert_eq!(err.kind, ErrorKind::Timeout);
-    }
-
-    #[test]
-    fn ensure_ok_keeps_device_rejected_without_diag_signal() {
-        // diag があっても探索/解決の失敗シグナルが無ければ従来どおり device_rejected。
-        let v = json!({
-            "results": [{ "error": "FAILURE" }],
-            "diag": "[IM] some unrelated chatter",
-        });
-        let err = ensure_ok(&v).expect_err("FAILURE must be an error");
-        assert_eq!(err.kind, ErrorKind::DeviceRejected);
-    }
-
-    #[test]
     fn native_group_params_maps_onoff_and_shortcuts() {
         let on = Op::GroupInvoke {
             group_id: 10,
@@ -1338,7 +887,7 @@ mod tests {
         );
         assert!(fields.is_none());
 
-        // 引数過多（onoff on は 0 引数）は chip-tool へ落とさず即 parse_error
+        // 引数過多（onoff on は 0 引数）は即 parse_error
         // （M8a Task10: ids ベースの classify_invoke と同じ拒否規則）。
         let with_args = Op::GroupInvoke {
             group_id: 10,
@@ -1373,7 +922,7 @@ mod tests {
         );
         assert!(fields.is_none()); // 引数なし → fields_tlv は None。
 
-        // 未知コマンド名は non-native（chip-tool へ）。
+        // 未知コマンド名は非対象（run_op が unresolved_op_error にする）。
         let unknown_command = Op::GroupInvoke {
             group_id: 10,
             cluster: "onoff".into(),
@@ -1417,49 +966,8 @@ mod tests {
             im::encode_move_to_hue_and_saturation_fields(180, 200, 0)
         );
 
-        // GroupProvision は常に chip-tool。
+        // GroupProvision は native_group_params の対象外（専用ハンドラ group_provision）。
         assert!(native_group_params(&Op::Ping).is_none());
-    }
-
-    #[test]
-    fn group_send_op_group_id_identifies_group_send_ops_only() {
-        assert_eq!(
-            group_send_op_group_id(&Op::GroupInvoke {
-                group_id: 10,
-                cluster: "levelcontrol".into(),
-                command: "move-to-level".into(),
-                args: vec!["100".into()],
-                endpoint: 1,
-            }),
-            Some(10)
-        );
-        assert_eq!(
-            group_send_op_group_id(&Op::GroupColor {
-                group_id: 20,
-                hue_raw: 0,
-                saturation_raw: 0,
-                hue: 0,
-                saturation: 0,
-                name: None,
-                rgb: None,
-                transition: 0,
-                endpoint: 1,
-            }),
-            Some(20)
-        );
-        assert_eq!(group_send_op_group_id(&Op::Ping), None);
-        assert_eq!(
-            group_send_op_group_id(&Op::GroupProvision {
-                group_id: 30,
-                node_ids: vec![1],
-                keyset_id: 1,
-                name: "n".into(),
-                endpoint: 1,
-                epoch_key: None,
-                rebind: false,
-            }),
-            None
-        );
     }
 
     use crate::native::test_support::{write_group_fixture_ini, FakeEstablisher};
@@ -1473,19 +981,6 @@ mod tests {
             args: vec![],
             endpoint: 1,
         }
-    }
-
-    /// 接続先の無い lazy backend（触られたら必ず接続エラー）。startup_timeout を
-    /// 300ms に短縮し、本番の 20 秒（[`ChipToolBackend::connect`]既定）を律儀に
-    /// 待たされないようにする（フォールバック検証テストの高速化）。
-    async fn dead_backend() -> ChipToolBackend {
-        ChipToolBackend::connect_with_startup_timeout(
-            1,
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_millis(300),
-        )
-        .await
-        .unwrap()
     }
 
     fn make_store() -> (tempfile::TempDir, PathBuf) {
@@ -1532,7 +1027,7 @@ mod tests {
             cluster: "nosuch".into(),
             attribute: "x".into(),
         };
-        assert!(!is_native_hotpath(&unknown)); // 未知名は chip-tool へ（互換）。
+        assert!(!is_native_hotpath(&unknown)); // 未知名は unresolved_op_error（run_op）。
         let write = Op::Write {
             node_id: 5,
             endpoint: 1,
@@ -1553,7 +1048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_generic_read_body_matches_chip_tool_schema() {
+    async fn native_generic_read_body_matches_expected_schema() {
         // FakeConn の read_json は json!(1) を返す（Task 6 の fake 仕様）。
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let op = Op::Read {
@@ -1590,7 +1085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_generic_invoke_and_describe_bodies_match_chip_tool_schema() {
+    async fn native_generic_invoke_and_describe_bodies_match_expected_schema() {
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let dir = store_with_node_5();
 
@@ -1611,85 +1106,12 @@ mod tests {
 
         let describe = Op::Describe { node_id: 5 };
         let body = native_op(&describe, &native, dir.path()).await.unwrap();
-        // 既存 chip-tool 経路の describe() と同形（node_id/endpoints[].{endpoint,clusters}）。
+        // node_id/endpoints[].{endpoint,clusters} の形。
         assert_eq!(body["node_id"], 5);
         let endpoints = body["endpoints"].as_array().unwrap();
         assert!(!endpoints.is_empty());
         assert!(endpoints[0].get("endpoint").is_some());
         assert!(endpoints[0]["clusters"].is_array());
-    }
-
-    /// controller 側 groupsettings（add-group/add-keysets/bind-keyset）だけ
-    /// 成功を返し、デバイス側 chip-tool コマンド（key-set-write /
-    /// group-key-map / groups add-group / accesscontrol）は全て失敗を返す
-    /// fake ws。native 有効時の `group_provision` がデバイス側ステップを
-    /// chip-tool に一切送らず native 経由で完遂することの証明に使う
-    /// （device-side コマンドが 1 回でも飛べば `ensure_ok` が失敗し
-    /// テストが落ちる）。
-    async fn spawn_fake_ws_controller_only() -> u16 {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut ws = accept_async(stream).await.unwrap();
-                    while let Some(Ok(msg)) = ws.next().await {
-                        if let Message::Text(line) = msg {
-                            let is_controller_step = line.starts_with("groupsettings ");
-                            let resp = if is_controller_step {
-                                json!({ "cmd": line, "results": [], "logs": [] })
-                            } else {
-                                json!({
-                                    "cmd": line,
-                                    "results": [{ "error": "FAILURE" }],
-                                    "logs": [],
-                                })
-                            };
-                            ws.send(Message::Text(resp.to_string())).await.unwrap();
-                        }
-                    }
-                });
-            }
-        });
-        port
-    }
-
-    /// controller 側 group state が native KVS 書込へ渡った場合、groupsettings
-    /// 系の ws コマンドが一切飛ばないことを検証する fake ws。groupsettings 行を
-    /// 受信したら panic する（native ctx 有効時はデバイス側コマンドも native 経由
-    /// になるため、本来このソケットには一切トラフィックが来ない — 来た場合は
-    /// テストを確実に失敗させる）。
-    async fn spawn_fake_ws_failing_on_groupsettings() -> u16 {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut ws = accept_async(stream).await.unwrap();
-                    while let Some(Ok(msg)) = ws.next().await {
-                        if let Message::Text(line) = msg {
-                            assert!(
-                                !line.starts_with("groupsettings "),
-                                "groupsettings ws command sent despite native group_settings_ctx being present: {line}"
-                            );
-                            let resp = json!({ "cmd": line, "results": [], "logs": [] });
-                            ws.send(Message::Text(resp.to_string())).await.unwrap();
-                        }
-                    }
-                });
-            }
-        });
-        port
     }
 
     /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
@@ -1716,37 +1138,10 @@ mod tests {
         }
     }
 
+    /// M8c-3: group_provision はコントローラ側 group state・デバイス側ともに
+    /// 常に native（group_settings_ctx を注入すれば KVS への実書込みまで検証できる）。
     #[tokio::test]
-    async fn group_provision_routes_device_side_steps_through_native() {
-        let (_dir, store_path) = make_store();
-        let port = spawn_fake_ws_controller_only().await;
-        let backend = ChipToolBackend::connect(port, std::time::Duration::from_secs(300))
-            .await
-            .unwrap();
-        let native = NativeBackend::with_establisher(Box::new(ScriptedEstablisher));
-
-        let op = Op::GroupProvision {
-            group_id: 1,
-            node_ids: vec![1],
-            keyset_id: 42,
-            name: "living".into(),
-            endpoint: 1,
-            epoch_key: Some("00112233445566778899aabbccddeeff".into()),
-            rebind: false,
-        };
-        let body = group_provision(&op, &backend, Some(&native), &store_path)
-            .await
-            .unwrap();
-        assert_eq!(body["status"], "provisioned");
-        assert_eq!(body["nodes"], json!([1]));
-    }
-
-    /// M8c-2 Task6: native group_settings_ctx がある場合、controller 側 group
-    /// state は chip-tool ws（groupsettings 系）を一切経由せず native KVS に直接
-    /// 書かれる。デバイス側は従来どおり native（ScriptedEstablisher）。ws に
-    /// groupsettings 行が飛べば fake ws が panic し、テストが失敗する。
-    #[tokio::test]
-    async fn group_provision_writes_controller_state_natively_when_ctx_present() {
+    async fn group_provision_writes_controller_and_device_state_natively() {
         let dir = tempfile::tempdir().unwrap();
         let ini = dir.path().join("chip_tool_config.ini");
         std::fs::write(&ini, "[Default]\n").unwrap();
@@ -1756,11 +1151,6 @@ mod tests {
             cfid: [7u8; 8],
         };
         let native = NativeBackend::with_parts_gs(Box::new(ScriptedEstablisher), None, Some(gs));
-
-        let port = spawn_fake_ws_failing_on_groupsettings().await;
-        let backend = ChipToolBackend::connect(port, std::time::Duration::from_secs(300))
-            .await
-            .unwrap();
 
         let (_dir2, store_path) = make_store();
         let op = Op::GroupProvision {
@@ -1772,12 +1162,30 @@ mod tests {
             epoch_key: None,
             rebind: false,
         };
-        let body = group_provision(&op, &backend, Some(&native), &store_path)
-            .await
-            .unwrap();
+        let body = group_provision(&op, &native, &store_path).await.unwrap();
         assert_eq!(body["status"], "provisioned");
-        assert!(body["note"].as_str().unwrap().contains("restart"), "{body}");
+        assert_eq!(body["nodes"], json!([1]));
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
+    }
+
+    /// group_settings_ctx が未構成（テスト注入時のみ起こり得る）だと internal エラー。
+    #[tokio::test]
+    async fn group_provision_without_group_settings_ctx_is_internal_error() {
+        let native = NativeBackend::with_establisher(Box::new(ScriptedEstablisher));
+        let (_dir, store_path) = make_store();
+        let op = Op::GroupProvision {
+            group_id: 1,
+            node_ids: vec![1],
+            keyset_id: 1,
+            name: "g".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        };
+        let err = group_provision(&op, &native, &store_path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
     }
 
     #[tokio::test]
@@ -1818,12 +1226,15 @@ mod tests {
                 sender: tokio::sync::Mutex::new(None),
             };
             let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
-            let backend = dead_backend().await;
 
-            let body = run_op(&group_on_op(), &backend, Some(&native), &store_path)
-                .await
-                .unwrap();
-            assert_eq!(body["status"], "sent"); // native 経路で chip-tool 不要のまま成功
+            let body = run_op(
+                &group_on_op(),
+                &NativeState::Ready(Box::new(native)),
+                &store_path,
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["status"], "sent"); // native 経路のみで成功
             let mut buf = [0u8; 1280];
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
@@ -1843,19 +1254,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_op_falls_back_to_chip_tool_when_unavailable() {
+    async fn group_op_returns_store_parse_when_group_ctx_unavailable() {
         let (_dir, store_path) = make_store();
-        // group ctx なしの native → Unavailable → chip-tool 経路へ。dead backend が
-        // エラーを返すこと自体が「フォールバックが試みられた」証拠。
+        // group ctx なしの native → Unavailable → M8c-3: フォールバック無しで
+        // store_parse（`mat group provision` へ誘導する detail）を即返す。
         let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), None);
-        let backend = dead_backend().await;
-        let err = run_op(&group_on_op(), &backend, Some(&native), &store_path)
+        let err = run_op(
+            &group_on_op(),
+            &NativeState::Ready(Box::new(native)),
+            &store_path,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreParse);
+        assert!(err.detail.contains("native group send unavailable"));
+    }
+
+    #[tokio::test]
+    async fn run_op_returns_build_error_uniformly_when_native_unavailable() {
+        // 起動時 native 構築失敗（KVS 不在等）は、Ping/Shutdown 以外の全 op へ
+        // その構築エラーをそのまま返す（M8c-3: 一律化、Task 9 と同じ精度）。
+        let (_dir, store_path) = make_store();
+        let build_err = MatError::store_missing("no KVS materials for native backend");
+        let state = NativeState::Unavailable(build_err.clone());
+
+        let err = run_op(&group_on_op(), &state, &store_path)
             .await
             .unwrap_err();
-        assert_ne!(
-            err.kind,
-            ErrorKind::Unreachable,
-            "native 送出エラーではなく chip-tool 接続系のエラーになる"
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        assert_eq!(err.detail, build_err.detail);
+
+        let read = Op::Read {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+        };
+        let err = run_op(&read, &state, &store_path).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+
+        // Ping/Shutdown だけは native に触れず常に成功する。
+        assert_eq!(
+            run_op(&Op::Ping, &state, &store_path).await.unwrap(),
+            json!({ "pong": true })
+        );
+        assert_eq!(
+            run_op(&Op::Shutdown, &state, &store_path).await.unwrap(),
+            json!({ "stopping": true })
         );
     }
 }
