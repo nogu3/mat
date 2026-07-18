@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M4 受け入れ: native 有効な matd を jarvis で（本番 matd とは別の socket/ws
 # ポートで）起動し、unix socket 越しにホットパス往復 / warm 再利用 / describe の
 # chip-tool フォールバックを検証する。本番 systemd matd（chip-tool 版, port 9100,

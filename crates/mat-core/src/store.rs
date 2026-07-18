@@ -71,7 +71,7 @@ impl Store {
         let root = root.into();
         if !root.is_dir() {
             return Err(MatError::store_missing(format!(
-                "credential store not found at {} (run `mat commission` to bootstrap, or pass --store)",
+                "credential store not found at {} (run `mat fabric init` to bootstrap, or pass --store)",
                 root.display()
             )));
         }

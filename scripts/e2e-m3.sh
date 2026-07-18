@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M3 受け入れ: jarvis 相乗り live E2E。aarch64-musl クロスビルド →
 # 転送 → コントローラ実機上で実行（KVS とデバイスは実機側にあるため）。
 # 必須 env: MAT_E2E_HOST（ssh 先。repo は public のため既定値を置かない）

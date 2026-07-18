@@ -3,9 +3,11 @@
 Working rules for AI agents (Claude Code, etc.) editing this repo. Keep these in
 mind on every change.
 
-`mat` is a CLI for controlling Matter devices. It calls a Matter controller
-(`chip-tool`) as a subprocess and normalizes its text output into `mat`'s JSON
-schema. For the full design, scope, the `mat` / `matd` split, and roadmap, read
+`mat` is a CLI for controlling Matter devices. It drives a native, from-scratch
+Rust Matter controller (crate `mat-controller`, via the shared `mat-native`
+engine) in-process and emits `mat`'s JSON schema. (`chip-tool` was the backend
+through Phase 5 M8c-2; it was fully retired in 0.22.0 / M8c-3.) For the full
+design, scope, the `mat` / `matd` split, and roadmap, read
 [ARCHITECTURE.md](./ARCHITECTURE.md). For usage, read [README.md](./README.md).
 This file is the short list of constraints you must not break.
 
@@ -13,15 +15,12 @@ This file is the short list of constraints you must not break.
 
 1. **Protocol code lives only in the backend crates.** No TLV, no CASE, no
    multicast routing inside `mat` / `matd` command layers — that all
-   belongs to the backend crates (`mat-controller` / `mat-native`, Phase 5,
-   in progress). By default the production path still delegates everything
-   to `chip-tool`; the native hotpath (see Backend section below) is opt-in
-   until `chip-tool` is fully retired (M8).
-2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
-   it in `mat`'s schema. No human decoration (color, progress, prompts). Never
-   pass `chip-tool` output through unchanged.
-3. **Diagnostics go to stderr as structured logs** (`tracing`). Do not swallow
-   `chip-tool`'s stderr; keep it at least at debug level.
+   belongs to the backend crates (`mat-controller` / `mat-native`, Phase 5).
+   As of M8c-3 the native backend is the only path (`chip-tool` retired); the
+   command layers still never speak the protocol.
+2. **stdout is pure structured JSON only.** Emit the result in `mat`'s schema.
+   No human decoration (color, progress, prompts).
+3. **Diagnostics go to stderr as structured logs** (`tracing`).
 4. **Hold no state except the credential KVS.** No session-cache DB, no daemon,
    no internal scheduler.
 
@@ -45,8 +44,7 @@ This file is the short list of constraints you must not break.
 ## Output conventions
 
 ### stdout
-- On success, print the result as JSON to stdout, re-composed in `mat`'s schema
-  (do not forward `chip-tool` output raw).
+- On success, print the result as JSON to stdout, composed in `mat`'s schema.
 - A `timestamp` field is **required** (**ISO 8601**, the time `mat` built the
   response — not Unix epoch). Example:
   ```json
@@ -61,58 +59,64 @@ This file is the short list of constraints you must not break.
   ```
 
 ### stderr
-- `chip-tool` errors go to stderr as structured logs.
-- `mat`'s own errors use the same form: `{"error": {"kind": "...", "detail": "..."}}`.
+- Diagnostics go to stderr as structured `tracing` logs.
+- `mat`'s errors use `{"error": {"kind": "...", "detail": "..."}}`.
   `detail` should be specific enough for an AI to decide recovery (e.g.
   `"Node 12 is unreachable"`).
 - `kind` values are stable and documented in README ("Errors and exit codes").
   Examples: `store_missing` / `store_parse` / `node_not_commissioned` /
-  `child_not_found` / `child_failed` / `commission_failed` / `timeout` /
-  `unreachable` / `session_failed` / `device_rejected` / `parse_error` / `other`.
+  `commission_failed` / `timeout` / `unreachable` / `session_failed` /
+  `device_rejected` / `parse_error` / `other`. (`child_not_found` /
+  `child_failed` still exist for wire compat but are not emitted as top-level
+  errors since 0.22.0 — chip-tool retired.)
 
 ### exit codes
 See the table in [README.md](./README.md#errors-and-exit-codes). In short:
 `0` success, `2` CLI arg error, `10` store missing/parse, `11` not commissioned,
-`12` chip-tool not found, `3` timeout, `4` device rejected, `5` unreachable,
-`6` CASE session establishment failed, `1` other. `chip-tool` exit codes are
-coarse (mostly `1`); `mat` parses stdout/stderr to classify into `3`/`4`/`5`/`6`,
-falling back to `parse_error` + `1`.
+`3` timeout, `4` device rejected, `5` unreachable, `6` CASE session
+establishment failed, `1` other. Exit `12` (chip-tool not found) is a retired,
+historical vacancy as of 0.22.0. The native backend maps its transport/IM
+outcomes to `3`/`4`/`5`/`6`, falling back to `parse_error` + `1`.
 
-## Backend (chip-tool)
+## Backend (native)
 
-- Route selection is per-op: matd auto-discovery (unchanged) -> native direct
-  (`mat-native`, only when `MAT_IFACE`/`MAT_MATD_IFACE` is set and the op is
-  in the native hotpath) -> direct `chip-tool`. As of Phase 5 M8a the native
-  hotpath widened from the M4/M5/M7 fixed shapes to generic `read`/`write`/
-  `invoke` (via the `mat-core::ids` name→ID table, scalar types only) plus
-  `describe`/`diag thread`/`open-window`/`group provision`/`group grant`/
-  `group invoke`; unresolvable names and list/struct/float fields still fall
-  back to `chip-tool` (or `parse_error` for the latter). As of M8b, `discover`
-  (commissionable browse) and the mDNS probe (`discover --probe` / `diag node
-  --deep`) also go native under `MAT_IFACE` (`mat-controller::dnssd`), direct
-  path only — never through `matd`; fallback to chip-tool/`avahi-browse`
-  fires only on an I/O error, never on a zero-result browse. As of M8c-1,
-  `commission` also goes native under `MAT_IFACE` (`mat-native::commission`,
-  auto mDNS→BLE route selection), direct path only; fallback to chip-tool
-  fires only pre-PASE (wire untouched) — a failure after PASE starts is
-  never retried via chip-tool. As of M8c-2, `group provision`'s
-  controller-side group state (`groupsettings` equivalent) is also native
-  when `MAT_IFACE`/`MAT_MATD_IFACE` is set — `mat` writes it straight into
-  the chip-tool-compatible KVS (`mat-controller::group_settings`, flock
-  exclusion, tmp+rename atomic replace), on both the direct path and via
-  `matd` (resolves the M8a hybrid, where only the device-side steps were
-  native). `diag node`'s IM part (operational check + thread signals) is
-  native too, direct path only. Only unresolved KVS materials fall back to
-  chip-tool; a write failure (including a flock `WouldBlock`) is a hard
-  error and never falls back. Nothing above this list changes when native
-  is unset — see README for the exact op list and fallback rules.
-- `chip-tool` is found on `PATH`; override the full path with `MAT_CHIP_TOOL_BIN`.
-- The backend is replaceable: `mat` couples to it only through `mat`'s own JSON
-  schema. Keep all backend specifics inside the child-runner adapter so a future
-  swap is one adapter, with subcommands and output schema unchanged.
-- The `Data = ...` parse path is the fragile part. Keep parser unit tests
-  (normal cases + unparseable = `parse_error`) so an upstream version change is
-  noticed.
+- The backend is native and pure Rust (crate `mat-controller`, via the shared
+  `mat-native` engine): TLV, CASE, IM, groupcast, mDNS, and commissioning
+  (on-network + BLE+Thread) run in-process. There is **no** `chip-tool` (or any
+  external controller) subprocess — it was fully retired in 0.22.0 (M8c-3).
+- Route selection is per-op: matd auto-discovery (if a `matd` answers the probed
+  socket) -> `mat`'s own native direct path. There is no third fallback tier.
+- The interface is **auto-detected** every run (up/multicast/non-loopback/
+  non-point-to-point with an IPv6 link-local address; exactly one candidate or a
+  hard `other` error). `MAT_IFACE` / `MAT_MATD_IFACE` override it; `matd` refuses
+  to start on an ambiguous autodetect. No state is held between runs (design
+  rule 4).
+- Generic `write`/`invoke`/`group invoke` encode **scalar** JSON→TLV only
+  (bool/int/uint/enum/bitmap/string/octstr, bytes as `hex:`). `list`/`struct`/
+  `float` fields and names the `mat-core::ids` table does not know are
+  `parse_error` (numeric IDs are the escape hatch) — a documented limitation,
+  not a fallback. `group provision`/`grant` list/struct writes use dedicated
+  encoders.
+- `mat` is the sole owner/writer of the persistent Matter KVS (chip-tool-
+  compatible INI form: keysets, operational credentials, group tables, the
+  group-send counter). Group-settings writes use flock exclusion + tmp+rename
+  atomic replace (`mat-controller::group_settings`); a write failure (including
+  a flock `WouldBlock`) is a hard error and never silently degrades. First-
+  fabric bootstrap is `mat fabric init` (random-epoch IPK). A fabric first
+  created by chip-tool is handled by verifying its fixed epoch against the KVS
+  materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`).
+- `matd`-only ops vs direct-only ops: `discover` / `commission` / `fabric init`
+  / `open-window` / `diag` / `group grant` are never part of the `matd` socket
+  protocol — they always run on `mat`'s own one-shot direct path. See README for
+  the exact op list.
+- The backend is still replaceable in principle: `mat` couples to it only
+  through `mat`'s own JSON schema. Subcommands and output schema are the contract.
+- **Fragile parts (keep tests):** (1) the **chip-tool INI KVS compatibility** —
+  base64 TLV records with upstream `GroupDataProviderImpl` link discipline
+  (`mat-controller::kvs` / `group_settings`); an upstream format assumption
+  breaking would corrupt the store. (2) the **one-shot mDNS (`dnssd`)** browse /
+  targeted resolve — real Thread meshes need targeted resolve, not enumeration.
+  Keep the unit + real-device tests that pin both.
 
 ## Credentials and the repo
 
@@ -126,9 +130,10 @@ Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
 the current one is fully done (all tests pass, acceptance criteria met). Phases
 0–4 are implemented, real-device E2E included (Phase 4 = `matd`, the resident
 binary with warm CASE sessions; a separate binary in this repo). **Phase 5**
-(native backend: from-scratch Rust controller, crate
-`mat-controller`) is decided and in progress — see
-`docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md`.
+(native backend: from-scratch Rust controller, crate `mat-controller`) is done
+through M8c-3 — `chip-tool` retired, native is the only path — see
+`docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md` and the
+M8c-3 record in ARCHITECTURE.md.
 
 ## Development commands
 
@@ -137,13 +142,14 @@ Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 ```bash
 task build            # release build -> target/release/{mat,matd}
 task install          # install both binaries into ~/.cargo/bin
-task run -- discover  # run (needs chip-tool on PATH)
-task test             # tests (incl. fake-chip-tool integration tests; no real chip-tool)
+task run -- discover  # run (native backend)
+task test             # tests (native FakeConn + binary integration; no real devices)
 task clippy           # lint (-D warnings)
 task fmt              # format
 task check            # CI equivalent (fmt:check + clippy + test)
 
-task docker:build     # image for x86_64 Linux (chip-tool baked in)
+task dist:arm64       # aarch64-gnu + BLE deploy build -> dist/arm64/{mat,matd}
+task docker:build     # slim x86_64 image (mat/matd only)
 task docker:run -- discover
 task docker:test      # no local toolchain needed
 ```
