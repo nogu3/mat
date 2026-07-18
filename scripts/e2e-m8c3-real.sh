@@ -331,6 +331,10 @@ stage1_main() {
       MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c3-chip-tool \
       "$REMOTE_MAT_BIN" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
     cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+    if [ "$rc" != 0 ]; then
+      echo "FAIL: remote command failed (rc=$rc): $@" >&2
+      cat "$LAST_STDERR_FILE" >&2
+    fi
     return "$rc"
   }
 
@@ -341,6 +345,10 @@ stage1_main() {
     local rc=0
     ssh -n "$MAT_E2E_HOST" "$REMOTE_MAT_BIN" --matd "$SOCKET" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
     cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+    if [ "$rc" != 0 ]; then
+      echo "FAIL: remote command failed (rc=$rc): $@" >&2
+      cat "$LAST_STDERR_FILE" >&2
+    fi
     return "$rc"
   }
 
