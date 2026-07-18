@@ -35,40 +35,60 @@ pub struct NativeProbe<'a> {
 const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `_matter._tcp` の到達性を判定する。native の targeted resolve を並行実行
-/// する。結果 0 件は正常（Ok(vec![])）。失敗（iface / 資材 / 全ノード I/O
-/// エラー）はそのままエラーを返す（フォールバック先が無い — Task 11）。
+/// する。結果 0 件は正常（Ok(vec![])）。失敗はそのままエラーを返す
+/// （フォールバック先が無い — Task 11）。失敗源ごとに ErrorKind を作り分ける
+/// （Task 11 レビュー修正）: iface 解決失敗は `Other`、KVS 資材の読み取り /
+/// NOC 自己発行失敗は `StoreMissing`（`mat fabric init` 未実施のヒント付き）、
+/// 全ノード I/O エラーのみ `Unreachable`。
 pub fn mdns(p: NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
-    resolve_ledger_nodes(&p).map_err(|e| {
-        MatError::new(
-            ErrorKind::Unreachable,
-            format!("native mDNS probe failed on {}: {e}", p.iface),
-        )
-    })
+    resolve_ledger_nodes(&p)
 }
 
 /// 台帳ノードそれぞれへ `resolve_operational` を並行実行する（M8b）。
-fn resolve_ledger_nodes(
-    p: &NativeProbe<'_>,
-) -> Result<Vec<MatterInstance>, Box<dyn std::error::Error>> {
+/// 失敗源ごとに ErrorKind を作り分ける（mat-native/lib.rs・commission.rs の
+/// 資材エラー写像に合わせる — Task 11 レビュー修正）。
+fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
     // 台帳が空なら何も解決しない（KVS も socket も不要）。
     if p.node_ids.is_empty() {
         return Ok(vec![]);
     }
 
-    let scope_id = dnssd::iface_index(p.iface)?;
+    let scope_id = dnssd::iface_index(p.iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("native mDNS probe: resolve iface {:?} index: {e}", p.iface),
+        )
+    })?;
 
     let materials = kvs::read_self_issue_materials(
         &p.store_root.join("chip_tool_config.alpha.ini"),
         &p.store_root.join("chip_tool_config.ini"),
         p.fabric_index,
         p.issuer_index,
-    )?;
-    let creds = fabric::FabricCredentials::from_self_issued(materials)?;
+    )
+    .map_err(|e| {
+        MatError::new(
+            ErrorKind::StoreMissing,
+            format!("native mDNS probe: read KVS credentials: {e} — run `mat fabric init`"),
+        )
+    })?;
+    let creds = fabric::FabricCredentials::from_self_issued(materials).map_err(|e| {
+        MatError::new(
+            ErrorKind::StoreMissing,
+            format!("native mDNS probe: self-issue NOC: {e} — run `mat fabric init`"),
+        )
+    })?;
     let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(|e| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("native mDNS probe: build async runtime: {e}"),
+            )
+        })?;
     let results: Vec<(u64, Result<dnssd::ResolvedNode, dnssd::DnssdError>)> = rt.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         for &node_id in p.node_ids {
@@ -89,15 +109,22 @@ fn resolve_ledger_nodes(
         out
     });
 
-    // 全ノードが Io エラーだった場合のみフォールバックさせる（例: MAT_IFACE=lo
-    // では multicast send 自体が全ノードで失敗する）。混在時は成功分を返す
-    // （個々の Timeout/Malformed は「不達」として扱い、全滅ではない）。
+    // 全ノードが Io エラーの場合はハードエラーを返す（例: MAT_IFACE=lo では
+    // multicast send 自体が全ノードで失敗する。フォールバック先は無い —
+    // Task 11 で撤去済み）。混在時は成功分を返す（個々の Timeout/Malformed は
+    // 「不達」として扱い、全滅ではない）。
     let all_io_err = !results.is_empty()
         && results
             .iter()
             .all(|(_, r)| matches!(r, Err(dnssd::DnssdError::Io(_))));
     if all_io_err {
-        return Err("all ledger node resolves failed with an I/O error".into());
+        return Err(MatError::new(
+            ErrorKind::Unreachable,
+            format!(
+                "native mDNS probe failed on {}: all ledger node resolves failed with an I/O error",
+                p.iface
+            ),
+        ));
     }
 
     let cfid_hex = cfid_hex(&cfid);
@@ -140,5 +167,46 @@ mod tests {
     fn cfid_hex_formats_16_uppercase_hex() {
         let cfid: [u8; 8] = [0x00, 0xAA, 0xBB, 0x11, 0x22, 0xCC, 0x33, 0x44];
         assert_eq!(cfid_hex(&cfid), "00AABB1122CC3344");
+    }
+
+    /// KVS 資材が無い store（`mat fabric init` 未実施相当）+ 台帳に 1 ノードの
+    /// 組み合わせは `StoreMissing`（`Unreachable` への一律写像ではない）に
+    /// 分類されるべき — Task 11 レビュー修正。
+    #[test]
+    fn resolve_ledger_nodes_maps_missing_kvs_materials_to_store_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = NativeProbe {
+            iface: "lo",
+            fabric_index: 1,
+            issuer_index: 1,
+            store_root: dir.path(),
+            node_ids: &[5],
+        };
+
+        let err = resolve_ledger_nodes(&p).expect_err("missing KVS materials must fail");
+
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        assert!(
+            err.detail.contains("mat fabric init"),
+            "detail should hint at `mat fabric init`: {}",
+            err.detail
+        );
+    }
+
+    /// 台帳が空なら KVS にも socket にも触れず Ok(vec![]) を返す（既存動作の
+    /// 回帰確認 — iface / KVS が壊れていても失敗しないことを保証する）。
+    #[test]
+    fn resolve_ledger_nodes_empty_ledger_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = NativeProbe {
+            iface: "no-such-iface-at-all",
+            fabric_index: 1,
+            issuer_index: 1,
+            store_root: dir.path(),
+            node_ids: &[],
+        };
+
+        let result = resolve_ledger_nodes(&p).expect("empty ledger must short-circuit to Ok");
+        assert!(result.is_empty());
     }
 }
