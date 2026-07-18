@@ -526,3 +526,30 @@ fn no_iface_env_reaches_autodetect_not_panic() {
         "expected evidence that iface autodetect ran: {stderr}"
     );
 }
+
+// ── fabric init（M8c-3 Task8: ローカル完結 bootstrap、iface/matd 不到達）───
+
+#[test]
+fn fabric_init_full_local_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1) init 成功: JSON スキーマ検証
+    let out = mat(dir.path()).args(["fabric", "init"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["timestamp"].is_string());
+    assert_eq!(v["fabric_id"], 1);
+    assert_eq!(v["admin_node_id"], 112233);
+    assert!(v["compressed_fabric_id"].as_str().unwrap().len() == 16);
+    // 2) KVS 2 ファイル + epoch キーが生成されている
+    let main_ini = std::fs::read_to_string(dir.path().join("chip_tool_config.ini")).unwrap();
+    assert!(main_ini.contains("mat/f/1/ipk-epoch"));
+    assert!(std::fs::metadata(dir.path().join("chip_tool_config.alpha.ini")).is_ok());
+    // 3) 再 init は拒否（exit 1、error JSON に kind: other）
+    let out2 = mat(dir.path()).args(["fabric", "init"]).output().unwrap();
+    assert_eq!(out2.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
+}

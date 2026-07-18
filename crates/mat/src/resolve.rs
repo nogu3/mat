@@ -245,6 +245,8 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 }
             },
         },
+        // fabric_id / admin_node_id は数値のみ（alias 対象フィールドが無い）— パススルー。
+        Command::Fabric { action } => Command::Fabric { action },
     })
 }
 

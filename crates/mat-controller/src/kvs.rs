@@ -72,6 +72,8 @@ pub enum KvsError {
     },
     BadCounter(&'static str),
     Locked,
+    /// `KvsTxn::create` の対象パスが既に存在する（M8c-3）。
+    AlreadyExists,
 }
 
 impl std::fmt::Display for KvsError {
@@ -111,6 +113,7 @@ impl std::fmt::Display for KvsError {
             }
             KvsError::BadCounter(reason) => write!(f, "kvs key \"g/gdc\": {reason}"),
             KvsError::Locked => write!(f, "kvs: locked by another process"),
+            KvsError::AlreadyExists => write!(f, "kvs already exists"),
         }
     }
 }
@@ -653,25 +656,32 @@ pub struct KvsTxn {
     _lock: std::fs::File,
 }
 
+/// sidecar `<path>.lock` を advisory flock（NonBlocking exclusive）する。
+/// `open` / `create` 共通の手順を括り出したもの。
+fn take_lock(path: &Path) -> Result<std::fs::File, KvsError> {
+    use rustix::fs::{flock, FlockOperation};
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::path::PathBuf::from(lock_path))
+        .map_err(KvsError::Io)?;
+    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+        if e == rustix::io::Errno::WOULDBLOCK {
+            KvsError::Locked
+        } else {
+            KvsError::Io(std::io::Error::other(e))
+        }
+    })?;
+    Ok(lock)
+}
+
 impl KvsTxn {
     pub fn open(path: &Path) -> Result<Self, KvsError> {
-        use rustix::fs::{flock, FlockOperation};
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(std::path::PathBuf::from(lock_path))
-            .map_err(KvsError::Io)?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == rustix::io::Errno::WOULDBLOCK {
-                KvsError::Locked
-            } else {
-                KvsError::Io(std::io::Error::other(e))
-            }
-        })?;
+        let lock = take_lock(path)?;
         let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
         // 末尾改行の有無を記録（commit で復元するため）。
         let trailing_newline = text.ends_with('\n');
@@ -713,6 +723,25 @@ impl KvsTxn {
             default_start,
             default_end,
             trailing_newline,
+            _lock: lock,
+        })
+    }
+
+    /// 新規 INI を作る（M8c-3、fabric bootstrap 用）。`path` が既に存在すれば
+    /// `KvsError::AlreadyExists`（上書きしない）。無ければ sidecar `.lock` を
+    /// 取ってから `[Default]` セクションだけの空トランザクションを返す
+    /// （`open` と同じ flock 手順・`commit` も共通）。
+    pub fn create(path: &Path) -> Result<Self, KvsError> {
+        if path.exists() {
+            return Err(KvsError::AlreadyExists);
+        }
+        let lock = take_lock(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines: vec!["[Default]".to_string()],
+            default_start: 1,
+            default_end: 1,
+            trailing_newline: true,
             _lock: lock,
         })
     }

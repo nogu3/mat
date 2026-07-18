@@ -258,6 +258,26 @@ pub enum Command {
         #[command(subcommand)]
         action: DiagCommand,
     },
+
+    /// fabric 管理（初回 bootstrap）。
+    Fabric {
+        #[command(subcommand)]
+        action: FabricAction,
+    },
+}
+
+/// `mat fabric` のサブコマンド（M8c-3）。
+#[derive(Subcommand, Debug)]
+pub enum FabricAction {
+    /// 初回 fabric bootstrap: root CA + ランダム epoch IPK を生成し KVS を新規作成
+    Init {
+        /// fabric id（既定 1）
+        #[arg(long, default_value_t = 1)]
+        fabric_id: u64,
+        /// controller 自身の admin node id（既定 112233 = chip-tool 慣例値）
+        #[arg(long, default_value_t = 112_233)]
+        admin_node_id: u64,
+    },
 }
 
 /// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/

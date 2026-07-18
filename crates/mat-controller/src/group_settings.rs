@@ -27,7 +27,7 @@ const INVALID_ENDPOINT_ID: u16 = 0xFFFF;
 /// KeySetData の operational key 配列は常に 3 スロット（KeySet::kEpochKeysMax）。
 const KEYSET_SLOTS: usize = 3;
 /// デバイス側 epochStartTime0 と一致させる（mat-core::group::EPOCH_START_TIME = "1"）。
-const EPOCH_START_TIME: u64 = 1;
+pub(crate) const EPOCH_START_TIME: u64 = 1;
 /// GroupName の最大バイト数（上流 CHIP_CONFIG_MAX_GROUP_NAME_LENGTH）。
 const GROUP_NAME_MAX: usize = 16;
 
@@ -301,7 +301,13 @@ fn parse_keymap(blob: &[u8]) -> Option<KeyMap> {
 /// bytes16}]（スロット1のみ実値、残りは 0/0/[0u8;16]）, ctx7 next }。読み側
 /// `kvs::parse_keyset_first_entry`/`parse_key_struct` はこの形の最初の
 /// エントリだけを見るので、残り2スロットの中身は問われない。
-fn serialize_keyset(policy: u16, start_time: u64, hash: u16, key: &[u8; 16], next: u16) -> Vec<u8> {
+pub(crate) fn serialize_keyset(
+    policy: u16,
+    start_time: u64,
+    hash: u16,
+    key: &[u8; 16],
+    next: u16,
+) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_uint(Tag::Context(1), u64::from(policy));
