@@ -559,6 +559,8 @@ REMOTE_SCRIPT
     echo "FAIL: 検証6 — iface auto-selected (native default) のログ行が見つからない" >&2
     exit 1
   fi
+  # Strip ANSI escape sequences from structured field output (tracing emits ANSI between field name/value)
+  IFACE_LINE=$(printf '%s' "$IFACE_LINE" | sed 's/\x1b\[[0-9;]*m//g')
   if ! printf '%s' "$IFACE_LINE" | grep -Eq 'iface[=:]"?eth0"?'; then
     echo "FAIL: 検証6 — 選択された iface が eth0 でない: $IFACE_LINE" >&2
     exit 1
