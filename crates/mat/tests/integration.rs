@@ -355,12 +355,12 @@ fn group_grant_with_forced_matd_exits_2() {
 //
 // `discover`（commissionable browse・`--probe` の mDNS targeted resolve 共に）
 // はこのテスト環境（サンドボックス）では `lo` 上の multicast 送信が
-// `Network is unreachable` として即エラーになり、native 側が chip-tool へ
-// フォールバックしてしまう（実機の「0 件で正常終了」や「IFF_MULTICAST 無しで
-// フォールバックのみ avahi 側に出る」という前提が成り立たない）。discover の
-// 成功系はもともと chip-tool のダミー実行体依存だった（撤去対象）ため、ここでは
-// 追わない — mDNS browse/probe 自体のロジックは `mat-controller::dnssd` /
-// `crates/mat/src/probe.rs` 側の責務。
+// `Network is unreachable` として即エラーになる。M8c-3 で chip-tool 経路
+// （Task 9/10）・avahi-browse フォールバック（Task 11）を撤去済みのため、
+// mDNS は dnssd 一本でフォールバック先が無く、I/O エラーはそのままハード
+// エラーになる（実機の「0 件で正常終了」という前提とは異なる環境）。discover
+// の成功系はここでは追わない — mDNS browse/probe 自体のロジックは
+// `mat-controller::dnssd` / `crates/mat/src/probe.rs` 側の責務。
 
 // ---- alias 解決（aliases.toml） ----
 //

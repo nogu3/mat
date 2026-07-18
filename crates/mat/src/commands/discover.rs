@@ -35,15 +35,16 @@ pub fn run(
     // 台帳から読むが、空ストアなら空配列になるだけ。
     let store = Store::open_or_init(store_path)?;
 
-    // commissionable 探索は native browse 一本化（M8c-3 で chip-tool 経路撤去）。
+    // commissionable 探索は native browse 一本化（M8c-3 で chip-tool 経路撤去、
+    // Task 11 で avahi-browse フォールバックも撤去 — mDNS は dnssd 一本）。
     // 結果 0 件は正常。IO 失敗はハードエラー（黙って落とさない — spec 設計3）。
-    // avahi 経路は Task 11 で扱う。
-    let iface = native.map(|c| c.iface).ok_or_else(|| {
+    let cfg = native.ok_or_else(|| {
         MatError::new(
             ErrorKind::Other,
             "discover: native backend not configured (internal)",
         )
     })?;
+    let iface = cfg.iface;
     let commissionable = native_commissionables(iface).map_err(|e| {
         MatError::new(
             ErrorKind::Unreachable,
@@ -66,13 +67,13 @@ pub fn run(
     // 判定する（M8b）。None = 未実施 or 実施不能（後者は reachable:null）。
     let instances: Option<Vec<MatterInstance>> = if probe {
         let ids: Vec<u64> = store.nodes().map(|n| n.node_id).collect();
-        match crate::probe::mdns(native.map(|c| crate::probe::NativeProbe {
-            iface: c.iface,
-            fabric_index: c.fabric_index,
-            issuer_index: c.issuer_index,
+        match crate::probe::mdns(crate::probe::NativeProbe {
+            iface: cfg.iface,
+            fabric_index: cfg.fabric_index,
+            issuer_index: cfg.issuer_index,
             store_root: store.root(),
             node_ids: &ids,
-        })) {
+        }) {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(

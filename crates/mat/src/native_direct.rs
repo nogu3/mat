@@ -327,7 +327,7 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             node_id: node_id.id(),
             endpoint: endpoint.id(),
         }),
-        // `Diag Node` は probe（ping6/avahi-browse）混在のため `run` の担当外
+        // `Diag Node` は probe（ping6/native mDNS resolve）混在のため `run` の担当外
         // （専用コマンド層 `commands::diag::node` が native IM probe + 補助
         // プローブを実施する）。
         Command::OpenWindow {
