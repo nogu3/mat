@@ -2,13 +2,13 @@
 //! （mDNS → BLE）・ErrorKind 写像を担う薄いラッパー。プロトコル本体は
 //! mat-controller（M6a `commission_on_network` / M6b `commission_ble_thread`）。
 //!
-//! フォールバック境界（spec 案A）: ワイヤ未接触（資材構築失敗・デバイス
-//! 未発見）だけが `Unavailable` = chip-tool へフォールバック可。PASE 開始後
-//! の失敗は Err — chip-tool での自動再実行は二重 commission を招くため
-//! 呼び出し側でもフォールバックしないこと。**例外（M8c-3）**: epoch IPK 解決
-//! （[`resolve_ipk_epoch`]）の失敗はワイヤ未接触でも Err — KVS 不整合や
-//! 非 chip-tool fabric を chip-tool へ静かに委ねない、という spec 承認済みの
-//! 挙動変更（M8c-1 時点では `Unavailable` だった）。
+//! M8c-3（chip-tool 撤去）: native が commission の唯一の経路。従来
+//! `CommissionAttempt::Unavailable`（ワイヤ未接触 → chip-tool フォールバック可）
+//! だった分岐はすべてハードエラー化した（`commission` は `Result<(), MatError>`）:
+//! - 発見の空振り（mDNS/BLE miss・manual code 0 件・PASE 直前の消失）→ `unreachable`。
+//! - KVS/資材/epoch 系 → `store_missing` / `store_parse`。
+//! - iface / UDP bind などローカル資材 → `other`。
+//! - PASE 開始後の失敗 → `kind_of` 写像（従来どおり）。
 
 use mat_controller::commissioning::{
     self, CommissionError, CommissionParams, CommissionTarget, CommissioningFabric,
@@ -30,17 +30,6 @@ pub struct CommissionRequest {
     pub thread_dataset: Option<Vec<u8>>,
     pub paa_dir: Option<std::path::PathBuf>,
     pub cd_signer_dir: Option<std::path::PathBuf>,
-}
-
-/// [`commission`] の結果。native が引き受けられなかった場合と成功の 2 値
-/// ——PASE 開始後の失敗は `Err` に載る（この enum には現れない）。
-pub enum CommissionAttempt {
-    /// native で完了（成功）。
-    Done,
-    /// native では引き受けられない（資材構築失敗 / デバイス未発見 =
-    /// ワイヤ未接触）。理由付き — 呼び出し側は warn を出して chip-tool へ
-    /// フォールバックする。
-    Unavailable(String),
 }
 
 /// setup code をパースした発見キー。QR は 12bit long、manual は 4bit short。
@@ -68,7 +57,7 @@ fn parse_code(s: &str) -> Result<Code, MatError> {
 }
 
 /// `CommissionError` → mat の `ErrorKind`（spec の写像。発見の空振り
-/// （`Discovery`）は呼び出し側が `Unavailable` に写すためここには来ない）。
+/// （`Discovery`）は `commission` 本体で `unreachable` に写すためここには来ない）。
 fn kind_of(e: &CommissionError) -> ErrorKind {
     match e {
         CommissionError::Timeout(_) => ErrorKind::Timeout,
@@ -87,8 +76,8 @@ fn commission_error(e: CommissionError) -> MatError {
 }
 
 /// manual code の short discriminator で commissionable 一覧から一意に選ぶ。
-/// 0 件 = `Ok(None)`（未発見 → フォールバック）、1 件 = `Ok(Some(_))`、2 件
-/// 以上 = `Err`（曖昧 — chip-tool でも同じ曖昧さなのでフォールバックしない）。
+/// 0 件 = `Ok(None)`（未発見 → 呼び出し側で `unreachable`）、1 件 = `Ok(Some(_))`、
+/// 2 件以上 = `Err`（曖昧 = `commission_failed`）。
 fn pick_by_short_strict(
     list: &[dnssd::CommissionableInstance],
     short: u8,
@@ -174,24 +163,31 @@ fn resolve_ipk_epoch(
     }
 }
 
-pub async fn commission(
-    cfg: &NativeConfig,
-    req: &CommissionRequest,
-) -> Result<CommissionAttempt, MatError> {
+pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(), MatError> {
     let code = parse_code(&req.setup_code)?;
 
-    // 資材構築（未接触 — 失敗は Unavailable = フォールバック可）。
-    let scope_id = match dnssd::iface_index(&cfg.iface) {
-        Ok(s) => s,
-        Err(e) => return Ok(CommissionAttempt::Unavailable(format!("iface: {e}"))),
-    };
+    // 資材構築（ローカル — M8c-3 で失敗は種別ごとのハードエラー）。
+    let scope_id = dnssd::iface_index(&cfg.iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("native commissioning: resolve iface {:?}: {e}", cfg.iface),
+        )
+    })?;
     let alpha = cfg.store.join("chip_tool_config.alpha.ini");
     let main_ini = cfg.store.join("chip_tool_config.ini");
     let materials =
         match kvs::read_self_issue_materials(&alpha, &main_ini, cfg.fabric_index, cfg.issuer_index)
         {
             Ok(m) => m,
-            Err(e) => return Ok(CommissionAttempt::Unavailable(format!("kvs: {e}"))),
+            // KVS 資材が読めない = fabric 未 bootstrap → store_missing。
+            Err(e) => {
+                return Err(MatError::new(
+                    ErrorKind::StoreMissing,
+                    format!(
+                        "native commissioning: read KVS credentials: {e} — run `mat fabric init`"
+                    ),
+                ))
+            }
         };
     // epoch IPK 解決（M8c-3）には fabric の root 公開鍵が要るため一度
     // `FabricCredentials` を組む——`kvs::SelfIssueMaterials` は既に
@@ -200,7 +196,13 @@ pub async fn commission(
     // で賄う。
     let creds = match fabric::FabricCredentials::from_self_issued(materials.clone()) {
         Ok(c) => c,
-        Err(e) => return Ok(CommissionAttempt::Unavailable(format!("self-issue: {e}"))),
+        // 資材はあるが NOC を組めない = 壊れた/不整合な store → store_parse。
+        Err(e) => {
+            return Err(MatError::new(
+                ErrorKind::StoreParse,
+                format!("native commissioning: self-issue NOC: {e}"),
+            ))
+        }
     };
     // 不一致（非 chip-tool fabric / IPK ローテーション済み）は Err —
     // フォールバックしない（resolve_ipk_epoch のドキュメント参照）。
@@ -218,19 +220,31 @@ pub async fn commission(
                     // mDNS に居ない → BLE を試す（ble ビルド + dataset 必須）。
                     return ble_path(&commissioning_fabric, req, passcode, long, scope_id).await;
                 }
-                Err(e) => return Ok(CommissionAttempt::Unavailable(format!("mdns: {e}"))),
+                Err(e) => {
+                    return Err(MatError::new(
+                        ErrorKind::Unreachable,
+                        format!("native commissioning: mdns resolve: {e}"),
+                    ))
+                }
             }
         }
         Code::Manual { passcode, short } => {
             let list = match dnssd::browse_commissionable(scope_id, dnssd::BROWSE_WINDOW).await {
                 Ok(l) => l,
-                Err(e) => return Ok(CommissionAttempt::Unavailable(format!("mdns: {e}"))),
+                Err(e) => {
+                    return Err(MatError::new(
+                        ErrorKind::Unreachable,
+                        format!("native commissioning: mdns browse: {e}"),
+                    ))
+                }
             };
             match pick_by_short_strict(&list, short)? {
                 Some(c) => {
                     let Some(addr) = c.addresses.first() else {
-                        return Ok(CommissionAttempt::Unavailable(
-                            "commissionable found but no address resolved".into(),
+                        return Err(MatError::new(
+                            ErrorKind::Unreachable,
+                            "native commissioning: commissionable found but no address resolved"
+                                .to_string(),
                         ));
                     };
                     let port = c.port.unwrap_or(5540);
@@ -249,22 +263,27 @@ pub async fn commission(
                 // manual code は BLE 経路なし（scan は 12bit 完全一致 —
                 // BLE で commission したい場合は QR を使う）。
                 None => {
-                    return Ok(CommissionAttempt::Unavailable(
-                        "not found via mDNS (manual code cannot use BLE; use the QR payload)"
-                            .into(),
+                    return Err(MatError::new(
+                        ErrorKind::Unreachable,
+                        "native commissioning: not found via mDNS (manual code cannot use BLE; use the QR payload)"
+                            .to_string(),
                     ))
                 }
             }
         }
     };
 
-    // UDP bind はローカルのエフェメラルポート取得のみ — ワイヤ未接触なので
-    // 失敗は Unavailable（chip-tool フォールバック可）。on-network 実行は
-    // ここから先（commission_on_network 呼び出し）が実ワイヤ接触で、そちらの
-    // 失敗は Err。
+    // UDP bind はローカルのエフェメラルポート取得のみ。M8c-3 で失敗は other。
+    // on-network 実行はここから先（commission_on_network 呼び出し）が実ワイヤ
+    // 接触で、そちらの失敗は `kind_of` 写像。
     let transport = match UdpTransport::bind().await {
         Ok(t) => std::sync::Arc::new(t),
-        Err(e) => return Ok(CommissionAttempt::Unavailable(format!("udp bind: {e}"))),
+        Err(e) => {
+            return Err(MatError::new(
+                ErrorKind::Other,
+                format!("native commissioning: udp bind: {e}"),
+            ))
+        }
     };
     let dev = match commissioning::commission_on_network(
         transport,
@@ -281,13 +300,13 @@ pub async fn commission(
     .await
     {
         Ok(d) => d,
-        // 内部 resolve（PASE より前 — ワイヤ未接触）での空振り。事前 resolve
-        // 成功後の狭い競合窓だが、規則どおり Unavailable = chip-tool
-        // フォールバック可に倒す。
+        // 内部 resolve（PASE より前）での空振り。事前 resolve 成功後の狭い競合窓
+        // だが発見の空振りなので unreachable に倒す（M8c-3: フォールバック撤去）。
         Err(CommissionError::Discovery(e)) => {
-            return Ok(CommissionAttempt::Unavailable(format!(
-                "commissionable disappeared before PASE: {e}"
-            )))
+            return Err(MatError::new(
+                ErrorKind::Unreachable,
+                format!("native commissioning: commissionable disappeared before PASE: {e}"),
+            ))
         }
         Err(other) => return Err(commission_error(other)),
     };
@@ -296,7 +315,7 @@ pub async fn commission(
         fabric_index = ?dev.fabric_index,
         "commission executed (native on-network)"
     );
-    Ok(CommissionAttempt::Done)
+    Ok(())
 }
 
 /// BLE 経路（feature "ble"）。scan の空振りは `commission_ble_thread` 内部で
@@ -318,10 +337,12 @@ async fn ble_path(
     passcode: u32,
     long: u16,
     scope_id: u32,
-) -> Result<CommissionAttempt, MatError> {
+) -> Result<(), MatError> {
     let Some(dataset) = req.thread_dataset.as_deref() else {
-        return Ok(CommissionAttempt::Unavailable(
-            "not found via mDNS and no --thread-dataset for the BLE path".into(),
+        return Err(MatError::new(
+            ErrorKind::Unreachable,
+            "native commissioning: not found via mDNS and no --thread-dataset for the BLE path"
+                .to_string(),
         ));
     };
     match commissioning::commission_ble_thread(
@@ -344,15 +365,16 @@ async fn ble_path(
                 fabric_index = ?dev.fabric_index,
                 "commission executed (native ble-thread)"
             );
-            Ok(CommissionAttempt::Done)
+            Ok(())
         }
-        // BLE scan の空振り（デバイスが見えない）はワイヤ未接触。
+        // BLE scan の空振り（デバイスが見えない）= 発見の空振り → unreachable。
         Err(CommissionError::Ble {
             step: "scan",
             detail,
-        }) => Ok(CommissionAttempt::Unavailable(format!(
-            "ble scan: {detail}"
-        ))),
+        }) => Err(MatError::new(
+            ErrorKind::Unreachable,
+            format!("native commissioning: ble scan: {detail}"),
+        )),
         Err(other) => Err(commission_error(other)),
     }
 }
@@ -364,9 +386,12 @@ async fn ble_path(
     _passcode: u32,
     _long: u16,
     _scope_id: u32,
-) -> Result<CommissionAttempt, MatError> {
-    Ok(CommissionAttempt::Unavailable(
-        "not found via mDNS; this build has no BLE support (feature \"ble\")".into(),
+) -> Result<(), MatError> {
+    // mDNS miss + BLE 未コンパイル → unreachable（detail に ble feature を明記）。
+    Err(MatError::new(
+        ErrorKind::Unreachable,
+        "native commissioning: not found via mDNS; this build has no BLE support (feature \"ble\")"
+            .to_string(),
     ))
 }
 

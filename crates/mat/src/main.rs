@@ -1,5 +1,6 @@
-//! `mat` — Matter デバイス操作 CLI。`chip-tool` をサブプロセスで呼び、その出力を
-//! `mat` のスキーマに正規化して返す。
+//! `mat` — Matter デバイス操作 CLI。native バックエンド（`mat-controller` /
+//! `mat-native`）で直接 Matter を喋り、結果を `mat` のスキーマで返す（M8c-3 で
+//! chip-tool 経路は撤去）。
 //!
 //! stdout は純粋な構造化 JSON のみ。診断は stderr に構造化ログ（`tracing`）。
 //! 認証情報 KVS 以外の永続状態は持たない。
@@ -10,15 +11,13 @@ mod matd_client;
 mod native_direct;
 mod probe;
 mod resolve;
-mod runner;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, DiagCommand, FabricAction, GroupCommand};
-use mat_core::alias::NodeRef;
+use cli::{Cli, Command, DiagCommand, FabricAction};
 use mat_core::error::ErrorKind;
 use mat_core::store::Store;
 
@@ -69,7 +68,7 @@ fn main() -> ExitCode {
 
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
-    // 失敗時と非対応 op は下の直 chip-tool 経路へフォールスルー）。store の locate は
+    // 失敗時と非対応 op は下の native 直経路へフォールスルー）。store の locate は
     // 不要（node 解決は matd 側が KVS で行う）。
     match matd_client::resolve_route(
         &args.matd,
@@ -87,7 +86,7 @@ fn main() -> ExitCode {
 
     // native 直経路: MAT_IFACE 設定時はその iface、未設定なら自動検出
     // （M8c-3 native 既定化）。自動検出の候補 0 / 複数はハードエラー
-    // （chip-tool へ黙って落とさない — spec 設計 3）。
+    // （黙って落とさない — spec 設計 3）。
     let iface_owned: String = match &args.iface {
         Some(i) => i.clone(),
         None => match mat_native::iface_select::autodetect() {
@@ -107,7 +106,7 @@ fn main() -> ExitCode {
         issuer_index: args.issuer_index,
     });
     if let Some(cfg) = &native_cfg {
-        if let Some(result) = native_direct::try_run(&command, &store_path, cfg) {
+        if let Some(result) = native_direct::run(&command, &store_path, cfg) {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -119,6 +118,9 @@ fn main() -> ExitCode {
         }
     }
 
+    // native_direct::run が `None` を返す op = 専用コマンド層を持つもの
+    // （discover / commission / diag node）。それ以外の op はすべて native_direct
+    // が処理済み（M8c-3 で chip-tool 経路は撤去）。
     let result = match &command {
         Command::Discover { probe } => {
             commands::discover::run(&store_path, *probe, native_cfg.as_ref())
@@ -138,185 +140,25 @@ fn main() -> ExitCode {
             native_cfg.as_ref(),
             thread_dataset.as_deref(),
         ),
-        Command::Read {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-        } => commands::read::run(&store_path, node_id.id(), endpoint.id(), cluster, attribute),
-        Command::Write {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-            value,
-        } => commands::write::run(
+        Command::Diag {
+            action:
+                DiagCommand::Node {
+                    node_id,
+                    endpoint,
+                    deep,
+                },
+        } => commands::diag::node(
             &store_path,
             node_id.id(),
             endpoint.id(),
-            cluster,
-            attribute,
-            value,
+            *deep,
+            native_cfg.as_ref(),
         ),
-        Command::Invoke {
-            node_id,
-            endpoint,
-            cluster,
-            command,
-            args,
-        } => commands::invoke::run(
-            &store_path,
-            node_id.id(),
-            endpoint.id(),
-            cluster,
-            command,
-            args,
-        ),
-        Command::Describe { node_id } => commands::describe::run(&store_path, node_id.id()),
-        Command::On { node_id, endpoint } => {
-            commands::invoke::run_onoff(&store_path, node_id.id(), endpoint.id(), true)
+        // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
+        // Command::Fabric は route dispatch より前の早期 return で処理済み。
+        _ => {
+            unreachable!("native_direct::run handles all ops except discover/commission/diag-node")
         }
-        Command::Off { node_id, endpoint } => {
-            commands::invoke::run_onoff(&store_path, node_id.id(), endpoint.id(), false)
-        }
-        Command::ColorTemp {
-            node_id,
-            endpoint,
-            kelvin,
-            mireds,
-            transition,
-        } => {
-            // --kelvin / --mireds を (mireds, kelvin) に解決（欠けた側は逆数換算で補完）。
-            let (mireds, kelvin) = commands::invoke::resolve_color_temp(*kelvin, *mireds);
-            commands::invoke::run_color_temp(
-                &store_path,
-                node_id.id(),
-                endpoint.id(),
-                kelvin,
-                mireds,
-                *transition,
-            )
-        }
-        Command::Color {
-            node_id,
-            endpoint,
-            spec,
-            transition,
-        } => mat_core::color::resolve_spec(
-            spec.name.as_deref(),
-            spec.rgb.as_deref(),
-            spec.hue,
-            spec.sat,
-        )
-        .and_then(|c| {
-            commands::invoke::run_color(&store_path, node_id.id(), endpoint.id(), &c, *transition)
-        }),
-        Command::OpenWindow {
-            node_id,
-            timeout,
-            iteration,
-            discriminator,
-        } => {
-            // discriminator 未指定なら node_id から決定的に算出（12-bit に収める、
-            // native 直経路 classify と同じ共有式）。
-            let disc = native_direct::resolve_discriminator(node_id.id(), *discriminator);
-            commands::open_window::run(&store_path, node_id.id(), *timeout, *iteration, disc)
-        }
-        Command::Group { action } => match action {
-            GroupCommand::Provision {
-                group_id,
-                node_ids,
-                keyset_id,
-                name,
-                endpoint,
-                epoch_key,
-                rebind,
-            } => {
-                // name 未指定なら group_id から決定的に補完（open-window の disc と同様）。
-                let gid = group_id.id();
-                let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
-                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
-                commands::group::provision(
-                    &store_path,
-                    gid,
-                    &ids,
-                    *keyset_id,
-                    &name,
-                    *endpoint,
-                    epoch_key.as_deref(),
-                    *rebind,
-                )
-            }
-            GroupCommand::Invoke {
-                group_id,
-                cluster,
-                command,
-                args,
-                endpoint,
-            } => commands::group::invoke(
-                &store_path,
-                group_id.id(),
-                cluster,
-                command,
-                args,
-                *endpoint,
-            ),
-            GroupCommand::Grant { group_id, node_ids } => {
-                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
-                commands::group::grant(&store_path, group_id.id(), &ids)
-            }
-            GroupCommand::ColorTemp {
-                group_id,
-                kelvin,
-                mireds,
-                transition,
-                endpoint,
-            } => {
-                // --kelvin / --mireds を (mireds, kelvin) に解決（単体 color-temp と同じ規則）。
-                let (mireds, kelvin) = commands::invoke::resolve_color_temp(*kelvin, *mireds);
-                commands::group::color_temp(
-                    &store_path,
-                    group_id.id(),
-                    kelvin,
-                    mireds,
-                    *transition,
-                    *endpoint,
-                )
-            }
-            GroupCommand::Color {
-                group_id,
-                spec,
-                transition,
-                endpoint,
-            } => mat_core::color::resolve_spec(
-                spec.name.as_deref(),
-                spec.rgb.as_deref(),
-                spec.hue,
-                spec.sat,
-            )
-            .and_then(|c| {
-                commands::group::color(&store_path, group_id.id(), &c, *transition, *endpoint)
-            }),
-        },
-        Command::Diag { action } => match action {
-            DiagCommand::Thread { node_id, endpoint } => {
-                commands::diag::thread(&store_path, node_id.id(), endpoint.id())
-            }
-            DiagCommand::Node {
-                node_id,
-                endpoint,
-                deep,
-            } => commands::diag::node(
-                &store_path,
-                node_id.id(),
-                endpoint.id(),
-                *deep,
-                native_cfg.as_ref(),
-            ),
-        },
-        // Command::Fabric は上の早期 return で必ず処理済み（ここには来ない —
-        // 網羅 match を保つためだけの腕）。
-        Command::Fabric { .. } => unreachable!("Command::Fabric handled before route dispatch"),
     };
 
     match result {

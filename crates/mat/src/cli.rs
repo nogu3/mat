@@ -13,7 +13,7 @@ use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
 #[command(
     name = "mat",
     version,
-    about = "Matter device control CLI (chip-tool wrapper)"
+    about = "Matter device control CLI (native Matter backend)"
 )]
 pub struct Cli {
     /// 認証情報ストアのパス（既定: $MAT_STORE / $XDG_CONFIG_HOME/mat / ~/.config/mat）。
