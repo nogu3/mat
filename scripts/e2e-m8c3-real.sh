@@ -734,7 +734,7 @@ stage2_main() {
   echo "WARN: node $NODE を一時的に第2 fabric（fresh store）へ join させます。実行判断は下記プロンプトで。" >&2
   if confirm_yn "検証3（cross-fabric commission、node=$NODE への open-window+commission+新fabricのRemoveFabricを伴う）を実行しますか"; then
     echo "-- open-window（元 fabric、node=$NODE、STORE_ARG=${STORE_ARG[*]:-<default>}）"
-    local OW_OUT OW_MANUAL_CODE
+    local OW_OUT OW_QR
     # op_sweep（検証1）で既に開いた commissioning window（180s有効期間）がまだ閉じていない場合、
     # ここでの open-window はデバイスから device_rejected (rc=4, IM status 0x02) を返す。
     # 初回 open の window 失効まで最大 45s×5 回リトライで対応する。
@@ -755,17 +755,17 @@ stage2_main() {
     fi
     echo "$OW_OUT"
     assert_no_fallback "open-window (cross-fabric prep)"
-    OW_MANUAL_CODE=$(printf '%s' "$OW_OUT" | jq -r '.manual_code')
-    if [ -z "$OW_MANUAL_CODE" ] || [ "$OW_MANUAL_CODE" = "null" ]; then
-      echo "FAIL: open-window の manual_code が取得できない" >&2
+    OW_QR=$(printf '%s' "$OW_OUT" | jq -r '.qr_payload')
+    if [ -z "$OW_QR" ] || [ "$OW_QR" = "null" ]; then
+      echo "FAIL: open-window の qr_payload が取得できない" >&2
       exit 1
     fi
 
-    echo "-- fresh store から on-network commission（manual code、commissioning window 再オープン待ちのため最大3回リトライ）"
+    echo "-- fresh store から on-network commission（QR ペイロード（long discriminator で targeted resolve、曖昧性回避）、commissioning window 再オープン待ちのため最大3回リトライ）"
     local NEW_NODE_JSON ok attempt
     ok=0
     for attempt in 1 2 3; do
-      if NEW_NODE_JSON=$(run_native_fresh commission --target "m8c3-cross-fabric-probe" --setup-code "$OW_MANUAL_CODE"); then
+      if NEW_NODE_JSON=$(run_native_fresh commission --target "m8c3-cross-fabric-probe" --setup-code "$OW_QR"); then
         ok=1
         break
       fi
