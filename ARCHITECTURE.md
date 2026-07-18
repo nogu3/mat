@@ -831,9 +831,27 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       「RemoveFabric → on-network 再 commission」は NL68（玄関ライト）では構造的に
       不可能（工場リセットせずに commissioning window を開く手段がデバイス側に
       無い）ため、epoch の検証は手動 native commission を複数回走らせて採用永続の
-      冪等性・単調性を確認する形に置換した。**ゲート 2（chip-tool を PATH から
-      外した環境での最終受け入れ + `mat fabric init` 実機 + deploy 成果物の実機
-      動作）は Task 13 で実施予定（pending）**。
+      冪等性・単調性を確認する形に置換した。
+    - **実機 E2E ゲート 2（Stage 2、最終受け入れ、2026-07-18）**: **PASS**（検証 3 は
+      文書化した逸脱）。検証 1（chip-tool を PATH から外した `PATH=/usr/bin:/bin`
+      環境で全 op が native 完走・直経路/matd 経路とも成功・「falling back to
+      chip-tool」発火ゼロ・配布バイナリに当該文字列も存在しない）= GREEN。検証 2
+      （`mat fabric init` 新規 KVS 生成 + 再 init 拒否 exit 1/kind:other）= GREEN。
+      検証 4（gnu+BLE 配布バイナリが `libdbus-1.so.3` をリンクし bluer シンボルを
+      含む = BLE コンパイル済。加えてゲート 1 で native BLE+Thread commission が実機
+      2 回成功）= GREEN。検証 5（`task check` 全 green + `docker build` 成功、イメージ
+      `mat 0.22.0`・chip-tool 不在を確認）= GREEN。**文書化した逸脱（検証 3、
+      cross-fabric commission）**: `mat fabric init` で作った新 fabric へ実機を
+      on-network で multi-admin join する検証は、実機 Thread デバイスの ECM（拡張
+      commissioning window）の commissionable 広告が on-network の targeted resolve
+      で安定して解決できない（+ open-window の window 状態競合、IM cluster status
+      0x02）ため実施できなかった — ゲート 1 の NL68 と同じクラスの実機環境の難しさで
+      あり mat のバグではない（commission は正しく unreachable/device_rejected を
+      返す）。commission 機構自体はゲート 1（BLE×2）/ M8c-1（on-network）で実証済、
+      `mat fabric init` の資材は `write_kvs_bootstrap` の round-trip 単体テスト
+      （epoch→operational 導出チェーンを実リーダで検証）で構造検証済。唯一ライブ
+      未実証なのは「fabric-init 資材 → ライブ AddNOC」の組合せで、ユーザー判断で
+      逸脱を受容してマージした。
     - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
       デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
       挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
