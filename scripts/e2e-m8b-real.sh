@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M8b 受け入れ: `mat discover` / `mat discover --probe` / `mat diag node
 # --deep` の mDNS プローブ（commissionable 探索・到達性判定）が MAT_IFACE 設定時
 # に chip-tool / avahi-browse を一切 spawn せず native（mat-controller::dnssd）

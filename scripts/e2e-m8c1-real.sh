@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M8c-1 受け入れ: `mat commission` の native 直経路（MAT_IFACE 設定時、
 # mDNS→BLE 自動フォールバック）が chip-tool を spawn せず完走すること
 # （on-network / BLE+Thread 両経路）、native 経路で commission したノードへの

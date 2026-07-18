@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M8c-2 受け入れ: `mat group provision` のコントローラ側 group state
 # 書込（groupsettings add-group/add-keysets/bind-keyset 相当）が MAT_IFACE
 # 設定時に chip-tool を一切 spawn せず native KVS 直書き（mat-controller::

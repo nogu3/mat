@@ -72,6 +72,8 @@ pub enum KvsError {
     },
     BadCounter(&'static str),
     Locked,
+    /// `KvsTxn::create` の対象パスが既に存在する（M8c-3）。
+    AlreadyExists,
 }
 
 impl std::fmt::Display for KvsError {
@@ -111,6 +113,7 @@ impl std::fmt::Display for KvsError {
             }
             KvsError::BadCounter(reason) => write!(f, "kvs key \"g/gdc\": {reason}"),
             KvsError::Locked => write!(f, "kvs: locked by another process"),
+            KvsError::AlreadyExists => write!(f, "kvs already exists"),
         }
     }
 }
@@ -653,25 +656,32 @@ pub struct KvsTxn {
     _lock: std::fs::File,
 }
 
+/// sidecar `<path>.lock` を advisory flock（NonBlocking exclusive）する。
+/// `open` / `create` 共通の手順を括り出したもの。
+fn take_lock(path: &Path) -> Result<std::fs::File, KvsError> {
+    use rustix::fs::{flock, FlockOperation};
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::path::PathBuf::from(lock_path))
+        .map_err(KvsError::Io)?;
+    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+        if e == rustix::io::Errno::WOULDBLOCK {
+            KvsError::Locked
+        } else {
+            KvsError::Io(std::io::Error::other(e))
+        }
+    })?;
+    Ok(lock)
+}
+
 impl KvsTxn {
     pub fn open(path: &Path) -> Result<Self, KvsError> {
-        use rustix::fs::{flock, FlockOperation};
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(std::path::PathBuf::from(lock_path))
-            .map_err(KvsError::Io)?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == rustix::io::Errno::WOULDBLOCK {
-                KvsError::Locked
-            } else {
-                KvsError::Io(std::io::Error::other(e))
-            }
-        })?;
+        let lock = take_lock(path)?;
         let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
         // 末尾改行の有無を記録（commit で復元するため）。
         let trailing_newline = text.ends_with('\n');
@@ -713,6 +723,25 @@ impl KvsTxn {
             default_start,
             default_end,
             trailing_newline,
+            _lock: lock,
+        })
+    }
+
+    /// 新規 INI を作る（M8c-3、fabric bootstrap 用）。`path` が既に存在すれば
+    /// `KvsError::AlreadyExists`（上書きしない）。無ければ sidecar `.lock` を
+    /// 取ってから `[Default]` セクションだけの空トランザクションを返す
+    /// （`open` と同じ flock 手順・`commit` も共通）。
+    pub fn create(path: &Path) -> Result<Self, KvsError> {
+        if path.exists() {
+            return Err(KvsError::AlreadyExists);
+        }
+        let lock = take_lock(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines: vec!["[Default]".to_string()],
+            default_start: 1,
+            default_end: 1,
+            trailing_newline: true,
             _lock: lock,
         })
     }
@@ -781,6 +810,45 @@ impl KvsTxn {
         std::fs::rename(&tmp, &self.path).map_err(KvsError::Io)?;
         Ok(())
     }
+}
+
+/// mat 専用の epoch IPK 永続キー（M8c-3）。chip-tool の名前空間
+/// （`f/<idx>/...` / `g/...` / `ExampleOpCredsCAKey<n>` 等）と衝突しない
+/// `mat/` プレフィクスを使う。chip-tool は未知キーを無視するため、
+/// Stage 1（chip-tool 共存期）でも安全。値は 16 バイトの epoch 鍵の base64。
+pub fn mat_ipk_epoch_key(fabric_index: u8) -> String {
+    format!("mat/f/{fabric_index}/ipk-epoch")
+}
+
+/// mat が永続した epoch IPK を読む。キー無し = `Ok(None)`（未採用 —
+/// 呼び出し側は既定定数の検証採用にフォールバック）。16 バイト以外の値は
+/// 不正データとして `KvsError::BadKeyset`（既存の「不正データ」系バリアント
+/// を流用 — 新規バリアントは追加しない）。
+pub fn read_mat_ipk_epoch(main_ini: &Path, fabric_index: u8) -> Result<Option<[u8; 16]>, KvsError> {
+    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    match decode_b64(sec, &mat_ipk_epoch_key(fabric_index))? {
+        None => Ok(None),
+        Some(v) => {
+            let arr: [u8; 16] = v.try_into().map_err(|_| KvsError::BadKeyset {
+                fabric_index,
+                reason: "mat ipk epoch must be 16 bytes",
+            })?;
+            Ok(Some(arr))
+        }
+    }
+}
+
+/// mat の epoch IPK を KVS へ永続する（`KvsTxn` 経由、flock 排他・
+/// tmp+rename 原子置換 — M8c-2 と同じ規律）。
+pub fn write_mat_ipk_epoch(
+    main_ini: &Path,
+    fabric_index: u8,
+    epoch: &[u8; 16],
+) -> Result<(), KvsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    txn.set(&mat_ipk_epoch_key(fabric_index), epoch);
+    txn.commit()
 }
 
 #[cfg(test)]
@@ -1358,5 +1426,28 @@ mod tests {
         txn.commit().unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert_eq!(text, "[Default]\ng/gdc=AQAAAA==");
+    }
+
+    // ---- M8c-3 Task 6: mat-epoch キー ----
+
+    #[test]
+    fn mat_ipk_epoch_roundtrip_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        assert_eq!(read_mat_ipk_epoch(&ini, 1).unwrap(), None);
+        let epoch = [0xA5u8; 16];
+        write_mat_ipk_epoch(&ini, 1, &epoch).unwrap();
+        assert_eq!(read_mat_ipk_epoch(&ini, 1).unwrap(), Some(epoch));
+        // 別 fabric index は独立
+        assert_eq!(read_mat_ipk_epoch(&ini, 2).unwrap(), None);
+        // 16 バイト以外は KvsError（手で壊す）
+        let text = std::fs::read_to_string(&ini).unwrap();
+        std::fs::write(
+            &ini,
+            text.replace(&base64ct::Base64::encode_string(&epoch), "AAAA"),
+        )
+        .unwrap();
+        assert!(read_mat_ipk_epoch(&ini, 1).is_err());
     }
 }

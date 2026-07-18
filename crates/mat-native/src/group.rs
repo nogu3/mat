@@ -1,6 +1,7 @@
 //! groupcast 送信コンテキストと送出処理。「未 provision・KVS 不備・counter
 //! 初期化不能」は `GroupOutcome::Unavailable` に写像し、呼び出し側（mat / matd）
-//! が chip-tool へフォールバックする合図として使う。
+//! が `store_parse` の per-op ハードエラーへ変換する合図として使う
+//! （M8c-3: chip-tool フォールバック撤去）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,8 @@ pub struct GroupCtx {
 }
 
 /// group 送信の結果。`Unavailable` は「native では送れない（未 provision・
-/// KVS 不備等）」で、server 層が chip-tool へフォールバックする合図。
+/// KVS 不備等）」で、消費側（mat / matd）が `store_parse` の per-op
+/// ハードエラーへ変換する合図（M8c-3: chip-tool フォールバック撤去）。
 pub enum GroupOutcome {
     Sent,
     Unavailable(String),
@@ -169,7 +171,7 @@ mod tests {
             .await;
             match result {
                 Ok(Ok(_)) => {
-                    // 未 provision group は Unavailable（フォールバックさせる）。
+                    // 未 provision group は Unavailable（消費側で store_parse ハードエラーになる）。
                     let r = send(&ctx, 99, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
                         .await
                         .unwrap();

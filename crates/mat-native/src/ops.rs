@@ -50,8 +50,8 @@ pub async fn describe(conn: &mut dyn NodeConn) -> Result<Vec<(u16, Vec<u64>)>, M
     Ok(out)
 }
 
-/// JSON 配列から数値要素のみを u64 化して集める（chip-tool 経路の
-/// `parse_id_list` と同じ寛容さ: 配列でない/数値でない要素はスキップ）。
+/// JSON 配列から数値要素のみを u64 化して集める（配列でない/数値でない
+/// 要素はスキップする寛容な変換）。
 fn parse_id_list_json(v: &Value) -> Vec<u64> {
     match v.as_array() {
         Some(items) => items.iter().filter_map(Value::as_u64).collect(),
@@ -88,7 +88,7 @@ const TABLES: &[(&str, &str)] = &[
 
 /// NeighborTableStruct（cluster 53）の field id → chip-tool 表記名。
 /// 表記は `crates/mat-core/src/parse.rs` の `struct_list_parses_neighbor_table`
-/// テスト（＝ fake-chip-tool フィクスチャ `neighbor-table` と同値）から確定。
+/// テスト（＝実 chip-tool の `neighbor-table` ログと同値）から確定。
 /// field id は Matter spec cluster 53 NeighborTableStruct の定義順。
 const NEIGHBOR_TABLE_FIELDS: &[(u8, &str)] = &[
     (0, "ExtAddress"),
@@ -109,9 +109,9 @@ const NEIGHBOR_TABLE_FIELDS: &[(u8, &str)] = &[
 
 /// RouteTableStruct（cluster 53）の field id → chip-tool 表記名。
 /// 表記は `crates/mat-core/src/parse.rs` の `struct_list_realworld_log_format`
-/// テスト（＝ fake-chip-tool フィクスチャ `route-table` と同値）から確定。
+/// テスト（＝実 chip-tool の `route-table` ログと同値）から確定。
 /// **注意**: LQI 表記は NeighborTable の "Lqi" と揃わず "LQIIn"/"LQIOut"
-/// （chip-tool の実際の表記ゆれ、フィクスチャが正）。
+/// （chip-tool の実際の表記ゆれ、テストのログサンプルが正）。
 const ROUTE_TABLE_FIELDS: &[(u8, &str)] = &[
     (0, "ExtAddress"),
     (1, "Rloc16"),

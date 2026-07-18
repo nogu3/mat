@@ -1,23 +1,20 @@
 //! `mat commission` — fabric への参加（初回 commission / multi-admin join 両対応）。
 //!
-//! `chip-tool pairing code <node-id> <setup-code>` をラップする。`setup_code` は
-//! 印刷された QR/manual code（初回）でも、既存 admin が開いた window の発行コード
-//! （join）でも一様に扱える。Root CA / 自分の NOC は chip-tool が初回 pairing 時に
-//! ストア配下へ生成・永続する。
+//! バックエンドは native（`mat-native::commission`, M8c-1; M8c-3 で chip-tool
+//! 経路は撤去）。`setup_code` は印刷された QR/manual code（初回）でも、既存 admin が
+//! 開いた window の発行コード（join）でも一様に扱える。Root CA / 自分の NOC は
+//! `mat fabric init` が事前に生成・永続する。
 //!
-//! `target`（IP/DNS）は台帳のメタとして記録する。`pairing code` はコード内の
-//! discriminator から mDNS でノードを自前探索するため、chip-tool には渡さない。
+//! `target`（IP/DNS）は台帳のメタとして記録する。コード内の discriminator から
+//! mDNS でノードを自前探索する。
 
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::runner::ChipTool;
 use mat_core::alias::AliasBook;
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::normalize::classify_failure;
 use mat_core::output;
-use mat_core::parse::commission_succeeded;
 use mat_core::store::{NodeRecord, Store};
 
 pub fn run(
@@ -29,60 +26,21 @@ pub fn run(
     native: Option<&crate::native_direct::Config<'_>>,
     thread_dataset: Option<&str>,
 ) -> Result<(), MatError> {
-    // commission はストアを bootstrap してよい経路（初回 fabric 作成を含む）。
+    // commission はストアを bootstrap してよい経路（node_id 採番のため）。
     let mut store = Store::open_or_init(store_path)?;
     let node_id = node_id.unwrap_or_else(|| next_node_id(&store));
 
-    // native 直経路（M8c-1）: MAT_IFACE 設定時は mat-controller で
-    // in-process commission。Unavailable（未接触失敗）のみ chip-tool へ
-    // フォールバック。Err（PASE 開始後の失敗）は即エラー — chip-tool での
-    // 自動再実行は二重 commission を招くためフォールバックしない。
-    if let Some(cfg) = native {
-        match native_commission(cfg, &store, setup_code, node_id, thread_dataset) {
-            Ok(NativeOutcome::Done) => {
-                return record_success(&mut store, node_id, target, alias);
-            }
-            Ok(NativeOutcome::Unavailable(reason)) => {
-                tracing::warn!(%reason, "native commissioning unavailable; falling back to chip-tool");
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    let chip = ChipTool::new(store.root());
-
-    // 本番 Matter デバイスは DAC が本番 PAA で署名されており、chip-tool 既定の
-    // 開発用 PAA だけでは attestation 検証に失敗する（Failed Device Attestation）。
-    // PAA ルート証明書ディレクトリが解決できれば chip-tool に渡す。
-    let mut args: Vec<String> = vec![
-        "pairing".to_string(),
-        "code".to_string(),
-        node_id.to_string(),
-        setup_code.to_string(),
-    ];
-    if let Some(paa) = paa_trust_store_path(store.root()) {
-        args.push("--paa-trust-store-path".to_string());
-        args.push(paa.to_string_lossy().into_owned());
-    }
-
-    let out = chip.run(args)?;
-
-    if out.success() && commission_succeeded(&out.stdout) {
-        return record_success(&mut store, node_id, target, alias);
-    }
-
-    // 失敗。chip-tool の粗い exit code に頼らず出力から種別を分類し、
-    // 分類できなければ commission_failed にフォールバック。
-    let kind = classify_failure(&out.stdout, &out.stderr).unwrap_or(ErrorKind::CommissionFailed);
-    Err(MatError::new(
-        kind,
-        format!("commissioning node {node_id} ({target}) failed"),
-    ))
-}
-
-enum NativeOutcome {
-    Done,
-    Unavailable(String),
+    // native commission（M8c-1; M8c-3 で唯一の経路）。発見空振り = unreachable、
+    // KVS/資材/epoch 系 = store_missing/store_parse、PASE 開始後の失敗も含め
+    // すべてハードエラー（chip-tool フォールバックは撤去）。
+    let cfg = native.ok_or_else(|| {
+        MatError::new(
+            ErrorKind::Other,
+            "commission: native backend not configured (internal)",
+        )
+    })?;
+    native_commission(cfg, &store, setup_code, node_id, thread_dataset)?;
+    record_success(&mut store, node_id, target, alias)
 }
 
 fn native_commission(
@@ -91,7 +49,7 @@ fn native_commission(
     setup_code: &str,
     node_id: u64,
     thread_dataset: Option<&str>,
-) -> Result<NativeOutcome, MatError> {
+) -> Result<(), MatError> {
     let dataset = thread_dataset
         .map(|h| {
             decode_hex(h).ok_or_else(|| {
@@ -119,12 +77,7 @@ fn native_commission(
         .enable_all()
         .build()
         .map_err(|e| MatError::new(ErrorKind::Other, format!("tokio runtime: {e}")))?;
-    match rt.block_on(mat_native::commission::commission(&ncfg, &req))? {
-        mat_native::commission::CommissionAttempt::Done => Ok(NativeOutcome::Done),
-        mat_native::commission::CommissionAttempt::Unavailable(r) => {
-            Ok(NativeOutcome::Unavailable(r))
-        }
-    }
+    rt.block_on(mat_native::commission::commission(&ncfg, &req))
 }
 
 /// 台帳 upsert + alias + JSON 出力（chip-tool 経路の成功側と共通）。

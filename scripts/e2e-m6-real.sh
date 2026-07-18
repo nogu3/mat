@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M6a 受け入れ: 実機（本番 fabric）に対する native commissioning。
 # 本番 fabric の Nanoleaf に native open-window → 使い捨て第二 fabric へ
 # native commission（実 _matterc browse + 本物 DAC の厳格 attestation）→

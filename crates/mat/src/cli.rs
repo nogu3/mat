@@ -13,7 +13,7 @@ use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
 #[command(
     name = "mat",
     version,
-    about = "Matter device control CLI (chip-tool wrapper)"
+    about = "Matter device control CLI (native Matter backend)"
 )]
 pub struct Cli {
     /// 認証情報ストアのパス（既定: $MAT_STORE / $XDG_CONFIG_HOME/mat / ~/.config/mat）。
@@ -24,19 +24,20 @@ pub struct Cli {
     /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ、無ければ既定パス
     /// （`$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`）。
     /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記の socket へ接続を
-    /// 試み、matd がいればそちら、いなければ直 chip-tool にフォールバック。
+    /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
     /// matd 対応は read/write/invoke/on/off/color-temp/color/describe/group のみ
-    /// （discover/commission/open-window/diag は常に直経路; 本フラグ明示時は exit 2）。
+    /// （discover/commission/open-window/diag/fabric は常に直経路; fabric 以外は本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
     /// one-shot 直経路を native（mat-controller 内蔵）で実行する場合の
-    /// Thread mesh iface 名（例: eth0）。未設定なら従来どおり chip-tool 直
-    /// （probe は avahi-browse）。対象 op は README の native hotpath 一覧を
-    /// 参照（M8a で汎用 read/write/invoke/describe 等、M8b で discover と
-    /// mDNS probe に拡大）。matd 稼働中は matd 自動発見が優先される。
+    /// Thread mesh iface 名（例: eth0）。未設定なら自動検出（up・multicast・
+    /// 非 P2P・非 loopback・IPv6 link-local の一意候補。曖昧ならエラー）。明示指定で
+    /// 上書き。M8c-3 で chip-tool が撤去され、native が全 op 共通の唯一の直経路
+    /// になった（詳細は README の Backend 節参照）。
+    /// matd 稼働中は matd 自動発見が優先される。
     #[arg(long, global = true, env = "MAT_IFACE", value_name = "IFACE")]
     pub iface: Option<String>,
 
@@ -90,7 +91,7 @@ pub enum Command {
         alias: Option<String>,
         /// BLE+Thread commissioning 用の Thread active operational dataset
         /// （hex）。native 経路（MAT_IFACE）で mDNS に見つからないデバイスを
-        /// BLE で commission するときに必須。chip-tool 経路では未使用。
+        /// BLE で commission するときに必須。on-network commissioning では不要。
         #[arg(
             long = "thread-dataset",
             env = "MAT_THREAD_DATASET",
@@ -129,7 +130,7 @@ pub enum Command {
         /// 属性名（chip-tool 表記）。
         #[arg(short = 'a', long, value_name = "NAME")]
         attribute: String,
-        /// 書き込む値（chip-tool にそのまま渡す）。
+        /// 書き込む値（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(long, value_name = "VALUE")]
         value: String,
     },
@@ -148,7 +149,7 @@ pub enum Command {
         /// コマンド名（chip-tool 表記、例: `on` / `off` / `move-to-level`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（chip-tool にそのまま渡す）。
+        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -257,6 +258,26 @@ pub enum Command {
         #[command(subcommand)]
         action: DiagCommand,
     },
+
+    /// fabric 管理（初回 bootstrap）。
+    Fabric {
+        #[command(subcommand)]
+        action: FabricAction,
+    },
+}
+
+/// `mat fabric` のサブコマンド（M8c-3）。
+#[derive(Subcommand, Debug)]
+pub enum FabricAction {
+    /// 初回 fabric bootstrap: root CA + ランダム epoch IPK を生成し KVS を新規作成
+    Init {
+        /// fabric id（既定 1）
+        #[arg(long, default_value_t = 1)]
+        fabric_id: u64,
+        /// controller 自身の admin node id（既定 112233 = chip-tool 慣例値）
+        #[arg(long, default_value_t = 112_233)]
+        admin_node_id: u64,
+    },
 }
 
 /// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/
@@ -298,8 +319,9 @@ pub enum DiagCommand {
     },
 
     /// commissioned ノードが「なぜ制御できないか」を層別チェックして verdict で返す。
-    /// 既定は chip-tool 完結。`--deep` で ping6 / mDNS ブラウズも実施し、
-    /// link_starved（弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
+    /// IM 部分（operational / thread）は native 完結（`MAT_IFACE` は自動検出、
+    /// 直経路のみ）。`--deep` で ping6 / mDNS ブラウズも実施し、link_starved
+    /// （弱リンク）と fabric_missing（fabric 脱落）まで切り分ける。
     Node {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
@@ -307,7 +329,7 @@ pub enum DiagCommand {
         /// エンドポイント番号、または aliases.toml の endpoint alias（既定 0 — 診断は通常 ep0）。
         #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "0")]
         endpoint: EndpointRef,
-        /// 補助プローブ（ping6 / avahi-browse）も実施して深掘りする。
+        /// 補助プローブ（ping6 / native mDNS targeted resolve）も実施して深掘りする。
         #[arg(long)]
         deep: bool,
     },
@@ -356,7 +378,7 @@ pub enum GroupCommand {
         /// コマンド名（chip-tool 表記、例: `on` / `off`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（chip-tool にそのまま渡す）。
+        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。

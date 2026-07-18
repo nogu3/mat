@@ -1,5 +1,5 @@
 # task check 相当（fmt:check + clippy + test）を PR / main push で回す。
-# テストは fake-chip-tool / fake-ws 統合テストまで含み、実 chip-tool は不要。
+# テストは trait-level FakeConn 単体テスト + backend フリーの binary 統合テストを含む。実 chip-tool は不要。
 name: CI
 
 on:

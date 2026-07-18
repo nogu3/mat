@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M7 受け入れ: one-shot 直経路の native 実行（MAT_IFACE/MAT_FABRIC_INDEX +
 # MAT_MATD=0）、native 有効な一時 matd との counter 共有（jump-ahead）、native 対象
 # 外 op（describe / diag thread / write）が chip-tool フォールバックで壊れていないこと、

@@ -1,11 +1,14 @@
 //! one-shot 直経路の native 実行（M7）。
 //!
 //! matd 稼働中は matd が優先される（main.rs の経路順）。ここに来るのは直経路のみで、
-//! `MAT_IFACE` 設定時に native 対象 op を mat-controller で in-process 実行する。
+//! native 対象 op を mat-controller で in-process 実行する。
 //! warm セッションは持たない: 確立 → 1 op → 破棄（設計ルール 4）。matd と違い
 //! Timeout 再確立はしない（確立直後の session が stale なことはない）。
-//! エンジン構築失敗（KVS 不備等）と group native 不可は warn を出して
-//! chip-tool 直へフォールバック（matd の起動時フォールバックと同型）。
+//!
+//! M8c-3（chip-tool 撤去）: native がこれら op の唯一の経路。従来 chip-tool 直へ
+//! フォールバックしていた分岐（エンジン構築失敗・group native 不可・名前未解決）は
+//! すべてハードエラー化した（`run` は非対象 op のみ `None` を返す — discover /
+//! commission / diag node など専用コマンド層を持つ op）。
 
 use std::path::Path;
 
@@ -190,8 +193,8 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             spec,
             transition,
         } => {
-            // 不正 color spec はここで None → chip-tool 経路が同一エラーを出す
-            // （resolve は決定的なので挙動は一致する）。
+            // 不正 color spec はここで None → `run` の `unresolved_op_error` が
+            // `resolve_spec` 本来のエラーを surface する（挙動は決定的で一致）。
             let c = mat_core::color::resolve_spec(
                 spec.name.as_deref(),
                 spec.rgb.as_deref(),
@@ -279,10 +282,9 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
         }
         // provision / grant（M8a Task9）: デバイス側 4 ステップ（KeySetWrite /
         // group-key-map / AddGroup / ACL）を native 化。コントローラ側
-        // groupsettings（chip-tool の KVS 書込）は変わらず chip-tool 側で行う
-        // （`run_op` の `NativeOp::GroupProvision` 実装を参照。KVS 書込所有の
-        // 分割は M8c）。name 未指定時の既定補完（`grp<id>`）は main.rs の
-        // chip-tool 経路と同じ式を共有する。
+        // groupsettings（KVS 書込）も native（M8c-2; `run_op` の
+        // `NativeOp::GroupProvision` 実装 = `write_group_provision` を参照）。
+        // name 未指定時の既定補完（`grp<id>`）は決定的な共有式。
         Command::Group {
             action:
                 GroupCommand::Provision {
@@ -325,8 +327,9 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             node_id: node_id.id(),
             endpoint: endpoint.id(),
         }),
-        // `Diag Node` は probe（ping6/avahi-browse）混在のため対象外
-        // （chip-tool 経路のまま。M8b/M8c で再訪）。
+        // `Diag Node` は probe（ping6/native mDNS resolve）混在のため `run` の担当外
+        // （専用コマンド層 `commands::diag::node` が native IM probe + 補助
+        // プローブを実施する）。
         Command::OpenWindow {
             node_id,
             timeout,
@@ -346,10 +349,9 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
     }
 }
 
-/// 汎用形の分類: None = 非対象（chip-tool へ）、Some(Ok) = native 実行、
-/// Some(Err) = native 対象だが値が符号化不能 → 即 parse_error（spec 決定3:
-/// フォールバックせず明示拒否。chip-tool なら通る形をあえて拒むのは
-/// opt-in（MAT_IFACE）下の意図した縮小）。
+/// 汎用形の分類: None = 名前未解決（`run` が parse_error 化）、Some(Ok) = native
+/// 実行、Some(Err) = 値が符号化不能 → parse_error（spec 決定3: 明示拒否。撤去前の
+/// chip-tool なら通る形をあえて拒む意図した縮小）。
 pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatError>> {
     match command {
         Command::Read {
@@ -484,44 +486,102 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
     }
 }
 
-enum Executed {
-    Done,
-    Fallback,
-}
-
-/// `run_op` の結果。`Fallback` は「op 自体は native 対象だが、この呼び出しでは
-/// native で完遂できない事情（group native 未整備等）」で、chip-tool 直へ
-/// フォールバックする合図（`Executed::Fallback` へそのまま写す）。
-#[derive(Debug)]
-enum RunOutcome {
-    Done,
-    Fallback,
-}
-
-/// 直経路 native の入口。None = chip-tool 直で実行すべき
-/// （非対象 op / エンジン構築不可 / group native 不可）。
-pub(crate) fn try_run(
+/// 直経路 native の入口（M8c-3）。`None` は「この op は native_direct の担当外」
+/// = discover / commission / diag node など専用コマンド層を持つ op のみ。
+/// それ以外の op は必ず `Some(Result)` を返す（chip-tool フォールバックは撤去）:
+/// - 名前解決できた op → native 実行結果。
+/// - 名前未解決（`classify` / `classify_strict` とも該当なし）→ `parse_error`
+///   （detail: unknown cluster/attribute/command name; 数値 ID は従来どおり受理）。
+/// - 値が符号化不能（`classify_strict` の `Err`）→ `parse_error`。
+pub(crate) fn run(
     command: &Command,
     store_path: &Path,
     cfg: &Config,
 ) -> Option<Result<(), MatError>> {
+    // 専用コマンド層を持つ op は native_direct の担当外（呼び出し側が処理）。
+    match command {
+        Command::Discover { .. }
+        | Command::Commission { .. }
+        | Command::Fabric { .. }
+        | Command::Diag {
+            action: DiagCommand::Node { .. },
+        } => return None,
+        _ => {}
+    }
+
     let op = match classify(command) {
         Some(op) => op,
-        None => match classify_strict(command)? {
-            Ok(op) => op,
-            // 値が符号化不能（非スカラー型等）: フォールバックせず即 parse_error
+        None => match classify_strict(command) {
+            Some(Ok(op)) => op,
+            // 値が符号化不能（非スカラー型等）: 即 parse_error
             // （spec 決定3。chip-tool 側では通る形をあえて拒む opt-in の縮小）。
-            Err(e) => return Some(Err(e)),
+            Some(Err(e)) => return Some(Err(e)),
+            // 名前未解決（名前→ID 表外）。chip-tool 撤去でフォールバック先が無い
+            // ため、黙って落とさず parse_error にする（数値 ID は受理される）。
+            None => return Some(Err(unresolved_op_error(command))),
         },
     };
-    match execute(&op, store_path, cfg) {
-        Ok(Executed::Done) => Some(Ok(())),
-        Ok(Executed::Fallback) => None,
-        Err(e) => Some(Err(e)),
-    }
+    Some(execute(&op, store_path, cfg))
 }
 
-fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, MatError> {
+/// `classify` / `classify_strict` がともに非対象と判定した native 担当 op の
+/// ハードエラー。Color / GroupColor だけは「不正 color spec」が失敗理由なので
+/// `resolve_spec` 本来のエラーを surface する（撤去前の chip-tool 経路と同一の
+/// 挙動を保つ）。それ以外は「名前未解決」= parse_error。
+fn unresolved_op_error(command: &Command) -> MatError {
+    let spec = match command {
+        Command::Color { spec, .. } => Some(spec),
+        Command::Group {
+            action: GroupCommand::Color { spec, .. },
+        } => Some(spec),
+        _ => None,
+    };
+    if let Some(spec) = spec {
+        if let Err(e) = mat_core::color::resolve_spec(
+            spec.name.as_deref(),
+            spec.rgb.as_deref(),
+            spec.hue,
+            spec.sat,
+        ) {
+            return e;
+        }
+    }
+    MatError::parse_error(
+        "unknown cluster/attribute/command name (or unsupported non-scalar type); \
+         numeric IDs are accepted",
+    )
+}
+
+/// エンジン構築失敗（M8c-3: chip-tool フォールバック撤去後のハードエラー化）。
+/// `Engine::build` は KVS 資材の読取失敗を `store_missing` に写す（`mat-native`
+/// 参照 — Io/NotFound と parse の細分化は将来）。ここでは store_missing に
+/// 「`mat fabric init` で資材を作れ」の誘導を足して返す。他 kind はそのまま伝播。
+fn map_engine_build_error(mut e: MatError) -> MatError {
+    if e.kind == mat_core::error::ErrorKind::StoreMissing && !e.detail.contains("mat fabric init") {
+        e.detail = format!(
+            "{} — run `mat fabric init` to bootstrap the credential store",
+            e.detail
+        );
+    }
+    e
+}
+
+/// group ctx / group_settings ctx 未構成（本番 `Engine::build` では常に `Some`
+/// なので実質到達しない — `with_parts` テスト注入時のみ `None`）。
+fn group_ctx_unconfigured_error() -> MatError {
+    MatError::new(
+        mat_core::error::ErrorKind::Other,
+        "native group context not configured (internal)",
+    )
+}
+
+/// group 送信不能（未 provision・KVS 不備等）。撤去前は chip-tool フォールバック
+/// だった。理由文字列に `mat group provision` 誘導を含む（`mat_native::group`）。
+fn group_unavailable_error(reason: &str) -> MatError {
+    MatError::store_parse(format!("native group send unavailable: {reason}"))
+}
+
+fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatError> {
     // store / commission チェックは chip-tool 経路と同一の順序・エラー(exit 10/11)。
     let store = Store::open(store_path)?;
     // group 送信 3 形は require_node をしない（chip-tool 経路の
@@ -555,6 +615,16 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
     if let Some(id) = node_id {
         store.require_node(id)?;
     }
+    // GroupProvision: CLI 指定 epoch key はバックエンド接触前に検証する
+    // （不正入力に fail-fast。撤去前は provision_controller_state 冒頭で
+    // resolve_epoch_key が最初に走っていた順序を保つ）。None = ランダム生成
+    // （常に妥当）なのでここでは検証しない。
+    if let NativeOp::GroupProvision {
+        epoch_key: Some(k), ..
+    } = op
+    {
+        mat_core::group::resolve_epoch_key(Some(k))?;
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -571,26 +641,20 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<Executed, M
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
-        let engine = match Engine::build(&native_cfg).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e.detail, "native direct build failed; falling back to chip-tool");
-                return Ok(Executed::Fallback);
-            }
-        };
-        match run_op(&engine, op).await? {
-            RunOutcome::Done => Ok(Executed::Done),
-            RunOutcome::Fallback => Ok(Executed::Fallback),
-        }
+        let engine = Engine::build(&native_cfg)
+            .await
+            .map_err(map_engine_build_error)?;
+        run_op(&engine, op).await
     })
 }
 
-/// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。unicast 4 形は
-/// 常に `Done`。group 3 形は `engine.group` 未設定 / `GroupOutcome::Unavailable`
-/// のとき `Fallback` を返し、chip-tool 直へ譲る（matd の native_group_params
-/// と対の判定を CLI 直経路で再現）。`GroupProvision` も同様に `engine.group_settings`
-/// 未設定（M8c-2: native KVS 書込ができない ctx 未構成）で `Fallback` を返す。
-async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> {
+/// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。
+///
+/// M8c-3（chip-tool 撤去）: 従来 `Fallback` を返していた分岐はハードエラー化。
+/// `engine.group` / `engine.group_settings` 未設定は本番 `Engine::build` では
+/// 常に `Some`（`with_parts` テスト注入時のみ `None`）なので Other、
+/// `GroupOutcome::Unavailable`（未 provision・KVS 不備）は store_parse で返す。
+async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
     use mat_controller::im;
     match op {
         NativeOp::On { node_id, endpoint } => {
@@ -603,6 +667,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                command = "on",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "on");
         }
         NativeOp::Off { node_id, endpoint } => {
@@ -615,11 +685,23 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                command = "off",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "off");
         }
         NativeOp::ReadOnOff { node_id, endpoint } => {
             let mut conn = engine.establisher.establish(*node_id).await?;
             let v = conn.read_onoff(*endpoint).await?;
+            tracing::info!(
+                node_id,
+                cluster = "onoff",
+                attribute = "on-off",
+                "read executed (native direct)"
+            );
             crate::commands::read::emit_read_success(
                 *node_id,
                 *endpoint,
@@ -648,6 +730,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "colorcontrol",
+                command = "move-to-hue-and-saturation",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_color_success(*node_id, *endpoint, color, *transition);
         }
         NativeOp::ColorTemp {
@@ -667,6 +755,12 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                 false,
             )
             .await?;
+            tracing::info!(
+                node_id,
+                cluster = "colorcontrol",
+                command = "move-to-color-temperature",
+                "invoke executed (native direct)"
+            );
             crate::commands::invoke::emit_color_temp_success(
                 *node_id,
                 *endpoint,
@@ -682,8 +776,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             endpoint,
         } => {
             let Some(ctx) = &engine.group else {
-                tracing::warn!("native group context not configured; falling back to chip-tool");
-                return Ok(RunOutcome::Fallback);
+                return Err(group_ctx_unconfigured_error());
             };
             match mat_native::group::send(ctx, *group_id, im::CLUSTER_ON_OFF, *command_id, None)
                 .await?
@@ -694,12 +787,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                     );
                 }
                 GroupOutcome::Unavailable(reason) => {
-                    tracing::warn!(
-                        group_id,
-                        reason,
-                        "native group send unavailable; falling back to chip-tool"
-                    );
-                    return Ok(RunOutcome::Fallback);
+                    return Err(group_unavailable_error(&reason));
                 }
             }
         }
@@ -710,8 +798,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             endpoint,
         } => {
             let Some(ctx) = &engine.group else {
-                tracing::warn!("native group context not configured; falling back to chip-tool");
-                return Ok(RunOutcome::Fallback);
+                return Err(group_ctx_unconfigured_error());
             };
             let fields = im::encode_move_to_hue_and_saturation_fields(
                 color.hue_raw,
@@ -736,12 +823,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                     );
                 }
                 GroupOutcome::Unavailable(reason) => {
-                    tracing::warn!(
-                        group_id,
-                        reason,
-                        "native group send unavailable; falling back to chip-tool"
-                    );
-                    return Ok(RunOutcome::Fallback);
+                    return Err(group_unavailable_error(&reason));
                 }
             }
         }
@@ -753,8 +835,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             endpoint,
         } => {
             let Some(ctx) = &engine.group else {
-                tracing::warn!("native group context not configured; falling back to chip-tool");
-                return Ok(RunOutcome::Fallback);
+                return Err(group_ctx_unconfigured_error());
             };
             let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
             match mat_native::group::send(
@@ -776,12 +857,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                     );
                 }
                 GroupOutcome::Unavailable(reason) => {
-                    tracing::warn!(
-                        group_id,
-                        reason,
-                        "native group send unavailable; falling back to chip-tool"
-                    );
-                    return Ok(RunOutcome::Fallback);
+                    return Err(group_unavailable_error(&reason));
                 }
             }
         }
@@ -795,8 +871,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             endpoint,
         } => {
             let Some(ctx) = &engine.group else {
-                tracing::warn!("native group context not configured; falling back to chip-tool");
-                return Ok(RunOutcome::Fallback);
+                return Err(group_ctx_unconfigured_error());
             };
             match mat_native::group::send(ctx, *group_id, *cluster, *command, fields_tlv.clone())
                 .await?
@@ -807,12 +882,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
                     );
                 }
                 GroupOutcome::Unavailable(reason) => {
-                    tracing::warn!(
-                        group_id,
-                        reason,
-                        "native group send unavailable; falling back to chip-tool"
-                    );
-                    return Ok(RunOutcome::Fallback);
+                    return Err(group_unavailable_error(&reason));
                 }
             }
         }
@@ -826,14 +896,10 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             rebind,
         } => {
             // 1) コントローラ側 group state（M8c-2: native KVS 書込）。ctx 未構成
-            //    はワイヤ・KVS とも未接触なので chip-tool へフォールバック
-            //    （group 送信の ctx 判定と対）。書込エラーは hard error
-            //    （ラッパー側 doc 参照 — flock WouldBlock 含む）。
+            //    は本番 Engine::build では起きない（Other 内部エラー）。書込エラーは
+            //    hard error（ラッパー側 doc 参照 — flock WouldBlock 含む）。
             let Some(gs) = &engine.group_settings else {
-                tracing::warn!(
-                    "native group settings context not configured; falling back to chip-tool"
-                );
-                return Ok(RunOutcome::Fallback);
+                return Err(group_ctx_unconfigured_error());
             };
             let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key.as_deref())?;
             let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
@@ -1014,7 +1080,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<RunOutcome, MatError> 
             );
         }
     }
-    Ok(RunOutcome::Done)
+    Ok(())
 }
 
 /// `mat diag node` の IM 部分（operational チェック + thread シグナル）を
@@ -1027,19 +1093,24 @@ pub(crate) struct DiagImProbe {
     pub thread: Result<mat_core::diag::ThreadCheck, mat_core::error::ErrorKind>,
 }
 
-/// `diag_im_probe` の入口。None = エンジン構築失敗 → 呼び出し側が
-/// chip-tool 経路へフォールバックする（`try_run`/`execute` の
-/// native direct build 失敗と同じ判定形）。
+/// `diag_im_probe` の入口。M8c-3（chip-tool 撤去）: エンジン構築失敗は
+/// フォールバックせずハードエラー化（`execute` の build 失敗と同じ写像 —
+/// store_missing に `mat fabric init` 誘導を付す）。
 pub(crate) fn diag_im_probe(
     cfg: &Config<'_>,
     store_root: &Path,
     node_id: u64,
     endpoint: u16,
-) -> Option<DiagImProbe> {
+) -> Result<DiagImProbe, MatError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .ok()?;
+        .map_err(|e| {
+            MatError::new(
+                mat_core::error::ErrorKind::Other,
+                format!("tokio runtime: {e}"),
+            )
+        })?;
     rt.block_on(async {
         let native_cfg = NativeConfig {
             store: store_root.to_path_buf(),
@@ -1047,14 +1118,10 @@ pub(crate) fn diag_im_probe(
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
-        let engine = match Engine::build(&native_cfg).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e.detail, "native diag build failed; falling back to chip-tool");
-                return None;
-            }
-        };
-        Some(diag_im_with_engine(&engine, node_id, endpoint).await)
+        let engine = Engine::build(&native_cfg)
+            .await
+            .map_err(map_engine_build_error)?;
+        Ok(diag_im_with_engine(&engine, node_id, endpoint).await)
     })
 }
 
@@ -1140,7 +1207,7 @@ mod tests {
         assert!(matches!(classify(&read), Some(NativeOp::ReadOnOff { .. })));
         // 汎用 read（onoff on-off 以外）で名前解決できるものは M8a Task7 で native
         // 対象に拡張された（`generic_read_is_native_when_names_resolve` 参照）。
-        // 名前解決できないものは引き続き非対象 —— matd の is_native_hotpath とパリティ。
+        // 名前解決できないものは classify 非対象（`run` が parse_error 化）。
         let unresolvable = Command::Read {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
@@ -1322,12 +1389,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_onoff_falls_back_when_engine_group_ctx_unconfigured() {
-        // engine.group == None（Config::build 中の group ctx 準備前に相当するテスト
-        // 経路）: run_op は Fallback を返し、chip-tool 直に譲る。
+    async fn group_onoff_hard_errors_when_engine_group_ctx_unconfigured() {
+        // engine.group == None（with_parts テスト注入）: M8c-3 で chip-tool
+        // フォールバックが撤去されたためハードエラー（Other, internal）。
         use mat_native::test_support::FakeEstablisher;
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let outcome = run_op(
+        let err = run_op(
             &engine,
             &NativeOp::GroupOnOff {
                 group_id: 10,
@@ -1337,8 +1404,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        assert!(matches!(outcome, RunOutcome::Fallback));
+        .expect_err("group ctx unconfigured must hard-error");
+        assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
     }
 
     #[tokio::test]
@@ -1400,7 +1467,7 @@ mod tests {
                 ..
             })
         ));
-        // 未知クラスタ名は chip-tool へ（互換）。
+        // 未知クラスタ名は classify 非対象（`run` が parse_error 化）。
         let unknown = Command::Read {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
@@ -1586,14 +1653,13 @@ mod tests {
             epoch_key: Some("42".repeat(16)),
             rebind: false,
         };
-        let out = run_op(&engine, &op).await.unwrap();
-        assert!(matches!(out, RunOutcome::Done));
+        run_op(&engine, &op).await.unwrap();
         // コントローラ側 state が chip-tool spawn なしで KVS に入っている。
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
     }
 
     #[tokio::test]
-    async fn run_op_group_provision_falls_back_when_ctx_missing() {
+    async fn run_op_group_provision_hard_errors_when_ctx_missing() {
         let engine = Engine::with_parts(Box::new(scripted_establisher()), None); // ctx なし
         let op = NativeOp::GroupProvision {
             group_id: 99,
@@ -1604,10 +1670,11 @@ mod tests {
             epoch_key: None,
             rebind: false,
         };
-        assert!(matches!(
-            run_op(&engine, &op).await.unwrap(),
-            RunOutcome::Fallback
-        ));
+        // M8c-3: group_settings ctx 未構成はフォールバックせずハードエラー（Other）。
+        let err = run_op(&engine, &op)
+            .await
+            .expect_err("missing group_settings ctx must hard-error");
+        assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
     }
 
     /// `diag_im_with_engine` の scripted establisher: parts-list（descriptor,
@@ -1685,8 +1752,15 @@ mod tests {
     #[tokio::test]
     async fn open_window_runs_via_fake_and_emits_codes() {
         // fake 経由で run_op(OpenWindow) が establish → open_window → emit まで
-        // 完走することを確認する（emit 先の stdout 内容そのものは
-        // `emit_open_window_success` の既存ユニットテストで担保済み）。
+        // 完走することを確認する。`emit_open_window_success` は `println!`
+        // ベース（`mat_core::output::emit`）で戻り値を返さないため、この
+        // ユニットテストでは「最後まで panic/Err せず走り切ること」までを
+        // 保証する（stdout の実際の JSON 内容は、これまで chip-tool 統合
+        // テストの `open_window_returns_codes` が担っていたが、M8c-3 Task3
+        // で chip-tool のダミー実行体ごと撤去した。プロセス stdout を安全に
+        // キャプチャする手段が無い（`#[test]` は並行実行され、生 fd
+        // リダイレクトは他テストの出力を巻き込む）ため、ここでは完走のみを
+        // 保証する — 詳細は Task3 の報告を参照）。
         use mat_native::test_support::FakeEstablisher;
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(
@@ -1700,5 +1774,80 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── M8c-3 Task3: read/write/invoke/describe の run_op 完走確認 ──────────
+    //
+    // これまで chip-tool 統合テスト（`read_parses_value` / `write_reports_success`
+    // / `invoke_reports_success` / `describe_lists_endpoints_and_clusters`）が
+    // 担っていた「成功系が最後まで走ること」の代替。stdout の JSON 内容自体は
+    // `emit_read_success` 等が `println!` 直書き（戻り値なし）で、プロセス
+    // stdout を安全にキャプチャする手段がこのテストバイナリに無いため検証
+    // できない（`open_window_runs_via_fake_and_emits_codes` のコメント参照）。
+    // ここでは `classify()` が実際に出す `NativeOp`（＝本番と同じ cluster/
+    // attribute の数値解決）をそのまま `run_op` に通し、`FakeConn` 応答で
+    // 最後まで `Ok(())` になることを保証する。
+
+    #[tokio::test]
+    async fn run_op_read_attr_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let read = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into(),
+        };
+        let op = classify(&read).expect("levelcontrol/current-level resolves natively");
+        assert!(matches!(op, NativeOp::ReadAttr { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        run_op(&engine, &op).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_op_write_attr_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let write = Command::Write {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            attribute: "on-level".into(),
+            value: "128".into(),
+        };
+        let op = classify(&write).expect("levelcontrol/on-level resolves natively");
+        assert!(matches!(op, NativeOp::WriteAttr { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        run_op(&engine, &op).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_op_invoke_generic_completes_via_native() {
+        use mat_core::alias::{EndpointRef, NodeRef};
+        use mat_native::test_support::FakeEstablisher;
+        let inv = Command::Invoke {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "levelcontrol".into(),
+            command: "move-to-level".into(),
+            args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+        };
+        let op = classify(&inv).expect("levelcontrol/move-to-level resolves natively");
+        assert!(matches!(op, NativeOp::InvokeGeneric { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        run_op(&engine, &op).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_op_describe_completes_via_native() {
+        use mat_core::alias::NodeRef;
+        use mat_native::test_support::FakeEstablisher;
+        let describe = Command::Describe {
+            node_id: NodeRef::Id(5),
+        };
+        let op = classify(&describe).expect("describe is native");
+        assert!(matches!(op, NativeOp::Describe { .. }));
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        run_op(&engine, &op).await.unwrap();
     }
 }
