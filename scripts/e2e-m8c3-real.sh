@@ -179,6 +179,33 @@ assert_marker_absent() {
   fi
 }
 
+# 使い捨て group $GROUP の controller/device 両側除去（best-effort、失敗は
+# WARN のみ — 一度も provision していない fresh KVS でも失敗しないことが
+# 前提）。検証7の後片付けと、検証2 group provision 直前の pre-clean の両方
+# から呼ばれる共有ロジック（fix3: 前回 run が検証6以降で中断すると group 99
+# の controller state が KVS に残ったままになり、非 --rebind の provision が
+# 「use --rebind」で必ず失敗する再実行耐性バグへの対策 — pre-clean で先に
+# 掃除しておけば非 --rebind の provision が常に fresh state から走れる）。
+# stage1_main の local 変数（GROUP_NODE_ARR / ENDPOINT / STORE_ARG / GROUP /
+# KEYSET / CHIP_TOOL_BIN / REMOTE_STORE）と run_native_default() 関数を
+# bash の動的スコープ経由で参照するため、stage1_main 実行中
+# （run_native_default 定義後）にのみ呼び出し可能。
+cleanup_disposable_group() {
+  local n
+  for n in "${GROUP_NODE_ARR[@]}"; do
+    run_native_default "${STORE_ARG[@]}" invoke -n "$n" -e "$ENDPOINT" -c groups --command remove-group "$GROUP" >/dev/null 2>&1 \
+      && echo "device-side remove-group OK (node=$n)" \
+      || echo "WARN: device-side groups remove-group が失敗 (node=$n, best-effort)" >&2
+  done
+  local CHIP_BIN="${CHIP_TOOL_BIN:-chip-tool}"
+  ssh -n "$MAT_E2E_HOST" "$CHIP_BIN" groupsettings remove-group "$GROUP" --storage-directory "$REMOTE_STORE" >/dev/null 2>&1 \
+    && echo "controller-side groupsettings remove-group OK" \
+    || echo "WARN: controller-side groupsettings remove-group が失敗 (best-effort)" >&2
+  ssh -n "$MAT_E2E_HOST" "$CHIP_BIN" groupsettings remove-keyset "$KEYSET" --storage-directory "$REMOTE_STORE" >/dev/null 2>&1 \
+    && echo "controller-side groupsettings remove-keyset OK" \
+    || echo "WARN: controller-side groupsettings remove-keyset が失敗 (best-effort)" >&2
+}
+
 # ---------------------------------------------------------------------------
 # STAGE=2（Task13 で実装。撤去後の最終受け入れ — chip-tool を PATH から
 # 外した環境での再検証・`mat fabric init` 実機検証・deploy 成果物
@@ -418,11 +445,26 @@ stage1_main() {
   assert_native_marker "open-window executed (native direct)" "open-window (native default)"
   assert_grep '"qr_payload"' "$OW_OUT" "open-window が qr_payload を含まない"
 
+  echo "-- group provision の pre-clean（前回 run の残留 state を best-effort 除去、再実行耐性）"
+  # fix3: 前回 run が検証6以降で中断していると group $GROUP の controller
+  # state（f/<idx>/g/<hex GROUP>, f/<idx>/k/<hex KEYSET>, keymap エントリ）が
+  # KVS に残ったままになり、下の非 --rebind provision が「use --rebind」で
+  # 必ず失敗する（かつ後述の rc 捕捉が無いと set -e で無言死する）。
+  # fresh KVS では単に何も無くて WARN が出るだけ（best-effort、失敗しても
+  # 続行する）。
+  cleanup_disposable_group
+
   echo "-- group provision（使い捨て group=$GROUP keyset=$KEYSET nodes=$GROUP_NODES）"
-  local GP_OUT
+  local GP_OUT GP_RC
+  GP_RC=0
   # shellcheck disable=SC2086 # GROUP_NODES は意図的に空白展開する（--nodes にそのまま渡す）
   GP_OUT=$(run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
-    --keyset-id "$KEYSET" --name "$GROUP_NAME")
+    --keyset-id "$KEYSET" --name "$GROUP_NAME") || GP_RC=$?
+  if [ "$GP_RC" != 0 ]; then
+    echo "FAIL: group provision (native default) が exit $GP_RC で失敗した（pre-clean 後でもこれが起きる場合は再実行耐性の問題ではなく実際の provision 失敗）:" >&2
+    cat "$LAST_STDERR_FILE" >&2
+    exit 1
+  fi
   echo "$GP_OUT"
   assert_no_fallback "group provision (native default)"
   assert_native_marker "iface auto-selected (native default)" "group provision (native default)"
@@ -432,15 +474,21 @@ stage1_main() {
   assert_grep '"note":".*restart' "$GP_OUT" "group provision の note に restart 案内が無い"
 
   echo "-- group provision --rebind（再実行、Duplicate にならないこと）"
+  GP_RC=0
   # shellcheck disable=SC2086
   GP_OUT=$(run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
-    --keyset-id "$KEYSET" --name "$GROUP_NAME" --rebind)
+    --keyset-id "$KEYSET" --name "$GROUP_NAME" --rebind) || GP_RC=$?
+  if [ "$GP_RC" != 0 ]; then
+    echo "FAIL: group provision --rebind (native default) が exit $GP_RC で失敗した:" >&2
+    cat "$LAST_STDERR_FILE" >&2
+    exit 1
+  fi
   echo "$GP_OUT"
   assert_no_fallback "group provision --rebind (native default)"
   assert_native_marker "group provision controller state written (native kvs)" "group provision --rebind (native default, kvs write)"
   assert_native_marker "group provision executed (native direct)" "group provision --rebind (native default, 完走)"
   assert_grep '"status":"provisioned"' "$GP_OUT" "group provision --rebind が status:provisioned を返さない"
-  echo "PASS: group provision 検証（native default, 通常+--rebind 両方）" >&2
+  echo "PASS: group provision 検証（native default, pre-clean+通常+--rebind 全て）" >&2
 
   echo "-- group invoke（toggle → 逆toggle）"
   local GI_OUT
@@ -662,19 +710,7 @@ REMOTE_SCRIPT
   fi
 
   echo "== 検証7/7: 後片付け（使い捨て group $GROUP、best-effort）"
-  local n
-  for n in "${GROUP_NODE_ARR[@]}"; do
-    run_native_default "${STORE_ARG[@]}" invoke -n "$n" -e "$ENDPOINT" -c groups --command remove-group "$GROUP" >/dev/null 2>&1 \
-      && echo "device-side remove-group OK (node=$n)" \
-      || echo "WARN: device-side groups remove-group が失敗 (node=$n, best-effort)" >&2
-  done
-  local CHIP_BIN="${CHIP_TOOL_BIN:-chip-tool}"
-  ssh -n "$MAT_E2E_HOST" "$CHIP_BIN" groupsettings remove-group "$GROUP" --storage-directory "$REMOTE_STORE" >/dev/null 2>&1 \
-    && echo "controller-side groupsettings remove-group OK" \
-    || echo "WARN: controller-side groupsettings remove-group が失敗 (best-effort)" >&2
-  ssh -n "$MAT_E2E_HOST" "$CHIP_BIN" groupsettings remove-keyset "$KEYSET" --storage-directory "$REMOTE_STORE" >/dev/null 2>&1 \
-    && echo "controller-side groupsettings remove-keyset OK" \
-    || echo "WARN: controller-side groupsettings remove-keyset が失敗 (best-effort)" >&2
+  cleanup_disposable_group
 
   echo "sudo systemctl restart matd（本番 native group state 再読込のため起動 — trap の cleanup でも start するが、後続の目視確認のためここで明示的に起動する）"
   ssh -n "$MAT_E2E_HOST" "sudo systemctl restart matd"
