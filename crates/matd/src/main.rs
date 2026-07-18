@@ -144,7 +144,15 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
             tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
             server::NativeState::Ready(Box::new(b))
         }
-        Err(e) => {
+        Err(mut e) => {
+            // mat 側の map_engine_build_error（crates/mat/src/native_direct.rs）と
+            // 同様に `mat fabric init` への誘導を detail に足す（二重付与は避ける）。
+            if !e.detail.contains("mat fabric init") {
+                e.detail = format!(
+                    "{} — run `mat fabric init` to bootstrap the credential store",
+                    e.detail
+                );
+            }
             tracing::warn!(
                 error = %e.detail,
                 "native backend build failed; matd will start but every op will \

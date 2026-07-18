@@ -1297,9 +1297,10 @@ impl CommissioningFabric {
     /// するための CommissioningFabric を組む。`generate`（新規 fabric）と
     /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は **epoch** 側 —
     /// operational を渡すとデバイス側の KDF 導出が二重になり CASE が壊れる。
-    /// epoch は KVS に永続されない（chip-tool は既定定数を毎回投入）ため
-    /// 引数で受ける。呼び出し側は `fabric::verify_default_ipk_epoch` の
-    /// ガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡すこと。
+    /// epoch は呼び出し側が解決して渡す引数（M8c-3: `mat/f/<idx>/ipk-epoch`
+    /// に永続される。`mat-native::commission::resolve_ipk_epoch` が、KVS に
+    /// 既存の永続 epoch があればそれを、無ければ `fabric::verify_default_ipk_epoch`
+    /// のガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を採用して永続化する）。
     pub fn from_materials(m: crate::kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self {
         Self {
             rcac_tlv: m.rcac,
@@ -1440,15 +1441,16 @@ impl CommissioningFabric {
 /// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
 /// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
 /// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
-/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない | ―     |
+/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `unreachable` のハードエラーにし（M8c-3: chip-tool フォールバック撤去）、`kind_of` を経由しない | ―     |
 /// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
 /// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
 ///
 /// `Ble { step: "scan", .. }` は `kind_of` を経由しない — `find_commissionable`
 /// の空振り（デバイスが見えない）はワイヤ未接触なので、呼び出し側
-/// (`mat-native::commission` の `ble_path`) が個別に検出して `Unavailable`
-/// にする。BLE/BTP のそれ以外の失敗（`bluez-session` / `adapter` / `gatt` /
-/// `btp-handshake` / `udp-bind`）は他の variant と同様 `commission_failed`。
+/// (`mat-native::commission` の `ble_path`) が個別に検出して `unreachable`
+/// のハードエラーにする（M8c-3: chip-tool フォールバック撤去）。BLE/BTP の
+/// それ以外の失敗（`bluez-session` / `adapter` / `gatt` / `btp-handshake` /
+/// `udp-bind`）は他の variant と同様 `commission_failed`。
 #[derive(Debug)]
 pub enum CommissionError {
     Discovery(crate::dnssd::DnssdError),

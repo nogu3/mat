@@ -190,7 +190,7 @@ impl Engine {
         })?;
         let creds = FabricCredentials::from_self_issued(materials).map_err(|e| {
             MatError::new(
-                ErrorKind::SessionFailed,
+                ErrorKind::StoreParse,
                 format!("native: self-issue NOC: {e}"),
             )
         })?;
@@ -506,7 +506,10 @@ mod tests {
         };
         let err = Engine::build(&cfg).await.expect_err("no KVS present");
         assert!(
-            matches!(err.kind, ErrorKind::StoreMissing | ErrorKind::Other),
+            matches!(
+                err.kind,
+                ErrorKind::StoreMissing | ErrorKind::StoreParse | ErrorKind::Other
+            ),
             "unexpected kind: {:?}",
             err.kind
         );
