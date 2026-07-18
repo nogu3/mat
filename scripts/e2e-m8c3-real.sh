@@ -324,13 +324,34 @@ stage1_main() {
   # （`cmd; cat ...` のように末尾コマンドを追加すると、関数の戻り値が最後の
   # `cat`（ほぼ常に成功）にすり替わり、if 条件や retry ループでの失敗判定が
   # 常に成功扱いになる — 検証5のリトライループ実装時に見つけて修正した）。
+  # Transport級の一過性失敗（rc=5/141/255）は1回リトライ（3秒待機）する
+  # （fix5: 一過性Thread mesh/SSH失敗への耐性）。
   run_native_default() {
     local rc=0
-    ssh -n "$MAT_E2E_HOST" env -u MAT_IFACE -u MAT_MATD_IFACE \
-      MAT_MATD=0 MAT_LOG=info "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
-      MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c3-chip-tool \
-      "$REMOTE_MAT_BIN" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
-    cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+    local attempt=1
+    while true; do
+      ssh -n "$MAT_E2E_HOST" env -u MAT_IFACE -u MAT_MATD_IFACE \
+        MAT_MATD=0 MAT_LOG=info "MAT_FABRIC_INDEX=$FABRIC_INDEX" \
+        MAT_CHIP_TOOL_BIN=/nonexistent/mat-e2e-m8c3-chip-tool \
+        "$REMOTE_MAT_BIN" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
+      cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+
+      # Check if we should retry on transient errors
+      if [ "$rc" != 0 ] && [ "$attempt" = "1" ]; then
+        case "$rc" in
+          5|141|255)
+            # Transient error: unreachable, SIGPIPE, or ssh transport — retry once
+            echo "WARN: transient rc=$rc, retrying once in 3s: $@" >&2
+            sleep 3
+            attempt=2
+            continue
+            ;;
+        esac
+      fi
+      # Final attempt or no retry needed
+      break
+    done
+
     if [ "$rc" != 0 ]; then
       echo "FAIL: remote command failed (rc=$rc): $@" >&2
       cat "$LAST_STDERR_FILE" >&2
@@ -341,10 +362,31 @@ stage1_main() {
   # 検証3: matd 経由（--matd で強制、接続失敗はフォールバック無しのハード
   # エラー）。matd 側の native/fallback 実証はソケットではなく
   # $REMOTE_MATD_LOG を見る（クライアント呼び出し自体の stderr は薄い）。
+  # Transport級の一過性失敗（rc=5/141/255）は1回リトライ（3秒待機）する
+  # （fix5: 一過性Thread mesh/SSH失敗への耐性）。
   run_matd() {
     local rc=0
-    ssh -n "$MAT_E2E_HOST" "$REMOTE_MAT_BIN" --matd "$SOCKET" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
-    cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+    local attempt=1
+    while true; do
+      ssh -n "$MAT_E2E_HOST" "$REMOTE_MAT_BIN" --matd "$SOCKET" "$@" 2>"$LAST_STDERR_FILE" || rc=$?
+      cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
+
+      # Check if we should retry on transient errors
+      if [ "$rc" != 0 ] && [ "$attempt" = "1" ]; then
+        case "$rc" in
+          5|141|255)
+            # Transient error: unreachable, SIGPIPE, or ssh transport — retry once
+            echo "WARN: transient rc=$rc, retrying once in 3s: $@" >&2
+            sleep 3
+            attempt=2
+            continue
+            ;;
+        esac
+      fi
+      # Final attempt or no retry needed
+      break
+    done
+
     if [ "$rc" != 0 ]; then
       echo "FAIL: remote command failed (rc=$rc): $@" >&2
       cat "$LAST_STDERR_FILE" >&2
