@@ -1,8 +1,10 @@
-//! matd の native バックエンド（Phase 5 M4）。
+//! matd の native バックエンド（Phase 5 M4、M8c-3 で唯一の実行経路に）。
 //!
-//! mat-controller の warm CASE セッションを matd プロセス内に保持し、ホットパス
-//! （on/off・色・色温度・onoff read）を chip-tool を介さず処理する。未対応 op は
-//! server 層が chip-tool ws にフォールバックする。
+//! mat-controller の warm CASE セッションを matd プロセス内に保持し、read/write/
+//! invoke/on/off/色/色温度/describe/group を in-process で処理する。名前解決
+//! できない cluster/attribute/command や、native 構築そのものの失敗は
+//! server 層が per-op のハードエラーへ変換する（chip-tool フォールバックは
+//! M8c-3 で撤去済み）。
 //!
 //! 確立器・group 送信のコアロジックは `mat-native`（mat one-shot と共有）に
 //! 集約されている。ここに残るのは warm session を per-node に保持する責務のみ。
@@ -59,21 +61,24 @@ impl NativeBackend {
         }
     }
 
-    /// テスト用: 任意の Establisher を注入する（group 送信は無効）。
-    #[cfg(test)]
-    pub(crate) fn with_establisher(establisher: Box<dyn Establisher>) -> Self {
+    /// テスト用: 任意の Establisher を注入する（group 送信は無効）。`pub`（cfg(test)
+    /// 非gate）なのは `tests/integration.rs`（外部テストクレート = 別コンパイル
+    /// 単位で `#[cfg(test)]` 項目は見えない）から fake establisher で matd の socket
+    /// 経路を end-to-end 検証するため — `mat_native::Engine::with_parts` 自体も
+    /// 元から同じ理由で常時 pub。
+    pub fn with_establisher(establisher: Box<dyn Establisher>) -> Self {
         Self::from_engine(mat_native::Engine::with_parts(establisher, None))
     }
 
-    /// テスト用: Establisher と group 送信コンテキストの両方を注入する。
-    #[cfg(test)]
-    pub(crate) fn with_parts(establisher: Box<dyn Establisher>, group: Option<GroupCtx>) -> Self {
+    /// テスト用: Establisher と group 送信コンテキストの両方を注入する（`pub` の
+    /// 理由は [`with_establisher`](Self::with_establisher) と同じ）。
+    pub fn with_parts(establisher: Box<dyn Establisher>, group: Option<GroupCtx>) -> Self {
         Self::from_engine(mat_native::Engine::with_parts(establisher, group))
     }
 
-    /// テスト用: with_parts + group_settings 注入。
-    #[cfg(test)]
-    pub(crate) fn with_parts_gs(
+    /// テスト用: with_parts + group_settings 注入（`pub` の理由は
+    /// [`with_establisher`](Self::with_establisher) と同じ）。
+    pub fn with_parts_gs(
         establisher: Box<dyn Establisher>,
         group: Option<GroupCtx>,
         gs: Option<mat_native::group_settings::GroupSettingsCtx>,
@@ -84,7 +89,8 @@ impl NativeBackend {
     }
 
     /// controller 側 group state の KVS 書込資材（M8c-2）。None = native 構築が
-    /// 未完（テスト注入等）— 呼び出し側は chip-tool ws へフォールバックする。
+    /// 未完（テスト注入等; 本番 `Engine::build` では常に `Some`）— 呼び出し側
+    /// （`server::group_provision`）は internal エラーとして拒否する（M8c-3）。
     pub fn group_settings_ctx(&self) -> Option<&mat_native::group_settings::GroupSettingsCtx> {
         self.engine.group_settings.as_ref()
     }

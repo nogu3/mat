@@ -1,17 +1,21 @@
-//! `matd` — Matter の常駐レイヤ（Phase 4）。
+//! `matd` — Matter の常駐レイヤ（Phase 4、M8c-3 で native 一本化）。
 //!
-//! chip-tool を `interactive server`（websocket）で常駐起動し、温かい CASE
-//! セッションを保持したまま unix socket で read/invoke 等を中継する。各呼び出しが
-//! mDNS 解決 + CASE ハンドシェイクを払う one-shot の `mat` に対し、ハンドシェイクを
-//! 省いて高速化する（ssh `ControlMaster`/`ControlPersist` モデル）。Matter 専用。
-//! 設計は ARCHITECTURE.md を参照。
+//! 埋め込みの native Matter コントローラ（`mat-controller`/`mat-native`）で
+//! 温かい CASE セッションを保持したまま unix socket で read/invoke 等を中継する。
+//! 各呼び出しが mDNS 解決 + CASE ハンドシェイクを払う one-shot の `mat` に対し、
+//! ハンドシェイクを省いて高速化する（ssh `ControlMaster`/`ControlPersist`
+//! モデル）。Matter 専用。設計は ARCHITECTURE.md を参照。
+//!
+//! M8c-3: chip-tool 経路を完全撤去した。native backend の構築に失敗しても
+//! （KVS 資材が読めない等）matd は起動を続け、以後のリクエストへ構築エラーを
+//! per-op で返す（[`matd::server::NativeState::Unavailable`]）——
+//! `mat fabric init` で資材を用意すれば再起動で解消できる。
 //!
 //! `mat` 本体の設計ルール 4（常駐・セッションキャッシュ禁止）は `mat` に効き続ける。
 //! `matd` は別バイナリ・別レイヤなので常駐してよい。
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use serde_json::Value;
@@ -19,7 +23,6 @@ use serde_json::Value;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
-use matd::backend::ChipToolBackend;
 use matd::server;
 
 /// matd — warm CASE sessions for Matter over a local unix socket.
@@ -34,19 +37,6 @@ struct Cli {
     /// serve / stop 両方が使う。
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
-
-    /// chip-tool interactive server の ws ポート。
-    #[arg(long, default_value_t = 9100)]
-    port: u16,
-
-    /// 子プロセスを起動せず、既に動いている chip-tool ws（--port）へ接続する。
-    #[arg(long)]
-    connect: bool,
-
-    /// アイドル秒数。無アクセスがこれを超えると warm セッションを畳む
-    /// （ssh ControlPersist 相当）。次のコマンドで遅延再確立する。
-    #[arg(long, default_value_t = 300)]
-    idle_timeout: u64,
 
     /// native warm session に使う Thread mesh の iface 名。未指定なら自動検出
     /// （M8c-3 native 既定化。曖昧なら起動拒否）。
@@ -106,27 +96,21 @@ async fn run(cli: Cli) -> Result<(), MatError> {
     }
 }
 
-/// serve: 単一インスタンスロックを取ってから chip-tool を起こし、socket を bind する。
+/// serve: 単一インスタンスロックを取ってから native backend を構築し、socket を bind する。
 async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     let socket = cli
         .socket
         .clone()
         .unwrap_or_else(mat_core::socket::default_socket_path);
 
-    // 二重起動ガード。chip-tool 起動・socket bind より前に取る（rival chip-tool を
-    // 起こさない）。_lock はプロセス生存中保持する（Drop でロック解放）。
+    // 二重起動ガード。socket bind より前に取る。_lock はプロセス生存中保持する
+    // （Drop でロック解放）。
     let _lock = matd::lock::acquire(&socket)?;
 
     let store_path = Store::locate(cli.store);
-    // 認証情報必須レイヤ。ストアが無ければ早めに exit 10。
-    Store::open(&store_path)?;
-
-    let idle = std::time::Duration::from_secs(cli.idle_timeout);
-    let backend = if cli.connect {
-        ChipToolBackend::connect(cli.port, idle).await?
-    } else {
-        ChipToolBackend::spawn(&store_path, cli.port, idle).await?
-    };
+    // M8c-3: KVS 不在でも matd は起動する（後から `mat fabric init` できるよう、
+    // per-op store_missing で応答する — 下の native 構築失敗の扱いを参照）。
+    // ここで早期 exit 10 にはしない。
 
     // native warm session バックエンド。iface は env / --iface、未設定なら自動
     // 検出（M8c-3 native 既定化）。自動検出の候補 0 / 複数は起動拒否 —
@@ -146,8 +130,9 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         },
     };
 
-    // native 構築失敗は致命にせず、chip-tool フォールバックへ落とす（native が
-    // 実機でコケても matd は無停止。Stage 1 ではここは温存）。
+    // native 構築失敗（KVS 資材が読めない等）は致命にしない。matd は起動を続け、
+    // 以後の全リクエストへこの構築エラーをそのまま返す（M8c-3: chip-tool
+    // フォールバックが撤去されたため、per-op ハードエラーで運転する）。
     let cfg = matd::native::NativeConfig {
         store: store_path.clone(),
         iface: iface.clone(),
@@ -157,15 +142,19 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     let native = match matd::native::NativeBackend::build(&cfg).await {
         Ok(b) => {
             tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
-            Some(Arc::new(b))
+            server::NativeState::Ready(Box::new(b))
         }
         Err(e) => {
-            tracing::warn!(error = %e.detail, "native backend build failed; falling back to chip-tool for all ops");
-            None
+            tracing::warn!(
+                error = %e.detail,
+                "native backend build failed; matd will start but every op will \
+                 error until this is resolved (e.g. `mat fabric init`)"
+            );
+            server::NativeState::Unavailable(e)
         }
     };
 
-    server::serve(&socket, store_path, Arc::new(backend), native)
+    server::serve(&socket, store_path, native)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }

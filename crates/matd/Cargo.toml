@@ -20,19 +20,15 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-base64.workspace = true
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "net",
     "io-util",
-    "process",
     "sync",
     "time",
     "signal",
 ] }
-tokio-tungstenite = "0.24"
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
@@ -40,4 +36,3 @@ mat-native = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
-base64ct = { version = "1", features = ["alloc"] }
