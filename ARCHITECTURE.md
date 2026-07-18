@@ -4,9 +4,12 @@ This document explains why `mat` is built the way it is. For how to use it, see
 [README.md](./README.md). For the rules an AI agent must follow when working in
 this repo, see [CLAUDE.md](./CLAUDE.md).
 
-`mat` is a CLI for controlling Matter devices. It calls a Matter controller
-(`chip-tool` for now) as a subprocess, and turns its long text output into one
-clean JSON object per command.
+`mat` is a CLI for controlling Matter devices. It drives a native,
+from-scratch Rust Matter controller (crate `mat-controller`, in this
+workspace) in-process and returns pure structured JSON, normalized to `mat`'s
+own schema — one clean JSON object per command. (`chip-tool` was the backend
+through Phase 5 M8c-2; it was fully retired in 0.22.0 / M8c-3 — see
+["Backend: native"](#backend-native-chip-tool-retired-in-0220) below.)
 
 `mat` is AI-native and UNIX-friendly:
 - stdout is pure structured JSON (one command = one JSON object).
@@ -22,8 +25,9 @@ above it is not `mat`'s concern.
 ## What `mat` does and does not do
 
 ### `mat` is responsible for
-- A consistent wrapper UX over a Matter controller (`chip-tool`).
-- Turning the controller's verbose text into `mat`'s JSON schema.
+- A consistent UX over a native Matter controller (`mat-controller`, driven
+  in-process — no external controller subprocess).
+- Emitting the result in `mat`'s own JSON schema.
 - Managing fabric credentials (Root CA, our own NOC, commissioned nodes) in a
   local key-value store (KVS).
 - Commissioning: joining a fabric and sharing devices with other admins.
@@ -33,7 +37,7 @@ above it is not `mat`'s concern.
   numeric `node_id`. Mapping human-facing names is out of scope — with one
   narrow exception: if an optional `<store>/aliases.toml` exists, the CLI
   layer resolves node / group / endpoint aliases to numbers right after arg
-  parsing, before dispatch. The wire and the backend (`chip-tool` / `matd`)
+  parsing, before dispatch. The wire and the backend (native / `matd`)
   always see numbers; a missing file is exactly the traditional behavior.
   Cluster / command / attribute names are unaffected (chip-tool notation
   only, no aliasing).
@@ -98,7 +102,7 @@ The one place Thread shows up in the command set is read-only diagnostics:
 routing, neighbor/route tables, counters). This stays inside the rules above —
 it is plain Matter attribute reads against one device, not Thread network
 management, and there is no Border Router access. It is one-shot like every
-other `mat` command and runs only on the direct chip-tool path (not via
+other `mat` command and runs only on the native direct path (not via
 `--matd`).
 
 ---
@@ -109,9 +113,12 @@ other `mat` command and runs only on the direct chip-tool path (not via
 like Home Assistant or Apple Home. A Matter device can belong to many fabrics at
 once (multi-admin), so `mat` can run alongside them.
 
-### Two ways to commission (both use `chip-tool pairing code`)
-A Matter setup code (QR or 11-digit) can be passed the same way to
-`chip-tool pairing code <node-id> <code>`. Only the source differs.
+### Two ways to commission (native, `mat commission`)
+A Matter setup code (QR or 11-digit) is passed the same way to
+`mat commission --target <host-or-ip> --setup-code <code>` (native PASE;
+`mat-native::commission` auto-selects on-network mDNS vs. BLE+Thread — see
+["Backend: native"](#backend-native-chip-tool-retired-in-0220)). Only the
+source of the code differs.
 
 1. **First commission** (a factory-reset device): use the printed setup code.
 2. **Multi-admin join** (a device already commissioned by another admin): the
@@ -125,8 +132,8 @@ the issued code."
 
 ### Sharing your own devices (`mat open-window`)
 To share a device that `mat` owns with another controller (Alexa / Apple /
-Google), `mat` can open a commissioning window (a wrap of
-`chip-tool pairing open-commissioning-window`).
+Google), `mat` can open a commissioning window (native `OpenCommissioningWindow`
+over the existing operational session).
 
 - The JSON output includes **both** `manual_code` (11-digit) and `qr_payload`
   (the `MT:...` string): `{ "node_id", "manual_code", "qr_payload", "expires_at" }`.
@@ -149,55 +156,61 @@ Google), `mat` can open a commissioning window (a wrap of
 
 ---
 
-## Backend: `chip-tool`
+## Backend: native (chip-tool retired in 0.22.0)
 
-The rule is "if an official CLI exists for a protocol, use it; do not write your
-own." `chip-tool` is CSA's official reference implementation.
+`mat`'s backend is a **native, from-scratch Rust Matter controller** (crate
+`mat-controller`, driven through the shared `mat-native` engine) — TLV, CASE,
+IM, groupcast, mDNS, and commissioning (on-network + BLE+Thread) all run
+in-process. There is no `chip-tool` (or any other external controller)
+subprocess.
 
-### Why `chip-tool`
-1. **Groupcast is effectively only possible with `chip-tool` today.** It has the
-   full path for Group Key Management and group commands.
-2. **Highest spec completeness.** New clusters and features land here first, so
-   even niche devices are likely to work.
-3. **Easy to debug.** Matter forums, issues, and official docs are all written in
-   `chip-tool` commands. Sharing the backend means you do not get lost figuring
-   out whether the fault is yours or the device's.
-4. **Fits the subprocess model.** Launch a native binary and exit.
+- **Route selection is per-op:** matd auto-discovery (if a `matd` answers the
+  probed socket) -> `mat`'s own native direct path. See README's
+  [Routing through `matd`](./README.md#routing-through-matd) and
+  [Native backend internals](./README.md#native-backend-internals) for
+  interface autodetect (`MAT_IFACE` / `MAT_MATD_IFACE`), fabric index, warm
+  vs. one-shot sessions, the shared groupcast counter, epoch adoption, and the
+  scalar-only generic write/invoke rule.
+- **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK). A fabric
+  first created by `chip-tool` is handled by verifying its fixed epoch
+  against the KVS materials and adopting it (persisted to
+  `mat/f/<idx>/ipk-epoch`), so pre-M8c-3 fabrics keep working.
+- `mat` is the sole owner/writer of the persistent Matter KVS (chip-tool INI
+  compatible form: keysets, operational credentials, group tables, the
+  group-send counter) — see [Credential store](#credential-store-kvs) below.
 
-### The one remaining cost: fragile output parsing
-`chip-tool` has log-style text output, which `mat` must turn into JSON. A version
-change can break the parser.
-
-- The `Data = ...` form for read/write/invoke is fairly regular. Pin it with
-  tests.
-- **`chip-tool` exit codes are coarse** (mostly `1` on failure; details are in the
-  log). So `mat` parses stdout/stderr to classify the failure kind (timeout /
-  unreachable / rejected) and maps it to `mat`'s own exit code / error kind.
-- Keep parser tests so an upstream update that breaks parsing is noticed.
+### History: why `chip-tool` first, and why it was retired
+Through Phase 5 M8c-2, `mat` drove CSA's reference `chip-tool` binary as a
+subprocess and turned its log-style text output into JSON. That was the
+pragmatic starting point: `chip-tool` had the fullest spec coverage (including
+groupcast, which had no other easy path), was easy to debug against (Matter
+forums and docs are all written in `chip-tool` commands), and fit a simple
+subprocess-and-exit model. The recurring cost was a fragile text parser (the
+`Data = ...` convention, coarse exit codes needing stdout/stderr
+reclassification) that had to be re-pinned against every `chip-tool` version.
+Phase 5 (decided 2026-07-10) replaced this piece by piece with a from-scratch
+Rust controller library, crate `mat-controller`, until milestone M8c-3
+(0.22.0) retired `chip-tool` entirely and deleted its text parsers — see the
+Phase 5 record below for the milestone-by-milestone history.
 
 ### The backend is replaceable (adapter boundary)
 `mat` couples to the backend through **only `mat`'s own JSON schema**.
-
-- Decided (2026-07-10): a from-scratch Rust controller library, crate
-  `mat-controller` in this workspace — see "Phase 5" below for the decision
-  record and milestones.
-- A replacement must be one adapter in the child-runner, with `mat`'s JSON schema
-  as the contract. Subcommands and output schema do not change.
+Subcommands and output schema do not change; a future replacement is still one
+adapter behind that schema (see "Phase 5" below for the current native
+backend's decision record and milestones).
 
 ---
 
 ## Design rules (must follow)
 
-1. **Protocol code lives only in the backend crate.** TLV, CASE, session
-   crypto, multicast routing — all of it belongs to `mat-controller`
-   (Phase 5) and nowhere else. The `mat` CLI and `matd` command layers
-   never speak the protocol; until Phase 5 lands they delegate everything
-   to `chip-tool`, which remains the production path.
-2. **stdout is pure structured JSON only.** Parse `chip-tool` output and re-emit
-   it in `mat`'s schema. No human decoration (color, progress, interactive
-   prompts).
-3. **Diagnostics go to stderr as structured logs** (`tracing`). Do not swallow
-   `chip-tool`'s stderr; keep it at least at debug level.
+1. **Protocol code lives only in the backend crates.** TLV, CASE, session
+   crypto, multicast routing — all of it belongs to `mat-controller` /
+   `mat-native` (Phase 5) and nowhere else. The `mat` CLI and `matd` command
+   layers never speak the protocol. As of M8c-3 the native backend is the
+   only path (`chip-tool` is retired).
+2. **stdout is pure structured JSON only.** Emit the result in `mat`'s schema.
+   No human decoration (color, progress, interactive prompts).
+3. **Diagnostics go to stderr as structured logs** (`tracing`).
 4. **Hold no state except the credential KVS.** No session-cache DB, no daemon, no
    internal scheduler.
 
@@ -207,8 +220,10 @@ change can break the parser.
 
 ### Location and ownership
 - Default path: `$XDG_CONFIG_HOME/mat/` (default `~/.config/mat/`). It holds the
-  Root CA, the controller's keys/cert, commissioned nodes' ledger, and
-  `chip-tool`'s persistent storage.
+  Root CA, the controller's keys/cert, commissioned nodes' ledger, and the
+  Matter KVS (keysets, operational credentials, group tables, the group-send
+  counter) in `chip-tool`-compatible INI form — `mat` is the sole owner/writer
+  since M8c-3.
 - Override with `--store <path>` or the `MAT_STORE` env var.
 - **Credentials are never committed** (the repo is public). `.gitignore` excludes
   them.
@@ -229,26 +244,33 @@ This repo ships two binaries from one install:
           +---------------+----------------+
           v                                v
    mat  (one-shot; credential KVS only)   matd (resident; Phase 4)
-       \   Command::new("chip-tool")        \  warm CASE sessions / unix socket
+       \   mat-native::Engine (in-process)  \  warm mat-native::Engine(s) / unix socket
         \                                     \
          +------------------+------------------+
                             v
-   chip-tool ── real Matter devices (Thread / Wi-Fi / Ethernet)
+              mat-controller (TLV / CASE / IM / mDNS / commissioning,
+                              in-process — no subprocess)
+                            v
+        real Matter devices (Thread / Wi-Fi / Ethernet)
 ```
 
-- **`mat`** is the one-shot CLI. It spawns `chip-tool`, runs one command, and
-  exits. Design rule 4 (no daemon / cache inside `mat`) always holds.
-- **`matd`** is the resident binary (Phase 4). It keeps warm CASE (Sigma)
-  sessions so repeated Matter calls skip the handshake — the same model as ssh
-  `ControlMaster`/`ControlPersist`. `matd` is allowed to be resident precisely
-  because it is a **separate binary and layer**, not `mat`. `mat` **auto-detects**
-  a running `matd` by default (a connect probe on the default socket, falling
-  back to spawning `chip-tool` directly when nothing answers); `--matd`/
-  `MAT_MATD=1` force the matd path, `MAT_MATD=0` disables probing entirely.
+- **`mat`** is the one-shot CLI. It builds a native `mat-native::Engine`
+  in-process, runs one command, and exits. Design rule 4 (no daemon / cache
+  inside `mat`) always holds.
+- **`matd`** is the resident binary (Phase 4). It holds a warm native `Engine`
+  per node (CASE/Sigma sessions) so repeated Matter calls skip the handshake —
+  the same model as ssh `ControlMaster`/`ControlPersist`. `matd` is allowed to
+  be resident precisely because it is a **separate binary and layer**, not
+  `mat`. `mat` **auto-detects** a running `matd` by default (a connect probe on
+  the default socket, falling back to its own native direct path when nothing
+  answers); `--matd`/`MAT_MATD=1` force the matd path, `MAT_MATD=0` disables
+  probing entirely.
 
-Both binaries share a library crate `mat-core` (the `parse` / `output` / `error`
-/ `group` modules: chip-tool parsing, the JSON schema, exit-code classification,
-group key logic) so the fragile parts are maintained once.
+Both binaries share a library crate `mat-core` (the `parse` / `output` /
+`error` / `group` / `acl` modules: shared value normalization, the JSON
+schema, exit-code classification, group key logic) and the shared engine
+crate `mat-native` (built on the protocol library `mat-controller`), so the
+fragile parts are maintained once.
 
 ### Two kinds of groups
 There are two "groups." Do not confuse them or define them twice.
@@ -761,6 +783,84 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     書換をバックアップ実在ガードで保護 — バックアップが無い状態で誤って
     破壊的な書換に入らないようにする安全策）。バージョンは 0.21.0。
     **実機 E2E は本タスクの範囲外（未実施）**。
+  - **M8c-3 実装済み（0.22.0、native 既定化 + chip-tool 完全撤去 +
+    fabric bootstrap）**: 設計は
+    `docs/superpowers/specs/2026-07-17-phase5-m8c3-native-default-design.md`。
+    内部二段構え（撤去は不可逆なため間に実機 E2E ゲートを置く）。
+    - **Stage 1（native 既定化、フォールバック温存）**: (1) **iface 自動検出**
+      （`mat-native::iface_select`）— up（carrier 有）・MULTICAST・非 loopback・
+      非 POINTOPOINT（tun/tailscale 除外）・IPv6 link-local 保有の候補を
+      `/sys/class/net` + `/proc/net/if_inet6` から集め、ちょうど 1 つで採用、
+      0/2+ は kind `other` のハードエラー（候補列挙 + `set MAT_IFACE`）。
+      純関数 `select` を表駆動ユニットテスト。`MAT_IFACE`/`MAT_MATD_IFACE`
+      未設定でも native 経路に入る（env は明示上書きとして存続、matd は曖昧なら
+      起動拒否）。(2) **epoch 採用永続**（`mat-native::commission::resolve_ipk_epoch`）
+      — 解決順は (1) KVS の `mat/f/<idx>/ipk-epoch` 読み出し → (2) 無ければ既定定数を
+      `verify_default_ipk_epoch` で検証し一致ならその場で同キーへ採用永続（flock
+      書込、失敗はハードエラー）→ (3) 不一致は `store_parse` ハードエラー
+      （M8c-1 の「不一致→フォールバック」から恒久挙動へ前倒し）。
+    - **Stage 2（完全撤去 + fabric bootstrap）**: (1) **chip-tool / avahi-browse
+      経路の全削除**（`mat` の runner spawn・各コマンドの chip-tool 分岐・
+      `MAT_CHIP_TOOL_BIN`・probe/discover の avahi フォールバック、matd の
+      chip-tool ランナーとフォールバック分岐、`Data = ...` パーサ、
+      `fake-chip-tool.sh`、統合テストの chip-tool 依存 — Task 9/10/11）。exit
+      12（`ChildNotFound`）は歴史的欠番として予約（variant は wire 互換で残置、
+      `diag node --deep` が ping6 不在を `unavailable` 配列の `tool_missing`
+      へ吸収する内部用途のみ）。新 error kind は追加せず（iface 曖昧 = `other`、
+      KVS 系 = `store_missing`/`store_parse`）。(2) **`mat fabric init`**
+      （`crates/mat/src/commands/fabric.rs`、直経路のみ・ネットワーク未接触）—
+      `CommissioningFabric::generate` で root CA + fabric 資材、OS 乱数で 16 バイト
+      ランダム epoch IPK、chip-tool INI 互換 KVS を新規 bootstrap 書込
+      （`write_kvs_bootstrap`）。既存 KVS があれば拒否（`--force` 無し、再初期化は
+      手動 ini 削除）。出力は fabric 識別子のみ（鍵素材は stdout に出さない）。
+      他コマンドは KVS 不在なら `store_missing`（exit 10）+ detail に
+      `mat fabric init` 誘導。(3) **ビルド一本化**: deploy 標準を
+      `cross build --release --target aarch64-unknown-linux-gnu --features ble`
+      に統一（`task dist:arm64`）、musl deploy 経路と Cross.toml の musl 設定を
+      撤去。ローカル `task check` は host build・BLE なしのまま無変更。Docker は
+      chip-tool 焼込ステージ・avahi/dbus/glib/ssl runtime 依存を撤去し
+      mat/matd バイナリ + 最小 runtime（`debian:bookworm-slim` + ca-certificates）
+      にスリム化（`docker:test` は維持）。旧 E2E スクリプト（e2e-m2〜m8c2）は
+      歴史的アーカイブ注記を付けて残置（0.21.0 タグでのみ動作）、Taskfile の
+      対応タスクは削除し `e2e:m8c3:real` のみ残す。
+    - **実機 E2E ゲート 1（Stage 1、jarvis 実運用 fabric、env 未設定）**:
+      **GREEN**。全 op が native 完走・「falling back to chip-tool」発火ゼロ、
+      iface 自動検出が jarvis（eth0+tailscale0）で eth0 を一意選択、初回 native
+      commission で epoch 採用永続が発生し `mat/f/<idx>/ipk-epoch` が書かれ 2 回目
+      以降は KVS 読み出しで通ることを実測。**文書化した逸脱**: 受け入れ手順の
+      「RemoveFabric → on-network 再 commission」は NL68（玄関ライト）では構造的に
+      不可能（工場リセットせずに commissioning window を開く手段がデバイス側に
+      無い）ため、epoch の検証は手動 native commission を複数回走らせて採用永続の
+      冪等性・単調性を確認する形に置換した。
+    - **実機 E2E ゲート 2（Stage 2、最終受け入れ、2026-07-18）**: **PASS**（検証 3 は
+      文書化した逸脱）。検証 1（chip-tool を PATH から外した `PATH=/usr/bin:/bin`
+      環境で全 op が native 完走・直経路/matd 経路とも成功・「falling back to
+      chip-tool」発火ゼロ・配布バイナリに当該文字列も存在しない）= GREEN。検証 2
+      （`mat fabric init` 新規 KVS 生成 + 再 init 拒否 exit 1/kind:other）= GREEN。
+      検証 4（gnu+BLE 配布バイナリが `libdbus-1.so.3` をリンクし bluer シンボルを
+      含む = BLE コンパイル済。加えてゲート 1 で native BLE+Thread commission が実機
+      2 回成功）= GREEN。検証 5（`task check` 全 green + `docker build` 成功、イメージ
+      `mat 0.22.0`・chip-tool 不在を確認）= GREEN。**文書化した逸脱（検証 3、
+      cross-fabric commission）**: `mat fabric init` で作った新 fabric へ実機を
+      on-network で multi-admin join する検証は、実機 Thread デバイスの ECM（拡張
+      commissioning window）の commissionable 広告が on-network の targeted resolve
+      で安定して解決できない（+ open-window の window 状態競合、IM cluster status
+      0x02）ため実施できなかった — ゲート 1 の NL68 と同じクラスの実機環境の難しさで
+      あり mat のバグではない（commission は正しく unreachable/device_rejected を
+      返す）。commission 機構自体はゲート 1（BLE×2）/ M8c-1（on-network）で実証済、
+      `mat fabric init` の資材は `write_kvs_bootstrap` の round-trip 単体テスト
+      （epoch→operational 導出チェーンを実リーダで検証）で構造検証済。唯一ライブ
+      未実証なのは「fabric-init 資材 → ライブ AddNOC」の組合せで、ユーザー判断で
+      逸脱を受容してマージした。
+    - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
+      デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
+      挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
+      scalar のみが仕様、汎用 write/invoke の後退を受容）。(3) IPK ローテーション
+      （全ノード KeySetWrite での epoch 完全移行 — 現状は既存 fabric の定数 epoch を
+      検証して採用永続するのみ）。(4) CASE の多アドレス試行（ゲート 1 で観測した
+      弱点: 1 ノードが複数 AAAA を広告するとき現状は 1 アドレスにしか CASE を
+      張らず、その経路が不調だと session_failed になる — 複数アドレスへ順次
+      試行する堅牢化）。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・

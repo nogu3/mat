@@ -374,7 +374,11 @@ pub(crate) fn random_nonzero_u16() -> u16 {
     }
 }
 
-fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
+/// `secret` の SEC1 uncompressed 公開鍵（65 バイト）。CASE の一時鍵専用に
+/// 見えるが実質「p256 secret → uncompressed pubkey」の唯一の変換なので、
+/// `commissioning::write_kvs_bootstrap`（M8c-3）の使い捨て admin op 鍵にも
+/// 再利用する（`pub(crate)`）。
+pub(crate) fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
     let point = secret.public_key().to_encoded_point(false);
     point
         .as_bytes()

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
+# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
 # Phase 5 M2b 受け入れ: 使い捨て fabric でコミッション → 自己発行 NOC で CASE + IM。
 # 前提: ./chip-all-clusters-app と ./chip-tool（task chip:extract:app / chip:extract）。
 set -euo pipefail

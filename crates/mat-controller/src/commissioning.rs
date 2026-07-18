@@ -1297,9 +1297,10 @@ impl CommissioningFabric {
     /// するための CommissioningFabric を組む。`generate`（新規 fabric）と
     /// 対になる読み込み側。AddNOC でデバイスへ渡す IPK は **epoch** 側 —
     /// operational を渡すとデバイス側の KDF 導出が二重になり CASE が壊れる。
-    /// epoch は KVS に永続されない（chip-tool は既定定数を毎回投入）ため
-    /// 引数で受ける。呼び出し側は `fabric::verify_default_ipk_epoch` の
-    /// ガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を渡すこと。
+    /// epoch は呼び出し側が解決して渡す引数（M8c-3: `mat/f/<idx>/ipk-epoch`
+    /// に永続される。`mat-native::commission::resolve_ipk_epoch` が、KVS に
+    /// 既存の永続 epoch があればそれを、無ければ `fabric::verify_default_ipk_epoch`
+    /// のガード通過後に `fabric::CHIP_TOOL_DEFAULT_IPK_EPOCH` を採用して永続化する）。
     pub fn from_materials(m: crate::kvs::SelfIssueMaterials, ipk_epoch: [u8; 16]) -> Self {
         Self {
             rcac_tlv: m.rcac,
@@ -1355,6 +1356,78 @@ impl CommissioningFabric {
         )?;
         Ok(noc.to_tlv())
     }
+
+    /// 初回 fabric bootstrap（M8c-3）: この fabric を chip-tool INI 互換 KVS へ
+    /// 新規永続する。書くもの:
+    ///   alpha ini … ExampleOpCredsCAKey<issuer> = pub65||priv32（97B）
+    ///   main ini  … f/<idx>/r = RCAC(TLV) / f/<idx>/n = admin NOC(TLV)
+    ///               f/<idx>/k/0 = IPK keyset blob（3 スロット、終端 0xFFFF）
+    ///               mat/f/<idx>/ipk-epoch = ランダム epoch（mat 専用キー）
+    /// 既に KVS があれば `KvsError::AlreadyExists`（上書きしない — 誤 store
+    /// パスでのサイレント別 fabric 生成を防ぐ、spec ユーザー決定）。
+    pub fn write_kvs_bootstrap(
+        &self,
+        store: &std::path::Path,
+        fabric_index: u8,
+        issuer_index: u8,
+    ) -> Result<(), crate::kvs::KvsError> {
+        use crate::kvs::KvsTxn;
+        let alpha_path = store.join("chip_tool_config.alpha.ini");
+        let main_path = store.join("chip_tool_config.ini");
+        // どちらか一方でも実在したら拒否（中途半端な store を悪化させない）。
+        if alpha_path.exists() || main_path.exists() {
+            return Err(crate::kvs::KvsError::AlreadyExists);
+        }
+
+        let rcac = MatterCert::parse(&self.rcac_tlv).map_err(|_| crate::kvs::KvsError::BadNoc {
+            fabric_index,
+            reason: "generated rcac unparseable (bug)",
+        })?;
+        let cfid = fabric::compressed_fabric_id(&rcac.pub_key, self.fabric_id);
+        let operational = fabric::derive_ipk_operational(&self.ipk_epoch, &cfid);
+
+        // admin NOC: 使い捨て op 鍵で自己発行（f/<idx>/n はリーダが node_id /
+        // fabric_id を読むためだけに使う — 実行時の CASE 用 NOC は毎回
+        // FabricCredentials::from_self_issued が自己発行するので秘密鍵は捨てる）。
+        let op_secret = case::random_p256_secret();
+        let op_public = case::eph_pub_bytes(&op_secret);
+        let admin_noc = self
+            .issue_device_noc(&op_public, self.admin_node_id)
+            .map_err(|_| crate::kvs::KvsError::BadNoc {
+                fabric_index,
+                reason: "admin noc issuance failed (bug)",
+            })?;
+
+        // alpha ini
+        let mut ca_key = Vec::with_capacity(97);
+        ca_key.extend_from_slice(&rcac.pub_key);
+        ca_key.extend_from_slice(&self.root_private_key);
+        let mut alpha = KvsTxn::create(&alpha_path)?;
+        alpha.set(&format!("ExampleOpCredsCAKey{issuer_index}"), &ca_key);
+        alpha.commit()?;
+
+        // main ini（1 flock 区間 + 1 commit）
+        let gkh = fabric::derive_group_session_id(&operational);
+        let mut main = KvsTxn::create(&main_path)?;
+        main.set(&format!("f/{fabric_index}/r"), &self.rcac_tlv);
+        main.set(&format!("f/{fabric_index}/n"), &admin_noc);
+        main.set(
+            &format!("f/{fabric_index}/k/0"),
+            &crate::group_settings::serialize_keyset(
+                0,
+                crate::group_settings::EPOCH_START_TIME,
+                gkh,
+                &operational,
+                0xFFFF,
+            ),
+        );
+        main.set(
+            &crate::kvs::mat_ipk_epoch_key(fabric_index),
+            &self.ipk_epoch,
+        );
+        main.commit()?;
+        Ok(())
+    }
 }
 
 // --- errors ---
@@ -1368,15 +1441,16 @@ impl CommissioningFabric {
 /// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
 /// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
 /// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
-/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `Unavailable`（chip-tool フォールバック）にし、`kind_of` を経由しない | ―     |
+/// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `unreachable` のハードエラーにし（M8c-3: chip-tool フォールバック撤去）、`kind_of` を経由しない | ―     |
 /// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
 /// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
 ///
 /// `Ble { step: "scan", .. }` は `kind_of` を経由しない — `find_commissionable`
 /// の空振り（デバイスが見えない）はワイヤ未接触なので、呼び出し側
-/// (`mat-native::commission` の `ble_path`) が個別に検出して `Unavailable`
-/// にする。BLE/BTP のそれ以外の失敗（`bluez-session` / `adapter` / `gatt` /
-/// `btp-handshake` / `udp-bind`）は他の variant と同様 `commission_failed`。
+/// (`mat-native::commission` の `ble_path`) が個別に検出して `unreachable`
+/// のハードエラーにする（M8c-3: chip-tool フォールバック撤去）。BLE/BTP の
+/// それ以外の失敗（`bluez-session` / `adapter` / `gatt` / `btp-handshake` /
+/// `udp-bind`）は他の variant と同様 `commission_failed`。
 #[derive(Debug)]
 pub enum CommissionError {
     Discovery(crate::dnssd::DnssdError),
@@ -1500,6 +1574,38 @@ impl From<crate::case::CaseError> for CommissionError {
 mod tests {
     use super::*;
     use crate::tlv::{Reader, Tag, Value, Writer};
+
+    #[test]
+    fn bootstrap_roundtrip_via_kvs_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let fab = CommissioningFabric::generate(1, 112233).unwrap();
+        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
+        // 既存リーダで読み戻せる = chip-tool INI 互換形式の証明
+        let m = crate::kvs::read_self_issue_materials(
+            &dir.path().join("chip_tool_config.alpha.ini"),
+            &dir.path().join("chip_tool_config.ini"),
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(m.fabric_id, 1);
+        assert_eq!(m.node_id, 112233);
+        // epoch → operational の導出チェーンが KVS の中身と一致
+        let creds = crate::fabric::FabricCredentials::from_self_issued(m.clone()).unwrap();
+        let epoch = crate::kvs::read_mat_ipk_epoch(&dir.path().join("chip_tool_config.ini"), 1)
+            .unwrap()
+            .expect("epoch persisted");
+        let cfid = crate::fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+        assert_eq!(
+            crate::fabric::derive_ipk_operational(&epoch, &cfid),
+            m.ipk_operational
+        );
+        // 二重 init は拒否
+        assert!(matches!(
+            fab.write_kvs_bootstrap(dir.path(), 1, 0),
+            Err(crate::kvs::KvsError::AlreadyExists)
+        ));
+    }
 
     #[test]
     fn arm_fail_safe_fields_shape() {

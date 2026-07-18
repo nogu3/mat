@@ -1,491 +1,61 @@
-//! ダミー `chip-tool` を使った統合テスト。実 chip-tool 不要・CI で回る。
+//! chip-tool を一切 spawn しない統合テスト（M8c-3 Task3）。
 //!
-//! 各テストは `--store` に tempdir を渡してストアを隔離し、`MAT_CHIP_TOOL_BIN`
-//! で `tests/fixtures/fake-chip-tool.sh` を指す。
-
-use std::path::PathBuf;
+//! Stage 1（native 既定化, Task4）以降、`MAT_IFACE` 未設定でも native 経路に
+//! 入るため、chip-tool のダミー実行体を PATH に注入する前提の「成功時の JSON
+//! 内容」テストは環境依存で挙動が変わってしまう。ここに残すのは
+//! **バックエンド（native / chip-tool）に
+//! 到達する前に完結する** テストだけ: CLI 引数エラー（exit 2）・store エラー
+//! （exit 10/11）・alias 解決（成功はバックエンド到達前で観測できる形のみ・
+//! 失敗は exit 2/10）・`--matd` 非対応サブコマンド（exit 2）。
+//!
+//! 成功時の JSON スキーマ（read/write/invoke/describe/diag node 等）の検証は
+//! `crates/mat/src/native_direct.rs` の `FakeConn` ベースのユニットテストに
+//! 委譲した（chip-tool 統合テストでの重複カバレッジを持たない）。
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn fake_chip_tool() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("fake-chip-tool.sh")
-}
-
-/// fake chip-tool を使う `mat` コマンド。store は与えられた dir。
-/// MAT_MATD=0 で直経路に固定する（matd 自動検出が既定のため、開発機で実 matd が
-/// 動いていても拾わない）。
+/// テスト用の `mat` コマンド。store は与えられた dir。
+///
+/// `MAT_IFACE=lo` を固定する: Task4（native 既定化）で `MAT_IFACE` 未設定は
+/// 自動検出に切り替わるため、先にこのテストスイート側を「明示 iface 指定」の
+/// 形に揃えておく（`lo` は実在するが KVS 資材が無いので native 経路は必ず
+/// warn + フォールスルーし、store/require_node チェックはこれまでどおり
+/// コマンド層 or native_direct::execute() の同一ロジックで exit 10/11 を出す
+/// — 詳細は native_direct.rs の `execute()` の doc コメント参照）。
+/// `MAT_MATD=0` で直経路に固定する（matd 自動検出が既定のため、開発機で実
+/// matd が動いていても拾わない）。
 fn mat(store: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("mat").unwrap();
-    c.env("MAT_CHIP_TOOL_BIN", fake_chip_tool())
+    c.env("MAT_IFACE", "lo")
         .env("MAT_MATD", "0")
-        .env_remove("MAT_IFACE")
         .arg("--store")
         .arg(store);
     c
 }
 
-#[test]
-fn discover_lists_commissionable_devices() {
-    let store = TempDir::new().unwrap(); // 存在する空ストア
-    mat(store.path())
-        .arg("discover")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"devices\""))
-        .stdout(predicate::str::contains("192.0.2.10"))
-        .stdout(predicate::str::contains("\"commissionable\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn discover_with_missing_store_bootstraps_and_succeeds() {
-    // discover は認証情報不要（commissionable 探索のみ）。store 無しでも
-    // 空ストアを bootstrap して成功し、commissionable を返す。
-    let store = TempDir::new().unwrap();
-    let missing = store.path().join("does-not-exist");
-    mat(&missing)
-        .arg("discover")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"commissionable\""));
-    // 空ストアが作られている。
-    assert!(missing.is_dir());
-}
-
-#[test]
-fn discover_with_missing_chip_tool_exits_12() {
-    let store = TempDir::new().unwrap();
-    Command::cargo_bin("mat")
-        .unwrap()
-        .env("MAT_CHIP_TOOL_BIN", "/nonexistent/chip-tool-binary")
-        .env("MAT_MATD", "0")
-        .arg("--store")
-        .arg(store.path())
-        .arg("discover")
-        .assert()
-        .code(12)
-        .stderr(predicate::str::contains("child_not_found"));
-}
-
-#[test]
-fn discover_native_bogus_iface_falls_back_to_chip_tool() {
-    // 存在しない iface 名 → iface_index が即失敗 → warn + chip-tool フォール
-    // バックで commissionable が従来どおり出る。
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .env("MAT_IFACE", "mat-test-no-such-iface")
-        .env("MAT_LOG", "warn")
-        .arg("discover")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"commissionable\""))
-        .stdout(predicate::str::contains("192.0.2.10"))
-        .stderr(predicate::str::contains("falling back to chip-tool"));
-}
-
-#[test]
-fn commission_success_updates_store_and_shows_in_discover() {
-    let store = TempDir::new().unwrap();
-
-    // commission（ストアは自動 bootstrap される）。
-    mat(store.path())
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE-SETUP-CODE",
-            "--node",
-            "5",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"node_id\":5"))
-        .stdout(predicate::str::contains("\"status\":\"success\""));
-
-    // 台帳に乗ったので discover が commissioned として返す。
-    mat(store.path())
-        .arg("discover")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"commissioned\""))
-        .stdout(predicate::str::contains("\"node_id\":5"));
-}
-
-#[test]
-fn commission_passes_paa_trust_store_when_set() {
-    // 本番デバイスの attestation 検証用に、MAT_PAA_TRUST_STORE で指定した PAA
-    // ディレクトリが chip-tool へ `--paa-trust-store-path` で渡ること。
-    let store = TempDir::new().unwrap();
-    let paa = TempDir::new().unwrap();
-    let args_file = store.path().join("recorded-args.txt");
-
-    mat(store.path())
-        .env("MAT_PAA_TRUST_STORE", paa.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE-SETUP-CODE",
-            "--node",
-            "7",
-        ])
-        .assert()
-        .success();
-
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("--paa-trust-store-path"),
-        "args did not include PAA flag: {recorded}"
-    );
-    assert!(
-        recorded.contains(paa.path().to_str().unwrap()),
-        "args did not include PAA path: {recorded}"
-    );
-}
-
-#[test]
-fn commission_timeout_exits_3() {
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-        ])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("timeout"));
-}
-
-#[test]
-fn commission_reject_exits_4() {
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "reject")
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-        ])
-        .assert()
-        .code(4)
-        .stderr(predicate::str::contains("device_rejected"));
-}
-
-#[test]
-fn commission_auto_assigns_node_id() {
-    let store = TempDir::new().unwrap();
-    // node-id 指定なし → 空台帳なので 1 が振られる。
-    mat(store.path())
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"node_id\":1"));
-}
-
-#[test]
-fn commission_native_bogus_iface_falls_back_to_chip_tool() {
-    // 存在しない iface → 資材構築前に iface_index が失敗 → warn +
-    // chip-tool フォールバックで従来どおり成功する。
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .env("MAT_IFACE", "mat-test-no-such-iface")
-        .env("MAT_LOG", "warn")
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            // parse_code が先に走るため、資材構築（iface_index）失敗の検証には
-            // 構文的に正当な QR payload が要る（"MT:FAKE" は base38 として不正
-            // で parse 段階の Err になり iface チェックまで届かない）。
-            "MT:-24J0AFN00KA0648G00",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"success\""))
-        .stderr(predicate::str::contains("falling back to chip-tool"));
-}
-
-#[test]
-fn commission_thread_dataset_arg_is_accepted() {
-    // --thread-dataset は BLE 経路（native）専用だが、chip-tool フォール
-    // バック時も引数としては受理される（exit 2 にならない）。
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .env("MAT_IFACE", "mat-test-no-such-iface")
-        .env("MAT_LOG", "warn")
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:-24J0AFN00KA0648G00",
-            "--thread-dataset",
-            "0e080000000000010000",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"success\""));
-}
-
-/// node 5 を commission 済みにしたストアを用意する（Phase 1 操作系の前提）。
+/// node 5 が commission 済みのストアを直接構築する（chip-tool を経由しない —
+/// `mat_core::store::Store` の `nodes.json` スキーマに直接書く）。
 fn store_with_node5() -> TempDir {
     let store = TempDir::new().unwrap();
-    mat(store.path())
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-            "--node",
-            "5",
-        ])
-        .assert()
-        .success();
+    std::fs::write(
+        store.path().join("nodes.json"),
+        r#"{"version":1,"nodes":{"5":{"node_id":5,"address":"192.0.2.10","commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
+    )
+    .unwrap();
     store
 }
 
-#[test]
-fn read_parses_value() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "read",
-            "--node",
-            "5",
-            "--cluster",
-            "onoff",
-            "--attribute",
-            "on-off",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
-        .stdout(predicate::str::contains("\"attribute\":\"on-off\""))
-        .stdout(predicate::str::contains("\"value\":true"))
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn diag_thread_returns_mesh_snapshot() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["diag", "thread", "--node", "5"])
-        .assert()
-        .success()
-        // スナップショット骨格と既定 endpoint 0。
-        .stdout(predicate::str::contains("\"thread\""))
-        .stdout(predicate::str::contains("\"endpoint\":0"))
-        // スカラ（routing-role の enum は数値のまま）。どの Thread 網かは extended-pan-id。
-        .stdout(predicate::str::contains("\"routing_role\":5"))
-        // 文字列の長さ注釈 `(14 chars)` は剥がれ、引用符も含まない。
-        .stdout(predicate::str::contains(
-            "\"network_name\":\"ha-thread-6562\"",
-        ))
-        .stdout(predicate::str::contains("\"pan_id\":25954"))
-        // neighbor-table の struct-list が配列で出る。キーは chip-tool 表記のまま。
-        .stdout(predicate::str::contains("\"neighbor_table\""))
-        .stdout(predicate::str::contains("\"AverageRssi\":-95"))
-        .stdout(predicate::str::contains("\"Lqi\":3"))
-        .stdout(predicate::str::contains("\"route_table\""))
-        .stdout(predicate::str::contains("\"PathCost\":1"))
-        // 全属性成功時は unavailable を出さない。
-        .stdout(predicate::str::contains("\"unavailable\"").not())
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn diag_thread_partial_records_unavailable() {
-    // 間欠不通の機器を模し neighbor-table だけ失敗させる。残りは返しつつ、失敗属性は
-    // unavailable に記録、未取得テーブルは null（空配列 `[]` = 真にゼロ、とは区別）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_THREAD_FAIL_ATTR", "neighbor-table")
-        .args(["diag", "thread", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"routing_role\":5"))
-        .stdout(predicate::str::contains("\"neighbor_table\":null"))
-        .stdout(predicate::str::contains("\"unavailable\""))
-        .stdout(predicate::str::contains("\"attribute\":\"neighbor-table\""))
-        .stdout(predicate::str::contains("\"kind\":\"device_rejected\""));
-}
-
-#[test]
-fn diag_thread_fully_unreachable_exits_3() {
-    // 全属性が timeout（完全不達）なら部分結果を諦め、timeout を伝播する（exit 3）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args(["diag", "thread", "--node", "5"])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("timeout"));
-}
-
-#[test]
-fn write_reports_success() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "write",
-            "--node",
-            "5",
-            "--cluster",
-            "levelcontrol",
-            "--attribute",
-            "on-level",
-            "--value",
-            "128",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"success\""))
-        // write の value は read と型を揃える（文字列 "128" ではなく整数 128）。
-        .stdout(predicate::str::contains("\"value\":128"));
-}
-
-#[test]
-fn invoke_reports_success() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "invoke",
-            "--node",
-            "5",
-            "--cluster",
-            "onoff",
-            "--command",
-            "toggle",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"command\":\"toggle\""))
-        .stdout(predicate::str::contains("\"status\":\"success\""));
-}
-
-#[test]
-fn on_maps_to_onoff_invoke() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["on", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
-        .stdout(predicate::str::contains("\"command\":\"on\""))
-        .stdout(predicate::str::contains("\"status\":\"success\""));
-}
-
-#[test]
-fn off_maps_to_onoff_invoke() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["off", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"command\":\"off\""));
-}
-
-#[test]
-fn color_temp_kelvin_expands_to_move_to_color_temperature() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color-temp", "--node", "5", "--kelvin", "2700"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"colorcontrol\""))
-        .stdout(predicate::str::contains(
-            "\"command\":\"move-to-color-temperature\"",
-        ))
-        // 入力の kelvin と換算後の mireds を両方エコーする（読み返し突合用）。
-        .stdout(predicate::str::contains("\"kelvin\":2700"))
-        .stdout(predicate::str::contains("\"mireds\":370"))
-        .stdout(predicate::str::contains("\"status\":\"success\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-    // chip-tool へは mireds + transition + optionsMask/Override、宛先は末尾。
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 5 1"),
-        "expected converted mireds invoke argv: {recorded}"
-    );
-}
-
-#[test]
-fn color_temp_mireds_passes_through_and_echoes_kelvin() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color-temp", "--node", "5", "--mireds", "370"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"mireds\":370"))
-        // 1_000_000 / 370 = 2702.7 → 2703（エコー用の逆換算）。
-        .stdout(predicate::str::contains("\"kelvin\":2703"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 5 1"),
-        "expected mireds passed through: {recorded}"
-    );
-}
-
-#[test]
-fn color_temp_transition_is_passed_to_chip_tool() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "color-temp",
-            "--node",
-            "5",
-            "--kelvin",
-            "2700",
-            "--transition",
-            "30",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"transition\":30"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-color-temperature 370 30 0 0 5 1"),
-        "expected transition time in argv: {recorded}"
-    );
-}
+// ── CLI 引数エラー（clap レベル、exit 2、バックエンド不到達）───────────────
 
 #[test]
 fn color_temp_requires_exactly_one_of_kelvin_or_mireds() {
     let store = store_with_node5();
-    // どちらも無し → CLI 引数エラー（exit 2）。
     mat(store.path())
         .args(["color-temp", "--node", "5"])
         .assert()
         .code(2);
-    // 両方指定 → 排他違反（exit 2）。
     mat(store.path())
         .args([
             "color-temp",
@@ -501,79 +71,12 @@ fn color_temp_requires_exactly_one_of_kelvin_or_mireds() {
 }
 
 #[test]
-fn color_temp_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["color-temp", "--node", "99", "--kelvin", "2700"])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn color_expands_to_move_to_hue_and_saturation() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color", "--node", "5", "--hue", "330", "--sat", "80"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"colorcontrol\""))
-        .stdout(predicate::str::contains(
-            "\"command\":\"move-to-hue-and-saturation\"",
-        ))
-        // 入力の度 / % と換算後の 0–254 生値を両方エコーする（読み返し突合用）。
-        .stdout(predicate::str::contains("\"hue\":330"))
-        .stdout(predicate::str::contains("\"saturation\":80"))
-        .stdout(predicate::str::contains("\"hue_raw\":233"))
-        .stdout(predicate::str::contains("\"saturation_raw\":203"))
-        .stdout(predicate::str::contains("\"status\":\"success\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-    // chip-tool へは hue/sat 生値 + transition + optionsMask/Override、宛先は末尾。
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 233 203 0 0 0 5 1"),
-        "expected converted hue/sat invoke argv: {recorded}"
-    );
-}
-
-#[test]
-fn color_transition_is_passed_to_chip_tool() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "color",
-            "--node",
-            "5",
-            "--hue",
-            "330",
-            "--sat",
-            "80",
-            "--transition",
-            "30",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"transition\":30"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 233 203 30 0 0 5 1"),
-        "expected transition time in argv: {recorded}"
-    );
-}
-
-#[test]
 fn color_requires_both_hue_and_sat() {
     let store = store_with_node5();
-    // --sat 欠け → CLI 引数エラー（exit 2）。
     mat(store.path())
         .args(["color", "--node", "5", "--hue", "330"])
         .assert()
         .code(2);
-    // --hue 欠け → 同じく exit 2。
     mat(store.path())
         .args(["color", "--node", "5", "--sat", "80"])
         .assert()
@@ -583,7 +86,6 @@ fn color_requires_both_hue_and_sat() {
 #[test]
 fn color_rejects_out_of_range_values() {
     let store = store_with_node5();
-    // hue は 0–360 度、sat は 0–100 %。超過は clap の値域検証で exit 2。
     mat(store.path())
         .args(["color", "--node", "5", "--hue", "361", "--sat", "80"])
         .assert()
@@ -595,81 +97,8 @@ fn color_rejects_out_of_range_values() {
 }
 
 #[test]
-fn color_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["color", "--node", "99", "--hue", "330", "--sat", "80"])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn color_name_red_converts_via_rgb_hsv() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color", "--node", "5", "--name", "red"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"name\":\"red\""))
-        .stdout(predicate::str::contains("\"rgb\":\"#ff0000\""))
-        .stdout(predicate::str::contains("\"hue_raw\":0"))
-        .stdout(predicate::str::contains("\"saturation_raw\":254"))
-        .stdout(predicate::str::contains("\"status\":\"success\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 0 254 0 0 0 5 1"),
-        "expected red converted argv: {recorded}"
-    );
-}
-
-#[test]
-fn color_name_white_collapses_to_sat_zero() {
-    // white = #ffffff は RGB→HSV で自然に sat=0（無彩色）。特別扱い無し。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color", "--node", "5", "--name", "white"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"saturation_raw\":0"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 0 0 0 0 0 5 1"),
-        "expected white sat=0 argv: {recorded}"
-    );
-}
-
-#[test]
-fn color_rgb_hex_and_decimal_forms_are_equivalent() {
-    let store = store_with_node5();
-    for rgb in ["#ff00aa", "ff00aa", "255,0,170"] {
-        let args_file = store.path().join("recorded-args.txt");
-        mat(store.path())
-            .env("FAKE_CHIP_ARGS_FILE", &args_file)
-            .args(["color", "--node", "5", "--rgb", rgb])
-            .assert()
-            .success()
-            // 入力表記によらず正規形 #rrggbb でエコーする。
-            .stdout(predicate::str::contains("\"rgb\":\"#ff00aa\""))
-            .stdout(predicate::str::contains("\"hue\":320"))
-            .stdout(predicate::str::contains("\"hue_raw\":226"))
-            .stdout(predicate::str::contains("\"saturation_raw\":254"));
-        let recorded = std::fs::read_to_string(&args_file).unwrap();
-        assert!(
-            recorded.contains("colorcontrol move-to-hue-and-saturation 226 254 0 0 0 5 1"),
-            "expected #ff00aa argv for input {rgb}: {recorded}"
-        );
-    }
-}
-
-#[test]
 fn color_spec_systems_are_mutually_exclusive() {
     let store = store_with_node5();
-    // 複数系統の同時指定は exit 2。
     mat(store.path())
         .args(["color", "--node", "5", "--name", "red", "--rgb", "#ff0000"])
         .assert()
@@ -698,592 +127,6 @@ fn color_spec_systems_are_mutually_exclusive() {
 }
 
 #[test]
-fn color_custom_name_from_aliases_colors_overrides_builtin() {
-    let store = store_with_node5();
-    std::fs::write(
-        store.path().join("aliases.toml"),
-        "[colors]\nwarm = \"#ff8c00\"\nred = \"0,0,255\"\n",
-    )
-    .unwrap();
-    let args_file = store.path().join("recorded-args.txt");
-    // ユーザー定義色。#ff8c00 → hue_raw 23, sat_raw 254。
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color", "--node", "5", "--name", "warm"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"name\":\"warm\""))
-        .stdout(predicate::str::contains("\"rgb\":\"#ff8c00\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 23 254 0 0 0 5 1"),
-        "expected warm argv: {recorded}"
-    );
-    // 組み込み red をユーザー定義（青）が上書き → hue_raw 169。
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["color", "--node", "5", "--name", "red"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"rgb\":\"#0000ff\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-hue-and-saturation 169 254 0 0 0 5 1"),
-        "expected overridden red (=blue) argv: {recorded}"
-    );
-}
-
-#[test]
-fn color_unknown_name_exits_2_and_broken_colors_exits_10() {
-    let store = store_with_node5();
-    // 未知の色名は CLI 引数エラー（exit 2）。既知名を列挙する。
-    mat(store.path())
-        .args(["color", "--node", "5", "--name", "sakura"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("unknown color name"));
-    // 壊れた [colors]（RGB パース不能）は store_parse（exit 10）。
-    std::fs::write(
-        store.path().join("aliases.toml"),
-        "[colors]\nbad = \"zzz\"\n",
-    )
-    .unwrap();
-    mat(store.path())
-        .args(["color", "--node", "5", "--name", "red"])
-        .assert()
-        .code(10)
-        .stderr(predicate::str::contains("store_parse"));
-}
-
-#[test]
-fn color_invalid_rgb_exits_2() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["color", "--node", "5", "--rgb", "zzz"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("invalid RGB"));
-}
-
-#[test]
-fn describe_lists_endpoints_and_clusters() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["describe", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"endpoints\""))
-        // ep0 の server-list（29,31）と ep1（6,8）。
-        .stdout(predicate::str::contains("\"endpoint\":0"))
-        .stdout(predicate::str::contains("\"endpoint\":1"))
-        .stdout(predicate::str::contains("29"))
-        .stdout(predicate::str::contains("\"clusters\":[6,8]"));
-}
-
-#[test]
-fn open_window_returns_codes() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["open-window", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"node_id\":5"))
-        .stdout(predicate::str::contains("\"manual_code\":\"36217551492\""))
-        .stdout(predicate::str::contains(
-            "\"qr_payload\":\"MT:-24J0AFN00KA0648G00\"",
-        ))
-        .stdout(predicate::str::contains("\"expires_at\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn open_window_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["open-window", "--node", "99"])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn open_window_timeout_exits_3() {
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args(["open-window", "--node", "5"])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("timeout"));
-}
-
-#[test]
-fn read_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "read",
-            "--node",
-            "99",
-            "--cluster",
-            "onoff",
-            "--attribute",
-            "on-off",
-        ])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn read_missing_store_exits_10() {
-    let store = TempDir::new().unwrap();
-    let missing = store.path().join("nope");
-    mat(&missing)
-        .args([
-            "read",
-            "--node",
-            "5",
-            "--cluster",
-            "onoff",
-            "--attribute",
-            "on-off",
-        ])
-        .assert()
-        .code(10)
-        .stderr(predicate::str::contains("store_missing"));
-}
-
-#[test]
-fn read_timeout_exits_3() {
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args([
-            "read",
-            "--node",
-            "5",
-            "--cluster",
-            "onoff",
-            "--attribute",
-            "on-off",
-        ])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("timeout"));
-}
-
-#[test]
-fn invoke_reject_exits_4() {
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "reject")
-        .args([
-            "invoke",
-            "--node",
-            "5",
-            "--cluster",
-            "onoff",
-            "--command",
-            "on",
-        ])
-        .assert()
-        .code(4)
-        .stderr(predicate::str::contains("device_rejected"));
-}
-
-// ── Phase 3: groupcast ──────────────────────────────────────────────────────
-
-#[test]
-fn group_provision_succeeds() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "group",
-            "provision",
-            "--group",
-            "1",
-            "--nodes",
-            "5",
-            "--name",
-            "living",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":1"))
-        .stdout(predicate::str::contains("\"keyset_id\":42"))
-        .stdout(predicate::str::contains("\"name\":\"living\""))
-        .stdout(predicate::str::contains("\"status\":\"provisioned\""))
-        .stdout(predicate::str::contains("\"nodes\":[5]"))
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn group_provision_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["group", "provision", "--group", "1", "--nodes", "99"])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn group_provision_rejects_bad_epoch_key() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "group",
-            "provision",
-            "--group",
-            "1",
-            "--nodes",
-            "5",
-            "--epoch-key",
-            "dead",
-        ])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("epoch-key"));
-}
-
-#[test]
-fn group_provision_runs_acl_read_merge_write_after_add_group() {
-    // provision の 4 ステップ目: add-group の後に acl read → （エントリが無いので）
-    // 全リスト + group エントリの write が走る。ステップ列を固定する。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "group",
-            "provision",
-            "--group",
-            "7",
-            "--nodes",
-            "5",
-            "--name",
-            "kitchen",
-            "--endpoint",
-            "2",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    let add = recorded
-        .find("groups add-group 7 kitchen 5 2")
-        .expect("add-group call missing");
-    let read = recorded
-        .find("accesscontrol read acl 5 0")
-        .expect("acl read call missing");
-    let write = recorded
-        .find("accesscontrol write acl ")
-        .expect("acl write call missing");
-    assert!(
-        add < read && read < write,
-        "acl steps out of order: {recorded}"
-    );
-    // write は「read できたリスト + 追記」の全置換: admin エントリ保全 + group 7。
-    let write_line = recorded
-        .lines()
-        .find(|l| l.contains("accesscontrol write acl"))
-        .unwrap();
-    assert!(write_line.contains("\"subjects\":[112233]"), "{write_line}");
-    assert!(write_line.contains("\"authMode\":3"), "{write_line}");
-    assert!(write_line.contains("\"subjects\":[7]"), "{write_line}");
-    // JSON は空白なし 1 引数（`acl ` と ` 5 0` の間に空白が無い）。
-    let json_part = write_line
-        .split("accesscontrol write acl ")
-        .nth(1)
-        .unwrap()
-        .split(" 5 0")
-        .next()
-        .unwrap();
-    assert!(
-        !json_part.contains(' '),
-        "write JSON must be compact: {json_part}"
-    );
-}
-
-#[test]
-fn group_provision_skips_acl_write_when_entry_exists() {
-    // 既に group 1 のエントリがある → 冪等: write は飛ばない。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .env("FAKE_ACL_HAS_GROUP", "1")
-        .args(["group", "provision", "--group", "1", "--nodes", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(recorded.contains("accesscontrol read acl 5 0"));
-    assert!(
-        !recorded.contains("accesscontrol write acl"),
-        "must not write when the group entry already exists: {recorded}"
-    );
-}
-
-#[test]
-fn group_provision_broken_acl_read_is_parse_error_without_write() {
-    // ACL read が解釈不能 → parse_error（exit 1）で停止し、絶対に write しない
-    // （write は全置換。解釈できないまま書くと管理者エントリを失う）。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .env("FAKE_ACL_BROKEN", "1")
-        .args(["group", "provision", "--group", "1", "--nodes", "5"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("parse_error"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        !recorded.contains("accesscontrol write acl"),
-        "must never write after an unparseable read: {recorded}"
-    );
-}
-
-#[test]
-fn group_provision_rebind_unbinds_before_bind() {
-    // bind 済み controller（FAKE_GROUP_BOUND=1）でも --rebind なら
-    // unbind-keyset → bind-keyset の順で成功する（issue #5: 既存グループへの
-    // ノード追加）。直経路の rebind は matd 再起動が必要なので note が出る。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .env("FAKE_GROUP_BOUND", "1")
-        .args([
-            "group",
-            "provision",
-            "--group",
-            "1",
-            "--nodes",
-            "5",
-            "--rebind",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"provisioned\""))
-        .stdout(predicate::str::contains("restart"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    let unbind = recorded
-        .find("groupsettings unbind-keyset 1 42")
-        .expect("unbind-keyset call missing");
-    let bind = recorded
-        .find("groupsettings bind-keyset 1 42")
-        .expect("bind-keyset call missing");
-    assert!(unbind < bind, "unbind must run before bind: {recorded}");
-}
-
-#[test]
-fn group_provision_rebind_on_unbound_group_succeeds() {
-    // 未 bind（新規グループ）でも --rebind 付きで成功する: unbind の失敗は
-    // best-effort で無視される（冪等）。
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "group",
-            "provision",
-            "--group",
-            "1",
-            "--nodes",
-            "5",
-            "--rebind",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"provisioned\""));
-}
-
-#[test]
-fn group_provision_without_rebind_still_fails_on_bound_group() {
-    // --rebind 無しの既存挙動は不変: bind 済みなら bind-keyset の Duplicate で
-    // 失敗する（誤って鍵を回す事故の防護）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_GROUP_BOUND", "1")
-        .args(["group", "provision", "--group", "1", "--nodes", "5"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("bind-keyset"));
-}
-
-#[test]
-fn group_invoke_reports_sent() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "group",
-            "invoke",
-            "--group",
-            "1",
-            "--cluster",
-            "onoff",
-            "--command",
-            "on",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":1"))
-        .stdout(predicate::str::contains("\"command\":\"on\""))
-        .stdout(predicate::str::contains("\"status\":\"sent\""))
-        .stdout(predicate::str::contains("unacknowledged"));
-    // group multicast 宛先（0xffffffffffff0001）が末尾近くに渡ること。
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("onoff on 0xffffffffffff0001 1"),
-        "group node-id was not passed as the destination: {recorded}"
-    );
-}
-
-#[test]
-fn group_invoke_timeout_exits_3() {
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args([
-            "group",
-            "invoke",
-            "--group",
-            "1",
-            "--cluster",
-            "onoff",
-            "--command",
-            "on",
-        ])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("timeout"));
-}
-
-#[test]
-fn group_grant_appends_acl_entry_and_reports_updated() {
-    // provision 済みで ACL だけ欠けたグループの修復（grant の主目的。実機 jarvis の
-    // group 10 相当: fake の既定 ACL は admin エントリのみ = ACL 欠落状態）。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["group", "grant", "--group", "10", "--nodes", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":10"))
-        .stdout(predicate::str::contains("\"nodes\":[5]"))
-        .stdout(predicate::str::contains("\"updated\":[5]"))
-        .stdout(predicate::str::contains("\"unchanged\":[]"))
-        .stdout(predicate::str::contains("\"status\":\"granted\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(recorded.contains("accesscontrol read acl 5 0"));
-    let write_line = recorded
-        .lines()
-        .find(|l| l.contains("accesscontrol write acl"))
-        .expect("acl write call missing");
-    // 既存 admin エントリを保全した全置換 + group 10 の Operate/Group エントリ。
-    assert!(write_line.contains("\"subjects\":[112233]"), "{write_line}");
-    assert!(write_line.contains("\"subjects\":[10]"), "{write_line}");
-    assert!(write_line.contains("\"privilege\":3"), "{write_line}");
-    assert!(write_line.contains("\"authMode\":3"), "{write_line}");
-}
-
-#[test]
-fn group_grant_reports_unchanged_when_entry_exists() {
-    // 既にエントリがある → 冪等: write せず unchanged に載せる。
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .env("FAKE_ACL_HAS_GROUP", "1")
-        .args(["group", "grant", "--group", "1", "--nodes", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"updated\":[]"))
-        .stdout(predicate::str::contains("\"unchanged\":[5]"))
-        .stdout(predicate::str::contains("\"status\":\"granted\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        !recorded.contains("accesscontrol write acl"),
-        "must not write when the entry already exists: {recorded}"
-    );
-}
-
-#[test]
-fn group_grant_unknown_node_exits_11() {
-    let store = store_with_node5();
-    mat(store.path())
-        .args(["group", "grant", "--group", "1", "--nodes", "99"])
-        .assert()
-        .code(11)
-        .stderr(predicate::str::contains("node_not_commissioned"));
-}
-
-#[test]
-fn group_grant_broken_acl_read_is_parse_error_without_write() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .env("FAKE_ACL_BROKEN", "1")
-        .args(["group", "grant", "--group", "1", "--nodes", "5"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("parse_error"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(!recorded.contains("accesscontrol write acl"), "{recorded}");
-}
-
-#[test]
-fn group_grant_with_forced_matd_exits_2() {
-    // grant は直経路のみ（matd プロトコルに op を追加しない）。--matd 明示は
-    // discover / commission と同じ「非対応サブコマンド」扱いで exit 2。
-    let store = store_with_node5();
-    mat(store.path())
-        .args([
-            "--matd",
-            "/nonexistent/matd.sock",
-            "group",
-            "grant",
-            "--group",
-            "1",
-            "--nodes",
-            "5",
-        ])
-        .assert()
-        .code(2);
-}
-
-#[test]
-fn group_color_temp_converts_kelvin_and_reports_sent() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["group", "color-temp", "--group", "1", "--kelvin", "2700"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":1"))
-        .stdout(predicate::str::contains(
-            "\"command\":\"move-to-color-temperature\"",
-        ))
-        .stdout(predicate::str::contains("\"kelvin\":2700"))
-        .stdout(predicate::str::contains("\"mireds\":370"))
-        .stdout(predicate::str::contains("\"status\":\"sent\""))
-        .stdout(predicate::str::contains("unacknowledged"));
-    // 換算済み mireds + group multicast 宛先（0xffffffffffff0001）。
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("colorcontrol move-to-color-temperature 370 0 0 0 0xffffffffffff0001 1"),
-        "expected groupcast color-temp argv: {recorded}"
-    );
-}
-
-#[test]
 fn group_color_temp_requires_exactly_one_of_kelvin_or_mireds() {
     let store = store_with_node5();
     mat(store.path())
@@ -1306,76 +149,6 @@ fn group_color_temp_requires_exactly_one_of_kelvin_or_mireds() {
 }
 
 #[test]
-fn group_color_name_converts_and_reports_sent() {
-    let store = store_with_node5();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["group", "color", "--group", "1", "--name", "blue"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":1"))
-        .stdout(predicate::str::contains(
-            "\"command\":\"move-to-hue-and-saturation\"",
-        ))
-        .stdout(predicate::str::contains("\"name\":\"blue\""))
-        .stdout(predicate::str::contains("\"rgb\":\"#0000ff\""))
-        .stdout(predicate::str::contains("\"hue_raw\":169"))
-        .stdout(predicate::str::contains("\"saturation_raw\":254"))
-        .stdout(predicate::str::contains("\"status\":\"sent\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded
-            .contains("colorcontrol move-to-hue-and-saturation 169 254 0 0 0 0xffffffffffff0001 1"),
-        "expected groupcast color argv: {recorded}"
-    );
-}
-
-#[test]
-fn group_color_hue_sat_and_rgb_forms_work() {
-    let store = store_with_node5();
-    // 生指定（既存単体 color と同じ換算）。
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args([
-            "group",
-            "color",
-            "--group",
-            "1",
-            "--hue",
-            "330",
-            "--sat",
-            "80",
-            "--transition",
-            "30",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"transition\":30"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains(
-            "colorcontrol move-to-hue-and-saturation 233 203 30 0 0 0xffffffffffff0001 1"
-        ),
-        "expected raw hue/sat groupcast argv: {recorded}"
-    );
-    // RGB 指定。
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["group", "color", "--group", "1", "--rgb", "255,0,170"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"rgb\":\"#ff00aa\""));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded
-            .contains("colorcontrol move-to-hue-and-saturation 226 254 0 0 0 0xffffffffffff0001 1"),
-        "expected rgb groupcast argv: {recorded}"
-    );
-}
-
-#[test]
 fn group_color_spec_systems_are_mutually_exclusive() {
     let store = store_with_node5();
     mat(store.path())
@@ -1390,388 +163,249 @@ fn group_color_spec_systems_are_mutually_exclusive() {
         .code(2);
 }
 
-// ── diag node ──────────────────────────────────────────────────────────────
+// ── resolve.rs レベルのエラー（kind=other→exit2、または store_parse→exit10、
+//    いずれもバックエンド不到達） ────────────────────────────────────────────
 
 #[test]
-fn diag_node_success_verdict_ok() {
+fn color_invalid_rgb_exits_2() {
     let store = store_with_node5();
     mat(store.path())
-        .args(["diag", "node", "--node", "5"])
+        .args(["color", "--node", "5", "--rgb", "zzz"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"ok\""))
-        .stdout(predicate::str::contains("\"checks\""))
-        .stdout(predicate::str::contains("\"timestamp\""));
-}
-
-#[test]
-fn diag_node_timeout_is_unresolvable_exit0() {
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .args(["diag", "node", "--node", "5"])
-        .assert()
-        .success() // 診断は落ちない
-        .stdout(predicate::str::contains("\"verdict\":\"unresolvable\""));
+        .code(2)
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
 
 #[test]
-fn diag_node_reject_is_device_rejected_exit0() {
+fn color_unknown_name_exits_2_and_broken_colors_exits_10() {
     let store = store_with_node5();
+    // 未知の色名は CLI 引数相当のエラー（kind=other, exit 2）。
     mat(store.path())
-        .env("FAKE_CHIP_MODE", "reject")
-        .args(["diag", "node", "--node", "5"])
+        .args(["color", "--node", "5", "--name", "sakura"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"device_rejected\""));
-}
-
-fn fake_ping6() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ping6.sh")
-}
-fn fake_avahi() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-avahi-browse.sh")
-}
-
-#[test]
-fn diag_node_deep_link_starved() {
-    // operational timeout + ip 生存(50%ロス) + mDNS に node5 広告なし → link_starved。
-    // self_cfid = 00AABB1122CC3344 (fake-chip-tool CFID)。
-    // avahi デフォルト出力: node 0xFF under 0011223344556677（アドレス付きでない）。
-    // → advertised_any_fabric=false → weak_link(loss 50%) → link_starved。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"link_starved\""))
-        .stdout(predicate::str::contains("\"ip\""))
-        .stdout(predicate::str::contains("\"loss_pct\":50"));
-}
-
-#[test]
-fn diag_node_deep_ip_unreachable() {
-    // operational timeout + ping 100% loss → ip_unreachable。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("FAKE_PING_LOSS", "100")
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"ip_unreachable\""));
-}
-
-#[test]
-fn diag_node_deep_fabric_missing() {
-    // operational timeout + ip ok (50%ロス) + avahi: 192.0.2.10 が他 fabric 下に広告
-    // (FAKE_AVAHI_FABRIC=0011223344556677 != fake-chip-tool CFID 00AABB1122CC3344)
-    // → advertised_any_fabric=true, advertised_self_fabric=Some(false) → fabric_missing。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
-        .env("FAKE_AVAHI_FABRIC", "0011223344556677")
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"fabric_missing\""));
-}
-
-#[test]
-fn diag_node_deep_missing_probe_binary() {
-    // ping6 バイナリが存在しない → unavailable に tool_missing、verdict は出る、exit 0。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("MAT_PING6_BIN", "/nonexistent/ping6")
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"tool_missing\""))
-        .stdout(predicate::str::contains("\"verdict\""));
-}
-
-#[test]
-fn diag_node_deep_self_fabric_via_instance_name() {
-    // [DIS] インスタンス名経路の分離テスト。FAKE_CHIP_NO_FP_CFID=1 で [FP] 行を抑止し、
-    // CFID の唯一のソースを [DIS] インスタンス名 00AABB1122CC3344-0000000000000005 に固定。
-    // avahi も同 CFID・192.0.2.10 で広告 → advertised_self_fabric=true。
-    // [FP] フォールバックが有効では [DIS] パーサ削除でもテストが通ってしまうため、この分離が必須。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("FAKE_CHIP_NO_FP_CFID", "1")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
-        .env("FAKE_AVAHI_FABRIC", "00AABB1122CC3344")
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"advertised_self_fabric\":true"));
-}
-
-#[test]
-fn diag_node_deep_cfid_unavailable_when_no_cfid_logs() {
-    // CFID 行を両方とも抑止 → self_cfid 取得不能。advertised_any_fabric は出るが
-    // advertised_self_fabric は省略、unavailable に cfid_unavailable が出る。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("FAKE_CHIP_NO_CFID", "1")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
-        .env("FAKE_AVAHI_FABRIC", "0011223344556677")
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cfid_unavailable\""))
-        .stdout(predicate::str::contains("\"advertised_any_fabric\":true"))
-        .stdout(predicate::str::contains("\"advertised_self_fabric\"").not());
-}
-
-#[test]
-fn diag_node_deep_self_fabric_via_stdout_logs() {
-    // 実 chip-tool は CFID シグナルを stdout に出す（stderr ではなく）。
-    // FAKE_CHIP_CFID_STDOUT=1 でその実機条件を再現。mat が stdout も走査することを保証
-    // （stderr だけを見ていた旧コードでは self_cfid=None になり advertised_self_fabric が
-    // 出ず、このテストは失敗する → 実機バグの回帰ガード）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("FAKE_CHIP_MODE", "timeout")
-        .env("FAKE_CHIP_CFID_STDOUT", "1")
-        .env("MAT_PING6_BIN", fake_ping6())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.10")
-        .env("FAKE_AVAHI_FABRIC", "00AABB1122CC3344")
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"advertised_self_fabric\":true"));
-}
-
-// ── discover --probe ────────────────────────────────────────────────────────
-
-#[test]
-fn discover_probe_reports_reachable_with_live_address() {
-    // node 5 を commission 済み（台帳 address = 192.0.2.10）。avahi が node 5 を
-    // 別アドレス 192.0.2.99 で広告 → reachable:true、address はライブ値に更新。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.99")
-        .args(["discover", "--probe"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"state\":\"commissioned\""))
-        .stdout(predicate::str::contains("\"reachable\":true"))
-        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""))
-        .stdout(predicate::str::contains("\"address\":\"192.0.2.10\"").not());
-}
-
-#[test]
-fn discover_probe_reports_unreachable_and_stale() {
-    // avahi に node 5 の広告なし（既定出力は node FF のみ）→ reachable:false、
-    // stale:true、address は台帳の据え置き値 192.0.2.10。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .args(["discover", "--probe"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"reachable\":false"))
-        .stdout(predicate::str::contains("\"stale\":true"))
-        .stdout(predicate::str::contains("\"address\":\"192.0.2.10\""));
-}
-
-#[test]
-fn discover_without_probe_omits_reachable() {
-    // --probe 無しは従来出力（reachable/stale を付与しない）。後方互換。
-    let store = store_with_node5();
-    mat(store.path())
-        .arg("discover")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"state\":\"commissioned\""))
-        .stdout(predicate::str::contains("\"reachable\"").not())
-        .stdout(predicate::str::contains("\"stale\"").not());
-}
-
-#[test]
-fn discover_probe_with_missing_avahi_reports_reachable_null() {
-    // avahi-browse バイナリ不在 → プローブ不能。reachable:null、stdout は純 JSON、
-    // discover 全体は成功（commissionable 探索は別経路で有効なため）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_AVAHI_BROWSE_BIN", "/nonexistent/avahi-browse-binary")
-        .args(["discover", "--probe"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"reachable\":null"));
-}
-
-#[test]
-fn discover_probe_native_lo_falls_back_to_avahi() {
-    // lo は IFF_MULTICAST 無し = ifindex 1 への multicast 送信はどの環境でも
-    // 失敗する（既知）→ native の targeted resolve が IO エラー → warn + avahi
-    // フォールバックで従来どおりの結果になる。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_IFACE", "lo")
-        .env("MAT_LOG", "warn")
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .env("FAKE_AVAHI_ADDR", "192.0.2.99")
-        .args(["discover", "--probe"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"reachable\":true"))
-        .stdout(predicate::str::contains("\"address\":\"192.0.2.99\""))
-        .stderr(predicate::str::contains("falling back to avahi-browse"));
-}
-
-#[test]
-fn diag_deep_native_bogus_iface_falls_back_to_avahi() {
-    // 存在しない iface 名 → iface_index が即失敗 → warn + avahi フォール
-    // バック（native 分岐のもう一方の入口も決定的に通す）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_IFACE", "mat-test-no-such-iface")
-        .env("MAT_LOG", "warn")
-        .env("MAT_AVAHI_BROWSE_BIN", fake_avahi())
-        .args(["diag", "node", "--node", "5", "--deep"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"advertised_any_fabric\""))
-        .stderr(predicate::str::contains("falling back to avahi-browse"));
-}
-
-#[test]
-fn diag_node_im_native_bogus_iface_falls_back_to_chip_tool() {
-    // 存在しない iface 名 → diag_im_probe 側の Engine::build も同じく
-    // iface_index で即失敗 → warn + chip-tool フォールバックで従来出力
-    // （verdict 等）が変わらず出ることを確認する（M8c-2 Task7）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_IFACE", "mat-test-no-such-iface")
-        .env("MAT_LOG", "warn")
-        .args(["diag", "node", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"verdict\":\"ok\""))
-        .stdout(predicate::str::contains("\"checks\""))
-        .stderr(predicate::str::contains(
-            "native diag build failed; falling back to chip-tool",
-        ));
-}
-
-// ---- alias 解決（aliases.toml） ----
-
-/// node 5 commission 済み + aliases.toml を置いたストア。
-fn store_with_node5_and_aliases() -> TempDir {
-    let store = store_with_node5();
+        .code(2)
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
+    // 壊れた [colors]（RGB パース不能）は store_parse（exit 10）。
     std::fs::write(
         store.path().join("aliases.toml"),
-        r#"
-            [nodes]
-            living-light = 5
-
-            [groups]
-            all-lights = 1
-
-            [endpoints.living-light]
-            main = 1
-            night = 2
-        "#,
+        "[colors]\nbad = \"zzz\"\n",
     )
     .unwrap();
-    store
+    mat(store.path())
+        .args(["color", "--node", "5", "--name", "red"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_parse"));
 }
 
+// ── store エラー（Store::open / require_node、バックエンド不到達）──────────
+//
+// native 直経路（`native_direct::execute()`）は Store::open / require_node を
+// Engine 構築より前に行う（chip-tool 経路と同一の順序・エラー）ので、
+// `MAT_IFACE=lo` 固定でもこれらのテストは変わらず backend 不到達で完結する。
+
 #[test]
-fn read_resolves_node_alias_to_numeric_id() {
-    let store = store_with_node5_and_aliases();
-    let args_file = store.path().join("recorded-args.txt");
-    mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
+fn read_missing_store_exits_10() {
+    let store = TempDir::new().unwrap();
+    let missing = store.path().join("nope");
+    mat(&missing)
         .args([
             "read",
             "--node",
-            "living-light",
+            "5",
             "--cluster",
             "onoff",
             "--attribute",
             "on-off",
         ])
         .assert()
-        .success()
-        // stdout スキーマは数値のまま（alias エコーバック無し）。
-        .stdout(predicate::str::contains("\"node_id\":5"))
-        .stdout(predicate::str::contains("living-light").not());
-    // chip-tool には数値 node_id が渡る。
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("onoff read on-off 5 1"),
-        "alias was not resolved before chip-tool: {recorded}"
-    );
+        .code(10)
+        .stderr(predicate::str::contains("store_missing"));
 }
 
 #[test]
-fn endpoint_alias_resolves_with_numeric_node() {
-    // -n 5 -e night: endpoints の外側キーが alias 表記でも解決後 node で照合。
-    let store = store_with_node5_and_aliases();
-    let args_file = store.path().join("recorded-args.txt");
+fn read_unknown_node_exits_11() {
+    let store = store_with_node5();
     mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
-        .args(["on", "--node", "5", "--endpoint", "night"])
+        .args([
+            "read",
+            "--node",
+            "99",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"endpoint\":2"));
-    let recorded = std::fs::read_to_string(&args_file).unwrap();
-    assert!(
-        recorded.contains("onoff on 5 2"),
-        "endpoint alias was not resolved: {recorded}"
-    );
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
 }
 
 #[test]
-fn group_invoke_resolves_group_alias() {
-    let store = store_with_node5_and_aliases();
+fn color_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["color", "--node", "99", "--hue", "330", "--sat", "80"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn color_temp_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["color-temp", "--node", "99", "--kelvin", "2700"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn open_window_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["open-window", "--node", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn diag_node_unknown_node_exits_11() {
+    // `commands::diag::node` は native IM probe より前に Store::require_node
+    // する（`crates/mat/src/commands/diag.rs` 参照）ので、native/chip-tool の
+    // どちらにも到達しない。
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["diag", "node", "--node", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn group_provision_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "provision", "--group", "1", "--nodes", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn group_grant_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "grant", "--group", "1", "--nodes", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn group_provision_rejects_bad_epoch_key() {
+    // require_node(5) はここでは通る（台帳にある）。epoch key の検証は
+    // controller state 書込（KVS/chip-tool）より前に走るので、この失敗は
+    // バックエンドに一切触れない（`provision_controller_state` 冒頭で
+    // `resolve_epoch_key` を呼ぶ — `crates/mat/src/commands/group.rs` 参照）。
+    let store = store_with_node5();
     mat(store.path())
         .args([
             "group",
-            "invoke",
+            "provision",
             "--group",
-            "all-lights",
-            "--cluster",
-            "onoff",
-            "--command",
-            "on",
+            "1",
+            "--nodes",
+            "5",
+            "--epoch-key",
+            "dead",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"group_id\":1"))
-        .stdout(predicate::str::contains("\"status\":\"sent\""));
+        .code(1)
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
+}
+
+// ── `--matd` 明示 + 非対応サブコマンド（matd プロトコル未到達、exit 2）───────
+
+#[test]
+fn group_grant_with_forced_matd_exits_2() {
+    // grant は直経路のみ（matd プロトコルに op を追加しない）。`to_op()` が
+    // 未対応と判定した時点で弾かれるので、指定したソケットには一切接続しない
+    // （`crates/mat/src/matd_client.rs` の `dispatch()` 参照）。
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "--matd",
+            "/nonexistent/matd.sock",
+            "group",
+            "grant",
+            "--group",
+            "1",
+            "--nodes",
+            "5",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
+}
+
+// ── discover ─────────────────────────────────────────────────────────────
+//
+// `discover`（commissionable browse・`--probe` の mDNS targeted resolve 共に）
+// はこのテスト環境（サンドボックス）では `lo` 上の multicast 送信が
+// `Network is unreachable` として即エラーになる。M8c-3 で chip-tool 経路
+// （Task 9/10）・avahi-browse フォールバック（Task 11）を撤去済みのため、
+// mDNS は dnssd 一本でフォールバック先が無く、I/O エラーはそのままハード
+// エラーになる（実機の「0 件で正常終了」という前提とは異なる環境）。discover
+// の成功系はここでは追わない — mDNS browse/probe 自体のロジックは
+// `mat-controller::dnssd` / `crates/mat/src/probe.rs` 側の責務。
+
+// ---- alias 解決（aliases.toml） ----
+//
+// alias 解決自体（`resolve::resolve_command`）は main.rs でバックエンド経路
+// 選択より前に完結する。解決の失敗は kind=other（exit 2）または
+// store_parse（exit 10）。解決の成功は、後続の Store::require_node が未
+// commission で弾く場面（exit 11、node_not_commissioned の detail に解決後の
+// 数値 node_id が載る）で観測する — read/write 等を実際に成功させるには
+// バックエンドが要るため、ここでは検証しない（成功時の JSON は
+// native_direct.rs のユニットテスト側の責務）。
+
+#[test]
+fn node_and_endpoint_alias_resolve_before_backend_then_node_not_commissioned() {
+    // node 5 は台帳に無い（aliases.toml だけを置く）。alias が数値 5 / 2 へ
+    // 正しく解決された上で Store::require_node(5) が未 commission として弾く
+    // （node/endpoint いずれかの alias 解決が失敗していれば exit 2 になり、
+    // このテストは exit 11 を観測できない）。
+    let store = TempDir::new().unwrap();
+    std::fs::write(
+        store.path().join("aliases.toml"),
+        "[nodes]\nliving-light = 5\n\n[endpoints.living-light]\nnight = 2\n",
+    )
+    .unwrap();
+    mat(store.path())
+        .args(["on", "--node", "living-light", "--endpoint", "night"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains(
+            "\"kind\":\"node_not_commissioned\"",
+        ));
 }
 
 #[test]
-fn unknown_alias_exits_2_and_lists_known() {
-    let store = store_with_node5_and_aliases();
+fn unknown_alias_exits_2() {
+    let store = store_with_node5();
+    std::fs::write(
+        store.path().join("aliases.toml"),
+        "[nodes]\nliving-light = 5\n",
+    )
+    .unwrap();
     mat(store.path())
         .args(["describe", "--node", "bogus"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("unknown node alias 'bogus'"))
-        .stderr(predicate::str::contains("living-light"));
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
 
 #[test]
@@ -1781,7 +415,7 @@ fn alias_without_aliases_file_exits_2() {
         .args(["describe", "--node", "living-light"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("no aliases.toml"));
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
 
 #[test]
@@ -1803,41 +437,18 @@ fn all_digit_alias_name_in_file_exits_10() {
         .args(["describe", "--node", "5"])
         .assert()
         .code(10)
-        .stderr(predicate::str::contains("invalid alias name"));
-}
-
-#[test]
-fn commission_with_alias_writes_aliases_toml() {
-    let store = TempDir::new().unwrap();
-    mat(store.path())
-        .args([
-            "commission",
-            "--target",
-            "192.0.2.10",
-            "--setup-code",
-            "MT:FAKE",
-            "--node",
-            "5",
-            "--alias",
-            "living-light",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"node_id\":5"));
-    // aliases.toml が作られ、以後 alias で参照できる。
-    mat(store.path())
-        .args(["describe", "--node", "living-light"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"node_id\":5"));
+        .stderr(predicate::str::contains("store_parse"));
 }
 
 #[test]
 fn commission_with_duplicate_alias_exits_2_before_running() {
-    let store = store_with_node5_and_aliases(); // living-light 定義済み
-    let args_file = store.path().join("recorded-args.txt");
+    let store = store_with_node5();
+    std::fs::write(
+        store.path().join("aliases.toml"),
+        "[nodes]\nliving-light = 5\n",
+    )
+    .unwrap();
     mat(store.path())
-        .env("FAKE_CHIP_ARGS_FILE", &args_file)
         .args([
             "commission",
             "--target",
@@ -1849,12 +460,7 @@ fn commission_with_duplicate_alias_exits_2_before_running() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("already exists"));
-    // 事前検証なので chip-tool は呼ばれていない。
-    assert!(
-        !args_file.exists(),
-        "chip-tool was invoked despite invalid alias"
-    );
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
 
 #[test]
@@ -1872,47 +478,78 @@ fn commission_with_all_digit_alias_exits_2() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("invalid alias name"));
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
 }
 
-#[test]
-fn native_iface_without_kvs_falls_back_to_chip_tool() {
-    // MAT_IFACE を立てても KVS（chip_tool_config.*.ini）が無ければ warn +
-    // chip-tool 直へフォールバックし、既存どおり成功する。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_IFACE", "lo")
-        .env("MAT_LOG", "warn")
-        .args(["on", "--node", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"cluster\":\"onoff\""))
-        .stdout(predicate::str::contains("\"command\":\"on\""))
-        .stdout(predicate::str::contains("\"status\":\"success\""))
-        .stderr(predicate::str::contains("falling back to chip-tool"));
-}
+// ── native 既定化（M8c-3 Task4）: MAT_IFACE 未設定は autodetect に入る ──────
 
+/// `mat()` ヘルパーは `MAT_IFACE=lo` を固定するため、このテストだけ env を
+/// 外して autodetect を発火させる。候補数は環境依存（CI/開発機で 0 個も
+/// 複数個もあり得る）なので、成功可否ではなく「autodetect が実際に走った
+/// 証拠が stderr に出ること」を assert する: マーカー
+/// `iface auto-selected (native default)`（候補一意 → native 経路へ進み、
+/// 別の理由で失敗するケース）か、autodetect 自身のエラー（候補 0 /
+/// 複数、kind `other`）のどちらか。単に `"error"` を含むだけでは
+/// chip-tool 不在（exit 12）でも通ってしまい無意味なため、どちらの経路
+/// にも共通する証拠として `iface` という語の出現を要求する。
 #[test]
-fn native_iface_group_send_falls_back_without_kvs() {
-    // group 送信も unicast と同じ理由（KVS 不備 → Engine::build 失敗）で
-    // chip-tool 直へフォールバックし、既存どおり成功する（group op は
-    // require_node しないので store_with_node5 の node5 未使用でも通る）。
-    let store = store_with_node5();
-    mat(store.path())
-        .env("MAT_IFACE", "lo")
-        .env("MAT_LOG", "warn")
+fn no_iface_env_reaches_autodetect_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("mat").unwrap();
+    cmd.env_remove("MAT_IFACE")
+        .env("MAT_MATD", "0")
+        .env("MAT_LOG", "info")
+        .arg("--store")
+        .arg(dir.path())
         .args([
-            "group",
-            "invoke",
-            "--group",
-            "10",
+            "read",
+            "--node",
+            "1",
             "--cluster",
             "onoff",
-            "--command",
-            "toggle",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"status\":\"sent\""))
-        .stderr(predicate::str::contains("falling back to chip-tool"));
+            "--attribute",
+            "on-off",
+        ]);
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"error\""),
+        "structured error expected: {stderr}"
+    );
+    // autodetect が実際に走った証拠: 成功時の info marker か、autodetect
+    // 自身の失敗（候補 0/複数）のどちらか。chip-tool 不在の
+    // child_not_found（native 未経由）ではこの語は出ない。
+    assert!(
+        stderr.contains("iface auto-selected (native default)")
+            || stderr.contains("iface autodetect"),
+        "expected evidence that iface autodetect ran: {stderr}"
+    );
+}
+
+// ── fabric init（M8c-3 Task8: ローカル完結 bootstrap、iface/matd 不到達）───
+
+#[test]
+fn fabric_init_full_local_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1) init 成功: JSON スキーマ検証
+    let out = mat(dir.path()).args(["fabric", "init"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["timestamp"].is_string());
+    assert_eq!(v["fabric_id"], 1);
+    assert_eq!(v["admin_node_id"], 112233);
+    assert!(v["compressed_fabric_id"].as_str().unwrap().len() == 16);
+    // 2) KVS 2 ファイル + epoch キーが生成されている
+    let main_ini = std::fs::read_to_string(dir.path().join("chip_tool_config.ini")).unwrap();
+    assert!(main_ini.contains("mat/f/1/ipk-epoch"));
+    assert!(std::fs::metadata(dir.path().join("chip_tool_config.alpha.ini")).is_ok());
+    // 3) 再 init は拒否（exit 1、error JSON に kind: other）
+    let out2 = mat(dir.path()).args(["fabric", "init"]).output().unwrap();
+    assert_eq!(out2.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
 }

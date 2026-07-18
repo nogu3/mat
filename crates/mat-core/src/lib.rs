@@ -12,7 +12,6 @@ pub mod error;
 pub mod group;
 pub mod ids;
 mod ids_gen;
-pub mod normalize;
 pub mod output;
 pub mod parse;
 pub mod reachability;

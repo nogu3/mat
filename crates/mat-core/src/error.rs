@@ -1,7 +1,8 @@
 //! `mat` 自身のエラー型と exit code マッピング。
 //!
-//! `chip-tool` は失敗時の exit code が粗い（おおむね `1`）ため、`mat` は
-//! stdout/stderr をパースして失敗種別を分類し、自身の `ErrorKind` にマップする。
+//! mat は native backend から構造化エラー（`ErrorKind` と詳細情報）を受け取る。
+//! 0.22.0 以降、chip-tool パーサは廃止された（フルスクラッチ Rust コントローラ
+//! `mat-controller` が backend を担当）。
 
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +18,17 @@ pub enum ErrorKind {
     /// 指定 node_id がストアに無い（未 commission）。
     NodeNotCommissioned,
     /// `chip-tool` バイナリが見つからない / 実行不可。
+    /// トップレベルの CLI エラーとしては 0.22.0 以降 emit されない（chip-tool
+    /// 撤去、exit code 12 は歴史的欠番）。`mat` は `diag node --deep` の内部で
+    /// ping6 バイナリ不在を `unavailable` 配列の `tool_missing` エントリへ
+    /// 吸収するためだけに構築する（exit 12 にはならない）。exit code 12 の
+    /// マッピングと wire 互換のため variant は残置 — README で撤去を告知。
     ChildNotFound,
     /// `chip-tool` が失敗終了（分類不能）。
+    /// 0.22.0 以降どちらのバイナリからも emit されない — `mat`（M8c-3 Task9）に続き
+    /// `matd`（M8c-3 Task10）も chip-tool 経路を完全撤去し、これが最後の emitter
+    /// だった。exit code 1 のマッピングと wire 互換のため variant 自体は残置する
+    /// （旧 `mat`/`matd` が返した過去の応答を deserialize できるように）。
     ChildFailed,
     /// commissioning に失敗。
     CommissionFailed,
