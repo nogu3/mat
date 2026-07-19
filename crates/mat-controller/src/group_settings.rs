@@ -124,11 +124,11 @@ fn truncate_name(name: &str) -> String {
 }
 
 /// `f/<idx>/g` — フラットなフィールドのみの struct（ctx1..7 全て Uint）。
-struct FabricData {
+pub(crate) struct FabricData {
     first_group: u16,
     group_count: u16,
-    first_map: u16,
-    map_count: u16,
+    pub(crate) first_map: u16,
+    pub(crate) map_count: u16,
     first_keyset: u16,
     keyset_count: u16,
     next: u16,
@@ -162,7 +162,7 @@ impl FabricData {
     }
 }
 
-fn parse_fabric_data(blob: &[u8]) -> Option<FabricData> {
+pub(crate) fn parse_fabric_data(blob: &[u8]) -> Option<FabricData> {
     let mut r = Reader::new(blob);
     if r.next().ok()??.value != Value::StructStart {
         return None;
@@ -249,13 +249,13 @@ fn parse_group_data(blob: &[u8]) -> Option<GroupData> {
 }
 
 /// `f/<idx>/gk/<id>` — GroupKeyMap の1エントリ（group_id, keyset_id,
-/// チェーン内 next）。タグは `kvs::parse_keymap_entry` と同じ ctx1/ctx2 に
-/// ctx3(next) を足しただけ — 読み側の寛容走査（未知タグ skip）と互換。
+/// チェーン内 next）。読み側（`kvs::read_group_credentials`）もこの parse を
+/// 共有し、first_map→next のチェーン走査で使う。
 #[derive(Clone, Copy)]
-struct KeyMap {
-    group_id: u16,
-    keyset_id: u16,
-    next: u16,
+pub(crate) struct KeyMap {
+    pub(crate) group_id: u16,
+    pub(crate) keyset_id: u16,
+    pub(crate) next: u16,
 }
 
 impl KeyMap {
@@ -270,7 +270,7 @@ impl KeyMap {
     }
 }
 
-fn parse_keymap(blob: &[u8]) -> Option<KeyMap> {
+pub(crate) fn parse_keymap(blob: &[u8]) -> Option<KeyMap> {
     let mut r = Reader::new(blob);
     if r.next().ok()??.value != Value::StructStart {
         return None;
