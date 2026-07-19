@@ -865,6 +865,22 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       establish/再確立を確実化。mat 直経路は無変更（設計ルール 4）。設計 spec は
       `docs/superpowers/specs/2026-07-19-matd-resident-mdns-cache-design.md`。実機 E2E
       はデプロイ時に実施予定（本ブランチ時点では未実施）。
+    - **検証 3（cross-fabric commission）の逸脱解消（0.23.1、2026-07-19 実機合格）**:
+      0.23.0 の層 1 修正は `resolve_operational` と常駐キャッシュにのみ適用されて
+      おり、`resolve_commissionable`（commission の QR 経路の targeted resolve）と
+      `browse`（discover の commissionable 列挙）は ephemeral socket のままだった —
+      ゲート 2 検証 3 が「commissionable 広告を安定解決できない」で失敗した真因は
+      この未適用（OTBR proxy のマルチキャスト応答が構造的に受信不能）。0.23.1 で
+      `bind_mdns_socket` を両関数へ適用し、マルチキャストでのみ応答する responder
+      模擬の単体テスト（実行時 iface 発見方式）で受信可否をピン留め。実機（jarvis、
+      node 6）で検証 3 のフルシーケンス — fresh store `fabric init` → 実運用 fabric
+      から open-window → fresh store から on-network commission（multi-admin join、
+      `commission executed (native on-network)`）→ 新 fabric read → 新 fabric のみ
+      RemoveFabric → 元 fabric read 無傷 — が合格し、M8c-3 ゲート 2 の文書化した
+      逸脱は解消。あわせて実機で判明: fresh store は `paa-trust-store/` を持たない
+      ため commission が attestation「no matching PAA in trust store」で落ちる —
+      ハーネス `run_native_fresh` に `MAT_PAA_TRUST_STORE=$REMOTE_STORE/paa-trust-store`
+      を追加（PAA は公開ルート証明書なので実運用 store のもので良い）。
     - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
       デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
       挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
