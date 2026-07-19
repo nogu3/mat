@@ -200,6 +200,54 @@ impl Resolver for OneShotResolver {
     }
 }
 
+/// matd 用リゾルバ: 常駐 mDNS キャッシュ（[`dnssd::OperationalCache`]）を参照し、
+/// ヒットは即返し、ミス時は provoke してリスナの次アナウンスを
+/// `CACHE_MISS_TIMEOUT` まで待つ。establish から渡される `timeout`（8s）ではなく
+/// この内部定数を使う理由は spec 参照（`mat` 一発を無変更に保つため窓を分離）。
+pub struct CachingResolver {
+    cache: dnssd::OperationalCache,
+}
+
+/// cache miss 時にリスナの次アナウンス（周期~30s）を確実に跨ぐ待ち窓。
+const CACHE_MISS_TIMEOUT: Duration = Duration::from_secs(35);
+/// キャッシュ充填の poll 間隔（Notify を使わず単純 poll で取りこぼしを防ぐ）。
+const CACHE_POLL: Duration = Duration::from_millis(500);
+
+impl CachingResolver {
+    pub fn new(cache: dnssd::OperationalCache) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl Resolver for CachingResolver {
+    async fn resolve(
+        &self,
+        _scope_id: u32,
+        cfid: [u8; 8],
+        node_id: u64,
+        _timeout: Duration,
+    ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError> {
+        let instance = format!(
+            "{}._matter._tcp.local",
+            dnssd::operational_instance(&cfid, node_id)
+        );
+        if let Some(n) = self.cache.get(&instance) {
+            return Ok(n);
+        }
+        // ミス: listener に provoke クエリを依頼し、次アナウンス/応答を待つ。
+        self.cache.request(instance.clone());
+        let deadline = tokio::time::Instant::now() + CACHE_MISS_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(CACHE_POLL).await;
+            if let Some(n) = self.cache.get(&instance) {
+                return Ok(n);
+            }
+        }
+        Err(dnssd::DnssdError::Timeout { instance })
+    }
+}
+
 impl Engine {
     /// KVS から資格情報を1回読み、NOC を自己発行し、UDP transport を bind、
     /// iface の scope_id を解決して実確立器を構築する。プロセス寿命で不変。
@@ -626,5 +674,71 @@ mod tests {
             out,
             Err(mat_controller::dnssd::DnssdError::Timeout { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caching_resolver_returns_cached_hit_immediately() {
+        use mat_controller::dnssd;
+        let (cache, _rx) = dnssd::OperationalCache::new();
+        let inst = dnssd::operational_instance(&[0xAB; 8], 5) + "._matter._tcp.local";
+        cache.insert(
+            inst,
+            dnssd::ResolvedNode {
+                port: 5540,
+                addresses: vec!["fd00::1".parse().unwrap()],
+                session_idle_interval_ms: None,
+                session_active_interval_ms: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        let r = CachingResolver::new(cache);
+        let n = r
+            .resolve(1, [0xAB; 8], 5, std::time::Duration::from_secs(8))
+            .await
+            .expect("hit");
+        assert_eq!(n.port, 5540);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caching_resolver_awaits_listener_fill_then_returns() {
+        use mat_controller::dnssd;
+        let (cache, mut rx) = dnssd::OperationalCache::new();
+        let inst = dnssd::operational_instance(&[0xAB; 8], 7) + "._matter._tcp.local";
+        let filler = cache.clone();
+        let inst2 = inst.clone();
+        // 別タスクが少し後に埋める（リスナ相当）。
+        tokio::spawn(async move {
+            // provoke request が届くはず。
+            let got = rx.recv().await.unwrap();
+            assert_eq!(got, inst2);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            filler.insert(
+                inst2,
+                dnssd::ResolvedNode {
+                    port: 5541,
+                    addresses: vec!["fd00::2".parse().unwrap()],
+                    session_idle_interval_ms: None,
+                    session_active_interval_ms: None,
+                },
+                std::time::Duration::from_secs(60),
+            );
+        });
+        let r = CachingResolver::new(cache);
+        let n = r
+            .resolve(1, [0xAB; 8], 7, std::time::Duration::from_secs(8))
+            .await
+            .expect("fill");
+        assert_eq!(n.port, 5541);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caching_resolver_times_out_when_never_filled() {
+        use mat_controller::dnssd;
+        let (cache, _rx) = dnssd::OperationalCache::new();
+        let r = CachingResolver::new(cache);
+        let out = r
+            .resolve(1, [0xAB; 8], 9, std::time::Duration::from_secs(8))
+            .await;
+        assert!(matches!(out, Err(dnssd::DnssdError::Timeout { .. })));
     }
 }
