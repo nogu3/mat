@@ -26,7 +26,7 @@
 //! instead of browsing `_matter._tcp` and matching results — see
 //! `crates/mat/src/probe.rs`. `browse_operational` was removed accordingly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -1165,28 +1165,37 @@ impl OperationalCache {
         )
     }
 
-    /// 鮮度のあるエントリのみ返す（期限切れ/不在は None）。
+    /// 鮮度のあるエントリのみ返す（期限切れ/不在は None）。キーは ASCII 小文字
+    /// 正規化して照合する（`resolve_operational` の `eq_ignore_ascii_case` と
+    /// 同規律 — 最終レビュー #2）。listener が insert する生の `r.name` と
+    /// `CachingResolver` が渡す `operational_instance()`（大文字16進）の大小差
+    /// で恒久ミスにならないようにする。
     pub fn get(&self, instance: &str) -> Option<ResolvedNode> {
+        let key = instance.to_ascii_lowercase();
         let map = self.inner.map.lock().expect("opcache mutex");
-        map.get(instance)
+        map.get(&key)
             .filter(|e| Instant::now() < e.expiry)
             .map(|e| e.node.clone())
     }
 
     /// listener に instance の provoke クエリ送信を依頼する（listener 不在でも無害）。
+    /// ここは正規化しない: provoke クエリはワイヤに出す質問名で、mDNS は
+    /// ワイヤ上では大小文字非依存（呼び出し元の形のまま送って構わない）。
     pub fn request(&self, instance: String) {
         let _ = self.inner.query_tx.send(instance);
     }
 
     /// listener が呼ぶ: エントリを入れて期限を更新する。上限超過時、新規キーは
-    /// 挿入しない（既存キーの更新は常に許可＝鮮度維持を止めない）。
+    /// 挿入しない（既存キーの更新は常に許可＝鮮度維持を止めない）。キーは
+    /// `get` と同じく ASCII 小文字正規化して格納する（最終レビュー #2）。
     pub fn insert(&self, instance: String, node: ResolvedNode, ttl: Duration) {
+        let key = instance.to_ascii_lowercase();
         let mut map = self.inner.map.lock().expect("opcache mutex");
-        if !map.contains_key(&instance) && map.len() >= MAX_CACHE {
+        if !map.contains_key(&key) && map.len() >= MAX_CACHE {
             return;
         }
         map.insert(
-            instance,
+            key,
             CacheEntry {
                 node,
                 expiry: Instant::now() + ttl,
@@ -1198,87 +1207,121 @@ impl OperationalCache {
 /// operational instance を _matter._tcp のサービス名で判定する接尾辞。
 const OPERATIONAL_SUFFIX: &str = "._matter._tcp.local";
 
-struct InstAcc {
-    srv: Option<(u16, String)>,
-    txt: Option<Vec<Vec<u8>>>,
-    /// SRV レコードの TTL（秒）。エントリ expiry の基準。
-    srv_ttl: u32,
-}
+/// 各マップの「異なるキー」件数の上限（偽装 flood でメモリを伸ばさない —
+/// MAX_INSTANCES/MAX_CACHE と同思想）。既存キーの更新は常に許可する（鮮度
+/// 維持を止めない）ので、新規キーだけがこの上限で弾かれる。
+const MAX_FOLD_ENTRIES: usize = 256;
+/// ホスト 1 件あたりの AAAA 保持上限（dedup 済み）。旧実装のグローバル 64
+/// プール（`MAX_BROWSE_AAAA`）は満杯になると新規ホストを一切学習できず恒久
+/// Unreachable を招いた（最終レビュー #1a）。per-host にすることでホスト数
+/// が MAX_FOLD_ENTRIES 未満である限り starve しない。
+const MAX_ADDRS_PER_HOST: usize = 8;
 
-/// 複数データグラムにまたがる operational レコードの畳み込み状態。listener が
-/// データグラムごとに [`fold_operational_into_cache`] へ食わせる。
+/// 常駐 mDNS listener（[`run_operational_cache`]）がプロセス寿命で保持する、
+/// 有界・自己更新型の operational レコード蓄積。旧実装（[`InstAcc`] 相当を
+/// 1個の HashMap + 1個のグローバル共有 `aaaa: Vec` に貯める設計）には2つの
+/// 欠陥があった（最終レビュー #1）:
+/// (a) 共有 AAAA プールが `MAX_BROWSE_AAAA`(64) で頭打ちになり、以後どんな
+///     新規/再アドレス化ノードも AAAA を学習できず恒久 Unreachable になる。
+/// (b) 完成 instance を「毎 datagram、蓄積された全部」を re-insert していた
+///     ため、広告をやめた（goodbye 無し）ノードでも無関係な multicast が
+///     expiry を延命し続け、TTL/goodbye 失効が機能しなかった。
+///
+/// この構造体はキーを全て ASCII 小文字化して保持し（大小文字非依存）、
+/// [`fold_operational_into_cache`] が「当該 datagram に現れた instance のみ」
+/// を touched として cache insert することで (b) を解消し、AAAA を
+/// host→addrs の per-host プールにすることで (a) を解消する。
 #[derive(Default)]
 struct OperationalFold {
-    /// instance 完全名 → 蓄積。
-    instances: HashMap<String, InstAcc>,
-    /// hostname(SRV target) → AAAA プール。instance 横断で共有し完成時に引く。
-    aaaa: Vec<(String, Ipv6Addr)>,
+    /// instance_lower → (port, target_lower, ttl)。
+    srv: HashMap<String, (u16, String, u32)>,
+    /// instance_lower → TXT 文字列群。
+    txt: HashMap<String, Vec<Vec<u8>>>,
+    /// host_lower(SRV target) → アドレス群（dedup、[`MAX_ADDRS_PER_HOST`] で
+    /// 頭打ち）。
+    addrs: HashMap<String, Vec<Ipv6Addr>>,
 }
 
-/// `records` を畳み込み、SRV + 一致 AAAA が揃った operational instance を
-/// `cache` に insert する（TTL は SRV レコード値を尊重）。commissionable
-/// (`_matterc._udp`) など operational でない名前は無視する。
+/// `records`（1 データグラム分）を `fold` へ畳み込み、その datagram に現れた
+/// instance のうち SRV + 一致 AAAA が揃っているものだけを `cache` へ insert
+/// する（TTL は SRV レコード値を尊重）。commissionable (`_matterc._udp`) など
+/// operational でない名前は無視する。
+///
+/// SRV が先の datagram、AAAA が後の datagram で届く分割到着でも、AAAA 到着時
+/// に `fold.srv` の target と一致する既知 instance を touched にする（この
+/// target→touched 走査がクロス datagram 完成を保つ）。だが「当該 datagram に
+/// 一切登場しない instance」は re-insert しない — 立ち去ったノードの expiry
+/// が無関係な multicast で延命されるのを防ぐ。
 fn fold_operational_into_cache(
     records: &[Record],
     fold: &mut OperationalFold,
     cache: &OperationalCache,
 ) {
+    let mut touched: HashSet<String> = HashSet::new();
+
     for r in records {
         match &r.rdata {
             RData::Srv { port, target } if r.name.ends_with(OPERATIONAL_SUFFIX) => {
-                let acc = fold.instances.entry(r.name.clone()).or_insert(InstAcc {
-                    srv: None,
-                    txt: None,
-                    srv_ttl: 0,
-                });
-                acc.srv = Some((*port, target.clone()));
-                acc.srv_ttl = r.ttl;
+                let inst = r.name.to_ascii_lowercase();
+                let is_new = !fold.srv.contains_key(&inst);
+                if is_new && fold.srv.len() >= MAX_FOLD_ENTRIES {
+                    continue;
+                }
+                fold.srv
+                    .insert(inst.clone(), (*port, target.to_ascii_lowercase(), r.ttl));
+                touched.insert(inst);
             }
             RData::Txt(strings) if r.name.ends_with(OPERATIONAL_SUFFIX) => {
-                let acc = fold.instances.entry(r.name.clone()).or_insert(InstAcc {
-                    srv: None,
-                    txt: None,
-                    srv_ttl: 0,
-                });
-                acc.txt = Some(strings.clone());
+                let inst = r.name.to_ascii_lowercase();
+                let is_new = !fold.txt.contains_key(&inst);
+                if is_new && fold.txt.len() >= MAX_FOLD_ENTRIES {
+                    continue;
+                }
+                fold.txt.insert(inst.clone(), strings.clone());
+                touched.insert(inst);
             }
-            RData::Aaaa(addr)
-                if !fold
-                    .aaaa
-                    .iter()
-                    .any(|(n, a)| a == addr && n.eq_ignore_ascii_case(&r.name))
-                    && fold.aaaa.len() < MAX_BROWSE_AAAA =>
-            {
-                fold.aaaa.push((r.name.clone(), *addr));
+            RData::Aaaa(addr) => {
+                let host = r.name.to_ascii_lowercase();
+                let is_new_host = !fold.addrs.contains_key(&host);
+                if !(is_new_host && fold.addrs.len() >= MAX_FOLD_ENTRIES) {
+                    let list = fold.addrs.entry(host.clone()).or_default();
+                    if list.len() < MAX_ADDRS_PER_HOST && !list.contains(addr) {
+                        list.push(*addr);
+                    }
+                }
+                // この host を SRV target に持つ既知 instance を touched に。
+                // これがクロス datagram 完成（SRV が先、AAAA が後）を支える。
+                for (inst, (_, target, _)) in &fold.srv {
+                    if target.eq_ignore_ascii_case(&host) {
+                        touched.insert(inst.clone());
+                    }
+                }
             }
             _ => {}
         }
     }
-    // 完成した instance を cache へ。
-    for (instance, acc) in &fold.instances {
-        let Some((port, target)) = &acc.srv else {
+
+    for inst in touched {
+        let Some((port, target, ttl)) = fold.srv.get(&inst) else {
             continue;
         };
-        let mut addresses: Vec<Ipv6Addr> = Vec::new();
-        for (n, a) in &fold.aaaa {
-            if n.eq_ignore_ascii_case(target) && !addresses.contains(a) {
-                addresses.push(*a);
-            }
-        }
-        if addresses.is_empty() {
+        let Some(addrs) = fold.addrs.get(target) else {
+            continue;
+        };
+        if addrs.is_empty() {
             continue;
         }
+        let mut addresses = addrs.clone();
         addresses.sort_by_key(is_link_local);
-        let strings: &[Vec<u8>] = acc.txt.as_deref().unwrap_or(&[]);
+        let txt = fold.txt.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
         let node = ResolvedNode {
             port: *port,
             addresses,
-            session_idle_interval_ms: txt_u32(strings, "SII"),
-            session_active_interval_ms: txt_u32(strings, "SAI"),
+            session_idle_interval_ms: txt_u32(txt, "SII"),
+            session_active_interval_ms: txt_u32(txt, "SAI"),
         };
         // TTL 0（goodbye）は即時失効相当なので短く。通常は広告 TTL を尊重。
-        let ttl = Duration::from_secs(u64::from(acc.srv_ttl));
-        cache.insert(instance.clone(), node, ttl);
+        cache.insert(inst.clone(), node, Duration::from_secs(u64::from(*ttl)));
     }
 }
 
@@ -2210,5 +2253,158 @@ mod tests {
         let (cache, mut rx) = OperationalCache::new();
         cache.request("x._matter._tcp.local".into());
         assert_eq!(rx.try_recv().unwrap(), "x._matter._tcp.local");
+    }
+
+    /// `resolve_operational` の `eq_ignore_ascii_case` 規律とキャッシュを揃える
+    /// (最終レビュー #2)。listener はワイヤ上の生の `r.name`（大小混在し得る）
+    /// を insert し、`CachingResolver` は `operational_instance()`（大文字16進）
+    /// で get する — 正規化しないと非大文字hex広告者で恒久ミスになる。
+    #[test]
+    fn opcache_get_is_case_insensitive() {
+        let (cache, _rx) = OperationalCache::new();
+        let lower = "ab7de08802e0cd54-0000000000000005._matter._tcp.local".to_string();
+        cache.insert(lower, sample_node(5540), Duration::from_secs(60));
+        let upper = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        assert_eq!(cache.get(upper).map(|n| n.port), Some(5540));
+    }
+
+    /// SRV+TXT が 1 データグラム、AAAA が別データグラムで届いても、後段の
+    /// AAAA 到着時に target 一致で touched になり完成する (最終レビュー #1,
+    /// step 4 の target→touched 走査)。
+    fn synth_srv_txt_only(service: &str, target: &str, port: u16, txt: &[&str]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]); // qd 0, an 2 (SRV+TXT)
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl 120
+        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
+        rdata.extend_from_slice(&port.to_be_bytes());
+        let mut tname = Vec::new();
+        push_name(&mut tname, target);
+        rdata.extend_from_slice(&tname);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        let mut rdata = Vec::new();
+        for s in txt {
+            rdata.push(s.len() as u8);
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        m
+    }
+
+    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // qd 0, an 1
+        push_name(&mut m, name);
+        m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01]); // cache-flush|IN
+        m.extend_from_slice(&ttl.to_be_bytes());
+        m.extend_from_slice(&16u16.to_be_bytes());
+        m.extend_from_slice(&addr.octets());
+        m
+    }
+
+    #[test]
+    fn fold_cross_datagram_srv_then_aaaa_completes() {
+        let (cache, _rx) = OperationalCache::new();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "12b41a22758b788a.local";
+        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        let mut fold = OperationalFold::default();
+
+        let msg1 = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        let records1 = parse_message(&msg1).unwrap();
+        fold_operational_into_cache(&records1, &mut fold, &cache);
+        assert!(
+            cache.get(service).is_none(),
+            "SRV without AAAA must not cache yet"
+        );
+
+        let msg2 = synth_aaaa_only(target, 120, addr);
+        let records2 = parse_message(&msg2).unwrap();
+        fold_operational_into_cache(&records2, &mut fold, &cache);
+
+        let node = cache
+            .get(service)
+            .expect("should complete once the AAAA for the SRV target arrives");
+        assert_eq!(node.port, 5540);
+        assert_eq!(node.addresses, vec![addr]);
+        assert_eq!(node.session_idle_interval_ms, Some(5000));
+    }
+
+    /// 旧実装は AAAA プールが `MAX_BROWSE_AAAA`(64) グローバル共有だったため、
+    /// 65 個目以降の新規ホストは学習不能で恒久 Unreachable になった
+    /// (最終レビュー #1a)。per-host 方式ならホスト数が MAX_FOLD_ENTRIES(256)
+    /// 未満である限り starve しない。
+    #[test]
+    fn fold_no_global_aaaa_starvation() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let mut last_addr = Ipv6Addr::UNSPECIFIED;
+        for i in 0..70u32 {
+            let host = format!("host{i}.local");
+            let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i as u16);
+            last_addr = addr;
+            let msg = synth_aaaa_only(&host, 120, addr);
+            let records = parse_message(&msg).unwrap();
+            fold_operational_into_cache(&records, &mut fold, &cache);
+        }
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "host69.local"; // 70 番目 (旧 64 上限を上回る)
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        let records = parse_message(&msg).unwrap();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+
+        let node = cache
+            .get(service)
+            .expect("the 70th distinct host's AAAA must not be starved by a global cap");
+        assert_eq!(node.addresses, vec![last_addr]);
+    }
+
+    /// 立ち去ったノード(A)の完成後、A に触れない無関係な datagram を挟んでも
+    /// A の expiry は延命されない — TTL(120s)通り +120s で失効する
+    /// (最終レビュー #1b)。旧実装は fold 内の全累積 instance を毎 datagram
+    /// 再 insert していたため、無関係な multicast が expiry を延命し続け、
+    /// goodbye/TTL 失効が事実上機能しなかった。
+    #[tokio::test(start_paused = true)]
+    async fn fold_departed_instance_expires_and_is_not_refreshed() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service_a = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target_a = "hosta.local";
+        let addr_a: Ipv6Addr = "fd54:4b81:8cce:1::a".parse().unwrap();
+
+        let msg_a = synth_response(service_a, target_a, 5540, &["SII=5000"], addr_a);
+        let records_a = parse_message(&msg_a).unwrap();
+        fold_operational_into_cache(&records_a, &mut fold, &cache);
+        assert!(
+            cache.get(service_a).is_some(),
+            "A should be cached initially"
+        );
+
+        tokio::time::advance(Duration::from_secs(119)).await;
+        assert!(
+            cache.get(service_a).is_some(),
+            "A should still be fresh at +119s (ttl=120s)"
+        );
+
+        // 無関係な datagram: A に一切触れない (別ホストの AAAA のみ)。
+        let addr_b: Ipv6Addr = "fd54:4b81:8cce:1::b".parse().unwrap();
+        let msg_unrelated = synth_aaaa_only("unrelated.local", 120, addr_b);
+        let records_unrelated = parse_message(&msg_unrelated).unwrap();
+        fold_operational_into_cache(&records_unrelated, &mut fold, &cache);
+
+        tokio::time::advance(Duration::from_secs(2)).await; // 合計 +121s
+        assert!(
+            cache.get(service_a).is_none(),
+            "departed A must expire, not be refreshed by unrelated multicast"
+        );
     }
 }
