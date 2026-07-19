@@ -852,6 +852,19 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       （epoch→operational 導出チェーンを実リーダで検証）で構造検証済。唯一ライブ
       未実証なのは「fabric-init 資材 → ライブ AddNOC」の組合せで、ユーザー判断で
       逸脱を受容してマージした。
+    - **native resolve 回帰の恒久修正（0.23.0）**: ゲート 2 の jarvis 本番 matd で
+      weak-link Thread ノード（node 5/14）の establish がランダムに失敗し、0.22.0
+      本番デプロイをロールバック（回帰要因の特定まで）。実機 tcpdump 分析
+      （2026-07-19）により、OTBR mDNS proxy が weak-link ノードの operational
+      SRV/AAAA を ff02::fb へ multicast でのみ返し QU ビットを無視、かつ ~30 秒周期
+      でしか広告しないことが判明。旧 resolver は ephemeral socket で group 未 join
+      のため受信不可、一発 resolve では周期を跨げず取りこぼし。修正は 2 層:
+      **層 1**（`mat-controller::dnssd`）resolver を 5353 bind + SO_REUSEADDR +
+      ff02::fb group join + QU + hop 255 に。**層 2**（matd）常駐 mDNS キャッシュ
+      `dnssd::run_operational_cache` + `OperationalCache` + `CachingResolver` を追加し
+      establish/再確立を確実化。mat 直経路は無変更（設計ルール 4）。設計 spec は
+      `docs/superpowers/specs/2026-07-19-matd-resident-mdns-cache-design.md`。実機 E2E
+      はデプロイ時に実施予定（本ブランチ時点では未実施）。
     - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
       デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
       挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
