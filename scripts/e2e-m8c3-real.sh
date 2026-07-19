@@ -274,11 +274,16 @@ run_matd() {
 # （$FRESH_STORE）・MAT_FABRIC_INDEX も明示 unset（fresh store 側の
 # fabric-index は `mat fabric init` が使った CLI 既定値 1 に委ねる —
 # 本番 fabric の FABRIC_INDEX=2 を誤って引き継がないため）。
+# PAA 信頼ストアは実運用 store（$REMOTE_STORE）のものを指す — fresh store
+# は fabric init 直後で paa-trust-store/ を持たず、無指定だと commission が
+# attestation の "no matching PAA in trust store"（device_rejected）で必ず
+# 落ちる（2026-07-19 の検証3再挑戦の実機実測）。PAA は公開ルート証明書
+# なので実運用 store のものを参照して問題ない。
 # 前提（グローバル）: MAT_E2E_HOST, REMOTE_MAT_BIN, FRESH_STORE,
-# LAST_STDERR_FILE, COMBINED_LOG, EXTRA_ENV。
+# REMOTE_STORE, LAST_STDERR_FILE, COMBINED_LOG, EXTRA_ENV。
 run_native_fresh() {
   _run_ssh_capture ssh -n "$MAT_E2E_HOST" env -u MAT_IFACE -u MAT_MATD_IFACE -u MAT_FABRIC_INDEX \
-    MAT_MATD=0 MAT_LOG=info "${EXTRA_ENV[@]}" \
+    MAT_MATD=0 MAT_LOG=info "MAT_PAA_TRUST_STORE=$REMOTE_STORE/paa-trust-store" "${EXTRA_ENV[@]}" \
     "$REMOTE_MAT_BIN" --store "$FRESH_STORE" "$@"
 }
 
