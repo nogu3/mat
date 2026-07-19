@@ -726,9 +726,7 @@ pub async fn resolve_commissionable(
     timeout: Duration,
 ) -> Result<ResolvedNode, DnssdError> {
     let subtype = long_discriminator_subtype(long_discriminator);
-    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
-        .await
-        .map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
     let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
 
     let mut instance: Option<String> = None;
@@ -1019,9 +1017,7 @@ async fn browse(
     service: &str,
     window: Duration,
 ) -> Result<Vec<FoldedInstance>, DnssdError> {
-    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
-        .await
-        .map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
     let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
     let mut fold = BrowseFold::new(service);
     let deadline = Instant::now() + window;
@@ -1529,6 +1525,143 @@ mod tests {
         // 二重 bind（REUSEADDR）で失敗しないこと＝常駐 socket が確立できる。
         let a = spawn_operational_cache(scope);
         assert!(a.is_ok(), "operational cache should bind on lo: {a:?}");
+    }
+
+    /// `IFF_UP|IFF_MULTICAST` な iface（lo 以外、`operstate == "up"` 優先）。
+    /// group.rs のテストと同じ実行時発見方式 — lo は IFF_MULTICAST を持たず
+    /// IPv6 マルチキャストが絶対に届かないため除外。
+    fn multicast_ifaces() -> Vec<(String, u32)> {
+        const IFF_UP: u32 = 0x1;
+        const IFF_MULTICAST: u32 = 0x1000;
+        let mut up_first = Vec::new();
+        let mut rest = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let flags = std::fs::read_to_string(base.join("flags"))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
+                continue;
+            }
+            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
+            if operstate.trim() == "up" {
+                up_first.push((name, index));
+            } else {
+                rest.push((name, index));
+            }
+        }
+        up_first.extend(rest);
+        up_first
+    }
+
+    /// OTBR mDNS advertising proxy 型 responder の模擬: QU（unicast-response）
+    /// ビットを無視し、応答/広告を **ff02::fb へのマルチキャストでのみ** 出す
+    /// （2026-07-19 実機 tcpdump で確定した挙動）。クエリ検出はせず周期
+    /// announce する — 問うのは「マルチキャスト応答を受信できるか」だけ。
+    fn spawn_multicast_announcer(
+        scope_id: u32,
+        msg: Vec<u8>,
+    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        let sock = bind_mdns_socket(scope_id)?;
+        let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+        Ok(tokio::spawn(async move {
+            loop {
+                let _ = sock.send_to(&msg, dest).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }))
+    }
+
+    /// resolve_commissionable が、マルチキャストでしか応答しない responder
+    /// （実機 OTBR proxy と同型）の commissionable 広告を受信できること。
+    /// resolver が ephemeral ソケット（5353 非 bind・ff02::fb 未 join）だと
+    /// この応答は構造的に受信不能で必ず timeout する — ゲート2 検証3
+    /// （cross-fabric commission）が実機で解決不能になった回帰のピン留め。
+    #[tokio::test]
+    async fn resolve_commissionable_receives_multicast_only_response() {
+        let msg = synth_commissionable_response(
+            "_L2989._sub._matterc._udp.local",
+            "MCASTONLY-RC._matterc._udp.local",
+            "mcastonly-rc.local",
+            5540,
+            &["D=2989"],
+            "fd00::2989".parse().unwrap(),
+        );
+        let mut tried = Vec::new();
+        for (name, idx) in multicast_ifaces() {
+            let Ok(announcer) = spawn_multicast_announcer(idx, msg.clone()) else {
+                tried.push(format!("{name}(idx={idx}): responder bind failed"));
+                continue;
+            };
+            let res = resolve_commissionable(idx, 2989, Duration::from_millis(1500)).await;
+            announcer.abort();
+            match res {
+                Ok(node) => {
+                    assert_eq!(node.port, 5540);
+                    assert_eq!(
+                        node.addresses,
+                        vec!["fd00::2989".parse::<Ipv6Addr>().unwrap()]
+                    );
+                    return; // 最初に届いた iface で十分 — PASS。
+                }
+                Err(e) => tried.push(format!("{name}(idx={idx}): {e:?}")),
+            }
+        }
+        panic!(
+            "no multicast-capable interface delivered the multicast-only \
+             commissionable answer to resolve_commissionable (lo excluded — \
+             it lacks IFF_MULTICAST on Linux); tried: {tried:?}"
+        );
+    }
+
+    /// browse（discover の commissionable 列挙）も同じくマルチキャストのみの
+    /// 広告を受信できること。resolve_commissionable と同じ回帰のピン留め。
+    #[tokio::test]
+    async fn browse_receives_multicast_only_announcement() {
+        let msg = synth_commissionable_response(
+            "_matterc._udp.local",
+            "MCASTONLY-BR._matterc._udp.local",
+            "mcastonly-br.local",
+            5541,
+            &["D=2990"],
+            "fd00::2990".parse().unwrap(),
+        );
+        let mut tried = Vec::new();
+        for (name, idx) in multicast_ifaces() {
+            let Ok(announcer) = spawn_multicast_announcer(idx, msg.clone()) else {
+                tried.push(format!("{name}(idx={idx}): responder bind failed"));
+                continue;
+            };
+            let res = browse_commissionable(idx, Duration::from_millis(1200)).await;
+            announcer.abort();
+            match res {
+                Ok(list) if list.iter().any(|c| c.discriminator == Some(2990)) => return,
+                Ok(list) => tried.push(format!(
+                    "{name}(idx={idx}): announcement not seen ({} unrelated instances)",
+                    list.len()
+                )),
+                Err(e) => tried.push(format!("{name}(idx={idx}): {e:?}")),
+            }
+        }
+        panic!(
+            "no multicast-capable interface delivered the multicast-only \
+             commissionable announcement to browse (lo excluded — it lacks \
+             IFF_MULTICAST on Linux); tried: {tried:?}"
+        );
     }
 
     /// commissionable browse 用の合成応答: PTR(subtype→instance) +
