@@ -26,10 +26,13 @@
 //! instead of browsing `_matter._tcp` and matching results — see
 //! `crates/mat/src/probe.rs`. `browse_operational` was removed accordingly.
 
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::exchange::MrpConfig;
@@ -1124,6 +1127,72 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
     Some(c)
 }
 
+/// キャッシュ上限（偽装 flood でメモリを伸ばさない — MAX_INSTANCES と同思想）。
+const MAX_CACHE: usize = 256;
+
+struct CacheEntry {
+    node: ResolvedNode,
+    expiry: Instant,
+}
+
+struct CacheInner {
+    map: StdMutex<HashMap<String, CacheEntry>>,
+    query_tx: mpsc::UnboundedSender<String>,
+}
+
+/// matd 常駐 mDNS キャッシュのハンドル。listener タスク（[`run_operational_cache`]）
+/// と `CachingResolver` が `Arc` で共有する。設計ルール4: `mat` 一発は使わない
+/// （matd 専用）。`Clone` は内部 `Arc` の複製。
+#[derive(Clone)]
+pub struct OperationalCache {
+    inner: std::sync::Arc<CacheInner>,
+}
+
+impl OperationalCache {
+    /// ハンドルと、listener が読む provoke-request 受信端を返す。
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                inner: std::sync::Arc::new(CacheInner {
+                    map: StdMutex::new(HashMap::new()),
+                    query_tx: tx,
+                }),
+            },
+            rx,
+        )
+    }
+
+    /// 鮮度のあるエントリのみ返す（期限切れ/不在は None）。
+    pub fn get(&self, instance: &str) -> Option<ResolvedNode> {
+        let map = self.inner.map.lock().expect("opcache mutex");
+        map.get(instance)
+            .filter(|e| Instant::now() < e.expiry)
+            .map(|e| e.node.clone())
+    }
+
+    /// listener に instance の provoke クエリ送信を依頼する（listener 不在でも無害）。
+    pub fn request(&self, instance: String) {
+        let _ = self.inner.query_tx.send(instance);
+    }
+
+    /// listener が呼ぶ: エントリを入れて期限を更新する。上限超過時、新規キーは
+    /// 挿入しない（既存キーの更新は常に許可＝鮮度維持を止めない）。
+    pub fn insert(&self, instance: String, node: ResolvedNode, ttl: Duration) {
+        let mut map = self.inner.map.lock().expect("opcache mutex");
+        if !map.contains_key(&instance) && map.len() >= MAX_CACHE {
+            return;
+        }
+        map.insert(
+            instance,
+            CacheEntry {
+                node,
+                expiry: Instant::now() + ttl,
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1893,5 +1962,62 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 60);
+    }
+
+    fn sample_node(port: u16) -> ResolvedNode {
+        ResolvedNode {
+            port,
+            addresses: vec!["fd00::1".parse().unwrap()],
+            session_idle_interval_ms: Some(5000),
+            session_active_interval_ms: Some(300),
+        }
+    }
+
+    #[test]
+    fn opcache_insert_get_and_expiry() {
+        let (cache, _rx) = OperationalCache::new();
+        let inst = "AABB-0005._matter._tcp.local".to_string();
+        cache.insert(inst.clone(), sample_node(5540), Duration::from_secs(60));
+        assert_eq!(cache.get(&inst).map(|n| n.port), Some(5540));
+        assert!(cache.get("nope._matter._tcp.local").is_none());
+        // 期限切れは None。
+        cache.insert(inst.clone(), sample_node(5540), Duration::from_millis(0));
+        assert!(cache.get(&inst).is_none());
+    }
+
+    #[test]
+    fn opcache_caps_new_instances_but_updates_existing() {
+        let (cache, _rx) = OperationalCache::new();
+        for i in 0..MAX_CACHE {
+            cache.insert(
+                format!("i{i}._matter._tcp.local"),
+                sample_node(1),
+                Duration::from_secs(60),
+            );
+        }
+        // 上限到達後の新規は無視。
+        cache.insert(
+            "overflow._matter._tcp.local".into(),
+            sample_node(1),
+            Duration::from_secs(60),
+        );
+        assert!(cache.get("overflow._matter._tcp.local").is_none());
+        // 既存キーの更新は上限後も許可。
+        cache.insert(
+            "i0._matter._tcp.local".into(),
+            sample_node(9999),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache.get("i0._matter._tcp.local").map(|n| n.port),
+            Some(9999)
+        );
+    }
+
+    #[test]
+    fn opcache_request_does_not_panic_and_is_received() {
+        let (cache, mut rx) = OperationalCache::new();
+        cache.request("x._matter._tcp.local".into());
+        assert_eq!(rx.try_recv().unwrap(), "x._matter._tcp.local");
     }
 }
