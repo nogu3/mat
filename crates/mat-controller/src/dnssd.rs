@@ -1,10 +1,12 @@
 //! Minimal one-shot mDNS/DNS-SD resolver for Matter operational services
-//! (Matter spec §4.3; RFC 6762 legacy unicast queries; RFC 2782 SRV).
+//! (Matter spec §4.3; RFC 6762; RFC 2782 SRV).
 //!
 //! Scope: resolve one `<CompressedFabricId>-<NodeId>._matter._tcp.local`
 //! instance to IPv6 addresses + port + MRP intervals (TXT `SII`/`SAI`).
-//! No advertising, no cache: send a legacy unicast query (source port ≠
-//! 5353, so responders reply straight back to us), fold responses until
+//! No advertising, no cache: bind `[::]:5353`, join `ff02::fb`, and query with
+//! the QU (unicast-response) bit set — then fold both the unicast replies and
+//! the multicast answers a responder may send to the group instead (see
+//! [`bind_mdns_socket`] and [`QU_CLASS_IN`]). Fold responses until
 //! SRV + at least one AAAA for its target are in hand. TXT is folded when
 //! it arrives in the same responses but is not waited for — MRP falls back
 //! to the spec default interval without it.
@@ -39,6 +41,16 @@ const TYPE_TXT: u16 = 16;
 const TYPE_AAAA: u16 = 28;
 const TYPE_SRV: u16 = 33;
 const CLASS_IN: u16 = 0x0001;
+/// QU (unicast-response) bit — top bit of the qclass field (RFC 6762 §5.4).
+/// Set on every question we send: this resolver is a one-shot querier bound to
+/// an ephemeral port (not 5353) and never joins the ff02::fb multicast group,
+/// so it can only receive *unicast* replies. Without QU, real responders (an
+/// OTBR mDNS advertising proxy, observed on the wire 2026-07-19) answer a QM
+/// query via multicast to ff02::fb, which our ephemeral socket never sees —
+/// the resolve then times out even though avahi/chip-tool (which join the
+/// group and set QU) resolve the same instance. QU explicitly requests the
+/// unicast reply this design already assumes.
+const QU_CLASS_IN: u16 = 0x8000 | CLASS_IN;
 /// Matter spec §4.12.8: SESSION_IDLE_INTERVAL default and ceiling (ms).
 const MRP_DEFAULT_IDLE_MS: u32 = 500;
 const MRP_MAX_INTERVAL_MS: u32 = 3_600_000;
@@ -94,6 +106,47 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
     text.trim()
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad ifindex"))
+}
+
+/// Binds the one-shot mDNS query socket used by the resolvers below.
+///
+/// It binds `[::]:5353` (the mDNS port) with address/port reuse and joins the
+/// `ff02::fb` group on the query interface. This is the crucial difference
+/// from a naive ephemeral-port querier: a real responder — an OTBR mDNS
+/// advertising proxy for Thread nodes, captured on the wire 2026-07-19 —
+/// answers our targeted query by **multicasting** the SRV/AAAA to `ff02::fb`
+/// even when we set the QU (unicast-response) bit, which RFC 6762 §5.4
+/// permits. A socket bound to an ephemeral port and not joined to the group
+/// never receives those answers, so the resolve times out even though avahi /
+/// chip-tool (which bind 5353 and join the group) resolve the same instance.
+/// `SO_REUSEADDR` (not `SO_REUSEPORT`) lets us coexist with a system mDNS
+/// daemon (e.g. avahi) that already holds 5353: with `SO_REUSEADDR` a multicast
+/// datagram is delivered to *every* socket bound to the port that joined the
+/// group, so we and avahi both get a copy. `SO_REUSEPORT` must NOT be used
+/// here — it puts the sockets in a load-balancing group that hashes *each*
+/// incoming datagram (multicast included) to a single member, so the
+/// responder's multicast answer lands on avahi at random and our resolve flakes
+/// (observed intermittently across all nodes, 2026-07-19). Unicast delivery to
+/// the shared port is not guaranteed to reach us, but we rely on the multicast
+/// answer this responder sends anyway.
+///
+/// Outgoing multicast is pinned to the interface — `sin6_scope_id` alone can
+/// leak a datagram out a VPN interface (see `transport.rs`) — with hop limit
+/// 255 (RFC 6762 §11 requires it; the OS default of 1 is also off-spec).
+/// Still one-shot: the caller drops the socket when the resolve returns, so no
+/// state is held between runs (design rule 4).
+fn bind_mdns_socket(scope_id: u32) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_only_v6(true)?;
+    sock.set_nonblocking(true)?;
+    let bind = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
+    sock.bind(&SocketAddr::V6(bind).into())?;
+    sock.join_multicast_v6(&MDNS_GROUP, scope_id)?;
+    sock.set_multicast_if_v6(scope_id)?;
+    sock.set_multicast_hops_v6(255)?;
+    UdpSocket::from_std(sock.into())
 }
 
 fn is_link_local(a: &Ipv6Addr) -> bool {
@@ -160,7 +213,7 @@ fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
     for (name, qtype) in questions {
         push_name(&mut out, name);
         out.extend_from_slice(&qtype.to_be_bytes());
-        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&QU_CLASS_IN.to_be_bytes());
     }
     out
 }
@@ -504,9 +557,7 @@ pub async fn resolve_operational(
 ) -> Result<ResolvedNode, DnssdError> {
     let instance = operational_instance(compressed_fabric_id, node_id);
     let service = format!("{instance}._matter._tcp.local");
-    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
-        .await
-        .map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
     let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
 
     let mut srv: Option<(u16, String)> = None;
@@ -1100,9 +1151,36 @@ mod tests {
             [
                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, // header: id 0, 1 question
                 1, b'a', 5, b'l', b'o', b'c', b'a', b'l', 0, // qname a.local
-                0, 33, 0, 1, // SRV, IN
+                0, 33, 0x80, 1, // SRV, QU|IN (unicast-response bit set)
             ]
         );
+    }
+
+    /// 全 question で QU（unicast-response）ビットが立つこと（qclass 最上位
+    /// 0x8000）。これが無いと、応答者（実機 OTBR mDNS proxy）が QM クエリに
+    /// マルチキャストで返し、ephemeral ソケットの一発 resolver が受信できず
+    /// timeout する回帰を招く（2026-07-19 実機 tcpdump で確定）。
+    #[test]
+    fn every_question_sets_qu_unicast_response_bit() {
+        let q = encode_query(0, &[("a.local", TYPE_SRV), ("a.local", TYPE_TXT)]);
+        // qclass は各 question の末尾 2 バイト。名前 "a.local" は 9 バイト
+        // (1+1 + 1+5 + 1)、それに qtype(2)+qclass(2) が続く。
+        // 先頭 12(ヘッダ) の後: [name9][SRV 2][qclass 2][name9][TXT 2][qclass 2]
+        let first_qclass = u16::from_be_bytes([q[12 + 9 + 2], q[12 + 9 + 3]]);
+        let second_qclass = u16::from_be_bytes([q[12 + 9 + 4 + 9 + 2], q[12 + 9 + 4 + 9 + 3]]);
+        assert_eq!(
+            first_qclass & 0x8000,
+            0x8000,
+            "SRV question must set QU bit"
+        );
+        assert_eq!(
+            second_qclass & 0x8000,
+            0x8000,
+            "TXT question must set QU bit"
+        );
+        // 下位 15 ビットは通常の IN クラスのまま。
+        assert_eq!(first_qclass & 0x7fff, CLASS_IN);
+        assert_eq!(second_qclass & 0x7fff, CLASS_IN);
     }
 
     /// SRV + TXT + AAAA を 1 メッセージに合成。AAAA のレコード名は SRV rdata
