@@ -139,7 +139,27 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         fabric_index: cli.fabric_index,
         issuer_index: cli.issuer_index,
     };
-    let native = match matd::native::NativeBackend::build(&cfg).await {
+    // 常駐 mDNS キャッシュ（周期アナウンス依存の弱リンク Thread ノードの
+    // establish を確実化）。bind 失敗時は OneShotResolver に degrade。
+    let resolver: std::sync::Arc<dyn mat_native::Resolver> =
+        match mat_controller::dnssd::iface_index(&cfg.iface) {
+            Ok(scope_id) => match mat_controller::dnssd::spawn_operational_cache(scope_id) {
+                Ok(cache) => {
+                    tracing::info!("matd: resident mDNS operational cache enabled");
+                    std::sync::Arc::new(mat_native::CachingResolver::new(cache))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "matd: mDNS cache bind failed; using one-shot resolver");
+                    std::sync::Arc::new(mat_native::OneShotResolver)
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "matd: iface index unresolved; using one-shot resolver");
+                std::sync::Arc::new(mat_native::OneShotResolver)
+            }
+        };
+
+    let native = match matd::native::NativeBackend::build_with_resolver(&cfg, resolver).await {
         Ok(b) => {
             tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
             server::NativeState::Ready(Box::new(b))

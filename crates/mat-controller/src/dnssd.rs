@@ -1,10 +1,12 @@
 //! Minimal one-shot mDNS/DNS-SD resolver for Matter operational services
-//! (Matter spec §4.3; RFC 6762 legacy unicast queries; RFC 2782 SRV).
+//! (Matter spec §4.3; RFC 6762; RFC 2782 SRV).
 //!
 //! Scope: resolve one `<CompressedFabricId>-<NodeId>._matter._tcp.local`
 //! instance to IPv6 addresses + port + MRP intervals (TXT `SII`/`SAI`).
-//! No advertising, no cache: send a legacy unicast query (source port ≠
-//! 5353, so responders reply straight back to us), fold responses until
+//! No advertising, no cache: bind `[::]:5353`, join `ff02::fb`, and query with
+//! the QU (unicast-response) bit set — then fold both the unicast replies and
+//! the multicast answers a responder may send to the group instead (see
+//! [`bind_mdns_socket`] and [`QU_CLASS_IN`]). Fold responses until
 //! SRV + at least one AAAA for its target are in hand. TXT is folded when
 //! it arrives in the same responses but is not waited for — MRP falls back
 //! to the spec default interval without it.
@@ -24,10 +26,13 @@
 //! instead of browsing `_matter._tcp` and matching results — see
 //! `crates/mat/src/probe.rs`. `browse_operational` was removed accordingly.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::exchange::MrpConfig;
@@ -39,6 +44,16 @@ const TYPE_TXT: u16 = 16;
 const TYPE_AAAA: u16 = 28;
 const TYPE_SRV: u16 = 33;
 const CLASS_IN: u16 = 0x0001;
+/// QU (unicast-response) bit — top bit of the qclass field (RFC 6762 §5.4).
+/// Set on every question we send: this resolver is a one-shot querier bound to
+/// an ephemeral port (not 5353) and never joins the ff02::fb multicast group,
+/// so it can only receive *unicast* replies. Without QU, real responders (an
+/// OTBR mDNS advertising proxy, observed on the wire 2026-07-19) answer a QM
+/// query via multicast to ff02::fb, which our ephemeral socket never sees —
+/// the resolve then times out even though avahi/chip-tool (which join the
+/// group and set QU) resolve the same instance. QU explicitly requests the
+/// unicast reply this design already assumes.
+const QU_CLASS_IN: u16 = 0x8000 | CLASS_IN;
 /// Matter spec §4.12.8: SESSION_IDLE_INTERVAL default and ceiling (ms).
 const MRP_DEFAULT_IDLE_MS: u32 = 500;
 const MRP_MAX_INTERVAL_MS: u32 = 3_600_000;
@@ -94,6 +109,47 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
     text.trim()
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad ifindex"))
+}
+
+/// Binds the one-shot mDNS query socket used by the resolvers below.
+///
+/// It binds `[::]:5353` (the mDNS port) with address/port reuse and joins the
+/// `ff02::fb` group on the query interface. This is the crucial difference
+/// from a naive ephemeral-port querier: a real responder — an OTBR mDNS
+/// advertising proxy for Thread nodes, captured on the wire 2026-07-19 —
+/// answers our targeted query by **multicasting** the SRV/AAAA to `ff02::fb`
+/// even when we set the QU (unicast-response) bit, which RFC 6762 §5.4
+/// permits. A socket bound to an ephemeral port and not joined to the group
+/// never receives those answers, so the resolve times out even though avahi /
+/// chip-tool (which bind 5353 and join the group) resolve the same instance.
+/// `SO_REUSEADDR` (not `SO_REUSEPORT`) lets us coexist with a system mDNS
+/// daemon (e.g. avahi) that already holds 5353: with `SO_REUSEADDR` a multicast
+/// datagram is delivered to *every* socket bound to the port that joined the
+/// group, so we and avahi both get a copy. `SO_REUSEPORT` must NOT be used
+/// here — it puts the sockets in a load-balancing group that hashes *each*
+/// incoming datagram (multicast included) to a single member, so the
+/// responder's multicast answer lands on avahi at random and our resolve flakes
+/// (observed intermittently across all nodes, 2026-07-19). Unicast delivery to
+/// the shared port is not guaranteed to reach us, but we rely on the multicast
+/// answer this responder sends anyway.
+///
+/// Outgoing multicast is pinned to the interface — `sin6_scope_id` alone can
+/// leak a datagram out a VPN interface (see `transport.rs`) — with hop limit
+/// 255 (RFC 6762 §11 requires it; the OS default of 1 is also off-spec).
+/// Still one-shot: the caller drops the socket when the resolve returns, so no
+/// state is held between runs (design rule 4).
+fn bind_mdns_socket(scope_id: u32) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_only_v6(true)?;
+    sock.set_nonblocking(true)?;
+    let bind = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
+    sock.bind(&SocketAddr::V6(bind).into())?;
+    sock.join_multicast_v6(&MDNS_GROUP, scope_id)?;
+    sock.set_multicast_if_v6(scope_id)?;
+    sock.set_multicast_hops_v6(255)?;
+    UdpSocket::from_std(sock.into())
 }
 
 fn is_link_local(a: &Ipv6Addr) -> bool {
@@ -160,7 +216,7 @@ fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
     for (name, qtype) in questions {
         push_name(&mut out, name);
         out.extend_from_slice(&qtype.to_be_bytes());
-        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&QU_CLASS_IN.to_be_bytes());
     }
     out
 }
@@ -504,9 +560,7 @@ pub async fn resolve_operational(
 ) -> Result<ResolvedNode, DnssdError> {
     let instance = operational_instance(compressed_fabric_id, node_id);
     let service = format!("{instance}._matter._tcp.local");
-    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
-        .await
-        .map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
     let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
 
     let mut srv: Option<(u16, String)> = None;
@@ -1073,6 +1127,253 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
     Some(c)
 }
 
+/// キャッシュ上限（偽装 flood でメモリを伸ばさない — MAX_INSTANCES と同思想）。
+const MAX_CACHE: usize = 256;
+
+#[derive(Debug)]
+struct CacheEntry {
+    node: ResolvedNode,
+    expiry: Instant,
+}
+
+#[derive(Debug)]
+struct CacheInner {
+    map: StdMutex<HashMap<String, CacheEntry>>,
+    query_tx: mpsc::UnboundedSender<String>,
+}
+
+/// matd 常駐 mDNS キャッシュのハンドル。listener タスク（[`run_operational_cache`]）
+/// と `CachingResolver` が `Arc` で共有する。設計ルール4: `mat` 一発は使わない
+/// （matd 専用）。`Clone` は内部 `Arc` の複製。
+#[derive(Clone, Debug)]
+pub struct OperationalCache {
+    inner: std::sync::Arc<CacheInner>,
+}
+
+impl OperationalCache {
+    /// ハンドルと、listener が読む provoke-request 受信端を返す。
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                inner: std::sync::Arc::new(CacheInner {
+                    map: StdMutex::new(HashMap::new()),
+                    query_tx: tx,
+                }),
+            },
+            rx,
+        )
+    }
+
+    /// 鮮度のあるエントリのみ返す（期限切れ/不在は None）。キーは ASCII 小文字
+    /// 正規化して照合する（`resolve_operational` の `eq_ignore_ascii_case` と
+    /// 同規律 — 最終レビュー #2）。listener が insert する生の `r.name` と
+    /// `CachingResolver` が渡す `operational_instance()`（大文字16進）の大小差
+    /// で恒久ミスにならないようにする。
+    pub fn get(&self, instance: &str) -> Option<ResolvedNode> {
+        let key = instance.to_ascii_lowercase();
+        let map = self.inner.map.lock().expect("opcache mutex");
+        map.get(&key)
+            .filter(|e| Instant::now() < e.expiry)
+            .map(|e| e.node.clone())
+    }
+
+    /// listener に instance の provoke クエリ送信を依頼する（listener 不在でも無害）。
+    /// ここは正規化しない: provoke クエリはワイヤに出す質問名で、mDNS は
+    /// ワイヤ上では大小文字非依存（呼び出し元の形のまま送って構わない）。
+    pub fn request(&self, instance: String) {
+        let _ = self.inner.query_tx.send(instance);
+    }
+
+    /// listener が呼ぶ: エントリを入れて期限を更新する。上限超過時、新規キーは
+    /// 挿入しない（既存キーの更新は常に許可＝鮮度維持を止めない）。キーは
+    /// `get` と同じく ASCII 小文字正規化して格納する（最終レビュー #2）。
+    pub fn insert(&self, instance: String, node: ResolvedNode, ttl: Duration) {
+        let key = instance.to_ascii_lowercase();
+        let mut map = self.inner.map.lock().expect("opcache mutex");
+        if !map.contains_key(&key) && map.len() >= MAX_CACHE {
+            return;
+        }
+        map.insert(
+            key,
+            CacheEntry {
+                node,
+                expiry: Instant::now() + ttl,
+            },
+        );
+    }
+}
+
+/// operational instance を _matter._tcp のサービス名で判定する接尾辞。
+const OPERATIONAL_SUFFIX: &str = "._matter._tcp.local";
+
+/// 各マップの「異なるキー」件数の上限（偽装 flood でメモリを伸ばさない —
+/// MAX_INSTANCES/MAX_CACHE と同思想）。既存キーの更新は常に許可する（鮮度
+/// 維持を止めない）ので、新規キーだけがこの上限で弾かれる。
+const MAX_FOLD_ENTRIES: usize = 256;
+/// ホスト 1 件あたりの AAAA 保持上限（dedup 済み）。旧実装のグローバル 64
+/// プール（`MAX_BROWSE_AAAA`）は満杯になると新規ホストを一切学習できず恒久
+/// Unreachable を招いた（最終レビュー #1a）。per-host にすることでホスト数
+/// が MAX_FOLD_ENTRIES 未満である限り starve しない。
+const MAX_ADDRS_PER_HOST: usize = 8;
+
+/// 常駐 mDNS listener（[`run_operational_cache`]）がプロセス寿命で保持する、
+/// 有界・自己更新型の operational レコード蓄積。旧実装（[`InstAcc`] 相当を
+/// 1個の HashMap + 1個のグローバル共有 `aaaa: Vec` に貯める設計）には2つの
+/// 欠陥があった（最終レビュー #1）:
+/// (a) 共有 AAAA プールが `MAX_BROWSE_AAAA`(64) で頭打ちになり、以後どんな
+///     新規/再アドレス化ノードも AAAA を学習できず恒久 Unreachable になる。
+/// (b) 完成 instance を「毎 datagram、蓄積された全部」を re-insert していた
+///     ため、広告をやめた（goodbye 無し）ノードでも無関係な multicast が
+///     expiry を延命し続け、TTL/goodbye 失効が機能しなかった。
+///
+/// この構造体はキーを全て ASCII 小文字化して保持し（大小文字非依存）、
+/// [`fold_operational_into_cache`] が「当該 datagram に現れた instance のみ」
+/// を touched として cache insert することで (b) を解消し、AAAA を
+/// host→addrs の per-host プールにすることで (a) を解消する。
+#[derive(Default)]
+struct OperationalFold {
+    /// instance_lower → (port, target_lower, ttl)。
+    srv: HashMap<String, (u16, String, u32)>,
+    /// instance_lower → TXT 文字列群。
+    txt: HashMap<String, Vec<Vec<u8>>>,
+    /// host_lower(SRV target) → アドレス群（dedup、[`MAX_ADDRS_PER_HOST`] で
+    /// 頭打ち）。
+    addrs: HashMap<String, Vec<Ipv6Addr>>,
+}
+
+/// `records`（1 データグラム分）を `fold` へ畳み込み、その datagram に現れた
+/// instance のうち SRV + 一致 AAAA が揃っているものだけを `cache` へ insert
+/// する（TTL は SRV レコード値を尊重）。commissionable (`_matterc._udp`) など
+/// operational でない名前は無視する。
+///
+/// SRV が先の datagram、AAAA が後の datagram で届く分割到着でも、AAAA 到着時
+/// に `fold.srv` の target と一致する既知 instance を touched にする（この
+/// target→touched 走査がクロス datagram 完成を保つ）。だが「当該 datagram に
+/// 一切登場しない instance」は re-insert しない — 立ち去ったノードの expiry
+/// が無関係な multicast で延命されるのを防ぐ。
+fn fold_operational_into_cache(
+    records: &[Record],
+    fold: &mut OperationalFold,
+    cache: &OperationalCache,
+) {
+    let mut touched: HashSet<String> = HashSet::new();
+
+    for r in records {
+        match &r.rdata {
+            RData::Srv { port, target } if r.name.ends_with(OPERATIONAL_SUFFIX) => {
+                let inst = r.name.to_ascii_lowercase();
+                let is_new = !fold.srv.contains_key(&inst);
+                if is_new && fold.srv.len() >= MAX_FOLD_ENTRIES {
+                    continue;
+                }
+                fold.srv
+                    .insert(inst.clone(), (*port, target.to_ascii_lowercase(), r.ttl));
+                touched.insert(inst);
+            }
+            RData::Txt(strings) if r.name.ends_with(OPERATIONAL_SUFFIX) => {
+                let inst = r.name.to_ascii_lowercase();
+                let is_new = !fold.txt.contains_key(&inst);
+                if is_new && fold.txt.len() >= MAX_FOLD_ENTRIES {
+                    continue;
+                }
+                fold.txt.insert(inst.clone(), strings.clone());
+                touched.insert(inst);
+            }
+            RData::Aaaa(addr) => {
+                let host = r.name.to_ascii_lowercase();
+                let is_new_host = !fold.addrs.contains_key(&host);
+                if !(is_new_host && fold.addrs.len() >= MAX_FOLD_ENTRIES) {
+                    let list = fold.addrs.entry(host.clone()).or_default();
+                    if list.len() < MAX_ADDRS_PER_HOST && !list.contains(addr) {
+                        list.push(*addr);
+                    }
+                }
+                // この host を SRV target に持つ既知 instance を touched に。
+                // これがクロス datagram 完成（SRV が先、AAAA が後）を支える。
+                for (inst, (_, target, _)) in &fold.srv {
+                    if target.eq_ignore_ascii_case(&host) {
+                        touched.insert(inst.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for inst in touched {
+        let Some((port, target, ttl)) = fold.srv.get(&inst) else {
+            continue;
+        };
+        let Some(addrs) = fold.addrs.get(target) else {
+            continue;
+        };
+        if addrs.is_empty() {
+            continue;
+        }
+        let mut addresses = addrs.clone();
+        addresses.sort_by_key(is_link_local);
+        let txt = fold.txt.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
+        let node = ResolvedNode {
+            port: *port,
+            addresses,
+            session_idle_interval_ms: txt_u32(txt, "SII"),
+            session_active_interval_ms: txt_u32(txt, "SAI"),
+        };
+        // TTL 0（goodbye）は即時失効相当なので短く。通常は広告 TTL を尊重。
+        cache.insert(inst.clone(), node, Duration::from_secs(u64::from(*ttl)));
+    }
+}
+
+/// operational レコードを常駐で受信・畳み込みキャッシュを温める。matd が起動時に
+/// spawn する。provoke リクエスト受信時はその instance の SRV+TXT クエリを送出。
+/// I/O エラー・パース失敗では落とさず継続する（listener はプロセス寿命）。
+async fn run_operational_cache(
+    sock: UdpSocket,
+    cache: OperationalCache,
+    mut requests: mpsc::UnboundedReceiver<String>,
+    scope_id: u32,
+) {
+    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let mut fold = OperationalFold::default();
+    // browse と同様、複数 instance の additional 同梱に備え広めに取る。
+    let mut buf = vec![0u8; 9000];
+    loop {
+        tokio::select! {
+            recv = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = recv else { continue; };
+                let Ok(records) = parse_message(&buf[..n]) else { continue; };
+                fold_operational_into_cache(&records, &mut fold, &cache);
+            }
+            req = requests.recv() => {
+                match req {
+                    // instance は "<CFID>-<NodeId>._matter._tcp.local"。
+                    Some(instance) => {
+                        let q = encode_query(0, &[(instance.as_str(), TYPE_SRV), (instance.as_str(), TYPE_TXT)]);
+                        let _ = sock.send_to(&q, dest).await;
+                    }
+                    // 全 sender が drop（= 実質プロセス終了時のみ）。
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+/// matd 用: mDNS socket を bind し常駐 cache タスクを spawn する。bind 失敗は
+/// `Err`（matd は OneShotResolver に degrade する）。tokio ランタイム内で呼ぶこと。
+pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCache> {
+    let sock = bind_mdns_socket(scope_id)?;
+    let (cache, requests) = OperationalCache::new();
+    tokio::spawn(run_operational_cache(
+        sock,
+        cache.clone(),
+        requests,
+        scope_id,
+    ));
+    Ok(cache)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,9 +1401,36 @@ mod tests {
             [
                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, // header: id 0, 1 question
                 1, b'a', 5, b'l', b'o', b'c', b'a', b'l', 0, // qname a.local
-                0, 33, 0, 1, // SRV, IN
+                0, 33, 0x80, 1, // SRV, QU|IN (unicast-response bit set)
             ]
         );
+    }
+
+    /// 全 question で QU（unicast-response）ビットが立つこと（qclass 最上位
+    /// 0x8000）。これが無いと、応答者（実機 OTBR mDNS proxy）が QM クエリに
+    /// マルチキャストで返し、ephemeral ソケットの一発 resolver が受信できず
+    /// timeout する回帰を招く（2026-07-19 実機 tcpdump で確定）。
+    #[test]
+    fn every_question_sets_qu_unicast_response_bit() {
+        let q = encode_query(0, &[("a.local", TYPE_SRV), ("a.local", TYPE_TXT)]);
+        // qclass は各 question の末尾 2 バイト。名前 "a.local" は 9 バイト
+        // (1+1 + 1+5 + 1)、それに qtype(2)+qclass(2) が続く。
+        // 先頭 12(ヘッダ) の後: [name9][SRV 2][qclass 2][name9][TXT 2][qclass 2]
+        let first_qclass = u16::from_be_bytes([q[12 + 9 + 2], q[12 + 9 + 3]]);
+        let second_qclass = u16::from_be_bytes([q[12 + 9 + 4 + 9 + 2], q[12 + 9 + 4 + 9 + 3]]);
+        assert_eq!(
+            first_qclass & 0x8000,
+            0x8000,
+            "SRV question must set QU bit"
+        );
+        assert_eq!(
+            second_qclass & 0x8000,
+            0x8000,
+            "TXT question must set QU bit"
+        );
+        // 下位 15 ビットは通常の IN クラスのまま。
+        assert_eq!(first_qclass & 0x7fff, CLASS_IN);
+        assert_eq!(second_qclass & 0x7fff, CLASS_IN);
     }
 
     /// SRV + TXT + AAAA を 1 メッセージに合成。AAAA のレコード名は SRV rdata
@@ -1148,6 +1476,59 @@ mod tests {
         m.extend_from_slice(&16u16.to_be_bytes());
         m.extend_from_slice(&addr.octets());
         m
+    }
+
+    #[test]
+    fn fold_operational_populates_cache_from_one_message() {
+        let (cache, _rx) = OperationalCache::new();
+        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        // operational instance の完成応答（SRV+TXT+AAAA を 1 メッセージに）。
+        let msg = synth_response(
+            "AB7DE08802E0CD54-0000000000000005._matter._tcp.local",
+            "12B41A22758B788A.local",
+            5540,
+            &["SII=5000", "SAI=300", "T=0"],
+            addr,
+        );
+        let records = parse_message(&msg).unwrap();
+        let mut fold = OperationalFold::default();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+
+        let node = cache
+            .get("AB7DE08802E0CD54-0000000000000005._matter._tcp.local")
+            .expect("operational instance should be cached");
+        assert_eq!(node.port, 5540);
+        assert_eq!(node.addresses, vec![addr]);
+        assert_eq!(node.session_idle_interval_ms, Some(5000));
+    }
+
+    #[test]
+    fn fold_operational_ignores_non_matter_and_incomplete() {
+        let (cache, _rx) = OperationalCache::new();
+        // commissionable(_matterc._udp) は operational ではないので無視。
+        let msg = synth_commissionable_response(
+            "_L3840._sub._matterc._udp.local",
+            "ABCD1234._matterc._udp.local",
+            "dev.local",
+            5540,
+            &["D=3840"],
+            "fd00::1".parse().unwrap(),
+        );
+        let records = parse_message(&msg).unwrap();
+        let mut fold = OperationalFold::default();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+        assert!(cache.get("ABCD1234._matterc._udp.local").is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_operational_cache_binds_on_loopback() {
+        // lo の ifindex。取得できない CI もあるため取得可否で分岐。
+        let Ok(scope) = iface_index("lo") else {
+            return; // lo が無い環境ではスキップ（bind の型検証は他テストで担保）。
+        };
+        // 二重 bind（REUSEADDR）で失敗しないこと＝常駐 socket が確立できる。
+        let a = spawn_operational_cache(scope);
+        assert!(a.is_ok(), "operational cache should bind on lo: {a:?}");
     }
 
     /// commissionable browse 用の合成応答: PTR(subtype→instance) +
@@ -1815,5 +2196,215 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 60);
+    }
+
+    fn sample_node(port: u16) -> ResolvedNode {
+        ResolvedNode {
+            port,
+            addresses: vec!["fd00::1".parse().unwrap()],
+            session_idle_interval_ms: Some(5000),
+            session_active_interval_ms: Some(300),
+        }
+    }
+
+    #[test]
+    fn opcache_insert_get_and_expiry() {
+        let (cache, _rx) = OperationalCache::new();
+        let inst = "AABB-0005._matter._tcp.local".to_string();
+        cache.insert(inst.clone(), sample_node(5540), Duration::from_secs(60));
+        assert_eq!(cache.get(&inst).map(|n| n.port), Some(5540));
+        assert!(cache.get("nope._matter._tcp.local").is_none());
+        // 期限切れは None。
+        cache.insert(inst.clone(), sample_node(5540), Duration::from_millis(0));
+        assert!(cache.get(&inst).is_none());
+    }
+
+    #[test]
+    fn opcache_caps_new_instances_but_updates_existing() {
+        let (cache, _rx) = OperationalCache::new();
+        for i in 0..MAX_CACHE {
+            cache.insert(
+                format!("i{i}._matter._tcp.local"),
+                sample_node(1),
+                Duration::from_secs(60),
+            );
+        }
+        // 上限到達後の新規は無視。
+        cache.insert(
+            "overflow._matter._tcp.local".into(),
+            sample_node(1),
+            Duration::from_secs(60),
+        );
+        assert!(cache.get("overflow._matter._tcp.local").is_none());
+        // 既存キーの更新は上限後も許可。
+        cache.insert(
+            "i0._matter._tcp.local".into(),
+            sample_node(9999),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache.get("i0._matter._tcp.local").map(|n| n.port),
+            Some(9999)
+        );
+    }
+
+    #[test]
+    fn opcache_request_does_not_panic_and_is_received() {
+        let (cache, mut rx) = OperationalCache::new();
+        cache.request("x._matter._tcp.local".into());
+        assert_eq!(rx.try_recv().unwrap(), "x._matter._tcp.local");
+    }
+
+    /// `resolve_operational` の `eq_ignore_ascii_case` 規律とキャッシュを揃える
+    /// (最終レビュー #2)。listener はワイヤ上の生の `r.name`（大小混在し得る）
+    /// を insert し、`CachingResolver` は `operational_instance()`（大文字16進）
+    /// で get する — 正規化しないと非大文字hex広告者で恒久ミスになる。
+    #[test]
+    fn opcache_get_is_case_insensitive() {
+        let (cache, _rx) = OperationalCache::new();
+        let lower = "ab7de08802e0cd54-0000000000000005._matter._tcp.local".to_string();
+        cache.insert(lower, sample_node(5540), Duration::from_secs(60));
+        let upper = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        assert_eq!(cache.get(upper).map(|n| n.port), Some(5540));
+    }
+
+    /// SRV+TXT が 1 データグラム、AAAA が別データグラムで届いても、後段の
+    /// AAAA 到着時に target 一致で touched になり完成する (最終レビュー #1,
+    /// step 4 の target→touched 走査)。
+    fn synth_srv_txt_only(service: &str, target: &str, port: u16, txt: &[&str]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]); // qd 0, an 2 (SRV+TXT)
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl 120
+        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
+        rdata.extend_from_slice(&port.to_be_bytes());
+        let mut tname = Vec::new();
+        push_name(&mut tname, target);
+        rdata.extend_from_slice(&tname);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        push_name(&mut m, service);
+        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        let mut rdata = Vec::new();
+        for s in txt {
+            rdata.push(s.len() as u8);
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        m
+    }
+
+    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // qd 0, an 1
+        push_name(&mut m, name);
+        m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        m.extend_from_slice(&[0x80, 0x01]); // cache-flush|IN
+        m.extend_from_slice(&ttl.to_be_bytes());
+        m.extend_from_slice(&16u16.to_be_bytes());
+        m.extend_from_slice(&addr.octets());
+        m
+    }
+
+    #[test]
+    fn fold_cross_datagram_srv_then_aaaa_completes() {
+        let (cache, _rx) = OperationalCache::new();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "12b41a22758b788a.local";
+        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        let mut fold = OperationalFold::default();
+
+        let msg1 = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        let records1 = parse_message(&msg1).unwrap();
+        fold_operational_into_cache(&records1, &mut fold, &cache);
+        assert!(
+            cache.get(service).is_none(),
+            "SRV without AAAA must not cache yet"
+        );
+
+        let msg2 = synth_aaaa_only(target, 120, addr);
+        let records2 = parse_message(&msg2).unwrap();
+        fold_operational_into_cache(&records2, &mut fold, &cache);
+
+        let node = cache
+            .get(service)
+            .expect("should complete once the AAAA for the SRV target arrives");
+        assert_eq!(node.port, 5540);
+        assert_eq!(node.addresses, vec![addr]);
+        assert_eq!(node.session_idle_interval_ms, Some(5000));
+    }
+
+    /// 旧実装は AAAA プールが `MAX_BROWSE_AAAA`(64) グローバル共有だったため、
+    /// 65 個目以降の新規ホストは学習不能で恒久 Unreachable になった
+    /// (最終レビュー #1a)。per-host 方式ならホスト数が MAX_FOLD_ENTRIES(256)
+    /// 未満である限り starve しない。
+    #[test]
+    fn fold_no_global_aaaa_starvation() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let mut last_addr = Ipv6Addr::UNSPECIFIED;
+        for i in 0..70u32 {
+            let host = format!("host{i}.local");
+            let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i as u16);
+            last_addr = addr;
+            let msg = synth_aaaa_only(&host, 120, addr);
+            let records = parse_message(&msg).unwrap();
+            fold_operational_into_cache(&records, &mut fold, &cache);
+        }
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "host69.local"; // 70 番目 (旧 64 上限を上回る)
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        let records = parse_message(&msg).unwrap();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+
+        let node = cache
+            .get(service)
+            .expect("the 70th distinct host's AAAA must not be starved by a global cap");
+        assert_eq!(node.addresses, vec![last_addr]);
+    }
+
+    /// 立ち去ったノード(A)の完成後、A に触れない無関係な datagram を挟んでも
+    /// A の expiry は延命されない — TTL(120s)通り +120s で失効する
+    /// (最終レビュー #1b)。旧実装は fold 内の全累積 instance を毎 datagram
+    /// 再 insert していたため、無関係な multicast が expiry を延命し続け、
+    /// goodbye/TTL 失効が事実上機能しなかった。
+    #[tokio::test(start_paused = true)]
+    async fn fold_departed_instance_expires_and_is_not_refreshed() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service_a = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target_a = "hosta.local";
+        let addr_a: Ipv6Addr = "fd54:4b81:8cce:1::a".parse().unwrap();
+
+        let msg_a = synth_response(service_a, target_a, 5540, &["SII=5000"], addr_a);
+        let records_a = parse_message(&msg_a).unwrap();
+        fold_operational_into_cache(&records_a, &mut fold, &cache);
+        assert!(
+            cache.get(service_a).is_some(),
+            "A should be cached initially"
+        );
+
+        tokio::time::advance(Duration::from_secs(119)).await;
+        assert!(
+            cache.get(service_a).is_some(),
+            "A should still be fresh at +119s (ttl=120s)"
+        );
+
+        // 無関係な datagram: A に一切触れない (別ホストの AAAA のみ)。
+        let addr_b: Ipv6Addr = "fd54:4b81:8cce:1::b".parse().unwrap();
+        let msg_unrelated = synth_aaaa_only("unrelated.local", 120, addr_b);
+        let records_unrelated = parse_message(&msg_unrelated).unwrap();
+        fold_operational_into_cache(&records_unrelated, &mut fold, &cache);
+
+        tokio::time::advance(Duration::from_secs(2)).await; // 合計 +121s
+        assert!(
+            cache.get(service_a).is_none(),
+            "departed A must expire, not be refreshed by unrelated multicast"
+        );
     }
 }

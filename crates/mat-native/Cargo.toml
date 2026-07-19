@@ -26,3 +26,5 @@ base64ct = { version = "1", features = ["alloc"], optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 base64ct = { version = "1", features = ["alloc"] }
+# start_paused=true（CachingResolver の 35s/500ms poll テスト、Task 5）に必須。
+tokio = { version = "1", features = ["test-util"] }
