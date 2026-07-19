@@ -252,6 +252,15 @@ impl Engine {
     /// KVS から資格情報を1回読み、NOC を自己発行し、UDP transport を bind、
     /// iface の scope_id を解決して実確立器を構築する。プロセス寿命で不変。
     pub async fn build(cfg: &NativeConfig) -> Result<Self, MatError> {
+        Self::build_with_resolver(cfg, Arc::new(OneShotResolver)).await
+    }
+
+    /// [`build`] と同じだが、establish の mDNS 解決に使う [`Resolver`] を注入する
+    /// （matd が `CachingResolver` を渡す。`mat` 一発は `build` の OneShotResolver）。
+    pub async fn build_with_resolver(
+        cfg: &NativeConfig,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self, MatError> {
         let alpha_ini = cfg.store.join("chip_tool_config.alpha.ini");
         let main_ini = cfg.store.join("chip_tool_config.ini");
         let materials = mat_controller::kvs::read_self_issue_materials(
@@ -310,7 +319,7 @@ impl Engine {
             creds: Arc::new(creds),
             transport: Arc::new(Transport::Udp(Arc::clone(&transport))),
             scope_id,
-            resolver: Arc::new(OneShotResolver),
+            resolver,
         };
         Ok(Self {
             establisher: Box::new(establisher),

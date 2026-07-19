@@ -22,7 +22,7 @@ use mat_controller::im::{
 use mat_core::error::{ErrorKind, MatError};
 
 pub use mat_native::group::{GroupCtx, GroupOutcome};
-pub use mat_native::{Establisher, NativeConfig, NodeConn};
+pub use mat_native::{Establisher, NativeConfig, NodeConn, Resolver};
 
 #[cfg(test)]
 pub(crate) use mat_native::test_support;
@@ -52,6 +52,16 @@ impl NativeBackend {
     /// iface の scope_id を解決して実確立器を構築する。プロセス寿命で不変。
     pub async fn build(cfg: &NativeConfig) -> Result<Self, MatError> {
         Ok(Self::from_engine(mat_native::Engine::build(cfg).await?))
+    }
+
+    /// [`build`] と同じだが Resolver を注入する（matd が CachingResolver を渡す）。
+    pub async fn build_with_resolver(
+        cfg: &NativeConfig,
+        resolver: std::sync::Arc<dyn mat_native::Resolver>,
+    ) -> Result<Self, MatError> {
+        Ok(Self::from_engine(
+            mat_native::Engine::build_with_resolver(cfg, resolver).await?,
+        ))
     }
 
     fn from_engine(engine: mat_native::Engine) -> Self {
@@ -425,5 +435,22 @@ mod tests {
     fn group_settings_ctx_is_none_without_injection() {
         let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         assert!(backend.group_settings_ctx().is_none());
+    }
+
+    #[tokio::test]
+    async fn build_with_resolver_accepts_caching_resolver() {
+        // 実 KVS が無いので build 自体は Err になるが、CachingResolver を
+        // Arc<dyn Resolver> として渡せる（型・API の結線）ことを確認する。
+        let (cache, _rx) = mat_controller::dnssd::OperationalCache::new();
+        let resolver: std::sync::Arc<dyn mat_native::Resolver> =
+            std::sync::Arc::new(mat_native::CachingResolver::new(cache));
+        let cfg = NativeConfig {
+            store: std::path::PathBuf::from("/nonexistent"),
+            iface: "lo".into(),
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        let r = NativeBackend::build_with_resolver(&cfg, resolver).await;
+        assert!(r.is_err()); // KVS 不在で store_missing。型結線が通ることが要点。
     }
 }
