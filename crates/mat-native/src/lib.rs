@@ -612,7 +612,12 @@ mod tests {
     async fn oneshot_resolver_times_out_without_responder() {
         // 応答者のいない iface で resolve すると Timeout（委譲先
         // resolve_operational の契約）。無応答→Timeout は不変。
-        let scope = multicast_capable_iface_index().unwrap_or(1);
+        let Some(scope) = multicast_capable_iface_index() else {
+            eprintln!(
+                "skipping oneshot_resolver test: no eligible multicast-capable IPv6 interface"
+            );
+            return;
+        };
         let r = OneShotResolver;
         let out = r
             .resolve(scope, [0u8; 8], 5, std::time::Duration::from_millis(300))
