@@ -1130,11 +1130,13 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
 /// キャッシュ上限（偽装 flood でメモリを伸ばさない — MAX_INSTANCES と同思想）。
 const MAX_CACHE: usize = 256;
 
+#[derive(Debug)]
 struct CacheEntry {
     node: ResolvedNode,
     expiry: Instant,
 }
 
+#[derive(Debug)]
 struct CacheInner {
     map: StdMutex<HashMap<String, CacheEntry>>,
     query_tx: mpsc::UnboundedSender<String>,
@@ -1143,7 +1145,7 @@ struct CacheInner {
 /// matd 常駐 mDNS キャッシュのハンドル。listener タスク（[`run_operational_cache`]）
 /// と `CachingResolver` が `Arc` で共有する。設計ルール4: `mat` 一発は使わない
 /// （matd 専用）。`Clone` は内部 `Arc` の複製。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OperationalCache {
     inner: std::sync::Arc<CacheInner>,
 }
@@ -1191,6 +1193,142 @@ impl OperationalCache {
             },
         );
     }
+}
+
+/// operational instance を _matter._tcp のサービス名で判定する接尾辞。
+const OPERATIONAL_SUFFIX: &str = "._matter._tcp.local";
+
+struct InstAcc {
+    srv: Option<(u16, String)>,
+    txt: Option<Vec<Vec<u8>>>,
+    /// SRV レコードの TTL（秒）。エントリ expiry の基準。
+    srv_ttl: u32,
+}
+
+/// 複数データグラムにまたがる operational レコードの畳み込み状態。listener が
+/// データグラムごとに [`fold_operational_into_cache`] へ食わせる。
+#[derive(Default)]
+struct OperationalFold {
+    /// instance 完全名 → 蓄積。
+    instances: HashMap<String, InstAcc>,
+    /// hostname(SRV target) → AAAA プール。instance 横断で共有し完成時に引く。
+    aaaa: Vec<(String, Ipv6Addr)>,
+}
+
+/// `records` を畳み込み、SRV + 一致 AAAA が揃った operational instance を
+/// `cache` に insert する（TTL は SRV レコード値を尊重）。commissionable
+/// (`_matterc._udp`) など operational でない名前は無視する。
+fn fold_operational_into_cache(
+    records: &[Record],
+    fold: &mut OperationalFold,
+    cache: &OperationalCache,
+) {
+    for r in records {
+        match &r.rdata {
+            RData::Srv { port, target } if r.name.ends_with(OPERATIONAL_SUFFIX) => {
+                let acc = fold.instances.entry(r.name.clone()).or_insert(InstAcc {
+                    srv: None,
+                    txt: None,
+                    srv_ttl: 0,
+                });
+                acc.srv = Some((*port, target.clone()));
+                acc.srv_ttl = r.ttl;
+            }
+            RData::Txt(strings) if r.name.ends_with(OPERATIONAL_SUFFIX) => {
+                let acc = fold.instances.entry(r.name.clone()).or_insert(InstAcc {
+                    srv: None,
+                    txt: None,
+                    srv_ttl: 0,
+                });
+                acc.txt = Some(strings.clone());
+            }
+            RData::Aaaa(addr)
+                if !fold
+                    .aaaa
+                    .iter()
+                    .any(|(n, a)| a == addr && n.eq_ignore_ascii_case(&r.name))
+                    && fold.aaaa.len() < MAX_BROWSE_AAAA =>
+            {
+                fold.aaaa.push((r.name.clone(), *addr));
+            }
+            _ => {}
+        }
+    }
+    // 完成した instance を cache へ。
+    for (instance, acc) in &fold.instances {
+        let Some((port, target)) = &acc.srv else {
+            continue;
+        };
+        let mut addresses: Vec<Ipv6Addr> = Vec::new();
+        for (n, a) in &fold.aaaa {
+            if n.eq_ignore_ascii_case(target) && !addresses.contains(a) {
+                addresses.push(*a);
+            }
+        }
+        if addresses.is_empty() {
+            continue;
+        }
+        addresses.sort_by_key(is_link_local);
+        let strings: &[Vec<u8>] = acc.txt.as_deref().unwrap_or(&[]);
+        let node = ResolvedNode {
+            port: *port,
+            addresses,
+            session_idle_interval_ms: txt_u32(strings, "SII"),
+            session_active_interval_ms: txt_u32(strings, "SAI"),
+        };
+        // TTL 0（goodbye）は即時失効相当なので短く。通常は広告 TTL を尊重。
+        let ttl = Duration::from_secs(u64::from(acc.srv_ttl));
+        cache.insert(instance.clone(), node, ttl);
+    }
+}
+
+/// operational レコードを常駐で受信・畳み込みキャッシュを温める。matd が起動時に
+/// spawn する。provoke リクエスト受信時はその instance の SRV+TXT クエリを送出。
+/// I/O エラー・パース失敗では落とさず継続する（listener はプロセス寿命）。
+async fn run_operational_cache(
+    sock: UdpSocket,
+    cache: OperationalCache,
+    mut requests: mpsc::UnboundedReceiver<String>,
+    scope_id: u32,
+) {
+    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let mut fold = OperationalFold::default();
+    // browse と同様、複数 instance の additional 同梱に備え広めに取る。
+    let mut buf = vec![0u8; 9000];
+    loop {
+        tokio::select! {
+            recv = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = recv else { continue; };
+                let Ok(records) = parse_message(&buf[..n]) else { continue; };
+                fold_operational_into_cache(&records, &mut fold, &cache);
+            }
+            req = requests.recv() => {
+                match req {
+                    // instance は "<CFID>-<NodeId>._matter._tcp.local"。
+                    Some(instance) => {
+                        let q = encode_query(0, &[(instance.as_str(), TYPE_SRV), (instance.as_str(), TYPE_TXT)]);
+                        let _ = sock.send_to(&q, dest).await;
+                    }
+                    // 全 sender が drop（= 実質プロセス終了時のみ）。
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+/// matd 用: mDNS socket を bind し常駐 cache タスクを spawn する。bind 失敗は
+/// `Err`（matd は OneShotResolver に degrade する）。tokio ランタイム内で呼ぶこと。
+pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCache> {
+    let sock = bind_mdns_socket(scope_id)?;
+    let (cache, requests) = OperationalCache::new();
+    tokio::spawn(run_operational_cache(
+        sock,
+        cache.clone(),
+        requests,
+        scope_id,
+    ));
+    Ok(cache)
 }
 
 #[cfg(test)]
@@ -1295,6 +1433,59 @@ mod tests {
         m.extend_from_slice(&16u16.to_be_bytes());
         m.extend_from_slice(&addr.octets());
         m
+    }
+
+    #[test]
+    fn fold_operational_populates_cache_from_one_message() {
+        let (cache, _rx) = OperationalCache::new();
+        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        // operational instance の完成応答（SRV+TXT+AAAA を 1 メッセージに）。
+        let msg = synth_response(
+            "AB7DE08802E0CD54-0000000000000005._matter._tcp.local",
+            "12B41A22758B788A.local",
+            5540,
+            &["SII=5000", "SAI=300", "T=0"],
+            addr,
+        );
+        let records = parse_message(&msg).unwrap();
+        let mut fold = OperationalFold::default();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+
+        let node = cache
+            .get("AB7DE08802E0CD54-0000000000000005._matter._tcp.local")
+            .expect("operational instance should be cached");
+        assert_eq!(node.port, 5540);
+        assert_eq!(node.addresses, vec![addr]);
+        assert_eq!(node.session_idle_interval_ms, Some(5000));
+    }
+
+    #[test]
+    fn fold_operational_ignores_non_matter_and_incomplete() {
+        let (cache, _rx) = OperationalCache::new();
+        // commissionable(_matterc._udp) は operational ではないので無視。
+        let msg = synth_commissionable_response(
+            "_L3840._sub._matterc._udp.local",
+            "ABCD1234._matterc._udp.local",
+            "dev.local",
+            5540,
+            &["D=3840"],
+            "fd00::1".parse().unwrap(),
+        );
+        let records = parse_message(&msg).unwrap();
+        let mut fold = OperationalFold::default();
+        fold_operational_into_cache(&records, &mut fold, &cache);
+        assert!(cache.get("ABCD1234._matterc._udp.local").is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_operational_cache_binds_on_loopback() {
+        // lo の ifindex。取得できない CI もあるため取得可否で分岐。
+        let Ok(scope) = iface_index("lo") else {
+            return; // lo が無い環境ではスキップ（bind の型検証は他テストで担保）。
+        };
+        // 二重 bind（REUSEADDR）で失敗しないこと＝常駐 socket が確立できる。
+        let a = spawn_operational_cache(scope);
+        assert!(a.is_ok(), "operational cache should bind on lo: {a:?}");
     }
 
     /// commissionable browse 用の合成応答: PTR(subtype→instance) +
