@@ -185,7 +185,11 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         }
     };
 
-    server::serve(&socket, store_path, native)
+    // イベント配信バス。SubscriptionManager の起動結線は Task 6 — ここでは
+    // serve のシグネチャを満たす最小限（capacity は listen 用の暫定値）。
+    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(1024);
+
+    server::serve(&socket, store_path, native, events_tx)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
