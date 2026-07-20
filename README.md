@@ -21,12 +21,15 @@ Everything documented below is implemented on the native backend: discover /
 commission (on-network and BLE+Thread), first-fabric bootstrap (`fabric init`),
 state operations (read / write / invoke / describe / on / off), multi-admin
 share (`open-window`), groupcast (`group provision` / `group invoke`), the
-resident daemon `matd` (warm CASE sessions, `mat --matd`), and diagnostics
-(`diag thread` / `diag node`). It passes the fake-connection / binary
-integration tests, and real-device E2E (Phase 5 gate 1) has confirmed the full
-op sweep runs natively with no fallback. Group *delivery* is unacknowledged
-multicast by design, so per-device actuation cannot be confirmed from the
-controller side (see Groupcast below).
+resident daemon `matd` (warm CASE sessions, `mat --matd`), diagnostics
+(`diag thread` / `diag node`), and `matd`'s resident wildcard Subscribe with
+`mat listen` streaming device-originated events (matd-only, no direct
+fallback). It passes the fake-connection / binary integration tests, and
+real-device E2E (Phase 5 gate 1) has confirmed the full op sweep runs
+natively with no fallback; `mat listen`'s real-device E2E is pending a
+separate deploy session. Group *delivery* is unacknowledged multicast by
+design, so per-device actuation cannot be confirmed from the controller side
+(see Groupcast below).
 
 The development roadmap and the Phase 5 native-backend record live in
 [ARCHITECTURE.md](./ARCHITECTURE.md).
@@ -383,6 +386,58 @@ mat diag node --node 5 --deep     # also probe ping6 + native targeted mDNS
 > materials — so it is always available (the historical `cfid_unavailable` case,
 > from the old chip-tool-log-parsing path, cannot occur on the native path).
 
+### Listen (device-originated events)
+
+`mat listen` streams attribute-change events from `matd`'s resident wildcard
+Subscribe (occupancy sensors, open/close, temperature/humidity, on-off, ...) —
+`mat`/`matd`'s alternative to depending on Home Assistant for these. It is
+the **first matd-only op**: there is no direct-native fallback, because a
+subscription needs a resident daemon to stay alive between calls (see
+[Routing through `matd`](#routing-through-matd)).
+
+```bash
+mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute <name>]
+           [--count <N>] [--timeout-ms <T>]
+```
+
+- Filters (`--node` / `--endpoint` / `--cluster` / `--attribute`) narrow which
+  events are delivered; omitted filters match everything. `--node` accepts a
+  node alias the same way other commands do; `--cluster` / `--attribute` are
+  chip-tool notation (never aliased), same as `read`.
+- `--count` (default `1`) is how many events to receive before exiting `0`.
+  `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
+  forever. Reaching `--count` exits `0`; the timeout firing with **zero**
+  events received exits `3` (with at least one event received, it still exits
+  `0` — same UX as `enl listen`).
+- `mat` connects to `matd`, sends the `listen` request, and prints the ack
+  line followed by one JSON event per line to stdout as they arrive:
+  ```json
+  {"timestamp":"...","listening":true}
+  {"timestamp":"2026-07-20T21:00:00+09:00","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy","value":1,"priming":false}
+  ```
+  `priming: true` marks events from the initial report burst right after
+  matd (re)establishes a subscription, so a consumer does not mistake
+  matd-restart residual state (e.g. `occupancy` still `1` from before a
+  restart) for a fresh trigger. Only **scalar** values become events —
+  `list`/`struct` attributes (ACL, server-list, etc., which show up in a
+  wildcard priming burst) are dropped, the same known limitation as generic
+  `read` (see [Scalar-only generic write / invoke](#scalar-only-generic-write--invoke)).
+- `matd` absent, refusing the connection, or dying mid-stream is
+  `matd_unavailable` (exit **13**) — see
+  [Errors and exit codes](#errors-and-exit-codes). Events already printed
+  before a mid-stream matd loss stay printed; the process still exits `13`
+  (not `3`), even if `--count` was not reached.
+- Usage form (a consumer like casa loops itself; `mat`/`matd` never run
+  automations — see [Backend](#backend) / ARCHITECTURE.md "Design rules"):
+  ```bash
+  while ev=$(mat listen --node 21 --cluster occupancysensing --count 1 --timeout-ms 0); do
+    # inspect $ev and react, e.g. mat on / mat off
+  done
+  ```
+
+See [Routing through `matd`](#routing-through-matd) for what `matd` actually
+subscribes to and how events reach it.
+
 ### Multi-admin share
 
 To share a `mat`-owned device with another controller (Alexa / Apple / Google),
@@ -609,9 +664,51 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   `invoke` / `color-temp` / `color` / `level`; `group grant` is direct only —
   see Groupcast above). `discover` / `commission` / `fabric init` /
   `open-window` / `diag` are direct-only: auto-detection skips them silently;
-  explicit `--matd` exits `2`.
+  explicit `--matd` exits `2`. `listen` (below) is the opposite case — it is
+  **matd-only**, with no direct-path fallback at all (not even auto-detect
+  skip-and-run-direct); without a reachable `matd` it is `matd_unavailable`
+  (exit `13`).
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
+
+#### Resident Subscribe and `mat listen`
+
+At startup `matd` reads the commissioned-node ledger and opens one **wildcard**
+Subscribe per node (every endpoint/cluster/attribute — the same "all-paths
+omitted" shape as a wildcard `read`), so device-originated attribute changes
+(occupancy, open/close, temperature, on-off, ...) are captured continuously,
+not just when a `mat` caller happens to be polling.
+
+- Subscribe parameters: `MinIntervalFloor = 0` (no artificial delay on
+  fast-changing sensors like occupancy), `MaxIntervalCeiling = 3600s` (favors
+  battery life on sleepy devices; the device still picks the actual interval),
+  `KeepSubscriptions = false` (a re-subscribe replaces rather than piles onto
+  the device's existing subscription table).
+- A subscription that fails to establish, or that goes silent for more than
+  **1.5× its negotiated MaxInterval** (subscription-death detection), is
+  re-subscribed with exponential backoff starting at 5s, capped at 5 minutes.
+  Retries are logged at `debug`; only the established/lost state transitions
+  are logged at `info` — a flaky Thread node re-subscribing every few seconds
+  does not spam the log.
+- Events fan out from each subscription's report pump through one
+  `tokio::sync::broadcast` channel to every connected `mat listen` client,
+  filtered per client. A listener that falls behind and misses events on the
+  channel gets a single `{"error":{"kind":"other","detail":"event stream
+  lagged"}}` line and is then disconnected — never silently dropped events.
+- `matd` holds **no** event history (no ring buffer, no replay): a `mat
+  listen` client only sees events emitted while it is connected, same as
+  `enl listen`. `priming` (see [Listen](#listen-device-originated-events))
+  is the mechanism for telling initial-state reports apart from later
+  changes without needing a replay log.
+- `listen` is the **only** op that breaks the "one line request = one line
+  response" rule of the `matd` socket protocol: it replies with one ack line
+  (`{"timestamp":...,"listening":true}`), then keeps the connection open and
+  streams matching event lines until the client disconnects.
+- v1 scope is attribute reports only. Not yet implemented (tracked as
+  future work): EventReport delivery (buttons / Generic Switch), a
+  `DataVersionFilter`, LIT ICD check-in registration, and a
+  `<store>/subscriptions.toml` to narrow which nodes/paths get subscribed
+  (today it is always all commissioned nodes).
 
 ### Native backend internals
 
@@ -826,6 +923,7 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 4 | device rejected |
 | 5 | unreachable / network |
 | 6 | CASE session establishment failed |
+| 13 | `matd` absent / unreachable (`mat listen` only) |
 | 1 | other |
 
 The native backend maps its own transport/IM outcomes onto `3` / `4` / `5` /
@@ -852,6 +950,12 @@ is `unreachable` (exit `5`).
   (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
   names a cluster / attribute / command the generated table does not know (pass
   the numeric id instead).
+- `matd_unavailable` (exit 13) — `mat listen` only. `matd` was not reachable at
+  all (no socket, connection refused, `MAT_MATD=0`), or the connection was cut
+  partway through the event stream. `mat listen` has no direct-path fallback
+  (subscriptions need a resident daemon), so this is the sole failure mode for
+  reaching `matd` — distinct from `timeout` (exit 3), which `mat listen` uses
+  only for "connected fine, zero events arrived before `--timeout-ms`."
 - `other` — anything else (exit 1); also what a `group provision` KVS write
   returns once the write is attempted and fails — including a duplicate bind
   (`detail` says `use --rebind`) or the KVS being locked by a concurrent writer
