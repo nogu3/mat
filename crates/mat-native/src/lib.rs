@@ -505,7 +505,9 @@ impl NodeConn for SessionConn {
 fn map_resolve_err(node_id: u64, e: dnssd::DnssdError) -> MatError {
     let kind = match e {
         dnssd::DnssdError::Timeout { .. } => ErrorKind::Timeout,
-        _ => ErrorKind::Unreachable,
+        // 非 timeout は構造的失敗 → unreachable。variant 追加時にここで分類を
+        // 決めさせるため wildcard にしない。
+        dnssd::DnssdError::Io(_) | dnssd::DnssdError::Malformed(_) => ErrorKind::Unreachable,
     };
     MatError::new(kind, format!("native: mDNS resolve node {node_id}: {e}"))
 }

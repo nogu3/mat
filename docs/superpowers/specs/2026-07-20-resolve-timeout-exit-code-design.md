@@ -19,8 +19,10 @@ resolve 失敗を variant で振り分ける:
 - `DnssdError::Timeout` → `ErrorKind::Timeout`（exit 3）
 - それ以外（socket I/O 等）→ `ErrorKind::Unreachable`（exit 5、現状維持）
 
-小関数 `dnssd_error_kind(&DnssdError) -> ErrorKind` に切り出して establish の
-call site から使う。detail は従来の `native: mDNS resolve node N: ...` を維持。
+小関数 `map_resolve_err(node_id, DnssdError) -> MatError`（既存
+`map_session_err`/`map_commission_err` と同型、detail 整形も同所に持つ）に
+切り出して establish の call site から使う。detail は従来の
+`native: mDNS resolve node N: ...` を維持。
 
 ## スコープ
 
