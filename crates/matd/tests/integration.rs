@@ -66,16 +66,45 @@ async fn roundtrip(socket: &std::path::Path, requests: &[Value]) -> Vec<Value> {
     out
 }
 
-/// matd の serve をバックグラウンドで起動し、socket path を返す。
+/// serve に渡す broadcast と、その送信ハンドルを返す版。listen 系テストが
+/// イベントを注入するのに使う。
+async fn start_matd_with_events(
+    store_path: PathBuf,
+    native: NativeState,
+    capacity: usize,
+) -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::broadcast::Sender<matd::subscription::Event>,
+) {
+    let socket = std::env::temp_dir().join(format!("matd-test-{}.sock", rand_suffix()));
+    let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
+    let socket_clone = socket.clone();
+    let tx2 = tx.clone();
+    let handle = tokio::spawn(async move {
+        let _ = matd::server::serve(&socket_clone, store_path, native, tx2).await;
+    });
+    (socket, handle, tx)
+}
+
+fn occupancy_event(node_id: u64) -> matd::subscription::Event {
+    matd::subscription::Event {
+        node_id,
+        endpoint: 1,
+        cluster: 0x0406,
+        attribute: 0x0000,
+        value: serde_json::json!(1),
+        priming: false,
+    }
+}
+
+/// matd の serve をバックグラウンドで起動し、socket path を返す。listen を使わない
+/// 既存テストの利便ラッパー（events 送信ハンドルは使い捨て）。
 async fn start_matd(
     store_path: PathBuf,
     native: NativeState,
 ) -> (PathBuf, tokio::task::JoinHandle<()>) {
-    let socket = std::env::temp_dir().join(format!("matd-test-{}.sock", rand_suffix()));
-    let socket_clone = socket.clone();
-    let handle = tokio::spawn(async move {
-        let _ = matd::server::serve(&socket_clone, store_path, native).await;
-    });
+    let (socket, handle, _tx) = start_matd_with_events(store_path, native, 16).await;
     (socket, handle)
 }
 
@@ -341,6 +370,99 @@ async fn native_unavailable_answers_every_op_with_build_error_but_keeps_serving(
     assert_eq!(resps[2]["error"]["kind"], "store_missing");
     // Ping だけは native に触れず常に成功する。
     assert_eq!(resps[3]["pong"], json!(true));
+
+    handle.abort();
+}
+
+/// listen: ack 1 行の後、フィルタ一致イベントだけが同接続に NDJSON で流れる。
+#[tokio::test]
+async fn listen_acks_then_streams_filtered_events() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, handle, tx) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
+
+    // 接続して listen（node 21 のみ）
+    let mut stream = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = stream.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(b"{\"id\":9,\"op\":\"listen\",\"node_id\":21}\n")
+        .await
+        .unwrap();
+
+    // ack 1 行
+    let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ack["listening"], json!(true));
+    assert_eq!(ack["id"], json!(9));
+    assert!(ack["timestamp"].is_string());
+
+    // フィルタ不一致（node 22）→ 届かない。一致（node 21）→ 届く。
+    tx.send(occupancy_event(22)).unwrap();
+    tx.send(occupancy_event(21)).unwrap();
+    let ev: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ev["node_id"], json!(21));
+    assert_eq!(ev["cluster"], "occupancysensing");
+    assert_eq!(ev["attribute"], "occupancy");
+    assert_eq!(ev["value"], json!(1));
+    assert_eq!(ev["priming"], json!(false));
+
+    handle.abort();
+}
+
+/// listen: broadcast の容量超過で listener が lag すると、エラー行を送ってから
+/// 切断する（黙って欠落させない — spec ②）。
+#[tokio::test]
+async fn lagged_listener_gets_error_line_and_disconnect() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    // capacity 1: listener が読む前に多数流すと必ず lag する。
+    let (socket, handle, tx) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 1).await;
+
+    let mut stream = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = stream.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(b"{\"op\":\"listen\"}\n")
+        .await
+        .unwrap();
+    let _ack = lines.next_line().await.unwrap().unwrap();
+
+    // 大量送信で lag を起こす（handler が 1 通処理する間に capacity 超過させる）。
+    for _ in 0..64 {
+        let _ = tx.send(occupancy_event(21));
+    }
+    // どこかで lag エラー行が来て、その後 EOF（切断）。
+    let mut saw_lag = false;
+    while let Some(line) = lines.next_line().await.unwrap() {
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v.get("error").is_some() {
+            assert_eq!(v["error"]["kind"], "other");
+            assert!(v["error"]["detail"].as_str().unwrap().contains("lagged"));
+            saw_lag = true;
+            break;
+        }
+    }
+    assert!(saw_lag, "expected lag error line");
+    // 切断される（次の read は EOF）。
+    assert!(lines.next_line().await.unwrap().is_none());
 
     handle.abort();
 }
