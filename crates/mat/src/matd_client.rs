@@ -612,6 +612,25 @@ mod tests {
     }
 
     #[test]
+    fn group_level_maps_to_group_level_op() {
+        let cmd = Command::Group {
+            action: GroupCommand::Level {
+                group_id: GroupRef::Id(1),
+                percent: 50,
+                transition: 0,
+                endpoint: 1,
+            },
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"group_level","group_id":1,
+                "level":127,"percent":50,"transition":0,"endpoint":1
+            })
+        );
+    }
+
+    #[test]
     fn group_color_maps_to_group_color_op_with_echo() {
         let cmd = Command::Group {
             action: GroupCommand::Color {
