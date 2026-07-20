@@ -222,6 +222,17 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                     transition,
                     endpoint,
                 },
+                GroupCommand::Level {
+                    group_id,
+                    percent,
+                    transition,
+                    endpoint,
+                } => GroupCommand::Level {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    percent,
+                    transition,
+                    endpoint,
+                },
                 GroupCommand::Color {
                     group_id,
                     spec,

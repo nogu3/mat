@@ -81,6 +81,13 @@ pub(crate) enum NativeOp {
         transition: u16,
         endpoint: u16,
     },
+    GroupLevel {
+        group_id: u16,
+        percent: u8,
+        level: u8,
+        transition: u16,
+        endpoint: u16,
+    },
     /// group への汎用 invoke（onoff on/off/toggle 引数なし以外 — M8a Task9）。
     /// `GroupOnOff` と違い cluster/command を名前解決した任意コマンドを送る。
     GroupInvokeGeneric {
@@ -275,6 +282,24 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 group_id: group_id.id(),
                 kelvin,
                 mireds,
+                transition: *transition,
+                endpoint: *endpoint,
+            })
+        }
+        Command::Group {
+            action:
+                GroupCommand::Level {
+                    group_id,
+                    percent,
+                    transition,
+                    endpoint,
+                },
+        } => {
+            let level = crate::commands::invoke::resolve_level(*percent);
+            Some(NativeOp::GroupLevel {
+                group_id: group_id.id(),
+                percent: *percent,
+                level,
                 transition: *transition,
                 endpoint: *endpoint,
             })
@@ -624,6 +649,7 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatErro
         NativeOp::GroupOnOff { .. }
         | NativeOp::GroupColor { .. }
         | NativeOp::GroupColorTemp { .. }
+        | NativeOp::GroupLevel { .. }
         | NativeOp::GroupInvokeGeneric { .. } => None,
         // provision / grant は複数ノード宛（`node_id: Option<u64>` に収まらない）
         // ので、ここで別途 require_node する（chip-tool 経路の `provision`/
@@ -906,6 +932,40 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
                         *group_id,
                         *kelvin,
                         *mireds,
+                        *transition,
+                        *endpoint,
+                    );
+                }
+                GroupOutcome::Unavailable(reason) => {
+                    return Err(group_unavailable_error(&reason));
+                }
+            }
+        }
+        NativeOp::GroupLevel {
+            group_id,
+            percent,
+            level,
+            transition,
+            endpoint,
+        } => {
+            let Some(ctx) = &engine.group else {
+                return Err(group_ctx_unconfigured_error());
+            };
+            let fields = im::encode_move_to_level_fields(*level, *transition);
+            match mat_native::group::send(
+                ctx,
+                *group_id,
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL,
+                Some(fields),
+            )
+            .await?
+            {
+                GroupOutcome::Sent => {
+                    crate::commands::group::emit_level_sent(
+                        *group_id,
+                        *percent,
+                        *level,
                         *transition,
                         *endpoint,
                     );
