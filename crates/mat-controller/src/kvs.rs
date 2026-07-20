@@ -558,8 +558,10 @@ impl std::fmt::Debug for GroupCredentials {
 /// `group_settings::scan_map` と同じ count 駆動) for the keyset id, then
 /// takes the first key entry's hash + operational key from the keyset blob.
 /// keymap id は max+1 で増え続け 0xff を超え得るので、数値走査ではなく
-/// チェーン走査でなければ全エントリに届かない。チェーンの欠損・不正
-/// エントリは読み経路の寛容主義に倣い打ち切り（→ `GroupNotFound`）。
+/// チェーン走査でなければ全エントリに届かない。レコード欠損・TLV 不正は
+/// 読み経路の寛容主義に倣い打ち切り（→ `GroupNotFound`）。base64 として
+/// 壊れた値だけは `decode_b64` の `KvsError` をそのまま上げる（store 破損は
+/// 黙殺しない）。
 pub fn read_group_credentials(
     path: &Path,
     fabric_index: u8,
@@ -1270,6 +1272,43 @@ mod tests {
         let c = read_group_credentials(&path, 2, 10).unwrap();
         assert_eq!(c.session_id, 0x855f);
         assert_eq!(c.encryption_key, GROUP_KEY);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn missing_fabric_data_is_group_not_found() {
+        // gk レコードがあっても `f/<idx>/g`（チェーンの入口）が無ければ
+        // GroupNotFound（panic やハードエラーにしない）。実 store では
+        // gk があれば必ず f/<idx>/g も書かれている（上流も mat 書き側も
+        // FabricData を常時維持する）ため、これは corrupt 系の防衛線。
+        let path = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn dangling_chain_link_is_group_not_found() {
+        // first_map / next が実在しないレコードを指していても走査を打ち切り
+        // GroupNotFound（gk/1 の next=7 が欠損 → 本命 gk/4 には届かない）。
+        let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 2)[..]),
+            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 7)[..]),
+            ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
+        ]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
         std::fs::remove_file(path).ok();
     }
 
