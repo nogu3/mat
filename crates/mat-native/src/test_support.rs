@@ -209,6 +209,22 @@ impl Establisher for FakeEstablisher {
 
 /// KeyMapData blob（`f/<idx>/gk/<n>`）: struct{ctx1:group_id,
 /// ctx2:keyset_id, ctx3:next}。`crate::kvs` のテストフィクスチャと同構造。
+/// `f/<idx>/g`（FabricData、ctx1..7 全 Uint）。keymap チェーンの入口
+/// （ctx3=first_map / ctx4=map_count）以外はゼロ相当。
+fn fabric_data_blob(first_map: u16, map_count: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(1), 0); // first_group
+    w.put_uint(Tag::Context(2), 0); // group_count
+    w.put_uint(Tag::Context(3), u64::from(first_map));
+    w.put_uint(Tag::Context(4), u64::from(map_count));
+    w.put_uint(Tag::Context(5), 0xFFFF); // first_keyset (INVALID)
+    w.put_uint(Tag::Context(6), 0); // keyset_count
+    w.put_uint(Tag::Context(7), 0); // next
+    w.end_container();
+    w.finish()
+}
+
 fn keymap_blob(group_id: u16, keyset_id: u16, next: u8) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
@@ -244,10 +260,12 @@ fn keyset_blob(hash: u16, key: &[u8; 16]) -> Vec<u8> {
 /// `[0xDD;16]`）と `g/gdc = 1000` を持つ chip-tool KVS ini フィクスチャを
 /// 書く。
 pub fn write_group_fixture_ini(path: &std::path::Path) {
+    let fb = fabric_data_blob(1, 1);
     let gk = keymap_blob(10, 0x3c, 0);
     let ks = keyset_blob(0x855f, &[0xDD; 16]);
     let gdc = 1000u32.to_le_bytes();
     let mut body = String::from("[Default]\n");
+    body.push_str(&format!("f/2/g = {}\n", Base64::encode_string(&fb)));
     body.push_str(&format!("f/2/gk/1 = {}\n", Base64::encode_string(&gk)));
     body.push_str(&format!("f/2/k/3c = {}\n", Base64::encode_string(&ks)));
     body.push_str(&format!("g/gdc = {}\n", Base64::encode_string(&gdc)));
