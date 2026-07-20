@@ -6,7 +6,7 @@
 //! groupcast 送出は `mat-native::group`）。このモジュールは native 経路から呼ばれる
 //! 成功 JSON の emit のみを持つ（スキーマの単一ソース）。
 //!
-//! groupcast は **unacknowledged**。`invoke` / `color-temp` / `color` は応答を
+//! groupcast は **unacknowledged**。`invoke` / `color-temp` / `level` / `color` は応答を
 //! 受け取れないため "sent" しか報告できない（per-device の配信成否は原理的に取れない）。
 
 use serde_json::json;
