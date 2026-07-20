@@ -81,6 +81,7 @@ async fn start_matd_with_events(
     let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
     let socket_clone = socket.clone();
     let tx2 = tx.clone();
+    let native = std::sync::Arc::new(native);
     let handle = tokio::spawn(async move {
         let _ = matd::server::serve(&socket_clone, store_path, native, tx2).await;
     });

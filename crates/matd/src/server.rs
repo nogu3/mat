@@ -52,7 +52,7 @@ impl NativeState {
 pub async fn serve(
     socket_path: &Path,
     store_path: PathBuf,
-    native: NativeState,
+    native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
 ) -> std::io::Result<()> {
     tracing::info!(native_ready = native.is_ready(), "matd backend");
@@ -66,7 +66,6 @@ pub async fn serve(
     // shutdown op（`matd stop`）で serve ループを抜けるための通知。
     let shutdown = Arc::new(Notify::new());
 
-    let native = Arc::new(native);
     let store_path = Arc::new(store_path);
     loop {
         tokio::select! {

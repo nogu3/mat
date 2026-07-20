@@ -185,9 +185,16 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         }
     };
 
-    // イベント配信バス。SubscriptionManager の起動結線は Task 6 — ここでは
-    // serve のシグネチャを満たす最小限（capacity は listen 用の暫定値）。
+    let native = std::sync::Arc::new(native);
+    // listen へのイベント配信路。購読 → broadcast → listen 接続（spec ②）。
     let (events_tx, _events_rx) = tokio::sync::broadcast::channel(1024);
+    // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
+    // ack だけ返り、イベントは流れない — `mat fabric init` 後の再起動で解消）。
+    let _sub_handles = matd::subscription::spawn_subscription_manager(
+        std::sync::Arc::clone(&native),
+        store_path.clone(),
+        events_tx.clone(),
+    );
 
     server::serve(&socket, store_path, native, events_tx)
         .await
