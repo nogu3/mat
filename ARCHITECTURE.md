@@ -886,10 +886,17 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
       scalar のみが仕様、汎用 write/invoke の後退を受容）。(3) IPK ローテーション
       （全ノード KeySetWrite での epoch 完全移行 — 現状は既存 fabric の定数 epoch を
-      検証して採用永続するのみ）。(4) CASE の多アドレス試行（ゲート 1 で観測した
-      弱点: 1 ノードが複数 AAAA を広告するとき現状は 1 アドレスにしか CASE を
-      張らず、その経路が不調だと session_failed になる — 複数アドレスへ順次
-      試行する堅牢化）。
+      検証して採用永続するのみ）。(4) ~~CASE の多アドレス試行~~【訂正
+      2026-07-20: これは記録が不正確だった。resolve は SRV target に一致する
+      全 AAAA を返し（重複排除・非 link-local 優先）、establish は M7 以来
+      全アドレスへ順次 CASE 試行する（`for peer in peers`）。ゲート 1 の
+      「1 アドレスしか試さない」観測の実体は、当時の resolver が ephemeral
+      socket で multicast 応答を受信できず AAAA が 1 本しか取れていなかった
+      resolve 回帰（0.23.0/0.23.1 で修正）への誤帰属とみられる。残余の未実装
+      は 2 点のみで実害未観測: (a) resolve は SRV+AAAA が揃った最初の応答で
+      早期 return するため、複数応答に分かれた後着 AAAA は取りこぼし得る、
+      (b) 死んだアドレス 1 本あたりの CASE 失敗待ちは MRP 予算依存
+      （SII=5000ms なら最大 ~80 秒）で、上限キャップ・並行試行は無い】。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・
