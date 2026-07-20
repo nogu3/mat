@@ -189,6 +189,11 @@ async fn run_subscription_once(
     }
     let deadline = Duration::from_secs_f64(f64::from(info.max_interval_s) * DEATH_FACTOR)
         .max(Duration::from_secs(5)); // MaxInterval が極端に小さくても常識的な下限
+    tracing::debug!(
+        node_id,
+        deadline_s = deadline.as_secs(),
+        "report pump running"
+    );
     loop {
         match conn.next_report(deadline).await {
             Ok(msg) => {
@@ -197,7 +202,12 @@ async fn run_subscription_once(
                 }
                 // keep-alive（reports 空）も無音 deadline をリセットするだけで良い。
             }
-            Err(_) => return Ok(()), // 無音死亡 or セッションエラー → 再購読
+            Err(e) => {
+                // 無音死亡 or セッションエラー → 再購読。何で死んだかは切り分けに
+                // 必須なので詳細を残す（直後に caller が「subscription lost」を出す）。
+                tracing::info!(node_id, kind = ?e.kind, detail = %e.detail, "report pump ended");
+                return Ok(());
+            }
         }
     }
 }

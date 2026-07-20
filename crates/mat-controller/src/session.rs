@@ -124,6 +124,9 @@ pub struct SecureSession {
     /// バッファ（screen は認証済み needs_ack メッセージをフィルタ前に ack するため、
     /// ack 済みをドロップしてはならない）。購読 API だけが消費する。
     peer_initiated: std::collections::VecDeque<IncomingMessage>,
+    /// ピアから最後に認証済みメッセージを受けた時刻（MRP active/idle 判定用、
+    /// spec 4.12.8: 直近受信ありなら SAI で再送）。
+    last_rx: Option<Instant>,
 }
 
 impl SecureSession {
@@ -147,6 +150,7 @@ impl SecureSession {
             counter: TxCounter::new_random(),
             rx_window: RxWindow::new(),
             peer_initiated: std::collections::VecDeque::new(),
+            last_rx: None,
         }
     }
 
@@ -227,6 +231,13 @@ impl SecureSession {
             Some(acked),
             &[],
         )?;
+        tracing::debug!(
+            exchange_id,
+            initiator,
+            acked,
+            peer = %self.peer,
+            "sending standalone ack"
+        );
         self.transport.send_to(&datagram, self.peer).await?;
         Ok(())
     }
@@ -262,6 +273,10 @@ impl SecureSession {
         filter: ScreenFilter,
     ) -> Result<Option<IncomingMessage>, SessionError> {
         if from != self.peer {
+            // 共有 op socket では他セッション宛の cross-traffic で正常に起きる。
+            // 購読専用 socket では「デバイスが別ソースアドレスから送っている」
+            // 兆候なので、切り分け時は trace で可視化する。
+            tracing::trace!(%from, peer = %self.peer, "screen: datagram from foreign address; ignored");
             return Ok(None);
         }
         // 平文ヘッダだけ先に見て session id を確認する（復号前フィルタ）。
@@ -269,15 +284,29 @@ impl SecureSession {
         // のデータグラムとして無視する（DoS 耐性、エラーを伝播しない）。
         let header_peek = match MessageHeader::decode(buf) {
             Ok((h, _)) => h,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                tracing::trace!(%from, "screen: undecodable header; ignored");
+                return Ok(None);
+            }
         };
         if header_peek.session_id != self.local_session_id {
+            tracing::trace!(
+                session_id = header_peek.session_id,
+                ours = self.local_session_id,
+                "screen: session id mismatch; ignored"
+            );
             return Ok(None);
         }
         let (header, proto, payload) = match open_message(&self.keys.r2i, buf, self.peer_node_id) {
             Ok(v) => v,
-            Err(OpenError::Message(_)) | Err(OpenError::Crypto(_)) => return Ok(None),
+            Err(OpenError::Message(_)) | Err(OpenError::Crypto(_)) => {
+                tracing::trace!(%from, "screen: authenticated decrypt failed; ignored");
+                return Ok(None);
+            }
         };
+        // 認証済み受信 = ピアは active。MRP 再送間隔の active/idle 判定に使う
+        // （重複再送でも「ピアが生きている」証拠として記録してよい）。
+        self.last_rx = Some(Instant::now());
         // RxWindow の重複検知はセッション単位（exchange 単位ではない）なので、
         // exchange フィルタより前にコミットする（コメント: この順序は意図的）。
         if !self.rx_window.check_and_commit(header.message_counter) {
@@ -309,6 +338,12 @@ impl SecureSession {
             ScreenFilter::AnyPeerInitiated => proto.initiator,
         };
         if !deliver {
+            tracing::trace!(
+                exchange_id = proto.exchange_id,
+                initiator = proto.initiator,
+                opcode = proto.opcode,
+                "screen: delivery filter miss"
+            );
             // フィルタ落ちでも device 発 ReportData は ack 済みなので待避する。
             if proto.initiator
                 && proto.protocol_id == crate::im::PROTOCOL_ID_IM
@@ -357,7 +392,7 @@ impl SecureSession {
         }
         let (datagram, our_counter) =
             self.seal(exchange_id, true, protocol_id, opcode, true, None, payload)?;
-        let mut interval = cfg.initial_interval;
+        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
         let mut attempts = 0u32;
         loop {
             self.transport.send_to(&datagram, self.peer).await?;
@@ -888,7 +923,7 @@ impl SecureSession {
             None,
             &payload,
         )?;
-        let mut interval = cfg.initial_interval;
+        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
         let mut attempts = 0u32;
         loop {
             self.transport.send_to(&datagram, self.peer).await?;
@@ -966,6 +1001,12 @@ impl SecureSession {
                 im::OPCODE_REPORT_DATA => {
                     let rd =
                         im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+                    tracing::debug!(
+                        exchange_id,
+                        reports = rd.reports.len(),
+                        more_chunks = rd.more_chunks,
+                        "subscribe: priming report chunk"
+                    );
                     priming.push(rd);
                     if priming.len() > MAX_REPORT_CHUNKS {
                         return Err(SessionError::Im(ImError::Malformed(
@@ -992,6 +1033,14 @@ impl SecureSession {
                 im::OPCODE_SUBSCRIBE_RESPONSE => {
                     let sr =
                         im::decode_subscribe_response(&msg.payload).map_err(SessionError::Im)?;
+                    tracing::debug!(
+                        exchange_id,
+                        subscription_id = sr.subscription_id,
+                        max_interval_s = sr.max_interval_s,
+                        needs_ack = msg.proto.needs_ack,
+                        counter = msg.header.message_counter,
+                        "subscribe: SubscribeResponse received"
+                    );
                     return Ok((sr, priming));
                 }
                 im::OPCODE_STATUS_RESPONSE => {
@@ -1029,6 +1078,7 @@ impl SecureSession {
                     return Err(SessionError::Timeout);
                 };
                 let (n, from) = recv?;
+                tracing::debug!(len = n, %from, "sub pump: datagram received");
                 let Some(m) = self
                     .screen_with(&buf[..n], from, ScreenFilter::AnyPeerInitiated)
                     .await?
@@ -1047,6 +1097,13 @@ impl SecureSession {
             return Err(SessionError::UnexpectedOpcode(msg.proto.opcode));
         }
         let rd = im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            subscription_id = rd.subscription_id,
+            reports = rd.reports.len(),
+            suppress_response = rd.suppress_response,
+            "sub pump: report delivered"
+        );
         if !rd.suppress_response {
             self.respond_status(msg.proto.exchange_id, 0, cfg).await?;
         }
@@ -1083,6 +1140,7 @@ mod tests {
     fn fast_cfg() -> MrpConfig {
         MrpConfig {
             initial_interval: Duration::from_millis(50),
+            active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
         }
@@ -1126,6 +1184,52 @@ mod tests {
     /// デバイス側で受信 → 復号して (header, proto) を返す。
     fn open_from_controller(buf: &[u8]) -> (MessageHeader, ProtocolHeader, Vec<u8>) {
         crate::crypto::open_message(&I2R, buf, OUR_NODE).unwrap()
+    }
+
+    /// 実機バグの釘（secure 経路）: priming チャンク受信直後＝ピア active の
+    /// 再送（respond_status / send_reliable 共通の base 選択）は active
+    /// interval で行う。SII=5000ms のまま再送するとデバイス側 chunk
+    /// タイムアウトに負けて購読が 0x80 死する（2026-07-20 実機ワイヤ確認）。
+    #[tokio::test]
+    async fn respond_status_retransmits_fast_after_recent_peer_rx() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        s.last_rx = Some(Instant::now()); // チャンク受信直後の状況を注入
+        let cfg = MrpConfig {
+            initial_interval: Duration::from_secs(5),
+            active_interval: Duration::from_millis(50),
+            max_retries: 2,
+            backoff: 1.0,
+        };
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let _ = device.recv_from(&mut buf).await.unwrap();
+            let again =
+                tokio::time::timeout(Duration::from_secs(1), device.recv_from(&mut buf)).await;
+            assert!(
+                again.is_ok(),
+                "no retransmission within 1s: active interval not applied"
+            );
+        });
+        let t0 = std::time::Instant::now();
+        let err = s.respond_status(1234, 0, &cfg).await.unwrap_err();
+        assert!(matches!(err, SessionError::Timeout));
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "timeout took {:?}; idle interval used despite recent rx?",
+            t0.elapsed()
+        );
+        dev.await.unwrap();
     }
 
     #[tokio::test]
@@ -1500,6 +1604,7 @@ mod tests {
         // quickly instead of stalling the test.
         let cfg = MrpConfig {
             initial_interval: Duration::from_millis(50),
+            active_interval: Duration::from_millis(50),
             max_retries: 1,
             backoff: 1.0,
         };

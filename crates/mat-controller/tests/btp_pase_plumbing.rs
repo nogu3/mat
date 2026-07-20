@@ -93,6 +93,7 @@ async fn pase_over_btp_sends_unreliable_pbkdf_request() {
         20202021,
         &MrpConfig {
             initial_interval: Duration::from_millis(200),
+            active_interval: Duration::from_millis(200),
             max_retries: 1,
             backoff: 1.0,
         },

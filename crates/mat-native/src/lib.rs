@@ -441,6 +441,9 @@ impl Establisher for CaseEstablisher {
                 format!("native: bind subscription udp: {e}"),
             )
         })?;
+        // 購読 socket の実ポートは実機切り分け（tcpdump / ss との突合）の鍵なので
+        // 確立ごとに可視化する。
+        let local = transport.local_addr().ok();
         let transport = Arc::new(Transport::Udp(Arc::new(transport)));
         let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
         let resolved = self
@@ -453,7 +456,15 @@ impl Establisher for CaseEstablisher {
         let mut last: Option<MatError> = None;
         for peer in peers {
             match case::establish(Arc::clone(&transport), peer, &self.creds, node_id, &mrp).await {
-                Ok(session) => return Ok(Box::new(SubscriptionSession { session, mrp })),
+                Ok(session) => {
+                    tracing::info!(
+                        node_id,
+                        local = %local.map(|a| a.to_string()).unwrap_or_default(),
+                        %peer,
+                        "subscription transport bound (dedicated socket + CASE)"
+                    );
+                    return Ok(Box::new(SubscriptionSession { session, mrp }));
+                }
                 Err(e) => {
                     last = Some(MatError::new(
                         ErrorKind::SessionFailed,

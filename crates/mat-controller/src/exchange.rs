@@ -15,7 +15,14 @@ use crate::transport::{Transport, MAX_DATAGRAM};
 /// MRP retransmission parameters (spec 4.12; defaults follow chip defaults).
 #[derive(Debug, Clone)]
 pub struct MrpConfig {
+    /// ピアが idle とみなされるときの再送初期間隔（mDNS TXT の SII 由来）。
     pub initial_interval: Duration,
+    /// ピアが active とみなされるときの再送初期間隔（mDNS TXT の SAI 由来）。
+    /// spec 4.12.8: 直近に受信があるピアは SESSION_ACTIVE_INTERVAL で再送する。
+    /// Thread sleepy device は SII=5000ms が普通で、これを active 中も使うと
+    /// 1 パケット喪失で 5 秒止まり、購読 priming のようなチャンク往復は
+    /// デバイス側 chunk タイムアウトに負けて死ぬ（実機で確認済み）。
+    pub active_interval: Duration,
     pub max_retries: u32,
     pub backoff: f64,
 }
@@ -24,9 +31,23 @@ impl Default for MrpConfig {
     fn default() -> Self {
         Self {
             initial_interval: Duration::from_millis(300),
+            active_interval: Duration::from_millis(300),
             max_retries: 4,
             backoff: 1.6,
         }
+    }
+}
+
+/// ピアを active とみなす受信からの経過時間の窓
+/// (spec: SESSION_ACTIVE_THRESHOLD、既定 4000ms)。
+pub(crate) const PEER_ACTIVE_WINDOW: Duration = Duration::from_millis(4000);
+
+/// 直近の受信時刻から MRP 再送の初期間隔を選ぶ（spec 4.12.8: 受信の新しい
+/// ピアは active → SAI、それ以外は idle → SII）。
+pub(crate) fn retrans_base(last_rx: Option<Instant>, cfg: &MrpConfig) -> Duration {
+    match last_rx {
+        Some(t) if t.elapsed() < PEER_ACTIVE_WINDOW => cfg.active_interval,
+        _ => cfg.initial_interval,
     }
 }
 
@@ -89,6 +110,8 @@ pub struct UnsecuredExchange<'t> {
     counter: TxCounter,
     rx_window: RxWindow,
     last_sent_counter: Option<u32>,
+    /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
+    last_rx: Option<Instant>,
 }
 
 impl<'t> UnsecuredExchange<'t> {
@@ -103,6 +126,7 @@ impl<'t> UnsecuredExchange<'t> {
             counter: TxCounter::new_random(),
             rx_window: RxWindow::new(),
             last_sent_counter: None,
+            last_rx: None,
         }
     }
 
@@ -185,6 +209,10 @@ impl<'t> UnsecuredExchange<'t> {
         if proto.exchange_id != self.exchange_id || proto.initiator {
             return Ok(None);
         }
+        // ここまで来た = このピアからの当該 exchange の有効トラフィック。
+        // MRP active/idle 判定の材料として受信時刻を記録する（重複でも良い —
+        // ピアが生きて送っている事実に変わりない）。
+        self.last_rx = Some(Instant::now());
         if !self.rx_window.check_and_commit(header.message_counter) {
             if proto.needs_ack && !self.transport.is_reliable() {
                 self.send_standalone_ack(header.message_counter).await?;
@@ -224,7 +252,7 @@ impl<'t> UnsecuredExchange<'t> {
         }
         let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
         self.last_sent_counter = Some(our_counter);
-        let mut interval = cfg.initial_interval;
+        let mut interval = retrans_base(self.last_rx, cfg);
         let mut attempts = 0u32;
         loop {
             self.transport.send_to(&datagram, self.peer).await?;
@@ -327,6 +355,7 @@ mod tests {
     fn fast_cfg() -> MrpConfig {
         MrpConfig {
             initial_interval: Duration::from_millis(50),
+            active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
         }
@@ -376,6 +405,76 @@ mod tests {
         let mut buf = h.encoded();
         p.encode(&mut buf);
         buf
+    }
+
+    /// retrans_base: 直近受信ありなら active interval（SAI）、無ければ/
+    /// PEER_ACTIVE_WINDOW より古ければ idle interval（SII）。
+    #[tokio::test]
+    async fn retrans_base_picks_active_interval_on_recent_rx() {
+        let cfg = MrpConfig {
+            initial_interval: Duration::from_secs(5),
+            active_interval: Duration::from_millis(300),
+            ..MrpConfig::default()
+        };
+        assert_eq!(retrans_base(None, &cfg), Duration::from_secs(5));
+        assert_eq!(
+            retrans_base(Some(Instant::now()), &cfg),
+            Duration::from_millis(300)
+        );
+        let stale = Instant::now() - (PEER_ACTIVE_WINDOW + Duration::from_millis(50));
+        assert_eq!(retrans_base(Some(stale), &cfg), Duration::from_secs(5));
+    }
+
+    /// 実機バグの釘: ピアから受信した直後の再送は active interval で行う。
+    /// SII=5000ms の Thread デバイスで、喪失した Sigma3 / StatusResponse の
+    /// 回復が 5 秒張り付き、デバイス側タイムアウト（≈5s）に負けて購読
+    /// priming が 0x80 死していた（2026-07-20 実機ワイヤで確認）。
+    #[tokio::test]
+    async fn send_reliable_retransmits_at_active_interval_after_peer_rx() {
+        let responder = bind_local().await;
+        let peer = responder.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let mut ex = UnsecuredExchange::new(&transport, peer);
+        let cfg = MrpConfig {
+            initial_interval: Duration::from_secs(5), // idle のままなら再送は 5 秒後
+            active_interval: Duration::from_millis(50),
+            max_retries: 2,
+            backoff: 1.0,
+        };
+
+        let responder_task = tokio::spawn(async move {
+            // 1 通目: 実応答（ack 同梱）でピア活動を作る。
+            let (h, p, from) = read_msg(&responder).await;
+            let reply = reply_datagram(p.exchange_id, 0x99, Some(h.message_counter), false, 7000);
+            responder.send_to(&reply, from).await.unwrap();
+            // 2 通目: ack しない。active interval なら 1 秒以内に再送が来る。
+            let _ = read_msg(&responder).await;
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let again =
+                tokio::time::timeout(Duration::from_secs(1), responder.recv_from(&mut buf)).await;
+            assert!(
+                again.is_ok(),
+                "no retransmission within 1s: active interval not applied"
+            );
+        });
+
+        let first = ex
+            .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x11, b"a", &cfg)
+            .await
+            .unwrap();
+        assert!(first.is_some());
+        let t0 = std::time::Instant::now();
+        let err = ex
+            .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x12, b"b", &cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExchangeError::Timeout));
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "timeout took {:?}; idle interval used despite recent rx?",
+            t0.elapsed()
+        );
+        responder_task.await.unwrap();
     }
 
     #[tokio::test]

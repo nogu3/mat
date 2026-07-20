@@ -924,6 +924,9 @@ pub async fn commission_btp_thread(
     // still returns immediately, this only raises the ceiling before we give up.
     let cfg = MrpConfig {
         initial_interval: Duration::from_secs(15),
+        // PASE 中の相手は計算で長考する。active 判定で間隔を縮めず、意図した
+        // 長 budget を保つ（この cfg は「応答待ち予算」として使っている）。
+        active_interval: Duration::from_secs(15),
         max_retries: 1,
         backoff: 1.0,
     };
@@ -1011,6 +1014,7 @@ pub async fn commission_btp_thread(
     //    breadcrumb=7）。
     let connect_cfg = MrpConfig {
         initial_interval: Duration::from_secs(60),
+        active_interval: Duration::from_secs(60), // Thread join 待ち予算を保つ
         max_retries: 0,
         backoff: 1.0,
     };
