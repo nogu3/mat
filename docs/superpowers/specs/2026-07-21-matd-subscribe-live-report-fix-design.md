@@ -91,3 +91,17 @@ pump タスクが実際には正しい socket で recv していない（Arc/ses
 ## スコープ外（本 spec でも据え置き）
 
 EventReport / DataVersionFilter / LIT ICD / `subscriptions.toml` / 状態スナップショット・リプレイ（元 spec のスコープ外を継承）。
+
+## 結果（2026-07-20 実施 — root-cause 確定と修正）
+
+E1〜E3 を単一ノード隔離 matd（別 socket・単一ノード store・RUST_LOG debug/trace + 両 iface tcpdump）で実施した。**確定した root-cause は仮説リストのどれとも微妙に違い、2 段の複合**だった:
+
+1. **「established 後に沈黙」ではなく priming チャンクハンドシェイク中に死んでいた。** 前セッションの「IM 0x80 = RESOURCE_EXHAUSTED（スロット枯渇）」は**誤読**で、0x80 は **INVALID_ACTION** — デバイスが chunk 応答（我々の StatusResponse）待ちタイムアウト（≈5s）で exchange を破棄した後、遅れて届いた再送 StatusResponse に返す応答。**「枯渇」は幻**（E2E 中の read/CASE は常に成功しており、待機も不要だった）。
+   - **真因(a): MRP 再送間隔が SII 固定。** 実機 Thread デバイスは TXT で SII=5000ms を広告し、我々は active な exchange 中の再送にもこれを使っていた（ワイヤ実測: 喪失した Sigma3 の再送まで 4.99 秒）。loss のある経路では 1 喪失で 5 秒停止 → デバイス側タイムアウトに必ず負ける。spec 4.12.8 の「直近受信ありのピアには SESSION_ACTIVE_INTERVAL (SAI=300ms) で再送」を実装して解消（`MrpConfig.active_interval` + `SecureSession`/`UnsecuredExchange` の `last_rx`、`PEER_ACTIVE_WINDOW=4s`）。CASE Sigma3 の回復も同時に 5s→300ms。
+   - ack 不正説（H1a）は棄却: 健全リンク（node8）では standalone ack が全て受理され priming 26 チャンクが dup ゼロで完走。平文 CASE 段の ack バイト列も spec 準拠を pcap で確認。
+2. **真因(b): 確立後の盲目窓。** flaky リンクのデバイスはレポート配送失敗（MRP 全滅）時に**購読を黙って破棄**する（実測: node6 で配送 2 分後に破棄、以後トグルしてもレポートゼロ）。subscriber 側の死活検知は keepalive 無音 ×1.5 しかなく、ceiling 3600s では**盲目窓が最長 90 分**。`SUBSCRIBE_MAX_INTERVAL_CEILING_S` を 300s に短縮（盲目窓 ≤7.5 分で自動再購読）。
+   - H2（送信元アドレス/経路非対称）は補助要因どまり: fd54 系ノードへは「eth0 の別 BR 経由」と「wpan0 直（jarvis 自身が同一 mesh の BR）」の 2 経路があるが、ping 実測で node6 はどちらの経路でも 20〜47% loss = **node6 自身の弱リンク**（node5 の前歴と同型）。H3/H4 は棄却（Recv-Q 滞留は再現せず）。
+3. **付随改善**: matd の tracing が `MAT_LOG`（無ければ `RUST_LOG`）を読むよう mat と整合。購読経路の恒久観測性（購読 socket の bind/peer info ログ、pump の datagram/report debug、screen 棄却理由 trace、pump 終了理由 info）。
+4. **実機結果**: node8/7/10/12 で購読確立・pump 稼働、`mat on/off` → `mat listen` へ約 400ms でイベント配信・exit 0（受け入れ基準達成）。node6 はセッション当時 RF が 20〜47% loss で priming 完走が運任せ（確立に一度成功し live レポート配信も実証。破棄→再購読ループは設計どおり回る）。デバイス側は max_interval=300 を受理。
+
+コミット: 8f4139d（SAI 再送 + 観測性）、以降のコミット（ceiling 300s + docs）。
