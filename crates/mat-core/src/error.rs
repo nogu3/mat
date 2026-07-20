@@ -44,6 +44,10 @@ pub enum ErrorKind {
     DeviceRejected,
     /// `chip-tool` 出力をパースできない。
     ParseError,
+    /// matd が利用できない（`mat listen` 専用）。
+    /// matd 常駐リスナなしで listen 実行時、またはバインド失敗時に使用。
+    /// exit code 12 は歴史的欠番（chip-tool 撤去）のため、13 を割当。
+    MatdUnavailable,
     /// その他。
     Other,
 }
@@ -55,6 +59,7 @@ impl ErrorKind {
             ErrorKind::StoreMissing | ErrorKind::StoreParse => 10,
             ErrorKind::NodeNotCommissioned => 11,
             ErrorKind::ChildNotFound => 12,
+            ErrorKind::MatdUnavailable => 13,
             ErrorKind::Timeout => 3,
             ErrorKind::DeviceRejected => 4,
             ErrorKind::Unreachable => 5,
@@ -133,6 +138,7 @@ mod tests {
         assert_eq!(ErrorKind::StoreParse.exit_code(), 10);
         assert_eq!(ErrorKind::NodeNotCommissioned.exit_code(), 11);
         assert_eq!(ErrorKind::ChildNotFound.exit_code(), 12);
+        assert_eq!(ErrorKind::MatdUnavailable.exit_code(), 13);
         assert_eq!(ErrorKind::Timeout.exit_code(), 3);
         assert_eq!(ErrorKind::DeviceRejected.exit_code(), 4);
         assert_eq!(ErrorKind::Unreachable.exit_code(), 5);
@@ -147,5 +153,14 @@ mod tests {
     fn kind_serializes_snake_case() {
         let s = serde_json::to_string(&ErrorKind::NodeNotCommissioned).unwrap();
         assert_eq!(s, "\"node_not_commissioned\"");
+    }
+
+    #[test]
+    fn matd_unavailable_is_exit_13_snake_case() {
+        assert_eq!(ErrorKind::MatdUnavailable.exit_code(), 13);
+        assert_eq!(
+            serde_json::to_string(&ErrorKind::MatdUnavailable).unwrap(),
+            "\"matd_unavailable\""
+        );
     }
 }
