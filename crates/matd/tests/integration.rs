@@ -90,6 +90,7 @@ async fn start_matd_with_events(
 
 fn occupancy_event(node_id: u64) -> matd::subscription::Event {
     matd::subscription::Event {
+        timestamp: "2026-07-20T00:00:00+09:00".to_string(),
         node_id,
         endpoint: 1,
         cluster: 0x0406,
