@@ -198,6 +198,20 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
+        Command::Level {
+            node_id,
+            endpoint,
+            percent,
+            transition,
+        } => {
+            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み level を
+            // 渡し、percent は応答エコー用。
+            let level = crate::commands::invoke::resolve_level(*percent);
+            json!({
+                "op": "level", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "level": level, "percent": percent, "transition": transition,
+            })
+        }
         Command::Color {
             node_id,
             endpoint,

@@ -55,6 +55,13 @@ pub(crate) enum NativeOp {
         mireds: u16,
         transition: u16,
     },
+    Level {
+        node_id: u64,
+        endpoint: u16,
+        percent: u8,
+        level: u8,
+        transition: u16,
+    },
     GroupOnOff {
         group_id: u16,
         command_id: u32,
@@ -184,6 +191,21 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 endpoint: endpoint.id(),
                 kelvin,
                 mireds,
+                transition: *transition,
+            })
+        }
+        Command::Level {
+            node_id,
+            endpoint,
+            percent,
+            transition,
+        } => {
+            let level = crate::commands::invoke::resolve_level(*percent);
+            Some(NativeOp::Level {
+                node_id: node_id.id(),
+                endpoint: endpoint.id(),
+                percent: *percent,
+                level,
                 transition: *transition,
             })
         }
@@ -592,6 +614,7 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatErro
         | NativeOp::ReadOnOff { node_id, .. }
         | NativeOp::Color { node_id, .. }
         | NativeOp::ColorTemp { node_id, .. }
+        | NativeOp::Level { node_id, .. }
         | NativeOp::ReadAttr { node_id, .. }
         | NativeOp::WriteAttr { node_id, .. }
         | NativeOp::InvokeGeneric { node_id, .. }
@@ -766,6 +789,37 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
                 *endpoint,
                 *kelvin,
                 *mireds,
+                *transition,
+            );
+        }
+        NativeOp::Level {
+            node_id,
+            endpoint,
+            percent,
+            level,
+            transition,
+        } => {
+            let fields = im::encode_move_to_level_fields(*level, *transition);
+            let mut conn = engine.establisher.establish(*node_id).await?;
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL,
+                Some(fields),
+                false,
+            )
+            .await?;
+            tracing::info!(
+                node_id,
+                cluster = "levelcontrol",
+                command = "move-to-level",
+                "invoke executed (native direct)"
+            );
+            crate::commands::invoke::emit_level_success(
+                *node_id,
+                *endpoint,
+                *percent,
+                *level,
                 *transition,
             );
         }
