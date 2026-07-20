@@ -209,6 +209,26 @@ pub enum Command {
         transition: u16,
     },
 
+    /// LevelControl の MoveToLevel を invoke する高頻度ショートカット（明るさ）。
+    /// `--percent`（0–100）を Matter の 0–254 生値（`round(percent / 100 * 254)`、
+    /// 255 は予約値）へ mat が換算する。0 は消灯相当（挙動はデバイス依存）。
+    /// デバイス対応範囲（min/max level）外はデバイス側が clamp する
+    /// （mat は事前 read / 検証をしない）。
+    Level {
+        /// commission 済みノードの node_id、または aliases.toml の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.toml の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
+        /// 明るさ（%）。0–100。
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
+    },
+
     /// ColorControl の MoveToHueAndSaturation を invoke する高頻度ショートカット。
     /// 色は `--name`（色名）/ `--rgb`（HEX or R,G,B）/ `--hue`+`--sat`（生指定、両方
     /// 必須）の 3 系統から 1 つで指定する。名前・RGB は RGB→HSV で hue/sat へ換算

@@ -262,6 +262,30 @@ fn color_temp_unknown_node_exits_11() {
 }
 
 #[test]
+fn level_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["level", "--node", "99", "--percent", "50"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn level_percent_out_of_range_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["level", "--node", "5", "--percent", "101"])
+        .assert()
+        .code(2);
+    // --percent は必須。
+    mat(store.path())
+        .args(["level", "--node", "5"])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn open_window_unknown_node_exits_11() {
     let store = store_with_node5();
     mat(store.path())
