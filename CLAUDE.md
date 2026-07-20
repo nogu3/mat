@@ -36,7 +36,10 @@ This file is the short list of constraints you must not break.
 - Logical groups like "the lights in the living room" (out of scope; `mat` takes
   a numeric GroupId).
 - Session cache, subscriptions, freshness (`mat` is one-shot; warm sessions are
-  `matd`'s role, a separate binary).
+  `matd`'s role, a separate binary). `mat listen` does not change this: it
+  holds no subscription state itself — it is a thin client that connects to
+  `matd`'s resident Subscribe and streams what `matd` sends (matd-only op, no
+  direct fallback; `matd` absent is `matd_unavailable`, exit 13).
 - Scenes, automation, voice/UI entry points (out of scope).
 - Being a Matter device / a bridge (a separate project).
 - Rendering or displaying QR images (emit the `qr_payload` string only).
@@ -66,17 +69,18 @@ This file is the short list of constraints you must not break.
 - `kind` values are stable and documented in README ("Errors and exit codes").
   Examples: `store_missing` / `store_parse` / `node_not_commissioned` /
   `commission_failed` / `timeout` / `unreachable` / `session_failed` /
-  `device_rejected` / `parse_error` / `other`. (`child_not_found` /
-  `child_failed` still exist for wire compat but are not emitted as top-level
-  errors since 0.22.0 — chip-tool retired.)
+  `device_rejected` / `parse_error` / `matd_unavailable` / `other`.
+  (`child_not_found` / `child_failed` still exist for wire compat but are not
+  emitted as top-level errors since 0.22.0 — chip-tool retired.)
 
 ### exit codes
 See the table in [README.md](./README.md#errors-and-exit-codes). In short:
 `0` success, `2` CLI arg error, `10` store missing/parse, `11` not commissioned,
 `3` timeout, `4` device rejected, `5` unreachable, `6` CASE session
-establishment failed, `1` other. Exit `12` (chip-tool not found) is a retired,
-historical vacancy as of 0.22.0. The native backend maps its transport/IM
-outcomes to `3`/`4`/`5`/`6`, falling back to `parse_error` + `1`.
+establishment failed, `13` matd absent (`mat listen` only), `1` other. Exit
+`12` (chip-tool not found) is a retired, historical vacancy as of 0.22.0. The
+native backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back
+to `parse_error` + `1`.
 
 ## Backend (native)
 
@@ -107,8 +111,10 @@ outcomes to `3`/`4`/`5`/`6`, falling back to `parse_error` + `1`.
   materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`).
 - `matd`-only ops vs direct-only ops: `discover` / `commission` / `fabric init`
   / `open-window` / `diag` / `group grant` are never part of the `matd` socket
-  protocol — they always run on `mat`'s own one-shot direct path. See README for
-  the exact op list.
+  protocol — they always run on `mat`'s own one-shot direct path. `listen` is
+  the opposite case and the first of its kind: it is **matd-only**, with no
+  direct-path fallback at all (subscriptions need a resident daemon). See
+  README for the exact op list.
 - The backend is still replaceable in principle: `mat` couples to it only
   through `mat`'s own JSON schema. Subcommands and output schema are the contract.
 - **Fragile parts (keep tests):** (1) the **chip-tool INI KVS compatibility** —
