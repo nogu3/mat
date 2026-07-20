@@ -142,11 +142,13 @@ pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
     w.finish()
 }
 
-/// 購読パラメータ（spec 決定値）: 人感の即応性優先で floor 0、sleepy の電池優先で
-/// ceiling 3600s（実間隔はデバイスが選ぶ）、再購読時に古い購読を掃除するため
-/// KeepSubscriptions=false。
+/// 購読パラメータ: 人感の即応性優先で floor 0、再購読時に古い購読を掃除するため
+/// KeepSubscriptions=false。ceiling は当初 3600s（電池優先）だったが、実機 E2E で
+/// 「flaky リンクのデバイスがレポート配送失敗時に購読を黙って破棄 → こちらは
+/// MaxInterval×1.5 = 90 分間死活を検知できない」盲目窓が核心機能を殺すと判明し
+/// 300s に短縮（keepalive 5 分毎、死活検知 ≤7.5 分で自動再購読）。
 pub const SUBSCRIBE_MIN_INTERVAL_FLOOR_S: u16 = 0;
-pub const SUBSCRIBE_MAX_INTERVAL_CEILING_S: u16 = 3600;
+pub const SUBSCRIBE_MAX_INTERVAL_CEILING_S: u16 = 300;
 pub const SUBSCRIBE_KEEP_SUBSCRIPTIONS: bool = false;
 
 /// 購読成立の結果（SubscriptionId とデバイス選択の MaxInterval）。

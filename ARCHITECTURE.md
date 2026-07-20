@@ -972,10 +972,14 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   独占する。既存 op 経路（warm session）は無改変。コストは購読ノードあたり
   CASE セッション 1 本の常駐。
 - **購読パラメータ**: `MinIntervalFloor = 0`（人感の即応性優先）、
-  `MaxIntervalCeiling = 3600s`（sleepy デバイスの電池優先。実間隔はデバイスが
-  選ぶ）、`KeepSubscriptions = false`（matd 再購読時に古い購読を掃除）。失敗・
-  死亡（MaxInterval の 1.5 倍を超える無音）時は指数 backoff（5s 開始、上限
-  5min）で再購読。リトライは debug ログ、確立/喪失の状態遷移のみ info。
+  `MaxIntervalCeiling = 300s`（当初 3600s だったが、実機 E2E で「flaky リンクの
+  デバイスはレポート配送失敗時に購読を黙って破棄し、subscriber の死活検知は
+  keepalive 周期 ×1.5 の無音でしか効かない」ことが判明。3600s では盲目窓が
+  最長 90 分になり核心機能が沈黙するため、300s（盲目窓 ≤7.5 分）へ短縮した —
+  2026-07-21 fix spec）、`KeepSubscriptions = false`（matd 再購読時に古い購読を
+  掃除）。失敗・死亡（MaxInterval の 1.5 倍を超える無音）時は指数 backoff
+  （5s 開始、上限 5min）で再購読。リトライは debug ログ、確立/喪失の状態遷移
+  のみ info。
 - **イベント配信**: 各ノードの購読ポンプ → `tokio::sync::broadcast` → `mat
   listen` 接続ごとの購読者へフィルタ付きでファンアウト。遅い listener の lag
   は黙って欠落させず、その listener にだけエラー行

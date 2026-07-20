@@ -680,10 +680,13 @@ omitted" shape as a wildcard `read`), so device-originated attribute changes
 not just when a `mat` caller happens to be polling.
 
 - Subscribe parameters: `MinIntervalFloor = 0` (no artificial delay on
-  fast-changing sensors like occupancy), `MaxIntervalCeiling = 3600s` (favors
-  battery life on sleepy devices; the device still picks the actual interval),
-  `KeepSubscriptions = false` (a re-subscribe replaces rather than piles onto
-  the device's existing subscription table).
+  fast-changing sensors like occupancy), `MaxIntervalCeiling = 300s` (the
+  device still picks the actual interval; a device on a flaky Thread link
+  silently discards its subscription when report delivery fails, and the
+  keepalive cadence is the only liveness signal the subscriber gets — 300s
+  bounds that blind window to ≤7.5 min, where the original 3600s left matd
+  blind for up to 90 minutes), `KeepSubscriptions = false` (a re-subscribe
+  replaces rather than piles onto the device's existing subscription table).
 - A subscription that fails to establish, or that goes silent for more than
   **1.5× its negotiated MaxInterval** (subscription-death detection), is
   re-subscribed with exponential backoff starting at 5s, capped at 5 minutes.
