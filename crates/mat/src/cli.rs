@@ -274,6 +274,34 @@ pub enum Command {
         action: GroupCommand,
     },
 
+    /// matd の常駐 Subscribe が受けたデバイス発の状態変化イベントを流す
+    /// （matd 専用 — matd 不在時は `matd_unavailable` / exit 13。direct
+    /// fallback は無い）。1 行 1 JSON。`--count` 到達で exit 0、`--timeout-ms`
+    /// 経過で打ち切り（0 = 無期限）。0 件で timeout は exit 3。
+    Listen {
+        /// フィルタ: node_id または node alias（省略 = 全ノード）。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: Option<NodeRef>,
+        /// フィルタ: エンドポイント（alias は --node 指定時のみ解決可）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS")]
+        endpoint: Option<EndpointRef>,
+        /// フィルタ: クラスタ名（chip-tool 表記）または数値 ID。
+        #[arg(short = 'c', long, value_name = "NAME")]
+        cluster: Option<String>,
+        /// フィルタ: 属性名（chip-tool 表記、--cluster 必須）または数値 ID。
+        #[arg(short = 'a', long, value_name = "NAME")]
+        attribute: Option<String>,
+        /// 受信するイベント数（到達で exit 0）。
+        #[arg(long, value_name = "N", default_value_t = 1,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        count: u32,
+        /// 打ち切りミリ秒（0 = 無期限）。既定 60000。上限 86400000（24h、
+        /// `Instant::now() + Duration` の桁あふれを避ける安全マージン）。
+        #[arg(long = "timeout-ms", value_name = "T", default_value_t = 60_000,
+              value_parser = clap::value_parser!(u64).range(0..=86_400_000))]
+        timeout_ms: u64,
+    },
+
     /// ネットワーク診断スナップショット（メッシュ健全性の分析用）。
     Diag {
         #[command(subcommand)]

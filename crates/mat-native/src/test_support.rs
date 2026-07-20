@@ -14,6 +14,75 @@ use mat_core::error::{ErrorKind, MatError};
 
 use crate::{Establisher, NodeConn};
 
+/// 購読 fake。`priming` は subscribe_wildcard が返す priming チャンク、`live` は
+/// next_report が 1 呼び出し 1 通で払い出すキュー。尽きたら timeout まで待って
+/// kind=Timeout（実セッションの無音と同じ形）。
+pub struct FakeSubConn {
+    pub max_interval_s: u16,
+    pub priming: Vec<mat_controller::im::ReportDataMessage>,
+    pub live: std::collections::VecDeque<mat_controller::im::ReportDataMessage>,
+}
+
+/// onoff on-off=true の AttributeReport 1 件を持つ ReportDataMessage を作る
+/// （テストフィクスチャ共通形）。
+pub fn onoff_report(sub_id: u32, value: bool) -> mat_controller::im::ReportDataMessage {
+    mat_controller::im::ReportDataMessage {
+        reports: vec![mat_controller::im::AttributeReport {
+            endpoint: Some(1),
+            cluster: Some(0x0006),
+            attribute: Some(0x0000),
+            list_append: false,
+            data: Some(serde_json::json!(value)),
+            status: None,
+        }],
+        subscription_id: Some(sub_id),
+        more_chunks: false,
+        suppress_response: false,
+    }
+}
+
+impl Default for FakeSubConn {
+    fn default() -> Self {
+        Self {
+            max_interval_s: 60,
+            priming: vec![onoff_report(1, true)],
+            live: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::SubscribeConn for FakeSubConn {
+    async fn subscribe_wildcard(
+        &mut self,
+    ) -> Result<
+        (
+            crate::SubscriptionInfo,
+            Vec<mat_controller::im::ReportDataMessage>,
+        ),
+        MatError,
+    > {
+        Ok((
+            crate::SubscriptionInfo {
+                subscription_id: 1,
+                max_interval_s: self.max_interval_s,
+            },
+            std::mem::take(&mut self.priming),
+        ))
+    }
+
+    async fn next_report(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<mat_controller::im::ReportDataMessage, MatError> {
+        if let Some(r) = self.live.pop_front() {
+            return Ok(r);
+        }
+        tokio::time::sleep(timeout).await;
+        Err(MatError::new(ErrorKind::Timeout, "fake: no more reports"))
+    }
+}
+
 /// 送信 1 回目に `fail_kind` で失敗するよう設定できる fake セッション。
 /// `sent` は `&mut self` 下でのみ触るので素の `usize` で足りる（atomic 不要）。
 ///
@@ -204,6 +273,14 @@ impl Establisher for FakeEstablisher {
             fail_kind: self.fail_kind,
             ..Default::default()
         }))
+    }
+
+    async fn establish_subscription(
+        &self,
+        _node_id: u64,
+    ) -> Result<Box<dyn crate::SubscribeConn>, MatError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FakeSubConn::default()))
     }
 }
 

@@ -318,6 +318,18 @@ impl NativeBackend {
         .await
     }
 
+    /// 購読専用コネクション（専用ソケット + 専用 CASE）を確立する。warm session
+    /// slot（`with_session`）とは独立 — 購読ポンプが独占する。
+    pub async fn establish_subscription(
+        &self,
+        node_id: u64,
+    ) -> Result<Box<dyn mat_native::SubscribeConn>, MatError> {
+        self.engine
+            .establisher
+            .establish_subscription(node_id)
+            .await
+    }
+
     /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
     /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
     /// （socket）だけを Err にする。

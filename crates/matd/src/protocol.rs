@@ -154,6 +154,18 @@ pub enum Op {
         transition: u16,
         endpoint: u16,
     },
+    /// イベントストリーム購読（matd 専用 op）。ack 1 行の後、フィルタ一致
+    /// イベントを同接続へ流し続ける（「1行=1往復」の唯一の例外）。全省略 = 全イベント。
+    Listen {
+        #[serde(default)]
+        node_id: Option<u64>,
+        #[serde(default)]
+        endpoint: Option<u16>,
+        #[serde(default)]
+        cluster: Option<String>,
+        #[serde(default)]
+        attribute: Option<String>,
+    },
     /// デーモン死活確認（native backend には触れない）。
     Ping,
     /// デーモンを停止する admin op（native backend には触れない）。`matd stop` が送る。
@@ -182,6 +194,7 @@ impl Op {
             | Op::GroupColorTemp { .. }
             | Op::GroupLevel { .. }
             | Op::GroupColor { .. }
+            | Op::Listen { .. }
             | Op::Ping
             | Op::Shutdown => None,
         }
@@ -354,6 +367,32 @@ mod tests {
         );
         assert_eq!(r.op.node_id(), None);
         assert!(matches!(r.op, Op::GroupInvoke { ref args, .. } if args.is_empty()));
+    }
+
+    #[test]
+    fn listen_parses_with_all_filters_optional() {
+        let r = parse(r#"{"op":"listen"}"#);
+        assert_eq!(r.op.node_id(), None);
+        assert!(matches!(
+            r.op,
+            Op::Listen {
+                node_id: None,
+                endpoint: None,
+                cluster: None,
+                attribute: None
+            }
+        ));
+        let r = parse(
+            r#"{"op":"listen","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy"}"#,
+        );
+        assert!(matches!(
+            r.op,
+            Op::Listen {
+                node_id: Some(21),
+                endpoint: Some(1),
+                ..
+            }
+        ));
     }
 
     #[test]

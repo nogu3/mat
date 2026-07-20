@@ -518,6 +518,7 @@ mod tests {
         fn fast_cfg() -> MrpConfig {
             MrpConfig {
                 initial_interval: Duration::from_millis(50),
+                active_interval: Duration::from_millis(50),
                 max_retries: 2,
                 backoff: 1.0,
             }

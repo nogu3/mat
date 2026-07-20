@@ -73,6 +73,7 @@ const ROOT01_PRIV: &[u8] = include_bytes!("fixtures/root01_privkey.bin");
 fn fast_cfg() -> MrpConfig {
     MrpConfig {
         initial_interval: Duration::from_millis(50),
+        active_interval: Duration::from_millis(50),
         max_retries: 3,
         backoff: 1.0,
     }
