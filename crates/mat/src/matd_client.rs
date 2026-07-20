@@ -340,6 +340,13 @@ fn to_op(command: &Command) -> Result<Value, String> {
         // fabric bootstrap は main.rs が経路解決より前に処理するため、
         // ここへは到達しない（網羅 match を保つためだけの腕）。
         Command::Fabric { .. } => return Err(unsupported("fabric")),
+        // listen はストリーミング op で main.rs が経路解決より前に先取りする
+        // （`dispatch_listen` 専用経路）ため、ここへは実際には到達しない。
+        Command::Listen { .. } => {
+            return Err(unsupported(
+                "listen (streaming op; handled before route dispatch)",
+            ))
+        }
     };
     Ok(op)
 }
@@ -394,6 +401,158 @@ fn emit_response(resp: Value) -> ExitCode {
 fn emit_error(kind: ErrorKind, detail: &str) {
     let body = json!({ "error": { "kind": kind, "detail": detail } });
     eprintln!("{body}");
+}
+
+/// listen リクエスト行を組む（None フィルタは省略）。
+fn listen_request_json(
+    node: Option<u64>,
+    endpoint: Option<u16>,
+    cluster: &Option<String>,
+    attribute: &Option<String>,
+) -> Value {
+    let mut op = json!({ "op": "listen" });
+    if let Some(n) = node {
+        op["node_id"] = json!(n);
+    }
+    if let Some(e) = endpoint {
+        op["endpoint"] = json!(e);
+    }
+    if let Some(c) = cluster {
+        op["cluster"] = json!(c);
+    }
+    if let Some(a) = attribute {
+        op["attribute"] = json!(a);
+    }
+    op
+}
+
+/// `mat listen`: matd へ接続し、ack 後のイベント行をそのまま stdout へ流す。
+/// count/timeout は mat 側制御（enl listen と同じ UX）。matd 不在・応答なし・
+/// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。
+pub fn dispatch_listen(socket: &Path, command: &Command) -> ExitCode {
+    let Command::Listen {
+        node_id,
+        endpoint,
+        cluster,
+        attribute,
+        count,
+        timeout_ms,
+    } = command
+    else {
+        unreachable!("dispatch_listen called with non-Listen command");
+    };
+    let op = listen_request_json(
+        node_id.as_ref().map(NodeRef::id),
+        endpoint.as_ref().map(mat_core::alias::EndpointRef::id),
+        cluster,
+        attribute,
+    );
+
+    let stream = match UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_error(
+                ErrorKind::MatdUnavailable,
+                &format!(
+                    "matd not reachable at {} ({e}); `mat listen` requires a running matd",
+                    socket.display()
+                ),
+            );
+            return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
+        }
+    };
+
+    match run_listen_stream(stream, &op, *count, *timeout_ms) {
+        Ok(code) => code,
+        Err(detail) => {
+            emit_error(ErrorKind::MatdUnavailable, &detail);
+            ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
+        }
+    }
+}
+
+/// ack → イベント行ループ。戻り値 Ok(exit code) / Err(detail) = matd 落ち扱い。
+fn run_listen_stream(
+    mut stream: UnixStream,
+    op: &Value,
+    count: u32,
+    timeout_ms: u64,
+) -> Result<ExitCode, String> {
+    use std::time::{Duration, Instant};
+
+    let mut line = serde_json::to_vec(op).map_err(|e| format!("failed to encode request: {e}"))?;
+    line.push(b'\n');
+    stream
+        .write_all(&line)
+        .map_err(|e| format!("failed to send listen request to matd: {e}"))?;
+
+    let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
+    let mut reader = BufReader::new(stream);
+    let mut received: u32 = 0;
+    let mut first = true; // 1 行目は ack（または即エラー）
+
+    loop {
+        // 残り時間を socket の read timeout に反映（0 = 無期限）。
+        if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(finish_on_timeout(received));
+            }
+            reader
+                .get_ref()
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| format!("failed to set read timeout: {e}"))?;
+        }
+        let mut buf = String::new();
+        match reader.read_line(&mut buf) {
+            Ok(0) => {
+                // EOF = matd がストリーム途中で落ちた（出力済みイベントはそのまま）。
+                return Err("matd closed the event stream".to_string());
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(finish_on_timeout(received));
+            }
+            Err(e) => return Err(format!("failed to read from matd: {e}")),
+        }
+        let v: Value = serde_json::from_str(&buf)
+            .map_err(|e| format!("matd sent non-JSON line: {e}; body={buf}"))?;
+        if let Some(err) = v.get("error") {
+            // ack 前のエラー（フィルタ不正等）/ ストリーム中の lag 切断。
+            eprintln!("{v}");
+            let kind = err
+                .get("kind")
+                .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
+                .unwrap_or(ErrorKind::Other);
+            return Ok(ExitCode::from(kind.exit_code()));
+        }
+        if first {
+            // ack 行 `{"listening":true}` は出力せず読み捨てる。
+            first = false;
+            if v.get("listening").is_none() {
+                return Err(format!("matd listen ack malformed: {v}"));
+            }
+            continue;
+        }
+        println!("{v}");
+        received += 1;
+        if received >= count {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+}
+
+/// timeout 打ち切り: 0 件なら timeout(exit 3)、1 件以上なら成功（enl 準拠）。
+fn finish_on_timeout(received: u32) -> ExitCode {
+    if received == 0 {
+        emit_error(ErrorKind::Timeout, "no events received within --timeout-ms");
+        ExitCode::from(ErrorKind::Timeout.exit_code())
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]
@@ -652,6 +811,26 @@ mod tests {
                 "hue_raw":169,"saturation_raw":254,
                 "hue":240,"saturation":100,"transition":0,"endpoint":1,
                 "name":"blue","rgb":"#0000ff"
+            })
+        );
+    }
+
+    #[test]
+    fn listen_request_json_omits_absent_filters() {
+        assert_eq!(
+            listen_request_json(None, None, &None, &None),
+            json!({"op":"listen"})
+        );
+        assert_eq!(
+            listen_request_json(
+                Some(21),
+                Some(1),
+                &Some("occupancysensing".into()),
+                &Some("occupancy".into()),
+            ),
+            json!({
+                "op":"listen","node_id":21,"endpoint":1,
+                "cluster":"occupancysensing","attribute":"occupancy"
             })
         );
     }

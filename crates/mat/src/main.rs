@@ -66,6 +66,29 @@ fn main() -> ExitCode {
         };
     }
 
+    // listen は初の matd 専用 op（direct fallback なし — 常駐なしに購読は成立
+    // しない）。経路解決の socket だけ流用し、Direct（MAT_MATD=falsy）は
+    // matd_unavailable で即エラー。
+    if let Command::Listen { .. } = &command {
+        return match matd_client::resolve_route(
+            &args.matd,
+            std::env::var_os("MAT_MATD_SOCKET"),
+            std::env::var_os("MAT_MATD"),
+        ) {
+            matd_client::Route::Forced(socket) | matd_client::Route::Auto(socket) => {
+                matd_client::dispatch_listen(&socket, &command)
+            }
+            matd_client::Route::Direct => {
+                mat_core::error::MatError::new(
+                    ErrorKind::MatdUnavailable,
+                    "`mat listen` requires matd (MAT_MATD=0 disables it)",
+                )
+                .emit();
+                ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
+            }
+        };
+    }
+
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
     // 失敗時と非対応 op は下の native 直経路へフォールスルー）。store の locate は
