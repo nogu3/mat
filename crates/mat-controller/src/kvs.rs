@@ -553,34 +553,15 @@ impl std::fmt::Debug for GroupCredentials {
     }
 }
 
-/// KeyMapData blob (`f/<idx>/gk/<n>`): struct{ ctx1: group_id, ctx2:
-/// keyset_id, ctx3: next }. Verified against a live v1.4.2.0 store.
-/// Malformed entries yield `None` so the scan can skip them.
-fn parse_keymap_entry(blob: &[u8]) -> Option<(u16, u16)> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
-    let (mut group, mut keyset) = (None, None);
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Uint(v)) => group = u16::try_from(v).ok(),
-            (Tag::Context(2), Value::Uint(v)) => keyset = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_rest_of_container(&mut r, 0).ok()?;
-            }
-            _ => {}
-        }
-    }
-    Some((group?, keyset?))
-}
-
-/// Reads the send credentials for `group_id`: scans the GroupKeyMap
-/// (`f/<idx>/gk/1..=ff`, sparse after removals, so no early stop) for the
-/// keyset id, then takes the first key entry's hash + operational key from
-/// the keyset blob.
+/// Reads the send credentials for `group_id`: walks the GroupKeyMap chain
+/// (`f/<idx>/g` の first_map から `next` を `map_count` 回、書き側
+/// `group_settings::scan_map` と同じ count 駆動) for the keyset id, then
+/// takes the first key entry's hash + operational key from the keyset blob.
+/// keymap id は max+1 で増え続け 0xff を超え得るので、数値走査ではなく
+/// チェーン走査でなければ全エントリに届かない。レコード欠損・TLV 不正は
+/// 読み経路の寛容主義に倣い打ち切り（→ `GroupNotFound`）。base64 として
+/// 壊れた値だけは `decode_b64` の `KvsError` をそのまま上げる（store 破損は
+/// 黙殺しない）。
 pub fn read_group_credentials(
     path: &Path,
     fabric_index: u8,
@@ -589,15 +570,22 @@ pub fn read_group_credentials(
     let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
     let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
     let mut keyset_id = None;
-    for n in 1u32..=0xff {
-        let Some(blob) = decode_b64(section, &format!("f/{fabric_index}/gk/{n:x}"))? else {
-            continue;
-        };
-        if let Some((gid, ksid)) = parse_keymap_entry(&blob) {
-            if gid == group_id {
-                keyset_id = Some(ksid);
+    if let Some(fabric) = decode_b64(section, &format!("f/{fabric_index}/g"))?
+        .and_then(|b| crate::group_settings::parse_fabric_data(&b))
+    {
+        let mut cur = fabric.first_map;
+        for _ in 0..fabric.map_count {
+            let Some(blob) = decode_b64(section, &format!("f/{fabric_index}/gk/{cur:x}"))? else {
+                break;
+            };
+            let Some(km) = crate::group_settings::parse_keymap(&blob) else {
+                break;
+            };
+            if km.group_id == group_id {
+                keyset_id = Some(km.keyset_id);
                 break;
             }
+            cur = km.next;
         }
     }
     let keyset_id = keyset_id.ok_or(KvsError::GroupNotFound {
@@ -1158,7 +1146,7 @@ mod tests {
         std::fs::remove_file(main).ok();
     }
 
-    fn keymap_blob(group_id: u16, keyset_id: u16, next: u8) -> Vec<u8> {
+    fn keymap_blob(group_id: u16, keyset_id: u16, next: u16) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
         w.put_uint(Tag::Context(1), u64::from(group_id));
@@ -1234,6 +1222,7 @@ mod tests {
 
         // group 読み出し（read_group_credentials 経由）: hash が無いと拒否する。
         let path2 = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 1)[..]),
             ("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..]),
             ("f/2/k/3c", &ks_no_hash[..]),
         ]);
@@ -1251,12 +1240,86 @@ mod tests {
         std::fs::remove_file(&path2).ok();
     }
 
+    /// `f/<idx>/g`（FabricData、group_settings::FabricData::serialize と同形の
+    /// ctx1..7 全 Uint struct）のテスト用 blob。keymap チェーンの入口
+    /// （ctx3=first_map / ctx4=map_count）以外はゼロ相当で埋める。
+    fn fabric_data_blob(first_map: u16, map_count: u16) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0); // first_group
+        w.put_uint(Tag::Context(2), 0); // group_count
+        w.put_uint(Tag::Context(3), u64::from(first_map));
+        w.put_uint(Tag::Context(4), u64::from(map_count));
+        w.put_uint(Tag::Context(5), 0xffff); // first_keyset (INVALID)
+        w.put_uint(Tag::Context(6), 0); // keyset_count
+        w.put_uint(Tag::Context(7), 0); // next
+        w.end_container();
+        w.finish()
+    }
+
+    #[test]
+    fn reads_group_credentials_with_keymap_id_beyond_0xff() {
+        // 書き側 (group_settings::write_keymap) は keymap id を max+1 で増やし
+        // 続け再利用しないため、通算 ~254 回の rebind で id が 0xff を超える。
+        // 読み側が数値走査 1..=0xff だとそのエントリが不可視になり
+        // GroupNotFound になる（M8c-2 latent）。チェーン（first_map→next）を
+        // 辿れば id の大きさに関係なく見つかることを固定する。
+        let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(0x100, 1)[..]),
+            ("f/2/gk/100", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
+        ]);
+        let c = read_group_credentials(&path, 2, 10).unwrap();
+        assert_eq!(c.session_id, 0x855f);
+        assert_eq!(c.encryption_key, GROUP_KEY);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn missing_fabric_data_is_group_not_found() {
+        // gk レコードがあっても `f/<idx>/g`（チェーンの入口）が無ければ
+        // GroupNotFound（panic やハードエラーにしない）。実 store では
+        // gk があれば必ず f/<idx>/g も書かれている（上流も mat 書き側も
+        // FabricData を常時維持する）ため、これは corrupt 系の防衛線。
+        let path = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn dangling_chain_link_is_group_not_found() {
+        // first_map / next が実在しないレコードを指していても走査を打ち切り
+        // GroupNotFound（gk/1 の next=7 が欠損 → 本命 gk/4 には届かない）。
+        let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 2)[..]),
+            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 7)[..]),
+            ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
+            ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
+        ]);
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn reads_group_credentials_scanning_past_builtin_entries() {
         // 実機と同形: chip-tool 組み込みサンプル (0x101→0x1a1) が先に居て、
-        // 本命 (group 10 → keyset 0x3c) が gk/4 に居る。
+        // 本命 (group 10 → keyset 0x3c) が gk/4 に居る（id は除去で sparse、
+        // チェーンは gk/1 → gk/4 と繋がっている）。
         let path = write_ini(&[
-            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 2)[..]),
+            ("f/2/g", &fabric_data_blob(1, 2)[..]),
+            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 4)[..]),
             ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
             ("f/2/k/1a1", &keyset_blob_with_hash(&[0xEE; 16], 0x1111)[..]),
             ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
@@ -1269,7 +1332,10 @@ mod tests {
 
     #[test]
     fn group_not_in_keymap_is_group_not_found() {
-        let path = write_ini(&[("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 0)[..])]);
+        let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 1)[..]),
+            ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 0)[..]),
+        ]);
         assert!(matches!(
             read_group_credentials(&path, 2, 10),
             Err(KvsError::GroupNotFound {
@@ -1282,7 +1348,10 @@ mod tests {
 
     #[test]
     fn keymap_hit_without_keyset_blob_is_key_missing() {
-        let path = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
+        let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 1)[..]),
+            ("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..]),
+        ]);
         assert!(matches!(
             read_group_credentials(&path, 2, 10),
             Err(KvsError::KeyMissing(k)) if k == "f/2/k/3c"
@@ -1291,17 +1360,24 @@ mod tests {
     }
 
     #[test]
-    fn malformed_keymap_entry_is_skipped() {
-        // gk/1 が壊れていても gk/2 の本命は見つかる（容認的走査）。
+    fn malformed_keymap_entry_stops_chain_walk() {
+        // チェーン途中の壊れたエントリは next が取れず走査を打ち切る
+        // （panic せず GroupNotFound に落ちる）。旧・数値走査は壊れたエントリを
+        // 飛ばして後続を拾えたが、チェーン走査ではリンクが切れた時点で
+        // 後続には構造的に到達できない。
         let path = write_ini(&[
+            ("f/2/g", &fabric_data_blob(1, 2)[..]),
             ("f/2/gk/1", &[0xFF, 0x00][..]),
             ("f/2/gk/2", &keymap_blob(10, 0x3c, 0)[..]),
             ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
         ]);
-        assert_eq!(
-            read_group_credentials(&path, 2, 10).unwrap().session_id,
-            0x855f
-        );
+        assert!(matches!(
+            read_group_credentials(&path, 2, 10),
+            Err(KvsError::GroupNotFound {
+                fabric_index: 2,
+                group_id: 10
+            })
+        ));
         std::fs::remove_file(path).ok();
     }
 

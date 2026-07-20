@@ -104,6 +104,10 @@ chip-tool `groupsettings` の永続形式を上流ソース
   `RemoveGroupKeyAt`: linked list 繋ぎ替えのみ（prev.next = removed.next /
   先頭なら fabric.first_map = removed.next）、map_count--。**id の再割当・
   詰め直しはしない**（sparse になる — 読み側の `1..=0xff` 全走査と整合）。
+  【訂正 2026-07-20】書き側 id は max+1 で増え続けるため、読み側の
+  `1..=0xff` 数値走査は通算 ~254 rebind で新エントリが不可視になる latent
+  だった。読み側（`kvs::read_group_credentials`）も first_map→next の
+  count 駆動チェーン走査（`scan_map` と同規律）に統一して解消。
 
 ### 鍵導出
 
