@@ -7,3 +7,4 @@ pub mod lock;
 pub mod native;
 pub mod protocol;
 pub mod server;
+pub mod subscription;
