@@ -27,6 +27,9 @@ pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
 pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
 pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
 pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
+pub const CLUSTER_LEVEL_CONTROL: u32 = 0x0008;
+pub const ATTR_CURRENT_LEVEL: u32 = 0x0000;
+pub const CMD_MOVE_TO_LEVEL: u32 = 0x00;
 /// GroupKeyManagement cluster (spec §11.2.7). `KeySetWrite` provisions a
 /// device's epoch key for a `GroupKeySetID`.
 pub const CLUSTER_GROUP_KEY_MANAGEMENT: u32 = 0x003F;
@@ -735,6 +738,21 @@ pub fn encode_move_to_color_temperature_fields(mireds: u16, transition_time_ds: 
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_uint(Tag::Context(0), u64::from(mireds));
+    w.put_uint(Tag::Context(1), u64::from(transition_time_ds));
+    w.put_uint(Tag::Context(2), 0);
+    w.put_uint(Tag::Context(3), 0);
+    w.end_container();
+    w.finish()
+}
+
+/// CommandFields for levelcontrol MoveToLevel (cluster spec §1.6.7.1):
+/// `{0: Level(u8), 1: TransitionTime(u16, 0.1 s units), 2: OptionsMask(u8),
+/// 3: OptionsOverride(u8)}`. Options are fixed to 0 (execute per the
+/// device's Options attribute), matching what chip-tool sends by default.
+pub fn encode_move_to_level_fields(level: u8, transition_time_ds: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(level));
     w.put_uint(Tag::Context(1), u64::from(transition_time_ds));
     w.put_uint(Tag::Context(2), 0);
     w.put_uint(Tag::Context(3), 0);
@@ -1643,6 +1661,27 @@ mod tests {
             "mireds 370 as ctx-tag-0 u16 little-endian, got {bytes:02X?}"
         );
         // transition=30=0x1E が context tag 1 の u8 として載る（0x24 = ctx-tag u8）
+        assert!(
+            bytes.windows(3).any(|w| w == [0x24, 0x01, 0x1E]),
+            "transition 30 as ctx-tag-1 u8, got {bytes:02X?}"
+        );
+    }
+
+    #[test]
+    fn move_to_level_fields_match_wire_shape() {
+        // CommandFields (levelcontrol MoveToLevel, cluster spec §1.6.7.1):
+        // {0: Level(u8), 1: TransitionTime(u16 0.1s),
+        //  2: OptionsMask(u8)=0, 3: OptionsOverride(u8)=0}.
+        // MoveToColorTemperature エンコーダと同じ手筋。
+        let bytes = encode_move_to_level_fields(127, 30);
+        assert_eq!(bytes.first(), Some(&0x15), "opens anonymous struct");
+        assert_eq!(bytes.last(), Some(&0x18), "closes container");
+        // level=127=0x7F が context tag 0 の u8 として載る（0x24 = ctx-tag u8）
+        assert!(
+            bytes.windows(3).any(|w| w == [0x24, 0x00, 0x7F]),
+            "level 127 as ctx-tag-0 u8, got {bytes:02X?}"
+        );
+        // transition=30=0x1E が context tag 1 の u8 として載る
         assert!(
             bytes.windows(3).any(|w| w == [0x24, 0x01, 0x1E]),
             "transition 30 as ctx-tag-1 u8, got {bytes:02X?}"
