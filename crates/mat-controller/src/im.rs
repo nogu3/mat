@@ -9,6 +9,8 @@ use crate::tlv::{copy_value, Element, Reader, Tag, TlvError, Value, Writer};
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
 pub const OPCODE_READ_REQUEST: u8 = 0x02;
+pub const OPCODE_SUBSCRIBE_REQUEST: u8 = 0x03;
+pub const OPCODE_SUBSCRIBE_RESPONSE: u8 = 0x04;
 pub const OPCODE_REPORT_DATA: u8 = 0x05;
 pub const OPCODE_WRITE_REQUEST: u8 = 0x06;
 pub const OPCODE_WRITE_RESPONSE: u8 = 0x07;
@@ -351,6 +353,8 @@ pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeReport {
     pub endpoint: Option<u16>,
+    /// パスの ClusterId（Context 3）。wildcard 購読 report のイベント化に必要。
+    pub cluster: Option<u32>,
     pub attribute: Option<u32>,
     /// path に ListIndex(null) があれば true（チャンク化 list の item 追記）。
     pub list_append: bool,
@@ -364,6 +368,8 @@ pub struct AttributeReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportDataMessage {
     pub reports: Vec<AttributeReport>,
+    /// 購読 report が運ぶ SubscriptionId（tag 0）。read 応答では None。
+    pub subscription_id: Option<u32>,
     pub more_chunks: bool,
     pub suppress_response: bool,
 }
@@ -441,12 +447,16 @@ fn hex_lower(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// `decode_attribute_path_ib` の戻り値: (endpoint, cluster, attribute, list_append).
+type AttributePathFields = (Option<u16>, Option<u32>, Option<u32>, bool);
+
 /// AttributePathIB (spec §8.9.2.2, list) のうち endpoint(Context 2) /
-/// attribute(Context 4) / ListIndex(Context 5, `Null` ならチャンク化 list
-/// への item 追記) を拾う。他フィールド（Node/Cluster/DataVersion 等）は
+/// cluster(Context 3) / attribute(Context 4) / ListIndex(Context 5, `Null` ならチャンク化 list
+/// への item 追記) を拾う。他フィールド（Node/DataVersion 等）は
 /// 読み飛ばす。呼び出し側は path を開く `ListStart` を既に読んでいる前提。
-fn decode_attribute_path_ib(r: &mut Reader) -> Result<(Option<u16>, Option<u32>, bool), ImError> {
+fn decode_attribute_path_ib(r: &mut Reader) -> Result<AttributePathFields, ImError> {
     let mut endpoint = None;
+    let mut cluster = None;
     let mut attribute = None;
     let mut list_append = false;
     loop {
@@ -458,6 +468,11 @@ fn decode_attribute_path_ib(r: &mut Reader) -> Result<(Option<u16>, Option<u32>,
             (Tag::Context(2), Value::Uint(v)) => {
                 endpoint = Some(
                     u16::try_from(v).map_err(|_| ImError::Malformed("endpoint out of range"))?,
+                );
+            }
+            (Tag::Context(3), Value::Uint(v)) => {
+                cluster = Some(
+                    u32::try_from(v).map_err(|_| ImError::Malformed("cluster id out of range"))?,
                 );
             }
             (Tag::Context(4), Value::Uint(v)) => {
@@ -473,17 +488,19 @@ fn decode_attribute_path_ib(r: &mut Reader) -> Result<(Option<u16>, Option<u32>,
             _ => {}
         }
     }
-    Ok((endpoint, attribute, list_append))
+    Ok((endpoint, cluster, attribute, list_append))
 }
+
+/// `decode_attribute_status_ib_full` の戻り値: (endpoint, cluster, attribute, status).
+type AttributeStatusFields = (Option<u16>, Option<u32>, Option<u32>, u8);
 
 /// AttributeStatusIB (spec §8.9.2.2): `{0: Path, 1: StatusIB{0: status, ...}}`,
 /// path も拾う汎用版（`decode_attribute_status_ib` の M2 版とは独立— 既存
 /// API 無改変のため別関数にした）。呼び出し側は AttributeReportIB の
 /// anonymous `StructStart`（tag 0）を既に読んでいる前提。
-fn decode_attribute_status_ib_full(
-    r: &mut Reader,
-) -> Result<(Option<u16>, Option<u32>, u8), ImError> {
+fn decode_attribute_status_ib_full(r: &mut Reader) -> Result<AttributeStatusFields, ImError> {
     let mut endpoint = None;
+    let mut cluster = None;
     let mut attribute = None;
     let mut status = None;
     loop {
@@ -493,8 +510,9 @@ fn decode_attribute_status_ib_full(
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ListStart) => {
-                let (ep, attr, _) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, _) = decode_attribute_path_ib(r)?;
                 endpoint = ep;
+                cluster = cl;
                 attribute = attr;
             }
             (Tag::Context(1), Value::StructStart) => {
@@ -522,12 +540,18 @@ fn decode_attribute_status_ib_full(
         }
     }
     let status = status.ok_or(ImError::Malformed("attribute status without StatusIB"))?;
-    Ok((endpoint, attribute, status))
+    Ok((endpoint, cluster, attribute, status))
 }
 
-/// `decode_attribute_data_ib_full` の戻り値: (endpoint, attribute,
+/// `decode_attribute_data_ib_full` の戻り値: (endpoint, cluster, attribute,
 /// list_append, data).
-type AttributeDataFields = (Option<u16>, Option<u32>, bool, Option<serde_json::Value>);
+type AttributeDataFields = (
+    Option<u16>,
+    Option<u32>,
+    Option<u32>,
+    bool,
+    Option<serde_json::Value>,
+);
 
 /// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`,
 /// path も拾い Data を JSON 化する汎用版（`decode_attribute_data_ib` の M2
@@ -535,6 +559,7 @@ type AttributeDataFields = (Option<u16>, Option<u32>, bool, Option<serde_json::V
 /// （tag 1）を既に読んでいる前提。
 fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, ImError> {
     let mut endpoint = None;
+    let mut cluster = None;
     let mut attribute = None;
     let mut list_append = false;
     let mut data = None;
@@ -545,8 +570,9 @@ fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, 
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::ListStart) => {
-                let (ep, attr, la) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, la) = decode_attribute_path_ib(r)?;
                 endpoint = ep;
+                cluster = cl;
                 attribute = attr;
                 list_append = la;
             }
@@ -559,7 +585,7 @@ fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, 
             _ => {}
         }
     }
-    Ok((endpoint, attribute, list_append, data))
+    Ok((endpoint, cluster, attribute, list_append, data))
 }
 
 /// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`,
@@ -567,6 +593,7 @@ fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, 
 /// 呼び出し側は開く anonymous `StructStart` を既に読んでいる前提。
 fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, ImError> {
     let mut endpoint = None;
+    let mut cluster = None;
     let mut attribute = None;
     let mut list_append = false;
     let mut data = None;
@@ -578,14 +605,16 @@ fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, Im
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::StructStart) => {
-                let (ep, attr, s) = decode_attribute_status_ib_full(r)?;
+                let (ep, cl, attr, s) = decode_attribute_status_ib_full(r)?;
                 endpoint = ep;
+                cluster = cl;
                 attribute = attr;
                 status = Some(s);
             }
             (Tag::Context(1), Value::StructStart) => {
-                let (ep, attr, la, d) = decode_attribute_data_ib_full(r)?;
+                let (ep, cl, attr, la, d) = decode_attribute_data_ib_full(r)?;
                 endpoint = ep;
+                cluster = cl;
                 attribute = attr;
                 list_append = la;
                 data = d;
@@ -598,6 +627,7 @@ fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, Im
     }
     Ok(AttributeReport {
         endpoint,
+        cluster,
         attribute,
         list_append,
         data,
@@ -614,6 +644,7 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut reports = Vec::new();
+    let mut subscription_id = None;
     let mut more_chunks = false;
     let mut suppress_response = false;
     loop {
@@ -622,6 +653,12 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
             .ok_or(ImError::Malformed("truncated report data"))?;
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => {
+                subscription_id = Some(
+                    u32::try_from(v)
+                        .map_err(|_| ImError::Malformed("subscription id out of range"))?,
+                );
+            }
             (Tag::Context(1), Value::ArrayStart) => {
                 // AttributeReportIBs: every entry, not just the first.
                 loop {
@@ -651,6 +688,7 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
     }
     Ok(ReportDataMessage {
         reports,
+        subscription_id,
         more_chunks,
         suppress_response,
     })
@@ -673,6 +711,74 @@ pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
+}
+
+/// SubscribeRequestMessage (spec §8.10) の wildcard 版。AttributeRequests は
+/// 全フィールド省略の AttributePathIB 1 本（= 全 endpoint / 全 cluster / 全
+/// attribute）。EventRequests は載せない（v1 は attribute report のみ）。
+pub fn encode_subscribe_request_wildcard(
+    min_interval_floor_s: u16,
+    max_interval_ceiling_s: u16,
+    keep_subscriptions: bool,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), keep_subscriptions);
+    w.put_uint(Tag::Context(1), u64::from(min_interval_floor_s));
+    w.put_uint(Tag::Context(2), u64::from(max_interval_ceiling_s));
+    w.start_array(Tag::Context(3)); // AttributeRequests
+    w.start_list(Tag::Anonymous); // AttributePathIB（全省略 = wildcard）
+    w.end_container();
+    w.end_container();
+    // IsFabricFiltered = true: read と同じ既定（encode_read_request のコメント参照）。
+    w.put_bool(Tag::Context(7), true);
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
+/// SubscribeResponseMessage (spec §8.10): {0: SubscriptionId, 2: MaxInterval}.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeResponse {
+    pub subscription_id: u32,
+    pub max_interval_s: u16,
+}
+
+pub fn decode_subscribe_response(payload: &[u8]) -> Result<SubscribeResponse, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut id = None;
+    let mut max_interval = None;
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated subscribe response"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => {
+                id = Some(
+                    u32::try_from(v)
+                        .map_err(|_| ImError::Malformed("subscription id out of range"))?,
+                );
+            }
+            (Tag::Context(2), Value::Uint(v)) => {
+                max_interval = Some(
+                    u16::try_from(v)
+                        .map_err(|_| ImError::Malformed("max interval out of range"))?,
+                );
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(SubscribeResponse {
+        subscription_id: id.ok_or(ImError::Malformed("subscribe response without id"))?,
+        max_interval_s: max_interval.ok_or(ImError::Malformed(
+            "subscribe response without max interval",
+        ))?,
+    })
 }
 
 /// 複数 ReportDataMessage・リスト追記を統合し attribute id → JSON 値へ。
@@ -2090,6 +2196,109 @@ mod tests {
         assert_eq!(msg.reports.len(), 1);
         let data = msg.reports[0].data.as_ref().unwrap();
         assert_eq!(data.get("0").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    #[test]
+    fn subscribe_request_wildcard_shape() {
+        // SubscribeRequestMessage (spec §8.10): {0: KeepSubscriptions, 1: MinIntervalFloor,
+        // 2: MaxIntervalCeiling, 3: AttributeRequests[[]], 7: IsFabricFiltered, 255: rev}
+        let b = encode_subscribe_request_wildcard(0, 3600, false);
+        let mut r = Reader::new(&b);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        let el = r.next().unwrap().unwrap(); // KeepSubscriptions
+        assert_eq!(el.tag, Tag::Context(0));
+        assert_eq!(el.value, Value::Bool(false));
+        let el = r.next().unwrap().unwrap(); // MinIntervalFloorSeconds
+        assert_eq!(el.tag, Tag::Context(1));
+        assert_eq!(el.value, Value::Uint(0));
+        let el = r.next().unwrap().unwrap(); // MaxIntervalCeilingSeconds
+        assert_eq!(el.tag, Tag::Context(2));
+        assert_eq!(el.value, Value::Uint(3600));
+        let el = r.next().unwrap().unwrap(); // AttributeRequests
+        assert_eq!(el.tag, Tag::Context(3));
+        assert!(matches!(el.value, Value::ArrayStart));
+        // wildcard AttributePathIB = 空 list（endpoint/cluster/attribute 全省略）
+        assert!(matches!(r.next().unwrap().unwrap().value, Value::ListStart));
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::ContainerEnd
+        )); // path
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::ContainerEnd
+        )); // requests
+        let el = r.next().unwrap().unwrap(); // IsFabricFiltered
+        assert_eq!(el.tag, Tag::Context(7));
+        assert_eq!(el.value, Value::Bool(true));
+    }
+
+    #[test]
+    fn subscribe_response_decodes_id_and_max_interval() {
+        // SubscribeResponseMessage: {0: SubscriptionId(u32), 2: MaxInterval(u16), 255: rev}
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 0xDEAD_BEEF);
+        w.put_uint(Tag::Context(2), 120);
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let resp = decode_subscribe_response(&w.finish()).unwrap();
+        assert_eq!(resp.subscription_id, 0xDEAD_BEEF);
+        assert_eq!(resp.max_interval_s, 120);
+    }
+
+    #[test]
+    fn subscribe_response_without_id_is_malformed() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(2), 120);
+        w.end_container();
+        assert!(decode_subscribe_response(&w.finish()).is_err());
+    }
+
+    #[test]
+    fn report_data_message_carries_subscription_id_and_cluster_path() {
+        // 購読 report: {0: SubscriptionId, 1: [AttributeReportIB(onoff on-off=true)], 255: rev}
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 77); // SubscriptionId
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeDataIB
+        w.put_uint(Tag::Context(0), 1); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), 1); // endpoint
+        w.put_uint(Tag::Context(3), 6); // cluster ← 新規に拾う
+        w.put_uint(Tag::Context(4), 0); // attribute
+        w.end_container();
+        w.put_bool(Tag::Context(2), true); // Data
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let m = decode_report_data_message(&w.finish()).unwrap();
+        assert_eq!(m.subscription_id, Some(77));
+        assert_eq!(m.reports.len(), 1);
+        assert_eq!(m.reports[0].endpoint, Some(1));
+        assert_eq!(m.reports[0].cluster, Some(6));
+        assert_eq!(m.reports[0].attribute, Some(0));
+        assert_eq!(m.reports[0].data, Some(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn empty_keepalive_report_decodes_with_no_reports() {
+        // keep-alive: SubscriptionId + rev のみ（AttributeReports 無し）
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 77);
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        let m = decode_report_data_message(&w.finish()).unwrap();
+        assert_eq!(m.subscription_id, Some(77));
+        assert!(m.reports.is_empty());
     }
 
     // M8a Task9: group provision デバイス側専用エンコーダ。

@@ -63,9 +63,12 @@ enum Command {
 }
 
 fn main() {
+    // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
+    // 既定は info（常駐デーモンなので状態遷移は既定で残す）。
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
+            tracing_subscriber::EnvFilter::try_from_env("MAT_LOG")
+                .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
@@ -185,7 +188,18 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         }
     };
 
-    server::serve(&socket, store_path, native)
+    let native = std::sync::Arc::new(native);
+    // listen へのイベント配信路。購読 → broadcast → listen 接続（spec ②）。
+    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(1024);
+    // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
+    // ack だけ返り、イベントは流れない — `mat fabric init` 後の再起動で解消）。
+    let _sub_handles = matd::subscription::spawn_subscription_manager(
+        std::sync::Arc::clone(&native),
+        store_path.clone(),
+        events_tx.clone(),
+    );
+
+    server::serve(&socket, store_path, native, events_tx)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }

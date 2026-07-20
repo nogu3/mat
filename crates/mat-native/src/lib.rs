@@ -142,10 +142,53 @@ pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
     w.finish()
 }
 
+/// 購読パラメータ: 人感の即応性優先で floor 0、再購読時に古い購読を掃除するため
+/// KeepSubscriptions=false。ceiling は当初 3600s（電池優先）だったが、実機 E2E で
+/// 「flaky リンクのデバイスがレポート配送失敗時に購読を黙って破棄 → こちらは
+/// MaxInterval×1.5 = 90 分間死活を検知できない」盲目窓が核心機能を殺すと判明し
+/// 300s に短縮（keepalive 5 分毎、死活検知 ≤7.5 分で自動再購読）。
+pub const SUBSCRIBE_MIN_INTERVAL_FLOOR_S: u16 = 0;
+pub const SUBSCRIBE_MAX_INTERVAL_CEILING_S: u16 = 300;
+pub const SUBSCRIBE_KEEP_SUBSCRIPTIONS: bool = false;
+
+/// 購読成立の結果（SubscriptionId とデバイス選択の MaxInterval）。
+#[derive(Debug, Clone, Copy)]
+pub struct SubscriptionInfo {
+    pub subscription_id: u32,
+    pub max_interval_s: u16,
+}
+
+/// 購読専用コネクション（専用 UdpTransport + 専用 CASE をポンプが独占する。
+/// 既存 op 経路 = warm session は不変 — spec 構造判断）。
+#[async_trait]
+pub trait SubscribeConn: Send {
+    /// wildcard Subscribe を張り、成立情報と priming report 群を返す。
+    async fn subscribe_wildcard(
+        &mut self,
+    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError>;
+    /// 次のデバイス発 report を待つ（keep-alive は reports 空で返る）。
+    /// 無音 `timeout` 経過は kind=Timeout。
+    async fn next_report(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<mat_controller::im::ReportDataMessage, MatError>;
+}
+
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
 #[async_trait]
 pub trait Establisher: Send + Sync {
     async fn establish(&self, node_id: u64) -> Result<Box<dyn NodeConn>, MatError>;
+    /// 購読専用の transport + CASE を別に確立する（matd SubscriptionManager 用）。
+    /// 既定は非対応 — 実確立器（CaseEstablisher）だけが上書きする。
+    async fn establish_subscription(
+        &self,
+        _node_id: u64,
+    ) -> Result<Box<dyn SubscribeConn>, MatError> {
+        Err(MatError::new(
+            ErrorKind::Other,
+            "subscription not supported by this establisher",
+        ))
+    }
 }
 
 /// native エンジン: 確立器 + （任意の）group 送信コンテキスト。
@@ -387,12 +430,105 @@ impl Establisher for CaseEstablisher {
             )
         }))
     }
+
+    async fn establish_subscription(
+        &self,
+        node_id: u64,
+    ) -> Result<Box<dyn SubscribeConn>, MatError> {
+        // 購読専用ソケット: op 用の共有 transport と recv を奪い合わないよう、
+        // ノードごとに専用 UdpTransport + 専用 CASE を確立する（spec 構造判断）。
+        let transport = UdpTransport::bind().await.map_err(|e| {
+            MatError::new(
+                ErrorKind::Other,
+                format!("native: bind subscription udp: {e}"),
+            )
+        })?;
+        // 購読 socket の実ポートは実機切り分け（tcpdump / ss との突合）の鍵なので
+        // 確立ごとに可視化する。
+        let local = transport.local_addr().ok();
+        let transport = Arc::new(Transport::Udp(Arc::new(transport)));
+        let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
+        let resolved = self
+            .resolver
+            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
+            .await
+            .map_err(|e| map_resolve_err(node_id, e))?;
+        let mrp = resolved.mrp_config();
+        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
+        let mut last: Option<MatError> = None;
+        for peer in peers {
+            match case::establish(Arc::clone(&transport), peer, &self.creds, node_id, &mrp).await {
+                Ok(session) => {
+                    tracing::info!(
+                        node_id,
+                        local = %local.map(|a| a.to_string()).unwrap_or_default(),
+                        %peer,
+                        "subscription transport bound (dedicated socket + CASE)"
+                    );
+                    return Ok(Box::new(SubscriptionSession { session, mrp }));
+                }
+                Err(e) => {
+                    last = Some(MatError::new(
+                        ErrorKind::SessionFailed,
+                        format!("native: subscription CASE via {peer}: {e}"),
+                    ));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            MatError::new(
+                ErrorKind::Unreachable,
+                format!("native: no addresses resolved for node {node_id}"),
+            )
+        }))
+    }
 }
 
 /// 実セッション: SecureSession + そのノードの MRP 設定。
 struct SessionConn {
     session: mat_controller::session::SecureSession,
     mrp: MrpConfig,
+}
+
+/// 購読専用の実セッション。
+struct SubscriptionSession {
+    session: mat_controller::session::SecureSession,
+    mrp: MrpConfig,
+}
+
+#[async_trait]
+impl SubscribeConn for SubscriptionSession {
+    async fn subscribe_wildcard(
+        &mut self,
+    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
+        let (resp, priming) = self
+            .session
+            .subscribe_wildcard(
+                SUBSCRIBE_MIN_INTERVAL_FLOOR_S,
+                SUBSCRIBE_MAX_INTERVAL_CEILING_S,
+                SUBSCRIBE_KEEP_SUBSCRIPTIONS,
+                &self.mrp,
+            )
+            .await
+            .map_err(map_session_err)?;
+        Ok((
+            SubscriptionInfo {
+                subscription_id: resp.subscription_id,
+                max_interval_s: resp.max_interval_s,
+            },
+            priming,
+        ))
+    }
+
+    async fn next_report(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<mat_controller::im::ReportDataMessage, MatError> {
+        self.session
+            .next_subscription_report(timeout, &self.mrp)
+            .await
+            .map_err(map_session_err)
+    }
 }
 
 #[async_trait]
@@ -779,5 +915,43 @@ mod tests {
             .resolve(1, [0xAB; 8], 9, std::time::Duration::from_secs(8))
             .await;
         assert!(matches!(out, Err(dnssd::DnssdError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn default_establisher_rejects_subscription() {
+        // Establisher trait の default 実装は購読非対応（CaseEstablisher だけが上書き）。
+        struct NoSub;
+        #[async_trait]
+        impl Establisher for NoSub {
+            async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
+                Err(MatError::new(ErrorKind::Other, "unused"))
+            }
+        }
+        // `.unwrap_err()` would require `Box<dyn SubscribeConn>: Debug`, which
+        // `SubscribeConn` deliberately doesn't require (mirrors `Engine`'s
+        // manual, secret-hiding `Debug` — see its impl above): match instead.
+        let err = match NoSub.establish_subscription(1).await {
+            Err(e) => e,
+            Ok(_) => panic!("default establish_subscription must reject"),
+        };
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("subscription"));
+    }
+
+    #[tokio::test]
+    async fn fake_establisher_serves_scripted_subscription() {
+        use crate::test_support::{FakeEstablisher, FakeSubConn};
+        let est = FakeEstablisher::default();
+        let mut conn = est.establish_subscription(5).await.unwrap();
+        let (info, priming) = conn.subscribe_wildcard().await.unwrap();
+        assert_eq!(info.max_interval_s, 60);
+        assert_eq!(priming.len(), 1); // default fake は onoff=true の priming 1 チャンク
+                                      // scripted report が尽きたら next_report は timeout で Err(Timeout)。
+        let err = conn
+            .next_report(std::time::Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        let _ = FakeSubConn::default(); // 型が公開されていること
     }
 }

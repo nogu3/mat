@@ -246,6 +246,40 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 },
             },
         },
+        Command::Listen {
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            count,
+            timeout_ms,
+        } => {
+            let node = node_id.map(|n| book.resolve_node(&n)).transpose()?;
+            let endpoint = match endpoint {
+                None => None,
+                Some(e) => Some(match node {
+                    Some(n) => EndpointRef::Id(book.resolve_endpoint(n, &e)?),
+                    // node 文脈が無いと endpoint alias は解決できない（数値のみ可）。
+                    None => match e {
+                        EndpointRef::Id(v) => EndpointRef::Id(v),
+                        EndpointRef::Alias(a) => {
+                            return Err(MatError::new(
+                                ErrorKind::Other,
+                                format!("endpoint alias {a:?} requires --node"),
+                            ))
+                        }
+                    },
+                }),
+            };
+            Command::Listen {
+                node_id: node.map(NodeRef::Id),
+                endpoint,
+                cluster,
+                attribute,
+                count,
+                timeout_ms,
+            }
+        }
         Command::Diag { action } => Command::Diag {
             action: match action {
                 DiagCommand::Thread { node_id, endpoint } => {
@@ -406,6 +440,38 @@ mod tests {
             Command::Describe { node_id } => assert_eq!(node_id, NodeRef::Id(5)),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn listen_resolves_node_alias_and_rejects_endpoint_alias_without_node() {
+        let dir = store_with(SAMPLE);
+        let cmd = Command::Listen {
+            node_id: Some(NodeRef::Alias("living-light".into())),
+            endpoint: Some(EndpointRef::Alias("night".into())),
+            cluster: None,
+            attribute: None,
+            count: 1,
+            timeout_ms: 60_000,
+        };
+        match resolve_command(cmd, dir.path()).unwrap() {
+            Command::Listen {
+                node_id, endpoint, ..
+            } => {
+                assert_eq!(node_id, Some(NodeRef::Id(5)));
+                assert_eq!(endpoint, Some(EndpointRef::Id(2)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // node 無しの endpoint alias は解決不能 → エラー（数値なら可）。
+        let cmd = Command::Listen {
+            node_id: None,
+            endpoint: Some(EndpointRef::Alias("night".into())),
+            cluster: None,
+            attribute: None,
+            count: 1,
+            timeout_ms: 60_000,
+        };
+        assert!(resolve_command(cmd, dir.path()).is_err());
     }
 
     #[test]

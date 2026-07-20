@@ -950,6 +950,63 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     （node の一過性 CASE 失敗 ×2 で 2 回中断 → 検証 1〜10 は同一走行で PASS、
     検証 11 は同ハーネスから抽出した同一手順を安定 node で PASS）。
 
+### Phase 5 拡張 — matd 常駐 Subscribe + `mat listen`（0.25.0、2026-07-20）
+
+設計 spec: `docs/superpowers/specs/2026-07-20-matd-subscribe-listen-design.md`。
+目的は人感(OccupancySensing)・開閉(BooleanState)・温湿度などの計測系センサーを
+mat 系だけで扱えるようにすること（脱 HA の一段）。オートメーション（「人感→
+ライトON」ルール）は引き続き casa の責務 — mat/matd はイベント配信までで、
+「scenes, automation はスコープ外」の設計ルールは不変。
+
+- **`listen` は matd の op 列挙に加わった初の matd 専用 op（direct fallback
+  なし）**。常駐なしに購読は成立しないため、`--matd` の強制/自動検出という
+  従来の経路解決を経ず、`matd` が見つからなければ direct へフォールバックせず
+  即 `matd_unavailable`（exit 13、`MAT_MATD=0` でも同じ）で終わる。既存の
+  matd-only / direct-only op（`group grant` 等）とは逆方向の非対称が新たに
+  1 種類増えたことになる。
+- **構造判断（購読は専用ソケット + 専用 CASE）**: 既存 `SecureSession` は
+  request-response 前提で、同一 UDP ソケットを既存 op とポンプが同時に recv
+  すると相手のメッセージを吸って壊れる。単一 recv ループ + session/exchange id
+  ルーティングへの demux 全面改修は**やらない**という設計判断をした —
+  ノードごとに購読専用の `UdpTransport` + CASE セッションを別途確立し、ポンプが
+  独占する。既存 op 経路（warm session）は無改変。コストは購読ノードあたり
+  CASE セッション 1 本の常駐。
+- **購読パラメータ**: `MinIntervalFloor = 0`（人感の即応性優先）、
+  `MaxIntervalCeiling = 300s`（当初 3600s だったが、実機 E2E で「flaky リンクの
+  デバイスはレポート配送失敗時に購読を黙って破棄し、subscriber の死活検知は
+  keepalive 周期 ×1.5 の無音でしか効かない」ことが判明。3600s では盲目窓が
+  最長 90 分になり核心機能が沈黙するため、300s（盲目窓 ≤7.5 分）へ短縮した —
+  2026-07-21 fix spec）、`KeepSubscriptions = false`（matd 再購読時に古い購読を
+  掃除）。失敗・死亡（MaxInterval の 1.5 倍を超える無音）時は指数 backoff
+  （5s 開始、上限 5min）で再購読。リトライは debug ログ、確立/喪失の状態遷移
+  のみ info。
+- **イベント配信**: 各ノードの購読ポンプ → `tokio::sync::broadcast` → `mat
+  listen` 接続ごとの購読者へフィルタ付きでファンアウト。遅い listener の lag
+  は黙って欠落させず、その listener にだけエラー行
+  (`{"error":{"kind":"other","detail":"event stream lagged"}}`) を送って切断。
+  イベント形式は `mat` スキーマ（`timestamp`/`node_id`/`endpoint`/`cluster`/
+  `attribute`/`value`/`priming`）。scalar 値のみイベント化（list/struct は
+  generic read と同じ既知の制限で debug ログのみに捨てる）。`priming: true`
+  は購読(再)確立直後の初回全量 report 由来であることを示すフラグ — casa が
+  matd 再起動直後の残留状態を新規トリガと誤認しないために存在する。
+- **matd は状態を持たない**: イベントのリングバッファ/リプレイはやらない（
+  聞いている間だけ届く、`enl listen` と同じ契約）。設計ルール4（KVS 以外の
+  永続状態を持たない）は listen の実装でも破っていない — 購読状態はプロセス
+  メモリ上のみで、matd 再起動で消え、起動時に commissioned 全ノードへの
+  wildcard 再購読からやり直す。
+- **v1 スコープ外（将来）**: EventReport 受信（Generic Switch 等のボタン、
+  im.rs の EventRequests/EventReportIB デコード追加で載る設計余地は確保
+  済み）、`DataVersionFilter`、LIT ICD 対応（ICDManagement register-client +
+  check-in 受信、対象は常時給電 + SIT sleepy まで）、`<store>/subscriptions.toml`
+  （対象ノード/パスの絞り込み — 無ければ v1 既定どおり全ノード、aliases.toml
+  と同じ「無ければ既定動作」規律）、状態スナップショット op / イベント
+  リプレイ。
+- テストは実デバイス不要の既存パターン（`ReliableChannel` ペアでの購読
+  ハンドシェイク/ポンプ/死亡検知、matd server の listen op ack→ストリーム→
+  フィルタ→lag 切断、バイナリ統合テストの count/timeout/exit code）で fragile
+  part を釘打ち。実機 E2E（人感未着でも Nanoleaf の on-off 変化で検証可能）は
+  実装・デプロイ後の別セッションで実施予定 — 本タスクの時点では未実施。
+
 ---
 
 ## Things we never do

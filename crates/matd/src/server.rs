@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use mat_controller::im;
 use mat_core::error::{ErrorKind, MatError};
@@ -27,6 +27,7 @@ use mat_core::store::Store;
 
 use crate::native::NativeBackend;
 use crate::protocol::{Op, Request};
+use crate::subscription::Event;
 
 /// native backend の構築結果。起動時に一度だけ試み、失敗しても matd 自体は
 /// 常駐を続ける（M8c-3: KVS 不在でも起動し、後から `mat fabric init` できる
@@ -51,7 +52,8 @@ impl NativeState {
 pub async fn serve(
     socket_path: &Path,
     store_path: PathBuf,
-    native: NativeState,
+    native: Arc<NativeState>,
+    events: broadcast::Sender<Event>,
 ) -> std::io::Result<()> {
     tracing::info!(native_ready = native.is_ready(), "matd backend");
     // 前回の残骸を掃除してから bind。
@@ -64,7 +66,6 @@ pub async fn serve(
     // shutdown op（`matd stop`）で serve ループを抜けるための通知。
     let shutdown = Arc::new(Notify::new());
 
-    let native = Arc::new(native);
     let store_path = Arc::new(store_path);
     loop {
         tokio::select! {
@@ -73,8 +74,10 @@ pub async fn serve(
                 let native = Arc::clone(&native);
                 let store_path = Arc::clone(&store_path);
                 let shutdown = Arc::clone(&shutdown);
+                let events = events.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, native, store_path, shutdown).await {
+                    if let Err(e) = handle_conn(stream, native, store_path, shutdown, events).await
+                    {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
                 });
@@ -97,11 +100,15 @@ pub async fn serve(
 }
 
 /// 1 接続。複数行のリクエストを順に処理し、各行に 1 行 JSON で応答する。
+///
+/// `listen` op だけは例外: ack 1 行を送った後、この接続を占有してフィルタ一致
+/// イベントを流し続ける（`stream_events` に委譲して抜ける）。
 async fn handle_conn(
     stream: UnixStream,
     native: Arc<NativeState>,
     store_path: Arc<PathBuf>,
     shutdown: Arc<Notify>,
+    events: broadcast::Sender<Event>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -109,6 +116,39 @@ async fn handle_conn(
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
+        }
+        // listen だけは「ack 1 行 + 以後ストリーム」の例外。この接続を占有する。
+        if let Ok(req) = serde_json::from_str::<Request>(&line) {
+            if let Op::Listen {
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+            } = &req.op
+            {
+                let filter = match ListenFilter::from_op(node_id, endpoint, cluster, attribute) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let mut buf = serde_json::to_vec(&error_response(req.id, &e))
+                            .unwrap_or_else(|_| b"{}".to_vec());
+                        buf.push(b'\n');
+                        write_half.write_all(&buf).await?;
+                        write_half.flush().await?;
+                        return Ok(());
+                    }
+                };
+                // ack より先に subscribe（ack 直後のイベントを取りこぼさない）。
+                let rx = events.subscribe();
+                let mut ack = json!({ "timestamp": now_iso8601(), "listening": true });
+                if let (Value::Object(map), Some(id)) = (&mut ack, req.id) {
+                    map.insert("id".into(), id);
+                }
+                let mut buf = serde_json::to_vec(&ack).unwrap_or_else(|_| b"{}".to_vec());
+                buf.push(b'\n');
+                write_half.write_all(&buf).await?;
+                write_half.flush().await?;
+                return stream_events(rx, filter, &mut lines, &mut write_half).await;
+            }
         }
         let (response, is_shutdown) = dispatch(&line, &native, &store_path).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
@@ -122,6 +162,120 @@ async fn handle_conn(
         }
     }
     Ok(())
+}
+
+/// listen ストリーム: フィルタ一致イベントを NDJSON で流し続ける。lag した
+/// listener は黙って欠落させず、エラー行を送って切断する（spec ②）。
+/// クライアント切断（EOF）でも抜ける。
+async fn stream_events(
+    mut rx: broadcast::Receiver<Event>,
+    filter: ListenFilter,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    loop {
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Ok(ev) => {
+                    if !filter.matches(&ev) {
+                        continue;
+                    }
+                    let mut buf = serde_json::to_vec(&ev.to_json())
+                        .unwrap_or_else(|_| b"{}".to_vec());
+                    buf.push(b'\n');
+                    write_half.write_all(&buf).await?;
+                    write_half.flush().await?;
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "listen client lagged; disconnecting");
+                    let body = json!({
+                        "error": { "kind": "other", "detail": "event stream lagged" },
+                        "timestamp": now_iso8601(),
+                    });
+                    let mut buf = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+                    buf.push(b'\n');
+                    write_half.write_all(&buf).await?;
+                    write_half.flush().await?;
+                    return Ok(());
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            line = lines.next_line() => {
+                // クライアント切断（None/Err）でストリーム終了。listen 中の追加
+                // リクエスト行は無視する（この op は接続占有の例外）。
+                match line {
+                    Ok(Some(_)) => continue,
+                    _ => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// listen のイベントフィルタ。リクエストの cluster/attribute 名はここで数値へ
+/// 解決して照合する（イベント側は数値を持つ）。属性名は cluster 無しでは解決
+/// できない（数値なら可）。
+#[derive(Debug)]
+pub(crate) struct ListenFilter {
+    node_id: Option<u64>,
+    endpoint: Option<u16>,
+    cluster: Option<u32>,
+    attribute: Option<u32>,
+}
+
+impl ListenFilter {
+    pub(crate) fn from_op(
+        node_id: &Option<u64>,
+        endpoint: &Option<u16>,
+        cluster: &Option<String>,
+        attribute: &Option<String>,
+    ) -> Result<Self, MatError> {
+        let cluster_id = match cluster {
+            None => None,
+            Some(c) => Some(mat_core::ids::resolve_cluster(c).ok_or_else(|| {
+                MatError::parse_error(format!(
+                    "unknown cluster name {c:?}; numeric IDs are accepted"
+                ))
+            })?),
+        };
+        let attribute_id =
+            match attribute {
+                None => None,
+                Some(a) => match cluster_id {
+                    Some(cid) => Some(
+                        mat_core::ids::resolve_attribute(cid, a)
+                            .ok_or_else(|| {
+                                MatError::parse_error(format!(
+                                    "unknown attribute name {a:?}; numeric IDs are accepted"
+                                ))
+                            })?
+                            .id,
+                    ),
+                    None => match mat_core::ids::parse_num(a) {
+                        Some(n) => Some(
+                            u32::try_from(n)
+                                .map_err(|_| MatError::parse_error("attribute id out of range"))?,
+                        ),
+                        None => return Err(MatError::parse_error(
+                            "attribute name filter requires a cluster filter (or use a numeric id)",
+                        )),
+                    },
+                },
+            };
+        Ok(Self {
+            node_id: *node_id,
+            endpoint: *endpoint,
+            cluster: cluster_id,
+            attribute: attribute_id,
+        })
+    }
+
+    pub(crate) fn matches(&self, ev: &Event) -> bool {
+        self.node_id.is_none_or(|n| n == ev.node_id)
+            && self.endpoint.is_none_or(|e| e == ev.endpoint)
+            && self.cluster.is_none_or(|c| c == ev.cluster)
+            && self.attribute.is_none_or(|a| a == ev.attribute)
+    }
 }
 
 /// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
@@ -171,6 +325,11 @@ async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Valu
     match op {
         Op::Ping => return Ok(json!({ "pong": true })),
         Op::Shutdown => return Ok(json!({ "stopping": true })),
+        // listen は handle_conn が行パース段階で先取りしてストリームへ分岐する
+        // ため、ここには到達しない（防御的に拒否する）。
+        Op::Listen { .. } => {
+            return Err(MatError::parse_error("listen must be the streaming path"))
+        }
         _ => {}
     }
 
@@ -815,6 +974,47 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
 mod tests {
     use super::*;
     use crate::protocol::Op;
+
+    #[test]
+    fn listen_filter_matches_by_resolved_ids() {
+        use crate::subscription::Event;
+        let ev = Event {
+            timestamp: "2026-07-20T00:00:00+09:00".to_string(),
+            node_id: 21,
+            endpoint: 1,
+            cluster: 0x0406,
+            attribute: 0x0000,
+            value: serde_json::json!(1),
+            priming: false,
+        };
+        let f = ListenFilter::from_op(
+            &Some(21),
+            &Some(1),
+            &Some("occupancysensing".into()),
+            &Some("occupancy".into()),
+        )
+        .unwrap();
+        assert!(f.matches(&ev));
+        // node 不一致
+        let f = ListenFilter::from_op(&Some(22), &None, &None, &None).unwrap();
+        assert!(!f.matches(&ev));
+        // 全省略 = 全イベント
+        let f = ListenFilter::from_op(&None, &None, &None, &None).unwrap();
+        assert!(f.matches(&ev));
+        // 数値 cluster/attribute も可
+        let f =
+            ListenFilter::from_op(&None, &None, &Some("0x0406".into()), &Some("0".into())).unwrap();
+        assert!(f.matches(&ev));
+        // 未知 cluster 名は parse_error
+        let err = ListenFilter::from_op(&None, &None, &Some("nosuch".into()), &None).unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::ParseError);
+        // 属性名フィルタは cluster 無しでは解決できない（数値なら可）
+        let err =
+            ListenFilter::from_op(&None, &None, &None, &Some("occupancy".into())).unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::ParseError);
+        let f = ListenFilter::from_op(&None, &None, &None, &Some("0".into())).unwrap();
+        assert!(f.matches(&ev));
+    }
 
     #[test]
     fn hotpath_routing_selects_native_ops() {
