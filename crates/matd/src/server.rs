@@ -207,8 +207,8 @@ async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Valu
     match op {
         Op::GroupProvision { .. } => group_provision(op, native, store_path).await,
         // ここに来るのは Read/Write/Invoke/GroupInvoke で cluster/attribute/command
-        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Describe は常に
-        // is_native_hotpath、GroupColorTemp/GroupColor は native_group_params が
+        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Level/Describe は常に
+        // is_native_hotpath、GroupColorTemp/GroupColor/GroupLevel は native_group_params が
         // 常に Some を返すため到達しない）。
         _ => Err(unresolved_op_error()),
     }
@@ -690,7 +690,7 @@ async fn group_provision(
     }))
 }
 
-/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupColor`）の成功 body。
+/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupLevel`/`GroupColor`）の成功 body。
 fn group_sent_body(op: &Op) -> Value {
     match op {
         Op::GroupInvoke {
