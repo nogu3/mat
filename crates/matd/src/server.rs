@@ -979,6 +979,7 @@ mod tests {
     fn listen_filter_matches_by_resolved_ids() {
         use crate::subscription::Event;
         let ev = Event {
+            timestamp: "2026-07-20T00:00:00+09:00".to_string(),
             node_id: 21,
             endpoint: 1,
             cluster: 0x0406,

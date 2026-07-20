@@ -25,9 +25,12 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// listen へ配る 1 イベント。cluster/attribute は数値で持ち、JSON 化時に
-/// chip-tool 記法へ名前化する（フィルタ照合は数値で行うため）。
+/// chip-tool 記法へ名前化する（フィルタ照合は数値で行うため）。timestamp は
+/// report 受信時に一度だけ採取した値を保持する（listener ごと・emit 時刻での
+/// 再採取はしない — 同一 report 由来のイベントは全リスナーで同じ時刻を返す）。
 #[derive(Debug, Clone)]
 pub struct Event {
+    pub timestamp: String,
     pub node_id: u64,
     pub endpoint: u16,
     pub cluster: u32,
@@ -39,6 +42,8 @@ pub struct Event {
 impl Event {
     /// mat スキーマの NDJSON 1 行分。cluster/attribute は `mat-core::ids` に
     /// あれば chip-tool 記法名、無ければ数値のまま（read と同じ規律）。
+    /// timestamp は report 受信時に採取済みの値をそのまま使う（emit 時刻の
+    /// 再採取はしない）。
     pub fn to_json(&self) -> serde_json::Value {
         let cluster = match mat_core::ids::find_cluster(self.cluster) {
             Some(def) => serde_json::json!(def.name),
@@ -51,7 +56,7 @@ impl Event {
             None => serde_json::json!(self.attribute),
         };
         serde_json::json!({
-            "timestamp": now_iso8601(),
+            "timestamp": self.timestamp.clone(),
             "node_id": self.node_id,
             "endpoint": self.endpoint,
             "cluster": cluster,
@@ -67,6 +72,9 @@ impl Event {
 /// （generic read と同じ既知の制限）。path が欠けた report・status-only も捨てる。
 pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) -> Vec<Event> {
     let mut out = Vec::new();
+    // 1 report から生まれる全イベントで同じ受信時刻を共有する（listener ごと・
+    // emit 時刻での再採取はしない — 同時到着イベントは同じ timestamp が正しい）。
+    let ts = now_iso8601();
     for rep in &msg.reports {
         let (Some(endpoint), Some(cluster), Some(attribute)) =
             (rep.endpoint, rep.cluster, rep.attribute)
@@ -85,6 +93,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             continue;
         }
         out.push(Event {
+            timestamp: ts.clone(),
             node_id,
             endpoint,
             cluster,
@@ -202,6 +211,7 @@ mod tests {
     #[test]
     fn event_json_uses_chip_tool_names_and_numeric_fallback() {
         let ev = Event {
+            timestamp: "2026-07-20T00:00:00+09:00".to_string(),
             node_id: 21,
             endpoint: 1,
             cluster: 0x0406,   // occupancysensing
@@ -216,7 +226,7 @@ mod tests {
         assert_eq!(j["attribute"], "occupancy");
         assert_eq!(j["value"], 1);
         assert_eq!(j["priming"], false);
-        assert!(j["timestamp"].is_string());
+        assert_eq!(j["timestamp"], "2026-07-20T00:00:00+09:00");
 
         // ids テーブルに無いものは数値のまま。
         let ev = Event {

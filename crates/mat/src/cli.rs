@@ -295,8 +295,10 @@ pub enum Command {
         #[arg(long, value_name = "N", default_value_t = 1,
               value_parser = clap::value_parser!(u32).range(1..))]
         count: u32,
-        /// 打ち切りミリ秒（0 = 無期限）。既定 60000。
-        #[arg(long = "timeout-ms", value_name = "T", default_value_t = 60_000)]
+        /// 打ち切りミリ秒（0 = 無期限）。既定 60000。上限 86400000（24h、
+        /// `Instant::now() + Duration` の桁あふれを避ける安全マージン）。
+        #[arg(long = "timeout-ms", value_name = "T", default_value_t = 60_000,
+              value_parser = clap::value_parser!(u64).range(0..=86_400_000))]
         timeout_ms: u64,
     },
 
