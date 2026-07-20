@@ -56,6 +56,9 @@ const CLASS_IN: u16 = 0x0001;
 const QU_CLASS_IN: u16 = 0x8000 | CLASS_IN;
 /// Matter spec §4.12.8: SESSION_IDLE_INTERVAL default and ceiling (ms).
 const MRP_DEFAULT_IDLE_MS: u32 = 500;
+/// Matter 既定の SESSION_ACTIVE_INTERVAL (spec 4.12.8)。TXT に SAI が無い
+/// デバイス向けのフォールバック。
+const MRP_DEFAULT_ACTIVE_MS: u32 = 300;
 const MRP_MAX_INTERVAL_MS: u32 = 3_600_000;
 const QUERY_RESEND_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -170,13 +173,22 @@ impl ResolvedNode {
     /// MRP config seeded from the device's advertised session *idle*
     /// interval (the session is idle until CASE completes), clamped to the
     /// spec ceiling; without TXT it falls back to the Matter default 500 ms.
+    /// The *active* interval (SAI) is carried alongside: retransmits while
+    /// the peer is provably active (recent rx) use it instead of SII
+    /// (spec 4.12.8) — Thread devices advertise SII=5000ms and using that
+    /// mid-exchange loses races against the peer's response timeouts.
     pub fn mrp_config(&self) -> MrpConfig {
-        let ms = self
+        let idle_ms = self
             .session_idle_interval_ms
             .unwrap_or(MRP_DEFAULT_IDLE_MS)
             .clamp(1, MRP_MAX_INTERVAL_MS);
+        let active_ms = self
+            .session_active_interval_ms
+            .unwrap_or(MRP_DEFAULT_ACTIVE_MS)
+            .clamp(1, MRP_MAX_INTERVAL_MS);
         MrpConfig {
-            initial_interval: Duration::from_millis(u64::from(ms)),
+            initial_interval: Duration::from_millis(u64::from(idle_ms)),
+            active_interval: Duration::from_millis(u64::from(active_ms)),
             ..MrpConfig::default()
         }
     }
@@ -1881,6 +1893,33 @@ mod tests {
         // 再送回数/バックオフは既定を保つ
         let d = MrpConfig::default();
         assert_eq!(node.mrp_config().max_retries, d.max_retries);
+    }
+
+    /// active_interval は TXT の SAI から取り、無ければ Matter 既定 300ms。
+    /// SII=5000 の Thread デバイスに対して active 中の再送が 5 秒張り付く
+    /// 実機バグ（購読 priming がデバイス側タイムアウトに負けて 0x80 死）の釘。
+    #[test]
+    fn mrp_config_uses_sai_for_active_interval() {
+        let mut node = ResolvedNode {
+            port: 5540,
+            addresses: vec![],
+            session_idle_interval_ms: Some(5000),
+            session_active_interval_ms: Some(300),
+        };
+        assert_eq!(
+            node.mrp_config().active_interval,
+            Duration::from_millis(300)
+        );
+        node.session_active_interval_ms = None;
+        assert_eq!(
+            node.mrp_config().active_interval,
+            Duration::from_millis(300) // Matter 既定 SESSION_ACTIVE_INTERVAL
+        );
+        node.session_active_interval_ms = Some(999_999_999);
+        assert_eq!(
+            node.mrp_config().active_interval,
+            Duration::from_millis(3_600_000)
+        );
     }
 
     #[test]

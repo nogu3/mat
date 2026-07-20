@@ -63,9 +63,12 @@ enum Command {
 }
 
 fn main() {
+    // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
+    // 既定は info（常駐デーモンなので状態遷移は既定で残す）。
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
+            tracing_subscriber::EnvFilter::try_from_env("MAT_LOG")
+                .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
