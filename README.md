@@ -208,6 +208,14 @@ mat color-temp --node 5 --kelvin 2700
 mat color-temp --node 5 --kelvin 2700 --transition 30
 mat color-temp --node 5 --mireds 370
 
+# Brightness (LevelControl MoveToLevel): give a percentage (0-100) and mat
+# converts to the raw 0-254 level (round(percent / 100 * 254); 255 is
+# reserved). --transition is in tenths of a second (30 = 3 s, default 0).
+# Values outside the device's supported range are clamped by the device
+# itself (mat does not pre-read or validate).
+mat level --node 5 --percent 50
+mat level --node 5 --percent 100 --transition 30
+
 # Hue / saturation (ColorControl MoveToHueAndSaturation): --hue in degrees
 # (0-360) and --sat in percent (0-100), both required. mat converts each to
 # Matter's 0-254 scale (round(v / full * 254); 255 is reserved so full scale
@@ -250,6 +258,10 @@ Outputs:
 // result can be cross-checked against a `color-temperature-mireds` read
 // (when --mireds is given, kelvin is back-computed the same way for the echo)
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "colorcontrol", "command": "move-to-color-temperature", "kelvin": 2700, "mireds": 370, "transition": 0, "status": "success" }
+
+// level — echoes both the input percent and the converted raw level so the
+// result can be cross-checked against a `current-level` read
+{ "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "levelcontrol", "command": "move-to-level", "percent": 50, "level": 127, "transition": 0, "status": "success" }
 
 // color — echoes the input degrees/percent plus the converted 0-254 raw
 // values so the result can be cross-checked against `current-hue` /
@@ -512,17 +524,18 @@ Outputs:
   existing group; `grant` runs just the ACL step instead. It is direct path
   only (`--matd` exits 2).
 
-Color shortcuts for groups (same conversions as the single-node `mat
-color-temp` / `mat color`, delivered as an unacknowledged groupcast — the
-result is `"status": "sent"` only; per-device delivery is not confirmed).
-Like all ColorControl commands sent with optionsMask=0, they only take effect
-on devices that are currently on:
+Color / brightness shortcuts for groups (same conversions as the single-node
+`mat color-temp` / `mat color` / `mat level`, delivered as an unacknowledged
+groupcast — the result is `"status": "sent"` only; per-device delivery is not
+confirmed). Like all ColorControl / LevelControl commands sent with
+optionsMask=0, they only take effect on devices that are currently on:
 
 ```bash
 mat group color-temp --group 1 --kelvin 2700
 mat group color --group 1 --name pink
 mat group color --group 1 --rgb "#ff00aa" --transition 30
 mat group color --group 1 --hue 330 --sat 80
+mat group level --group 1 --percent 100
 ```
 
 ### Routing through `matd`
@@ -592,11 +605,11 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
-  `color-temp` / `color` / `describe` / `group` (`provision` / `invoke` /
-  `color-temp` / `color`; `group grant` is direct only — see Groupcast
-  above). `discover` / `commission` / `fabric init` / `open-window` / `diag`
-  are direct-only: auto-detection skips them silently; explicit `--matd` exits
-  `2`.
+  `color-temp` / `color` / `level` / `describe` / `group` (`provision` /
+  `invoke` / `color-temp` / `color` / `level`; `group grant` is direct only —
+  see Groupcast above). `discover` / `commission` / `fabric init` /
+  `open-window` / `diag` are direct-only: auto-detection skips them silently;
+  explicit `--matd` exits `2`.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 
@@ -743,18 +756,18 @@ mypink = "255,182,193"
 ```
 
 - `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
-  describe / on / off / color-temp / color / open-window / diag thread / diag node) and
+  describe / on / off / color-temp / color / level / open-window / diag thread / diag node) and
   by `--nodes` in `group provision` (each element resolved independently).
 - `groups`: alias → GroupId. Accepted by `-g/--group` in every `group`
-  subcommand (`provision` / `invoke` / `grant` / `color-temp` / `color`).
+  subcommand (`provision` / `invoke` / `grant` / `color-temp` / `color` / `level`).
 - `endpoints`: defined **per node** — the outer key is a node alias or a
   node_id digit string, the inner map is alias → endpoint number (endpoint
   numbers mean different things on different nodes, so there is no global
   endpoint dictionary). Accepted by `-e/--endpoint` on node-taking commands;
   the lookup uses the *resolved* node, so `-n 5 -e main` and
   `-n living-light -e main` give the same result. The `-e` of `group
-  provision` / `group invoke` / `group color-temp` / `group color` is
-  **numeric only** (no node context to resolve against).
+  provision` / `group invoke` / `group color-temp` / `group color` / `group
+  level` is **numeric only** (no node context to resolve against).
 - `colors`: custom color name → RGB value (`#rrggbb` / `rrggbb` / `R,G,B`),
   used by `--name` in `color` / `group color`. Entries are defined as RGB and
   go through the same RGB → HSV pipeline as `--rgb`. A user-defined name

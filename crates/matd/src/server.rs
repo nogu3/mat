@@ -207,8 +207,8 @@ async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Valu
     match op {
         Op::GroupProvision { .. } => group_provision(op, native, store_path).await,
         // ここに来るのは Read/Write/Invoke/GroupInvoke で cluster/attribute/command
-        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Describe は常に
-        // is_native_hotpath、GroupColorTemp/GroupColor は native_group_params が
+        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Level/Describe は常に
+        // is_native_hotpath、GroupColorTemp/GroupColor/GroupLevel は native_group_params が
         // 常に Some を返すため到達しない）。
         _ => Err(unresolved_op_error()),
     }
@@ -230,6 +230,7 @@ pub(crate) fn is_native_hotpath(op: &Op) -> bool {
         | Op::Off { .. }
         | Op::Color { .. }
         | Op::ColorTemp { .. }
+        | Op::Level { .. }
         | Op::Describe { .. } => true,
         Op::Read {
             cluster, attribute, ..
@@ -309,6 +310,17 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                 *transition,
             )),
         ))),
+        Op::GroupLevel {
+            group_id,
+            level,
+            transition,
+            ..
+        } => Some(Ok((
+            *group_id,
+            im::CLUSTER_LEVEL_CONTROL,
+            im::CMD_MOVE_TO_LEVEL,
+            Some(im::encode_move_to_level_fields(*level, *transition)),
+        ))),
         Op::GroupColor {
             group_id,
             hue_raw,
@@ -366,6 +378,18 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
         } => {
             native
                 .color_temp(*node_id, *endpoint, *mireds, *transition)
+                .await?;
+            Ok(hotpath_success_body(op, None))
+        }
+        Op::Level {
+            node_id,
+            endpoint,
+            level,
+            transition,
+            ..
+        } => {
+            native
+                .level(*node_id, *endpoint, *level, *transition)
                 .await?;
             Ok(hotpath_success_body(op, None))
         }
@@ -535,6 +559,19 @@ fn hotpath_success_body(op: &Op, read_value: Option<Value>) -> Value {
             "kelvin": kelvin, "mireds": mireds, "transition": transition,
             "status": "success",
         }),
+        Op::Level {
+            node_id,
+            endpoint,
+            level,
+            percent,
+            transition,
+        } => json!({
+            "node_id": node_id, "endpoint": endpoint,
+            "cluster": "levelcontrol", "command": "move-to-level",
+            // 換算後 level と入力 percent を両方エコー（読み返し突合用; 直経路と同形）。
+            "percent": percent, "level": level, "transition": transition,
+            "status": "success",
+        }),
         Op::Color {
             node_id,
             endpoint,
@@ -653,7 +690,7 @@ async fn group_provision(
     }))
 }
 
-/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupColor`）の成功 body。
+/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupLevel`/`GroupColor`）の成功 body。
 fn group_sent_body(op: &Op) -> Value {
     match op {
         Op::GroupInvoke {
@@ -680,6 +717,19 @@ fn group_sent_body(op: &Op) -> Value {
             "group_id": group_id, "cluster": "colorcontrol",
             "command": "move-to-color-temperature",
             "kelvin": kelvin, "mireds": mireds, "transition": transition,
+            "endpoint": endpoint, "status": "sent",
+            "note": "unacknowledged groupcast; per-device delivery not confirmed",
+        }),
+        Op::GroupLevel {
+            group_id,
+            level,
+            percent,
+            transition,
+            endpoint,
+        } => json!({
+            "group_id": group_id, "cluster": "levelcontrol",
+            "command": "move-to-level",
+            "percent": percent, "level": level, "transition": transition,
             "endpoint": endpoint, "status": "sent",
             "note": "unacknowledged groupcast; per-device delivery not confirmed",
         }),
@@ -793,6 +843,13 @@ mod tests {
             saturation: 100,
             name: None,
             rgb: None,
+            transition: 0
+        }));
+        assert!(is_native_hotpath(&Op::Level {
+            node_id: 1,
+            endpoint: 1,
+            level: 127,
+            percent: 50,
             transition: 0
         }));
         // onoff on-off の read。
@@ -946,6 +1003,18 @@ mod tests {
             fields.unwrap(),
             im::encode_move_to_color_temperature_fields(370, 0)
         );
+
+        let lv = Op::GroupLevel {
+            group_id: 10,
+            level: 254,
+            percent: 100,
+            transition: 0,
+            endpoint: 1,
+        };
+        let (_, cluster, command, fields) = native_group_params(&lv).unwrap().unwrap();
+        assert_eq!(cluster, im::CLUSTER_LEVEL_CONTROL);
+        assert_eq!(command, im::CMD_MOVE_TO_LEVEL);
+        assert_eq!(fields.unwrap(), im::encode_move_to_level_fields(254, 0));
 
         let color = Op::GroupColor {
             group_id: 10,

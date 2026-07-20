@@ -60,6 +60,17 @@ pub enum Op {
         #[serde(default)]
         transition: u16,
     },
+    /// LevelControl MoveToLevel のショートカット（`mat level` 相当）。
+    /// `level` は mat 側で換算済みの 0–254 生値。`percent` は応答へのエコー用
+    /// （換算は mat の 1 箇所に置く — color_temp の mireds/kelvin と同じ約束）。
+    Level {
+        node_id: u64,
+        endpoint: u16,
+        level: u8,
+        percent: u8,
+        #[serde(default)]
+        transition: u16,
+    },
     /// ColorControl MoveToHueAndSaturation のショートカット（`mat color` 相当）。
     /// `hue_raw` / `saturation_raw` は mat 側で換算済みの 0–254 値を受け取る。
     /// `hue`（度）/ `saturation`（%）は応答へのエコー用
@@ -115,6 +126,17 @@ pub enum Op {
         transition: u16,
         endpoint: u16,
     },
+    /// LevelControl MoveToLevel の group ショートカット（`mat group level`
+    /// 相当、groupcast）。`level` は mat 側で換算済み、`percent` はエコー用。
+    /// unacknowledged なので "sent" のみ報告する。
+    GroupLevel {
+        group_id: u16,
+        level: u8,
+        percent: u8,
+        #[serde(default)]
+        transition: u16,
+        endpoint: u16,
+    },
     /// ColorControl MoveToHueAndSaturation の group ショートカット
     /// （`mat group color` 相当、groupcast）。raw は mat 側で換算済み、
     /// 度・%・name・rgb は応答エコー用。unacknowledged なので "sent" のみ報告する。
@@ -152,11 +174,13 @@ impl Op {
             | Op::On { node_id, .. }
             | Op::Off { node_id, .. }
             | Op::ColorTemp { node_id, .. }
+            | Op::Level { node_id, .. }
             | Op::Color { node_id, .. }
             | Op::Describe { node_id } => Some(*node_id),
             Op::GroupProvision { .. }
             | Op::GroupInvoke { .. }
             | Op::GroupColorTemp { .. }
+            | Op::GroupLevel { .. }
             | Op::GroupColor { .. }
             | Op::Ping
             | Op::Shutdown => None,
@@ -230,6 +254,27 @@ mod tests {
         );
         assert_eq!(r.op.node_id(), Some(6));
         assert!(matches!(r.op, Op::ColorTemp { mireds: 370, .. }));
+    }
+
+    #[test]
+    fn level_shortcut_parses() {
+        // level は mat 側で換算済み。percent は応答エコー用。
+        let r = parse(
+            r#"{"op":"level","node_id":6,"endpoint":1,"level":127,"percent":50,"transition":30}"#,
+        );
+        assert_eq!(r.op.node_id(), Some(6));
+        assert!(matches!(r.op, Op::Level { level: 127, .. }));
+        let g =
+            parse(r#"{"op":"group_level","group_id":10,"level":254,"percent":100,"endpoint":1}"#);
+        assert_eq!(g.op.node_id(), None);
+        assert!(matches!(
+            g.op,
+            Op::GroupLevel {
+                level: 254,
+                transition: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

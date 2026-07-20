@@ -198,6 +198,20 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
+        Command::Level {
+            node_id,
+            endpoint,
+            percent,
+            transition,
+        } => {
+            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み level を
+            // 渡し、percent は応答エコー用。
+            let level = crate::commands::invoke::resolve_level(*percent);
+            json!({
+                "op": "level", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "level": level, "percent": percent, "transition": transition,
+            })
+        }
         Command::Color {
             node_id,
             endpoint,
@@ -272,6 +286,20 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 json!({
                     "op": "group_color_temp", "group_id": group_id.id(),
                     "mireds": mireds, "kelvin": kelvin,
+                    "transition": transition, "endpoint": endpoint,
+                })
+            }
+            GroupCommand::Level {
+                group_id,
+                percent,
+                transition,
+                endpoint,
+            } => {
+                // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
+                let level = crate::commands::invoke::resolve_level(*percent);
+                json!({
+                    "op": "group_level", "group_id": group_id.id(),
+                    "level": level, "percent": percent,
                     "transition": transition, "endpoint": endpoint,
                 })
             }
@@ -579,6 +607,25 @@ mod tests {
             json!({
                 "op":"group_color_temp","group_id":1,
                 "mireds":370,"kelvin":2700,"transition":0,"endpoint":1
+            })
+        );
+    }
+
+    #[test]
+    fn group_level_maps_to_group_level_op() {
+        let cmd = Command::Group {
+            action: GroupCommand::Level {
+                group_id: GroupRef::Id(1),
+                percent: 50,
+                transition: 0,
+                endpoint: 1,
+            },
+        };
+        assert_eq!(
+            to_op(&cmd).unwrap(),
+            json!({
+                "op":"group_level","group_id":1,
+                "level":127,"percent":50,"transition":0,"endpoint":1
             })
         );
     }
