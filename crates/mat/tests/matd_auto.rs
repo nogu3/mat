@@ -110,6 +110,26 @@ fn auto_routes_color_temp_with_converted_mireds() {
 }
 
 #[test]
+fn auto_routes_level_with_converted_raw_value() {
+    let store = store_with_node5();
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    let matd = spawn_fake_matd(socket.clone());
+
+    mat_auto(store.path(), &socket)
+        .args(["level", "--node", "5", "--percent", "50"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"via\":\"fake-matd\""));
+
+    // 換算（50% → 127）は mat 側で済んだ状態で matd に届く。
+    let req = matd.join().unwrap();
+    assert!(req.contains("\"op\":\"level\""), "request line: {req}");
+    assert!(req.contains("\"level\":127"), "request line: {req}");
+    assert!(req.contains("\"percent\":50"), "request line: {req}");
+}
+
+#[test]
 fn auto_routes_color_with_converted_values() {
     let store = store_with_node5();
     let dir = TempDir::new().unwrap();

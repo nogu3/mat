@@ -149,6 +149,19 @@ fn group_color_temp_requires_exactly_one_of_kelvin_or_mireds() {
 }
 
 #[test]
+fn group_level_percent_out_of_range_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "level", "--group", "10", "--percent", "101"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args(["group", "level", "--group", "10"])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn group_color_spec_systems_are_mutually_exclusive() {
     let store = store_with_node5();
     mat(store.path())
@@ -259,6 +272,30 @@ fn color_temp_unknown_node_exits_11() {
         .assert()
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn level_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["level", "--node", "99", "--percent", "50"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn level_percent_out_of_range_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["level", "--node", "5", "--percent", "101"])
+        .assert()
+        .code(2);
+    // --percent は必須。
+    mat(store.path())
+        .args(["level", "--node", "5"])
+        .assert()
+        .code(2);
 }
 
 #[test]

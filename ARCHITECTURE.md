@@ -370,7 +370,7 @@ serializes commands over it.
 **Upstream socket protocol.** `matd` listens on a unix socket and speaks
 newline-delimited JSON (one line = one request = one response), same "one op = one
 JSON object" spirit as the `mat` CLI. A request is `{ "id"?, "op", ... }`;
-`op` ∈ `read | write | invoke | on | off | color_temp | color | describe | group | ping`. The response
+`op` ∈ `read | write | invoke | on | off | color_temp | color | level | describe | group | ping`. The response
 is a mat-schema object (with `timestamp`, echoing `id`) or
 `{ "error": { "kind", "detail" } }`. node_id resolution is re-checked against the
 KVS per request.
@@ -396,7 +396,7 @@ on top of that:
   device_rejected, unknown falls back to device_rejected). The `error` value is a
   status-name **string** (e.g. `"FAILURE"`), not numeric.
 - **`mat` client path — auto-detected by default:** for
-  read/write/invoke/on/off/color-temp/color/describe/group, `mat` probes the default `matd`
+  read/write/invoke/on/off/color-temp/color/level/describe/group, `mat` probes the default `matd`
   socket with a connect and, when something answers, routes the call through
   it (std `UnixStream`, newline JSON) instead of spawning chip-tool; on no
   answer it falls back to the direct chip-tool path. `--matd`/`MAT_MATD=1`

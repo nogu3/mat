@@ -126,6 +126,21 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 transition,
             }
         }
+        Command::Level {
+            node_id,
+            endpoint,
+            percent,
+            transition,
+        } => {
+            let node = book.resolve_node(&node_id)?;
+            let ep = book.resolve_endpoint(node, &endpoint)?;
+            Command::Level {
+                node_id: NodeRef::Id(node),
+                endpoint: EndpointRef::Id(ep),
+                percent,
+                transition,
+            }
+        }
         Command::Color {
             node_id,
             endpoint,
@@ -204,6 +219,17 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                     group_id: GroupRef::Id(book.resolve_group(&group_id)?),
                     kelvin,
                     mireds,
+                    transition,
+                    endpoint,
+                },
+                GroupCommand::Level {
+                    group_id,
+                    percent,
+                    transition,
+                    endpoint,
+                } => GroupCommand::Level {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    percent,
                     transition,
                     endpoint,
                 },

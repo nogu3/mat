@@ -1,7 +1,8 @@
 //! clap(derive) による CLI 定義。
 //!
 //! Phase 0: `discover` / `commission`。Phase 1: `read` / `write` / `invoke` /
-//! `describe` / `on` / `off`（後追いの高頻度ショートカットとして `color-temp` / `color` も）。
+//! `describe` / `on` / `off`（後追いの高頻度ショートカットとして `color-temp` / `color` /
+//! `level` も）。
 //! Phase 2: `open-window`。Phase 3: `group provision` / `group invoke`（groupcast）。
 
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ pub struct Cli {
     /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
-    /// matd 対応は read/write/invoke/on/off/color-temp/color/describe/group のみ
+    /// matd 対応は read/write/invoke/on/off/color-temp/color/level/describe/group のみ
     /// （discover/commission/open-window/diag/fabric は常に直経路; fabric 以外は本フラグ明示時は exit 2）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
@@ -204,6 +205,26 @@ pub enum Command {
         /// 色温度（mireds）。`--kelvin` と排他。
         #[arg(long, value_name = "M", value_parser = clap::value_parser!(u16).range(1..))]
         mireds: Option<u16>,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
+    },
+
+    /// LevelControl の MoveToLevel を invoke する高頻度ショートカット（明るさ）。
+    /// `--percent`（0–100）を Matter の 0–254 生値（`round(percent / 100 * 254)`、
+    /// 255 は予約値）へ mat が換算する。0 は消灯相当（挙動はデバイス依存）。
+    /// デバイス対応範囲（min/max level）外はデバイス側が clamp する
+    /// （mat は事前 read / 検証をしない）。
+    Level {
+        /// commission 済みノードの node_id、または aliases.toml の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// エンドポイント番号、または aliases.toml の endpoint alias（既定 1）。
+        #[arg(short = 'e', long, value_name = "EP|ALIAS", default_value = "1")]
+        endpoint: EndpointRef,
+        /// 明るさ（%）。0–100。
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
         /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
         #[arg(long, value_name = "DS", default_value_t = 0)]
         transition: u16,
@@ -406,6 +427,25 @@ pub enum GroupCommand {
         /// 色温度（mireds）。`--kelvin` と排他。
         #[arg(long, value_name = "M", value_parser = clap::value_parser!(u16).range(1..))]
         mireds: Option<u16>,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
+        /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+    },
+
+    /// LevelControl MoveToLevel を group へ multicast する高頻度ショートカット
+    /// （`mat level` の group 版）。`--percent`（0–100）を 0–254 生値へ換算。
+    /// unacknowledged groupcast なので "sent" のみ報告する。点灯中でないと
+    /// 反映されない（ExecuteIfOff は立てない）。
+    Level {
+        /// Matter GroupId、または aliases.toml の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// 明るさ（%）。0–100。
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
         /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
         #[arg(long, value_name = "DS", default_value_t = 0)]
         transition: u16,

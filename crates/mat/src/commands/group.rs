@@ -6,7 +6,7 @@
 //! groupcast 送出は `mat-native::group`）。このモジュールは native 経路から呼ばれる
 //! 成功 JSON の emit のみを持つ（スキーマの単一ソース）。
 //!
-//! groupcast は **unacknowledged**。`invoke` / `color-temp` / `color` は応答を
+//! groupcast は **unacknowledged**。`invoke` / `color-temp` / `level` / `color` は応答を
 //! 受け取れないため "sent" しか報告できない（per-device の配信成否は原理的に取れない）。
 
 use serde_json::json;
@@ -76,6 +76,27 @@ pub(crate) fn emit_color_temp_sent(
         "command": "move-to-color-temperature",
         "kelvin": kelvin,
         "mireds": mireds,
+        "transition": transition,
+        "endpoint": endpoint,
+        "status": "sent",
+        "note": "unacknowledged groupcast; per-device delivery not confirmed",
+    }));
+}
+
+/// `level` の出力部（native 直経路の単一ソース）。
+pub(crate) fn emit_level_sent(
+    group_id: u16,
+    percent: u8,
+    level: u8,
+    transition: u16,
+    endpoint: u16,
+) {
+    output::emit(json!({
+        "group_id": group_id,
+        "cluster": "levelcontrol",
+        "command": "move-to-level",
+        "percent": percent,
+        "level": level,
         "transition": transition,
         "endpoint": endpoint,
         "status": "sent",

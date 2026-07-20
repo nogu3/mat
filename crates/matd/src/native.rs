@@ -16,8 +16,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use mat_controller::im::{
-    self, CLUSTER_COLOR_CONTROL, CLUSTER_ON_OFF, CMD_MOVE_TO_COLOR_TEMPERATURE,
-    CMD_MOVE_TO_HUE_AND_SATURATION, CMD_ON_OFF_OFF, CMD_ON_OFF_ON,
+    self, CLUSTER_COLOR_CONTROL, CLUSTER_LEVEL_CONTROL, CLUSTER_ON_OFF,
+    CMD_MOVE_TO_COLOR_TEMPERATURE, CMD_MOVE_TO_HUE_AND_SATURATION, CMD_MOVE_TO_LEVEL,
+    CMD_ON_OFF_OFF, CMD_ON_OFF_ON,
 };
 use mat_core::error::{ErrorKind, MatError};
 
@@ -218,6 +219,26 @@ impl NativeBackend {
                 endpoint,
                 CLUSTER_COLOR_CONTROL,
                 CMD_MOVE_TO_COLOR_TEMPERATURE,
+                Some(fields.clone()),
+                false,
+            )
+        })
+        .await
+    }
+
+    pub async fn level(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        level: u8,
+        transition: u16,
+    ) -> Result<(), MatError> {
+        let fields = im::encode_move_to_level_fields(level, transition);
+        self.with_session(node_id, move |c| {
+            c.invoke(
+                endpoint,
+                CLUSTER_LEVEL_CONTROL,
+                CMD_MOVE_TO_LEVEL,
                 Some(fields.clone()),
                 false,
             )
