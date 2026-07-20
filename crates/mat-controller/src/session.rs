@@ -2645,4 +2645,48 @@ mod tests {
         assert_eq!(rd.subscription_id, Some(9));
         dev.await.unwrap();
     }
+
+    /// buffer-then-drain: `screen_with` が（`OurExchange`/`PeerExchange` フィルタ
+    /// 中に届いた device 発 ReportData を）`peer_initiated` へ待避した状況を直接
+    /// 再現し、`next_subscription_report` がソケットを読む前にそれを drain して
+    /// 返すことを示す（"pop_front で先に drain" の回帰検知）。dev 側は何も送らない
+    /// ため、drain が外れれば pop_front 後の分岐に落ちてソケット待ちになり、
+    /// 短い timeout で `SessionError::Timeout` になって assert が落ちる。
+    #[tokio::test]
+    async fn next_subscription_report_drains_buffered_report_before_reading_socket() {
+        let (mut s, _dev) = reliable_session_pair();
+
+        let header = MessageHeader {
+            session_id: LOCAL_SID,
+            security_flags: 0,
+            message_counter: 500,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: crate::im::OPCODE_REPORT_DATA,
+            exchange_id: 0x9999,
+            protocol_id: crate::im::PROTOCOL_ID_IM,
+            vendor_id: None,
+        };
+        // screen_with の buffer push (session.rs 内 push_back) と同じ形の
+        // IncomingMessage を、フィルタ落ちで待避済みだった体で直接 peer_initiated
+        // に積む（`tests` は `session` のサブモジュールなので private field に届く）。
+        s.peer_initiated.push_back(IncomingMessage {
+            header,
+            proto,
+            payload: subscription_report_payload(77, true, false),
+        });
+
+        let rd = s
+            .next_subscription_report(Duration::from_millis(200), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd.subscription_id, Some(77));
+        assert_eq!(rd.reports.len(), 1);
+        assert!(s.peer_initiated.is_empty());
+    }
 }
