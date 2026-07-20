@@ -83,6 +83,27 @@ pub(crate) fn emit_color_temp_sent(
     }));
 }
 
+/// `level` の出力部（native 直経路の単一ソース）。
+pub(crate) fn emit_level_sent(
+    group_id: u16,
+    percent: u8,
+    level: u8,
+    transition: u16,
+    endpoint: u16,
+) {
+    output::emit(json!({
+        "group_id": group_id,
+        "cluster": "levelcontrol",
+        "command": "move-to-level",
+        "percent": percent,
+        "level": level,
+        "transition": transition,
+        "endpoint": endpoint,
+        "status": "sent",
+        "note": "unacknowledged groupcast; per-device delivery not confirmed",
+    }));
+}
+
 /// `color` の出力部（native 直経路の単一ソース — M7 Task5）。
 pub(crate) fn emit_color_sent(
     group_id: u16,

@@ -434,6 +434,25 @@ pub enum GroupCommand {
         endpoint: u16,
     },
 
+    /// LevelControl MoveToLevel を group へ multicast する高頻度ショートカット
+    /// （`mat level` の group 版）。`--percent`（0–100）を 0–254 生値へ換算。
+    /// unacknowledged groupcast なので "sent" のみ報告する。点灯中でないと
+    /// 反映されない（ExecuteIfOff は立てない）。
+    Level {
+        /// Matter GroupId、または aliases.toml の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// 明るさ（%）。0–100。
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
+        /// 遷移時間（0.1 秒単位、既定 0 = 即時）。例: 30 = 3 秒。
+        #[arg(long, value_name = "DS", default_value_t = 0)]
+        transition: u16,
+        /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+    },
+
     /// ColorControl MoveToHueAndSaturation を group へ multicast する高頻度
     /// ショートカット（`mat color` の group 版）。色は `--name` / `--rgb` /
     /// `--hue`+`--sat` の 1 系統で指定（名前・RGB は明度を変えない）。

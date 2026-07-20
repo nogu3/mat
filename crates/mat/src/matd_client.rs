@@ -289,6 +289,20 @@ fn to_op(command: &Command) -> Result<Value, String> {
                     "transition": transition, "endpoint": endpoint,
                 })
             }
+            GroupCommand::Level {
+                group_id,
+                percent,
+                transition,
+                endpoint,
+            } => {
+                // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
+                let level = crate::commands::invoke::resolve_level(*percent);
+                json!({
+                    "op": "group_level", "group_id": group_id.id(),
+                    "level": level, "percent": percent,
+                    "transition": transition, "endpoint": endpoint,
+                })
+            }
             GroupCommand::Color {
                 group_id,
                 spec,

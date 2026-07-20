@@ -149,6 +149,19 @@ fn group_color_temp_requires_exactly_one_of_kelvin_or_mireds() {
 }
 
 #[test]
+fn group_level_percent_out_of_range_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "level", "--group", "10", "--percent", "101"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .args(["group", "level", "--group", "10"])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn group_color_spec_systems_are_mutually_exclusive() {
     let store = store_with_node5();
     mat(store.path())
