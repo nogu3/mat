@@ -816,7 +816,11 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 1 | other |
 
 The native backend maps its own transport/IM outcomes onto `3` / `4` / `5` /
-`6`; anything it cannot classify is exit `1`.
+`6`; anything it cannot classify is exit `1`. An operational mDNS resolve
+**timeout** (the node did not advertise within the wait window — often
+recoverable by retrying, since Thread border routers advertise on a ~30s
+cycle) is `timeout` (exit `3`); any other resolve failure (socket I/O, etc.)
+is `unreachable` (exit `5`).
 
 `kind` values (stable; callers may branch on these strings):
 
