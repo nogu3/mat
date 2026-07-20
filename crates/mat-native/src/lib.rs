@@ -355,12 +355,7 @@ impl Establisher for CaseEstablisher {
             .resolver
             .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
             .await
-            .map_err(|e| {
-                MatError::new(
-                    ErrorKind::Unreachable,
-                    format!("native: mDNS resolve node {node_id}: {e}"),
-                )
-            })?;
+            .map_err(|e| map_resolve_err(node_id, e))?;
         let mrp = resolved.mrp_config();
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
         let mut last: Option<MatError> = None;
@@ -502,6 +497,21 @@ impl NodeConn for SessionConn {
     }
 }
 
+/// operational mDNS resolve のエラーを mat の ErrorKind へ写像する。
+/// Timeout は「窓内に広告が取れなかっただけ」（OTBR proxy の ~30s 周期広告は
+/// リトライで跨げば通ることが多い）→ `timeout`(exit 3)。それ以外
+/// （socket I/O 等の構造的失敗）→ `unreachable`(exit 5)。mat 直経路と matd
+/// （常駐キャッシュのミス）は同じ establish を通るので分類は経路で割れない。
+fn map_resolve_err(node_id: u64, e: dnssd::DnssdError) -> MatError {
+    let kind = match e {
+        dnssd::DnssdError::Timeout { .. } => ErrorKind::Timeout,
+        // 非 timeout は構造的失敗 → unreachable。variant 追加時にここで分類を
+        // 決めさせるため wildcard にしない。
+        dnssd::DnssdError::Io(_) | dnssd::DnssdError::Malformed(_) => ErrorKind::Unreachable,
+    };
+    MatError::new(kind, format!("native: mDNS resolve node {node_id}: {e}"))
+}
+
 /// SecureSession のエラーを mat の ErrorKind へ写像する（経路によらず分類を揃える）。
 fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     use mat_controller::session::SessionError;
@@ -555,6 +565,26 @@ mod tests {
         .unwrap();
         let all = conn.read_cluster(1, 0x0006).await.unwrap();
         assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn resolve_timeout_maps_to_timeout_kind() {
+        // resolve timeout は「時間内に広告が取れなかっただけ」（OTBR proxy の
+        // ~30s 周期広告はリトライで跨げば通ることが多い）→ timeout(exit 3)。
+        // socket I/O 等の構造的失敗は unreachable(exit 5) のまま。
+        use mat_controller::dnssd::DnssdError;
+        let e = map_resolve_err(
+            5,
+            DnssdError::Timeout {
+                instance: "x".into(),
+            },
+        );
+        assert_eq!(e.kind, ErrorKind::Timeout);
+        assert!(e.detail.contains("node 5"), "detail: {}", e.detail);
+        let e = map_resolve_err(5, DnssdError::Io(std::io::Error::other("boom")));
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        let e = map_resolve_err(5, DnssdError::Malformed("bad"));
+        assert_eq!(e.kind, ErrorKind::Unreachable);
     }
 
     #[test]
