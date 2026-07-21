@@ -231,7 +231,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         std::sync::Arc::clone(&sub_health),
     );
 
-    server::serve(&socket, store_path, native, events_tx)
+    server::serve(&socket, store_path, native, events_tx, sub_health)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
