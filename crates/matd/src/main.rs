@@ -197,6 +197,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         std::sync::Arc::clone(&native),
         store_path.clone(),
         events_tx.clone(),
+        None,
     );
 
     server::serve(&socket, store_path, native, events_tx)
