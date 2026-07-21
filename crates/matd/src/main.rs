@@ -33,8 +33,8 @@ struct Cli {
     #[arg(long)]
     store: Option<PathBuf>,
 
-    /// 上流 unix socket のパス。未指定なら $XDG_RUNTIME_DIR/matd.sock（無ければ /tmp）。
-    /// serve / stop 両方が使う。
+    /// 上流 unix socket のパス。未指定なら $XDG_RUNTIME_DIR/matd/matd.sock
+    /// （dir は 0700 で自動作成。XDG 不在なら /tmp/matd.sock）。serve / stop 両方が使う。
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -101,10 +101,22 @@ async fn run(cli: Cli) -> Result<(), MatError> {
 
 /// serve: 単一インスタンスロックを取ってから native backend を構築し、socket を bind する。
 async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
-    let socket = cli
-        .socket
-        .clone()
-        .unwrap_or_else(mat_core::socket::default_socket_path);
+    // 既定パス（$XDG_RUNTIME_DIR/matd/matd.sock）のときだけ親 dir を 0700 で
+    // 用意する。明示 --socket の親不在は従来どおり bind エラーに任せる。
+    // lock ファイル（<socket>.lock）も同 dir なので acquire より前に作る。
+    let socket = match cli.socket.clone() {
+        Some(p) => p,
+        None => {
+            let p = mat_core::socket::default_socket_path();
+            mat_core::socket::ensure_socket_dir(&p).map_err(|e| {
+                MatError::new(
+                    ErrorKind::Other,
+                    format!("failed to create socket dir for {}: {e}", p.display()),
+                )
+            })?;
+            p
+        }
+    };
 
     // 二重起動ガード。socket bind より前に取る。_lock はプロセス生存中保持する
     // （Drop でロック解放）。
