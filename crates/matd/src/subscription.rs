@@ -120,6 +120,7 @@ pub fn spawn_subscription_manager(
     native: Arc<NativeState>,
     store_path: PathBuf,
     events: broadcast::Sender<Event>,
+    clusters: Option<Vec<u32>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let node_ids: Vec<u64> = match Store::open(&store_path) {
         Ok(store) => store.nodes().map(|n| n.node_id).collect(),
@@ -128,13 +129,18 @@ pub fn spawn_subscription_manager(
             return Vec::new();
         }
     };
+    // None = subscriptions.toml 無し = full wildcard（空 slice がワイヤ上の wildcard 形）。
+    let clusters: Arc<[u32]> = clusters.unwrap_or_default().into();
     tracing::info!(nodes = node_ids.len(), "subscription manager starting");
     node_ids
         .into_iter()
         .map(|node_id| {
             let native = Arc::clone(&native);
             let events = events.clone();
-            tokio::spawn(async move { node_subscription_loop(node_id, native, events).await })
+            let clusters = Arc::clone(&clusters);
+            tokio::spawn(
+                async move { node_subscription_loop(node_id, native, events, clusters).await },
+            )
         })
         .collect()
 }
@@ -146,13 +152,14 @@ async fn node_subscription_loop(
     node_id: u64,
     native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
+    clusters: Arc<[u32]>,
 ) {
     let NativeState::Ready(backend) = &*native else {
         return;
     };
     let mut backoff = Duration::ZERO;
     loop {
-        match run_subscription_once(node_id, backend, &events).await {
+        match run_subscription_once(node_id, backend, &events, &clusters).await {
             Ok(()) => {
                 // 購読が成立して喪失した: 状態遷移なので info、backoff はリセット。
                 tracing::info!(node_id, "subscription lost; resubscribing");
@@ -173,9 +180,10 @@ async fn run_subscription_once(
     node_id: u64,
     backend: &crate::native::NativeBackend,
     events: &broadcast::Sender<Event>,
+    clusters: &[u32],
 ) -> Result<(), mat_core::error::MatError> {
     let mut conn = backend.establish_subscription(node_id).await?;
-    let (info, priming) = conn.subscribe_wildcard().await?;
+    let (info, priming) = conn.subscribe_wildcard(clusters).await?;
     tracing::info!(
         node_id,
         subscription_id = info.subscription_id,
@@ -314,7 +322,7 @@ mod tests {
             crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let _handles = spawn_subscription_manager(state, dir.path().to_path_buf(), tx);
+        let _handles = spawn_subscription_manager(state, dir.path().to_path_buf(), tx, None);
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -323,5 +331,39 @@ mod tests {
         assert_eq!(ev.node_id, 5);
         assert_eq!(ev.cluster, 0x0006);
         assert!(ev.priming);
+    }
+
+    /// manager 経路: subscriptions.toml 由来のクラスタ集合が SubscribeConn::
+    /// subscribe_wildcard まで届く（絞り込みの配線の釘打ち）。
+    #[tokio::test]
+    async fn manager_passes_clusters_to_subscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
+            })
+            .unwrap();
+
+        let est = FakeEstablisher::default();
+        let seen = std::sync::Arc::clone(&est.sub_clusters);
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            Some(vec![0x0006, 0x0406]),
+        );
+
+        // priming イベントが届いた時点で subscribe_wildcard は呼ばれている。
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no event within 2s")
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![0x0006, 0x0406]);
     }
 }
