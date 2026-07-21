@@ -37,3 +37,5 @@ mat-native = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
+# start_paused=true（op 相関 / born-dead 検知テスト、Task 4）に必須。
+tokio = { version = "1", features = ["test-util"] }

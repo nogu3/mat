@@ -219,6 +219,8 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
             "subscriptions.toml loaded; narrowing resident subscribe paths"
         );
     }
+    // op 相関ヘルス表: server（note_op）と購読 pump（判定）の共有。
+    let sub_health = std::sync::Arc::new(matd::subscription::SubHealth::new(sub_clusters.clone()));
     // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
     // ack だけ返り、イベントは流れない — `mat fabric init` 後の再起動で解消）。
     let _sub_handles = matd::subscription::spawn_subscription_manager(
@@ -226,9 +228,10 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         store_path.clone(),
         events_tx.clone(),
         sub_clusters,
+        std::sync::Arc::clone(&sub_health),
     );
 
-    server::serve(&socket, store_path, native, events_tx)
+    server::serve(&socket, store_path, native, events_tx, sub_health)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }

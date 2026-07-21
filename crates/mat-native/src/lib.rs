@@ -169,12 +169,13 @@ pub trait SubscribeConn: Send {
         &mut self,
         clusters: &[u32],
     ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError>;
-    /// 次のデバイス発 report を待つ（keep-alive は reports 空で返る）。
-    /// 無音 `timeout` 経過は kind=Timeout。
+    /// 次のデバイス発 report を待つ（keep-alive は reports 空の Some で返る）。
+    /// `timeout` 内無音は `Ok(None)` — エラーではない（pump がスライスで刻んで
+    /// 死活判定するための契約）。`Err` はセッション異常のみ。
     async fn next_report(
         &mut self,
         timeout: Duration,
-    ) -> Result<mat_controller::im::ReportDataMessage, MatError>;
+    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError>;
 }
 
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
@@ -528,11 +529,16 @@ impl SubscribeConn for SubscriptionSession {
     async fn next_report(
         &mut self,
         timeout: Duration,
-    ) -> Result<mat_controller::im::ReportDataMessage, MatError> {
-        self.session
+    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+        match self
+            .session
             .next_subscription_report(timeout, &self.mrp)
             .await
-            .map_err(map_session_err)
+        {
+            Ok(msg) => Ok(Some(msg)),
+            Err(mat_controller::session::SessionError::Silence) => Ok(None),
+            Err(e) => Err(map_session_err(e)),
+        }
     }
 }
 
@@ -659,6 +665,9 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     match e {
         // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
         SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
+        // 購読の無音 deadline 切れ。通常は SubscriptionSession::next_report が
+        // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
+        SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
         SessionError::Im(_) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
@@ -951,12 +960,23 @@ mod tests {
         let (info, priming) = conn.subscribe_wildcard(&[]).await.unwrap();
         assert_eq!(info.max_interval_s, 60);
         assert_eq!(priming.len(), 1); // default fake は onoff=true の priming 1 チャンク
-                                      // scripted report が尽きたら next_report は timeout で Err(Timeout)。
-        let err = conn
+                                      // scripted report が尽きたら next_report は timeout まで待って Ok(None)（無音）。
+        let silent = conn
             .next_report(std::time::Duration::from_millis(50))
             .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Timeout);
+            .unwrap();
+        assert!(silent.is_none());
+        // 共有 live キューに積めば次の next_report が払い出す。
+        est.sub_live
+            .lock()
+            .unwrap()
+            .push_back(crate::test_support::onoff_report(1, false));
+        let msg = conn
+            .next_report(std::time::Duration::from_millis(50))
+            .await
+            .unwrap()
+            .expect("live report");
+        assert_eq!(msg.reports.len(), 1);
         let _ = FakeSubConn::default(); // 型が公開されていること
     }
 }

@@ -5,9 +5,12 @@
 //! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 5min）で再購読。
 //! イベントは `tokio::sync::broadcast` で listen 接続へ配る。
 //! 状態は持たない（リングバッファ/リプレイ無し — 聞いている間だけ届く契約）。
+//! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -18,8 +21,6 @@ use mat_core::store::Store;
 
 use crate::server::NativeState;
 
-/// 購読死亡判定: デバイス選択 MaxInterval の 1.5 倍無音でループを抜け再購読。
-const DEATH_FACTOR: f64 = 1.5;
 /// 再購読 backoff の初期値 / 上限。
 const BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -27,6 +28,101 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// 未確立がこの時間続いたら warn を 1 回出す（弱リンクノードの長期ブラインドを
 /// 本番 info/warn レベルで可視化する — 実測で盲目窓が数時間に達した反省）。
 const STUCK_WARN_AFTER: Duration = Duration::from_secs(600);
+
+/// pump の受信待ち 1 スライス。op 相関検知（SubHealth）をこの周期で確認する。
+/// `next_report` は recv → screen → StatusResponse の多段 await で cancel-safe
+/// でないため、`select!` ではなくスライスで刻む（spec §1）。
+const PUMP_SLICE: Duration = Duration::from_secs(5);
+/// 状態変更 op 成功からデバイス発メッセージ皆無をこの時間まで許す（spec §1）。
+const OP_GRACE: Duration = Duration::from_secs(10);
+/// 無音 deadline: デバイス選択 max_interval + この slack。デバイスは
+/// max_interval までに必ず report か keep-alive を送る義務があり、slack は
+/// MRP 再送とジッタの余裕（旧 DEATH_FACTOR 1.5 = 450s を置換、spec §2）。
+const SILENCE_SLACK: Duration = Duration::from_secs(30);
+
+/// 無音 deadline の計算（純関数）。
+pub(crate) fn silence_deadline(max_interval_s: u16) -> Duration {
+    (Duration::from_secs(u64::from(max_interval_s)) + SILENCE_SLACK).max(Duration::from_secs(5))
+}
+
+/// pump 終了理由（純関数 `pump_verdict` の出力 — ログ文言の出し分けに使う）。
+#[derive(Debug, PartialEq)]
+pub(crate) enum PumpEnd {
+    /// 状態変更 op から OP_GRACE 経過してもデバイス発ゼロ（op 相関の born-dead 検知）。
+    OpGrace { since_op: Duration },
+    /// 確立以降デバイス発ゼロのまま無音 deadline 超過（born-dead）。
+    BornDeadSilence,
+    /// 生存実績のあと無音 deadline 超過（通常の購読死）。
+    Silence,
+}
+
+/// pump を殺すべきか判定する（純関数 — 時計は pump が持つ）。
+/// op 相関を無音 deadline より先に評価する（そちらが常に早く満ちるため）。
+pub(crate) fn pump_verdict(
+    proven: bool,
+    since_last_msg: Duration,
+    deadline: Duration,
+    pending_op: Option<Duration>,
+) -> Option<PumpEnd> {
+    if let Some(since_op) = pending_op {
+        if since_op >= OP_GRACE {
+            return Some(PumpEnd::OpGrace { since_op });
+        }
+    }
+    if since_last_msg >= deadline {
+        return Some(if proven {
+            PumpEnd::Silence
+        } else {
+            PumpEnd::BornDeadSilence
+        });
+    }
+    None
+}
+
+/// op 相関ヘルス表: server op 経路（書き手）と購読 pump（読み手）の共有状態。
+/// 「状態変更 op が success したのにデバイス発メッセージが来ない」= レポート
+/// 経路死の証拠、を pending として持つ。ephemeral なランタイム状態のみ
+/// （設計ルール4の永続状態には該当しない）。
+pub struct SubHealth {
+    /// 購読対象クラスタ集合（subscriptions.toml 由来。空 = full wildcard = 全対象）。
+    clusters: Vec<u32>,
+    /// node_id → 未消化の状態変更 op の時刻。
+    pending: Mutex<HashMap<u64, tokio::time::Instant>>,
+}
+
+impl SubHealth {
+    pub fn new(clusters: Option<Vec<u32>>) -> Self {
+        Self {
+            clusters: clusters.unwrap_or_default(),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 状態変更 op が success した。cluster が購読対象なら pending を打つ。
+    pub fn note_op(&self, node_id: u64, cluster: u32) {
+        if !self.clusters.is_empty() && !self.clusters.contains(&cluster) {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(node_id, tokio::time::Instant::now());
+    }
+
+    /// デバイス発メッセージ（keep-alive 含む）や priming を受けた — pending 解除。
+    pub fn clear_pending(&self, node_id: u64) {
+        self.pending.lock().unwrap().remove(&node_id);
+    }
+
+    /// 未消化 op からの経過時間（無ければ None）。
+    pub fn pending_elapsed(&self, node_id: u64) -> Option<Duration> {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .map(|t| t.elapsed())
+    }
+}
 
 /// 確立失敗ログの出し分け（純関数 — 時計はループ側が持つ）。
 /// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 5 分毎に永久に失敗し
@@ -153,6 +249,7 @@ pub fn spawn_subscription_manager(
     store_path: PathBuf,
     events: broadcast::Sender<Event>,
     clusters: Option<Vec<u32>>,
+    health: Arc<SubHealth>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let node_ids: Vec<u64> = match Store::open(&store_path) {
         Ok(store) => store.nodes().map(|n| n.node_id).collect(),
@@ -170,9 +267,10 @@ pub fn spawn_subscription_manager(
             let native = Arc::clone(&native);
             let events = events.clone();
             let clusters = Arc::clone(&clusters);
-            tokio::spawn(
-                async move { node_subscription_loop(node_id, native, events, clusters).await },
-            )
+            let health = Arc::clone(&health);
+            tokio::spawn(async move {
+                node_subscription_loop(node_id, native, events, clusters, health).await
+            })
         })
         .collect()
 }
@@ -185,6 +283,7 @@ async fn node_subscription_loop(
     native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
     clusters: Arc<[u32]>,
+    health: Arc<SubHealth>,
 ) {
     let NativeState::Ready(backend) = &*native else {
         return;
@@ -196,8 +295,10 @@ async fn node_subscription_loop(
     let mut failures: u32 = 0;
     let mut warned = false;
     loop {
-        match run_subscription_once(node_id, backend, &events, &clusters, down_since, failures)
-            .await
+        match run_subscription_once(
+            node_id, backend, &events, &clusters, &health, down_since, failures,
+        )
+        .await
         {
             Ok(()) => {
                 // 購読が成立して喪失した: 状態遷移なので info、状態リセット。
@@ -247,6 +348,7 @@ async fn run_subscription_once(
     backend: &crate::native::NativeBackend,
     events: &broadcast::Sender<Event>,
     clusters: &[u32],
+    health: &SubHealth,
     down_since: tokio::time::Instant,
     prior_failures: u32,
 ) -> Result<(), mat_core::error::MatError> {
@@ -260,29 +362,69 @@ async fn run_subscription_once(
         attempts = prior_failures + 1,
         "subscription established"
     );
+    // priming は現在状態の全量 — down 中の op はここで配信されるので pending 解除。
+    health.clear_pending(node_id);
     for msg in &priming {
         for ev in events_from_report(node_id, msg, true) {
             let _ = events.send(ev); // 受信者ゼロは正常（listen 接続なし）
         }
     }
-    let deadline = Duration::from_secs_f64(f64::from(info.max_interval_s) * DEATH_FACTOR)
-        .max(Duration::from_secs(5)); // MaxInterval が極端に小さくても常識的な下限
+    let deadline = silence_deadline(info.max_interval_s);
     tracing::debug!(
         node_id,
         deadline_s = deadline.as_secs(),
         "report pump running"
     );
+    // 確立以降デバイス発を 1 度でも受けたか（born-dead 判定）。
+    let mut proven = false;
+    let mut last_msg = tokio::time::Instant::now();
     loop {
-        match conn.next_report(deadline).await {
-            Ok(msg) => {
+        if let Some(end) = pump_verdict(
+            proven,
+            last_msg.elapsed(),
+            deadline,
+            health.pending_elapsed(node_id),
+        ) {
+            // 再購読直後に同じ pending で即再発火しないよう先に消す。
+            health.clear_pending(node_id);
+            match end {
+                PumpEnd::OpGrace { since_op } => tracing::info!(
+                    node_id,
+                    since_op_s = since_op.as_secs(),
+                    "report pump ended (op-correlated: no device message after op)"
+                ),
+                PumpEnd::BornDeadSilence => tracing::info!(
+                    node_id,
+                    silent_s = last_msg.elapsed().as_secs(),
+                    "report pump ended (born-dead: no device message since establishment)"
+                ),
+                PumpEnd::Silence => tracing::info!(
+                    node_id,
+                    silent_s = last_msg.elapsed().as_secs(),
+                    "report pump ended (silence past deadline)"
+                ),
+            }
+            return Ok(());
+        }
+        let remaining = deadline.saturating_sub(last_msg.elapsed());
+        let slice = PUMP_SLICE.min(remaining);
+        match conn.next_report(slice).await {
+            Ok(Some(msg)) => {
+                proven = true;
+                last_msg = tokio::time::Instant::now();
+                health.clear_pending(node_id);
                 for ev in events_from_report(node_id, &msg, false) {
                     let _ = events.send(ev);
                 }
-                // keep-alive（reports 空）も無音 deadline をリセットするだけで良い。
+                // keep-alive（reports 空）も受信 = 経路生存の証明として扱う。
+            }
+            Ok(None) => {
+                // スライス無音 — 次周回の pump_verdict で判定する。
             }
             Err(e) => {
-                // 無音死亡 or セッションエラー → 再購読。何で死んだかは切り分けに
-                // 必須なので詳細を残す（直後に caller が「subscription lost」を出す）。
+                // セッションエラー → 再購読。何で死んだかは切り分けに必須なので
+                // 詳細を残す（直後に caller が「subscription lost」を出す）。
+                health.clear_pending(node_id);
                 tracing::info!(node_id, kind = ?e.kind, detail = %e.detail, "report pump ended");
                 return Ok(());
             }
@@ -421,7 +563,9 @@ mod tests {
             crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let _handles = spawn_subscription_manager(state, dir.path().to_path_buf(), tx, None);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles =
+            spawn_subscription_manager(state, dir.path().to_path_buf(), tx, None, health);
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -451,11 +595,13 @@ mod tests {
         let native = crate::native::NativeBackend::with_establisher(Box::new(est));
         let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let health = std::sync::Arc::new(SubHealth::new(None));
         let _handles = spawn_subscription_manager(
             state,
             dir.path().to_path_buf(),
             tx,
             Some(vec![0x0006, 0x0406]),
+            health,
         );
 
         // priming イベントが届いた時点で subscribe_wildcard は呼ばれている。
@@ -464,5 +610,164 @@ mod tests {
             .expect("no event within 2s")
             .unwrap();
         assert_eq!(*seen.lock().unwrap(), vec![0x0006, 0x0406]);
+    }
+
+    #[test]
+    fn silence_deadline_is_max_interval_plus_slack() {
+        assert_eq!(silence_deadline(300), Duration::from_secs(330));
+        assert_eq!(silence_deadline(60), Duration::from_secs(90));
+        // 極端に小さくても常識的な下限（5s）を割らない。
+        assert!(silence_deadline(0) >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn pump_verdict_prioritizes_op_grace_then_silence() {
+        let dl = Duration::from_secs(330);
+        // 平常: 何も返さない。
+        assert!(pump_verdict(true, Duration::from_secs(10), dl, None).is_none());
+        // op から OP_GRACE 未満はまだ待つ。
+        assert!(pump_verdict(
+            true,
+            Duration::from_secs(10),
+            dl,
+            Some(Duration::from_secs(9))
+        )
+        .is_none());
+        // op から OP_GRACE 経過でデバイス発ゼロ → op 相関死。
+        assert!(matches!(
+            pump_verdict(
+                true,
+                Duration::from_secs(15),
+                dl,
+                Some(Duration::from_secs(10))
+            ),
+            Some(PumpEnd::OpGrace { .. })
+        ));
+        // 無音 deadline 超過: 生存実績なし → born-dead、あり → 通常無音死。
+        assert!(matches!(
+            pump_verdict(false, Duration::from_secs(330), dl, None),
+            Some(PumpEnd::BornDeadSilence)
+        ));
+        assert!(matches!(
+            pump_verdict(true, Duration::from_secs(330), dl, None),
+            Some(PumpEnd::Silence)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sub_health_notes_and_clears_pending_respecting_clusters() {
+        // 絞り込み無し = 全 cluster が対象。
+        let h = SubHealth::new(None);
+        assert!(h.pending_elapsed(5).is_none());
+        h.note_op(5, 0x0006);
+        assert!(h.pending_elapsed(5).is_some());
+        h.clear_pending(5);
+        assert!(h.pending_elapsed(5).is_none());
+        // 絞り込みあり: 対象外 cluster の op は無視。
+        let h = SubHealth::new(Some(vec![0x0402]));
+        h.note_op(5, 0x0006);
+        assert!(h.pending_elapsed(5).is_none());
+        h.note_op(5, 0x0402);
+        assert!(h.pending_elapsed(5).is_some());
+    }
+
+    /// op 相関検知: 確立後に note_op して沈黙させると、無音 deadline (90s) を
+    /// 待たず grace+backoff 内（<40s）に再購読 = 2 回目の priming が届く。
+    #[tokio::test(start_paused = true)]
+    async fn op_grace_triggers_fast_resubscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        // 1 回目の priming（確立）。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        // 状態変更 op（デバイス発は来ない = born-dead 相当）。
+        let t0 = tokio::time::Instant::now();
+        health.note_op(5, 0x0006);
+        // grace(10s) + backoff(5s) + スライス誤差内に再購読の priming が届く。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(40), rx.recv())
+            .await
+            .expect("re-priming after op-grace")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(10),
+            "grace より早く殺さない: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(40),
+            "無音 deadline (90s) を待っていないこと: {elapsed:?}"
+        );
+    }
+
+    /// live report（keep-alive 相当含む）が届けば pending は解除され、
+    /// 無音 deadline 前に再購読は起きない。
+    #[tokio::test(start_paused = true)]
+    async fn live_report_clears_pending_without_resubscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let est = FakeEstablisher::default();
+        let live = std::sync::Arc::clone(&est.sub_live);
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        // op → 直後に live report が届く（健全経路）。
+        health.note_op(5, 0x0006);
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event")
+            .unwrap();
+        assert!(!ev.priming);
+        assert!(health.pending_elapsed(5).is_none(), "受信で pending 解除");
+        // 無音 deadline (90s) 未満の 80s の間、再購読（= 追加イベント）は起きない。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(80), rx.recv())
+                .await
+                .is_err(),
+            "健全な購読を殺していないこと"
+        );
     }
 }
