@@ -67,6 +67,9 @@ pub struct SessionKeys {
 #[derive(Debug)]
 pub enum SessionError {
     Timeout,
+    /// 購読 pump の無音 deadline 切れ（受信ゼロ）。MRP 送信 ack 切れの
+    /// `Timeout` とはログ上の意味が全く違うため分離（born-dead 切り分け）。
+    Silence,
     Io(std::io::Error),
     Message(MessageError),
     Crypto(CryptoError),
@@ -78,6 +81,12 @@ impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SessionError::Timeout => write!(f, "no acknowledgement within MRP retry budget"),
+            SessionError::Silence => {
+                write!(
+                    f,
+                    "no device-initiated message within the subscription deadline"
+                )
+            }
             SessionError::Io(e) => write!(f, "transport error: {e}"),
             SessionError::Message(e) => write!(f, "peer sent malformed message: {e}"),
             SessionError::Crypto(e) => write!(f, "session crypto error: {e}"),
@@ -1057,7 +1066,7 @@ impl SecureSession {
 
     /// 購読成立後のデバイス発 ReportData を 1 通受ける。keep-alive（空 report）も
     /// そのまま返す（deadline リセットは呼び出し側 = matd の責務）。`timeout` 無音は
-    /// `SessionError::Timeout`（上位が購読死亡として再購読する）。
+    /// `SessionError::Silence`（上位が購読死亡として再購読する）。
     pub async fn next_subscription_report(
         &mut self,
         timeout: Duration,
@@ -1072,13 +1081,13 @@ impl SecureSession {
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(SessionError::Timeout);
+                    return Err(SessionError::Silence);
                 }
                 let mut buf = [0u8; MAX_DATAGRAM];
                 let Ok(recv) =
                     tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
                 else {
-                    return Err(SessionError::Timeout);
+                    return Err(SessionError::Silence);
                 };
                 let (n, from) = recv?;
                 tracing::debug!(len = n, %from, "sub pump: datagram received");
@@ -2708,14 +2717,15 @@ mod tests {
         dev_task.await.unwrap();
     }
 
-    /// 無音は Timeout（上位=matd が MaxInterval×1.5 で購読死亡と判定して再購読する）。
+    /// 無音は Silence（上位=matd が購読死亡と判定して再購読する）。MRP 送信
+    /// ack 切れの Timeout とは別 variant（pump 終了ログの切り分けに必須）。
     #[tokio::test]
     async fn next_subscription_report_times_out_on_silence() {
         let (mut s, _dev) = reliable_session_pair();
         assert!(matches!(
             s.next_subscription_report(Duration::from_millis(100), &fast_cfg())
                 .await,
-            Err(SessionError::Timeout)
+            Err(SessionError::Silence)
         ));
     }
 
