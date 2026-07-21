@@ -356,6 +356,10 @@ async fn run_op(
         let result = native_op(op, native, store_path).await;
         if result.is_ok() {
             if let Some((node_id, cluster)) = op_report_expectation(op) {
+                // 前提: デバイスは invoke 応答を先に、購読 report を後に送る。
+                // report が note_op より先に pump へ届く逆順だと pending が残り
+                // 健全購読を 1 回余分に再購読するが、それが最悪ケース（イベント
+                // 自体は配信済みで priming が状態を再配達する）。
                 health.note_op(node_id, cluster);
             }
         }
