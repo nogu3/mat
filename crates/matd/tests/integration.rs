@@ -82,8 +82,9 @@ async fn start_matd_with_events(
     let socket_clone = socket.clone();
     let tx2 = tx.clone();
     let native = std::sync::Arc::new(native);
+    let health = std::sync::Arc::new(matd::subscription::SubHealth::new(None));
     let handle = tokio::spawn(async move {
-        let _ = matd::server::serve(&socket_clone, store_path, native, tx2).await;
+        let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health).await;
     });
     (socket, handle, tx)
 }

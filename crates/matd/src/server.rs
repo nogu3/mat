@@ -27,7 +27,7 @@ use mat_core::store::Store;
 
 use crate::native::NativeBackend;
 use crate::protocol::{Op, Request};
-use crate::subscription::Event;
+use crate::subscription::{Event, SubHealth};
 
 /// native backend の構築結果。起動時に一度だけ試み、失敗しても matd 自体は
 /// 常駐を続ける（M8c-3: KVS 不在でも起動し、後から `mat fabric init` できる
@@ -54,6 +54,7 @@ pub async fn serve(
     store_path: PathBuf,
     native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
+    health: Arc<SubHealth>,
 ) -> std::io::Result<()> {
     tracing::info!(native_ready = native.is_ready(), "matd backend");
     // 前回の残骸を掃除してから bind。
@@ -75,8 +76,10 @@ pub async fn serve(
                 let store_path = Arc::clone(&store_path);
                 let shutdown = Arc::clone(&shutdown);
                 let events = events.clone();
+                let health = Arc::clone(&health);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, native, store_path, shutdown, events).await
+                    if let Err(e) =
+                        handle_conn(stream, native, store_path, shutdown, events, health).await
                     {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
@@ -109,6 +112,7 @@ async fn handle_conn(
     store_path: Arc<PathBuf>,
     shutdown: Arc<Notify>,
     events: broadcast::Sender<Event>,
+    health: Arc<SubHealth>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -150,7 +154,7 @@ async fn handle_conn(
                 return stream_events(rx, filter, &mut lines, &mut write_half).await;
             }
         }
-        let (response, is_shutdown) = dispatch(&line, &native, &store_path).await;
+        let (response, is_shutdown) = dispatch(&line, &native, &store_path, &health).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
@@ -279,7 +283,12 @@ impl ListenFilter {
 }
 
 /// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
-async fn dispatch(line: &str, native: &NativeState, store_path: &Path) -> (Value, bool) {
+async fn dispatch(
+    line: &str,
+    native: &NativeState,
+    store_path: &Path,
+    health: &SubHealth,
+) -> (Value, bool) {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -295,7 +304,7 @@ async fn dispatch(line: &str, native: &NativeState, store_path: &Path) -> (Value
     let id = req.id.clone();
     let is_shutdown = matches!(req.op, Op::Shutdown);
 
-    let body = match run_op(&req.op, native, store_path).await {
+    let body = match run_op(&req.op, native, store_path, health).await {
         Ok(mut body) => {
             // id をエコーし、timestamp を必ず付ける（mat スキーマ規約）。
             if let Value::Object(map) = &mut body {
@@ -320,7 +329,12 @@ async fn dispatch(line: &str, native: &NativeState, store_path: &Path) -> (Value
 /// 名前解決できない cluster/attribute/command（chip-tool 互換の任意名を受けられた
 /// 旧経路の名残）は [`unresolved_op_error`] で即 parse_error にする — フォールバック
 /// 先が無いため（数値 ID は resolve 済みなので影響しない）。
-async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Value, MatError> {
+async fn run_op(
+    op: &Op,
+    native: &NativeState,
+    store_path: &Path,
+    health: &SubHealth,
+) -> Result<Value, MatError> {
     // Ping / Shutdown は native に触れず即応。
     match op {
         Op::Ping => return Ok(json!({ "pong": true })),
@@ -339,7 +353,13 @@ async fn run_op(op: &Op, native: &NativeState, store_path: &Path) -> Result<Valu
     };
 
     if is_native_hotpath(op) {
-        return native_op(op, native, store_path).await;
+        let result = native_op(op, native, store_path).await;
+        if result.is_ok() {
+            if let Some((node_id, cluster)) = op_report_expectation(op) {
+                health.note_op(node_id, cluster);
+            }
+        }
+        return result;
     }
 
     if let Some(result) = native_group_params(op) {
@@ -415,6 +435,24 @@ pub(crate) fn is_native_hotpath(op: &Op) -> bool {
             mat_core::ids::InvokeClass::NotNative
         ),
         _ => false,
+    }
+}
+
+/// 状態変更 op → (node_id, 変化が現れる cluster)。op 相関の born-dead 検知
+/// （SubHealth::note_op）の根拠。Read/Describe は状態を変えないので None。
+/// Group 系はノード特定不能、listen/管理系は対象外で None。
+fn op_report_expectation(op: &Op) -> Option<(u64, u32)> {
+    match op {
+        Op::On { node_id, .. } | Op::Off { node_id, .. } => Some((*node_id, 0x0006)),
+        Op::Level { node_id, .. } => Some((*node_id, 0x0008)),
+        Op::Color { node_id, .. } | Op::ColorTemp { node_id, .. } => Some((*node_id, 0x0300)),
+        Op::Write {
+            node_id, cluster, ..
+        }
+        | Op::Invoke {
+            node_id, cluster, ..
+        } => mat_core::ids::resolve_cluster(cluster).map(|c| (*node_id, c)),
+        _ => None,
     }
 }
 
@@ -1500,6 +1538,7 @@ mod tests {
                 &group_on_op(),
                 &NativeState::Ready(Box::new(native)),
                 &store_path,
+                &SubHealth::new(None),
             )
             .await
             .unwrap();
@@ -1532,6 +1571,7 @@ mod tests {
             &group_on_op(),
             &NativeState::Ready(Box::new(native)),
             &store_path,
+            &SubHealth::new(None),
         )
         .await
         .unwrap_err();
@@ -1546,8 +1586,9 @@ mod tests {
         let (_dir, store_path) = make_store();
         let build_err = MatError::store_missing("no KVS materials for native backend");
         let state = NativeState::Unavailable(build_err.clone());
+        let health = SubHealth::new(None);
 
-        let err = run_op(&group_on_op(), &state, &store_path)
+        let err = run_op(&group_on_op(), &state, &store_path, &health)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
@@ -1559,17 +1600,114 @@ mod tests {
             cluster: "onoff".into(),
             attribute: "on-off".into(),
         };
-        let err = run_op(&read, &state, &store_path).await.unwrap_err();
+        let err = run_op(&read, &state, &store_path, &health)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
 
         // Ping/Shutdown だけは native に触れず常に成功する。
         assert_eq!(
-            run_op(&Op::Ping, &state, &store_path).await.unwrap(),
+            run_op(&Op::Ping, &state, &store_path, &health)
+                .await
+                .unwrap(),
             json!({ "pong": true })
         );
         assert_eq!(
-            run_op(&Op::Shutdown, &state, &store_path).await.unwrap(),
+            run_op(&Op::Shutdown, &state, &store_path, &health)
+                .await
+                .unwrap(),
             json!({ "stopping": true })
+        );
+    }
+
+    /// 状態変更 op の success が SubHealth に pending を打つ（read は打たない）。
+    #[tokio::test]
+    async fn run_op_success_marks_pending_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = NativeState::Ready(Box::new(native));
+        let health = std::sync::Arc::new(SubHealth::new(None));
+
+        // off (onoff=0x0006) の success → pending。
+        let body = run_op(
+            &Op::Off {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &state,
+            dir.path(),
+            &health,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["status"], "success");
+        assert!(health.pending_elapsed(5).is_some());
+
+        // read は状態を変えないので pending を打たない。
+        health.clear_pending(5);
+        let _ = run_op(
+            &Op::Read {
+                node_id: 5,
+                endpoint: 1,
+                cluster: "onoff".into(),
+                attribute: "on-off".into(),
+            },
+            &state,
+            dir.path(),
+            &health,
+        )
+        .await
+        .unwrap();
+        assert!(health.pending_elapsed(5).is_none());
+    }
+
+    #[test]
+    fn op_report_expectation_maps_state_changing_ops() {
+        assert_eq!(
+            op_report_expectation(&Op::On {
+                node_id: 5,
+                endpoint: 1
+            }),
+            Some((5, 0x0006))
+        );
+        assert_eq!(
+            op_report_expectation(&Op::Level {
+                node_id: 5,
+                endpoint: 1,
+                level: 128,
+                percent: 50,
+                transition: 0,
+            }),
+            Some((5, 0x0008))
+        );
+        assert_eq!(
+            op_report_expectation(&Op::Read {
+                node_id: 5,
+                endpoint: 1,
+                cluster: "onoff".into(),
+                attribute: "on-off".into(),
+            }),
+            None
+        );
+        // Write は cluster 名を解決して返す。
+        assert_eq!(
+            op_report_expectation(&Op::Write {
+                node_id: 5,
+                endpoint: 1,
+                cluster: "onoff".into(),
+                attribute: "on-time".into(),
+                value: "0".into(),
+            }),
+            Some((5, 0x0006))
         );
     }
 }
