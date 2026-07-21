@@ -507,6 +507,7 @@ impl SubscribeConn for SubscriptionSession {
                 SUBSCRIBE_MIN_INTERVAL_FLOOR_S,
                 SUBSCRIBE_MAX_INTERVAL_CEILING_S,
                 SUBSCRIBE_KEEP_SUBSCRIPTIONS,
+                &[],
                 &self.mrp,
             )
             .await
