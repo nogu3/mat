@@ -713,13 +713,17 @@ pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
     w.finish()
 }
 
-/// SubscribeRequestMessage (spec §8.10) の wildcard 版。AttributeRequests は
-/// 全フィールド省略の AttributePathIB 1 本（= 全 endpoint / 全 cluster / 全
-/// attribute）。EventRequests は載せない（v1 は attribute report のみ）。
-pub fn encode_subscribe_request_wildcard(
+/// SubscribeRequestMessage (spec §8.10)。`clusters` が空なら全フィールド省略の
+/// AttributePathIB 1 本（= 全 endpoint / 全 cluster / 全 attribute の full
+/// wildcard）。非空なら「endpoint wildcard + cluster 指定 + attribute wildcard」
+/// の AttributePathIB をクラスタ数ぶん並べる（priming 軽量化 — 弱リンクでは
+/// full wildcard priming の数十往復が完走できない）。EventRequests は載せない
+/// （v1 は attribute report のみ）。
+pub fn encode_subscribe_request(
     min_interval_floor_s: u16,
     max_interval_ceiling_s: u16,
     keep_subscriptions: bool,
+    clusters: &[u32],
 ) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
@@ -727,8 +731,16 @@ pub fn encode_subscribe_request_wildcard(
     w.put_uint(Tag::Context(1), u64::from(min_interval_floor_s));
     w.put_uint(Tag::Context(2), u64::from(max_interval_ceiling_s));
     w.start_array(Tag::Context(3)); // AttributeRequests
-    w.start_list(Tag::Anonymous); // AttributePathIB（全省略 = wildcard）
-    w.end_container();
+    if clusters.is_empty() {
+        w.start_list(Tag::Anonymous); // AttributePathIB（全省略 = wildcard）
+        w.end_container();
+    } else {
+        for &cluster in clusters {
+            w.start_list(Tag::Anonymous); // AttributePathIB
+            w.put_uint(Tag::Context(3), u64::from(cluster)); // Cluster のみ指定
+            w.end_container();
+        }
+    }
     w.end_container();
     // IsFabricFiltered = true: read と同じ既定（encode_read_request のコメント参照）。
     w.put_bool(Tag::Context(7), true);
@@ -2202,7 +2214,7 @@ mod tests {
     fn subscribe_request_wildcard_shape() {
         // SubscribeRequestMessage (spec §8.10): {0: KeepSubscriptions, 1: MinIntervalFloor,
         // 2: MaxIntervalCeiling, 3: AttributeRequests[[]], 7: IsFabricFiltered, 255: rev}
-        let b = encode_subscribe_request_wildcard(0, 3600, false);
+        let b = encode_subscribe_request(0, 3600, false, &[]);
         let mut r = Reader::new(&b);
         assert!(matches!(
             r.next().unwrap().unwrap().value,
@@ -2231,6 +2243,51 @@ mod tests {
             Value::ContainerEnd
         )); // requests
         let el = r.next().unwrap().unwrap(); // IsFabricFiltered
+        assert_eq!(el.tag, Tag::Context(7));
+        assert_eq!(el.value, Value::Bool(true));
+    }
+
+    #[test]
+    fn subscribe_request_cluster_paths_shape() {
+        // clusters 非空: AttributePathIB を「cluster(Context(3)) のみ指定」で
+        // クラスタ数ぶん並べる（endpoint/attribute は省略 = wildcard）。
+        let b = encode_subscribe_request(0, 300, false, &[0x0006, 0x0402]);
+        let mut r = Reader::new(&b);
+        // 外殻 struct → keep/min/max を読み飛ばして AttributeRequests へ。
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
+        r.next().unwrap().unwrap(); // KeepSubscriptions
+        r.next().unwrap().unwrap(); // MinIntervalFloorSeconds
+        r.next().unwrap().unwrap(); // MaxIntervalCeilingSeconds
+        let el = r.next().unwrap().unwrap(); // AttributeRequests
+        assert_eq!(el.tag, Tag::Context(3));
+        assert!(matches!(el.value, Value::ArrayStart));
+        // path 1: list { Context(3) = 0x0006 }
+        assert!(matches!(r.next().unwrap().unwrap().value, Value::ListStart));
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(el.tag, Tag::Context(3));
+        assert_eq!(el.value, Value::Uint(0x0006));
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::ContainerEnd
+        ));
+        // path 2: list { Context(3) = 0x0402 }
+        assert!(matches!(r.next().unwrap().unwrap().value, Value::ListStart));
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(el.tag, Tag::Context(3));
+        assert_eq!(el.value, Value::Uint(0x0402));
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::ContainerEnd
+        ));
+        // AttributeRequests 閉じ → IsFabricFiltered
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::ContainerEnd
+        ));
+        let el = r.next().unwrap().unwrap();
         assert_eq!(el.tag, Tag::Context(7));
         assert_eq!(el.value, Value::Bool(true));
     }

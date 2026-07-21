@@ -977,10 +977,11 @@ impl SecureSession {
     > {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
-        let req = im::encode_subscribe_request_wildcard(
+        let req = im::encode_subscribe_request(
             min_interval_floor_s,
             max_interval_ceiling_s,
             keep_subscriptions,
+            &[],
         );
         let resp = self
             .send_reliable(
