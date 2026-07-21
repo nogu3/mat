@@ -145,8 +145,9 @@ pub(crate) fn next_backoff(cur: Duration) -> Duration {
     }
 }
 
-/// commissioned 全ノードへ購読タスクを張る（v1: 起動時の台帳スナップショット。
-/// 将来 subscriptions.toml で絞り込み）。native が Unavailable なら何もしない。
+/// commissioned 全ノードへ購読タスクを張る。cluster 絞り込みは subscriptions.toml で
+/// 実装済み（`clusters` パラメータに配線）。今後はノード単位の絞り込み（per-node 粒度）
+/// の検討。native が Unavailable なら何もしない。
 pub fn spawn_subscription_manager(
     native: Arc<NativeState>,
     store_path: PathBuf,
@@ -177,8 +178,8 @@ pub fn spawn_subscription_manager(
 }
 
 /// 1 ノードの購読ループ。確立 → priming 配信 → ポンプ。失敗・死亡は backoff 再購読。
-/// リトライは debug、確立/喪失の状態遷移のみ info（弱リンクノードを常駐ノイズに
-/// しない — spec ②）。
+/// ストリーク初回失敗は info、未確立 10 分で warn 1 回、以降リトライは debug、確立/喪失は info
+/// （弱リンクノードを常駐ノイズにしない規律は不変）。
 async fn node_subscription_loop(
     node_id: u64,
     native: Arc<NativeState>,
