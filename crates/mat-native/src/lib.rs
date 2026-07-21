@@ -162,9 +162,12 @@ pub struct SubscriptionInfo {
 /// 既存 op 経路 = warm session は不変 — spec 構造判断）。
 #[async_trait]
 pub trait SubscribeConn: Send {
-    /// wildcard Subscribe を張り、成立情報と priming report 群を返す。
+    /// Subscribe を張り、成立情報と priming report 群を返す。`clusters` 空 =
+    /// full wildcard、非空 = 「endpoint wildcard + cluster 指定」のパス列挙
+    /// （priming 軽量化 — subscriptions.toml 由来）。
     async fn subscribe_wildcard(
         &mut self,
+        clusters: &[u32],
     ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError>;
     /// 次のデバイス発 report を待つ（keep-alive は reports 空で返る）。
     /// 無音 `timeout` 経過は kind=Timeout。
@@ -500,6 +503,7 @@ struct SubscriptionSession {
 impl SubscribeConn for SubscriptionSession {
     async fn subscribe_wildcard(
         &mut self,
+        clusters: &[u32],
     ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
         let (resp, priming) = self
             .session
@@ -507,6 +511,7 @@ impl SubscribeConn for SubscriptionSession {
                 SUBSCRIBE_MIN_INTERVAL_FLOOR_S,
                 SUBSCRIBE_MAX_INTERVAL_CEILING_S,
                 SUBSCRIBE_KEEP_SUBSCRIPTIONS,
+                clusters,
                 &self.mrp,
             )
             .await
@@ -943,7 +948,7 @@ mod tests {
         use crate::test_support::{FakeEstablisher, FakeSubConn};
         let est = FakeEstablisher::default();
         let mut conn = est.establish_subscription(5).await.unwrap();
-        let (info, priming) = conn.subscribe_wildcard().await.unwrap();
+        let (info, priming) = conn.subscribe_wildcard(&[]).await.unwrap();
         assert_eq!(info.max_interval_s, 60);
         assert_eq!(priming.len(), 1); // default fake は onoff=true の priming 1 チャンク
                                       // scripted report が尽きたら next_report は timeout で Err(Timeout)。

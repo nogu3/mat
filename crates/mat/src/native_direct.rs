@@ -1533,6 +1533,7 @@ mod tests {
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_first_send: true,
             fail_kind: ErrorKind::Timeout,
+            ..Default::default()
         };
         let calls = std::sync::Arc::clone(&est.calls);
         let engine = mat_native::Engine::with_parts(Box::new(est), None);

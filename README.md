@@ -403,7 +403,11 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
 - Filters (`--node` / `--endpoint` / `--cluster` / `--attribute`) narrow which
   events are delivered; omitted filters match everything. `--node` accepts a
   node alias the same way other commands do; `--cluster` / `--attribute` are
-  chip-tool notation (never aliased), same as `read`.
+  chip-tool notation (never aliased), same as `read`. If `<store>/subscriptions.toml`
+  exists, only its listed clusters are ever subscribed by `matd` in the first
+  place, so `--cluster` can narrow further within that set but never outside
+  it — see [Subscriptions (`subscriptions.toml`, optional, matd
+  only)](#subscriptions-subscriptionstoml-optional-matd-only) below.
 - `--count` (default `1`) is how many events to receive before exiting `0`.
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
   forever. Reaching `--count` exits `0`; the timeout firing with **zero**
@@ -709,9 +713,10 @@ not just when a `mat` caller happens to be polling.
   streams matching event lines until the client disconnects.
 - v1 scope is attribute reports only. Not yet implemented (tracked as
   future work): EventReport delivery (buttons / Generic Switch), a
-  `DataVersionFilter`, LIT ICD check-in registration, and a
-  `<store>/subscriptions.toml` to narrow which nodes/paths get subscribed
-  (today it is always all commissioned nodes).
+  `DataVersionFilter`, and LIT ICD check-in registration. Cluster-level
+  narrowing of what gets subscribed **is** implemented — see
+  [Subscriptions (`subscriptions.toml`, optional, matd
+  only)](#subscriptions-subscriptionstoml-optional-matd-only) below.
 
 ### Native backend internals
 
@@ -910,6 +915,51 @@ already taken → exit `2`, before any network op runs), and it is written
 to `aliases.toml` only on success (the file is created if absent). Without
 `--alias`, `commission` never touches `aliases.toml`. Deleting or renaming an
 alias is a hand edit of the file — there is no management subcommand.
+
+## Subscriptions (`subscriptions.toml`, optional, matd only)
+
+By default `matd`'s resident Subscribe (see [Resident Subscribe and `mat
+listen`](#resident-subscribe-and-mat-listen)) is a full **wildcard**: every
+endpoint/cluster/attribute, on every commissioned node. If
+`<store>/subscriptions.toml` exists, `matd` narrows that to just the listed
+clusters' paths instead.
+
+Full-wildcard priming (the initial full-attribute dump right after a
+subscription is (re)established — dozens of request/response round trips) can
+fail to complete on a weak Thread link, leaving a subscription unestablished
+for tens of minutes to hours. Narrowing to a handful of clusters shrinks
+priming to one or two chunks, so a link good enough for `read` is usually
+good enough to subscribe on too.
+
+```toml
+clusters = [
+  "onoff",
+  "occupancysensing",
+  "temperaturemeasurement",
+]
+```
+
+- Cluster names use chip-tool notation (same as `mat read`); numeric ids
+  (`"0x0006"` / `"6"`) also work, the same escape hatch as elsewhere for names
+  `mat-core::ids` doesn't know.
+- **Absent file = full wildcard, unchanged** — the same absent-file discipline
+  as `aliases.toml`.
+- A parse failure, an unknown cluster name, or an empty list makes `matd`
+  **refuse to start** (`store_parse`, exit `10`); it never silently falls back
+  to wildcard, so a misconfiguration can't quietly disable the weak-link
+  workaround.
+- **Edge case: nodes that serve none of the listed clusters.** When the file is
+  present, the narrowed Subscribe is sent to every commissioned node; a node
+  that exposes none of the listed clusters will never establish its subscription
+  (it retries on backoff forever). Ensure each node serves at least one of the
+  listed clusters.
+- When this file is present, `mat listen` only ever sees events for the
+  listed clusters — a `--cluster` filter naming a cluster outside that set
+  simply never matches anything.
+- Read once at `matd` startup; an edit needs a `matd` restart to take effect
+  (e.g. `systemctl --user restart matd`).
+- `mat` (one-shot) never reads this file — like the rest of the resident
+  Subscribe, it is matd-only.
 
 ## Errors and exit codes
 

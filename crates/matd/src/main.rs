@@ -191,12 +191,29 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     let native = std::sync::Arc::new(native);
     // listen へのイベント配信路。購読 → broadcast → listen 接続（spec ②）。
     let (events_tx, _events_rx) = tokio::sync::broadcast::channel(1024);
+    // 常駐購読のクラスタ絞り込み（subscriptions.toml、無し = full wildcard）。
+    // 設定不備は fail-fast: 黙って wildcard に落ちると弱リンク対策が無効化
+    // されたことに気づけない（ambiguous iface autodetect と同じ規律）。
+    let sub_clusters = match matd::subscribe_config::load(&store_path) {
+        Ok(c) => c,
+        Err(e) => {
+            e.emit();
+            std::process::exit(e.kind.exit_code() as i32);
+        }
+    };
+    if let Some(c) = &sub_clusters {
+        tracing::info!(
+            clusters = c.len(),
+            "subscriptions.toml loaded; narrowing resident subscribe paths"
+        );
+    }
     // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
     // ack だけ返り、イベントは流れない — `mat fabric init` 後の再起動で解消）。
     let _sub_handles = matd::subscription::spawn_subscription_manager(
         std::sync::Arc::clone(&native),
         store_path.clone(),
         events_tx.clone(),
+        sub_clusters,
     );
 
     server::serve(&socket, store_path, native, events_tx)

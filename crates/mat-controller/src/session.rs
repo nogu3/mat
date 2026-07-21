@@ -958,7 +958,8 @@ impl SecureSession {
         }
     }
 
-    /// wildcard Subscribe を張る（spec §8.10、v1: attribute report のみ）。
+    /// Subscribe を張る（`clusters` 空 = full wildcard、非空 = クラスタ絞り込み）。
+    /// spec §8.10、v1: attribute report のみ。
     /// priming ReportData（分割対応、各チャンクに StatusResponse(0) 応答）→
     /// SubscribeResponse 受信で成立。priming の中身も返す（matd が priming=true
     /// イベントとして流す）。
@@ -967,6 +968,7 @@ impl SecureSession {
         min_interval_floor_s: u16,
         max_interval_ceiling_s: u16,
         keep_subscriptions: bool,
+        clusters: &[u32],
         cfg: &MrpConfig,
     ) -> Result<
         (
@@ -977,10 +979,11 @@ impl SecureSession {
     > {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
-        let req = im::encode_subscribe_request_wildcard(
+        let req = im::encode_subscribe_request(
             min_interval_floor_s,
             max_interval_ceiling_s,
             keep_subscriptions,
+            clusters,
         );
         let resp = self
             .send_reliable(
@@ -2565,13 +2568,75 @@ mod tests {
         });
 
         let (resp, priming) = s
-            .subscribe_wildcard(0, 3600, false, &fast_cfg())
+            .subscribe_wildcard(0, 3600, false, &[], &fast_cfg())
             .await
             .unwrap();
         assert_eq!(resp.subscription_id, 42);
         assert_eq!(resp.max_interval_s, 120);
         assert_eq!(priming.len(), 2);
         assert_eq!(priming[0].reports[0].data, Some(serde_json::json!(true)));
+        dev_task.await.unwrap();
+    }
+
+    /// 絞り込み購読: SubscribeRequest の AttributeRequests に指定クラスタの
+    /// AttributePathIB が列挙されてワイヤに乗る（priming 軽量化の釘打ち）。
+    #[tokio::test]
+    async fn subscribe_wildcard_sends_cluster_paths_when_narrowed() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_SUBSCRIBE_REQUEST);
+            // SubscribeRequest 中の Uint な Context(3) は AttributePathIB の
+            // cluster だけ（トップの Context(3) は ArrayStart、IsFabricFiltered
+            // は Context(7)）なので、素朴な全要素走査で拾える。
+            use crate::tlv::{Reader, Tag, Value};
+            let mut r = Reader::new(&body);
+            let mut clusters = Vec::new();
+            while let Some(el) = r.next().unwrap() {
+                if el.tag == Tag::Context(3) {
+                    if let Value::Uint(v) = el.value {
+                        clusters.push(u32::try_from(v).unwrap());
+                    }
+                }
+            }
+            assert_eq!(clusters, vec![0x0006, 0x0402]);
+            let ex = p.exchange_id;
+            // priming 1 チャンク（more=false）→ StatusResponse(0) → SubscribeResponse
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                9100,
+                &subscription_report_payload(43, false, false),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p2, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p2.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_SUBSCRIBE_RESPONSE,
+                None,
+                false,
+                9101,
+                &subscribe_response_payload(43, 300),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+        });
+
+        let (resp, priming) = s
+            .subscribe_wildcard(0, 300, false, &[0x0006, 0x0402], &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(resp.subscription_id, 43);
+        assert_eq!(priming.len(), 1);
         dev_task.await.unwrap();
     }
 

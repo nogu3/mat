@@ -21,6 +21,8 @@ pub struct FakeSubConn {
     pub max_interval_s: u16,
     pub priming: Vec<mat_controller::im::ReportDataMessage>,
     pub live: std::collections::VecDeque<mat_controller::im::ReportDataMessage>,
+    /// subscribe_wildcard が受けた clusters の記録先（FakeEstablisher と共有）。
+    pub seen_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 /// onoff on-off=true の AttributeReport 1 件を持つ ReportDataMessage を作る
@@ -47,6 +49,7 @@ impl Default for FakeSubConn {
             max_interval_s: 60,
             priming: vec![onoff_report(1, true)],
             live: std::collections::VecDeque::new(),
+            seen_clusters: std::sync::Arc::default(),
         }
     }
 }
@@ -55,6 +58,7 @@ impl Default for FakeSubConn {
 impl crate::SubscribeConn for FakeSubConn {
     async fn subscribe_wildcard(
         &mut self,
+        clusters: &[u32],
     ) -> Result<
         (
             crate::SubscriptionInfo,
@@ -62,6 +66,7 @@ impl crate::SubscribeConn for FakeSubConn {
         ),
         MatError,
     > {
+        *self.seen_clusters.lock().unwrap() = clusters.to_vec();
         Ok((
             crate::SubscriptionInfo {
                 subscription_id: 1,
@@ -252,6 +257,9 @@ pub struct FakeEstablisher {
     pub calls: std::sync::Arc<AtomicUsize>,
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
+    /// 直近の establish_subscription が返した FakeSubConn の seen_clusters と
+    /// 共有される記録先（matd の manager テストが検証に使う）。
+    pub sub_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 impl Default for FakeEstablisher {
@@ -260,6 +268,7 @@ impl Default for FakeEstablisher {
             calls: std::sync::Arc::new(AtomicUsize::new(0)),
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
+            sub_clusters: std::sync::Arc::default(),
         }
     }
 }
@@ -280,7 +289,10 @@ impl Establisher for FakeEstablisher {
         _node_id: u64,
     ) -> Result<Box<dyn crate::SubscribeConn>, MatError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(FakeSubConn::default()))
+        Ok(Box::new(FakeSubConn {
+            seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
+            ..Default::default()
+        }))
     }
 }
 

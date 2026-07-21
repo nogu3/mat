@@ -362,6 +362,7 @@ mod tests {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
+            ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         backend.read_onoff(0x1234, 1).await.unwrap();
@@ -377,6 +378,7 @@ mod tests {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: true,
             fail_kind: ErrorKind::Timeout,
+            ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が Timeout → slot 破棄 → 再確立 → 再送成功。
@@ -392,6 +394,7 @@ mod tests {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: true,
             fail_kind: ErrorKind::DeviceRejected,
+            ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が DeviceRejected（コマンドは届いている）→ 再確立せず
@@ -419,6 +422,7 @@ mod tests {
             calls: std::sync::Arc::clone(&calls),
             fail_first_send: true,
             fail_kind: ErrorKind::Other,
+            ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が session 致命エラー（Other=復号失敗/counter desync 等）。

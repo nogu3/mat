@@ -33,6 +33,9 @@ This file is the short list of constraints you must not break.
   `mat-core`) — to numbers right after arg parsing — optional, local, and
   absent-file = no behavior change (built-in color names still work without
   the file). Cluster / attribute names stay chip-tool notation (no aliasing).
+  `<store>/subscriptions.toml` follows the same absent-file discipline (matd-
+  only: narrows the resident Subscribe to listed clusters; absent = full
+  wildcard; a bad config makes `matd` refuse to start).
 - Logical groups like "the lights in the living room" (out of scope; `mat` takes
   a numeric GroupId).
 - Session cache, subscriptions, freshness (`mat` is one-shot; warm sessions are
