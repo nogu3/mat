@@ -24,6 +24,37 @@ const DEATH_FACTOR: f64 = 1.5;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
+/// 未確立がこの時間続いたら warn を 1 回出す（弱リンクノードの長期ブラインドを
+/// 本番 info/warn レベルで可視化する — 実測で盲目窓が数時間に達した反省）。
+const STUCK_WARN_AFTER: Duration = Duration::from_secs(600);
+
+/// 確立失敗ログの出し分け（純関数 — 時計はループ側が持つ）。
+/// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 5 分毎に永久に失敗し
+/// 続ける）なので、状態遷移 + 間引きで出す — spec ①。
+#[derive(Debug)]
+pub(crate) enum FailureLog {
+    /// 成功（or 起動）後の最初の失敗: info。
+    First,
+    /// 未確立 STUCK_WARN_AFTER 超・未警告: warn を 1 回。
+    StuckWarn,
+    /// それ以外: debug。
+    Quiet,
+}
+
+pub(crate) fn classify_failure(
+    consecutive_failures: u32,
+    down_for: Duration,
+    warned: bool,
+) -> FailureLog {
+    if consecutive_failures == 1 {
+        FailureLog::First
+    } else if !warned && down_for >= STUCK_WARN_AFTER {
+        FailureLog::StuckWarn
+    } else {
+        FailureLog::Quiet
+    }
+}
+
 /// listen へ配る 1 イベント。cluster/attribute は数値で持ち、JSON 化時に
 /// chip-tool 記法へ名前化する（フィルタ照合は数値で行うため）。timestamp は
 /// report 受信時に一度だけ採取した値を保持する（listener ごと・emit 時刻での
@@ -158,15 +189,49 @@ async fn node_subscription_loop(
         return;
     };
     let mut backoff = Duration::ZERO;
+    // ダウン起点（起動 or 購読喪失）とその後の失敗ストリーク。established で
+    // リセットされる（run_subscription_once が確立ログにダウン時間を載せる）。
+    let mut down_since = tokio::time::Instant::now();
+    let mut failures: u32 = 0;
+    let mut warned = false;
     loop {
-        match run_subscription_once(node_id, backend, &events, &clusters).await {
+        match run_subscription_once(node_id, backend, &events, &clusters, down_since, failures)
+            .await
+        {
             Ok(()) => {
-                // 購読が成立して喪失した: 状態遷移なので info、backoff はリセット。
+                // 購読が成立して喪失した: 状態遷移なので info、状態リセット。
                 tracing::info!(node_id, "subscription lost; resubscribing");
                 backoff = Duration::ZERO;
+                down_since = tokio::time::Instant::now();
+                failures = 0;
+                warned = false;
             }
             Err(e) => {
-                tracing::debug!(node_id, kind = ?e.kind, detail = %e.detail, "subscription attempt failed");
+                failures += 1;
+                match classify_failure(failures, down_since.elapsed(), warned) {
+                    FailureLog::First => {
+                        tracing::info!(
+                            node_id,
+                            kind = ?e.kind,
+                            detail = %e.detail,
+                            "subscription attempt failed; retrying with backoff"
+                        );
+                    }
+                    FailureLog::StuckWarn => {
+                        warned = true;
+                        tracing::warn!(
+                            node_id,
+                            attempts = failures,
+                            down_s = down_since.elapsed().as_secs(),
+                            kind = ?e.kind,
+                            detail = %e.detail,
+                            "subscription still not established"
+                        );
+                    }
+                    FailureLog::Quiet => {
+                        tracing::debug!(node_id, kind = ?e.kind, detail = %e.detail, "subscription attempt failed");
+                    }
+                }
             }
         }
         backoff = next_backoff(backoff);
@@ -181,6 +246,8 @@ async fn run_subscription_once(
     backend: &crate::native::NativeBackend,
     events: &broadcast::Sender<Event>,
     clusters: &[u32],
+    down_since: tokio::time::Instant,
+    prior_failures: u32,
 ) -> Result<(), mat_core::error::MatError> {
     let mut conn = backend.establish_subscription(node_id).await?;
     let (info, priming) = conn.subscribe_wildcard(clusters).await?;
@@ -188,6 +255,8 @@ async fn run_subscription_once(
         node_id,
         subscription_id = info.subscription_id,
         max_interval_s = info.max_interval_s,
+        down_s = down_since.elapsed().as_secs(),
+        attempts = prior_failures + 1,
         "subscription established"
     );
     for msg in &priming {
@@ -302,6 +371,35 @@ mod tests {
             next_backoff(Duration::from_secs(300)),
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn failure_log_first_then_quiet_then_single_warn() {
+        use std::time::Duration;
+        // 1 回目の失敗は info（First）。
+        assert!(matches!(
+            classify_failure(1, Duration::from_secs(3), false),
+            FailureLog::First
+        ));
+        // 2 回目以降は debug（Quiet）。
+        assert!(matches!(
+            classify_failure(2, Duration::from_secs(20), false),
+            FailureLog::Quiet
+        ));
+        // 未確立 10 分超で warn（StuckWarn）— 一度だけ。
+        assert!(matches!(
+            classify_failure(5, Duration::from_secs(601), false),
+            FailureLog::StuckWarn
+        ));
+        assert!(matches!(
+            classify_failure(6, Duration::from_secs(900), true),
+            FailureLog::Quiet
+        ));
+        // 初回失敗が既に 10 分超（あり得ないが）でも First 優先で情報は出る。
+        assert!(matches!(
+            classify_failure(1, Duration::from_secs(700), false),
+            FailureLog::First
+        ));
     }
 
     /// manager 経路: fake establisher の priming report が priming=true イベントで
