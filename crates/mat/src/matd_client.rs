@@ -26,54 +26,55 @@ use serde_json::{json, Value};
 use crate::cli::{Command, GroupCommand};
 use mat_core::alias::NodeRef;
 use mat_core::error::ErrorKind;
-use mat_core::socket::default_socket_path;
+use mat_core::socket::default_socket_candidates;
 
-/// mat の実行経路。`resolve_route` が決める。
+/// mat の実行経路。`resolve_route` が決める。socket は探索候補リスト
+/// （明示指定は 1 本、既定は subdir 新既定 → flat 旧既定の順で connect 試行）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
-    /// 明示有効化（`--matd` / `MAT_MATD=truthy`）: matd 固定。接続失敗はエラー、
-    /// 非対応 op は exit 2。フォールバックしない。
-    Forced(PathBuf),
-    /// 既定（どちらも未設定）: socket へ connect を試み、成功なら matd、
-    /// 失敗なら mat 自身の native 直経路にフォールバック。
-    Auto(PathBuf),
+    /// 明示有効化（`--matd` / `MAT_MATD=truthy`）: matd 固定。全候補接続失敗は
+    /// エラー、非対応 op は exit 2。フォールバックしない。
+    Forced(Vec<PathBuf>),
+    /// 既定（どちらも未設定）: 候補へ順に connect を試み、成功なら matd、
+    /// 全滅なら mat 自身の native 直経路にフォールバック。
+    Auto(Vec<PathBuf>),
     /// 明示無効化（`MAT_MATD=falsy`）: 常に native 直経路。probe もしない。
     Direct,
 }
 
-/// 経路と socket パスを決める（純粋関数; env は注入）。
+/// 経路と socket 候補を決める（純粋関数; env は注入）。
 ///
 /// - `--matd [<path>]` or `MAT_MATD=truthy` → `Forced`
 /// - `MAT_MATD=falsy`（`0`/`false`/`no`/`off`） → `Direct`
 /// - どちらも無し（truthy/falsy どちらでもない値も同じ） → `Auto`
 ///
-/// socket パスの優先順: `--matd <path>`（明示）> `MAT_MATD_SOCKET=<path>`（非空）>
-/// 既定パス。`MAT_MATD_SOCKET` はパス指定のみで経路は変えない。
+/// socket 候補の優先順: `--matd <path>`（明示、1 本）> `MAT_MATD_SOCKET=<path>`（非空、
+/// 1 本）> 既定候補（subdir → flat）。`MAT_MATD_SOCKET` はパス指定のみで経路は変えない。
 pub fn resolve_route(
     flag: &Option<Option<PathBuf>>,
     env_socket: Option<OsString>,
     env_enable: Option<OsString>,
 ) -> Route {
     match flag {
-        // --matd <path> → 明示パスで強制 matd。
-        Some(Some(path)) => Route::Forced(path.clone()),
-        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET > 既定。
-        Some(None) => Route::Forced(socket_from_env_or_default(env_socket)),
+        // --matd <path> → 明示パスで強制 matd（候補 1 本）。
+        Some(Some(path)) => Route::Forced(vec![path.clone()]),
+        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET > 既定候補。
+        Some(None) => Route::Forced(sockets_from_env_or_default(env_socket)),
         None => match env_enable.as_deref() {
-            Some(v) if is_truthy(v) => Route::Forced(socket_from_env_or_default(env_socket)),
+            Some(v) if is_truthy(v) => Route::Forced(sockets_from_env_or_default(env_socket)),
             Some(v) if is_falsy(v) => Route::Direct,
             // 未設定（or 解釈不能な値）→ 自動検出。
-            _ => Route::Auto(socket_from_env_or_default(env_socket)),
+            _ => Route::Auto(sockets_from_env_or_default(env_socket)),
         },
     }
 }
 
-/// 有効化済みのときに使う socket パスを決める: `MAT_MATD_SOCKET`（非空）> 既定パス。
-fn socket_from_env_or_default(env_socket: Option<OsString>) -> PathBuf {
+/// 有効化済みのときに使う socket 候補: `MAT_MATD_SOCKET`（非空、1 本）> 既定候補。
+fn sockets_from_env_or_default(env_socket: Option<OsString>) -> Vec<PathBuf> {
     env_socket
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path)
+        .map(|s| vec![PathBuf::from(s)])
+        .unwrap_or_else(default_socket_candidates)
 }
 
 /// `MAT_MATD` の真偽判定。`1` / `true` / `yes` / `on`（大小無視）を有効とみなす。
@@ -94,7 +95,7 @@ fn is_falsy(v: &OsStr) -> bool {
 }
 
 /// `--matd` 指定時のディスパッチ。非対応サブコマンドは CLI 利用の誤り（exit 2）。
-pub fn dispatch(socket: &Path, command: &Command) -> ExitCode {
+pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let op = match to_op(command) {
         Ok(op) => op,
         Err(detail) => {
@@ -103,7 +104,16 @@ pub fn dispatch(socket: &Path, command: &Command) -> ExitCode {
         }
     };
 
-    match exchange(socket, &op) {
+    let (stream, socket) = match connect_candidates(sockets) {
+        Ok(s) => s,
+        Err(detail) => {
+            emit_error(ErrorKind::Other, &detail);
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(socket = %socket.display(), "using matd (forced)");
+
+    match exchange_on_stream(stream, &op) {
         Ok(resp) => emit_response(resp),
         Err(detail) => {
             emit_error(ErrorKind::Other, &detail);
@@ -118,16 +128,15 @@ pub fn dispatch(socket: &Path, command: &Command) -> ExitCode {
 /// connect した stream をそのまま本リクエストに使う（probe 後の再接続はしない）ので、
 /// フォールバックが起きるのは 1 バイトも送る前だけ。接続後のエラーは matd 経路の
 /// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
-pub fn dispatch_auto(socket: &Path, command: &Command) -> Option<ExitCode> {
+pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode> {
     // matd 非対応 op（discover / commission / open-window / diag）は probe せず直経路。
     let op = to_op(command).ok()?;
 
-    let stream = match UnixStream::connect(socket) {
+    let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
-        Err(e) => {
+        Err(detail) => {
             tracing::info!(
-                socket = %socket.display(),
-                error = %e,
+                error = %detail,
                 "matd not reachable, falling back to direct native backend"
             );
             return None;
@@ -355,11 +364,20 @@ fn unsupported(name: &str) -> String {
     format!("`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)")
 }
 
-/// matd へ接続して 1 行送り 1 行受け取る。接続/送受信の失敗は detail 文字列で返す。
-fn exchange(socket: &Path, op: &Value) -> Result<Value, String> {
-    let stream = UnixStream::connect(socket)
-        .map_err(|e| format!("could not connect to matd at {}: {e}", socket.display()))?;
-    exchange_on_stream(stream, op)
+/// 候補 socket へ順に connect し、最初に成功した stream と使用パスを返す。
+/// 全滅は Err（試行した全パスと各エラーを列挙 — Forced 経路のエラー detail 用）。
+fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String> {
+    let mut attempts = Vec::new();
+    for socket in sockets {
+        match UnixStream::connect(socket) {
+            Ok(stream) => return Ok((stream, socket)),
+            Err(e) => attempts.push(format!("{} ({e})", socket.display())),
+        }
+    }
+    Err(format!(
+        "could not connect to matd at {}",
+        attempts.join(", ")
+    ))
 }
 
 /// 接続済み stream で 1 行送り 1 行受け取る（自動検出は probe した接続を使い回す）。
@@ -429,7 +447,7 @@ fn listen_request_json(
 /// `mat listen`: matd へ接続し、ack 後のイベント行をそのまま stdout へ流す。
 /// count/timeout は mat 側制御（enl listen と同じ UX）。matd 不在・応答なし・
 /// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。
-pub fn dispatch_listen(socket: &Path, command: &Command) -> ExitCode {
+pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let Command::Listen {
         node_id,
         endpoint,
@@ -448,19 +466,17 @@ pub fn dispatch_listen(socket: &Path, command: &Command) -> ExitCode {
         attribute,
     );
 
-    let stream = match UnixStream::connect(socket) {
+    let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
-        Err(e) => {
+        Err(detail) => {
             emit_error(
                 ErrorKind::MatdUnavailable,
-                &format!(
-                    "matd not reachable at {} ({e}); `mat listen` requires a running matd",
-                    socket.display()
-                ),
+                &format!("{detail}; `mat listen` requires a running matd"),
             );
             return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
         }
     };
+    tracing::info!(socket = %socket.display(), "listening via matd");
 
     match run_listen_stream(stream, &op, *count, *timeout_ms) {
         Ok(code) => code,
@@ -693,25 +709,25 @@ mod tests {
     #[test]
     fn resolve_route_three_states() {
         let some_path = PathBuf::from("/x/y.sock");
-        let dflt = default_socket_path();
+        let dflt = mat_core::socket::default_socket_candidates();
 
-        // --matd <path> → 強制 matd（明示パスが MAT_MATD_SOCKET より優先）。
+        // --matd <path> → 強制 matd（明示パスが MAT_MATD_SOCKET より優先、候補 1 本）。
         assert_eq!(
             resolve_route(
                 &Some(Some(some_path.clone())),
                 Some("/env.sock".into()),
                 None
             ),
-            Route::Forced(some_path)
+            Route::Forced(vec![some_path])
         );
-        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET > 既定。
+        // --matd（値省略）→ 強制 matd。パスは MAT_MATD_SOCKET（1 本）> 既定候補。
         assert_eq!(
             resolve_route(&Some(None), None, None),
             Route::Forced(dflt.clone())
         );
         assert_eq!(
             resolve_route(&Some(None), Some("/env.sock".into()), None),
-            Route::Forced(PathBuf::from("/env.sock"))
+            Route::Forced(vec![PathBuf::from("/env.sock")])
         );
         // MAT_MATD=truthy → 強制 matd。
         assert_eq!(
@@ -724,17 +740,56 @@ mod tests {
             resolve_route(&None, Some("/env.sock".into()), Some("off".into())),
             Route::Direct
         );
-        // 未設定 → 自動。probe 先は MAT_MATD_SOCKET（非空）> 既定。
+        // 未設定 → 自動。probe 先は MAT_MATD_SOCKET（非空、1 本）> 既定候補。
         assert_eq!(resolve_route(&None, None, None), Route::Auto(dflt.clone()));
         assert_eq!(
             resolve_route(&None, Some("/env.sock".into()), None),
-            Route::Auto(PathBuf::from("/env.sock"))
+            Route::Auto(vec![PathBuf::from("/env.sock")])
         );
         // truthy でも falsy でもない値 → 未設定と同じ（自動）。
         assert_eq!(
             resolve_route(&None, None, Some("abc".into())),
             Route::Auto(dflt)
         );
+    }
+
+    #[test]
+    fn connect_candidates_falls_through_to_second_socket() {
+        // 候補 1 = 存在しないパス、候補 2 = 生きた listener → 候補 2 で繋がる。
+        let dir = tempfile::tempdir().unwrap();
+        let dead = dir.path().join("matd").join("matd.sock"); // 不在（dir ごと無い）
+        let alive = dir.path().join("matd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&alive).unwrap();
+
+        // 戻り値の &Path は候補スライスを借用するため、候補は変数に束縛してから渡す。
+        let candidates = [dead, alive.clone()];
+        let (_stream, used) = connect_candidates(&candidates).expect("second candidate connects");
+        assert_eq!(used, alive.as_path());
+    }
+
+    #[test]
+    fn connect_candidates_skips_stale_socket_file() {
+        // 候補 1 = stale socket ファイル（listener 死亡済み）→ connect 失敗で候補 2 へ。
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap()); // ファイルは残る
+        assert!(stale.exists());
+        let alive = dir.path().join("alive.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&alive).unwrap();
+
+        let candidates = [stale, alive.clone()];
+        let (_stream, used) = connect_candidates(&candidates).expect("stale is skipped");
+        assert_eq!(used, alive.as_path());
+    }
+
+    #[test]
+    fn connect_candidates_error_lists_all_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sock");
+        let b = dir.path().join("b.sock");
+        let err = connect_candidates(&[a.clone(), b.clone()]).unwrap_err();
+        assert!(err.contains(&a.display().to_string()), "got: {err}");
+        assert!(err.contains(&b.display().to_string()), "got: {err}");
     }
 
     #[test]
