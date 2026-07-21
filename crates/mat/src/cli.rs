@@ -22,9 +22,10 @@ pub struct Cli {
     pub store: Option<PathBuf>,
 
     /// matd の unix socket 経由での実行を強制する（接続失敗はエラー、フォールバック無し）。
-    /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ、無ければ既定パス
-    /// （`$XDG_RUNTIME_DIR/matd.sock`、無ければ `/tmp/matd.sock`）。
-    /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記の socket へ接続を
+    /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ（1 本）、無ければ既定候補
+    /// （`$XDG_RUNTIME_DIR/matd/matd.sock` → 旧 `$XDG_RUNTIME_DIR/matd.sock` の順に
+    /// connect 試行。XDG 不在なら `/tmp/matd.sock`）。
+    /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記候補へ接続を
     /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。

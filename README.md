@@ -609,8 +609,9 @@ does (missing and stale sockets alike).
 
 ```bash
 # Start the resident daemon (separate binary; see ARCHITECTURE.md / matd --help).
-# With no --socket it uses the default path ($XDG_RUNTIME_DIR/matd.sock, else
-# /tmp/matd.sock) — the same default mat probes below.
+# With no --socket it binds the default path ($XDG_RUNTIME_DIR/matd/matd.sock,
+# dir auto-created 0700; /tmp/matd.sock without XDG_RUNTIME_DIR) — the first
+# default mat probes below.
 matd &
 
 # No flag needed: mat finds the running matd on the default socket by itself.
@@ -659,7 +660,12 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   falls back to the direct path when nobody answers. `MAT_MATD_SOCKET` just
   selects *which* socket in every mode.
 - Socket path precedence (all modes): `--matd <path>` > `MAT_MATD_SOCKET=<path>`
-  > default socket (`$XDG_RUNTIME_DIR/matd.sock`, else `/tmp/matd.sock`).
+  (a single socket in both cases) > default candidates, probed in order:
+  `$XDG_RUNTIME_DIR/matd/matd.sock` (the systemd `RuntimeDirectory=matd`
+  convention, matd's own bind default) then the pre-0.27.0
+  `$XDG_RUNTIME_DIR/matd.sock` (transition compat); just `/tmp/matd.sock`
+  without `XDG_RUNTIME_DIR`. Stale sockets fail the connect and fall through
+  naturally.
 - Once connected, errors are reported from the matd path as-is — `mat` never
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
