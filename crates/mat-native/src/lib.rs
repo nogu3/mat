@@ -659,6 +659,9 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     match e {
         // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
         SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
+        // 購読の無音 deadline 切れ。通常は SubscriptionSession::next_report が
+        // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
+        SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
         SessionError::Im(_) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
