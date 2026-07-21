@@ -75,8 +75,8 @@ fn main() -> ExitCode {
             std::env::var_os("MAT_MATD_SOCKET"),
             std::env::var_os("MAT_MATD"),
         ) {
-            matd_client::Route::Forced(socket) | matd_client::Route::Auto(socket) => {
-                matd_client::dispatch_listen(&socket, &command)
+            matd_client::Route::Forced(sockets) | matd_client::Route::Auto(sockets) => {
+                matd_client::dispatch_listen(&sockets, &command)
             }
             matd_client::Route::Direct => {
                 mat_core::error::MatError::new(
@@ -98,9 +98,9 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD_SOCKET"),
         std::env::var_os("MAT_MATD"),
     ) {
-        matd_client::Route::Forced(socket) => return matd_client::dispatch(&socket, &command),
-        matd_client::Route::Auto(socket) => {
-            if let Some(code) = matd_client::dispatch_auto(&socket, &command) {
+        matd_client::Route::Forced(sockets) => return matd_client::dispatch(&sockets, &command),
+        matd_client::Route::Auto(sockets) => {
+            if let Some(code) = matd_client::dispatch_auto(&sockets, &command) {
                 return code;
             }
         }
