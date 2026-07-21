@@ -603,7 +603,7 @@ Each `mat` call is a one-shot: it establishes CASE, runs the op, and discards
 the session. With a running `matd` the call is routed through its **warm**
 session instead — same subcommands, same JSON on stdout, but the handshake is
 skipped on repeated calls. `mat` **auto-detects** `matd`: for supported
-subcommands it tries a connect on the default socket, uses `matd` when something
+subcommands it tries a connect on the default socket candidates, uses `matd` when something
 answers, and silently falls back to `mat`'s own native direct path when nothing
 does (missing and stale sockets alike).
 

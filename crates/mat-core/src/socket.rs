@@ -44,7 +44,8 @@ pub fn default_socket_candidates_from(xdg_runtime_dir: Option<OsString>) -> Vec<
 
 /// socket の親ディレクトリを 0700 で作成する（存在すれば no-op）。matd が
 /// 既定パスで bind する前に呼ぶ（明示 `--socket` の親不在は従来どおり bind
-/// エラーに任せるので呼ばない）。
+/// エラーに任せるので呼ばない）。`recursive` なので途中の祖先 dir（例: 存在しない
+/// `XDG_RUNTIME_DIR` 自体）も同じ 0700 で作られる。
 pub fn ensure_socket_dir(socket: &Path) -> io::Result<()> {
     let Some(dir) = socket.parent() else {
         return Ok(());
