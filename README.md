@@ -948,6 +948,11 @@ clusters = [
   **refuse to start** (`store_parse`, exit `10`); it never silently falls back
   to wildcard, so a misconfiguration can't quietly disable the weak-link
   workaround.
+- **Edge case: nodes that serve none of the listed clusters.** When the file is
+  present, the narrowed Subscribe is sent to every commissioned node; a node
+  that exposes none of the listed clusters will never establish its subscription
+  (it retries on backoff forever). Ensure each node serves at least one of the
+  listed clusters.
 - When this file is present, `mat listen` only ever sees events for the
   listed clusters — a `--cluster` filter naming a cluster outside that set
   simply never matches anything.
