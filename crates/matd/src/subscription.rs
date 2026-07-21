@@ -274,15 +274,21 @@ async fn run_subscription_once(
     );
     loop {
         match conn.next_report(deadline).await {
-            Ok(msg) => {
+            Ok(Some(msg)) => {
                 for ev in events_from_report(node_id, &msg, false) {
                     let _ = events.send(ev);
                 }
                 // keep-alive（reports 空）も無音 deadline をリセットするだけで良い。
             }
+            Ok(None) => {
+                // 無音 deadline 切れ → 再購読（Task 4 で born-dead/op 相関の
+                // 判定に置き換わる暫定形）。
+                tracing::info!(node_id, "report pump ended (silence)");
+                return Ok(());
+            }
             Err(e) => {
-                // 無音死亡 or セッションエラー → 再購読。何で死んだかは切り分けに
-                // 必須なので詳細を残す（直後に caller が「subscription lost」を出す）。
+                // セッションエラー → 再購読。何で死んだかは切り分けに必須なので
+                // 詳細を残す（直後に caller が「subscription lost」を出す）。
                 tracing::info!(node_id, kind = ?e.kind, detail = %e.detail, "report pump ended");
                 return Ok(());
             }

@@ -15,12 +15,15 @@ use mat_core::error::{ErrorKind, MatError};
 use crate::{Establisher, NodeConn};
 
 /// 購読 fake。`priming` は subscribe_wildcard が返す priming チャンク、`live` は
-/// next_report が 1 呼び出し 1 通で払い出すキュー。尽きたら timeout まで待って
-/// kind=Timeout（実セッションの無音と同じ形）。
+/// next_report が 1 呼び出し 1 通で払い出す共有キュー（FakeEstablisher.sub_live
+/// と同一 — テストが確立後に注入できる）。尽きたら timeout まで待って Ok(None)
+/// （実セッションの無音と同じ形）。
 pub struct FakeSubConn {
     pub max_interval_s: u16,
     pub priming: Vec<mat_controller::im::ReportDataMessage>,
-    pub live: std::collections::VecDeque<mat_controller::im::ReportDataMessage>,
+    pub live: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<mat_controller::im::ReportDataMessage>>,
+    >,
     /// subscribe_wildcard が受けた clusters の記録先（FakeEstablisher と共有）。
     pub seen_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
 }
@@ -48,7 +51,7 @@ impl Default for FakeSubConn {
         Self {
             max_interval_s: 60,
             priming: vec![onoff_report(1, true)],
-            live: std::collections::VecDeque::new(),
+            live: std::sync::Arc::default(),
             seen_clusters: std::sync::Arc::default(),
         }
     }
@@ -79,12 +82,12 @@ impl crate::SubscribeConn for FakeSubConn {
     async fn next_report(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Result<mat_controller::im::ReportDataMessage, MatError> {
-        if let Some(r) = self.live.pop_front() {
-            return Ok(r);
+    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+        if let Some(r) = self.live.lock().unwrap().pop_front() {
+            return Ok(Some(r));
         }
         tokio::time::sleep(timeout).await;
-        Err(MatError::new(ErrorKind::Timeout, "fake: no more reports"))
+        Ok(self.live.lock().unwrap().pop_front())
     }
 }
 
@@ -260,6 +263,10 @@ pub struct FakeEstablisher {
     /// 直近の establish_subscription が返した FakeSubConn の seen_clusters と
     /// 共有される記録先（matd の manager テストが検証に使う）。
     pub sub_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// 全 FakeSubConn と共有する live キュー（テストが確立後に report を注入する）。
+    pub sub_live: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<mat_controller::im::ReportDataMessage>>,
+    >,
 }
 
 impl Default for FakeEstablisher {
@@ -269,6 +276,7 @@ impl Default for FakeEstablisher {
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
             sub_clusters: std::sync::Arc::default(),
+            sub_live: std::sync::Arc::default(),
         }
     }
 }
@@ -291,6 +299,7 @@ impl Establisher for FakeEstablisher {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeSubConn {
             seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
+            live: std::sync::Arc::clone(&self.sub_live),
             ..Default::default()
         }))
     }
