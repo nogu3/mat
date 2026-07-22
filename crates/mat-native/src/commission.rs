@@ -58,9 +58,25 @@ fn parse_code(s: &str) -> Result<Code, MatError> {
 
 /// `CommissionError` → mat の `ErrorKind`（spec の写像。発見の空振り
 /// （`Discovery`）は `commission` 本体で `unreachable` に写すためここには来ない）。
+///
+/// v1 品質修正 1: 旧 `_ => CommissionFailed` が Pase/Case/Session を全部吸収して
+/// いたのを分離 — timeout 系（MRP 再送尽き）は `Timeout`(exit 3)、デバイスの明示
+/// 拒否（passcode 不一致 = SPAKE2+ confirm 不一致 / PASE・CASE の StatusReport 拒否 /
+/// Sigma2 署名不正）は `DeviceRejected`(exit 4)。残余のみ `CommissionFailed`。
 fn kind_of(e: &CommissionError) -> ErrorKind {
+    use mat_controller::case::CaseError;
+    use mat_controller::exchange::ExchangeError;
+    use mat_controller::pase::PaseError;
+    use mat_controller::session::SessionError;
     match e {
-        CommissionError::Timeout(_) => ErrorKind::Timeout,
+        CommissionError::Timeout(_)
+        | CommissionError::Pase(PaseError::Exchange(ExchangeError::Timeout))
+        | CommissionError::Case(CaseError::Exchange(ExchangeError::Timeout))
+        | CommissionError::Session(SessionError::Timeout) => ErrorKind::Timeout,
+        CommissionError::Pase(PaseError::ConfirmMismatch | PaseError::StatusReport { .. })
+        | CommissionError::Case(CaseError::PeerStatus { .. } | CaseError::Sigma2SignatureInvalid) => {
+            ErrorKind::DeviceRejected
+        }
         CommissionError::Attestation(_) => ErrorKind::DeviceRejected,
         CommissionError::Noc(_) | CommissionError::CommandStatus { .. } => {
             ErrorKind::DeviceRejected
@@ -443,6 +459,70 @@ mod tests {
                 step: "gatt",
                 detail: "x".into()
             }),
+            ErrorKind::CommissionFailed
+        );
+    }
+
+    /// v1 品質修正 1: `_ => CommissionFailed` が吸収していた Pase/Case/Session の
+    /// うち、timeout 系 → `Timeout`(exit 3)、デバイス明示拒否系 → `DeviceRejected`
+    /// (exit 4) に分離されること。
+    #[test]
+    fn kind_of_splits_timeout_and_rejection_out_of_commission_failed() {
+        use mat_controller::case::CaseError;
+        use mat_controller::exchange::ExchangeError;
+        use mat_controller::pase::PaseError;
+        use mat_controller::session::SessionError;
+
+        // timeout 系（MRP 再送尽き）→ Timeout
+        assert_eq!(
+            kind_of(&CommissionError::Pase(PaseError::Exchange(
+                ExchangeError::Timeout
+            ))),
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Case(CaseError::Exchange(
+                ExchangeError::Timeout
+            ))),
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Session(SessionError::Timeout)),
+            ErrorKind::Timeout
+        );
+
+        // 拒否系 → DeviceRejected
+        assert_eq!(
+            kind_of(&CommissionError::Pase(PaseError::ConfirmMismatch)),
+            ErrorKind::DeviceRejected
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Pase(PaseError::StatusReport {
+                general_code: 1,
+                protocol_code: 0,
+            })),
+            ErrorKind::DeviceRejected
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Case(CaseError::PeerStatus {
+                stage: "sigma2",
+                general_code: 1,
+                protocol_code: 0,
+            })),
+            ErrorKind::DeviceRejected
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Case(CaseError::Sigma2SignatureInvalid)),
+            ErrorKind::DeviceRejected
+        );
+
+        // 上記以外の Pase/Case/Session は従来どおり CommissionFailed の残余
+        assert_eq!(
+            kind_of(&CommissionError::Pase(PaseError::NotAcked)),
+            ErrorKind::CommissionFailed
+        );
+        assert_eq!(
+            kind_of(&CommissionError::Case(CaseError::Tbe2DecryptFailed)),
             ErrorKind::CommissionFailed
         );
     }
