@@ -1003,7 +1003,10 @@ is `unreachable` (exit `5`).
   be established, e.g. an intermittent `CHIP Error 0x54 (Invalid CASE parameter)`
   during the Sigma exchange (exit 6). Distinct from `unreachable` (no IP route)
   and `device_rejected` (the device answered and refused); typically retryable.
-- `commission_failed` — commissioning failed (unclassified, exit 1)
+- `commission_failed` — commissioning failed (unclassified residue, exit 1).
+  Since 1.0.0 timeouts during PASE/CASE map to `timeout` and explicit device
+  refusals (wrong passcode / StatusReport rejection / bad Sigma2 signature) map
+  to `device_rejected` instead of landing here.
 - `parse_error` — this kind is returned when a generic `write` / `invoke` names
   a known attribute or command field whose type is `list` / `struct` / `float`
   (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
