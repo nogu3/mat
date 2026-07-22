@@ -672,10 +672,19 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                     Value::Bool(v),
                 ))
             } else {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("is_native_hotpath already resolved this cluster name");
-                let attr = mat_core::ids::resolve_attribute(cluster_id, attribute)
-                    .expect("is_native_hotpath already resolved this attribute name");
+                // is_native_hotpath が解決済みのはずだが、不変条件が破れても
+                // panic せず typed error（v1 品質修正 6 — alias.rs id() と同じ規律）。
+                let cluster_id = mat_core::ids::resolve_cluster(cluster).ok_or_else(|| {
+                    MatError::parse_error(format!(
+                        "internal: unknown cluster name '{cluster}' (is_native_hotpath invariant violated)"
+                    ))
+                })?;
+                let attr =
+                    mat_core::ids::resolve_attribute(cluster_id, attribute).ok_or_else(|| {
+                        MatError::parse_error(format!(
+                            "internal: unknown attribute name '{attribute}' for cluster '{cluster}' (is_native_hotpath invariant violated)"
+                        ))
+                    })?;
                 let v = native
                     .read_json(*node_id, *endpoint, cluster_id, attr.id)
                     .await?;
