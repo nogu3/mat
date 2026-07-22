@@ -99,16 +99,21 @@ pub async fn send(
             tracing::info!(group_id, counter, "groupcast sent (native)");
             Ok(GroupOutcome::Sent)
         }
-        // GroupSendError::{Crypto,Io} 双方を Unreachable に一括写像する。Io
-        // （socket 送出失敗）は妥当な写像だが、Crypto（AES-CCM 暗号化失敗）は
-        // 実用上ほぼ起き得ない（caller bug か payload サイズ超過のみ）ため、
-        // 専用 ErrorKind を割かずに Unreachable へ寄せる pragmatic な
-        // catch-all という判断（レビュー指摘 minor、挙動変更なし）。
-        Err(e) => Err(MatError::new(
-            ErrorKind::Unreachable,
-            format!("groupcast send to group {group_id}: {e}"),
-        )),
+        Err(e) => Err(group_send_error(group_id, e)),
     }
+}
+
+/// `GroupSendError` → mat の `ErrorKind`。`Io`（socket 送出失敗 = ワイヤに乗らな
+/// かった）は `Unreachable`。`Crypto`（AES-CCM 暗号化失敗 — 実用上 caller bug か
+/// payload サイズ超過のみで、ネットワーク不達ではない）は `Other` へ分離
+/// （v1 品質修正 2 — 旧実装は両者を Unreachable に一括写像していた）。
+fn group_send_error(group_id: u16, e: mat_controller::group::GroupSendError) -> MatError {
+    use mat_controller::group::GroupSendError;
+    let kind = match &e {
+        GroupSendError::Io(_) => ErrorKind::Unreachable,
+        GroupSendError::Crypto(_) => ErrorKind::Other,
+    };
+    MatError::new(kind, format!("groupcast send to group {group_id}: {e}"))
 }
 
 #[cfg(test)]
@@ -116,6 +121,25 @@ mod tests {
     use super::*;
     use crate::test_support::write_group_fixture_ini;
     use mat_controller::im;
+
+    /// v1 品質修正 2: `Io`(socket 送出失敗) は `Unreachable` のままだが、
+    /// `Crypto`(AES-CCM 暗号化失敗 = ネットワーク不達ではない) は `Other` へ。
+    #[test]
+    fn group_send_error_maps_io_to_unreachable_and_crypto_to_other() {
+        use mat_controller::group::GroupSendError;
+        let io = group_send_error(10, GroupSendError::Io(std::io::Error::other("send failed")));
+        assert_eq!(io.kind, mat_core::error::ErrorKind::Unreachable);
+        let crypto = group_send_error(
+            10,
+            GroupSendError::Crypto(mat_controller::crypto::CryptoError::PayloadTooLarge),
+        );
+        assert_eq!(crypto.kind, mat_core::error::ErrorKind::Other);
+        assert!(
+            crypto.detail.contains("group 10"),
+            "detail: {}",
+            crypto.detail
+        );
+    }
 
     #[tokio::test]
     async fn group_invoke_sends_multicast_and_reports_sent() {
