@@ -40,7 +40,10 @@ pub(crate) fn emit_level_success(
     transition: u16,
 ) {
     output::emit(body::level_success(
-        node_id, endpoint, percent, level, transition,
+        node_id,
+        endpoint,
+        body::LevelEcho { percent, level },
+        transition,
     ));
 }
 

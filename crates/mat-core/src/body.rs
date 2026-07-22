@@ -85,21 +85,23 @@ pub fn color_temp_success(
     })
 }
 
+/// `percent`(入力)と `level`(換算後 0–254)のエコーペア。隣接する同型 `u8`
+/// 引数の取り違え(swap)をコンパイル時に防ぐ(v1 品質修正 8 — 任意項目)。
+#[derive(Debug, Clone, Copy)]
+pub struct LevelEcho {
+    pub percent: u8,
+    pub level: u8,
+}
+
 /// `level` の成功 body。入力 percent と換算後 level を両方エコー。
-pub fn level_success(
-    node_id: u64,
-    endpoint: u16,
-    percent: u8,
-    level: u8,
-    transition: u16,
-) -> Value {
+pub fn level_success(node_id: u64, endpoint: u16, echo: LevelEcho, transition: u16) -> Value {
     json!({
         "node_id": node_id,
         "endpoint": endpoint,
         "cluster": "levelcontrol",
         "command": "move-to-level",
-        "percent": percent,
-        "level": level,
+        "percent": echo.percent,
+        "level": echo.level,
         "transition": transition,
         "status": "success",
     })
@@ -175,19 +177,13 @@ pub fn group_color_temp_sent(
 }
 
 /// `group level` の sent body。
-pub fn group_level_sent(
-    group_id: u16,
-    percent: u8,
-    level: u8,
-    transition: u16,
-    endpoint: u16,
-) -> Value {
+pub fn group_level_sent(group_id: u16, echo: LevelEcho, transition: u16, endpoint: u16) -> Value {
     json!({
         "group_id": group_id,
         "cluster": "levelcontrol",
         "command": "move-to-level",
-        "percent": percent,
-        "level": level,
+        "percent": echo.percent,
+        "level": echo.level,
         "transition": transition,
         "endpoint": endpoint,
         "status": "sent",
@@ -314,7 +310,15 @@ mod tests {
     #[test]
     fn level_success_shape() {
         assert_eq!(
-            level_success(5, 1, 50, 127, 0),
+            level_success(
+                5,
+                1,
+                LevelEcho {
+                    percent: 50,
+                    level: 127
+                },
+                0
+            ),
             json!({
                 "node_id": 5, "endpoint": 1, "cluster": "levelcontrol",
                 "command": "move-to-level",
@@ -404,7 +408,15 @@ mod tests {
     #[test]
     fn group_level_sent_shape() {
         assert_eq!(
-            group_level_sent(10, 50, 127, 0, 1),
+            group_level_sent(
+                10,
+                LevelEcho {
+                    percent: 50,
+                    level: 127
+                },
+                0,
+                1
+            ),
             json!({
                 "group_id": 10, "cluster": "levelcontrol",
                 "command": "move-to-level",

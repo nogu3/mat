@@ -535,7 +535,15 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
             im::CLUSTER_LEVEL_CONTROL,
             im::CMD_MOVE_TO_LEVEL,
             Some(im::encode_move_to_level_fields(*level, *transition)),
-            mat_core::body::group_level_sent(*group_id, *percent, *level, *transition, *endpoint),
+            mat_core::body::group_level_sent(
+                *group_id,
+                mat_core::body::LevelEcho {
+                    percent: *percent,
+                    level: *level,
+                },
+                *transition,
+                *endpoint,
+            ),
         ))),
         Op::GroupColor {
             group_id,
@@ -651,8 +659,10 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             Ok(mat_core::body::level_success(
                 *node_id,
                 *endpoint,
-                *percent,
-                *level,
+                mat_core::body::LevelEcho {
+                    percent: *percent,
+                    level: *level,
+                },
                 *transition,
             ))
         }
