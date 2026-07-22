@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{Command, GroupCommand};
 use mat_core::alias::NodeRef;
-use mat_core::error::ErrorKind;
+use mat_core::error::{ErrorKind, MatError};
 use mat_core::socket::default_socket_candidates;
 
 /// mat の実行経路。`resolve_route` が決める。socket は探索候補リスト
@@ -107,17 +107,17 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            return ExitCode::FAILURE;
+            emit_error(ErrorKind::MatdUnavailable, &detail);
+            return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
         }
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
     match exchange_on_stream(stream, &op) {
         Ok(resp) => emit_response(resp),
-        Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            ExitCode::FAILURE
+        Err(e) => {
+            e.emit();
+            ExitCode::from(e.kind.exit_code())
         }
     }
 }
@@ -146,9 +146,9 @@ pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode>
 
     Some(match exchange_on_stream(stream, &op) {
         Ok(resp) => emit_response(resp),
-        Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            ExitCode::FAILURE
+        Err(e) => {
+            e.emit();
+            ExitCode::from(e.kind.exit_code())
         }
     })
 }
@@ -381,22 +381,37 @@ fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String
 }
 
 /// 接続済み stream で 1 行送り 1 行受け取る（自動検出は probe した接続を使い回す）。
-fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, String> {
-    let mut line = serde_json::to_vec(op).map_err(|e| format!("failed to encode request: {e}"))?;
+///
+/// v1 品質修正 3: 途中失敗を typed error 化。送受信の I/O 断・応答なし切断は
+/// 「matd がいなくなった」= `matd_unavailable`（送信後はリクエストが実行済みの
+/// 可能性があるので detail で明示）。応答が JSON でないのは `parse_error`。
+fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, MatError> {
+    let mut line = serde_json::to_vec(op)
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to encode request: {e}")))?;
     line.push(b'\n');
-    stream
-        .write_all(&line)
-        .map_err(|e| format!("failed to send request to matd: {e}"))?;
+    stream.write_all(&line).map_err(|e| {
+        MatError::new(
+            ErrorKind::MatdUnavailable,
+            format!("failed to send request to matd: {e}"),
+        )
+    })?;
 
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
-    let n = reader
-        .read_line(&mut resp)
-        .map_err(|e| format!("failed to read response from matd: {e}"))?;
+    let n = reader.read_line(&mut resp).map_err(|e| {
+        MatError::new(
+            ErrorKind::MatdUnavailable,
+            format!("failed to read response from matd: {e}; the request may have been executed"),
+        )
+    })?;
     if n == 0 {
-        return Err("matd closed the connection without responding".to_string());
+        return Err(MatError::new(
+            ErrorKind::MatdUnavailable,
+            "matd closed the connection without responding; the request may have been executed",
+        ));
     }
-    serde_json::from_str(&resp).map_err(|e| format!("matd response was not JSON: {e}; body={resp}"))
+    serde_json::from_str(&resp)
+        .map_err(|e| MatError::parse_error(format!("matd response was not JSON: {e}; body={resp}")))
 }
 
 /// matd 応答を mat の規約どおり出力する: 成功は stdout、エラーは stderr。exit code は
@@ -404,10 +419,20 @@ fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, Strin
 fn emit_response(resp: Value) -> ExitCode {
     if let Some(err) = resp.get("error") {
         eprintln!("{resp}");
-        let kind = err
+        let kind = match err
             .get("kind")
             .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
-            .unwrap_or(ErrorKind::Other);
+        {
+            Some(k) => k,
+            None => {
+                let raw_kind = err.get("kind").cloned().unwrap_or(Value::Null);
+                tracing::warn!(
+                    kind = %raw_kind,
+                    "unknown error kind from matd; mapping to `other` for the exit code"
+                );
+                ErrorKind::Other
+            }
+        };
         ExitCode::from(kind.exit_code())
     } else {
         println!("{resp}");
@@ -901,5 +926,54 @@ mod tests {
             thread_dataset: None,
         })
         .is_err());
+    }
+
+    /// v1 品質修正 3: matd 経路の途中失敗が一律 `other` だったのを分離。
+    /// 応答なし切断（EOF）= matd 側が死んだ → `matd_unavailable`(exit 13)。
+    #[test]
+    fn exchange_on_stream_maps_eof_to_matd_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            // リクエスト行を消費してから切断する（先にドロップすると client の
+            // write_all がリクエスト到達前に broken pipe で失敗し得るため、EOF-on-read
+            // を確実に踏ませるにはここで 1 行読んでおく必要がある）。
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            drop(conn); // 1 行も返さず切断 → クライアント側は EOF
+        });
+        let stream = UnixStream::connect(&path).unwrap();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::MatdUnavailable);
+        assert!(
+            err.detail.contains("may have been executed"),
+            "detail should warn about possible partial execution: {}",
+            err.detail
+        );
+        server.join().unwrap();
+    }
+
+    /// 応答は来たが JSON でない → `parse_error`（native 経路の出力不能時と同じ分類）。
+    #[test]
+    fn exchange_on_stream_maps_non_json_response_to_parse_error() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap(); // リクエスト 1 行を消費
+            let mut conn = conn;
+            conn.write_all(b"garbage\n").unwrap();
+        });
+        let stream = UnixStream::connect(&path).unwrap();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        server.join().unwrap();
     }
 }
