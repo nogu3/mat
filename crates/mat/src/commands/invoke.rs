@@ -1,28 +1,20 @@
 //! `mat invoke` — コマンドを実行する。
 //!
 //! バックエンド実行は native 直経路（`native_direct`）が担う（M8c-3 で chip-tool
-//! 経路は撤去）。このモジュールは native 経路から呼ばれる成功 JSON の emit と、
-//! 経路非依存の入力換算ヘルパー（`resolve_color_temp`）を持つ。`mat on` / `mat off`
+//! 経路は撤去）。成功 JSON の形は `mat_core::body`（直経路・matd 共有の単一
+//! ソース）、このモジュールは stdout への emit のみを持つ。経路非依存の入力換算
+//! ヘルパー（`resolve_color_temp` / `resolve_level`）も持つ。`mat on` / `mat off`
 //! は OnOff クラスタの On/Off コマンドを invoke にマップしたショートカット。
 
-use serde_json::json;
-
 use mat_core::color::ResolvedColor;
-use mat_core::output;
+use mat_core::{body, output};
 
-/// `invoke` / `on` / `off` の成功 JSON を stdout へ emit する。native 直経路
-/// （`native_direct`）から呼ばれる単一ソース（スキーマ不変）。
+/// `invoke` / `on` / `off` の成功 JSON を stdout へ emit する（body は `mat_core::body` 共有）。
 pub(crate) fn emit_invoke_success(node_id: u64, endpoint: u16, cluster: &str, command: &str) {
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": cluster,
-        "command": command,
-        "status": "success",
-    }));
+    output::emit(body::invoke_success(node_id, endpoint, cluster, command));
 }
 
-/// `color-temp` の成功 JSON を stdout へ emit する（native 直経路の単一ソース）。
+/// `color-temp` の成功 JSON を stdout へ emit する（body は `mat_core::body` 共有）。
 /// 出力には入力の kelvin と換算後の mireds を両方載せ、`color-temperature-mireds`
 /// の読み返しと突合しやすくする。
 pub(crate) fn emit_color_temp_success(
@@ -32,19 +24,12 @@ pub(crate) fn emit_color_temp_success(
     mireds: u16,
     transition: u16,
 ) {
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": "colorcontrol",
-        "command": "move-to-color-temperature",
-        "kelvin": kelvin,
-        "mireds": mireds,
-        "transition": transition,
-        "status": "success",
-    }));
+    output::emit(body::color_temp_success(
+        node_id, endpoint, kelvin, mireds, transition,
+    ));
 }
 
-/// `level` の成功 JSON を stdout へ emit する（native 直経路の単一ソース）。
+/// `level` の成功 JSON を stdout へ emit する（body は `mat_core::body` 共有）。
 /// 出力には入力の percent と換算後の level を両方載せ、`current-level` の
 /// 読み返しと突合しやすくする。
 pub(crate) fn emit_level_success(
@@ -54,16 +39,9 @@ pub(crate) fn emit_level_success(
     level: u8,
     transition: u16,
 ) {
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": "levelcontrol",
-        "command": "move-to-level",
-        "percent": percent,
-        "level": level,
-        "transition": transition,
-        "status": "success",
-    }));
+    output::emit(body::level_success(
+        node_id, endpoint, percent, level, transition,
+    ));
 }
 
 /// `mat color-temp` の `--kelvin` / `--mireds`（排他・どちらか必須）を
@@ -93,7 +71,7 @@ pub(crate) fn resolve_level(percent: u8) -> u8 {
     ((u32::from(percent) * 254 + 50) / 100) as u8
 }
 
-/// `color` の成功 JSON を stdout へ emit する（native 直経路の単一ソース）。
+/// `color` の成功 JSON を stdout へ emit する（body は `mat_core::body` 共有）。
 /// 入力（name / rgb / 度・%）と換算後の 0–254 生値を両方エコーし、`current-hue` /
 /// `current-saturation` の読み返しと突合しやすくする。
 pub(crate) fn emit_color_success(
@@ -102,25 +80,7 @@ pub(crate) fn emit_color_success(
     color: &ResolvedColor,
     transition: u16,
 ) {
-    let mut body = json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": "colorcontrol",
-        "command": "move-to-hue-and-saturation",
-        "hue": color.hue,
-        "saturation": color.sat,
-        "hue_raw": color.hue_raw,
-        "saturation_raw": color.sat_raw,
-        "transition": transition,
-        "status": "success",
-    });
-    if let Some(name) = &color.name {
-        body["name"] = json!(name);
-    }
-    if let Some(rgb) = &color.rgb {
-        body["rgb"] = json!(rgb);
-    }
-    output::emit(body);
+    output::emit(body::color_success(node_id, endpoint, color, transition));
 }
 
 #[cfg(test)]
