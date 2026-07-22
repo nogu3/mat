@@ -446,9 +446,11 @@ pub(crate) fn is_native_hotpath(op: &Op) -> bool {
 /// Group 系はノード特定不能、listen/管理系は対象外で None。
 fn op_report_expectation(op: &Op) -> Option<(u64, u32)> {
     match op {
-        Op::On { node_id, .. } | Op::Off { node_id, .. } => Some((*node_id, 0x0006)),
-        Op::Level { node_id, .. } => Some((*node_id, 0x0008)),
-        Op::Color { node_id, .. } | Op::ColorTemp { node_id, .. } => Some((*node_id, 0x0300)),
+        Op::On { node_id, .. } | Op::Off { node_id, .. } => Some((*node_id, im::CLUSTER_ON_OFF)),
+        Op::Level { node_id, .. } => Some((*node_id, im::CLUSTER_LEVEL_CONTROL)),
+        Op::Color { node_id, .. } | Op::ColorTemp { node_id, .. } => {
+            Some((*node_id, im::CLUSTER_COLOR_CONTROL))
+        }
         Op::Write {
             node_id, cluster, ..
         }
