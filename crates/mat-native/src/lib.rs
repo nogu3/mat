@@ -671,6 +671,9 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
         SessionError::Im(_) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
+        // ピアの応答がメッセージ層で壊れている → 応答は来た（不達ではない）が
+        // 解釈不能 = parse_error（v1 品質修正 4）。
+        SessionError::Message(_) => MatError::new(ErrorKind::ParseError, format!("native: {e}")),
         _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
     }
 }
@@ -735,6 +738,16 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::Unreachable);
         let e = map_resolve_err(5, DnssdError::Malformed("bad"));
         assert_eq!(e.kind, ErrorKind::Unreachable);
+    }
+
+    #[test]
+    fn map_session_err_maps_malformed_message_to_parse_error() {
+        // v1 品質修正 4: ピアの壊れた応答（Message 層のパース失敗）は「応答は来た
+        // が解釈不能」= `parse_error`。旧実装は catch-all で `other` に落ちていた。
+        let e = map_session_err(mat_controller::session::SessionError::Message(
+            mat_controller::message::MessageError::Truncated,
+        ));
+        assert_eq!(e.kind, ErrorKind::ParseError);
     }
 
     #[test]
