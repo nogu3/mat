@@ -1012,12 +1012,16 @@ is `unreachable` (exit `5`).
   (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
   names a cluster / attribute / command the generated table does not know (pass
   the numeric id instead).
-- `matd_unavailable` (exit 13) — `mat listen` only. `matd` was not reachable at
-  all (no socket, connection refused, `MAT_MATD=0`), or the connection was cut
-  partway through the event stream. `mat listen` has no direct-path fallback
-  (subscriptions need a resident daemon), so this is the sole failure mode for
-  reaching `matd` — distinct from `timeout` (exit 3), which `mat listen` uses
-  only for "connected fine, zero events arrived before `--timeout-ms`."
+- `matd_unavailable` (exit 13) — `matd` was not reachable or died mid-request.
+  For `mat listen`: no socket, connection refused, `MAT_MATD=0`, or the
+  connection was cut partway through the event stream (`mat listen` has no
+  direct-path fallback). Since 1.0.0 also for every other op on the matd path:
+  forced `--matd` failing to connect, or an I/O failure / silent disconnect
+  after the request line was sent (the request may or may not have been
+  executed — the detail says so; there is deliberately no direct-path retry, to
+  avoid double execution of writes). Distinct from `timeout` (exit 3), which
+  `mat listen` uses only for "connected fine, zero events arrived before
+  `--timeout-ms`."
 - `other` — anything else (exit 1); also what a `group provision` KVS write
   returns once the write is attempted and fails — including a duplicate bind
   (`detail` says `use --rebind`) or the KVS being locked by a concurrent writer
