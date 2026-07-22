@@ -22,7 +22,6 @@ use mat_controller::im;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::group::resolve_epoch_key;
 use mat_core::output::now_iso8601;
-use mat_core::parse::normalize_value;
 use mat_core::store::Store;
 
 use crate::native::NativeBackend;
@@ -368,14 +367,14 @@ async fn run_op(
 
     if let Some(result) = native_group_params(op) {
         return match result {
-            Ok((group_id, cluster, command, fields)) => {
+            Ok((group_id, cluster, command, fields, sent_body)) => {
                 // chip-tool 撤去前と同じ前提チェック（store が開けること）。
                 let _store = Store::open(store_path)?;
                 match native
                     .group_invoke(group_id, cluster, command, fields)
                     .await?
                 {
-                    crate::native::GroupOutcome::Sent => Ok(group_sent_body(op)),
+                    crate::native::GroupOutcome::Sent => Ok(sent_body),
                     crate::native::GroupOutcome::Unavailable(reason) => {
                         Err(group_unavailable_error(&reason))
                     }
@@ -460,8 +459,10 @@ fn op_report_expectation(op: &Op) -> Option<(u64, u32)> {
     }
 }
 
-/// `native_group_params` の Ok 内訳: (group_id, cluster_id, command_id, fields_tlv)。
-type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>);
+/// `native_group_params` の Ok 内訳: (group_id, cluster_id, command_id, fields_tlv,
+/// 成功時 sent body)。body は op 変種が確定しているここで組む(旧 `group_sent_body`
+/// の `let … else unreachable!` を型で排除)。
+type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>, Value);
 
 /// group 送信 op の native 適用判定。`GroupInvoke` の cluster/command/引数は
 /// mat-core::ids の `classify_invoke` に通す（onoff 限定を撤廃 — M8a
@@ -478,6 +479,7 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
             cluster,
             command,
             args,
+            endpoint,
             ..
         } => match mat_core::ids::classify_invoke(cluster, command, args) {
             mat_core::ids::InvokeClass::NotNative => None,
@@ -494,14 +496,17 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                 } else {
                     Some(mat_native::encode_command_fields(&fields))
                 };
-                Some(Ok((*group_id, cluster_id, cmd_id, fields_tlv)))
+                let sent_body =
+                    mat_core::body::group_invoke_sent(*group_id, cluster, command, *endpoint);
+                Some(Ok((*group_id, cluster_id, cmd_id, fields_tlv, sent_body)))
             }
         },
         Op::GroupColorTemp {
             group_id,
             mireds,
+            kelvin,
             transition,
-            ..
+            endpoint,
         } => Some(Ok((
             *group_id,
             im::CLUSTER_COLOR_CONTROL,
@@ -510,34 +515,58 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                 *mireds,
                 *transition,
             )),
+            mat_core::body::group_color_temp_sent(
+                *group_id,
+                *kelvin,
+                *mireds,
+                *transition,
+                *endpoint,
+            ),
         ))),
         Op::GroupLevel {
             group_id,
             level,
+            percent,
             transition,
-            ..
+            endpoint,
         } => Some(Ok((
             *group_id,
             im::CLUSTER_LEVEL_CONTROL,
             im::CMD_MOVE_TO_LEVEL,
             Some(im::encode_move_to_level_fields(*level, *transition)),
+            mat_core::body::group_level_sent(*group_id, *percent, *level, *transition, *endpoint),
         ))),
         Op::GroupColor {
             group_id,
             hue_raw,
             saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
             transition,
-            ..
-        } => Some(Ok((
-            *group_id,
-            im::CLUSTER_COLOR_CONTROL,
-            im::CMD_MOVE_TO_HUE_AND_SATURATION,
-            Some(im::encode_move_to_hue_and_saturation_fields(
-                *hue_raw,
-                *saturation_raw,
-                *transition,
-            )),
-        ))),
+            endpoint,
+        } => {
+            let color = mat_core::color::ResolvedColor {
+                hue_raw: *hue_raw,
+                sat_raw: *saturation_raw,
+                hue: *hue,
+                sat: *saturation,
+                name: name.clone(),
+                rgb: rgb.clone(),
+            };
+            Some(Ok((
+                *group_id,
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_HUE_AND_SATURATION,
+                Some(im::encode_move_to_hue_and_saturation_fields(
+                    *hue_raw,
+                    *saturation_raw,
+                    *transition,
+                )),
+                mat_core::body::group_color_sent(*group_id, &color, *transition, *endpoint),
+            )))
+        }
         _ => None,
     }
 }
@@ -551,48 +580,80 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
     match op {
         Op::On { node_id, endpoint } => {
             native.on(*node_id, *endpoint).await?;
-            Ok(hotpath_success_body(op, None))
+            Ok(mat_core::body::invoke_success(
+                *node_id, *endpoint, "onoff", "on",
+            ))
         }
         Op::Off { node_id, endpoint } => {
             native.off(*node_id, *endpoint).await?;
-            Ok(hotpath_success_body(op, None))
+            Ok(mat_core::body::invoke_success(
+                *node_id, *endpoint, "onoff", "off",
+            ))
         }
         Op::Color {
             node_id,
             endpoint,
             hue_raw,
             saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
             transition,
-            ..
         } => {
             native
                 .color(*node_id, *endpoint, *hue_raw, *saturation_raw, *transition)
                 .await?;
-            Ok(hotpath_success_body(op, None))
+            let color = mat_core::color::ResolvedColor {
+                hue_raw: *hue_raw,
+                sat_raw: *saturation_raw,
+                hue: *hue,
+                sat: *saturation,
+                name: name.clone(),
+                rgb: rgb.clone(),
+            };
+            Ok(mat_core::body::color_success(
+                *node_id,
+                *endpoint,
+                &color,
+                *transition,
+            ))
         }
         Op::ColorTemp {
             node_id,
             endpoint,
             mireds,
+            kelvin,
             transition,
-            ..
         } => {
             native
                 .color_temp(*node_id, *endpoint, *mireds, *transition)
                 .await?;
-            Ok(hotpath_success_body(op, None))
+            Ok(mat_core::body::color_temp_success(
+                *node_id,
+                *endpoint,
+                *kelvin,
+                *mireds,
+                *transition,
+            ))
         }
         Op::Level {
             node_id,
             endpoint,
             level,
+            percent,
             transition,
-            ..
         } => {
             native
                 .level(*node_id, *endpoint, *level, *transition)
                 .await?;
-            Ok(hotpath_success_body(op, None))
+            Ok(mat_core::body::level_success(
+                *node_id,
+                *endpoint,
+                *percent,
+                *level,
+                *transition,
+            ))
         }
         Op::Read {
             node_id,
@@ -602,7 +663,13 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
         } => {
             if cluster == "onoff" && attribute == "on-off" {
                 let v = native.read_onoff(*node_id, *endpoint).await?;
-                Ok(hotpath_success_body(op, Some(Value::Bool(v))))
+                Ok(mat_core::body::read_success(
+                    *node_id,
+                    *endpoint,
+                    cluster,
+                    attribute,
+                    Value::Bool(v),
+                ))
             } else {
                 let cluster_id = mat_core::ids::resolve_cluster(cluster)
                     .expect("is_native_hotpath already resolved this cluster name");
@@ -611,7 +678,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                 let v = native
                     .read_json(*node_id, *endpoint, cluster_id, attr.id)
                     .await?;
-                Ok(hotpath_success_body(op, Some(v)))
+                Ok(mat_core::body::read_success(
+                    *node_id, *endpoint, cluster, attribute, v,
+                ))
             }
         }
         Op::Write {
@@ -642,7 +711,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                         timed,
                     )
                     .await?;
-                Ok(write_success_body(op))
+                Ok(mat_core::body::write_success(
+                    *node_id, *endpoint, cluster, attribute, value,
+                ))
             }
         },
         Op::Invoke {
@@ -671,149 +742,16 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                 native
                     .invoke_generic(*node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed)
                     .await?;
-                Ok(invoke_success_body(op))
+                Ok(mat_core::body::invoke_success(
+                    *node_id, *endpoint, cluster, command,
+                ))
             }
         },
         Op::Describe { node_id } => {
             let endpoints = native.describe(*node_id).await?;
-            Ok(describe_success_body(*node_id, &endpoints))
+            Ok(mat_core::body::describe_success(*node_id, &endpoints))
         }
         _ => unreachable!("native_op called with non-hotpath op"),
-    }
-}
-
-/// Write op の成功 body（timestamp 抜き）。
-fn write_success_body(op: &Op) -> Value {
-    let Op::Write {
-        node_id,
-        endpoint,
-        cluster,
-        attribute,
-        value,
-    } = op
-    else {
-        unreachable!("write_success_body called with non-Write op");
-    };
-    json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": cluster,
-        "attribute": attribute,
-        // mat write と同じく、入力文字列を read と揃えた型へ正規化して返す。
-        "value": normalize_value(value),
-        "status": "success",
-    })
-}
-
-/// Invoke op の成功 body（timestamp 抜き）。
-fn invoke_success_body(op: &Op) -> Value {
-    let Op::Invoke {
-        node_id,
-        endpoint,
-        cluster,
-        command,
-        ..
-    } = op
-    else {
-        unreachable!("invoke_success_body called with non-Invoke op");
-    };
-    json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": cluster,
-        "command": command,
-        "status": "success",
-    })
-}
-
-/// describe op の成功 body（timestamp 抜き）。`endpoints` は (endpoint, clusters) の列
-/// （`mat_native::ops::describe` が集約した形をそのまま渡す）。
-fn describe_success_body(node_id: u64, endpoints: &[(u16, Vec<u64>)]) -> Value {
-    let out_endpoints: Vec<Value> = endpoints
-        .iter()
-        .map(|(ep, clusters)| json!({ "endpoint": ep, "clusters": clusters }))
-        .collect();
-    json!({ "node_id": node_id, "endpoints": out_endpoints })
-}
-
-/// ホットパス op の成功 body（timestamp 抜き）。
-fn hotpath_success_body(op: &Op, read_value: Option<Value>) -> Value {
-    match op {
-        Op::On { node_id, endpoint } => json!({
-            "node_id": node_id, "endpoint": endpoint,
-            "cluster": "onoff", "command": "on", "status": "success",
-        }),
-        Op::Off { node_id, endpoint } => json!({
-            "node_id": node_id, "endpoint": endpoint,
-            "cluster": "onoff", "command": "off", "status": "success",
-        }),
-        Op::ColorTemp {
-            node_id,
-            endpoint,
-            mireds,
-            kelvin,
-            transition,
-        } => json!({
-            "node_id": node_id, "endpoint": endpoint,
-            "cluster": "colorcontrol", "command": "move-to-color-temperature",
-            // 換算後 mireds と入力 kelvin を両方エコー（読み返し突合用; 直経路と同形）。
-            "kelvin": kelvin, "mireds": mireds, "transition": transition,
-            "status": "success",
-        }),
-        Op::Level {
-            node_id,
-            endpoint,
-            level,
-            percent,
-            transition,
-        } => json!({
-            "node_id": node_id, "endpoint": endpoint,
-            "cluster": "levelcontrol", "command": "move-to-level",
-            // 換算後 level と入力 percent を両方エコー（読み返し突合用; 直経路と同形）。
-            "percent": percent, "level": level, "transition": transition,
-            "status": "success",
-        }),
-        Op::Color {
-            node_id,
-            endpoint,
-            hue_raw,
-            saturation_raw,
-            hue,
-            saturation,
-            name,
-            rgb,
-            transition,
-        } => {
-            let mut body = json!({
-                "node_id": node_id, "endpoint": endpoint,
-                "cluster": "colorcontrol", "command": "move-to-hue-and-saturation",
-                // 入力の度 / % と換算後 0–254 生値を両方エコー（読み返し突合用; 直経路と同形）。
-                "hue": hue, "saturation": saturation,
-                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
-                "transition": transition,
-                "status": "success",
-            });
-            if let Some(n) = name {
-                body["name"] = json!(n);
-            }
-            if let Some(r) = rgb {
-                body["rgb"] = json!(r);
-            }
-            body
-        }
-        Op::Read {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-        } => json!({
-            "node_id": node_id,
-            "endpoint": endpoint,
-            "cluster": cluster,
-            "attribute": attribute,
-            "value": read_value.unwrap_or(Value::Null),
-        }),
-        _ => unreachable!("hotpath_success_body called with non-hotpath op"),
     }
 }
 
@@ -881,89 +819,9 @@ async fn group_provision(
             .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
     }
 
-    Ok(json!({
-        "group_id": group_id,
-        "keyset_id": keyset_id,
-        "name": name,
-        "endpoint": endpoint,
-        "nodes": node_ids,
-        "status": "provisioned",
-    }))
-}
-
-/// group 送信 op（`GroupInvoke`/`GroupColorTemp`/`GroupLevel`/`GroupColor`）の成功 body。
-fn group_sent_body(op: &Op) -> Value {
-    match op {
-        Op::GroupInvoke {
-            group_id,
-            cluster,
-            command,
-            endpoint,
-            ..
-        } => json!({
-            "group_id": group_id,
-            "cluster": cluster,
-            "command": command,
-            "endpoint": endpoint,
-            "status": "sent",
-            "note": "unacknowledged groupcast; per-device delivery not confirmed",
-        }),
-        Op::GroupColorTemp {
-            group_id,
-            mireds,
-            kelvin,
-            transition,
-            endpoint,
-        } => json!({
-            "group_id": group_id, "cluster": "colorcontrol",
-            "command": "move-to-color-temperature",
-            "kelvin": kelvin, "mireds": mireds, "transition": transition,
-            "endpoint": endpoint, "status": "sent",
-            "note": "unacknowledged groupcast; per-device delivery not confirmed",
-        }),
-        Op::GroupLevel {
-            group_id,
-            level,
-            percent,
-            transition,
-            endpoint,
-        } => json!({
-            "group_id": group_id, "cluster": "levelcontrol",
-            "command": "move-to-level",
-            "percent": percent, "level": level, "transition": transition,
-            "endpoint": endpoint, "status": "sent",
-            "note": "unacknowledged groupcast; per-device delivery not confirmed",
-        }),
-        Op::GroupColor {
-            group_id,
-            hue_raw,
-            saturation_raw,
-            hue,
-            saturation,
-            name,
-            rgb,
-            transition,
-            endpoint,
-        } => {
-            let mut body = json!({
-                "group_id": group_id, "cluster": "colorcontrol",
-                "command": "move-to-hue-and-saturation",
-                "hue": hue, "saturation": saturation,
-                "hue_raw": hue_raw, "saturation_raw": saturation_raw,
-                "transition": transition, "endpoint": endpoint,
-                "status": "sent",
-                "note": "unacknowledged groupcast; per-device delivery not confirmed",
-            });
-            if let Some(n) = name {
-                body["name"] = json!(n);
-            }
-            if let Some(r) = rgb {
-                body["rgb"] = json!(r);
-            }
-            body
-        }
-        _ => unreachable!("group_sent_body called with non group-send op"),
-    }
+    Ok(mat_core::body::group_provision_success(
+        *group_id, *keyset_id, name, *endpoint, node_ids, None,
+    ))
 }
 
 /// store を開いて node_id が commission 済みか確認する（常駐中の台帳更新を拾うよう
@@ -1179,7 +1037,7 @@ mod tests {
             args: vec![],
             endpoint: 1,
         };
-        let (gid, cluster, command, fields) = native_group_params(&on).unwrap().unwrap();
+        let (gid, cluster, command, fields, _) = native_group_params(&on).unwrap().unwrap();
         assert_eq!(
             (gid, cluster, command),
             (10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON)
@@ -1207,7 +1065,8 @@ mod tests {
             args: vec![],
             endpoint: 1,
         };
-        let (gid, cluster, command, fields) = native_group_params(&other_cluster).unwrap().unwrap();
+        let (gid, cluster, command, fields, _) =
+            native_group_params(&other_cluster).unwrap().unwrap();
         assert_eq!(gid, 10);
         assert_eq!(
             cluster,
@@ -1238,7 +1097,7 @@ mod tests {
             transition: 0,
             endpoint: 1,
         };
-        let (_, cluster, command, fields) = native_group_params(&ct).unwrap().unwrap();
+        let (_, cluster, command, fields, _) = native_group_params(&ct).unwrap().unwrap();
         assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
         assert_eq!(command, im::CMD_MOVE_TO_COLOR_TEMPERATURE);
         assert_eq!(
@@ -1253,7 +1112,7 @@ mod tests {
             transition: 0,
             endpoint: 1,
         };
-        let (_, cluster, command, fields) = native_group_params(&lv).unwrap().unwrap();
+        let (_, cluster, command, fields, _) = native_group_params(&lv).unwrap().unwrap();
         assert_eq!(cluster, im::CLUSTER_LEVEL_CONTROL);
         assert_eq!(command, im::CMD_MOVE_TO_LEVEL);
         assert_eq!(fields.unwrap(), im::encode_move_to_level_fields(254, 0));
@@ -1269,7 +1128,7 @@ mod tests {
             transition: 0,
             endpoint: 1,
         };
-        let (_, cluster, command, fields) = native_group_params(&color).unwrap().unwrap();
+        let (_, cluster, command, fields, _) = native_group_params(&color).unwrap().unwrap();
         assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
         assert_eq!(command, im::CMD_MOVE_TO_HUE_AND_SATURATION);
         assert_eq!(
