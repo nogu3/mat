@@ -74,7 +74,10 @@ pub(crate) fn emit_level_sent(
     endpoint: u16,
 ) {
     output::emit(body::group_level_sent(
-        group_id, percent, level, transition, endpoint,
+        group_id,
+        body::LevelEcho { percent, level },
+        transition,
+        endpoint,
     ));
 }
 

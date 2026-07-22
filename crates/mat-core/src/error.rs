@@ -44,8 +44,9 @@ pub enum ErrorKind {
     DeviceRejected,
     /// `chip-tool` 出力をパースできない。
     ParseError,
-    /// matd が利用できない（`mat listen` 専用）。
-    /// matd 常駐リスナなしで listen 実行時、またはバインド失敗時に使用。
+    /// matd が利用できない。`mat listen`（常駐リスナ必須・バインド失敗含む）に
+    /// 加え、1.0.0 から matd 経路の途中失敗（強制 matd の接続失敗・送受信の
+    /// I/O 断・応答なし切断）にも使う。
     /// exit code 12 は歴史的欠番（chip-tool 撤去）のため、13 を割当。
     MatdUnavailable,
     /// その他。
@@ -127,6 +128,15 @@ impl std::fmt::Display for MatError {
 }
 
 impl std::error::Error for MatError {}
+
+/// `Result<_, String>` の関数内で `MatError` を `?` で流すための縮退変換
+/// （matd_client::to_op が使う）。kind は落ち detail のみ残る — 内部バグ経路
+/// 専用で、通常経路では発生しない。
+impl From<MatError> for String {
+    fn from(e: MatError) -> Self {
+        e.detail
+    }
+}
 
 #[cfg(test)]
 mod tests {

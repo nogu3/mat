@@ -1676,6 +1676,49 @@ mod tests {
         );
     }
 
+    /// resolve_operational（CASE 前の targeted resolve）も、マルチキャストで
+    /// しか応答しない responder（実機 OTBR proxy と同型）の広告を受信できる
+    /// こと。browse / resolve_commissionable と同じ回帰（QU bit 層1、sibling
+    /// 関数の適用漏れ = 0.23.1 の教訓）のピン留め — これで 3 兄弟が対称になる。
+    #[tokio::test]
+    async fn resolve_operational_receives_multicast_only_response() {
+        let cfid: [u8; 8] = 0xAB7D_E088_02E0_CD54u64.to_be_bytes();
+        let node_id: u64 = 5;
+        let service = format!(
+            "{}._matter._tcp.local",
+            operational_instance(&cfid, node_id)
+        );
+        let msg = synth_response(
+            &service,
+            "mcastonly-op.local",
+            5540,
+            &["SII=5000"],
+            "fd00::5".parse().unwrap(),
+        );
+        let mut tried = Vec::new();
+        for (name, idx) in multicast_ifaces() {
+            let Ok(announcer) = spawn_multicast_announcer(idx, msg.clone()) else {
+                tried.push(format!("{name}(idx={idx}): responder bind failed"));
+                continue;
+            };
+            let res = resolve_operational(idx, &cfid, node_id, Duration::from_millis(1500)).await;
+            announcer.abort();
+            match res {
+                Ok(node) => {
+                    assert_eq!(node.port, 5540);
+                    assert_eq!(node.addresses, vec!["fd00::5".parse::<Ipv6Addr>().unwrap()]);
+                    return; // 最初に届いた iface で十分 — PASS。
+                }
+                Err(e) => tried.push(format!("{name}(idx={idx}): {e:?}")),
+            }
+        }
+        panic!(
+            "no multicast-capable interface delivered the multicast-only \
+             operational answer to resolve_operational (lo excluded — it lacks \
+             IFF_MULTICAST on Linux); tried: {tried:?}"
+        );
+    }
+
     /// commissionable browse 用の合成応答: PTR(subtype→instance) +
     /// SRV(instance→port/target) + TXT(instance) + AAAA(target への圧縮名)
     /// を 1 メッセージに詰める。`synth_response` の SRV/TXT/AAAA 部分に PTR

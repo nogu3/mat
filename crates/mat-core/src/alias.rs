@@ -45,15 +45,19 @@ macro_rules! impl_ref {
         }
         impl $ty {
             /// 解決済み（`Id`）前提で数値を返す。resolve 層通過後にのみ呼ぶ。
-            pub fn id(&self) -> $num {
+            /// 未解決 alias が届いたら resolve_command の考慮漏れ（内部バグ）
+            /// だが、panic で JSON 契約を破らず typed error として返す。
+            pub fn id(&self) -> Result<$num, MatError> {
                 match self {
-                    $ty::Id(n) => *n,
-                    $ty::Alias(a) => {
-                        unreachable!(
-                            "unresolved {} alias '{a}': resolve_command must run first",
+                    $ty::Id(n) => Ok(*n),
+                    $ty::Alias(a) => Err(MatError::new(
+                        ErrorKind::Other,
+                        format!(
+                            "internal: unresolved {} alias '{a}' reached execution \
+                             — resolve_command must run first",
                             $what
-                        )
-                    }
+                        ),
+                    )),
                 }
             }
         }
@@ -387,9 +391,25 @@ mod tests {
 
     #[test]
     fn id_returns_inner_value() {
-        assert_eq!(NodeRef::Id(7).id(), 7);
-        assert_eq!(GroupRef::Id(258).id(), 258);
-        assert_eq!(EndpointRef::Id(2).id(), 2);
+        assert_eq!(NodeRef::Id(7).id().unwrap(), 7);
+        assert_eq!(GroupRef::Id(258).id().unwrap(), 258);
+        assert_eq!(EndpointRef::Id(2).id().unwrap(), 2);
+    }
+
+    /// v1 品質修正 5: 未解決 alias が実行層まで届いた場合（resolve_command の
+    /// 考慮漏れ = 内部バグ）でも panic せず typed error — stdout/stderr の
+    /// JSON 契約を守る。
+    #[test]
+    fn unresolved_alias_id_is_typed_error_not_panic() {
+        let r: NodeRef = "living".parse().unwrap();
+        let err = r.id().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("living"), "detail: {}", err.detail);
+        assert!(
+            err.detail.contains("resolve_command"),
+            "detail: {}",
+            err.detail
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{Command, GroupCommand};
 use mat_core::alias::NodeRef;
-use mat_core::error::ErrorKind;
+use mat_core::error::{ErrorKind, MatError};
 use mat_core::socket::default_socket_candidates;
 
 /// mat の実行経路。`resolve_route` が決める。socket は探索候補リスト
@@ -107,17 +107,17 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            return ExitCode::FAILURE;
+            emit_error(ErrorKind::MatdUnavailable, &detail);
+            return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
         }
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
     match exchange_on_stream(stream, &op) {
         Ok(resp) => emit_response(resp),
-        Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            ExitCode::FAILURE
+        Err(e) => {
+            e.emit();
+            ExitCode::from(e.kind.exit_code())
         }
     }
 }
@@ -146,9 +146,9 @@ pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode>
 
     Some(match exchange_on_stream(stream, &op) {
         Ok(resp) => emit_response(resp),
-        Err(detail) => {
-            emit_error(ErrorKind::Other, &detail);
-            ExitCode::FAILURE
+        Err(e) => {
+            e.emit();
+            ExitCode::from(e.kind.exit_code())
         }
     })
 }
@@ -162,7 +162,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             cluster,
             attribute,
         } => json!({
-            "op": "read", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "read", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "attribute": attribute,
         }),
         Command::Write {
@@ -172,7 +172,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             attribute,
             value,
         } => json!({
-            "op": "write", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "write", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "attribute": attribute, "value": value,
         }),
         Command::Invoke {
@@ -182,15 +182,15 @@ fn to_op(command: &Command) -> Result<Value, String> {
             command,
             args,
         } => json!({
-            "op": "invoke", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "invoke", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "command": command, "args": args,
         }),
-        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id() }),
+        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id()? }),
         Command::On { node_id, endpoint } => {
-            json!({ "op": "on", "node_id": node_id.id(), "endpoint": endpoint.id() })
+            json!({ "op": "on", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
         }
         Command::Off { node_id, endpoint } => {
-            json!({ "op": "off", "node_id": node_id.id(), "endpoint": endpoint.id() })
+            json!({ "op": "off", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
         }
         Command::ColorTemp {
             node_id,
@@ -203,7 +203,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
             let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
             json!({
-                "op": "color_temp", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "color_temp", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
@@ -217,7 +217,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // 渡し、percent は応答エコー用。
             let level = crate::commands::invoke::resolve_level(*percent);
             json!({
-                "op": "level", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "level", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "level": level, "percent": percent, "transition": transition,
             })
         }
@@ -237,7 +237,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             )
             .map_err(|e| e.detail)?;
             let mut op = json!({
-                "op": "color", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "color", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
                 "hue": c.hue, "saturation": c.sat, "transition": transition,
             });
@@ -260,9 +260,12 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 rebind,
             } => {
                 // name 未指定なら group_id から決定的に補完（main の直接経路と同じ規則）。
-                let gid = group_id.id();
+                let gid = group_id.id()?;
                 let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
-                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
+                let ids: Vec<u64> = node_ids
+                    .iter()
+                    .map(NodeRef::id)
+                    .collect::<Result<Vec<u64>, MatError>>()?;
                 json!({
                     "op": "group_provision", "group_id": gid, "node_ids": ids,
                     "keyset_id": keyset_id, "name": name, "endpoint": endpoint,
@@ -276,7 +279,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 args,
                 endpoint,
             } => json!({
-                "op": "group_invoke", "group_id": group_id.id(), "cluster": cluster,
+                "op": "group_invoke", "group_id": group_id.id()?, "cluster": cluster,
                 "command": command, "args": args, "endpoint": endpoint,
             }),
             // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
@@ -293,7 +296,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 let (mireds, kelvin) =
                     crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
                 json!({
-                    "op": "group_color_temp", "group_id": group_id.id(),
+                    "op": "group_color_temp", "group_id": group_id.id()?,
                     "mireds": mireds, "kelvin": kelvin,
                     "transition": transition, "endpoint": endpoint,
                 })
@@ -307,7 +310,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
                 let level = crate::commands::invoke::resolve_level(*percent);
                 json!({
-                    "op": "group_level", "group_id": group_id.id(),
+                    "op": "group_level", "group_id": group_id.id()?,
                     "level": level, "percent": percent,
                     "transition": transition, "endpoint": endpoint,
                 })
@@ -327,7 +330,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 )
                 .map_err(|e| e.detail)?;
                 let mut op = json!({
-                    "op": "group_color", "group_id": group_id.id(),
+                    "op": "group_color", "group_id": group_id.id()?,
                     "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
                     "hue": c.hue, "saturation": c.sat,
                     "transition": transition, "endpoint": endpoint,
@@ -381,22 +384,37 @@ fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String
 }
 
 /// 接続済み stream で 1 行送り 1 行受け取る（自動検出は probe した接続を使い回す）。
-fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, String> {
-    let mut line = serde_json::to_vec(op).map_err(|e| format!("failed to encode request: {e}"))?;
+///
+/// v1 品質修正 3: 途中失敗を typed error 化。送受信の I/O 断・応答なし切断は
+/// 「matd がいなくなった」= `matd_unavailable`（送信後はリクエストが実行済みの
+/// 可能性があるので detail で明示）。応答が JSON でないのは `parse_error`。
+fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, MatError> {
+    let mut line = serde_json::to_vec(op)
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to encode request: {e}")))?;
     line.push(b'\n');
-    stream
-        .write_all(&line)
-        .map_err(|e| format!("failed to send request to matd: {e}"))?;
+    stream.write_all(&line).map_err(|e| {
+        MatError::new(
+            ErrorKind::MatdUnavailable,
+            format!("failed to send request to matd: {e}"),
+        )
+    })?;
 
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
-    let n = reader
-        .read_line(&mut resp)
-        .map_err(|e| format!("failed to read response from matd: {e}"))?;
+    let n = reader.read_line(&mut resp).map_err(|e| {
+        MatError::new(
+            ErrorKind::MatdUnavailable,
+            format!("failed to read response from matd: {e}; the request may have been executed"),
+        )
+    })?;
     if n == 0 {
-        return Err("matd closed the connection without responding".to_string());
+        return Err(MatError::new(
+            ErrorKind::MatdUnavailable,
+            "matd closed the connection without responding; the request may have been executed",
+        ));
     }
-    serde_json::from_str(&resp).map_err(|e| format!("matd response was not JSON: {e}; body={resp}"))
+    serde_json::from_str(&resp)
+        .map_err(|e| MatError::parse_error(format!("matd response was not JSON: {e}; body={resp}")))
 }
 
 /// matd 応答を mat の規約どおり出力する: 成功は stdout、エラーは stderr。exit code は
@@ -404,10 +422,20 @@ fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, Strin
 fn emit_response(resp: Value) -> ExitCode {
     if let Some(err) = resp.get("error") {
         eprintln!("{resp}");
-        let kind = err
+        let kind = match err
             .get("kind")
             .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
-            .unwrap_or(ErrorKind::Other);
+        {
+            Some(k) => k,
+            None => {
+                let raw_kind = err.get("kind").cloned().unwrap_or(Value::Null);
+                tracing::warn!(
+                    kind = %raw_kind,
+                    "unknown error kind from matd; mapping to `other` for the exit code"
+                );
+                ErrorKind::Other
+            }
+        };
         ExitCode::from(kind.exit_code())
     } else {
         println!("{resp}");
@@ -459,12 +487,27 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     else {
         unreachable!("dispatch_listen called with non-Listen command");
     };
-    let op = listen_request_json(
-        node_id.as_ref().map(NodeRef::id),
-        endpoint.as_ref().map(mat_core::alias::EndpointRef::id),
-        cluster,
-        attribute,
-    );
+    // 未解決 alias が届いた場合（内部バグ）は typed error を emit して抜ける
+    // （他の経路と同じ MatError::emit + exit_code パターン、panic しない）。
+    let node_num = match node_id.as_ref().map(NodeRef::id).transpose() {
+        Ok(n) => n,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let endpoint_num = match endpoint
+        .as_ref()
+        .map(mat_core::alias::EndpointRef::id)
+        .transpose()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let op = listen_request_json(node_num, endpoint_num, cluster, attribute);
 
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
@@ -901,5 +944,54 @@ mod tests {
             thread_dataset: None,
         })
         .is_err());
+    }
+
+    /// v1 品質修正 3: matd 経路の途中失敗が一律 `other` だったのを分離。
+    /// 応答なし切断（EOF）= matd 側が死んだ → `matd_unavailable`(exit 13)。
+    #[test]
+    fn exchange_on_stream_maps_eof_to_matd_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            // リクエスト行を消費してから切断する（先にドロップすると client の
+            // write_all がリクエスト到達前に broken pipe で失敗し得るため、EOF-on-read
+            // を確実に踏ませるにはここで 1 行読んでおく必要がある）。
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            drop(conn); // 1 行も返さず切断 → クライアント側は EOF
+        });
+        let stream = UnixStream::connect(&path).unwrap();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::MatdUnavailable);
+        assert!(
+            err.detail.contains("may have been executed"),
+            "detail should warn about possible partial execution: {}",
+            err.detail
+        );
+        server.join().unwrap();
+    }
+
+    /// 応答は来たが JSON でない → `parse_error`（native 経路の出力不能時と同じ分類）。
+    #[test]
+    fn exchange_on_stream_maps_non_json_response_to_parse_error() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap(); // リクエスト 1 行を消費
+            let mut conn = conn;
+            conn.write_all(b"garbage\n").unwrap();
+        });
+        let stream = UnixStream::connect(&path).unwrap();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        server.join().unwrap();
     }
 }

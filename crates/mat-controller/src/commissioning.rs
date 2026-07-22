@@ -1441,13 +1441,18 @@ impl CommissioningFabric {
 ///
 /// | variant                                               | kind                | exit |
 /// |--------------------------------------------------------|---------------------|------|
-/// | `Timeout(_)`                                            | `timeout`           | 3    |
-/// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }`     | `device_rejected`   | 4    |
+/// | `Timeout(_)` / `Pase(Exchange(Timeout))` /               | `timeout`           | 3    |
+/// |   `Case(Exchange(Timeout))` / `Session(Timeout)`         |                     |      |
+/// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }` /   | `device_rejected`   | 4    |
+/// |   `Pase(ConfirmMismatch)`（passcode 不一致）/            |                     |      |
+/// |   `Pase(StatusReport)` / `Case(PeerStatus)` /            |                     |      |
+/// |   `Case(Sigma2SignatureInvalid)` /                       |                     |      |
+/// |   `Case(EstablishmentFailed)`（Sigma3 の拒否）           |                     |      |
 /// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
 /// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
 /// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `unreachable` のハードエラーにし（M8c-3: chip-tool フォールバック撤去）、`kind_of` を経由しない | ―     |
-/// | 上記以外すべて（`Pase` / `Session` / `Cert` / `Fabric` /  | `commission_failed` | 1    |
-/// | `Case` / `Ble`（`step: "scan"` 以外））                   |                     |      |
+/// | 上記以外すべて（`Pase` / `Case` / `Session` 等の上記で     | `commission_failed` | 1    |
+/// | 分離した variant を除く、`Cert` / `Fabric` / `Ble` 等）     |                     |      |
 ///
 /// `Ble { step: "scan", .. }` は `kind_of` を経由しない — `find_commissionable`
 /// の空振り（デバイスが見えない）はワイヤ未接触なので、呼び出し側
