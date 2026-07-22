@@ -339,6 +339,31 @@ mod tests {
         );
     }
 
+    /// name / rgb 指定時のみキーが現れる分岐の Some 側(rgb=Some)。None 側は
+    /// キー不在が既存テストで担保済み — Some 側の形状はここで初めてピン留め。
+    #[test]
+    fn color_success_includes_name_and_rgb_when_present() {
+        let color = ResolvedColor {
+            hue_raw: 10,
+            sat_raw: 254,
+            hue: 14,
+            sat: 100,
+            name: Some("red".to_string()),
+            rgb: Some("#ff0000".to_string()),
+        };
+        assert_eq!(
+            color_success(5, 1, &color, 0),
+            json!({
+                "node_id": 5, "endpoint": 1, "cluster": "colorcontrol",
+                "command": "move-to-hue-and-saturation",
+                "hue": 14, "saturation": 100,
+                "hue_raw": 10, "saturation_raw": 254,
+                "transition": 0, "status": "success",
+                "name": "red", "rgb": "#ff0000",
+            })
+        );
+    }
+
     #[test]
     fn describe_success_shape() {
         assert_eq!(
@@ -402,6 +427,30 @@ mod tests {
                 "transition": 0, "endpoint": 1, "status": "sent",
                 "note": "unacknowledged groupcast; per-device delivery not confirmed",
                 "name": "blue",
+            })
+        );
+    }
+
+    #[test]
+    fn group_color_sent_includes_name_and_rgb_when_present() {
+        let color = ResolvedColor {
+            hue_raw: 10,
+            sat_raw: 254,
+            hue: 14,
+            sat: 100,
+            name: Some("red".to_string()),
+            rgb: Some("#ff0000".to_string()),
+        };
+        assert_eq!(
+            group_color_sent(10, &color, 0, 1),
+            json!({
+                "group_id": 10, "cluster": "colorcontrol",
+                "command": "move-to-hue-and-saturation",
+                "hue": 14, "saturation": 100,
+                "hue_raw": 10, "saturation_raw": 254,
+                "transition": 0, "endpoint": 1,
+                "status": "sent", "note": GROUPCAST_NOTE,
+                "name": "red", "rgb": "#ff0000",
             })
         );
     }
