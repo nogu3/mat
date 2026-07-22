@@ -136,11 +136,6 @@ impl Store {
         self.ledger.nodes.values()
     }
 
-    #[allow(dead_code)]
-    pub fn contains(&self, node_id: u64) -> bool {
-        self.ledger.nodes.contains_key(&node_id)
-    }
-
     /// ノードを取得。未 commission なら [`ErrorKind::NodeNotCommissioned`]（exit 11）。
     ///
     /// read/write/invoke/describe が node_id 解決に使う。
@@ -197,7 +192,6 @@ mod tests {
         }
         // 再オープンして永続を確認。
         let store = Store::open(dir.path()).unwrap();
-        assert!(store.contains(7));
         assert_eq!(
             store.require_node(7).unwrap().address.as_deref(),
             Some("192.0.2.10")

@@ -1,15 +1,12 @@
 //! `mat read` — 属性を読む。
 //!
 //! バックエンド実行は native 直経路（`native_direct`）が担う（M8c-3 で chip-tool
-//! 経路は撤去）。このモジュールは native 経路から呼ばれる成功 JSON の emit のみを
-//! 持つ（スキーマの単一ソース）。
+//! 経路は撤去）。成功 JSON の形は `mat_core::body`（直経路・matd 共有の単一
+//! ソース）、このモジュールは stdout への emit のみを持つ。
 
-use serde_json::json;
+use mat_core::{body, output};
 
-use mat_core::output;
-
-/// `read` の成功 JSON を stdout へ emit する。native 直経路（`native_direct`）
-/// から呼ばれる単一ソース（スキーマ不変）。
+/// `read` の成功 JSON を stdout へ emit する（body は `mat_core::body` 共有）。
 pub(crate) fn emit_read_success(
     node_id: u64,
     endpoint: u16,
@@ -17,11 +14,7 @@ pub(crate) fn emit_read_success(
     attribute: &str,
     value: serde_json::Value,
 ) {
-    output::emit(json!({
-        "node_id": node_id,
-        "endpoint": endpoint,
-        "cluster": cluster,
-        "attribute": attribute,
-        "value": value,
-    }));
+    output::emit(body::read_success(
+        node_id, endpoint, cluster, attribute, value,
+    ));
 }

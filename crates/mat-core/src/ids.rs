@@ -195,9 +195,11 @@ pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
 /// `Command::Write` 判定を移設・一本化 — M8a Task10）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteClass {
-    /// native で実行可能。`attribute` は数値 ID、`value` は型に沿って符号化済みの
-    /// スカラー。
+    /// native で実行可能。`cluster` / `attribute` は数値 ID、`value` は型に沿って
+    /// 符号化済みのスカラー。cluster ID を含めるのは、呼び手に resolve_cluster の
+    /// 再解決(classifier との drift で panic し得る)をさせないため。
     Native {
+        cluster: u32,
         attribute: u32,
         value: ScalarValue,
         timed: bool,
@@ -227,6 +229,7 @@ pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass
     };
     match parsed {
         Ok(v) => WriteClass::Native {
+            cluster: cluster_id,
             attribute: attr.id,
             value: v,
             timed,
@@ -241,9 +244,12 @@ pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass
 /// — この型がその一本化の受け皿）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvokeClass {
-    /// native で実行可能。`command` は数値 ID、`fields` は引数を位置順に
-    /// スカラー化した列（呼び出し側が CommandFields TLV へ符号化する）。
+    /// native で実行可能。`cluster` は数値 ID、`command` は数値 ID、`fields` は
+    /// 引数を位置順にスカラー化した列（呼び出し側が CommandFields TLV へ符号化
+    /// する）。cluster ID を含めるのは、呼び手に resolve_cluster の再解決
+    /// （classifier との drift で panic し得る）をさせないため。
     Native {
+        cluster: u32,
         command: u32,
         fields: Vec<ScalarValue>,
         timed: bool,
@@ -289,6 +295,7 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
                 }
             }
             InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd.id,
                 fields: values,
                 timed: def.timed,
@@ -301,6 +308,7 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
                 return InvokeClass::NotNative;
             }
             InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd.id,
                 fields: Vec::new(),
                 timed: false,
@@ -451,6 +459,7 @@ mod tests {
         assert_eq!(
             c,
             WriteClass::Native {
+                cluster: 0x0008,
                 attribute: 0x0011,
                 value: ScalarValue::UInt(128),
                 timed: false,
@@ -492,6 +501,7 @@ mod tests {
         assert_eq!(
             c,
             InvokeClass::Native {
+                cluster: 0x0008,
                 command: 0x00,
                 fields: vec![
                     ScalarValue::UInt(128),
@@ -536,6 +546,7 @@ mod tests {
         assert_eq!(
             c,
             InvokeClass::Native {
+                cluster: 6,
                 command: 1,
                 fields: vec![],
                 timed: false,
