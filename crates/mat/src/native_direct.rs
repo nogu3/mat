@@ -169,25 +169,31 @@ pub(crate) fn resolve_discriminator(node_id: u64, discriminator: Option<u16>) ->
     discriminator.unwrap_or((node_id % 4096) as u16)
 }
 
-pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
-    match command {
-        Command::On { node_id, endpoint } => Some(NativeOp::On {
-            node_id: node_id.id(),
-            endpoint: endpoint.id(),
-        }),
-        Command::Off { node_id, endpoint } => Some(NativeOp::Off {
-            node_id: node_id.id(),
-            endpoint: endpoint.id(),
-        }),
+pub(crate) fn classify(command: &Command) -> Option<Result<NativeOp, MatError>> {
+    classify_inner(command).transpose()
+}
+
+/// `Ok(None)` = native 高速路の対象外（classify_strict へ）。`Err` = 未解決
+/// alias が届いた内部バグ（alias.rs `id()` 参照）。
+fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
+    Ok(Some(match command {
+        Command::On { node_id, endpoint } => NativeOp::On {
+            node_id: node_id.id()?,
+            endpoint: endpoint.id()?,
+        },
+        Command::Off { node_id, endpoint } => NativeOp::Off {
+            node_id: node_id.id()?,
+            endpoint: endpoint.id()?,
+        },
         Command::Read {
             node_id,
             endpoint,
             cluster,
             attribute,
-        } if cluster == "onoff" && attribute == "on-off" => Some(NativeOp::ReadOnOff {
-            node_id: node_id.id(),
-            endpoint: endpoint.id(),
-        }),
+        } if cluster == "onoff" && attribute == "on-off" => NativeOp::ReadOnOff {
+            node_id: node_id.id()?,
+            endpoint: endpoint.id()?,
+        },
         Command::ColorTemp {
             node_id,
             endpoint,
@@ -196,13 +202,13 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             transition,
         } => {
             let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
-            Some(NativeOp::ColorTemp {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
+            NativeOp::ColorTemp {
+                node_id: node_id.id()?,
+                endpoint: endpoint.id()?,
                 kelvin,
                 mireds,
                 transition: *transition,
-            })
+            }
         }
         Command::Level {
             node_id,
@@ -211,13 +217,13 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             transition,
         } => {
             let level = crate::commands::invoke::resolve_level(*percent);
-            Some(NativeOp::Level {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
+            NativeOp::Level {
+                node_id: node_id.id()?,
+                endpoint: endpoint.id()?,
                 percent: *percent,
                 level,
                 transition: *transition,
-            })
+            }
         }
         Command::Color {
             node_id,
@@ -227,19 +233,20 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
         } => {
             // 不正 color spec はここで None → `run` の `unresolved_op_error` が
             // `resolve_spec` 本来のエラーを surface する（挙動は決定的で一致）。
-            let c = mat_core::color::resolve_spec(
+            let Ok(c) = mat_core::color::resolve_spec(
                 spec.name.as_deref(),
                 spec.rgb.as_deref(),
                 spec.hue,
                 spec.sat,
-            )
-            .ok()?;
-            Some(NativeOp::Color {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
+            ) else {
+                return Ok(None);
+            };
+            NativeOp::Color {
+                node_id: node_id.id()?,
+                endpoint: endpoint.id()?,
                 color: c,
                 transition: *transition,
-            })
+            }
         }
         // group 送信 3 形 + provision/grant（M8a Task9 でデバイス側 native 化）。
         // GroupInvoke は onoff の引数なし on/off/toggle のみここで直接
@@ -261,14 +268,14 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 "on" => (mat_controller::im::CMD_ON_OFF_ON, "on"),
                 "off" => (mat_controller::im::CMD_ON_OFF_OFF, "off"),
                 "toggle" => (mat_controller::im::CMD_ON_OFF_TOGGLE, "toggle"),
-                _ => return None,
+                _ => return Ok(None),
             };
-            Some(NativeOp::GroupOnOff {
-                group_id: group_id.id(),
+            NativeOp::GroupOnOff {
+                group_id: group_id.id()?,
                 command_id,
                 command,
                 endpoint: *endpoint,
-            })
+            }
         }
         Command::Group {
             action:
@@ -281,13 +288,13 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 },
         } => {
             let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
-            Some(NativeOp::GroupColorTemp {
-                group_id: group_id.id(),
+            NativeOp::GroupColorTemp {
+                group_id: group_id.id()?,
                 kelvin,
                 mireds,
                 transition: *transition,
                 endpoint: *endpoint,
-            })
+            }
         }
         Command::Group {
             action:
@@ -299,13 +306,13 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                 },
         } => {
             let level = crate::commands::invoke::resolve_level(*percent);
-            Some(NativeOp::GroupLevel {
-                group_id: group_id.id(),
+            NativeOp::GroupLevel {
+                group_id: group_id.id()?,
                 percent: *percent,
                 level,
                 transition: *transition,
                 endpoint: *endpoint,
-            })
+            }
         }
         Command::Group {
             action:
@@ -316,19 +323,20 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                     endpoint,
                 },
         } => {
-            let c = mat_core::color::resolve_spec(
+            let Ok(c) = mat_core::color::resolve_spec(
                 spec.name.as_deref(),
                 spec.rgb.as_deref(),
                 spec.hue,
                 spec.sat,
-            )
-            .ok()?;
-            Some(NativeOp::GroupColor {
-                group_id: group_id.id(),
+            ) else {
+                return Ok(None);
+            };
+            NativeOp::GroupColor {
+                group_id: group_id.id()?,
                 color: c,
                 transition: *transition,
                 endpoint: *endpoint,
-            })
+            }
         }
         // provision / grant（M8a Task9）: デバイス側 4 ステップ（KeySetWrite /
         // group-key-map / AddGroup / ACL）を native 化。コントローラ側
@@ -347,36 +355,42 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
                     rebind,
                 },
         } => {
-            let gid = group_id.id();
+            let gid = group_id.id()?;
             let resolved_name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
-            Some(NativeOp::GroupProvision {
+            let resolved_nodes: Result<Vec<u64>, MatError> =
+                node_ids.iter().map(NodeRef::id).collect();
+            NativeOp::GroupProvision {
                 group_id: gid,
-                node_ids: node_ids.iter().map(NodeRef::id).collect(),
+                node_ids: resolved_nodes?,
                 keyset_id: *keyset_id,
                 name: resolved_name,
                 endpoint: *endpoint,
                 epoch_key: epoch_key.clone(),
                 rebind: *rebind,
-            })
+            }
         }
         Command::Group {
             action: GroupCommand::Grant { group_id, node_ids },
-        } => Some(NativeOp::GroupGrant {
-            group_id: group_id.id(),
-            node_ids: node_ids.iter().map(NodeRef::id).collect(),
-        }),
+        } => {
+            let resolved_nodes: Result<Vec<u64>, MatError> =
+                node_ids.iter().map(NodeRef::id).collect();
+            NativeOp::GroupGrant {
+                group_id: group_id.id()?,
+                node_ids: resolved_nodes?,
+            }
+        }
         // describe / diag thread / open-window（M8a Task8）: 値の符号化を
         // 伴わない読み取り専用 op なので、classify_strict と違い常に
         // Some/None（Err にはならない）。
-        Command::Describe { node_id } => Some(NativeOp::Describe {
-            node_id: node_id.id(),
-        }),
+        Command::Describe { node_id } => NativeOp::Describe {
+            node_id: node_id.id()?,
+        },
         Command::Diag {
             action: DiagCommand::Thread { node_id, endpoint },
-        } => Some(NativeOp::DiagThread {
-            node_id: node_id.id(),
-            endpoint: endpoint.id(),
-        }),
+        } => NativeOp::DiagThread {
+            node_id: node_id.id()?,
+            endpoint: endpoint.id()?,
+        },
         // `Diag Node` は probe（ping6/native mDNS resolve）混在のため `run` の担当外
         // （専用コマンド層 `commands::diag::node` が native IM probe + 補助
         // プローブを実施する）。
@@ -385,41 +399,57 @@ pub(crate) fn classify(command: &Command) -> Option<NativeOp> {
             timeout,
             iteration,
             discriminator,
-        } => Some(NativeOp::OpenWindow {
-            node_id: node_id.id(),
-            timeout: *timeout,
-            iteration: *iteration,
-            discriminator: resolve_discriminator(node_id.id(), *discriminator),
-        }),
+        } => {
+            let nid = node_id.id()?;
+            NativeOp::OpenWindow {
+                node_id: nid,
+                timeout: *timeout,
+                iteration: *iteration,
+                discriminator: resolve_discriminator(nid, *discriminator),
+            }
+        }
         // 汎用 read/write/invoke（M8a）: classify_strict の判定を再利用し、値の
         // 符号化不能（Err）はここでは黙って None（chip-tool 直路）に丸める —
         // その Err を明示的に拒否（即 parse_error）したい呼び出し側は
         // `classify_strict` を直接使う（`try_run` がそうしている）。
-        _ => classify_strict(command)?.ok(),
-    }
+        _ => match classify_strict(command) {
+            Some(Ok(op)) => op,
+            _ => return Ok(None),
+        },
+    }))
 }
 
 /// 汎用形の分類: None = 名前未解決（`run` が parse_error 化）、Some(Ok) = native
 /// 実行、Some(Err) = 値が符号化不能 → parse_error（spec 決定3: 明示拒否。撤去前の
 /// chip-tool なら通る形をあえて拒む意図した縮小）。
 pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatError>> {
-    match command {
+    classify_strict_inner(command).transpose()
+}
+
+/// `classify_strict` の inner。`Ok(None)` = 名前未解決（NotNative / catch-all）、
+/// `Err` = 値が符号化不能（Reject）**または**未解決 alias が届いた内部バグ。
+fn classify_strict_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
+    Ok(Some(match command {
         Command::Read {
             node_id,
             endpoint,
             cluster,
             attribute,
         } => {
-            let cluster_id = mat_core::ids::resolve_cluster(cluster)?;
-            let attr = mat_core::ids::resolve_attribute(cluster_id, attribute)?;
-            Some(Ok(NativeOp::ReadAttr {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
+            let Some(cluster_id) = mat_core::ids::resolve_cluster(cluster) else {
+                return Ok(None);
+            };
+            let Some(attr) = mat_core::ids::resolve_attribute(cluster_id, attribute) else {
+                return Ok(None);
+            };
+            NativeOp::ReadAttr {
+                node_id: node_id.id()?,
+                endpoint: endpoint.id()?,
                 cluster_in: cluster.clone(),
                 attribute_in: attribute.clone(),
                 cluster: cluster_id,
                 attribute: attr.id,
-            }))
+            }
         }
         // 汎用 write（M8a Task7、M8a Task10 で classify_write へ一本化）:
         // cluster/attribute 名の解決 + 値の型スカラー化は mat-core::ids に
@@ -431,16 +461,16 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             attribute,
             value,
         } => match mat_core::ids::classify_write(cluster, attribute, value) {
-            mat_core::ids::WriteClass::NotNative => None,
-            mat_core::ids::WriteClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::WriteClass::NotNative => return Ok(None),
+            mat_core::ids::WriteClass::Reject(msg) => return Err(MatError::parse_error(msg)),
             mat_core::ids::WriteClass::Native {
                 cluster: cluster_id,
                 attribute: attr_id,
                 value: scalar,
                 timed,
-            } => Some(Ok(NativeOp::WriteAttr {
-                node_id: node_id.id(),
-                endpoint: endpoint.id(),
+            } => NativeOp::WriteAttr {
+                node_id: node_id.id()?,
+                endpoint: endpoint.id()?,
                 cluster_in: cluster.clone(),
                 attribute_in: attribute.clone(),
                 cluster: cluster_id,
@@ -448,7 +478,7 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                 value_in: value.clone(),
                 value: scalar,
                 timed,
-            })),
+            },
         },
         // 汎用 invoke（M8a Task7、M8a Task10 で classify_invoke へ一本化）:
         // cluster/command 名の解決 + 引数の型スカラー化は mat-core::ids に
@@ -460,8 +490,8 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             command: command_name,
             args,
         } => match mat_core::ids::classify_invoke(cluster, command_name, args) {
-            mat_core::ids::InvokeClass::NotNative => None,
-            mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::InvokeClass::NotNative => return Ok(None),
+            mat_core::ids::InvokeClass::Reject(msg) => return Err(MatError::parse_error(msg)),
             mat_core::ids::InvokeClass::Native {
                 cluster: cluster_id,
                 command: cmd_id,
@@ -473,16 +503,16 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                 } else {
                     Some(mat_native::encode_command_fields(&fields))
                 };
-                Some(Ok(NativeOp::InvokeGeneric {
-                    node_id: node_id.id(),
-                    endpoint: endpoint.id(),
+                NativeOp::InvokeGeneric {
+                    node_id: node_id.id()?,
+                    endpoint: endpoint.id()?,
                     cluster_in: cluster.clone(),
                     command_in: command_name.clone(),
                     cluster: cluster_id,
                     command: cmd_id,
                     fields_tlv,
                     timed,
-                }))
+                }
             }
         },
         // group invoke の汎用形（M8a Task9、M8a Task10 で classify_invoke へ
@@ -503,8 +533,8 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                     endpoint,
                 },
         } => match mat_core::ids::classify_invoke(cluster, command_name, args) {
-            mat_core::ids::InvokeClass::NotNative => None,
-            mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
+            mat_core::ids::InvokeClass::NotNative => return Ok(None),
+            mat_core::ids::InvokeClass::Reject(msg) => return Err(MatError::parse_error(msg)),
             mat_core::ids::InvokeClass::Native {
                 cluster: cluster_id,
                 command: cmd_id,
@@ -516,19 +546,19 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
                 } else {
                     Some(mat_native::encode_command_fields(&fields))
                 };
-                Some(Ok(NativeOp::GroupInvokeGeneric {
-                    group_id: group_id.id(),
+                NativeOp::GroupInvokeGeneric {
+                    group_id: group_id.id()?,
                     cluster_in: cluster.clone(),
                     command_in: command_name.clone(),
                     cluster: cluster_id,
                     command: cmd_id,
                     fields_tlv,
                     endpoint: *endpoint,
-                }))
+                }
             }
         },
-        _ => None,
-    }
+        _ => return Ok(None),
+    }))
 }
 
 /// 直経路 native の入口（M8c-3）。`None` は「この op は native_direct の担当外」
@@ -555,7 +585,9 @@ pub(crate) fn run(
     }
 
     let op = match classify(command) {
-        Some(op) => op,
+        Some(Ok(op)) => op,
+        // 未解決 alias が届いた内部バグ — typed error で JSON 契約を守る。
+        Some(Err(e)) => return Some(Err(e)),
         None => match classify_strict(command) {
             Some(Ok(op)) => op,
             // 値が符号化不能（非スカラー型等）: 即 parse_error
@@ -1448,10 +1480,10 @@ mod tests {
         };
         assert!(matches!(
             classify(&on),
-            Some(NativeOp::On {
+            Some(Ok(NativeOp::On {
                 node_id: 5,
                 endpoint: 1
-            })
+            }))
         ));
         let off = Command::Off {
             node_id: NodeRef::Id(5),
@@ -1459,10 +1491,10 @@ mod tests {
         };
         assert!(matches!(
             classify(&off),
-            Some(NativeOp::Off {
+            Some(Ok(NativeOp::Off {
                 node_id: 5,
                 endpoint: 1
-            })
+            }))
         ));
         let read = Command::Read {
             node_id: NodeRef::Id(5),
@@ -1470,7 +1502,10 @@ mod tests {
             cluster: "onoff".into(),
             attribute: "on-off".into(),
         };
-        assert!(matches!(classify(&read), Some(NativeOp::ReadOnOff { .. })));
+        assert!(matches!(
+            classify(&read),
+            Some(Ok(NativeOp::ReadOnOff { .. }))
+        ));
         // 汎用 read（onoff on-off 以外）で名前解決できるものは M8a Task7 で native
         // 対象に拡張された（`generic_read_is_native_when_names_resolve` 参照）。
         // 名前解決できないものは classify 非対象（`run` が parse_error 化）。
@@ -1498,13 +1533,13 @@ mod tests {
         };
         assert!(matches!(
             classify(&ct),
-            Some(NativeOp::ColorTemp {
+            Some(Ok(NativeOp::ColorTemp {
                 node_id: 5,
                 endpoint: 1,
                 kelvin: 2700,
                 mireds: 370,
                 transition: 0
-            })
+            }))
         ));
     }
 
@@ -1527,11 +1562,11 @@ mod tests {
         };
         assert!(matches!(
             classify(&c),
-            Some(NativeOp::Color {
+            Some(Ok(NativeOp::Color {
                 node_id: 5,
                 endpoint: 1,
                 ..
-            })
+            }))
         ));
     }
 
@@ -1553,7 +1588,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&native),
-            Some(NativeOp::GroupOnOff { group_id: 10, .. })
+            Some(Ok(NativeOp::GroupOnOff { group_id: 10, .. }))
         ));
         // 引数付き / onoff 以外の group invoke も、cluster/command 名前解決 +
         // 引数スカラー化ができれば native 対象（M8a Task9、classify_strict の
@@ -1569,11 +1604,11 @@ mod tests {
         };
         assert!(matches!(
             classify(&generic),
-            Some(NativeOp::GroupInvokeGeneric {
+            Some(Ok(NativeOp::GroupInvokeGeneric {
                 group_id: 10,
                 fields_tlv: Some(_),
                 ..
-            })
+            }))
         ));
         // provision / grant のデバイス側ステップも native 対象（コントローラ側
         // groupsettings は M8c まで chip-tool のまま — `run_op` 参照）。
@@ -1585,7 +1620,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&grant),
-            Some(NativeOp::GroupGrant { group_id: 10, node_ids }) if node_ids == vec![5, 6]
+            Some(Ok(NativeOp::GroupGrant { group_id: 10, node_ids })) if node_ids == vec![5, 6]
         ));
         let provision = Command::Group {
             action: GroupCommand::Provision {
@@ -1600,7 +1635,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&provision),
-            Some(NativeOp::GroupProvision {
+            Some(Ok(NativeOp::GroupProvision {
                 group_id: 10,
                 keyset_id: 60,
                 ref name,
@@ -1608,7 +1643,7 @@ mod tests {
                 epoch_key: None,
                 rebind: false,
                 ..
-            }) if name == "grp10"
+            })) if name == "grp10"
         ));
     }
 
@@ -1627,13 +1662,13 @@ mod tests {
         };
         assert!(matches!(
             classify(&ct),
-            Some(NativeOp::GroupColorTemp {
+            Some(Ok(NativeOp::GroupColorTemp {
                 group_id: 10,
                 kelvin: 2700,
                 mireds: 370,
                 transition: 0,
                 endpoint: 1,
-            })
+            }))
         ));
         let color = Command::Group {
             action: GroupCommand::Color {
@@ -1650,7 +1685,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&color),
-            Some(NativeOp::GroupColor { group_id: 10, .. })
+            Some(Ok(NativeOp::GroupColor { group_id: 10, .. }))
         ));
     }
 
@@ -1728,11 +1763,11 @@ mod tests {
         };
         assert!(matches!(
             classify(&read),
-            Some(NativeOp::ReadAttr {
+            Some(Ok(NativeOp::ReadAttr {
                 cluster: 0x0008,
                 attribute: 0x0000,
                 ..
-            })
+            }))
         ));
         // 未知クラスタ名は classify 非対象（`run` が parse_error 化）。
         let unknown = Command::Read {
@@ -1749,7 +1784,10 @@ mod tests {
             cluster: "0x0008".into(),
             attribute: "0".into(),
         };
-        assert!(matches!(classify(&byid), Some(NativeOp::ReadAttr { .. })));
+        assert!(matches!(
+            classify(&byid),
+            Some(Ok(NativeOp::ReadAttr { .. }))
+        ));
     }
 
     #[test]
@@ -1762,7 +1800,7 @@ mod tests {
             attribute: "on-level".into(),
             value: "128".into(),
         };
-        assert!(matches!(classify(&w), Some(NativeOp::WriteAttr { .. })));
+        assert!(matches!(classify(&w), Some(Ok(NativeOp::WriteAttr { .. }))));
         // list 型（acl）への汎用 write は parse_error（classify_strict 経由で確認）。
         let acl = Command::Write {
             node_id: NodeRef::Id(5),
@@ -1788,7 +1826,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&inv),
-            Some(NativeOp::InvokeGeneric { .. })
+            Some(Ok(NativeOp::InvokeGeneric { .. }))
         ));
         // struct field を要求するコマンド（key-set-write）への引数 → parse_error。
         let ks = Command::Invoke {
@@ -1811,7 +1849,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&describe),
-            Some(NativeOp::Describe { node_id: 5 })
+            Some(Ok(NativeOp::Describe { node_id: 5 }))
         ));
 
         let diag_thread = Command::Diag {
@@ -1822,10 +1860,10 @@ mod tests {
         };
         assert!(matches!(
             classify(&diag_thread),
-            Some(NativeOp::DiagThread {
+            Some(Ok(NativeOp::DiagThread {
                 node_id: 5,
                 endpoint: 0
-            })
+            }))
         ));
 
         // `diag node` は probe 混在のため引き続き非対象（chip-tool 直）。
@@ -1847,12 +1885,12 @@ mod tests {
         };
         assert!(matches!(
             classify(&ow),
-            Some(NativeOp::OpenWindow {
+            Some(Ok(NativeOp::OpenWindow {
                 node_id: 5,
                 timeout: 180,
                 iteration: 1000,
                 discriminator: 3840,
-            })
+            }))
         ));
         // discriminator 未指定は node_id % 4096 で決定的に補完（main.rs と同じ式）。
         let ow_default = Command::OpenWindow {
@@ -1863,10 +1901,10 @@ mod tests {
         };
         assert!(matches!(
             classify(&ow_default),
-            Some(NativeOp::OpenWindow {
+            Some(Ok(NativeOp::OpenWindow {
                 discriminator: 5,
                 ..
-            })
+            }))
         ));
     }
 
@@ -2065,7 +2103,9 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "current-level".into(),
         };
-        let op = classify(&read).expect("levelcontrol/current-level resolves natively");
+        let op = classify(&read)
+            .expect("levelcontrol/current-level resolves natively")
+            .unwrap();
         assert!(matches!(op, NativeOp::ReadAttr { .. }));
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(&engine, &op).await.unwrap();
@@ -2082,7 +2122,9 @@ mod tests {
             attribute: "on-level".into(),
             value: "128".into(),
         };
-        let op = classify(&write).expect("levelcontrol/on-level resolves natively");
+        let op = classify(&write)
+            .expect("levelcontrol/on-level resolves natively")
+            .unwrap();
         assert!(matches!(op, NativeOp::WriteAttr { .. }));
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(&engine, &op).await.unwrap();
@@ -2099,7 +2141,9 @@ mod tests {
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
         };
-        let op = classify(&inv).expect("levelcontrol/move-to-level resolves natively");
+        let op = classify(&inv)
+            .expect("levelcontrol/move-to-level resolves natively")
+            .unwrap();
         assert!(matches!(op, NativeOp::InvokeGeneric { .. }));
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(&engine, &op).await.unwrap();
@@ -2112,7 +2156,7 @@ mod tests {
         let describe = Command::Describe {
             node_id: NodeRef::Id(5),
         };
-        let op = classify(&describe).expect("describe is native");
+        let op = classify(&describe).expect("describe is native").unwrap();
         assert!(matches!(op, NativeOp::Describe { .. }));
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(&engine, &op).await.unwrap();

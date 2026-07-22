@@ -162,7 +162,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             cluster,
             attribute,
         } => json!({
-            "op": "read", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "read", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "attribute": attribute,
         }),
         Command::Write {
@@ -172,7 +172,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             attribute,
             value,
         } => json!({
-            "op": "write", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "write", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "attribute": attribute, "value": value,
         }),
         Command::Invoke {
@@ -182,15 +182,15 @@ fn to_op(command: &Command) -> Result<Value, String> {
             command,
             args,
         } => json!({
-            "op": "invoke", "node_id": node_id.id(), "endpoint": endpoint.id(),
+            "op": "invoke", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
             "cluster": cluster, "command": command, "args": args,
         }),
-        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id() }),
+        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id()? }),
         Command::On { node_id, endpoint } => {
-            json!({ "op": "on", "node_id": node_id.id(), "endpoint": endpoint.id() })
+            json!({ "op": "on", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
         }
         Command::Off { node_id, endpoint } => {
-            json!({ "op": "off", "node_id": node_id.id(), "endpoint": endpoint.id() })
+            json!({ "op": "off", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
         }
         Command::ColorTemp {
             node_id,
@@ -203,7 +203,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
             let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
             json!({
-                "op": "color_temp", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "color_temp", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
             })
         }
@@ -217,7 +217,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             // 渡し、percent は応答エコー用。
             let level = crate::commands::invoke::resolve_level(*percent);
             json!({
-                "op": "level", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "level", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "level": level, "percent": percent, "transition": transition,
             })
         }
@@ -237,7 +237,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
             )
             .map_err(|e| e.detail)?;
             let mut op = json!({
-                "op": "color", "node_id": node_id.id(), "endpoint": endpoint.id(),
+                "op": "color", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
                 "hue": c.hue, "saturation": c.sat, "transition": transition,
             });
@@ -260,9 +260,12 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 rebind,
             } => {
                 // name 未指定なら group_id から決定的に補完（main の直接経路と同じ規則）。
-                let gid = group_id.id();
+                let gid = group_id.id()?;
                 let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
-                let ids: Vec<u64> = node_ids.iter().map(NodeRef::id).collect();
+                let ids: Vec<u64> = node_ids
+                    .iter()
+                    .map(NodeRef::id)
+                    .collect::<Result<Vec<u64>, MatError>>()?;
                 json!({
                     "op": "group_provision", "group_id": gid, "node_ids": ids,
                     "keyset_id": keyset_id, "name": name, "endpoint": endpoint,
@@ -276,7 +279,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 args,
                 endpoint,
             } => json!({
-                "op": "group_invoke", "group_id": group_id.id(), "cluster": cluster,
+                "op": "group_invoke", "group_id": group_id.id()?, "cluster": cluster,
                 "command": command, "args": args, "endpoint": endpoint,
             }),
             // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
@@ -293,7 +296,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 let (mireds, kelvin) =
                     crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
                 json!({
-                    "op": "group_color_temp", "group_id": group_id.id(),
+                    "op": "group_color_temp", "group_id": group_id.id()?,
                     "mireds": mireds, "kelvin": kelvin,
                     "transition": transition, "endpoint": endpoint,
                 })
@@ -307,7 +310,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
                 let level = crate::commands::invoke::resolve_level(*percent);
                 json!({
-                    "op": "group_level", "group_id": group_id.id(),
+                    "op": "group_level", "group_id": group_id.id()?,
                     "level": level, "percent": percent,
                     "transition": transition, "endpoint": endpoint,
                 })
@@ -327,7 +330,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 )
                 .map_err(|e| e.detail)?;
                 let mut op = json!({
-                    "op": "group_color", "group_id": group_id.id(),
+                    "op": "group_color", "group_id": group_id.id()?,
                     "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
                     "hue": c.hue, "saturation": c.sat,
                     "transition": transition, "endpoint": endpoint,
@@ -484,12 +487,27 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     else {
         unreachable!("dispatch_listen called with non-Listen command");
     };
-    let op = listen_request_json(
-        node_id.as_ref().map(NodeRef::id),
-        endpoint.as_ref().map(mat_core::alias::EndpointRef::id),
-        cluster,
-        attribute,
-    );
+    // 未解決 alias が届いた場合（内部バグ）は typed error を emit して抜ける
+    // （他の経路と同じ MatError::emit + exit_code パターン、panic しない）。
+    let node_num = match node_id.as_ref().map(NodeRef::id).transpose() {
+        Ok(n) => n,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let endpoint_num = match endpoint
+        .as_ref()
+        .map(mat_core::alias::EndpointRef::id)
+        .transpose()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let op = listen_request_json(node_num, endpoint_num, cluster, attribute);
 
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,

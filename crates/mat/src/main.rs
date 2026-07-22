@@ -170,13 +170,11 @@ fn main() -> ExitCode {
                     endpoint,
                     deep,
                 },
-        } => commands::diag::node(
-            &store_path,
-            node_id.id(),
-            endpoint.id(),
-            *deep,
-            native_cfg.as_ref(),
-        ),
+        } => node_id.id().and_then(|node| {
+            endpoint.id().and_then(|ep| {
+                commands::diag::node(&store_path, node, ep, *deep, native_cfg.as_ref())
+            })
+        }),
         // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
         // Command::Fabric は route dispatch より前の早期 return で処理済み。
         _ => {
