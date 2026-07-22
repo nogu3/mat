@@ -1446,7 +1446,8 @@ impl CommissioningFabric {
 /// | `Attestation(_)` / `Noc(_)` / `CommandStatus { .. }` /   | `device_rejected`   | 4    |
 /// |   `Pase(ConfirmMismatch)`（passcode 不一致）/            |                     |      |
 /// |   `Pase(StatusReport)` / `Case(PeerStatus)` /            |                     |      |
-/// |   `Case(Sigma2SignatureInvalid)`                         |                     |      |
+/// |   `Case(Sigma2SignatureInvalid)` /                       |                     |      |
+/// |   `Case(EstablishmentFailed)`（Sigma3 の拒否）           |                     |      |
 /// | `NetworkConfig { .. }`                                   | `unreachable`       | 5    |
 /// | `Malformed { .. }` / `Csr(_)`                            | `parse_error`       | 1    |
 /// | `Discovery(_)`                                           | 常に PASE 前（`commission_on_network` 内の唯一の発生箇所は step 1 の対象 resolve のみ。BLE フローの PASE 後 discovery は `Timeout` に写る）—ワイヤ未接触なので `mat-native` 側で `unreachable` のハードエラーにし（M8c-3: chip-tool フォールバック撤去）、`kind_of` を経由しない | ―     |
