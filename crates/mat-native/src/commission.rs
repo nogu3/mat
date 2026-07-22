@@ -74,9 +74,14 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
         | CommissionError::Case(CaseError::Exchange(ExchangeError::Timeout))
         | CommissionError::Session(SessionError::Timeout) => ErrorKind::Timeout,
         CommissionError::Pase(PaseError::ConfirmMismatch | PaseError::StatusReport { .. })
-        | CommissionError::Case(CaseError::PeerStatus { .. } | CaseError::Sigma2SignatureInvalid) => {
-            ErrorKind::DeviceRejected
-        }
+        | CommissionError::Case(
+            // EstablishmentFailed は Sigma3 完了 StatusReport が非成功 =
+            // PeerStatus（Sigma1/2 段階の拒否）と同じイベントクラス
+            // （v1 最終レビュー指摘で追加 — 1.0.0 契約凍結前に揃える）。
+            CaseError::PeerStatus { .. }
+            | CaseError::Sigma2SignatureInvalid
+            | CaseError::EstablishmentFailed { .. },
+        ) => ErrorKind::DeviceRejected,
         CommissionError::Attestation(_) => ErrorKind::DeviceRejected,
         CommissionError::Noc(_) | CommissionError::CommandStatus { .. } => {
             ErrorKind::DeviceRejected
@@ -513,6 +518,14 @@ mod tests {
         );
         assert_eq!(
             kind_of(&CommissionError::Case(CaseError::Sigma2SignatureInvalid)),
+            ErrorKind::DeviceRejected
+        );
+        // Sigma3 完了 StatusReport の非成功も PeerStatus と同じ拒否クラス。
+        assert_eq!(
+            kind_of(&CommissionError::Case(CaseError::EstablishmentFailed {
+                general_code: 1,
+                protocol_code: 0,
+            })),
             ErrorKind::DeviceRejected
         );
 
