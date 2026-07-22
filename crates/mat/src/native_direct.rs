@@ -12,7 +12,10 @@
 
 use std::path::Path;
 
+use mat_controller::im;
+use mat_core::color::ResolvedColor;
 use mat_core::error::MatError;
+use mat_core::ids::ScalarValue;
 use mat_core::store::Store;
 use mat_native::group::GroupOutcome;
 use mat_native::{Engine, NativeConfig};
@@ -431,24 +434,21 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::WriteClass::NotNative => None,
             mat_core::ids::WriteClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::WriteClass::Native {
+                cluster: cluster_id,
                 attribute: attr_id,
                 value: scalar,
                 timed,
-            } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_write already resolved this cluster name");
-                Some(Ok(NativeOp::WriteAttr {
-                    node_id: node_id.id(),
-                    endpoint: endpoint.id(),
-                    cluster_in: cluster.clone(),
-                    attribute_in: attribute.clone(),
-                    cluster: cluster_id,
-                    attribute: attr_id,
-                    value_in: value.clone(),
-                    value: scalar,
-                    timed,
-                }))
-            }
+            } => Some(Ok(NativeOp::WriteAttr {
+                node_id: node_id.id(),
+                endpoint: endpoint.id(),
+                cluster_in: cluster.clone(),
+                attribute_in: attribute.clone(),
+                cluster: cluster_id,
+                attribute: attr_id,
+                value_in: value.clone(),
+                value: scalar,
+                timed,
+            })),
         },
         // 汎用 invoke（M8a Task7、M8a Task10 で classify_invoke へ一本化）:
         // cluster/command 名の解決 + 引数の型スカラー化は mat-core::ids に
@@ -463,12 +463,11 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::InvokeClass::NotNative => None,
             mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 timed,
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {
@@ -507,12 +506,11 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::InvokeClass::NotNative => None,
             mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 ..
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {
@@ -697,284 +695,548 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatErro
     })
 }
 
-/// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。
+async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(endpoint, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None, false)
+        .await?;
+    tracing::info!(
+        node_id,
+        cluster = "onoff",
+        command = "on",
+        "invoke executed (native direct)"
+    );
+    crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "on");
+    Ok(())
+}
+
+async fn op_off(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(
+        endpoint,
+        im::CLUSTER_ON_OFF,
+        im::CMD_ON_OFF_OFF,
+        None,
+        false,
+    )
+    .await?;
+    tracing::info!(
+        node_id,
+        cluster = "onoff",
+        command = "off",
+        "invoke executed (native direct)"
+    );
+    crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "off");
+    Ok(())
+}
+
+async fn op_read_onoff(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    let v = conn.read_onoff(endpoint).await?;
+    tracing::info!(
+        node_id,
+        cluster = "onoff",
+        attribute = "on-off",
+        "read executed (native direct)"
+    );
+    crate::commands::read::emit_read_success(
+        node_id,
+        endpoint,
+        "onoff",
+        "on-off",
+        serde_json::json!(v),
+    );
+    Ok(())
+}
+
+async fn op_color(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    color: &ResolvedColor,
+    transition: u16,
+) -> Result<(), MatError> {
+    let fields =
+        im::encode_move_to_hue_and_saturation_fields(color.hue_raw, color.sat_raw, transition);
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(
+        endpoint,
+        im::CLUSTER_COLOR_CONTROL,
+        im::CMD_MOVE_TO_HUE_AND_SATURATION,
+        Some(fields),
+        false,
+    )
+    .await?;
+    tracing::info!(
+        node_id,
+        cluster = "colorcontrol",
+        command = "move-to-hue-and-saturation",
+        "invoke executed (native direct)"
+    );
+    crate::commands::invoke::emit_color_success(node_id, endpoint, color, transition);
+    Ok(())
+}
+
+async fn op_color_temp(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+) -> Result<(), MatError> {
+    let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(
+        endpoint,
+        im::CLUSTER_COLOR_CONTROL,
+        im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+        Some(fields),
+        false,
+    )
+    .await?;
+    tracing::info!(
+        node_id,
+        cluster = "colorcontrol",
+        command = "move-to-color-temperature",
+        "invoke executed (native direct)"
+    );
+    crate::commands::invoke::emit_color_temp_success(node_id, endpoint, kelvin, mireds, transition);
+    Ok(())
+}
+
+async fn op_level(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    percent: u8,
+    level: u8,
+    transition: u16,
+) -> Result<(), MatError> {
+    let fields = im::encode_move_to_level_fields(level, transition);
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(
+        endpoint,
+        im::CLUSTER_LEVEL_CONTROL,
+        im::CMD_MOVE_TO_LEVEL,
+        Some(fields),
+        false,
+    )
+    .await?;
+    tracing::info!(
+        node_id,
+        cluster = "levelcontrol",
+        command = "move-to-level",
+        "invoke executed (native direct)"
+    );
+    crate::commands::invoke::emit_level_success(node_id, endpoint, percent, level, transition);
+    Ok(())
+}
+
+async fn op_group_onoff(
+    engine: &Engine,
+    group_id: u16,
+    command_id: u32,
+    command: &str,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    match mat_native::group::send(ctx, group_id, im::CLUSTER_ON_OFF, command_id, None).await? {
+        GroupOutcome::Sent => {
+            crate::commands::group::emit_invoke_sent(group_id, "onoff", command, endpoint);
+        }
+        GroupOutcome::Unavailable(reason) => {
+            return Err(group_unavailable_error(&reason));
+        }
+    }
+    Ok(())
+}
+
+async fn op_group_color(
+    engine: &Engine,
+    group_id: u16,
+    color: &ResolvedColor,
+    transition: u16,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    let fields =
+        im::encode_move_to_hue_and_saturation_fields(color.hue_raw, color.sat_raw, transition);
+    match mat_native::group::send(
+        ctx,
+        group_id,
+        im::CLUSTER_COLOR_CONTROL,
+        im::CMD_MOVE_TO_HUE_AND_SATURATION,
+        Some(fields),
+    )
+    .await?
+    {
+        GroupOutcome::Sent => {
+            crate::commands::group::emit_color_sent(group_id, color, transition, endpoint);
+        }
+        GroupOutcome::Unavailable(reason) => {
+            return Err(group_unavailable_error(&reason));
+        }
+    }
+    Ok(())
+}
+
+async fn op_group_color_temp(
+    engine: &Engine,
+    group_id: u16,
+    kelvin: u32,
+    mireds: u16,
+    transition: u16,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
+    match mat_native::group::send(
+        ctx,
+        group_id,
+        im::CLUSTER_COLOR_CONTROL,
+        im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+        Some(fields),
+    )
+    .await?
+    {
+        GroupOutcome::Sent => {
+            crate::commands::group::emit_color_temp_sent(
+                group_id, kelvin, mireds, transition, endpoint,
+            );
+        }
+        GroupOutcome::Unavailable(reason) => {
+            return Err(group_unavailable_error(&reason));
+        }
+    }
+    Ok(())
+}
+
+async fn op_group_level(
+    engine: &Engine,
+    group_id: u16,
+    percent: u8,
+    level: u8,
+    transition: u16,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    let fields = im::encode_move_to_level_fields(level, transition);
+    match mat_native::group::send(
+        ctx,
+        group_id,
+        im::CLUSTER_LEVEL_CONTROL,
+        im::CMD_MOVE_TO_LEVEL,
+        Some(fields),
+    )
+    .await?
+    {
+        GroupOutcome::Sent => {
+            crate::commands::group::emit_level_sent(group_id, percent, level, transition, endpoint);
+        }
+        GroupOutcome::Unavailable(reason) => {
+            return Err(group_unavailable_error(&reason));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn op_group_invoke_generic(
+    engine: &Engine,
+    group_id: u16,
+    cluster_in: &str,
+    command_in: &str,
+    cluster: u32,
+    command: u32,
+    fields_tlv: &Option<Vec<u8>>,
+    endpoint: u16,
+) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    match mat_native::group::send(ctx, group_id, cluster, command, fields_tlv.clone()).await? {
+        GroupOutcome::Sent => {
+            crate::commands::group::emit_invoke_sent(group_id, cluster_in, command_in, endpoint);
+        }
+        GroupOutcome::Unavailable(reason) => {
+            return Err(group_unavailable_error(&reason));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn op_group_provision(
+    engine: &Engine,
+    group_id: u16,
+    node_ids: &[u64],
+    keyset_id: u16,
+    name: &str,
+    endpoint: u16,
+    epoch_key: Option<&str>,
+    rebind: bool,
+) -> Result<(), MatError> {
+    // 1) コントローラ側 group state（M8c-2: native KVS 書込）。ctx 未構成
+    //    は本番 Engine::build では起きない（Other 内部エラー）。書込エラーは
+    //    hard error（ラッパー側 doc 参照 — flock WouldBlock 含む）。
+    let Some(gs) = &engine.group_settings else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key)?;
+    let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
+    mat_native::group_settings::write_group_provision(
+        gs,
+        group_id,
+        keyset_id,
+        name,
+        &epoch_key_bytes,
+        rebind,
+    )?;
+
+    // 2) 各デバイスへ provision（native, unicast）— M8a のまま。
+    for &node_id in node_ids {
+        let mut conn = engine.establisher.establish(node_id).await?;
+        let p = mat_native::ops::ProvisionNodeParams {
+            group_id,
+            keyset_id,
+            name: name.to_string(),
+            endpoint,
+            epoch_key: epoch_key_bytes,
+        };
+        mat_native::ops::provision_node(&mut *conn, &p)
+            .await
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+    }
+
+    tracing::info!(
+        group_id,
+        keyset_id,
+        "group provision executed (native direct)"
+    );
+    crate::commands::group::emit_provision_success(
+        group_id, keyset_id, name, endpoint, node_ids, rebind, true,
+    );
+    Ok(())
+}
+
+async fn op_group_grant(engine: &Engine, group_id: u16, node_ids: &[u64]) -> Result<(), MatError> {
+    let mut updated: Vec<u64> = Vec::new();
+    let mut unchanged: Vec<u64> = Vec::new();
+    for &node_id in node_ids {
+        let mut conn = engine.establisher.establish(node_id).await?;
+        if mat_native::ops::ensure_group_acl(&mut *conn, group_id)
+            .await
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?
+        {
+            updated.push(node_id);
+        } else {
+            unchanged.push(node_id);
+        }
+    }
+    tracing::info!(group_id, "group grant executed (native direct)");
+    crate::commands::group::emit_grant_success(group_id, node_ids, &updated, &unchanged);
+    Ok(())
+}
+
+async fn op_read_attr(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    cluster_in: &str,
+    attribute_in: &str,
+    cluster: u32,
+    attribute: u32,
+) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    let v = conn.read_json(endpoint, cluster, attribute).await?;
+    tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
+    crate::commands::read::emit_read_success(node_id, endpoint, cluster_in, attribute_in, v);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn op_write_attr(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    cluster_in: &str,
+    attribute_in: &str,
+    cluster: u32,
+    attribute: u32,
+    value_in: &str,
+    value: &ScalarValue,
+    timed: bool,
+) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.write_tlv(
+        endpoint,
+        cluster,
+        attribute,
+        mat_native::scalar_to_tlv(value),
+        timed,
+    )
+    .await?;
+    tracing::info!(
+        node_id,
+        cluster,
+        attribute,
+        "write executed (native direct)"
+    );
+    crate::commands::write::emit_write_success(
+        node_id,
+        endpoint,
+        cluster_in,
+        attribute_in,
+        value_in,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn op_invoke_generic(
+    engine: &Engine,
+    node_id: u64,
+    endpoint: u16,
+    cluster_in: &str,
+    command_in: &str,
+    cluster: u32,
+    command: u32,
+    fields_tlv: &Option<Vec<u8>>,
+    timed: bool,
+) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    conn.invoke(endpoint, cluster, command, fields_tlv.clone(), timed)
+        .await?;
+    tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
+    crate::commands::invoke::emit_invoke_success(node_id, endpoint, cluster_in, command_in);
+    Ok(())
+}
+
+async fn op_describe(engine: &Engine, node_id: u64) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    let endpoints = mat_native::ops::describe(&mut *conn).await?;
+    tracing::info!(node_id, "describe executed (native direct)");
+    crate::commands::describe::emit_describe_success(node_id, &endpoints);
+    Ok(())
+}
+
+async fn op_diag_thread(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    let snap = mat_native::ops::diag_thread(&mut *conn, endpoint).await?;
+    // wildcard read は per-attribute の失敗を出さないため native 経路の
+    // unavailable は通常空だが、スキーマ整合のため chip-tool 経路と同じ
+    // 形（{"attribute", "kind"}）へ変換して渡す。
+    let unavailable: Vec<serde_json::Value> = snap
+        .unavailable
+        .iter()
+        .map(|(attr, kind)| {
+            serde_json::json!({
+                "attribute": attr,
+                "kind": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    tracing::info!(node_id, endpoint, "diag thread executed (native direct)");
+    crate::commands::diag::emit_diag_thread_success(node_id, endpoint, snap.fields, unavailable);
+    Ok(())
+}
+
+async fn op_open_window(
+    engine: &Engine,
+    node_id: u64,
+    timeout: u32,
+    iteration: u32,
+    discriminator: u16,
+) -> Result<(), MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    // timeout は chip-tool 経路と同じ u32 CLI 値、window API は u16
+    // （spec 上 window timeout は 16-bit）。飽和させて渡す。
+    let timeout_u16 = u16::try_from(timeout).unwrap_or(u16::MAX);
+    let (manual_code, qr_payload) = conn
+        .open_window(timeout_u16, discriminator, iteration)
+        .await?;
+    tracing::info!(
+        node_id,
+        discriminator,
+        "open-window executed (native direct)"
+    );
+    crate::commands::open_window::emit_open_window_success(
+        node_id,
+        &manual_code,
+        &qr_payload,
+        timeout,
+    );
+    Ok(())
+}
+
+/// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。ディスパッチのみ —
+/// 各 op の実体は op_*（1 op = 1 関数、matd の native.rs と同じ粒度）。
 ///
 /// M8c-3（chip-tool 撤去）: 従来 `Fallback` を返していた分岐はハードエラー化。
 /// `engine.group` / `engine.group_settings` 未設定は本番 `Engine::build` では
 /// 常に `Some`（`with_parts` テスト注入時のみ `None`）なので Other、
 /// `GroupOutcome::Unavailable`（未 provision・KVS 不備）は store_parse で返す。
 async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
-    use mat_controller::im;
     match op {
-        NativeOp::On { node_id, endpoint } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_ON_OFF,
-                im::CMD_ON_OFF_ON,
-                None,
-                false,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster = "onoff",
-                command = "on",
-                "invoke executed (native direct)"
-            );
-            crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "on");
-        }
-        NativeOp::Off { node_id, endpoint } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_ON_OFF,
-                im::CMD_ON_OFF_OFF,
-                None,
-                false,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster = "onoff",
-                command = "off",
-                "invoke executed (native direct)"
-            );
-            crate::commands::invoke::emit_invoke_success(*node_id, *endpoint, "onoff", "off");
-        }
+        NativeOp::On { node_id, endpoint } => op_on(engine, *node_id, *endpoint).await,
+        NativeOp::Off { node_id, endpoint } => op_off(engine, *node_id, *endpoint).await,
         NativeOp::ReadOnOff { node_id, endpoint } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            let v = conn.read_onoff(*endpoint).await?;
-            tracing::info!(
-                node_id,
-                cluster = "onoff",
-                attribute = "on-off",
-                "read executed (native direct)"
-            );
-            crate::commands::read::emit_read_success(
-                *node_id,
-                *endpoint,
-                "onoff",
-                "on-off",
-                serde_json::json!(v),
-            );
+            op_read_onoff(engine, *node_id, *endpoint).await
         }
         NativeOp::Color {
             node_id,
             endpoint,
             color,
             transition,
-        } => {
-            let fields = im::encode_move_to_hue_and_saturation_fields(
-                color.hue_raw,
-                color.sat_raw,
-                *transition,
-            );
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(fields),
-                false,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster = "colorcontrol",
-                command = "move-to-hue-and-saturation",
-                "invoke executed (native direct)"
-            );
-            crate::commands::invoke::emit_color_success(*node_id, *endpoint, color, *transition);
-        }
+        } => op_color(engine, *node_id, *endpoint, color, *transition).await,
         NativeOp::ColorTemp {
             node_id,
             endpoint,
             kelvin,
             mireds,
             transition,
-        } => {
-            let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(fields),
-                false,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster = "colorcontrol",
-                command = "move-to-color-temperature",
-                "invoke executed (native direct)"
-            );
-            crate::commands::invoke::emit_color_temp_success(
-                *node_id,
-                *endpoint,
-                *kelvin,
-                *mireds,
-                *transition,
-            );
-        }
+        } => op_color_temp(engine, *node_id, *endpoint, *kelvin, *mireds, *transition).await,
         NativeOp::Level {
             node_id,
             endpoint,
             percent,
             level,
             transition,
-        } => {
-            let fields = im::encode_move_to_level_fields(*level, *transition);
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(fields),
-                false,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster = "levelcontrol",
-                command = "move-to-level",
-                "invoke executed (native direct)"
-            );
-            crate::commands::invoke::emit_level_success(
-                *node_id,
-                *endpoint,
-                *percent,
-                *level,
-                *transition,
-            );
-        }
+        } => op_level(engine, *node_id, *endpoint, *percent, *level, *transition).await,
         NativeOp::GroupOnOff {
             group_id,
             command_id,
             command,
             endpoint,
-        } => {
-            let Some(ctx) = &engine.group else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            match mat_native::group::send(ctx, *group_id, im::CLUSTER_ON_OFF, *command_id, None)
-                .await?
-            {
-                GroupOutcome::Sent => {
-                    crate::commands::group::emit_invoke_sent(
-                        *group_id, "onoff", command, *endpoint,
-                    );
-                }
-                GroupOutcome::Unavailable(reason) => {
-                    return Err(group_unavailable_error(&reason));
-                }
-            }
-        }
+        } => op_group_onoff(engine, *group_id, *command_id, command, *endpoint).await,
         NativeOp::GroupColor {
             group_id,
             color,
             transition,
             endpoint,
-        } => {
-            let Some(ctx) = &engine.group else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            let fields = im::encode_move_to_hue_and_saturation_fields(
-                color.hue_raw,
-                color.sat_raw,
-                *transition,
-            );
-            match mat_native::group::send(
-                ctx,
-                *group_id,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(fields),
-            )
-            .await?
-            {
-                GroupOutcome::Sent => {
-                    crate::commands::group::emit_color_sent(
-                        *group_id,
-                        color,
-                        *transition,
-                        *endpoint,
-                    );
-                }
-                GroupOutcome::Unavailable(reason) => {
-                    return Err(group_unavailable_error(&reason));
-                }
-            }
-        }
+        } => op_group_color(engine, *group_id, color, *transition, *endpoint).await,
         NativeOp::GroupColorTemp {
             group_id,
             kelvin,
             mireds,
             transition,
             endpoint,
-        } => {
-            let Some(ctx) = &engine.group else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
-            match mat_native::group::send(
-                ctx,
-                *group_id,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(fields),
-            )
-            .await?
-            {
-                GroupOutcome::Sent => {
-                    crate::commands::group::emit_color_temp_sent(
-                        *group_id,
-                        *kelvin,
-                        *mireds,
-                        *transition,
-                        *endpoint,
-                    );
-                }
-                GroupOutcome::Unavailable(reason) => {
-                    return Err(group_unavailable_error(&reason));
-                }
-            }
-        }
+        } => op_group_color_temp(engine, *group_id, *kelvin, *mireds, *transition, *endpoint).await,
         NativeOp::GroupLevel {
             group_id,
             percent,
             level,
             transition,
             endpoint,
-        } => {
-            let Some(ctx) = &engine.group else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            let fields = im::encode_move_to_level_fields(*level, *transition);
-            match mat_native::group::send(
-                ctx,
-                *group_id,
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(fields),
-            )
-            .await?
-            {
-                GroupOutcome::Sent => {
-                    crate::commands::group::emit_level_sent(
-                        *group_id,
-                        *percent,
-                        *level,
-                        *transition,
-                        *endpoint,
-                    );
-                }
-                GroupOutcome::Unavailable(reason) => {
-                    return Err(group_unavailable_error(&reason));
-                }
-            }
-        }
+        } => op_group_level(engine, *group_id, *percent, *level, *transition, *endpoint).await,
         NativeOp::GroupInvokeGeneric {
             group_id,
             cluster_in,
@@ -984,21 +1246,11 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
             fields_tlv,
             endpoint,
         } => {
-            let Some(ctx) = &engine.group else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            match mat_native::group::send(ctx, *group_id, *cluster, *command, fields_tlv.clone())
-                .await?
-            {
-                GroupOutcome::Sent => {
-                    crate::commands::group::emit_invoke_sent(
-                        *group_id, cluster_in, command_in, *endpoint,
-                    );
-                }
-                GroupOutcome::Unavailable(reason) => {
-                    return Err(group_unavailable_error(&reason));
-                }
-            }
+            op_group_invoke_generic(
+                engine, *group_id, cluster_in, command_in, *cluster, *command, fields_tlv,
+                *endpoint,
+            )
+            .await
         }
         NativeOp::GroupProvision {
             group_id,
@@ -1009,63 +1261,20 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
             epoch_key,
             rebind,
         } => {
-            // 1) コントローラ側 group state（M8c-2: native KVS 書込）。ctx 未構成
-            //    は本番 Engine::build では起きない（Other 内部エラー）。書込エラーは
-            //    hard error（ラッパー側 doc 参照 — flock WouldBlock 含む）。
-            let Some(gs) = &engine.group_settings else {
-                return Err(group_ctx_unconfigured_error());
-            };
-            let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key.as_deref())?;
-            let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;
-            mat_native::group_settings::write_group_provision(
-                gs,
+            op_group_provision(
+                engine,
                 *group_id,
+                node_ids,
                 *keyset_id,
                 name,
-                &epoch_key_bytes,
+                *endpoint,
+                epoch_key.as_deref(),
                 *rebind,
-            )?;
-
-            // 2) 各デバイスへ provision（native, unicast）— M8a のまま。
-            for &node_id in node_ids {
-                let mut conn = engine.establisher.establish(node_id).await?;
-                let p = mat_native::ops::ProvisionNodeParams {
-                    group_id: *group_id,
-                    keyset_id: *keyset_id,
-                    name: name.clone(),
-                    endpoint: *endpoint,
-                    epoch_key: epoch_key_bytes,
-                };
-                mat_native::ops::provision_node(&mut *conn, &p)
-                    .await
-                    .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
-            }
-
-            tracing::info!(
-                group_id,
-                keyset_id,
-                "group provision executed (native direct)"
-            );
-            crate::commands::group::emit_provision_success(
-                *group_id, *keyset_id, name, *endpoint, node_ids, *rebind, true,
-            );
+            )
+            .await
         }
         NativeOp::GroupGrant { group_id, node_ids } => {
-            let mut updated: Vec<u64> = Vec::new();
-            let mut unchanged: Vec<u64> = Vec::new();
-            for &node_id in node_ids {
-                let mut conn = engine.establisher.establish(node_id).await?;
-                if mat_native::ops::ensure_group_acl(&mut *conn, *group_id)
-                    .await
-                    .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?
-                {
-                    updated.push(node_id);
-                } else {
-                    unchanged.push(node_id);
-                }
-            }
-            tracing::info!(group_id, "group grant executed (native direct)");
-            crate::commands::group::emit_grant_success(*group_id, node_ids, &updated, &unchanged);
+            op_group_grant(engine, *group_id, node_ids).await
         }
         NativeOp::ReadAttr {
             node_id,
@@ -1075,16 +1284,16 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
             cluster,
             attribute,
         } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            let v = conn.read_json(*endpoint, *cluster, *attribute).await?;
-            tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
-            crate::commands::read::emit_read_success(
+            op_read_attr(
+                engine,
                 *node_id,
                 *endpoint,
                 cluster_in,
                 attribute_in,
-                v,
-            );
+                *cluster,
+                *attribute,
+            )
+            .await
         }
         NativeOp::WriteAttr {
             node_id,
@@ -1097,28 +1306,19 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
             value,
             timed,
         } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.write_tlv(
-                *endpoint,
-                *cluster,
-                *attribute,
-                mat_native::scalar_to_tlv(value),
-                *timed,
-            )
-            .await?;
-            tracing::info!(
-                node_id,
-                cluster,
-                attribute,
-                "write executed (native direct)"
-            );
-            crate::commands::write::emit_write_success(
+            op_write_attr(
+                engine,
                 *node_id,
                 *endpoint,
                 cluster_in,
                 attribute_in,
+                *cluster,
+                *attribute,
                 value_in,
-            );
+                value,
+                *timed,
+            )
+            .await
         }
         NativeOp::InvokeGeneric {
             node_id,
@@ -1130,71 +1330,23 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
             fields_tlv,
             timed,
         } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            conn.invoke(*endpoint, *cluster, *command, fields_tlv.clone(), *timed)
-                .await?;
-            tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
-            crate::commands::invoke::emit_invoke_success(
-                *node_id, *endpoint, cluster_in, command_in,
-            );
+            op_invoke_generic(
+                engine, *node_id, *endpoint, cluster_in, command_in, *cluster, *command,
+                fields_tlv, *timed,
+            )
+            .await
         }
-        NativeOp::Describe { node_id } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            let endpoints = mat_native::ops::describe(&mut *conn).await?;
-            tracing::info!(node_id, "describe executed (native direct)");
-            crate::commands::describe::emit_describe_success(*node_id, &endpoints);
-        }
+        NativeOp::Describe { node_id } => op_describe(engine, *node_id).await,
         NativeOp::DiagThread { node_id, endpoint } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            let snap = mat_native::ops::diag_thread(&mut *conn, *endpoint).await?;
-            // wildcard read は per-attribute の失敗を出さないため native 経路の
-            // unavailable は通常空だが、スキーマ整合のため chip-tool 経路と同じ
-            // 形（{"attribute", "kind"}）へ変換して渡す。
-            let unavailable: Vec<serde_json::Value> = snap
-                .unavailable
-                .iter()
-                .map(|(attr, kind)| {
-                    serde_json::json!({
-                        "attribute": attr,
-                        "kind": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
-                    })
-                })
-                .collect();
-            tracing::info!(node_id, endpoint, "diag thread executed (native direct)");
-            crate::commands::diag::emit_diag_thread_success(
-                *node_id,
-                *endpoint,
-                snap.fields,
-                unavailable,
-            );
+            op_diag_thread(engine, *node_id, *endpoint).await
         }
         NativeOp::OpenWindow {
             node_id,
             timeout,
             iteration,
             discriminator,
-        } => {
-            let mut conn = engine.establisher.establish(*node_id).await?;
-            // timeout は chip-tool 経路と同じ u32 CLI 値、window API は u16
-            // （spec 上 window timeout は 16-bit）。飽和させて渡す。
-            let timeout_u16 = u16::try_from(*timeout).unwrap_or(u16::MAX);
-            let (manual_code, qr_payload) = conn
-                .open_window(timeout_u16, *discriminator, *iteration)
-                .await?;
-            tracing::info!(
-                node_id,
-                discriminator,
-                "open-window executed (native direct)"
-            );
-            crate::commands::open_window::emit_open_window_success(
-                *node_id,
-                &manual_code,
-                &qr_payload,
-                *timeout,
-            );
-        }
+        } => op_open_window(engine, *node_id, *timeout, *iteration, *discriminator).await,
     }
-    Ok(())
 }
 
 /// `mat diag node` の IM 部分（operational チェック + thread シグナル）を
