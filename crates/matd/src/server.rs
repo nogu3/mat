@@ -485,12 +485,11 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
             mat_core::ids::InvokeClass::NotNative => None,
             mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 ..
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {
@@ -695,12 +694,11 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             }
             mat_core::ids::WriteClass::Reject(msg) => Err(MatError::parse_error(msg)),
             mat_core::ids::WriteClass::Native {
+                cluster: cluster_id,
                 attribute: attr_id,
                 value: scalar,
                 timed,
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_write already resolved this cluster name");
                 native
                     .write_tlv(
                         *node_id,
@@ -728,12 +726,11 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             }
             mat_core::ids::InvokeClass::Reject(msg) => Err(MatError::parse_error(msg)),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 timed,
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {

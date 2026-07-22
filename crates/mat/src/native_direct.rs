@@ -431,24 +431,21 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::WriteClass::NotNative => None,
             mat_core::ids::WriteClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::WriteClass::Native {
+                cluster: cluster_id,
                 attribute: attr_id,
                 value: scalar,
                 timed,
-            } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_write already resolved this cluster name");
-                Some(Ok(NativeOp::WriteAttr {
-                    node_id: node_id.id(),
-                    endpoint: endpoint.id(),
-                    cluster_in: cluster.clone(),
-                    attribute_in: attribute.clone(),
-                    cluster: cluster_id,
-                    attribute: attr_id,
-                    value_in: value.clone(),
-                    value: scalar,
-                    timed,
-                }))
-            }
+            } => Some(Ok(NativeOp::WriteAttr {
+                node_id: node_id.id(),
+                endpoint: endpoint.id(),
+                cluster_in: cluster.clone(),
+                attribute_in: attribute.clone(),
+                cluster: cluster_id,
+                attribute: attr_id,
+                value_in: value.clone(),
+                value: scalar,
+                timed,
+            })),
         },
         // 汎用 invoke（M8a Task7、M8a Task10 で classify_invoke へ一本化）:
         // cluster/command 名の解決 + 引数の型スカラー化は mat-core::ids に
@@ -463,12 +460,11 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::InvokeClass::NotNative => None,
             mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 timed,
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {
@@ -507,12 +503,11 @@ pub(crate) fn classify_strict(command: &Command) -> Option<Result<NativeOp, MatE
             mat_core::ids::InvokeClass::NotNative => None,
             mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
             mat_core::ids::InvokeClass::Native {
+                cluster: cluster_id,
                 command: cmd_id,
                 fields,
                 ..
             } => {
-                let cluster_id = mat_core::ids::resolve_cluster(cluster)
-                    .expect("classify_invoke already resolved this cluster name");
                 let fields_tlv = if fields.is_empty() {
                     None
                 } else {
