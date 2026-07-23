@@ -1470,6 +1470,80 @@ async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> Di
     }
 }
 
+/// `mat diag mesh` の per-node 収集結果 1 件。
+pub(crate) struct MeshProbeItem {
+    pub node_id: u64,
+    pub result: Result<mat_core::mesh::ProbeData, MatError>,
+}
+
+/// `mat diag mesh` の収集: engine を 1 度構築し、各対象ノードへ逐次
+/// CASE → cluster 53（diag_thread）+ cluster 0x33（thread_identity）。
+/// per-node の失敗は item の Err に畳む（部分結果）。エンジン構築失敗のみ
+/// ハードエラー。
+pub(crate) fn diag_mesh_probe(
+    cfg: &Config<'_>,
+    store_root: &Path,
+    targets: &[u64],
+) -> Result<Vec<MeshProbeItem>, MatError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            MatError::new(
+                mat_core::error::ErrorKind::Other,
+                format!("tokio runtime: {e}"),
+            )
+        })?;
+    rt.block_on(async {
+        let native_cfg = NativeConfig {
+            store: store_root.to_path_buf(),
+            iface: cfg.iface.to_string(),
+            fabric_index: cfg.fabric_index,
+            issuer_index: cfg.issuer_index,
+        };
+        let engine = Engine::build(&native_cfg)
+            .await
+            .map_err(map_engine_build_error)?;
+        let mut out = Vec::new();
+        for &node_id in targets {
+            let result = mesh_probe_one(&engine, node_id).await;
+            if let Err(e) = &result {
+                tracing::warn!(node_id, kind = ?e.kind, detail = %e.detail,
+                    "mesh probe failed for node; continuing");
+            }
+            out.push(MeshProbeItem { node_id, result });
+        }
+        Ok(out)
+    })
+}
+
+/// 1 ノード分: CASE 確立 → cluster 53 → cluster 0x33。0x33 は補助情報なので
+/// 読めなくても成功扱い（identity=None、warn ログのみ）。
+async fn mesh_probe_one(
+    engine: &Engine,
+    node_id: u64,
+) -> Result<mat_core::mesh::ProbeData, MatError> {
+    let mut conn = engine.establisher.establish(node_id).await?;
+    let snap = mat_native::ops::diag_thread(&mut *conn, 0).await?;
+    let identity = match mat_native::ops::thread_identity(&mut *conn, 0).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(node_id, kind = ?e.kind,
+                "network-interfaces read failed; continuing without self-identity");
+            None
+        }
+    };
+    tracing::info!(
+        node_id,
+        has_identity = identity.is_some(),
+        "mesh probe executed (native direct)"
+    );
+    Ok(mat_core::mesh::ProbeData {
+        thread: snap.fields,
+        identity,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
