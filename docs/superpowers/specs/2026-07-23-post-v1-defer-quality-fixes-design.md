@@ -94,10 +94,14 @@ workspace 全体の footgun になっている。
 観測可能な挙動変更は **1 系統だけ**:
 
 - forced `--matd` + `to_op` 内の実エラー: exit 2 / kind=other →
-  **固有 kind / 固有 exit**。該当は alias 解決失敗（未解決 alias = other / 1、
-  aliases.toml 破損 = store_parse / 10）と、group color の spec 解決失敗
-  （`resolve_spec` — 実装時判明。従来 `.map_err(|e| e.detail)?` で kind を
-  落としていた同族箇所で、`ToOpError` 化により自然に固有 kind へ戻る）。
+  **固有 kind / 固有 exit**。ユーザー到達可能な実例は color spec 解決失敗
+  （`resolve_spec` — 単発 `color` と `group color` の両方。従来
+  `.map_err(|e| e.detail)?` で kind を落としていた同族箇所で、`ToOpError`
+  化により直経路と同一の other / exit 1 へ戻る）。alias 系は CLI 層の
+  `resolve_command` が dispatch より前に解決するため、未解決 alias や
+  aliases.toml 破損（store_parse / 10）はそこで落ち、`to_op` に届くのは
+  内部バグ経路のみ — テストはその経路の kind 保持をピン留めする
+  （最終レビュー指摘で当初の例示を訂正）。
 
 不変なもの: 非対応 op の exit 2、auto 経路の出力、正常系すべて、
 README の exit code 表（実装時に要再確認）。unreachable! 6 箇所は
