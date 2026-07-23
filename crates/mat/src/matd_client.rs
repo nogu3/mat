@@ -485,7 +485,12 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
         timeout_ms,
     } = command
     else {
-        unreachable!("dispatch_listen called with non-Listen command");
+        // 内部バグ経路: 非 Listen command が来ても panic しない（v1 Task6 規律）。
+        let e = MatError::parse_error(
+            "internal: dispatch_listen called with non-Listen command (dispatch invariant violated)",
+        );
+        e.emit();
+        return ExitCode::from(e.kind.exit_code());
     };
     // 未解決 alias が届いた場合（内部バグ）は typed error を emit して抜ける
     // （他の経路と同じ MatError::emit + exit_code パターン、panic しない）。
