@@ -303,6 +303,12 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                         deep,
                     }
                 }
+                DiagCommand::Mesh { nodes } => DiagCommand::Mesh {
+                    nodes: nodes
+                        .into_iter()
+                        .map(|n| book.resolve_node(&n).map(NodeRef::Id))
+                        .collect::<Result<_, MatError>>()?,
+                },
             },
         },
         // fabric_id / admin_node_id は数値のみ（alias 対象フィールドが無い）— パススルー。

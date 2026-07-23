@@ -580,6 +580,9 @@ pub(crate) fn run(
         | Command::Fabric { .. }
         | Command::Diag {
             action: DiagCommand::Node { .. },
+        }
+        | Command::Diag {
+            action: DiagCommand::Mesh { .. },
         } => return None,
         _ => {}
     }
@@ -1906,6 +1909,22 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn diag_mesh_is_excluded_from_native_direct_run() {
+        use crate::cli::DiagCommand;
+        let cmd = Command::Diag {
+            action: DiagCommand::Mesh { nodes: vec![] },
+        };
+        let cfg = Config {
+            iface: "lo",
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        // 専用コマンド層を持つ op は run() が None（store にも触れない —
+        // 実在しないパスで良い）。
+        assert!(run(&cmd, std::path::Path::new("/nonexistent"), &cfg).is_none());
     }
 
     /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
