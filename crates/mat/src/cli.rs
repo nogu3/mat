@@ -383,6 +383,18 @@ pub enum DiagCommand {
         #[arg(long)]
         deep: bool,
     },
+
+    /// Thread メッシュ全体のトポロジー（ノード + リンク品質エッジ）を 1 JSON で
+    /// 返す。自 fabric の commission 済みノードを順に診断（cluster 53 + 0x33）し、
+    /// テーブルに現れた未知参加者（BR / 他 fabric デバイス）もグラフに含める。
+    /// 直経路のみ・endpoint 0 固定。ラベルは aliases.toml（node alias 逆引き +
+    /// `[thread]` セクション）。
+    Mesh {
+        /// 対象ノード（node_id または alias、1 つ以上）。省略時 = store の全
+        /// commission 済みノード。
+        #[arg(long = "nodes", num_args = 1.., value_name = "N|ALIAS")]
+        nodes: Vec<NodeRef>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
