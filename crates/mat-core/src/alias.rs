@@ -668,7 +668,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("aliases.toml"),
-            "[nodes]\nstudy_motion = 16\n\n[thread]\n\"aabbccddeeff0011\" = \"otbr-br\"\n",
+            "[nodes]\nhall_motion = 42\n\n[thread]\n\"aabbccddeeff0011\" = \"otbr-br\"\n",
         )
         .unwrap();
         let book = AliasBook::load(dir.path()).unwrap();
@@ -696,11 +696,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("aliases.toml"),
-            "[nodes]\nstudy_motion = 16\nbed_light = 5\n",
+            "[nodes]\nhall_motion = 42\nporch_light = 7\n",
         )
         .unwrap();
         let book = AliasBook::load(dir.path()).unwrap();
-        assert_eq!(book.node_alias_of(16), Some("study_motion"));
+        assert_eq!(book.node_alias_of(42), Some("hall_motion"));
         assert_eq!(book.node_alias_of(99), None);
     }
 
