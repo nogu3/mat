@@ -710,9 +710,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             attribute,
             value,
         } => match mat_core::ids::classify_write(cluster, attribute, value) {
-            mat_core::ids::WriteClass::NotNative => {
-                unreachable!("is_native_hotpath already filtered NotNative writes")
-            }
+            mat_core::ids::WriteClass::NotNative => Err(MatError::parse_error(
+                "internal: NotNative write reached native_op (is_native_hotpath invariant violated)",
+            )),
             mat_core::ids::WriteClass::Reject(msg) => Err(MatError::parse_error(msg)),
             mat_core::ids::WriteClass::Native {
                 cluster: cluster_id,
@@ -742,9 +742,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             command,
             args,
         } => match mat_core::ids::classify_invoke(cluster, command, args) {
-            mat_core::ids::InvokeClass::NotNative => {
-                unreachable!("is_native_hotpath already filtered NotNative invokes")
-            }
+            mat_core::ids::InvokeClass::NotNative => Err(MatError::parse_error(
+                "internal: NotNative invoke reached native_op (is_native_hotpath invariant violated)",
+            )),
             mat_core::ids::InvokeClass::Reject(msg) => Err(MatError::parse_error(msg)),
             mat_core::ids::InvokeClass::Native {
                 cluster: cluster_id,
@@ -769,7 +769,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             let endpoints = native.describe(*node_id).await?;
             Ok(mat_core::body::describe_success(*node_id, &endpoints))
         }
-        _ => unreachable!("native_op called with non-hotpath op"),
+        _ => Err(MatError::parse_error(
+            "internal: native_op called with non-hotpath op (dispatch invariant violated)",
+        )),
     }
 }
 
@@ -797,7 +799,9 @@ async fn group_provision(
         rebind,
     } = op
     else {
-        unreachable!("group_provision called with non-GroupProvision op");
+        return Err(MatError::parse_error(
+            "internal: group_provision called with non-GroupProvision op (dispatch invariant violated)",
+        ));
     };
 
     let store = Store::open(store_path)?;
@@ -1590,5 +1594,55 @@ mod tests {
             }),
             Some((5, 0x0006))
         );
+    }
+
+    /// post-1.0 defer: dispatch 不変条件が破れても panic しない（v1 Task6 規律）。
+    #[tokio::test]
+    async fn native_op_invariant_violations_are_typed_errors_not_panics() {
+        let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let store = store_with_node_5();
+
+        // NotNative write（未知 cluster 名 → classify_write が NotNative）
+        let op = Op::Write {
+            node_id: 5,
+            endpoint: 1,
+            cluster: "nosuchcluster".into(),
+            attribute: "x".into(),
+            value: "1".into(),
+        };
+        let err = native_op(&op, &native, store.path()).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
+
+        // NotNative invoke
+        let op = Op::Invoke {
+            node_id: 5,
+            endpoint: 1,
+            cluster: "nosuchcluster".into(),
+            command: "x".into(),
+            args: vec![],
+        };
+        let err = native_op(&op, &native, store.path()).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
+
+        // non-hotpath op（Ping は node_id() が None なので require_node を素通りして
+        // catch-all に到達する）
+        let err = native_op(&Op::Ping, &native, store.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn group_provision_rejects_non_group_provision_op_without_panic() {
+        let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let err = group_provision(&Op::Ping, &native, dir.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
     }
 }
