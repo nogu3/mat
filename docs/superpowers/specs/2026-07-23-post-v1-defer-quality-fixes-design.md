@@ -91,17 +91,21 @@ workspace 全体の footgun になっている。
 
 ## C. 挙動変更の整理
 
-観測可能な挙動変更は **1 系統だけ**:
+観測可能な挙動変更は **なし**（実機 E2E で確定、2026-07-23 jarvis A/B）:
 
-- forced `--matd` + `to_op` 内の実エラー: exit 2 / kind=other →
-  **固有 kind / 固有 exit**。ユーザー到達可能な実例は color spec 解決失敗
-  （`resolve_spec` — 単発 `color` と `group color` の両方。従来
-  `.map_err(|e| e.detail)?` で kind を落としていた同族箇所で、`ToOpError`
-  化により直経路と同一の other / exit 1 へ戻る）。alias 系は CLI 層の
-  `resolve_command` が dispatch より前に解決するため、未解決 alias や
-  aliases.toml 破損（store_parse / 10）はそこで落ち、`to_op` に届くのは
-  内部バグ経路のみ — テストはその経路の kind 保持をピン留めする
-  （最終レビュー指摘で当初の例示を訂正）。
+- `to_op` の `Mat` 経路（alias / color spec 解決失敗の kind 保持）は、
+  ユーザー到達可能な全ケースが dispatch より前に捕捉されるため
+  **内部バグ経路専用の防御層**である: 未解決 alias / aliases.toml 破損は
+  CLI 層 `resolve_command` が捕捉（新旧とも kind=other + exit 2 を実機確認）、
+  color spec は clap の必須グループ（no-spec）・hue/sat 併用強制（hue 単独）・
+  CLI resolve 層（不正 rgb 値）が捕捉（いずれも新旧 exit 2 同一を実機 A/B）。
+  当初 spec と最終レビューが挙げた「到達可能な実例」（aliases.toml 破損、
+  color spec 解決失敗）はいずれも実機で反証された — `ToOpError` 化の価値は
+  unreachable! 修正と同じ「不変条件が破れても kind を落とさない」規律の
+  一貫化と、`From<MatError> for String` footgun の除去にある。
+- 実機 E2E（jarvis、新旧バイナリ A/B）: matd 経路 read / 直経路 read 回帰
+  exit 0、`--matd discover` = other / exit 2 維持、color spec・alias エラー
+  全形状で新旧出力・exit 完全一致。
 
 不変なもの: 非対応 op の exit 2、auto 経路の出力、正常系すべて、
 README の exit code 表（実装時に要再確認）。unreachable! 6 箇所は
