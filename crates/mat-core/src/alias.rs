@@ -93,6 +93,10 @@ struct AliasFile {
     /// （mat-core::color::BUILTIN_COLORS）の同名を上書きする。
     #[serde(default)]
     colors: BTreeMap<String, String>,
+    /// `[thread]`: Thread ExtAddress（16 桁 hex）→ 表示ラベル。`mat diag mesh` が
+    /// 未知メッシュ参加者（BR / 他 fabric デバイス）のラベル付けに使う。
+    #[serde(default)]
+    thread: BTreeMap<String, String>,
 }
 
 impl Default for AliasFile {
@@ -105,6 +109,7 @@ impl Default for AliasFile {
             groups: BTreeMap::new(),
             endpoints: BTreeMap::new(),
             colors: BTreeMap::new(),
+            thread: BTreeMap::new(),
         }
     }
 }
@@ -174,6 +179,15 @@ impl AliasBook {
             if let Err(e) = crate::color::parse_rgb(value) {
                 return Err(MatError::store_parse(format!(
                     "invalid RGB value for color '{name}' in {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+        for (key, label) in &file.thread {
+            let hex_ok = key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit());
+            if !hex_ok || label.is_empty() {
+                return Err(MatError::store_parse(format!(
+                    "invalid thread entry '{key}' in {} (key must be 16 hex chars = Thread ExtAddress, label must be non-empty)",
                     path.display()
                 )));
             }
@@ -263,6 +277,25 @@ impl AliasBook {
                 format!("unknown color name '{name}' (known: {})", known.join(", ")),
             )
         })
+    }
+
+    /// node_id → alias の逆引き（複数定義時は BTreeMap 順の先勝ち）。
+    /// `mat diag mesh` の出力ラベル用。
+    pub fn node_alias_of(&self, node_id: u64) -> Option<&str> {
+        self.file
+            .nodes
+            .iter()
+            .find(|(_, &v)| v == node_id)
+            .map(|(k, _)| k.as_str())
+    }
+
+    /// `[thread]` の ExtAddress → ラベル表（キーを大文字 hex へ正規化して返す）。
+    pub fn thread_labels(&self) -> BTreeMap<String, String> {
+        self.file
+            .thread
+            .iter()
+            .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
+            .collect()
     }
 
     /// 未知 alias の detail 文。AI が自己修復できるよう既知 alias を列挙する。
@@ -628,5 +661,53 @@ mod tests {
             AliasBook::load(dir.path()).unwrap_err().kind,
             ErrorKind::StoreParse
         );
+    }
+
+    #[test]
+    fn thread_section_parses_and_normalizes_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aliases.toml"),
+            "[nodes]\nhall_motion = 42\n\n[thread]\n\"aabbccddeeff0011\" = \"otbr-br\"\n",
+        )
+        .unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        let labels = book.thread_labels();
+        assert_eq!(
+            labels.get("AABBCCDDEEFF0011").map(String::as_str),
+            Some("otbr-br")
+        );
+    }
+
+    #[test]
+    fn thread_section_rejects_non_hex_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aliases.toml"),
+            "[thread]\n\"not-hex\" = \"x\"\n",
+        )
+        .unwrap();
+        let err = AliasBook::load(dir.path()).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreParse);
+    }
+
+    #[test]
+    fn node_alias_reverse_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aliases.toml"),
+            "[nodes]\nhall_motion = 42\nporch_light = 7\n",
+        )
+        .unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(book.node_alias_of(42), Some("hall_motion"));
+        assert_eq!(book.node_alias_of(99), None);
+    }
+
+    #[test]
+    fn node_alias_reverse_lookup_absent_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        assert_eq!(book.node_alias_of(1), None);
     }
 }

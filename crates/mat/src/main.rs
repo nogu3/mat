@@ -175,6 +175,13 @@ fn main() -> ExitCode {
                 commands::diag::node(&store_path, node, ep, *deep, native_cfg.as_ref())
             })
         }),
+        Command::Diag {
+            action: DiagCommand::Mesh { nodes },
+        } => nodes
+            .iter()
+            .map(mat_core::alias::NodeRef::id)
+            .collect::<Result<Vec<u64>, MatError>>()
+            .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
         // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
         // Command::Fabric は route dispatch より前の早期 return で処理済み。
         // 不変条件が破れても panic せず typed error（v1 Task6 と同じ規律）。

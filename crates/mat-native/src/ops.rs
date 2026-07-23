@@ -78,6 +78,8 @@ const SCALARS: &[(&str, &str)] = &[
     ("pan_id", "pan-id"),
     ("partition_id", "partition-id"),
     ("channel", "channel"),
+    ("leader_router_id", "leader-router-id"),
+    ("mesh_local_prefix", "mesh-local-prefix"),
 ];
 
 /// list-of-struct 属性: (出力キー, chip-tool 属性名)。
@@ -162,6 +164,55 @@ pub async fn diag_thread(
         fields,
         unavailable: Vec::new(),
     })
+}
+
+/// General Diagnostics（cluster 0x33）NetworkInterfaces。
+const CLUSTER_GENERAL_DIAG: u32 = 0x0033;
+const ATTR_NETWORK_INTERFACES: u32 = 0x0000;
+/// NetworkInterfaceStruct の InterfaceTypeEnum: 4 = Thread。
+const IFACE_TYPE_THREAD: u64 = 4;
+
+/// cluster 0x33 NetworkInterfaces から Thread インターフェースの自己同定情報
+/// （HardwareAddress = 802.15.4 ExtAddress、IPv6 一覧）を取り出す。
+/// Thread IF が無い / 形が想定外なら Ok(None)（mesh 収集は自己同定なしで続行可能
+/// — read 自体の失敗は Err で伝播し、呼び出し側が None に丸めるか決める）。
+/// struct のキーは context tag の 10 進文字列（`tlv_element_to_json` 参照）:
+/// "0"=Name, "1"=IsOperational, "4"=HardwareAddress(octstr→hex),
+/// "6"=IPv6Addresses(list of octstr→hex), "7"=Type。
+pub async fn thread_identity(
+    conn: &mut dyn NodeConn,
+    endpoint: u16,
+) -> Result<Option<mat_core::mesh::Identity>, MatError> {
+    let v = conn
+        .read_json(endpoint, CLUSTER_GENERAL_DIAG, ATTR_NETWORK_INTERFACES)
+        .await?;
+    let Some(items) = v.as_array() else {
+        return Ok(None);
+    };
+    for item in items {
+        let Some(o) = item.as_object() else { continue };
+        if o.get("7").and_then(Value::as_u64) != Some(IFACE_TYPE_THREAD) {
+            continue;
+        }
+        let Some(hw) = o.get("4").and_then(Value::as_str) else {
+            continue;
+        };
+        let ipv6 = o
+            .get("6")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(Some(mat_core::mesh::Identity {
+            ext_address: hw.to_string(),
+            ipv6,
+        }));
+    }
+    Ok(None)
 }
 
 /// diag node の thread シグナル: `ThreadSnapshot` から `ThreadCheck`
@@ -451,6 +502,66 @@ pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<
 mod tests {
     use super::*;
     use crate::test_support::FakeConn;
+
+    #[tokio::test]
+    async fn thread_identity_picks_thread_interface() {
+        // NetworkInterfaces: eth (type=2) と Thread (type=4)。Thread を選ぶ。
+        let mut conn = FakeConn::scripted().with_read(
+            0,
+            0x0033,
+            0x0000,
+            serde_json::json!([
+                {"0": "eth0", "1": true, "4": "aabbccddeeff", "6": [], "7": 2},
+                {"0": "wpan0", "1": true, "4": "0011223344556677",
+                 "6": ["fd00112233445566000000fffe001400",
+                        "fe800000000000000011223344556677"],
+                 "7": 4}
+            ]),
+        );
+        let id = thread_identity(&mut conn, 0).await.unwrap().unwrap();
+        assert_eq!(id.ext_address, "0011223344556677");
+        assert_eq!(id.ipv6.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn thread_identity_none_without_thread_interface() {
+        let mut conn = FakeConn::scripted().with_read(
+            0,
+            0x0033,
+            0x0000,
+            serde_json::json!([
+                {"0": "eth0", "1": true, "4": "aabbccddeeff", "6": [], "7": 2}
+            ]),
+        );
+        assert!(thread_identity(&mut conn, 0).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_identity_none_on_non_array() {
+        let mut conn = FakeConn::scripted().with_read(0, 0x0033, 0x0000, serde_json::json!(null));
+        assert!(thread_identity(&mut conn, 0).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn diag_thread_includes_leader_and_ml_prefix_scalars() {
+        // 既存 diag_thread_maps_names_and_partial_results と同じ組み方で、
+        // leader-router-id(0x000d) と mesh-local-prefix(0x0005) が fields に載ること。
+        let mut conn = FakeConn::scripted().with_cluster(
+            0,
+            0x0035,
+            vec![
+                (0x0001, serde_json::json!(5)),
+                (0x000d, serde_json::json!(8)),
+                (0x0005, serde_json::json!("fd00112233445566")),
+            ],
+        );
+        let snap = diag_thread(&mut conn, 0).await.unwrap();
+        assert_eq!(snap.fields["leader_router_id"], serde_json::json!(8));
+        assert_eq!(
+            snap.fields["mesh_local_prefix"],
+            serde_json::json!("fd00112233445566")
+        );
+    }
 
     #[tokio::test]
     async fn describe_walks_parts_and_server_lists() {
