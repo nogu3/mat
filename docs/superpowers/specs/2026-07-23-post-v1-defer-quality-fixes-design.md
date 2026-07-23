@@ -91,10 +91,13 @@ workspace 全体の footgun になっている。
 
 ## C. 挙動変更の整理
 
-観測可能な挙動変更は **1 つだけ**:
+観測可能な挙動変更は **1 系統だけ**:
 
-- forced `--matd` + alias 解決失敗: exit 2 / kind=other →
-  **固有 kind / 固有 exit**（例: aliases.toml 破損なら store_parse / 10）。
+- forced `--matd` + `to_op` 内の実エラー: exit 2 / kind=other →
+  **固有 kind / 固有 exit**。該当は alias 解決失敗（未解決 alias = other / 1、
+  aliases.toml 破損 = store_parse / 10）と、group color の spec 解決失敗
+  （`resolve_spec` — 実装時判明。従来 `.map_err(|e| e.detail)?` で kind を
+  落としていた同族箇所で、`ToOpError` 化により自然に固有 kind へ戻る）。
 
 不変なもの: 非対応 op の exit 2、auto 経路の出力、正常系すべて、
 README の exit code 表（実装時に要再確認）。unreachable! 6 箇所は
