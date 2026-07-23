@@ -429,20 +429,33 @@ mat diag mesh --nodes 5 16
 }
 ```
 
-> `--nodes` takes node_ids or `aliases.toml` node aliases, one or more;
-> omitted, it means every commissioned node in the store. A node with 0
+> `--nodes` takes node_ids or `aliases.toml` node aliases, one or more,
+> deduped preserving first-seen order (`--nodes 7 7`, or the same node given
+> twice via alias + id, probes it once and emits one graph node — `id` is the
+> graph's stable key, so a duplicate target would otherwise duplicate the
+> node); omitted, it means every commissioned node in the store. A node with 0
 > targets (empty store) is not an error — it returns an empty graph
-> (`"nodes":[]`, `"edges":[]`) with just a `timestamp`, without touching the
+> (`"nodes":[]`, `"edges":[]`) plus a `network` object (all fields absent
+> except an empty `partition_ids`) and a `timestamp`, without touching the
 > backend.
 >
 > A node's stable `id` is `ext:<HEX16>` when its ExtAddress is known (either
 > self-identified via cluster 0x33, for fabric nodes, or observed in a
 > neighbor/route table row, for unknown participants), `rloc:<hex>` when only
-> the RLOC16 could be derived, and `node:<node_id>` for a fabric node whose
-> probe never got far enough to read either (e.g. cluster 0x33 unreadable).
-> Unknown participants get a `label` from `aliases.toml`'s `[thread]` section
-> (see [Aliases](#aliases-aliasestoml-optional) above) instead of an `alias`,
+> the RLOC16 could be derived (reserved — unused by the current
+> implementation: RLOC16 derivation depends on the same ExtAddress
+> canonicalization `ext:` needs, so a canonicalization failure suppresses
+> both), and `node:<node_id>` for a fabric node whose probe never got far
+> enough to read either (e.g. cluster 0x33 unreadable). Unknown participants
+> get a `label` from `aliases.toml`'s `[thread]` section (see
+> [Aliases](#aliases-aliasestoml-optional) above) instead of an `alias`,
 > which is reserved for commissioned nodes' own node alias.
+>
+> A fabric node `mat` could not self-identify (probe failure, or cluster 0x33
+> unreadable) shows up only as a `node:<id>` graph node; the same physical
+> radio may *also* surface separately as an `ext:` unknown-participant node if
+> another probed node's neighbor/route table observed it. `mat` does not
+> correlate the two into a single entry today — merging them is future work.
 >
 > Like `diag node`, `diag mesh` is direct path only (native, not part of the
 > `matd` protocol) and always fixes on endpoint 0 (cluster 53 / 0x33 are

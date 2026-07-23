@@ -205,7 +205,9 @@ pub fn mesh(
         for &id in node_ids {
             store.require_node(id)?;
         }
-        node_ids.to_vec()
+        // id はグラフの安定キーなので重複指定（alias 経由の二重指定も含む）は
+        // 1 回の probe / グラフノードに畳む。
+        dedup_preserving_order(node_ids)
     };
     let book = mat_core::alias::AliasBook::load(store.root())?;
 
@@ -242,6 +244,18 @@ pub fn mesh(
         .map_err(|e| MatError::parse_error(format!("serialize mesh graph: {e}")))?;
     output::emit(body);
     Ok(())
+}
+
+/// 順序を保ったまま重複を除去する（`--nodes` の重複指定を 1 回の probe に
+/// 畳むため）。件数が小さい前提で `contains` の線形探索を使う。
+fn dedup_preserving_order(ids: &[u64]) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// 全ノード probe 失敗時のトップレベルエラー: 最頻の失敗 kind（同数タイは
@@ -346,5 +360,12 @@ mod tests {
     fn dominant_error_tie_is_first_seen() {
         let items = vec![item(1, ErrorKind::Timeout), item(2, ErrorKind::Unreachable)];
         assert_eq!(dominant_error(&items).kind, ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn dedup_preserving_order_removes_duplicates_keeping_first_seen_order() {
+        assert_eq!(dedup_preserving_order(&[7, 7, 3, 7, 5, 3]), vec![7, 3, 5]);
+        assert_eq!(dedup_preserving_order(&[]), Vec::<u64>::new());
+        assert_eq!(dedup_preserving_order(&[1, 2, 3]), vec![1, 2, 3]);
     }
 }
