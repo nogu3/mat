@@ -386,6 +386,106 @@ mat diag node --node 5 --deep     # also probe ping6 + native targeted mDNS
 > materials — so it is always available (the historical `cfid_unavailable` case,
 > from the old chip-tool-log-parsing path, cannot occur on the native path).
 
+`mat diag mesh` answers a third question: **what does the whole Thread mesh
+look like?** It probes each fabric node's Thread Network Diagnostics (cluster
+53) and NetworkInterfaces (cluster 0x33, for self-identification) in turn and
+assembles the results into one node/edge topology graph — neighbor and route
+table rows that name a participant `mat` never commissioned (an OTBR border
+router, a device on another fabric) become graph nodes too, so the mesh is
+visible even where the fabric does not reach.
+
+```bash
+# diag mesh [--nodes N|ALIAS ...]   (omit --nodes = every commissioned node)
+mat diag mesh
+mat diag mesh --nodes 5 16
+```
+
+```json
+// dummy values; ExtAddress / rloc16 are hex, ids are the graph's stable keys.
+{
+  "timestamp": "...",
+  "network": {
+    "name": "ha-thread-6562", "channel": 15,
+    "partition_ids": [597971536], "leader_router_id": 8
+  },
+  "nodes": [
+    { "id": "ext:0011223344556677", "ext_address": "0011223344556677",
+      "rloc16": "0x1400", "router_id": 5, "role": "router",
+      "node_id": 42, "alias": "hall_motion", "probed": true },
+    { "id": "ext:8899AABBCCDDEEFF", "ext_address": "8899AABBCCDDEEFF",
+      "rloc16": "0x0c01", "role": "child", "node_id": 5, "probed": true },
+    { "id": "ext:AABBCCDDEEFF0011", "ext_address": "AABBCCDDEEFF0011",
+      "rloc16": "0x2000", "router_id": 8, "role": "leader", "label": "otbr-br" }
+  ],
+  "edges": [
+    { "a": "ext:0011223344556677", "b": "ext:8899AABBCCDDEEFF",
+      "a_sees_b": { "lqi": 140, "avg_rssi": -60, "last_rssi": -58, "frame_error_rate": 2, "age": 12 },
+      "b_sees_a": { "lqi": 130, "avg_rssi": -65, "last_rssi": -64, "frame_error_rate": 5, "age": 8 } },
+    { "a": "ext:0011223344556677", "b": "ext:AABBCCDDEEFF0011",
+      "a_sees_b": { "lqi": 200, "avg_rssi": -50, "last_rssi": -49, "frame_error_rate": 0, "age": 3 },
+      "b_sees_a": null,
+      "route": { "lqi_in": 3, "lqi_out": 3, "path_cost": 1 } }
+  ]
+}
+```
+
+> `--nodes` takes node_ids or `aliases.toml` node aliases, one or more,
+> deduped preserving first-seen order (`--nodes 7 7`, or the same node given
+> twice via alias + id, probes it once and emits one graph node — `id` is the
+> graph's stable key, so a duplicate target would otherwise duplicate the
+> node); omitted, it means every commissioned node in the store. A node with 0
+> targets (empty store) is not an error — it returns an empty graph
+> (`"nodes":[]`, `"edges":[]`) plus a `network` object (all fields absent
+> except an empty `partition_ids`) and a `timestamp`, without touching the
+> backend.
+>
+> A node's stable `id` is `ext:<HEX16>` when its ExtAddress is known (either
+> self-identified via cluster 0x33, for fabric nodes, or observed in a
+> neighbor/route table row, for unknown participants), `rloc:<hex>` when only
+> the RLOC16 could be derived (reserved — unused by the current
+> implementation: RLOC16 derivation depends on the same ExtAddress
+> canonicalization `ext:` needs, so a canonicalization failure suppresses
+> both), and `node:<node_id>` for a fabric node whose probe never got far
+> enough to read either (e.g. cluster 0x33 unreadable). Unknown participants
+> get a `label` from `aliases.toml`'s `[thread]` section (see
+> [Aliases](#aliases-aliasestoml-optional) above) instead of an `alias`,
+> which is reserved for commissioned nodes' own node alias.
+>
+> A fabric node `mat` could not self-identify (probe failure, cluster 0x33
+> unreadable, or a duplicate self-ext claim invalidated below) shows up as a
+> `node:<id>` graph node — and still contributes its own viewpoint edges,
+> anchored at `node:<id>` rather than an `ext:` vertex, from its own
+> neighbor/route table rows. The same physical radio may *also* surface
+> separately as an `ext:` unknown-participant node if another probed node's
+> neighbor/route table observed it. `mat` does not correlate the two into a
+> single entry today — merging them is future work.
+>
+> Real-device finding (2026-07-23): some Thread devices (ESP32-based tape
+> lights) report an identical, firmware-hardcoded HardwareAddress on cluster
+> 0x33 across every unit (with an empty IPv6Addresses list). Since that ext
+> claim is physically impossible once two or more fabric nodes make it, `mat`
+> invalidates the self-identification of *all* nodes that claimed the same
+> ext — they fall back to `node:<id>` (see above) rather than merging into one
+> bogus graph vertex. Separately, some devices encode `mesh-local-prefix` as a
+> length-prefixed octstr (`0x40` = 64-bit length byte + 8-byte prefix, 18 hex
+> chars) rather than the bare 8-byte form (16 hex chars); `mat` normalizes both
+> to the 16-hex form before deriving RLOC16. A route-table row with
+> `ExtAddress: 0` is treated as garbage and ignored (no node, no edge).
+>
+> Like `diag node`, `diag mesh` is direct path only (native, not part of the
+> `matd` protocol) and always fixes on endpoint 0 (cluster 53 / 0x33 are
+> normally endpoint 0). Collection is **sequential**, one CASE session per
+> node, so wall-clock time scales with node count — a handful of seconds per
+> node, so an 8-node mesh takes on the order of tens of seconds.
+>
+> A single node's probe failure does not fail the whole command: it shows up
+> as `"probed":false` plus a `probe_error` (`{"kind":...,"detail":...}`) on
+> that node, and the command still exits `0` with the partial graph — same
+> philosophy as `diag thread`'s per-attribute `unavailable`. Only when *every*
+> targeted node's probe fails does `diag mesh` exit non-zero, mapped from the
+> most common failure `kind` across nodes (e.g. all nodes `unreachable` exits
+> `5`; a tie is broken by first-seen kind).
+
 ### Listen (device-originated events)
 
 `mat listen` streams attribute-change events from `matd`'s resident wildcard
@@ -811,9 +911,10 @@ life of the process.
 #### Ops that never route through `matd`
 
 `discover`, `commission`, `fabric init`, `open-window`, `diag thread` / `diag
-node`, and `group grant` are not part of the `matd` socket protocol at all (by
-design — rare, or no warm session to reuse). They always run on `mat`'s own
-one-shot direct path (native), even when a `matd` is running. `discover --probe`
+node` / `diag mesh`, and `group grant` are not part of the `matd` socket
+protocol at all (by design — rare, or no warm session to reuse). They always
+run on `mat`'s own one-shot direct path (native), even when a `matd` is
+running. `discover --probe`
 and `diag node --deep` do a native **targeted** mDNS resolve per ledger node
 (run concurrently), not a service-type enumeration: real Thread meshes have
 advertising proxies that answer direct instance queries but omit instances from
@@ -864,11 +965,14 @@ pir = 3
 [colors]
 warm = "#ff8c00"
 mypink = "255,182,193"
+
+[thread]
+"AABBCCDDEEFF0011" = "otbr-br"
 ```
 
 - `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
   describe / on / off / color-temp / color / level / open-window / diag thread / diag node) and
-  by `--nodes` in `group provision` (each element resolved independently).
+  by `--nodes` in `group provision` / `diag mesh` (each element resolved independently).
 - `groups`: alias → GroupId. Accepted by `-g/--group` in every `group`
   subcommand (`provision` / `invoke` / `grant` / `color-temp` / `color` / `level`).
 - `endpoints`: defined **per node** — the outer key is a node alias or a
@@ -886,6 +990,13 @@ mypink = "255,182,193"
   file the built-in table still works. A value that does not parse as RGB is
   `store_parse` (exit `10`); an unknown color name is a CLI argument error
   (exit `2`) listing the known names.
+- `thread`: Thread ExtAddress (16 hex, case-insensitive) → display label, used
+  by `mat diag mesh` to name unknown participants (OTBR border routers, other-
+  fabric devices) that show up in a neighbor/route table but were never
+  commissioned onto this fabric, so they have no `nodes` alias to fall back
+  on. The graph's `label` field matches on ExtAddress regardless of fabric
+  status, so a commissioned node whose ExtAddress happens to be listed here
+  gets a `label` too, alongside its `nodes` `alias`.
 
 ```bash
 # With the aliases.toml above, these are equivalent:

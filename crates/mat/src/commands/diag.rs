@@ -189,6 +189,115 @@ fn deep_probes(
     }
 }
 
+/// `mat diag mesh` — メッシュ全体のトポロジーを 1 JSON で返す。
+/// `node_ids` 空 = store の全 commission 済みノード。probe の部分失敗は
+/// JSON 内（`probed:false` + `probe_error`）に畳み、全滅時のみ最頻 kind を
+/// トップレベルエラーへ写像する。
+pub fn mesh(
+    store_path: &Path,
+    node_ids: &[u64],
+    native: Option<&crate::native_direct::Config<'_>>,
+) -> Result<(), MatError> {
+    let store = Store::open(store_path)?;
+    let targets: Vec<u64> = if node_ids.is_empty() {
+        store.nodes().map(|r| r.node_id).collect()
+    } else {
+        for &id in node_ids {
+            store.require_node(id)?;
+        }
+        // id はグラフの安定キーなので重複指定（alias 経由の二重指定も含む）は
+        // 1 回の probe / グラフノードに畳む。
+        dedup_preserving_order(node_ids)
+    };
+    let book = mat_core::alias::AliasBook::load(store.root())?;
+
+    // 対象 0 = 空グラフで正常終了（バックエンド未接触）。
+    let items = if targets.is_empty() {
+        Vec::new()
+    } else {
+        let cfg = native.ok_or_else(|| {
+            MatError::new(
+                ErrorKind::Other,
+                "diag mesh: native backend not configured (internal)",
+            )
+        })?;
+        crate::native_direct::diag_mesh_probe(cfg, store.root(), &targets)?
+    };
+
+    if !items.is_empty() && items.iter().all(|i| i.result.is_err()) {
+        return Err(dominant_error(&items));
+    }
+
+    let inputs: Vec<mat_core::mesh::NodeInput> = items
+        .into_iter()
+        .map(|i| mat_core::mesh::NodeInput {
+            node_id: i.node_id,
+            alias: book.node_alias_of(i.node_id).map(str::to_string),
+            probe: i.result.map_err(|e| mat_core::mesh::ProbeFailure {
+                kind: e.kind,
+                detail: e.detail,
+            }),
+        })
+        .collect();
+    let graph = mat_core::mesh::build_graph(&inputs, &book.thread_labels());
+    let body = serde_json::to_value(&graph)
+        .map_err(|e| MatError::parse_error(format!("serialize mesh graph: {e}")))?;
+    output::emit(body);
+    Ok(())
+}
+
+/// 順序を保ったまま重複を除去する（`--nodes` の重複指定を 1 回の probe に
+/// 畳むため）。件数が小さい前提で `contains` の線形探索を使う。
+fn dedup_preserving_order(ids: &[u64]) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// 全ノード probe 失敗時のトップレベルエラー: 最頻の失敗 kind（同数タイは
+/// 先勝ち）+ per-node detail の列挙。
+fn dominant_error(items: &[crate::native_direct::MeshProbeItem]) -> MatError {
+    let mut counts: Vec<(ErrorKind, usize)> = Vec::new();
+    for it in items {
+        if let Err(e) = &it.result {
+            match counts.iter_mut().find(|(k, _)| *k == e.kind) {
+                Some((_, c)) => *c += 1,
+                None => counts.push((e.kind, 1)),
+            }
+        }
+    }
+    // 先勝ちタイ: 厳密により大きい時だけ更新。
+    let mut best = ErrorKind::Other;
+    let mut best_n = 0usize;
+    for (k, n) in counts {
+        if n > best_n {
+            best = k;
+            best_n = n;
+        }
+    }
+    let detail: Vec<String> = items
+        .iter()
+        .filter_map(|it| {
+            it.result
+                .as_ref()
+                .err()
+                .map(|e| format!("node {}: {}", it.node_id, e.detail))
+        })
+        .collect();
+    MatError::new(
+        best,
+        format!(
+            "all {} mesh probes failed: {}",
+            items.len(),
+            detail.join("; ")
+        ),
+    )
+}
+
 /// プローブエラーの kind を JSON 値に変換。
 /// バイナリが見つからない場合は `"tool_missing"`、その他はエラーの ErrorKind の snake_case。
 fn probe_error_kind(e: &MatError) -> Value {
@@ -220,4 +329,43 @@ fn probe_ping6(addr: &str) -> Result<mat_core::diag::Ping6Stats, MatError> {
     tracing::debug!(%text, "ping6 stdout");
     tracing::debug!(%stderr_text, "ping6 stderr");
     parse_ping6(&text).ok_or_else(|| MatError::parse_error("ping6 output unparseable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mat_core::error::{ErrorKind, MatError};
+
+    fn item(node_id: u64, kind: ErrorKind) -> crate::native_direct::MeshProbeItem {
+        crate::native_direct::MeshProbeItem {
+            node_id,
+            result: Err(MatError::new(kind, format!("node {node_id} failed"))),
+        }
+    }
+
+    #[test]
+    fn dominant_error_picks_most_frequent_kind() {
+        let items = vec![
+            item(1, ErrorKind::Timeout),
+            item(2, ErrorKind::Unreachable),
+            item(3, ErrorKind::Unreachable),
+        ];
+        let e = dominant_error(&items);
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert!(e.detail.contains("node 1"));
+        assert!(e.detail.contains("node 3"));
+    }
+
+    #[test]
+    fn dominant_error_tie_is_first_seen() {
+        let items = vec![item(1, ErrorKind::Timeout), item(2, ErrorKind::Unreachable)];
+        assert_eq!(dominant_error(&items).kind, ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn dedup_preserving_order_removes_duplicates_keeping_first_seen_order() {
+        assert_eq!(dedup_preserving_order(&[7, 7, 3, 7, 5, 3]), vec![7, 3, 5]);
+        assert_eq!(dedup_preserving_order(&[]), Vec::<u64>::new());
+        assert_eq!(dedup_preserving_order(&[1, 2, 3]), vec![1, 2, 3]);
+    }
 }

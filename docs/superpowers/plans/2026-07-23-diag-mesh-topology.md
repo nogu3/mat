@@ -49,7 +49,7 @@ fn thread_section_parses_and_normalizes_keys() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("aliases.toml"),
-        "[nodes]\nstudy_motion = 16\n\n[thread]\n\"aabbccddeeff0011\" = \"otbr-br\"\n",
+        "[nodes]\nhall_motion = 42\n\n[thread]\n\"aabbccddeeff0011\" = \"otbr-br\"\n",
     )
     .unwrap();
     let book = AliasBook::load(dir.path()).unwrap();
@@ -74,11 +74,11 @@ fn node_alias_reverse_lookup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("aliases.toml"),
-        "[nodes]\nstudy_motion = 16\nbed_light = 5\n",
+        "[nodes]\nhall_motion = 42\nporch_light = 7\n",
     )
     .unwrap();
     let book = AliasBook::load(dir.path()).unwrap();
-    assert_eq!(book.node_alias_of(16), Some("study_motion"));
+    assert_eq!(book.node_alias_of(42), Some("hall_motion"));
     assert_eq!(book.node_alias_of(99), None);
 }
 
@@ -423,11 +423,11 @@ git commit -m "feat(mat-core): mesh モジュール — 自己同定・role・ID
 
     #[test]
     fn build_graph_two_fabric_nodes_and_unknown_br() {
-        // node16 (ext 0011..., rloc 0x1400) が node5 (ext 8899..., rloc 0x0c01=child)
+        // node42 (ext 0011..., rloc 0x1400) が node7 (ext 8899..., rloc 0x0c01=child)
         // と BR (ext AABB..., rloc 0x2000, route-table 経由) を見る。
         let n16 = fabric_input(
-            16,
-            Some("study_motion"),
+            42,
+            Some("hall_motion"),
             "0011223344556677",
             "fd00112233445566000000fffe001400",
             vec![
@@ -453,7 +453,7 @@ git commit -m "feat(mat-core): mesh モジュール — 自己同定・role・ID
             ],
         );
         let n5 = fabric_input(
-            5,
+            7,
             None,
             "8899AABBCCDDEEFF",
             "fd00112233445566000000fffe000c01",
@@ -480,12 +480,12 @@ git commit -m "feat(mat-core): mesh モジュール — 自己同定・role・ID
 
         // ノード: fabric 2 + unknown BR 1
         assert_eq!(g.nodes.len(), 3);
-        let n16o = g.nodes.iter().find(|n| n.node_id == Some(16)).unwrap();
+        let n16o = g.nodes.iter().find(|n| n.node_id == Some(42)).unwrap();
         assert_eq!(n16o.id, "ext:0011223344556677");
         assert_eq!(n16o.rloc16.as_deref(), Some("0x1400"));
         assert_eq!(n16o.router_id, Some(5));
         assert_eq!(n16o.role, "router");
-        assert_eq!(n16o.alias.as_deref(), Some("study_motion"));
+        assert_eq!(n16o.alias.as_deref(), Some("hall_motion"));
         assert_eq!(n16o.probed, Some(true));
         let br = g.nodes.iter().find(|n| n.node_id.is_none()).unwrap();
         assert_eq!(br.id, "ext:AABBCCDDEEFF0011");
@@ -1643,7 +1643,7 @@ git commit -m "feat(mat): diag mesh 統合テスト + README/スペック追記�
   - 全 commission 済みノードが `nodes` に載る（probe 失敗ノードも `probed:false` で残る）
   - OTBR BR（jarvis 自身の wpan0）が unknown ノードとしてグラフに現れる
   - 既知の弱リンク/強リンク（静的 HTML 版の手集計）とエッジ実測が整合する
-  - SED（study_motion 等）が親ルータにぶら下がる形で出る
+  - SED（人感センサー等）が親ルータにぶら下がる形で出る
   - `aliases.toml` に `[thread]` で BR の ExtAddress を登録するとラベルが付く
   - partition_ids が単一（分断なし）
 - [ ] **Step 5:** 結果をユーザーへ報告し、マージ判断を仰ぐ（finishing-a-development-branch）

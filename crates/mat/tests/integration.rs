@@ -321,6 +321,55 @@ fn diag_node_unknown_node_exits_11() {
         .stderr(predicate::str::contains("node_not_commissioned"));
 }
 
+// ── diag mesh ────────────────────────────────────────────────────────────
+
+#[test]
+fn diag_mesh_missing_store_exits_10() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("no-store");
+    mat(&missing)
+        .args(["diag", "mesh"])
+        .assert()
+        .failure()
+        .code(10)
+        .stderr(predicate::str::contains("store_missing"));
+}
+
+#[test]
+fn diag_mesh_empty_store_emits_empty_graph_exit_0() {
+    // store は存在するが commission 済みノード 0 → バックエンド未接触で
+    // 空グラフ + timestamp を返す。
+    let dir = TempDir::new().unwrap();
+    mat(dir.path())
+        .args(["diag", "mesh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"nodes\":[]"))
+        .stdout(predicate::str::contains("\"edges\":[]"))
+        .stdout(predicate::str::contains("timestamp"));
+}
+
+#[test]
+fn diag_mesh_unknown_node_exits_11() {
+    let dir = store_with_node5();
+    mat(dir.path())
+        .args(["diag", "mesh", "--nodes", "99"])
+        .assert()
+        .failure()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn diag_mesh_unknown_alias_exits_2() {
+    let dir = store_with_node5();
+    mat(dir.path())
+        .args(["diag", "mesh", "--nodes", "no_such_alias"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
 #[test]
 fn group_provision_unknown_node_exits_11() {
     let store = store_with_node5();
