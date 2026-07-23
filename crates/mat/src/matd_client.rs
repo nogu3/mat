@@ -98,9 +98,17 @@ fn is_falsy(v: &OsStr) -> bool {
 pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let op = match to_op(command) {
         Ok(op) => op,
-        Err(detail) => {
+        // 非対応 op は CLI 利用誤り。kind=other(exit_code()=1) だが exit 2 を
+        // 返すのは「2 = CLI 引数エラー」の documented シグナルを保つ意図的な
+        // 例外（spec B 節、テストでピン留め）。
+        Err(ToOpError::Unsupported(detail)) => {
             emit_error(ErrorKind::Other, &detail);
             return ExitCode::from(2);
+        }
+        // alias / color spec 解決失敗など実エラーは固有 kind / exit を返す。
+        Err(ToOpError::Mat(e)) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
         }
     };
 
@@ -130,7 +138,16 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
 /// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
 pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode> {
     // matd 非対応 op（discover / commission / open-window / diag）は probe せず直経路。
-    let op = to_op(command).ok()?;
+    let op = match to_op(command) {
+        Ok(op) => op,
+        Err(ToOpError::Unsupported(_)) => return None,
+        // 実エラーは直経路でも同じ解決関数が同じエラーで失敗する（決定的）。
+        // ここで emit して解決 2 回を 1 回に短縮（stderr / exit は直経路と同一）。
+        Err(ToOpError::Mat(e)) => {
+            e.emit();
+            return Some(ExitCode::from(e.kind.exit_code()));
+        }
+    };
 
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
@@ -153,8 +170,27 @@ pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode>
     })
 }
 
-/// サブコマンドを matd の op JSON に変換する。matd 非対応のものは `Err`。
-fn to_op(command: &Command) -> Result<Value, String> {
+/// `to_op` のエラー。matd 非対応 op（CLI 利用誤り）と、alias / color spec
+/// 解決失敗など固有 kind を持つ実エラーを区別する（post-1.0 defer:
+/// kind=other / exit 2 不一致の解消）。
+#[derive(Debug)]
+enum ToOpError {
+    /// matd 非対応サブコマンド。forced では kind=other + exit 2 の意図的例外。
+    Unsupported(String),
+    /// 固有 kind を持つ実エラー。forced では kind どおりの exit を返す。
+    Mat(MatError),
+}
+
+/// `id()?` / `resolve_spec(...)?` を to_op 内でそのまま流すための変換。
+impl From<MatError> for ToOpError {
+    fn from(e: MatError) -> Self {
+        ToOpError::Mat(e)
+    }
+}
+
+/// サブコマンドを matd の op JSON に変換する。matd 非対応のものは
+/// `Unsupported`、alias / color spec 解決失敗は固有 kind を保った `Mat`。
+fn to_op(command: &Command) -> Result<Value, ToOpError> {
     let op = match command {
         Command::Read {
             node_id,
@@ -234,8 +270,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                 spec.rgb.as_deref(),
                 spec.hue,
                 spec.sat,
-            )
-            .map_err(|e| e.detail)?;
+            )?;
             let mut op = json!({
                 "op": "color", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
@@ -327,8 +362,7 @@ fn to_op(command: &Command) -> Result<Value, String> {
                     spec.rgb.as_deref(),
                     spec.hue,
                     spec.sat,
-                )
-                .map_err(|e| e.detail)?;
+                )?;
                 let mut op = json!({
                     "op": "group_color", "group_id": group_id.id()?,
                     "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
@@ -363,8 +397,10 @@ fn to_op(command: &Command) -> Result<Value, String> {
     Ok(op)
 }
 
-fn unsupported(name: &str) -> String {
-    format!("`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)")
+fn unsupported(name: &str) -> ToOpError {
+    ToOpError::Unsupported(format!(
+        "`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)"
+    ))
 }
 
 /// 候補 socket へ順に connect し、最初に成功した stream と使用パスを返す。
@@ -485,7 +521,12 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
         timeout_ms,
     } = command
     else {
-        unreachable!("dispatch_listen called with non-Listen command");
+        // 内部バグ経路: 非 Listen command が来ても panic しない（v1 Task6 規律）。
+        let e = MatError::parse_error(
+            "internal: dispatch_listen called with non-Listen command (dispatch invariant violated)",
+        );
+        e.emit();
+        return ExitCode::from(e.kind.exit_code());
     };
     // 未解決 alias が届いた場合（内部バグ）は typed error を emit して抜ける
     // （他の経路と同じ MatError::emit + exit_code パターン、panic しない）。
@@ -944,6 +985,29 @@ mod tests {
             thread_dataset: None,
         })
         .is_err());
+    }
+
+    /// post-1.0 defer: to_op のエラー 2 種の分離をピン留め。
+    /// - 非対応 op = Unsupported → forced dispatch は kind=other + exit 2 の
+    ///   意図的例外（「2 = CLI 引数エラー」の documented シグナル維持）。
+    /// - alias 解決失敗 = Mat → 固有 kind / exit（ここでは Other = exit 1）。
+    #[test]
+    fn to_op_separates_unsupported_from_real_errors() {
+        match to_op(&Command::Discover { probe: false }) {
+            Err(ToOpError::Unsupported(msg)) => assert!(msg.contains("discover")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        let cmd = Command::On {
+            node_id: NodeRef::Alias("kitchen".into()),
+            endpoint: EndpointRef::Id(1),
+        };
+        match to_op(&cmd) {
+            Err(ToOpError::Mat(e)) => {
+                assert_eq!(e.kind, ErrorKind::Other);
+                assert!(e.detail.contains("kitchen"), "detail={}", e.detail);
+            }
+            other => panic!("expected Mat, got {other:?}"),
+        }
     }
 
     /// v1 品質修正 3: matd 経路の途中失敗が一律 `other` だったのを分離。
