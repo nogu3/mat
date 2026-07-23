@@ -18,7 +18,7 @@ use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Command, DiagCommand, FabricAction};
-use mat_core::error::ErrorKind;
+use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
 fn main() -> ExitCode {
@@ -177,9 +177,10 @@ fn main() -> ExitCode {
         }),
         // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
         // Command::Fabric は route dispatch より前の早期 return で処理済み。
-        _ => {
-            unreachable!("native_direct::run handles all ops except discover/commission/diag-node")
-        }
+        // 不変条件が破れても panic せず typed error（v1 Task6 と同じ規律）。
+        _ => Err(MatError::parse_error(
+            "internal: op not handled by native_direct::run (route dispatch invariant violated)",
+        )),
     };
 
     match result {

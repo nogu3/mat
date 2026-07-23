@@ -129,15 +129,6 @@ impl std::fmt::Display for MatError {
 
 impl std::error::Error for MatError {}
 
-/// `Result<_, String>` の関数内で `MatError` を `?` で流すための縮退変換
-/// （matd_client::to_op が使う）。kind は落ち detail のみ残る — 内部バグ経路
-/// 専用で、通常経路では発生しない。
-impl From<MatError> for String {
-    fn from(e: MatError) -> Self {
-        e.detail
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
