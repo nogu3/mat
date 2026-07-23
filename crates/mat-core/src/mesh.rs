@@ -24,7 +24,8 @@ pub struct ProbeData {
     /// `routing_role` / `partition_id` / `leader_router_id` /
     /// `mesh_local_prefix` / `network_name` / `channel`）。
     pub thread: Map<String, Value>,
-    /// cluster 0x33 由来の自己同定（読めなければ None — エッジは他ノード視点のみ）。
+    /// cluster 0x33 由来の自己同定（読めなければ None — 自視点エッジは
+    /// `node:<node_id>` を頂点として張られる）。
     pub identity: Option<Identity>,
 }
 
@@ -54,17 +55,28 @@ pub fn canon_ext_hex(s: &str) -> Option<String> {
     (s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_uppercase())
 }
 
-/// mesh-local-prefix（hex、先頭 8B を prefix とみなす）と IPv6 一覧から自 RLOC16 を
-/// 導出。RLOC = `<prefix 8B> 00 00 00 ff fe 00 <rloc16 2B>`。
-pub fn derive_rloc16(mesh_local_prefix_hex: &str, ipv6_hex: &[String]) -> Option<u16> {
-    let p = mesh_local_prefix_hex.to_ascii_lowercase();
-    if p.len() < 16 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+/// mesh-local-prefix の hex を 8B prefix の 16 桁 hex（小文字）へ正規化。
+/// 実機観測: 8B 素形（16 桁）と長さ前置形（0x40=64bit 長 + 8B = 18 桁、NL68 系）の
+/// 両方が存在する。それ以外の形は None。
+fn canon_ml_prefix(hex: &str) -> Option<String> {
+    let h = hex.to_ascii_lowercase();
+    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let prefix = &p[..16];
+    match h.len() {
+        16 => Some(h),
+        18 if h.starts_with("40") => Some(h[2..].to_string()),
+        _ => None,
+    }
+}
+
+/// mesh-local-prefix（hex、8B 素形 or 長さ前置形。`canon_ml_prefix` で正規化）と
+/// IPv6 一覧から自 RLOC16 を導出。RLOC = `<prefix 8B> 00 00 00 ff fe 00 <rloc16 2B>`。
+pub fn derive_rloc16(mesh_local_prefix_hex: &str, ipv6_hex: &[String]) -> Option<u16> {
+    let prefix = canon_ml_prefix(mesh_local_prefix_hex)?;
     for a in ipv6_hex {
         let a = a.to_ascii_lowercase();
-        if a.len() == 32 && a.starts_with(prefix) && &a[16..28] == "000000fffe00" {
+        if a.len() == 32 && a.starts_with(&prefix) && &a[16..28] == "000000fffe00" {
             return u16::from_str_radix(&a[28..32], 16).ok();
         }
     }
@@ -196,6 +208,14 @@ fn ordered(x: String, y: String) -> (String, String) {
     }
 }
 
+/// fabric ノードのグラフ頂点 id。自己同定できれば ext:、できなければ node:。
+fn fabric_vertex_id(node_id: u64, self_ext: &BTreeMap<u64, String>) -> String {
+    match self_ext.get(&node_id) {
+        Some(e) => format!("ext:{e}"),
+        None => format!("node:{node_id}"),
+    }
+}
+
 /// テーブル観測から集めた未知参加者の証拠。
 #[derive(Default)]
 struct Part {
@@ -209,9 +229,11 @@ struct Part {
 /// per-node 収集結果からグラフを組み立てる（純関数）。
 ///
 /// - 参加者は ExtAddress（正準 16 桁大文字 hex）キーで台帳化。fabric ノードの
-///   自己同定（identity）とテーブル行の両方から集める。
-/// - エッジは無向 1 本に双方向実測を併記。自己同定できないノードの行は
-///   張れない（他ノード視点のみ成立）。
+///   自己同定（identity）とテーブル行の両方から集める。同一 ext を複数 fabric
+///   ノードが自己同定した場合（実機 NL68 系 FW バグ）は物理的にあり得ない
+///   衝突として全員無効化する。
+/// - エッジは無向 1 本に双方向実測を併記。自視点は自己同定できれば `ext:`、
+///   できなければ `node:<node_id>` を頂点として張る（同定不能でも観測は有効）。
 pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String>) -> MeshGraph {
     // 1. network サマリ（最初に読めた値を採用）+ mesh-local-prefix。
     let mut name = None;
@@ -238,7 +260,7 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             ml_prefix = f
                 .get("mesh_local_prefix")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .and_then(canon_ml_prefix);
         }
         if let Some(pid) = f.get("partition_id").and_then(Value::as_u64) {
             if !partition_ids.contains(&pid) {
@@ -258,10 +280,43 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             continue;
         };
         self_ext.insert(inp.node_id, ext);
-        if let Some(pref) = &ml_prefix {
+        // 自ノードの mesh_local_prefix を優先し、無ければ network サマリの
+        // フォールバックを使う（両方 canon_ml_prefix 経由で正規化済み）。
+        let prefix = p
+            .thread
+            .get("mesh_local_prefix")
+            .and_then(Value::as_str)
+            .and_then(canon_ml_prefix)
+            .or_else(|| ml_prefix.clone());
+        if let Some(pref) = &prefix {
             if let Some(r) = derive_rloc16(pref, &id.ipv6) {
                 self_rloc.insert(inp.node_id, r);
             }
+        }
+    }
+
+    // 実機 NL68 系で全台同一の工場 MAC（HardwareAddress）を申告する FW バグを
+    // 観測: 同一 ext を 2 台以上の fabric ノードが自己同定した場合、物理的に
+    // あり得ない衝突なので該当ノード全員の self_ext / self_rloc を無効化する
+    // （どちらの申告も信用できないため、片方だけ残す判断はしない）。
+    let mut claim_counts: BTreeMap<&str, u32> = BTreeMap::new();
+    for ext in self_ext.values() {
+        *claim_counts.entry(ext.as_str()).or_insert(0) += 1;
+    }
+    let dup_exts: std::collections::BTreeSet<String> = claim_counts
+        .into_iter()
+        .filter(|(_, c)| *c >= 2)
+        .map(|(e, _)| e.to_string())
+        .collect();
+    if !dup_exts.is_empty() {
+        let dup_nodes: Vec<u64> = self_ext
+            .iter()
+            .filter(|(_, e)| dup_exts.contains(e.as_str()))
+            .map(|(n, _)| *n)
+            .collect();
+        for n in dup_nodes {
+            self_ext.remove(&n);
+            self_rloc.remove(&n);
         }
     }
 
@@ -270,9 +325,11 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
     for inp in inputs {
         let Ok(p) = &inp.probe else { continue };
         for row in table_rows(&p.thread, "neighbor_table") {
+            // 実機で ExtAddress=0 のゴミ行を観測することがあるため除外。
             let Some(ext) = row
                 .get("ExtAddress")
                 .and_then(Value::as_u64)
+                .filter(|v| *v != 0)
                 .map(ext_hex_from_u64)
             else {
                 continue;
@@ -292,9 +349,11 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             }
         }
         for row in table_rows(&p.thread, "route_table") {
+            // 実機で ExtAddress=0 のゴミ route 行を観測することがあるため除外。
             let Some(ext) = row
                 .get("ExtAddress")
                 .and_then(Value::as_u64)
+                .filter(|v| *v != 0)
                 .map(ext_hex_from_u64)
             else {
                 continue;
@@ -324,22 +383,29 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
     let mut edges: BTreeMap<(String, String), EdgeAcc> = BTreeMap::new();
     for inp in inputs {
         let Ok(p) = &inp.probe else { continue };
-        let Some(my_ext) = self_ext.get(&inp.node_id) else {
-            continue;
-        };
+        // 自己同定できていれば ext:、できなくても node:<id> で自視点のエッジを張る
+        // （2026-07-23 実機 E2E 対応: 以前は自己同定不能ノードはエッジを持てな
+        // かったが、テーブル行自体は有効な観測なので node: 頂点に付け替える）。
+        let my_id = fabric_vertex_id(inp.node_id, &self_ext);
+        let my_ext = self_ext.get(&inp.node_id);
         for row in table_rows(&p.thread, "neighbor_table") {
-            let Some(other) = row
+            // 実機で ExtAddress=0 のゴミ行を観測することがあるため除外。
+            let Some(other_ext) = row
                 .get("ExtAddress")
                 .and_then(Value::as_u64)
+                .filter(|v| *v != 0)
                 .map(ext_hex_from_u64)
             else {
                 continue;
             };
-            if other == *my_ext {
+            // 自己同定済みなら自分自身を指す行を弾く（同定不能時は自己参照を
+            // 判定できないが、行は常に ext ベースなので自己ループは生じない）。
+            if my_ext == Some(&other_ext) {
                 continue;
             }
-            let key = ordered(my_ext.clone(), other);
-            let mine_is_a = key.0 == *my_ext;
+            let other_id = format!("ext:{other_ext}");
+            let key = ordered(my_id.clone(), other_id);
+            let mine_is_a = key.0 == my_id;
             let acc = edges.entry(key).or_default();
             let m = link_metrics(row);
             if mine_is_a {
@@ -352,18 +418,21 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             if row.get("LinkEstablished").and_then(Value::as_bool) != Some(true) {
                 continue;
             }
-            let Some(other) = row
+            // 実機で ExtAddress=0 のゴミ route 行を観測することがあるため除外。
+            let Some(other_ext) = row
                 .get("ExtAddress")
                 .and_then(Value::as_u64)
+                .filter(|v| *v != 0)
                 .map(ext_hex_from_u64)
             else {
                 continue;
             };
-            if other == *my_ext {
+            if my_ext == Some(&other_ext) {
                 continue;
             }
-            let key = ordered(my_ext.clone(), other);
-            let mine_is_a = key.0 == *my_ext;
+            let other_id = format!("ext:{other_ext}");
+            let key = ordered(my_id.clone(), other_id);
+            let mine_is_a = key.0 == my_id;
             let acc = edges.entry(key).or_default();
             let r = RouteMetrics {
                 lqi_in: row.get("LQIIn").and_then(Value::as_u64),
@@ -400,10 +469,15 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
                 .unwrap_or("unknown"),
             Err(_) => "unknown",
         };
-        let id = match (&ext, rloc16) {
-            (Some(e), _) => format!("ext:{e}"),
-            (None, Some(r)) => format!("rloc:{}", rloc16_str(r)),
-            (None, None) => format!("node:{}", inp.node_id),
+        let id = if ext.is_some() {
+            fabric_vertex_id(inp.node_id, &self_ext)
+        } else {
+            match rloc16 {
+                // 予約 — 現実装では未到達（rloc16 導出は self_ext 正準化の成功に
+                // 依存するため、ext が None ならここも常に None）。
+                Some(r) => format!("rloc:{}", rloc16_str(r)),
+                None => format!("node:{}", inp.node_id),
+            }
         };
         nodes.push(MeshNode {
             id,
@@ -463,12 +537,13 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
         });
     }
 
-    // 6. エッジ出力（キー昇順、route は a 視点優先）。
+    // 6. エッジ出力（キー昇順、route は a 視点優先）。キーは既に完全な id
+    // 文字列（`ext:…` / `node:…`）なので再プレフィックスしない。
     let edges = edges
         .into_iter()
         .map(|((a, b), acc)| MeshEdge {
-            a: format!("ext:{a}"),
-            b: format!("ext:{b}"),
+            a,
+            b,
             a_sees_b: acc.a_sees_b,
             b_sees_a: acc.b_sees_a,
             route: acc.route_a.or(acc.route_b),
@@ -538,10 +613,53 @@ mod tests {
     }
 
     #[test]
-    fn derive_rloc16_tolerates_long_prefix_encoding() {
-        // 一部デバイスが prefix を長い octstr で返しても先頭 8B を prefix とみなす
+    fn derive_rloc16_rejects_18_hex_not_length_prefixed() {
+        // 18 桁 hex でも先頭が "40"（長さ前置バイト）でなければ不正形として None。
         let addrs = vec!["fd00112233445566000000fffe002c00".to_string()];
-        assert_eq!(derive_rloc16("fd0011223344556600", &addrs), Some(0x2c00));
+        assert_eq!(derive_rloc16("fd0011223344556600", &addrs), None);
+    }
+
+    #[test]
+    fn derive_rloc16_tolerates_length_prefixed_encoding() {
+        // 実機観測: 一部デバイスが mesh-local-prefix を「長さ前置 octstr」
+        // （0x40 = 64bit 長 + 8B prefix = 18 桁 hex、NL68 系）で返す。
+        let addrs = vec!["fd00112233445566000000fffe002c00".to_string()];
+        assert_eq!(derive_rloc16("40fd00112233445566", &addrs), Some(0x2c00));
+    }
+
+    #[test]
+    fn canon_ml_prefix_16_hex_passthrough_lowercased() {
+        assert_eq!(
+            canon_ml_prefix("FD00112233445566").as_deref(),
+            Some("fd00112233445566")
+        );
+        assert_eq!(
+            canon_ml_prefix("fd00112233445566").as_deref(),
+            Some("fd00112233445566")
+        );
+    }
+
+    #[test]
+    fn canon_ml_prefix_18_hex_length_prefixed_strips_to_trailing_16() {
+        assert_eq!(
+            canon_ml_prefix("40fd00112233445566").as_deref(),
+            Some("fd00112233445566")
+        );
+        // 大文字混在でも同様。
+        assert_eq!(
+            canon_ml_prefix("40FD00112233445566").as_deref(),
+            Some("fd00112233445566")
+        );
+    }
+
+    #[test]
+    fn canon_ml_prefix_18_hex_not_starting_40_is_none() {
+        assert_eq!(canon_ml_prefix("fd0011223344556600"), None);
+    }
+
+    #[test]
+    fn canon_ml_prefix_non_hex_is_none() {
+        assert_eq!(canon_ml_prefix("zzfd00112233445566"), None);
     }
 
     #[test]
@@ -751,5 +869,129 @@ mod tests {
         assert_eq!(sed.role, "sed");
         assert_eq!(sed.rloc16.as_deref(), Some("0x1401"));
         assert_eq!(sed.router_id, None);
+    }
+
+    /// 実機 NL68 系: 工場出荷 FW バグで全台が同一の HardwareAddress（ext）を
+    /// cluster 0x33 で申告する（IPv6Addresses は空）。両者の self-ext は
+    /// 物理的にあり得ない衝突として無効化され、各々 `node:<id>` として自視点
+    /// エッジを持つ。
+    fn dup_claim_input(node_id: u64, dup_ext: &str, real_neighbor_ext: u64) -> NodeInput {
+        let mut thread = Map::new();
+        thread.insert("network_name".into(), json!("TestNet"));
+        thread.insert("channel".into(), json!(25));
+        thread.insert("routing_role".into(), json!(5));
+        thread.insert(
+            "neighbor_table".into(),
+            json!([
+                {"ExtAddress": real_neighbor_ext, "Rloc16": 0x2000, "Lqi": 150,
+                 "AverageRssi": -55, "LastRssi": -54, "FrameErrorRate": 1, "Age": 5,
+                 "RxOnWhenIdle": true, "IsChild": false}
+            ]),
+        );
+        thread.insert("route_table".into(), json!([]));
+        NodeInput {
+            node_id,
+            alias: None,
+            probe: Ok(ProbeData {
+                thread,
+                identity: Some(Identity {
+                    ext_address: dup_ext.to_string(),
+                    ipv6: vec![],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn duplicate_self_ext_claims_are_invalidated() {
+        let n42 = dup_claim_input(42, "4CFA012000FC0115", 0xAAAAAAAAAAAAAAAAu64);
+        let n7 = dup_claim_input(7, "4cfa012000fc0115", 0xBBBBBBBBBBBBBBBBu64);
+        let g = build_graph(&[n42, n7], &BTreeMap::new());
+
+        // 重複申告された ext:4CFA012000FC0115 の頂点は存在しない。
+        assert!(!g.nodes.iter().any(|n| n.id == "ext:4CFA012000FC0115"));
+
+        let node42 = g.nodes.iter().find(|n| n.node_id == Some(42)).unwrap();
+        assert_eq!(node42.id, "node:42");
+        assert!(node42.ext_address.is_none());
+        let node7 = g.nodes.iter().find(|n| n.node_id == Some(7)).unwrap();
+        assert_eq!(node7.id, "node:7");
+        assert!(node7.ext_address.is_none());
+
+        // それぞれ自視点で node:<id> → 実在ルータへのエッジが張られる。
+        let e42 = g
+            .edges
+            .iter()
+            .find(|e| e.a == "ext:AAAAAAAAAAAAAAAA" && e.b == "node:42")
+            .unwrap();
+        assert_eq!(e42.b_sees_a.as_ref().unwrap().lqi, Some(150));
+        assert!(e42.a_sees_b.is_none());
+        let e7 = g
+            .edges
+            .iter()
+            .find(|e| e.a == "ext:BBBBBBBBBBBBBBBB" && e.b == "node:7")
+            .unwrap();
+        assert_eq!(e7.b_sees_a.as_ref().unwrap().lqi, Some(150));
+        assert!(e7.a_sees_b.is_none());
+    }
+
+    #[test]
+    fn zero_ext_address_rows_are_ignored() {
+        let n1 = fabric_input(
+            1,
+            None,
+            "0011223344556677",
+            "fd00112233445566000000fffe001400",
+            vec![(
+                "route_table",
+                json!([
+                    {"ExtAddress": 0u64, "Rloc16": 0x2000, "RouterId": 8,
+                     "PathCost": 1, "LQIIn": 3, "LQIOut": 3, "Allocated": true,
+                     "LinkEstablished": true}
+                ]),
+            )],
+        );
+        let g = build_graph(&[n1], &BTreeMap::new());
+        // ExtAddress=0 のゴミ行はノードにもエッジにもならない。
+        assert!(g.edges.is_empty());
+        assert_eq!(g.nodes.len(), 1);
+        assert!(!g.nodes.iter().any(|n| n.id == "ext:0000000000000000"));
+    }
+
+    #[test]
+    fn identityless_probe_success_anchors_edges_at_node_id() {
+        // 2026-07-23 実機 E2E 対応の仕様変更: cluster 0x33 が読めず自己同定
+        // できなくても、cluster 53 のテーブル行自体は有効な観測なので
+        // `node:<id>` を自視点としてエッジを張る（以前は他ノード視点のみ）。
+        let mut thread = Map::new();
+        thread.insert("network_name".into(), json!("TestNet"));
+        thread.insert("channel".into(), json!(25));
+        thread.insert("routing_role".into(), json!(5));
+        thread.insert(
+            "neighbor_table".into(),
+            json!([
+                {"ExtAddress": 0xAABBCCDDEEFF0011u64, "Rloc16": 0x2000, "Lqi": 180,
+                 "AverageRssi": -52, "LastRssi": -50, "FrameErrorRate": 0, "Age": 4,
+                 "RxOnWhenIdle": true, "IsChild": false}
+            ]),
+        );
+        thread.insert("route_table".into(), json!([]));
+        let n = NodeInput {
+            node_id: 9,
+            alias: None,
+            probe: Ok(ProbeData {
+                thread,
+                identity: None,
+            }),
+        };
+        let g = build_graph(&[n], &BTreeMap::new());
+        let fabric_node = g.nodes.iter().find(|n| n.node_id == Some(9)).unwrap();
+        assert_eq!(fabric_node.id, "node:9");
+        assert_eq!(g.edges.len(), 1);
+        let e = &g.edges[0];
+        assert_eq!(e.a, "ext:AABBCCDDEEFF0011");
+        assert_eq!(e.b, "node:9");
+        assert_eq!(e.b_sees_a.as_ref().unwrap().lqi, Some(180));
+        assert!(e.a_sees_b.is_none());
     }
 }

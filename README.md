@@ -451,11 +451,26 @@ mat diag mesh --nodes 5 16
 > [Aliases](#aliases-aliasestoml-optional) above) instead of an `alias`,
 > which is reserved for commissioned nodes' own node alias.
 >
-> A fabric node `mat` could not self-identify (probe failure, or cluster 0x33
-> unreadable) shows up only as a `node:<id>` graph node; the same physical
-> radio may *also* surface separately as an `ext:` unknown-participant node if
-> another probed node's neighbor/route table observed it. `mat` does not
-> correlate the two into a single entry today — merging them is future work.
+> A fabric node `mat` could not self-identify (probe failure, cluster 0x33
+> unreadable, or a duplicate self-ext claim invalidated below) shows up as a
+> `node:<id>` graph node — and still contributes its own viewpoint edges,
+> anchored at `node:<id>` rather than an `ext:` vertex, from its own
+> neighbor/route table rows. The same physical radio may *also* surface
+> separately as an `ext:` unknown-participant node if another probed node's
+> neighbor/route table observed it. `mat` does not correlate the two into a
+> single entry today — merging them is future work.
+>
+> Real-device finding (2026-07-23): some Thread devices (ESP32-based tape
+> lights) report an identical, firmware-hardcoded HardwareAddress on cluster
+> 0x33 across every unit (with an empty IPv6Addresses list). Since that ext
+> claim is physically impossible once two or more fabric nodes make it, `mat`
+> invalidates the self-identification of *all* nodes that claimed the same
+> ext — they fall back to `node:<id>` (see above) rather than merging into one
+> bogus graph vertex. Separately, some devices encode `mesh-local-prefix` as a
+> length-prefixed octstr (`0x40` = 64-bit length byte + 8-byte prefix, 18 hex
+> chars) rather than the bare 8-byte form (16 hex chars); `mat` normalizes both
+> to the 16-hex form before deriving RLOC16. A route-table row with
+> `ExtAddress: 0` is treated as garbage and ignored (no node, no edge).
 >
 > Like `diag node`, `diag mesh` is direct path only (native, not part of the
 > `matd` protocol) and always fixes on endpoint 0 (cluster 53 / 0x33 are
