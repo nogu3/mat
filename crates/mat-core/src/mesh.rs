@@ -595,11 +595,11 @@ mod tests {
 
     #[test]
     fn build_graph_two_fabric_nodes_and_unknown_br() {
-        // node16 (ext 0011..., rloc 0x1400) が node5 (ext 8899..., rloc 0x0c01=child)
+        // node42 (ext 0011..., rloc 0x1400) が node7 (ext 8899..., rloc 0x0c01=child)
         // と BR (ext AABB..., rloc 0x2000, route-table 経由) を見る。
         let n16 = fabric_input(
-            16,
-            Some("study_motion"),
+            42,
+            Some("hall_motion"),
             "0011223344556677",
             "fd00112233445566000000fffe001400",
             vec![
@@ -625,7 +625,7 @@ mod tests {
             ],
         );
         let n5 = fabric_input(
-            5,
+            7,
             None,
             "8899AABBCCDDEEFF",
             "fd00112233445566000000fffe000c01",
@@ -652,12 +652,12 @@ mod tests {
 
         // ノード: fabric 2 + unknown BR 1
         assert_eq!(g.nodes.len(), 3);
-        let n16o = g.nodes.iter().find(|n| n.node_id == Some(16)).unwrap();
+        let n16o = g.nodes.iter().find(|n| n.node_id == Some(42)).unwrap();
         assert_eq!(n16o.id, "ext:0011223344556677");
         assert_eq!(n16o.rloc16.as_deref(), Some("0x1400"));
         assert_eq!(n16o.router_id, Some(5));
         assert_eq!(n16o.role, "router");
-        assert_eq!(n16o.alias.as_deref(), Some("study_motion"));
+        assert_eq!(n16o.alias.as_deref(), Some("hall_motion"));
         assert_eq!(n16o.probed, Some(true));
         let br = g.nodes.iter().find(|n| n.node_id.is_none()).unwrap();
         assert_eq!(br.id, "ext:AABBCCDDEEFF0011");

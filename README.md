@@ -411,7 +411,7 @@ mat diag mesh --nodes 5 16
   "nodes": [
     { "id": "ext:0011223344556677", "ext_address": "0011223344556677",
       "rloc16": "0x1400", "router_id": 5, "role": "router",
-      "node_id": 16, "alias": "study_motion", "probed": true },
+      "node_id": 42, "alias": "hall_motion", "probed": true },
     { "id": "ext:8899AABBCCDDEEFF", "ext_address": "8899AABBCCDDEEFF",
       "rloc16": "0x0c01", "role": "child", "node_id": 5, "probed": true },
     { "id": "ext:AABBCCDDEEFF0011", "ext_address": "AABBCCDDEEFF0011",
