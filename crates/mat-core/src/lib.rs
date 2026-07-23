@@ -13,6 +13,7 @@ pub mod error;
 pub mod group;
 pub mod ids;
 mod ids_gen;
+pub mod mesh;
 pub mod output;
 pub mod parse;
 pub mod reachability;
