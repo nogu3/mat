@@ -136,7 +136,6 @@ impl SubHealth {
     }
 
     /// 属性の最終既知値（未知なら None）。
-    #[allow(dead_code)] // テスト検証済み、Task 4 で server op 経路へ配線予定
     pub(crate) fn cached_value(
         &self,
         node_id: u64,
