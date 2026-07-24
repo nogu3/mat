@@ -164,6 +164,11 @@ pub struct Event {
     pub attribute: u32,
     pub value: serde_json::Value,
     pub priming: bool,
+    /// priming 差分回復で昇格したイベント（購読の盲目期間中に起きた実遷移を
+    /// 再購読時の priming から検出したもの）。`priming` と直交し、昇格時は
+    /// `priming: false` + `recovered: true` になる。timestamp は受信時刻で
+    /// あり、実際の遷移時刻ではない。
+    pub recovered: bool,
 }
 
 impl Event {
@@ -190,6 +195,7 @@ impl Event {
             "attribute": attribute,
             "value": self.value,
             "priming": self.priming,
+            "recovered": self.recovered,
         })
     }
 }
@@ -227,6 +233,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             attribute,
             value: data.clone(),
             priming,
+            recovered: false,
         });
     }
     out
@@ -448,6 +455,7 @@ mod tests {
             attribute: 0x0000, // occupancy
             value: json!(1),
             priming: false,
+            recovered: false,
         };
         let j = ev.to_json();
         assert_eq!(j["node_id"], 21);
@@ -456,6 +464,8 @@ mod tests {
         assert_eq!(j["attribute"], "occupancy");
         assert_eq!(j["value"], 1);
         assert_eq!(j["priming"], false);
+        // 差分回復で昇格したイベントかどうかは常に載る（既定 false）。
+        assert_eq!(j["recovered"], false);
         assert_eq!(j["timestamp"], "2026-07-20T00:00:00+09:00");
 
         // ids テーブルに無いものは数値のまま。
@@ -467,6 +477,14 @@ mod tests {
         let j = ev.to_json();
         assert_eq!(j["cluster"], 0xFFF1_0001u32);
         assert_eq!(j["attribute"], 0x9999);
+
+        // 昇格イベントは priming=false と recovered=true が同居する。
+        let ev = Event {
+            priming: false,
+            recovered: true,
+            ..ev
+        };
+        assert_eq!(ev.to_json()["recovered"], true);
     }
 
     #[test]

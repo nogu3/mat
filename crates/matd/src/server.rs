@@ -908,6 +908,7 @@ mod tests {
             attribute: 0x0000,
             value: serde_json::json!(1),
             priming: false,
+            recovered: false,
         };
         let f = ListenFilter::from_op(
             &Some(21),
