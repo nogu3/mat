@@ -88,6 +88,11 @@ pub struct SubHealth {
     clusters: Vec<u32>,
     /// node_id → 未消化の状態変更 op の時刻。
     pending: Mutex<HashMap<u64, tokio::time::Instant>>,
+    /// 属性最終既知値。購読 pump（書き手: priming / live 全イベント）と
+    /// server op 経路（読み手: 「この op は本当に値を変えるか」の証明）で共有する。
+    /// ephemeral なプロセス内状態のみ（設計ルール4の永続状態には該当しない）。
+    #[allow(dead_code)] // テスト検証済み、Task 3 で購読 pump へ配線予定
+    values: Mutex<HashMap<ValueKey, serde_json::Value>>,
 }
 
 impl SubHealth {
@@ -95,6 +100,7 @@ impl SubHealth {
         Self {
             clusters: clusters.unwrap_or_default(),
             pending: Mutex::new(HashMap::new()),
+            values: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +127,30 @@ impl SubHealth {
             .unwrap()
             .get(&node_id)
             .map(|t| t.elapsed())
+    }
+
+    /// pump が受けた 1 イベントをキャッシュへ反映し、差分 priming なら昇格して返す。
+    /// listen クライアントの有無と無関係に呼ぶ（状態追跡は購読が生きている限り継続）。
+    #[allow(dead_code)] // テスト検証済み、Task 3 で購読 pump へ配線予定
+    pub(crate) fn observe(&self, ev: Event) -> Event {
+        let mut cache = self.values.lock().unwrap();
+        classify_against_cache(&mut cache, ev)
+    }
+
+    /// 属性の最終既知値（未知なら None）。
+    #[allow(dead_code)] // テスト検証済み、Task 3 で server op 経路へ配線予定
+    pub(crate) fn cached_value(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Option<serde_json::Value> {
+        self.values
+            .lock()
+            .unwrap()
+            .get(&(node_id, endpoint, cluster, attribute))
+            .cloned()
     }
 }
 
@@ -169,6 +199,38 @@ pub struct Event {
     /// `priming: false` + `recovered: true` になる。timestamp は受信時刻で
     /// あり、実際の遷移時刻ではない。
     pub recovered: bool,
+}
+
+/// 属性値キャッシュのキー: (node_id, endpoint, cluster, attribute)。
+pub(crate) type ValueKey = (u64, u16, u32, u32);
+
+/// priming イベントをキャッシュと突き合わせ、盲目期間中に起きた実遷移なら
+/// 通常イベントへ昇格する（spec 2026-07-23 priming 差分回復）。
+///
+/// - 同値: 何も変えず素通し（消費者は priming を無視する）。
+/// - 既知の値と異なる priming: `priming=false` + `recovered=true` へ昇格。
+/// - 初見（キャッシュに無い）: 昇格**しない**（matd 起動直後の全量 priming で
+///   誤発火させないため）。キャッシュには格納する。
+/// - 非 priming: 素通し + キャッシュ更新。
+#[allow(dead_code)] // テスト検証済み、Task 3 で購読 pump へ配線予定
+pub(crate) fn classify_against_cache(
+    cache: &mut HashMap<ValueKey, serde_json::Value>,
+    ev: Event,
+) -> Event {
+    let key = (ev.node_id, ev.endpoint, ev.cluster, ev.attribute);
+    if cache.get(&key).is_some_and(|prev| *prev == ev.value) {
+        return ev;
+    }
+    let known = cache.contains_key(&key);
+    cache.insert(key, ev.value.clone());
+    if known && ev.priming {
+        return Event {
+            priming: false,
+            recovered: true,
+            ..ev
+        };
+    }
+    ev
 }
 
 impl Event {
@@ -787,5 +849,78 @@ mod tests {
                 .is_err(),
             "健全な購読を殺していないこと"
         );
+    }
+
+    /// 純関数の契約（priming 差分回復 spec の挙動表）:
+    /// 初見 priming → 非昇格・格納 / 同値 priming → 非昇格・素通し /
+    /// 差分 priming → 昇格 / 非 priming → 素通し・更新。
+    #[test]
+    fn classify_against_cache_promotes_only_changed_priming() {
+        fn ev(value: serde_json::Value, priming: bool) -> Event {
+            Event {
+                timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+                node_id: 5,
+                endpoint: 1,
+                cluster: 0x0006,
+                attribute: 0x0000,
+                value,
+                priming,
+                recovered: false,
+            }
+        }
+        let mut cache: HashMap<ValueKey, serde_json::Value> = HashMap::new();
+
+        // 初見 priming: 昇格しない（matd 起動直後の全量で誤発火しないため）。
+        let out = classify_against_cache(&mut cache, ev(json!(true), true));
+        assert!(out.priming);
+        assert!(!out.recovered);
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(true));
+
+        // 同値 priming: 素通し（消費者は priming として無視する）。
+        let out = classify_against_cache(&mut cache, ev(json!(true), true));
+        assert!(out.priming);
+        assert!(!out.recovered);
+
+        // 差分 priming: 盲目期間中の実遷移 → 昇格 + キャッシュ更新。
+        let out = classify_against_cache(&mut cache, ev(json!(false), true));
+        assert!(!out.priming);
+        assert!(out.recovered);
+        assert_eq!(out.value, json!(false));
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(false));
+
+        // 非 priming（live）: 素通し + キャッシュ更新。昇格フラグは立てない。
+        let out = classify_against_cache(&mut cache, ev(json!(true), false));
+        assert!(!out.priming);
+        assert!(!out.recovered);
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(true));
+
+        // キーは (node, endpoint, cluster, attribute) 単位で独立している。
+        let other = Event {
+            node_id: 6,
+            ..ev(json!(false), true)
+        };
+        let out = classify_against_cache(&mut cache, other);
+        assert!(out.priming, "別ノードの初見は昇格しない");
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// SubHealth 越しに同じキャッシュを読み書きできる（op 経路と pump の共有点）。
+    #[test]
+    fn sub_health_observe_updates_shared_value_cache() {
+        let h = SubHealth::new(None);
+        assert!(h.cached_value(5, 1, 0x0006, 0x0000).is_none());
+        let ev = Event {
+            timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0006,
+            attribute: 0x0000,
+            value: json!(true),
+            priming: true,
+            recovered: false,
+        };
+        let out = h.observe(ev);
+        assert!(out.priming && !out.recovered, "初見は素通し");
+        assert_eq!(h.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
     }
 }
