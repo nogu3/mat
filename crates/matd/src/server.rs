@@ -464,20 +464,47 @@ fn op_report_expectation(
             .as_bool()?
             .then_some((*node_id, im::CLUSTER_ON_OFF)),
         // level は mat 側で換算済みの raw 0–254 が届く（protocol.rs の約束）。
-        Op::Level { node_id, level, .. } => (cached_level?.as_u64()? != u64::from(*level))
-            .then_some((*node_id, im::CLUSTER_LEVEL_CONTROL)),
+        // MoveToLevel は OptionsMask/OptionsOverride = 0 で送られる
+        // （encode_move_to_level_fields）ため、ExecuteIfOff 規則により OnOff=false
+        // のデバイスでは実行されずレポートも出ない。確実に消灯中と分かる時
+        // （cached_on_off = Some(false)）だけ打たない — 不明（None）を消灯と
+        // 決めつけず、その場合は従来通り level の比較へ進む。
+        Op::Level { node_id, level, .. } => {
+            if cached_on_off.and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            (cached_level?.as_u64()? != u64::from(*level))
+                .then_some((*node_id, im::CLUSTER_LEVEL_CONTROL))
+        }
         _ => None,
     }
 }
 
 /// 期待判定に使うキャッシュの参照先 (node_id, endpoint)。On/Off/Level のみ。
+///
+/// 網羅 match（`_ => None` を使わない）: `Op` に新しい状態変更 op が増えたとき、
+/// ここを更新し忘れるとコンパイルエラーで気付ける（`op_report_expectation` 側
+/// だけ更新して静かに no-op 化するのを防ぐ — `Op::node_id()` と同じ書き方）。
 fn op_state_target(op: &Op) -> Option<(u64, u16)> {
     match op {
         Op::On { node_id, endpoint } | Op::Off { node_id, endpoint } => Some((*node_id, *endpoint)),
         Op::Level {
             node_id, endpoint, ..
         } => Some((*node_id, *endpoint)),
-        _ => None,
+        Op::Read { .. }
+        | Op::Write { .. }
+        | Op::Invoke { .. }
+        | Op::ColorTemp { .. }
+        | Op::Color { .. }
+        | Op::Describe { .. }
+        | Op::GroupProvision { .. }
+        | Op::GroupInvoke { .. }
+        | Op::GroupColorTemp { .. }
+        | Op::GroupLevel { .. }
+        | Op::GroupColor { .. }
+        | Op::Listen { .. }
+        | Op::Ping
+        | Op::Shutdown => None,
     }
 }
 
@@ -1733,6 +1760,17 @@ mod tests {
             Some((5, im::CLUSTER_LEVEL_CONTROL))
         );
         assert_eq!(op_report_expectation(&level, None, Some(&l128)), None);
+
+        // Level while off: MoveToLevel は Options=0 なので OnOff=false のデバイス
+        // では実行されずレポートも出ない → 確実に消灯中なら値差分があっても打たない。
+        assert_eq!(op_report_expectation(&level, Some(&f), Some(&l200)), None);
+        // Level while on: 点灯中は通常通り値差分で判定する。
+        assert_eq!(
+            op_report_expectation(&level, Some(&t), Some(&l200)),
+            Some((5, im::CLUSTER_LEVEL_CONTROL))
+        );
+        // Level, on-off キャッシュ欠落: 「不明」を「消灯」と決めつけず従来通り
+        // level の比較へ進む（挙動不変の確認。上の `None, Some(&l200)` ケースと同じ）。
 
         // キャッシュ欠落: 証明できないので打たない（matd 起動直後・購読未確立）。
         assert_eq!(op_report_expectation(&on, None, None), None);

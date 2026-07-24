@@ -536,6 +536,15 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   the blind window). Values `matd` has never seen before (first priming after
   a `matd` restart) are **not** promoted: they are plain `priming: true`
   events, so a restart never fires a consumer's automation.
+- Promotion applies to **any** subscribed attribute whose value changed, not
+  just the ones a consumer cares about — after a blind window a full-wildcard
+  subscription can promote diagnostics counters and similar monotonic
+  attributes too. Narrowing via `subscriptions.toml` or the `mat listen
+  --cluster` / `--attribute` filters is the control.
+- A transition that `matd`'s **own** op caused during the blind window also
+  comes back as `recovered: true` (matd never observed the report either). A
+  consumer whose rule is toggle-shaped should key off the value, not the
+  event's arrival.
 - `matd` absent, refusing the connection, or dying mid-stream is
   `matd_unavailable` (exit **13**) — see
   [Errors and exit codes](#errors-and-exit-codes). Events already printed
