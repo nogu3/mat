@@ -356,7 +356,9 @@ pub struct AttributeReport {
     /// パスの ClusterId（Context 3）。wildcard 購読 report のイベント化に必要。
     pub cluster: Option<u32>,
     pub attribute: Option<u32>,
-    /// path に ListIndex(null) があれば true（チャンク化 list の item 追記）。
+    /// path に ListIndex(Context 5) があれば true = この IB は list の要素（scalar
+    /// 属性値ではない）。null（チャンク化 list の item 追記）が通常だが、具体 index
+    /// を入れてくる非準拠デバイスも同様に list 要素として扱う。
     pub list_append: bool,
     /// AttributeDataIB の Data 要素を JSON 化したもの（status レポートなら None）。
     pub data: Option<serde_json::Value>,
@@ -451,8 +453,9 @@ fn hex_lower(b: &[u8]) -> String {
 type AttributePathFields = (Option<u16>, Option<u32>, Option<u32>, bool);
 
 /// AttributePathIB (spec §8.9.2.2, list) のうち endpoint(Context 2) /
-/// cluster(Context 3) / attribute(Context 4) / ListIndex(Context 5, `Null` ならチャンク化 list
-/// への item 追記) を拾う。他フィールド（Node/DataVersion 等）は
+/// cluster(Context 3) / attribute(Context 4) / ListIndex(Context 5, 存在すれば
+/// list 要素 = `list_append`。`Null` はチャンク化 list への item 追記、具体 index は
+/// 非準拠デバイスの edit/replace 表現) を拾う。他フィールド（Node/DataVersion 等）は
 /// 読み飛ばす。呼び出し側は path を開く `ListStart` を既に読んでいる前提。
 fn decode_attribute_path_ib(r: &mut Reader) -> Result<AttributePathFields, ImError> {
     let mut endpoint = None;
@@ -481,7 +484,10 @@ fn decode_attribute_path_ib(r: &mut Reader) -> Result<AttributePathFields, ImErr
                         .map_err(|_| ImError::Malformed("attribute id out of range"))?,
                 );
             }
-            (Tag::Context(5), Value::Null) => list_append = true,
+            // ListIndex(Context 5) の存在自体が「この IB は list 要素」を意味する。
+            // null（append）でも具体 index（非準拠デバイスの edit/replace 表現）でも
+            // scalar 属性値ではないので list_append 扱いにする（下流の偽 recovered 抑止）。
+            (Tag::Context(5), Value::Null | Value::Uint(_) | Value::Int(_)) => list_append = true,
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(r)?;
             }
@@ -2048,6 +2054,38 @@ mod tests {
 
         let merged = merge_reports(&[m1, m2]);
         assert_eq!(merged, vec![(0x0007, serde_json::json!([7, 8]))]);
+    }
+
+    #[test]
+    fn attribute_path_with_concrete_list_index_is_list_append() {
+        // 非準拠デバイスが list 要素レポートで ListIndex に null ではなく具体
+        // index（Context(5) = Uint）を入れてくるケース。これも list 要素であって
+        // scalar 属性値ではないため list_append 扱いにしないと、下流
+        // （matd events_from_report / SubHealth）が scalar と誤認して偽 recovered
+        // を出す。Context(5) の存在自体で list_append を立てる。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1)); // AttributeDataIB.Data path
+        w.start_list(Tag::Context(1)); // AttributePathIB
+        w.put_uint(Tag::Context(2), 0);
+        w.put_uint(Tag::Context(3), 0x0035);
+        w.put_uint(Tag::Context(4), 0x0007);
+        w.put_uint(Tag::Context(5), 0); // ListIndex = 具体 index（非準拠）
+        w.end_container();
+        w.put_uint(Tag::Context(2), 42); // Data = list item（scalar）
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        let m = decode_report_data_message(&w.finish()).unwrap();
+        assert_eq!(m.reports.len(), 1);
+        assert!(
+            m.reports[0].list_append,
+            "具体 index の list 要素も list_append 扱い: {:?}",
+            m.reports[0]
+        );
     }
 
     #[test]
