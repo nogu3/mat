@@ -98,6 +98,7 @@ fn occupancy_event(node_id: u64) -> matd::subscription::Event {
         attribute: 0x0000,
         value: serde_json::json!(1),
         priming: false,
+        recovered: false,
     }
 }
 
@@ -417,6 +418,7 @@ async fn listen_acks_then_streams_filtered_events() {
     assert_eq!(ev["attribute"], "occupancy");
     assert_eq!(ev["value"], json!(1));
     assert_eq!(ev["priming"], json!(false));
+    assert_eq!(ev["recovered"], json!(false));
 
     handle.abort();
 }
