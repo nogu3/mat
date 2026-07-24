@@ -984,4 +984,170 @@ mod tests {
         assert_eq!(ev.value, json!(true));
         assert_eq!(health.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
     }
+
+    /// Level 配線の釘打ち: `note_op_expectation` の levelcontrol/current-level
+    /// キャッシュ引き当て（cluster 0x0008 / attribute 0x0000）が実際に機能して
+    /// いること。On/Off と同じく、同値の Level op は pending を立てず、差分の
+    /// Level op は pending を立てる。
+    #[tokio::test]
+    async fn note_op_expectation_wires_level_cluster_cache() {
+        let health = SubHealth::new(None);
+        health.observe(Event {
+            timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0008,
+            attribute: 0x0000,
+            value: json!(128),
+            priming: true,
+            recovered: false,
+        });
+
+        // 同値（キャッシュ 128 / op level 128）: no-op なので pending を立てない。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Level {
+                node_id: 5,
+                endpoint: 1,
+                level: 128,
+                percent: 50,
+                transition: 0,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_none(),
+            "同値の level op は no-op — pending を立てない"
+        );
+
+        // 差分（キャッシュ 128 / op level 200）: 値が変わるので pending を立てる。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Level {
+                node_id: 5,
+                endpoint: 1,
+                level: 200,
+                percent: 78,
+                transition: 0,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_some(),
+            "差分の level op は pending を立てる"
+        );
+    }
+
+    /// 誤爆の釘打ち（spec テスト (a)）: priming でキャッシュが埋まった後、
+    /// 同値の op（既に on のノードへの on）は pending を立てず、健全な購読を
+    /// 無音 deadline 前に殺さない。
+    #[tokio::test(start_paused = true)]
+    async fn noop_op_does_not_kill_healthy_subscription() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        // priming（on-off=true）でキャッシュが埋まる。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // 既に on のノードへ on = no-op。デバイスはレポートを出さないので
+        // 期待を打ってはいけない。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::On {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_none(),
+            "no-op で pending を打たない"
+        );
+
+        // 無音 deadline (90s) 未満の 80s の間、再購読（= 追加イベント）は起きない。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(80), rx.recv())
+                .await
+                .is_err(),
+            "健全な購読を殺していないこと"
+        );
+    }
+
+    /// 真の born-dead 検知の維持（spec テスト (b)）: 値が実際に変わる op
+    /// （on のノードへの off）でデバイスが沈黙したままなら、従来どおり
+    /// grace + backoff 内（<40s）に再購読する。
+    #[tokio::test(start_paused = true)]
+    async fn changing_op_with_silent_device_triggers_fast_resubscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // on のノードへ off = 値が変わる → レポートが出るはず → 期待を打つ。
+        let t0 = tokio::time::Instant::now();
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Off {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &health,
+        );
+        assert!(health.pending_elapsed(5).is_some());
+        // デバイスは沈黙 → grace(10s) + backoff(5s) 内に再購読の priming が届く。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(40), rx.recv())
+            .await
+            .expect("re-priming after op-grace")
+            .unwrap();
+        assert_eq!(ev.value, json!(true));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(10),
+            "grace より早く殺さない: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(40),
+            "無音 deadline (90s) を待っていないこと: {elapsed:?}"
+        );
+    }
 }

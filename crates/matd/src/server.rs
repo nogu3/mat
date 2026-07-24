@@ -1602,8 +1602,7 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert!(health.pending_elapsed(5).is_some());
 
-        // 同じ off をもう一度: キャッシュはまだ true のままだが、
-        // ここでは「値が一致していれば打たない」規則の確認として on を撃つ。
+        // 既に on のノードへ on を撃つ: 値が変わらないので pending は立たない。
         health.clear_pending(5);
         let _ = run_op(
             &Op::On {
