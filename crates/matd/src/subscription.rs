@@ -273,6 +273,22 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             continue;
         };
         let Some(data) = &rep.data else { continue };
+        // list 属性は要素ごとに別々の report として届くことがある
+        // (AttributePathIB.ListIndex = null → デコーダは list_append: true)。
+        // その 1 要素は scalar なので下の is_array/is_object 判定を素通りして
+        // しまう — list_append 単体で落とす（list-diff priming recovery が
+        // 同一キーへの要素ごとの値変化を実遷移と誤認して recovered を大量発生
+        // させる害の元。README の「list/struct attributes are dropped」契約どおり）。
+        if rep.list_append {
+            tracing::debug!(
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+                "dropping list-append element report"
+            );
+            continue;
+        }
         if data.is_array() || data.is_object() {
             tracing::debug!(
                 node_id,
@@ -549,6 +565,18 @@ mod tests {
     #[test]
     fn events_from_report_keeps_scalars_and_drops_containers() {
         let mut msg = onoff_report(1, true);
+        // list 要素として届く scalar（AttributePathIB.ListIndex=null → デコーダは
+        // list_append: true として表現）はイベント化せず捨てる。値そのものは
+        // scalar（JSON array/object ではない）なので is_array/is_object 判定は
+        // 素通りしてしまう — list_append フラグでの判定が必要。
+        msg.reports.push(mat_controller::im::AttributeReport {
+            endpoint: Some(1),
+            cluster: Some(0x0008),
+            attribute: Some(0xFFFB), // attribute-list
+            list_append: true,
+            data: Some(json!(65531)),
+            status: None,
+        });
         // list/struct（wildcard priming に混ざる ACL / server-list 等）は捨てる。
         msg.reports.push(mat_controller::im::AttributeReport {
             endpoint: Some(0),
@@ -568,11 +596,57 @@ mod tests {
             status: Some(0x7E),
         });
         let evs = events_from_report(7, &msg, true);
+        // 唯一残るのは onoff_report が積んだ通常の scalar（list_append: false）。
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].node_id, 7);
         assert_eq!(evs[0].cluster, 0x0006);
         assert_eq!(evs[0].value, json!(true));
         assert!(evs[0].priming);
+    }
+
+    /// このバグが差分回復へ及ぼしていた害の釘打ち: list 属性は要素ごとに別々の
+    /// AttributeReport（list_append: true, data: scalar）として届き、同一キー
+    /// (node/endpoint/cluster/attribute) に対して値が要素ごとに違う。もし
+    /// list_append 要素をイベント化してしまうと、classify_against_cache が
+    /// 「値が変わった priming」と誤認して recovered: true を大量発生させる
+    /// （実機 node 13 の再購読 priming で観測: onoff/attribute-list 等）。
+    /// events_from_report が list_append 要素を落とす限り、SubHealth::observe
+    /// を通しても recovered イベントは 1 つも出ない。
+    #[test]
+    fn list_append_elements_never_produce_recovered_events() {
+        let health = SubHealth::new(None);
+        let round = |values: &[i64]| {
+            let msg = mat_controller::im::ReportDataMessage {
+                reports: values
+                    .iter()
+                    .map(|&v| mat_controller::im::AttributeReport {
+                        endpoint: Some(1),
+                        cluster: Some(0x0006),
+                        attribute: Some(0xFFFB), // attribute-list
+                        list_append: true,
+                        data: Some(json!(v)),
+                        status: None,
+                    })
+                    .collect(),
+                subscription_id: Some(1),
+                more_chunks: false,
+                suppress_response: false,
+            };
+            events_from_report(13, &msg, true)
+                .into_iter()
+                .map(|ev| health.observe(ev))
+                .collect::<Vec<_>>()
+        };
+        // 1 回目の priming（要素 0, 1）: 同一キーに異なる値が複数届く。
+        let first = round(&[0, 1]);
+        // 再購読後の 2 回目の priming（要素の値も変わり得る = list append の実態）。
+        let second = round(&[0, 1, 65533]);
+        assert!(
+            first.iter().all(|e| !e.recovered) && second.iter().all(|e| !e.recovered),
+            "list_append 要素起因の偽 recovered は出ない: first={first:?} second={second:?}"
+        );
+        // list_append 要素はそもそもイベント化されない（events_from_report の契約）。
+        assert!(first.is_empty() && second.is_empty());
     }
 
     #[test]
