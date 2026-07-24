@@ -98,6 +98,7 @@ fn occupancy_event(node_id: u64) -> matd::subscription::Event {
         attribute: 0x0000,
         value: serde_json::json!(1),
         priming: false,
+        recovered: false,
     }
 }
 
