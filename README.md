@@ -517,7 +517,7 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   line followed by one JSON event per line to stdout as they arrive:
   ```json
   {"timestamp":"...","listening":true}
-  {"timestamp":"2026-07-20T21:00:00+09:00","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy","value":1,"priming":false}
+  {"timestamp":"2026-07-20T21:00:00+09:00","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy","value":1,"priming":false,"recovered":false}
   ```
   `priming: true` marks events from the initial report burst right after
   matd (re)establishes a subscription, so a consumer does not mistake
@@ -526,6 +526,16 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   `list`/`struct` attributes (ACL, server-list, etc., which show up in a
   wildcard priming burst) are dropped, the same known limitation as generic
   `read` (see [Scalar-only generic write / invoke](#scalar-only-generic-write--invoke)).
+- `recovered: true` marks an event `matd` reconstructed from a priming
+  report: the attribute's value in the new subscription's priming burst
+  differs from the last value `matd` saw, so the transition happened while
+  the subscription was down. Such an event is delivered with
+  `priming: false` **and** `recovered: true`, so an existing consumer trigger
+  fires on it without any change. Its `timestamp` is the **receive** time,
+  not the time of the actual transition (which is unknowable — somewhere in
+  the blind window). Values `matd` has never seen before (first priming after
+  a `matd` restart) are **not** promoted: they are plain `priming: true`
+  events, so a restart never fires a consumer's automation.
 - `matd` absent, refusing the connection, or dying mid-stream is
   `matd_unavailable` (exit **13**) — see
   [Errors and exit codes](#errors-and-exit-codes). Events already printed
