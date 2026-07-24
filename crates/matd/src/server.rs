@@ -354,13 +354,11 @@ async fn run_op(
     if is_native_hotpath(op) {
         let result = native_op(op, native, store_path).await;
         if result.is_ok() {
-            if let Some((node_id, cluster)) = op_report_expectation(op) {
-                // 前提: デバイスは invoke 応答を先に、購読 report を後に送る。
-                // report が note_op より先に pump へ届く逆順だと pending が残り
-                // 健全購読を 1 回余分に再購読するが、それが最悪ケース（イベント
-                // 自体は配信済みで priming が状態を再配達する）。
-                health.note_op(node_id, cluster);
-            }
+            // 前提: デバイスは invoke 応答を先に、購読 report を後に送る。
+            // report が note_op より先に pump へ届く逆順だと pending が残り
+            // 健全購読を 1 回余分に再購読するが、それが最悪ケース（イベント
+            // 自体は配信済みで priming が状態を再配達する）。
+            note_op_expectation(op, health);
         }
         return result;
     }
@@ -442,22 +440,89 @@ pub(crate) fn is_native_hotpath(op: &Op) -> bool {
 }
 
 /// 状態変更 op → (node_id, 変化が現れる cluster)。op 相関の born-dead 検知
-/// （SubHealth::note_op）の根拠。Read/Describe は状態を変えないので None。
-/// Group 系はノード特定不能、listen/管理系は対象外で None。
-fn op_report_expectation(op: &Op) -> Option<(u64, u32)> {
+/// （`SubHealth::note_op`）の根拠。
+///
+/// **「op が成功した」は「レポートが出るはず」を含意しない**: すでに目標状態に
+/// あるデバイスへの On/Off/Level は data model が変化せず、Matter 仕様上
+/// 購読レポートは出ない（レポートは属性変化時のみ）。よって購読キャッシュの
+/// 現在値と目標値が**不一致の時だけ**期待を返す（spec 2026-07-24）。
+/// キャッシュ欠落（matd 起動直後・購読未確立）は「証明できない」ので None。
+/// Color / ColorTemp / Write / Invoke は変化を証明できないため対象外
+/// （受け皿は無音 deadline）。Read / Describe / Group 系も元から None。
+fn op_report_expectation(
+    op: &Op,
+    cached_on_off: Option<&Value>,
+    cached_level: Option<&Value>,
+) -> Option<(u64, u32)> {
     match op {
-        Op::On { node_id, .. } | Op::Off { node_id, .. } => Some((*node_id, im::CLUSTER_ON_OFF)),
-        Op::Level { node_id, .. } => Some((*node_id, im::CLUSTER_LEVEL_CONTROL)),
-        Op::Color { node_id, .. } | Op::ColorTemp { node_id, .. } => {
-            Some((*node_id, im::CLUSTER_COLOR_CONTROL))
+        // 現在 off の時だけ on は変化を生む。
+        Op::On { node_id, .. } => {
+            (!cached_on_off?.as_bool()?).then_some((*node_id, im::CLUSTER_ON_OFF))
         }
-        Op::Write {
-            node_id, cluster, ..
+        // 現在 on の時だけ off は変化を生む。
+        Op::Off { node_id, .. } => cached_on_off?
+            .as_bool()?
+            .then_some((*node_id, im::CLUSTER_ON_OFF)),
+        // level は mat 側で換算済みの raw 0–254 が届く（protocol.rs の約束）。
+        // MoveToLevel は OptionsMask/OptionsOverride = 0 で送られる
+        // （encode_move_to_level_fields）ため、ExecuteIfOff 規則により OnOff=false
+        // のデバイスでは実行されずレポートも出ない。確実に消灯中と分かる時
+        // （cached_on_off = Some(false)）だけ打たない — 不明（None）を消灯と
+        // 決めつけず、その場合は従来通り level の比較へ進む。
+        Op::Level { node_id, level, .. } => {
+            if cached_on_off.and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            (cached_level?.as_u64()? != u64::from(*level))
+                .then_some((*node_id, im::CLUSTER_LEVEL_CONTROL))
         }
-        | Op::Invoke {
-            node_id, cluster, ..
-        } => mat_core::ids::resolve_cluster(cluster).map(|c| (*node_id, c)),
         _ => None,
+    }
+}
+
+/// 期待判定に使うキャッシュの参照先 (node_id, endpoint)。On/Off/Level のみ。
+///
+/// 網羅 match（`_ => None` を使わない）: `Op` に新しい状態変更 op が増えたとき、
+/// ここを更新し忘れるとコンパイルエラーで気付ける（`op_report_expectation` 側
+/// だけ更新して静かに no-op 化するのを防ぐ — `Op::node_id()` と同じ書き方）。
+fn op_state_target(op: &Op) -> Option<(u64, u16)> {
+    match op {
+        Op::On { node_id, endpoint } | Op::Off { node_id, endpoint } => Some((*node_id, *endpoint)),
+        Op::Level {
+            node_id, endpoint, ..
+        } => Some((*node_id, *endpoint)),
+        Op::Read { .. }
+        | Op::Write { .. }
+        | Op::Invoke { .. }
+        | Op::ColorTemp { .. }
+        | Op::Color { .. }
+        | Op::Describe { .. }
+        | Op::GroupProvision { .. }
+        | Op::GroupInvoke { .. }
+        | Op::GroupColorTemp { .. }
+        | Op::GroupLevel { .. }
+        | Op::GroupColor { .. }
+        | Op::Listen { .. }
+        | Op::Ping
+        | Op::Shutdown => None,
+    }
+}
+
+/// 成功した op に対し、レポート期待（pending）を打つべきなら打つ。
+/// 購読の最終既知値を根拠にするので、no-op（すでに目標状態）では打たない。
+pub(crate) fn note_op_expectation(op: &Op, health: &SubHealth) {
+    let Some((node_id, endpoint)) = op_state_target(op) else {
+        return;
+    };
+    let on_off = health.cached_value(node_id, endpoint, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF);
+    let level = health.cached_value(
+        node_id,
+        endpoint,
+        im::CLUSTER_LEVEL_CONTROL,
+        im::ATTR_CURRENT_LEVEL,
+    );
+    if let Some((node_id, cluster)) = op_report_expectation(op, on_off.as_ref(), level.as_ref()) {
+        health.note_op(node_id, cluster);
     }
 }
 
@@ -908,6 +973,7 @@ mod tests {
             attribute: 0x0000,
             value: serde_json::json!(1),
             priming: false,
+            recovered: false,
         };
         let f = ListenFilter::from_op(
             &Some(21),
@@ -1522,7 +1588,33 @@ mod tests {
         let state = NativeState::Ready(Box::new(native));
         let health = std::sync::Arc::new(SubHealth::new(None));
 
-        // off (onoff=0x0006) の success → pending。
+        // キャッシュが空（購読未確立）なら、成功した off でも pending は打たない
+        // — 「値が変わる」ことを証明できないため（spec 2026-07-24）。
+        let body = run_op(
+            &Op::Off {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &state,
+            dir.path(),
+            &health,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["status"], "success");
+        assert!(health.pending_elapsed(5).is_none());
+
+        // 購読キャッシュが on-off=true を知っている状態で off → 変化するので pending。
+        health.observe(crate::subscription::Event {
+            timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0006,
+            attribute: 0x0000,
+            value: json!(true),
+            priming: true,
+            recovered: false,
+        });
         let body = run_op(
             &Op::Off {
                 node_id: 5,
@@ -1536,6 +1628,24 @@ mod tests {
         .unwrap();
         assert_eq!(body["status"], "success");
         assert!(health.pending_elapsed(5).is_some());
+
+        // 既に on のノードへ on を撃つ: 値が変わらないので pending は立たない。
+        health.clear_pending(5);
+        let _ = run_op(
+            &Op::On {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &state,
+            dir.path(),
+            &health,
+        )
+        .await
+        .unwrap();
+        assert!(
+            health.pending_elapsed(5).is_none(),
+            "既に on のノードへの on は no-op — レポートは出ないので pending を打たない"
+        );
 
         // read は状態を変えないので pending を打たない。
         health.clear_pending(5);
@@ -1553,47 +1663,6 @@ mod tests {
         .await
         .unwrap();
         assert!(health.pending_elapsed(5).is_none());
-    }
-
-    #[test]
-    fn op_report_expectation_maps_state_changing_ops() {
-        assert_eq!(
-            op_report_expectation(&Op::On {
-                node_id: 5,
-                endpoint: 1
-            }),
-            Some((5, 0x0006))
-        );
-        assert_eq!(
-            op_report_expectation(&Op::Level {
-                node_id: 5,
-                endpoint: 1,
-                level: 128,
-                percent: 50,
-                transition: 0,
-            }),
-            Some((5, 0x0008))
-        );
-        assert_eq!(
-            op_report_expectation(&Op::Read {
-                node_id: 5,
-                endpoint: 1,
-                cluster: "onoff".into(),
-                attribute: "on-off".into(),
-            }),
-            None
-        );
-        // Write は cluster 名を解決して返す。
-        assert_eq!(
-            op_report_expectation(&Op::Write {
-                node_id: 5,
-                endpoint: 1,
-                cluster: "onoff".into(),
-                attribute: "on-time".into(),
-                value: "0".into(),
-            }),
-            Some((5, 0x0006))
-        );
     }
 
     /// post-1.0 defer: dispatch 不変条件が破れても panic しない（v1 Task6 規律）。
@@ -1644,5 +1713,111 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
+    }
+
+    /// op → レポート期待の分類（spec 2026-07-24 の表）。
+    /// 「op 成功」は「レポートが出る」を含意しない: 目標状態と現在値が一致する
+    /// no-op はレポートを生まないので pending を打ってはならない。
+    #[test]
+    fn op_report_expectation_only_when_value_actually_changes() {
+        let on = Op::On {
+            node_id: 5,
+            endpoint: 1,
+        };
+        let off = Op::Off {
+            node_id: 5,
+            endpoint: 1,
+        };
+        let level = Op::Level {
+            node_id: 5,
+            endpoint: 1,
+            level: 128,
+            percent: 50,
+            transition: 0,
+        };
+        let t = json!(true);
+        let f = json!(false);
+        let l128 = json!(128);
+        let l200 = json!(200);
+
+        // On: 現在 off → 変化する → pending。
+        assert_eq!(
+            op_report_expectation(&on, Some(&f), None),
+            Some((5, im::CLUSTER_ON_OFF))
+        );
+        // On: 既に on → no-op → 打たない。
+        assert_eq!(op_report_expectation(&on, Some(&t), None), None);
+        // Off: 現在 on → 変化する → pending。
+        assert_eq!(
+            op_report_expectation(&off, Some(&t), None),
+            Some((5, im::CLUSTER_ON_OFF))
+        );
+        // Off: 既に off → no-op → 打たない（casa 人感ルールの誤キルの正体）。
+        assert_eq!(op_report_expectation(&off, Some(&f), None), None);
+        // Level: 現在値と異なる → pending / 同値 → 打たない。
+        assert_eq!(
+            op_report_expectation(&level, None, Some(&l200)),
+            Some((5, im::CLUSTER_LEVEL_CONTROL))
+        );
+        assert_eq!(op_report_expectation(&level, None, Some(&l128)), None);
+
+        // Level while off: MoveToLevel は Options=0 なので OnOff=false のデバイス
+        // では実行されずレポートも出ない → 確実に消灯中なら値差分があっても打たない。
+        assert_eq!(op_report_expectation(&level, Some(&f), Some(&l200)), None);
+        // Level while on: 点灯中は通常通り値差分で判定する。
+        assert_eq!(
+            op_report_expectation(&level, Some(&t), Some(&l200)),
+            Some((5, im::CLUSTER_LEVEL_CONTROL))
+        );
+        // Level, on-off キャッシュ欠落: 「不明」を「消灯」と決めつけず従来通り
+        // level の比較へ進む（挙動不変の確認。上の `None, Some(&l200)` ケースと同じ）。
+
+        // キャッシュ欠落: 証明できないので打たない（matd 起動直後・購読未確立）。
+        assert_eq!(op_report_expectation(&on, None, None), None);
+        assert_eq!(op_report_expectation(&off, None, None), None);
+        assert_eq!(op_report_expectation(&level, None, None), None);
+        // 型が想定外（level が null 等）でも打たない。
+        assert_eq!(
+            op_report_expectation(&level, None, Some(&json!(null))),
+            None
+        );
+
+        // Color / ColorTemp / Write / Invoke は pending 対象から降格
+        // （状態変化を証明できない。受け皿は無音 deadline）。
+        let color_temp = Op::ColorTemp {
+            node_id: 5,
+            endpoint: 1,
+            mireds: 370,
+            kelvin: 2700,
+            transition: 0,
+        };
+        assert_eq!(
+            op_report_expectation(&color_temp, Some(&t), Some(&l128)),
+            None
+        );
+        let invoke = Op::Invoke {
+            node_id: 5,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            command: "toggle".into(),
+            args: vec![],
+        };
+        assert_eq!(op_report_expectation(&invoke, Some(&t), Some(&l128)), None);
+        let write = Op::Write {
+            node_id: 5,
+            endpoint: 1,
+            cluster: "levelcontrol".into(),
+            attribute: "on-level".into(),
+            value: "128".into(),
+        };
+        assert_eq!(op_report_expectation(&write, Some(&t), Some(&l128)), None);
+        // Read は元から対象外。
+        let read = Op::Read {
+            node_id: 5,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+        };
+        assert_eq!(op_report_expectation(&read, Some(&f), None), None);
     }
 }

@@ -88,6 +88,10 @@ pub struct SubHealth {
     clusters: Vec<u32>,
     /// node_id → 未消化の状態変更 op の時刻。
     pending: Mutex<HashMap<u64, tokio::time::Instant>>,
+    /// 属性最終既知値。購読 pump（書き手: priming / live 全イベント）と
+    /// server op 経路（読み手: 「この op は本当に値を変えるか」の証明）で共有する。
+    /// ephemeral なプロセス内状態のみ（設計ルール4の永続状態には該当しない）。
+    values: Mutex<HashMap<ValueKey, serde_json::Value>>,
 }
 
 impl SubHealth {
@@ -95,6 +99,7 @@ impl SubHealth {
         Self {
             clusters: clusters.unwrap_or_default(),
             pending: Mutex::new(HashMap::new()),
+            values: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +126,28 @@ impl SubHealth {
             .unwrap()
             .get(&node_id)
             .map(|t| t.elapsed())
+    }
+
+    /// pump が受けた 1 イベントをキャッシュへ反映し、差分 priming なら昇格して返す。
+    /// listen クライアントの有無と無関係に呼ぶ（状態追跡は購読が生きている限り継続）。
+    pub(crate) fn observe(&self, ev: Event) -> Event {
+        let mut cache = self.values.lock().unwrap();
+        classify_against_cache(&mut cache, ev)
+    }
+
+    /// 属性の最終既知値（未知なら None）。
+    pub(crate) fn cached_value(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Option<serde_json::Value> {
+        self.values
+            .lock()
+            .unwrap()
+            .get(&(node_id, endpoint, cluster, attribute))
+            .cloned()
     }
 }
 
@@ -164,6 +191,42 @@ pub struct Event {
     pub attribute: u32,
     pub value: serde_json::Value,
     pub priming: bool,
+    /// priming 差分回復で昇格したイベント（購読の盲目期間中に起きた実遷移を
+    /// 再購読時の priming から検出したもの）。`priming` と直交し、昇格時は
+    /// `priming: false` + `recovered: true` になる。timestamp は受信時刻で
+    /// あり、実際の遷移時刻ではない。
+    pub recovered: bool,
+}
+
+/// 属性値キャッシュのキー: (node_id, endpoint, cluster, attribute)。
+pub(crate) type ValueKey = (u64, u16, u32, u32);
+
+/// priming イベントをキャッシュと突き合わせ、盲目期間中に起きた実遷移なら
+/// 通常イベントへ昇格する（spec 2026-07-23 priming 差分回復）。
+///
+/// - 同値: 何も変えず素通し（消費者は priming を無視する）。
+/// - 既知の値と異なる priming: `priming=false` + `recovered=true` へ昇格。
+/// - 初見（キャッシュに無い）: 昇格**しない**（matd 起動直後の全量 priming で
+///   誤発火させないため）。キャッシュには格納する。
+/// - 非 priming: 素通し + キャッシュ更新。
+pub(crate) fn classify_against_cache(
+    cache: &mut HashMap<ValueKey, serde_json::Value>,
+    ev: Event,
+) -> Event {
+    let key = (ev.node_id, ev.endpoint, ev.cluster, ev.attribute);
+    if cache.get(&key).is_some_and(|prev| *prev == ev.value) {
+        return ev;
+    }
+    let known = cache.contains_key(&key);
+    cache.insert(key, ev.value.clone());
+    if known && ev.priming {
+        return Event {
+            priming: false,
+            recovered: true,
+            ..ev
+        };
+    }
+    ev
 }
 
 impl Event {
@@ -190,6 +253,7 @@ impl Event {
             "attribute": attribute,
             "value": self.value,
             "priming": self.priming,
+            "recovered": self.recovered,
         })
     }
 }
@@ -209,6 +273,22 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             continue;
         };
         let Some(data) = &rep.data else { continue };
+        // list 属性は要素ごとに別々の report として届くことがある
+        // (AttributePathIB.ListIndex = null → デコーダは list_append: true)。
+        // その 1 要素は scalar なので下の is_array/is_object 判定を素通りして
+        // しまう — list_append 単体で落とす（list-diff priming recovery が
+        // 同一キーへの要素ごとの値変化を実遷移と誤認して recovered を大量発生
+        // させる害の元。README の「list/struct attributes are dropped」契約どおり）。
+        if rep.list_append {
+            tracing::debug!(
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+                "dropping list-append element report"
+            );
+            continue;
+        }
         if data.is_array() || data.is_object() {
             tracing::debug!(
                 node_id,
@@ -227,6 +307,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             attribute,
             value: data.clone(),
             priming,
+            recovered: false,
         });
     }
     out
@@ -366,7 +447,8 @@ async fn run_subscription_once(
     health.clear_pending(node_id);
     for msg in &priming {
         for ev in events_from_report(node_id, msg, true) {
-            let _ = events.send(ev); // 受信者ゼロは正常（listen 接続なし）
+            // 盲目期間中に起きた実遷移はここで通常イベントへ昇格する。
+            let _ = events.send(health.observe(ev)); // 受信者ゼロは正常（listen 接続なし）
         }
     }
     let deadline = silence_deadline(info.max_interval_s);
@@ -414,7 +496,7 @@ async fn run_subscription_once(
                 last_msg = tokio::time::Instant::now();
                 health.clear_pending(node_id);
                 for ev in events_from_report(node_id, &msg, false) {
-                    let _ = events.send(ev);
+                    let _ = events.send(health.observe(ev));
                 }
                 // keep-alive（reports 空）も受信 = 経路生存の証明として扱う。
             }
@@ -448,6 +530,7 @@ mod tests {
             attribute: 0x0000, // occupancy
             value: json!(1),
             priming: false,
+            recovered: false,
         };
         let j = ev.to_json();
         assert_eq!(j["node_id"], 21);
@@ -456,6 +539,8 @@ mod tests {
         assert_eq!(j["attribute"], "occupancy");
         assert_eq!(j["value"], 1);
         assert_eq!(j["priming"], false);
+        // 差分回復で昇格したイベントかどうかは常に載る（既定 false）。
+        assert_eq!(j["recovered"], false);
         assert_eq!(j["timestamp"], "2026-07-20T00:00:00+09:00");
 
         // ids テーブルに無いものは数値のまま。
@@ -467,11 +552,31 @@ mod tests {
         let j = ev.to_json();
         assert_eq!(j["cluster"], 0xFFF1_0001u32);
         assert_eq!(j["attribute"], 0x9999);
+
+        // 昇格イベントは priming=false と recovered=true が同居する。
+        let ev = Event {
+            priming: false,
+            recovered: true,
+            ..ev
+        };
+        assert_eq!(ev.to_json()["recovered"], true);
     }
 
     #[test]
     fn events_from_report_keeps_scalars_and_drops_containers() {
         let mut msg = onoff_report(1, true);
+        // list 要素として届く scalar（AttributePathIB.ListIndex=null → デコーダは
+        // list_append: true として表現）はイベント化せず捨てる。値そのものは
+        // scalar（JSON array/object ではない）なので is_array/is_object 判定は
+        // 素通りしてしまう — list_append フラグでの判定が必要。
+        msg.reports.push(mat_controller::im::AttributeReport {
+            endpoint: Some(1),
+            cluster: Some(0x0008),
+            attribute: Some(0xFFFB), // attribute-list
+            list_append: true,
+            data: Some(json!(65531)),
+            status: None,
+        });
         // list/struct（wildcard priming に混ざる ACL / server-list 等）は捨てる。
         msg.reports.push(mat_controller::im::AttributeReport {
             endpoint: Some(0),
@@ -491,11 +596,57 @@ mod tests {
             status: Some(0x7E),
         });
         let evs = events_from_report(7, &msg, true);
+        // 唯一残るのは onoff_report が積んだ通常の scalar（list_append: false）。
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].node_id, 7);
         assert_eq!(evs[0].cluster, 0x0006);
         assert_eq!(evs[0].value, json!(true));
         assert!(evs[0].priming);
+    }
+
+    /// このバグが差分回復へ及ぼしていた害の釘打ち: list 属性は要素ごとに別々の
+    /// AttributeReport（list_append: true, data: scalar）として届き、同一キー
+    /// (node/endpoint/cluster/attribute) に対して値が要素ごとに違う。もし
+    /// list_append 要素をイベント化してしまうと、classify_against_cache が
+    /// 「値が変わった priming」と誤認して recovered: true を大量発生させる
+    /// （実機 node 13 の再購読 priming で観測: onoff/attribute-list 等）。
+    /// events_from_report が list_append 要素を落とす限り、SubHealth::observe
+    /// を通しても recovered イベントは 1 つも出ない。
+    #[test]
+    fn list_append_elements_never_produce_recovered_events() {
+        let health = SubHealth::new(None);
+        let round = |values: &[i64]| {
+            let msg = mat_controller::im::ReportDataMessage {
+                reports: values
+                    .iter()
+                    .map(|&v| mat_controller::im::AttributeReport {
+                        endpoint: Some(1),
+                        cluster: Some(0x0006),
+                        attribute: Some(0xFFFB), // attribute-list
+                        list_append: true,
+                        data: Some(json!(v)),
+                        status: None,
+                    })
+                    .collect(),
+                subscription_id: Some(1),
+                more_chunks: false,
+                suppress_response: false,
+            };
+            events_from_report(13, &msg, true)
+                .into_iter()
+                .map(|ev| health.observe(ev))
+                .collect::<Vec<_>>()
+        };
+        // 1 回目の priming（要素 0, 1）: 同一キーに異なる値が複数届く。
+        let first = round(&[0, 1]);
+        // 再購読後の 2 回目の priming（要素の値も変わり得る = list append の実態）。
+        let second = round(&[0, 1, 65533]);
+        assert!(
+            first.iter().all(|e| !e.recovered) && second.iter().all(|e| !e.recovered),
+            "list_append 要素起因の偽 recovered は出ない: first={first:?} second={second:?}"
+        );
+        // list_append 要素はそもそもイベント化されない（events_from_report の契約）。
+        assert!(first.is_empty() && second.is_empty());
     }
 
     #[test]
@@ -768,6 +919,309 @@ mod tests {
                 .await
                 .is_err(),
             "健全な購読を殺していないこと"
+        );
+    }
+
+    /// 純関数の契約（priming 差分回復 spec の挙動表）:
+    /// 初見 priming → 非昇格・格納 / 同値 priming → 非昇格・素通し /
+    /// 差分 priming → 昇格 / 非 priming → 素通し・更新。
+    #[test]
+    fn classify_against_cache_promotes_only_changed_priming() {
+        fn ev(value: serde_json::Value, priming: bool) -> Event {
+            Event {
+                timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+                node_id: 5,
+                endpoint: 1,
+                cluster: 0x0006,
+                attribute: 0x0000,
+                value,
+                priming,
+                recovered: false,
+            }
+        }
+        let mut cache: HashMap<ValueKey, serde_json::Value> = HashMap::new();
+
+        // 初見 priming: 昇格しない（matd 起動直後の全量で誤発火しないため）。
+        let out = classify_against_cache(&mut cache, ev(json!(true), true));
+        assert!(out.priming);
+        assert!(!out.recovered);
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(true));
+
+        // 同値 priming: 素通し（消費者は priming として無視する）。
+        let out = classify_against_cache(&mut cache, ev(json!(true), true));
+        assert!(out.priming);
+        assert!(!out.recovered);
+
+        // 差分 priming: 盲目期間中の実遷移 → 昇格 + キャッシュ更新。
+        let out = classify_against_cache(&mut cache, ev(json!(false), true));
+        assert!(!out.priming);
+        assert!(out.recovered);
+        assert_eq!(out.value, json!(false));
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(false));
+
+        // 非 priming（live）: 素通し + キャッシュ更新。昇格フラグは立てない。
+        let out = classify_against_cache(&mut cache, ev(json!(true), false));
+        assert!(!out.priming);
+        assert!(!out.recovered);
+        assert_eq!(cache[&(5, 1, 0x0006, 0x0000)], json!(true));
+
+        // キーは (node, endpoint, cluster, attribute) 単位で独立している。
+        let other = Event {
+            node_id: 6,
+            ..ev(json!(false), true)
+        };
+        let out = classify_against_cache(&mut cache, other);
+        assert!(out.priming, "別ノードの初見は昇格しない");
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// SubHealth 越しに同じキャッシュを読み書きできる（op 経路と pump の共有点）。
+    #[test]
+    fn sub_health_observe_updates_shared_value_cache() {
+        let h = SubHealth::new(None);
+        assert!(h.cached_value(5, 1, 0x0006, 0x0000).is_none());
+        let ev = Event {
+            timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0006,
+            attribute: 0x0000,
+            value: json!(true),
+            priming: true,
+            recovered: false,
+        };
+        let out = h.observe(ev);
+        assert!(out.priming && !out.recovered, "初見は素通し");
+        assert_eq!(h.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
+    }
+
+    /// 差分回復の統合: priming(true) → live(false) → 購読死 → 再 priming(true)。
+    /// 2 回目の priming はキャッシュ(false)と異なるので昇格イベントとして届く。
+    /// キャッシュが live イベントでも更新されること（spec テスト (c)）も同時に釘打ち。
+    #[tokio::test(start_paused = true)]
+    async fn priming_diff_after_resubscribe_is_promoted_to_recovered_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let est = FakeEstablisher::default();
+        let live = std::sync::Arc::clone(&est.sub_live);
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+
+        // 1 回目の priming（on-off=true）: 初見なので昇格しない。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming && !ev.recovered);
+        assert_eq!(health.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
+
+        // live で false へ遷移 → キャッシュ更新（priming/live 両経路で更新される証明）。
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event")
+            .unwrap();
+        assert!(!ev.priming && !ev.recovered);
+        assert_eq!(
+            health.cached_value(5, 1, 0x0006, 0x0000),
+            Some(json!(false))
+        );
+
+        // 購読を殺して再購読させる（fake の priming は常に on-off=true）。
+        health.note_op(5, 0x0006);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
+            .await
+            .expect("re-priming after resubscribe")
+            .unwrap();
+        // 盲目期間中に false→true の実遷移があったとみなし、通常イベントへ昇格。
+        assert!(!ev.priming, "昇格イベントは priming=false");
+        assert!(
+            ev.recovered,
+            "recovered=true で消費者の既存トリガが発火する"
+        );
+        assert_eq!(ev.value, json!(true));
+        assert_eq!(health.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
+    }
+
+    /// Level 配線の釘打ち: `note_op_expectation` の levelcontrol/current-level
+    /// キャッシュ引き当て（cluster 0x0008 / attribute 0x0000）が実際に機能して
+    /// いること。On/Off と同じく、同値の Level op は pending を立てず、差分の
+    /// Level op は pending を立てる。
+    #[tokio::test]
+    async fn note_op_expectation_wires_level_cluster_cache() {
+        let health = SubHealth::new(None);
+        health.observe(Event {
+            timestamp: "2026-07-24T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0008,
+            attribute: 0x0000,
+            value: json!(128),
+            priming: true,
+            recovered: false,
+        });
+
+        // 同値（キャッシュ 128 / op level 128）: no-op なので pending を立てない。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Level {
+                node_id: 5,
+                endpoint: 1,
+                level: 128,
+                percent: 50,
+                transition: 0,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_none(),
+            "同値の level op は no-op — pending を立てない"
+        );
+
+        // 差分（キャッシュ 128 / op level 200）: 値が変わるので pending を立てる。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Level {
+                node_id: 5,
+                endpoint: 1,
+                level: 200,
+                percent: 78,
+                transition: 0,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_some(),
+            "差分の level op は pending を立てる"
+        );
+    }
+
+    /// 誤爆の釘打ち（spec テスト (a)）: priming でキャッシュが埋まった後、
+    /// 同値の op（既に on のノードへの on）は pending を立てず、健全な購読を
+    /// 無音 deadline 前に殺さない。
+    #[tokio::test(start_paused = true)]
+    async fn noop_op_does_not_kill_healthy_subscription() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        // priming（on-off=true）でキャッシュが埋まる。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // 既に on のノードへ on = no-op。デバイスはレポートを出さないので
+        // 期待を打ってはいけない。
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::On {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &health,
+        );
+        assert!(
+            health.pending_elapsed(5).is_none(),
+            "no-op で pending を打たない"
+        );
+
+        // 無音 deadline (90s) 未満の 80s の間、再購読（= 追加イベント）は起きない。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(80), rx.recv())
+                .await
+                .is_err(),
+            "健全な購読を殺していないこと"
+        );
+    }
+
+    /// 真の born-dead 検知の維持（spec テスト (b)）: 値が実際に変わる op
+    /// （on のノードへの off）でデバイスが沈黙したままなら、従来どおり
+    /// grace + backoff 内（<40s）に再購読する。
+    #[tokio::test(start_paused = true)]
+    async fn changing_op_with_silent_device_triggers_fast_resubscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native =
+            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let health = std::sync::Arc::new(SubHealth::new(None));
+        let _handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            std::sync::Arc::clone(&health),
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // on のノードへ off = 値が変わる → レポートが出るはず → 期待を打つ。
+        let t0 = tokio::time::Instant::now();
+        crate::server::note_op_expectation(
+            &crate::protocol::Op::Off {
+                node_id: 5,
+                endpoint: 1,
+            },
+            &health,
+        );
+        assert!(health.pending_elapsed(5).is_some());
+        // デバイスは沈黙 → grace(10s) + backoff(5s) 内に再購読の priming が届く。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(40), rx.recv())
+            .await
+            .expect("re-priming after op-grace")
+            .unwrap();
+        assert_eq!(ev.value, json!(true));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(10),
+            "grace より早く殺さない: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(40),
+            "無音 deadline (90s) を待っていないこと: {elapsed:?}"
         );
     }
 }
