@@ -213,8 +213,13 @@ fn init_tracing() {
     fmt()
         .with_env_filter(filter)
         // 対話 tty では色を許すが、パイプや mando 経由では ANSI を出さない
-        // （構造化ログを grep できる形に保つ）。
-        .with_ansi(std::io::stderr().is_terminal())
+        // （構造化ログを grep できる形に保つ）。`NO_COLOR` も尊重する —
+        // with_ansi はライブラリ既定の NO_COLOR 判定を無条件に上書きするので、
+        // ここで自分で見る必要がある（https://no-color.org/）。
+        .with_ansi(
+            std::io::stderr().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        )
         .with_writer(std::io::stderr)
         .init();
 }
