@@ -1181,7 +1181,7 @@ terminal — so `grep node_id=42` works on a journal or through a pipe.
 
 | line | level | when |
 |---|---|---|
-| `matd op failed` | warn | the path itself failed — `timeout` / `unreachable` / `session_failed` / `other` (plus the retired `child_*` kinds). Carries `kind` and `detail`. |
+| `matd op failed` | warn | the path itself failed — `timeout` / `unreachable` / `session_failed` / `other` / `commission_failed` / `matd_unavailable` (plus the retired `child_*` kinds). Carries `kind` and `detail`. |
 | `matd op rejected` | info | the request or its meaning was refused — `store_missing` / `store_parse` / `node_not_commissioned` / `device_rejected` / `parse_error` |
 | `matd op slow` | info | success that took **≥ 300 ms**. A warm session is normally 71–149 ms, so this is the early sign of a weak link or a degraded mesh. |
 | `matd op ok` | debug | ordinary success — not shown at the default level |
