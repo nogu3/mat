@@ -57,13 +57,17 @@
 
 ```
 INFO  matd::server: matd op slow op=on node_id=7 endpoint=1 elapsed_ms=1243
-WARN  matd::server: matd op failed op=read node_id=42 endpoint=1 target=occupancysensing/occupancy elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
+WARN  matd::server: matd op failed op=read node_id=42 endpoint=1 path=occupancysensing/occupancy elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
 INFO  matd::server: matd op rejected op=read node_id=99 endpoint=1 elapsed_ms=1 kind=NodeNotCommissioned detail=node 99 is not commissioned
-DEBUG matd::server: matd op ok op=read node_id=6 endpoint=1 target=onoff/on-off elapsed_ms=94
+DEBUG matd::server: matd op ok op=read node_id=6 endpoint=1 path=onoff/on-off elapsed_ms=94
 ```
 
+フィールド名に `target` は使わない — `tracing` のマクロは `target:` を特別扱い
+するため、同名のフィールドは避けて `path` にする（cluster/attribute は Matter の
+attribute path、cluster/command は command path なので意味も合う）。
+
 `kind` は既存 5 箇所（`subscription.rs:415` 他）と同じ `?e.kind`（Debug 表記）に
-揃える。`node_id` / `endpoint` / `target` / `group_id` は `Option` で渡す —
+揃える。`node_id` / `endpoint` / `path` / `group_id` は `Option` で渡す —
 tracing の `impl<T: Value> Value for Option<T>` は `None` のとき
 **フィールドごと省略する**（`tracing-core-0.1.36` `field.rs:791`）ので、
 `node_id=Some(42)` にはならず `grep node_id=42` が効く形を保てる。
@@ -150,7 +154,7 @@ pub fn log_filter_spec(mat_log: Option<&str>, rust_log: Option<&str>) -> Option<
 - `endpoint() -> Option<u16>` — `Describe` / `Ping` / `Shutdown` / `Listen` 以外の
   13 op が `endpoint: u16` を持つ（`Listen` の `endpoint` は `Option<u16>` だが
   dispatch に到達しないので `None` を返す）。
-- `log_target() -> Option<String>` — `Read` / `Write` は `cluster/attribute`、
+- `log_path() -> Option<String>` — `Read` / `Write` は `cluster/attribute`、
   `Invoke` / `GroupInvoke` は `cluster/command`、それ以外は `None`（op 名だけで
   足りる）。
 
