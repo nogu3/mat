@@ -281,6 +281,96 @@ impl ListenFilter {
     }
 }
 
+/// 成功 op のうち、この時間以上かかったものは info で残す（劣化の前兆）。
+/// warm セッションの実測は 71-149ms なので、300ms を超えた成功はもう
+/// 「普段と違う」= 弱リンク化 / メッシュ劣化の兆候である。
+const SLOW_OP_MS: u64 = 300;
+
+/// op ログの level 方針。ここに集約してテストで釘を打ち、tracing のマクロ
+/// 呼び出し側は薄く保つ。
+#[derive(Debug, PartialEq, Eq)]
+enum OpLogClass {
+    /// 経路そのものの問題（warn）。`journalctl -p warning` で劣化だけ抽出できる。
+    Failed,
+    /// 要求側・意味の問題（info）。warn を汚さない。
+    Rejected,
+    /// 成功だが遅い（info）。
+    Slow,
+    /// 通常の成功（debug）。既定 level（info）では出ない。
+    Ok,
+}
+
+/// `ErrorKind` を網羅 match する — 将来 variant が増えたら level の判断を
+/// コンパイラが強制する。
+fn classify_op_log(result: &Result<Value, MatError>, elapsed_ms: u64) -> OpLogClass {
+    match result {
+        Ok(_) if elapsed_ms >= SLOW_OP_MS => OpLogClass::Slow,
+        Ok(_) => OpLogClass::Ok,
+        Err(e) => match e.kind {
+            ErrorKind::Timeout
+            | ErrorKind::Unreachable
+            | ErrorKind::SessionFailed
+            | ErrorKind::Other
+            // commission / child 系は matd 経路では発生しないが、網羅 match の
+            // ために分類は決めておく（発生したら経路の問題として扱う）。
+            | ErrorKind::CommissionFailed
+            | ErrorKind::MatdUnavailable
+            | ErrorKind::ChildNotFound
+            | ErrorKind::ChildFailed => OpLogClass::Failed,
+            ErrorKind::StoreMissing
+            | ErrorKind::StoreParse
+            | ErrorKind::NodeNotCommissioned
+            | ErrorKind::DeviceRejected
+            | ErrorKind::ParseError => OpLogClass::Rejected,
+        },
+    }
+}
+
+/// op 1 件を 1 行で記録する。
+///
+/// `Option` のフィールドはそのまま渡す — tracing は `None` のフィールドを
+/// 省略するので `node_id=Some(42)` にはならず、`grep node_id=42` が効く。
+fn log_op(op: &Op, result: &Result<Value, MatError>, elapsed_ms: u64) {
+    let op_name = op.name();
+    let node_id = op.node_id();
+    let group_id = op.group_id();
+    let endpoint = op.endpoint();
+    let path = op.log_path();
+    let path = path.as_deref();
+    match result {
+        Err(e) => match classify_op_log(result, elapsed_ms) {
+            OpLogClass::Rejected => tracing::info!(
+                op = op_name, node_id, group_id, endpoint, path, elapsed_ms,
+                kind = ?e.kind, detail = %e.detail, "matd op rejected"
+            ),
+            _ => tracing::warn!(
+                op = op_name, node_id, group_id, endpoint, path, elapsed_ms,
+                kind = ?e.kind, detail = %e.detail, "matd op failed"
+            ),
+        },
+        Ok(_) => match classify_op_log(result, elapsed_ms) {
+            OpLogClass::Slow => tracing::info!(
+                op = op_name,
+                node_id,
+                group_id,
+                endpoint,
+                path,
+                elapsed_ms,
+                "matd op slow"
+            ),
+            _ => tracing::debug!(
+                op = op_name,
+                node_id,
+                group_id,
+                endpoint,
+                path,
+                elapsed_ms,
+                "matd op ok"
+            ),
+        },
+    }
+}
+
 /// 1 リクエスト行を処理して応答 JSON を組み立てる。戻り値の bool は shutdown 要求か。
 async fn dispatch(
     line: &str,
@@ -303,7 +393,13 @@ async fn dispatch(
     let id = req.id.clone();
     let is_shutdown = matches!(req.op, Op::Shutdown);
 
-    let body = match run_op(&req.op, native, store_path, health).await {
+    // op の所要時間は run_op のみを測る（JSON パース・応答書き込みは含めない）。
+    let started = std::time::Instant::now();
+    let result = run_op(&req.op, native, store_path, health).await;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    log_op(&req.op, &result, elapsed_ms);
+
+    let body = match result {
         Ok(mut body) => {
             // id をエコーし、timestamp を必ず付ける（mat スキーマ規約）。
             if let Value::Object(map) = &mut body {
@@ -1819,5 +1915,69 @@ mod tests {
             attribute: "on-off".into(),
         };
         assert_eq!(op_report_expectation(&read, Some(&f), None), None);
+    }
+
+    fn err(kind: ErrorKind) -> Result<Value, MatError> {
+        Err(MatError::new(kind, "test"))
+    }
+
+    #[test]
+    fn path_failures_are_warn_worthy() {
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::Unreachable,
+            ErrorKind::SessionFailed,
+            ErrorKind::Other,
+            ErrorKind::CommissionFailed,
+            ErrorKind::MatdUnavailable,
+            ErrorKind::ChildNotFound,
+            ErrorKind::ChildFailed,
+        ] {
+            assert_eq!(
+                classify_op_log(&err(kind), 10),
+                OpLogClass::Failed,
+                "kind: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_side_errors_do_not_pollute_warn() {
+        for kind in [
+            ErrorKind::StoreMissing,
+            ErrorKind::StoreParse,
+            ErrorKind::NodeNotCommissioned,
+            ErrorKind::DeviceRejected,
+            ErrorKind::ParseError,
+        ] {
+            assert_eq!(
+                classify_op_log(&err(kind), 10),
+                OpLogClass::Rejected,
+                "kind: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_threshold_is_inclusive_at_300ms() {
+        let ok = Ok(json!({"value": true}));
+        assert_eq!(classify_op_log(&ok, 0), OpLogClass::Ok);
+        assert_eq!(classify_op_log(&ok, 299), OpLogClass::Ok);
+        assert_eq!(classify_op_log(&ok, 300), OpLogClass::Slow);
+        assert_eq!(classify_op_log(&ok, 8134), OpLogClass::Slow);
+    }
+
+    #[test]
+    fn elapsed_time_does_not_change_error_classification() {
+        // 失敗は所要時間に関わらず失敗として分類される（速い失敗を
+        // 「速いから ok」に見せない）。
+        assert_eq!(
+            classify_op_log(&err(ErrorKind::Timeout), 0),
+            OpLogClass::Failed
+        );
+        assert_eq!(
+            classify_op_log(&err(ErrorKind::NodeNotCommissioned), 9999),
+            OpLogClass::Rejected
+        );
     }
 }
