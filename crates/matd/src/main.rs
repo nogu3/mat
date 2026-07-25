@@ -65,9 +65,10 @@ enum Command {
 fn main() {
     // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
     // 既定は info（常駐デーモンなので状態遷移は既定で残す）。空文字は
-    // 未設定扱い（`mat_core::log` 参照）。
-    let filter = mat_core::log::log_filter_spec_from_env()
-        .and_then(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
+    // 未設定扱い、パースできない指定は次の候補へ送る（`mat_core::log` 参照）。
+    let filter = mat_core::log::log_filter_candidates_from_env()
+        .into_iter()
+        .find_map(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)

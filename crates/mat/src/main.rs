@@ -204,9 +204,11 @@ fn main() -> ExitCode {
 /// 診断ログを stderr に出す。レベルは `MAT_LOG`（無ければ `RUST_LOG`）で制御、
 /// 既定は `warn`。stdout は JSON 専用なので絶対に汚さない。
 fn init_tracing() {
-    // 空文字は未設定扱い（`mat_core::log` 参照）。既定は warn。
-    let filter = mat_core::log::log_filter_spec_from_env()
-        .and_then(|s| EnvFilter::try_new(&s).ok())
+    // 空文字は未設定扱い、パースできない指定は次の候補へ送る
+    // （`mat_core::log` 参照）。既定は warn。
+    let filter = mat_core::log::log_filter_candidates_from_env()
+        .into_iter()
+        .find_map(|s| EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| EnvFilter::new("warn"));
     fmt()
         .with_env_filter(filter)
