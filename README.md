@@ -1166,6 +1166,50 @@ is `unreachable` (exit `5`).
   `tool_missing` entry inside `diag node --deep`'s `unavailable` array — this
   never becomes exit 12.)
 
+## Logs (stderr)
+
+`mat` and `matd` write diagnostics to **stderr** as structured `tracing` logs
+(stdout stays pure JSON). The filter comes from `MAT_LOG`, falling back to
+`RUST_LOG`; the default is `warn` for `mat` and `info` for `matd`. An empty
+value counts as unset, so `MAT_LOG=` falls back to the default instead of
+silencing everything.
+
+`matd` never emits ANSI escapes, and `mat` colors only when stderr is a
+terminal — so `grep node_id=42` works on a journal or through a pipe.
+
+`matd` logs one line per op:
+
+| line | level | when |
+|---|---|---|
+| `matd op failed` | warn | the path itself failed — `timeout` / `unreachable` / `session_failed` / `other` / `commission_failed` / `matd_unavailable` (plus the retired `child_*` kinds). Carries `kind` and `detail`. |
+| `matd op rejected` | info | the request or its meaning was refused — `store_missing` / `store_parse` / `node_not_commissioned` / `device_rejected` / `parse_error` |
+| `matd op slow` | info | success that took **≥ 300 ms**. A warm session is normally 71–149 ms, so this is the early sign of a weak link or a degraded mesh. |
+| `matd op ok` | debug | ordinary success — not shown at the default level |
+
+Fields: `op`, `node_id` / `group_id`, `endpoint`, `path` (`cluster/attribute`
+or `cluster/command`), `elapsed_ms` (the op itself, excluding JSON handling).
+Absent fields are omitted rather than printed as `None`. String values are
+quoted by the formatter, numbers are not:
+
+```
+WARN matd::server: matd op failed op="read" node_id=42 endpoint=1 path="occupancysensing/occupancy" elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
+```
+
+Note that `kind` prints the Rust variant name, not the JSON spelling — the log says `kind=Timeout` where the error object says `"kind": "timeout"`.
+
+Related lines:
+
+- `no warm session; establishing` (info) — a CASE session had to be built for
+  this op. Repeatedly for one node means session churn.
+- `listen client attached` / `listen client detached` (info) — an event-stream
+  client connected or went away. `detached` carries `delivered` and `reason`
+  (`client_disconnected` / `channel_closed`).
+- `subscription established` / `report pump ended` / `subscription lost;
+  resubscribing` (info) — the resident Subscribe lifecycle (see
+  [Subscriptions](#subscriptions-subscriptionstoml-optional-matd-only)).
+
+`journalctl -p warning` gives you just the degradation.
+
 ## Backend
 
 `mat`'s backend is a **native, from-scratch Rust Matter controller** (crate
@@ -1197,7 +1241,7 @@ Environment variables:
 | `MAT_CD_SIGNER_STORE` | CD signer trust store (warn-only if absent) |
 | `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission |
 | `MAT_PING6_BIN` | override the `ping6` binary used by `diag node --deep` |
-| `MAT_LOG` | `tracing` filter for stderr logs (e.g. `info`) |
+| `MAT_LOG` | `tracing` filter for stderr logs (e.g. `info`); empty counts as unset — see [Logs](#logs-stderr) |
 
 > Matter uses mDNS / IPv6 multicast, so running in Docker **requires host
 > networking** (`docker run --network host`). A bridge network cannot receive

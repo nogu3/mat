@@ -64,13 +64,19 @@ enum Command {
 
 fn main() {
     // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
-    // 既定は info（常駐デーモンなので状態遷移は既定で残す）。
+    // 既定は info（常駐デーモンなので状態遷移は既定で残す）。空文字は
+    // 未設定扱い、パースできない指定は次の候補へ送る（`mat_core::log` 参照）。
+    let filter = mat_core::log::log_filter_candidates_from_env()
+        .into_iter()
+        .find_map(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MAT_LOG")
-                .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
+        // デーモンなので ANSI は常に無効。tracing-subscriber は tty 判定を
+        // せず（`is_ansi = cfg!(feature = "ansi") && NO_COLOR 未設定`）、
+        // 既定では journald に `^[[3mnode_id^[[0m^[[2m=^[[0m42` を書いて
+        // しまい `grep node_id=42` が空振りする。
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 

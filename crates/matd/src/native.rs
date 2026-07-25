@@ -132,6 +132,11 @@ impl NativeBackend {
         let slot = self.slot(node_id).await;
         let mut guard = slot.lock().await;
         if guard.is_none() {
+            // cold: warm セッションが無いので CASE から張る。同じノードで
+            // これが繰り返し出るなら session churn（op ログの elapsed_ms が
+            // 伸びる原因）。再確立側は下の Timeout / その他エラー腕で既に
+            // info を出しているので、これで確立の両側が揃う。
+            tracing::info!(node_id, "no warm session; establishing");
             *guard = Some(self.engine.establisher.establish(node_id).await?);
         }
         let result = op(guard.as_mut().expect("established above")).await;
