@@ -12,6 +12,7 @@ mod native_direct;
 mod probe;
 mod resolve;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -203,11 +204,15 @@ fn main() -> ExitCode {
 /// 診断ログを stderr に出す。レベルは `MAT_LOG`（無ければ `RUST_LOG`）で制御、
 /// 既定は `warn`。stdout は JSON 専用なので絶対に汚さない。
 fn init_tracing() {
-    let filter = EnvFilter::try_from_env("MAT_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    // 空文字は未設定扱い（`mat_core::log` 参照）。既定は warn。
+    let filter = mat_core::log::log_filter_spec_from_env()
+        .and_then(|s| EnvFilter::try_new(&s).ok())
+        .unwrap_or_else(|| EnvFilter::new("warn"));
     fmt()
         .with_env_filter(filter)
+        // 対話 tty では色を許すが、パイプや mando 経由では ANSI を出さない
+        // （構造化ログを grep できる形に保つ）。
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 }
