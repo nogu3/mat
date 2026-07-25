@@ -1195,6 +1195,8 @@ quoted by the formatter, numbers are not:
 WARN matd::server: matd op failed op="read" node_id=42 endpoint=1 path="occupancysensing/occupancy" elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
 ```
 
+Note that `kind` prints the Rust variant name, not the JSON spelling — the log says `kind=Timeout` where the error object says `"kind": "timeout"`.
+
 Related lines:
 
 - `no warm session; establishing` (info) — a CASE session had to be built for

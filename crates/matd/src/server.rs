@@ -422,7 +422,7 @@ async fn dispatch(
             // op ログの唯一の穴を塞ぐ。未知の op（新しい mat ↔ 古い matd の
             // バージョン差異）もここに来るので、無音だと切り分けができない。
             // `line` 自体は出さない — 要求のペイロードを journald に残さない。
-            tracing::info!(kind = "parse_error", detail = %e, "matd request rejected");
+            tracing::info!(kind = ?ErrorKind::ParseError, detail = %e, "matd request rejected");
             return (
                 error_response(
                     None,
