@@ -263,8 +263,10 @@ cargo build -p matd
 S=$(mktemp -d)
 # この環境の iface autodetect は [eth1, eth4] で曖昧なので明示する。
 # socket も一時ディレクトリに逃がす（/run/user/... に残骸を作らない）。
-MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_MATD_SOCKET=$S/t.sock MAT_LOG=info \
-  timeout 3 ./target/debug/matd 2>&1 | cat -v | head -5
+# matd 自身の bind 先は `--socket`。`MAT_MATD_SOCKET` は mat クライアント側が
+# 読む変数なので matd には効かない。
+MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_LOG=info \
+  timeout 3 ./target/debug/matd --socket $S/t.sock 2>&1 | cat -v | head -5
 ```
 
 Expected: `INFO matd: matd: resident mDNS operational cache enabled` のような行が
@@ -272,8 +274,8 @@ Expected: `INFO matd: matd: resident mDNS operational cache enabled` のよう�
 のように必ず含まれていた）。
 
 ```bash
-MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_MATD_SOCKET=$S/t.sock MAT_LOG="" \
-  timeout 3 ./target/debug/matd 2>&1 | head -3
+MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_LOG="" \
+  timeout 3 ./target/debug/matd --socket $S/t.sock 2>&1 | head -3
 rm -rf $S
 ```
 
@@ -759,8 +761,8 @@ Expected: exit 0
 ```bash
 cargo build -p matd
 S=$(mktemp -d)
-MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_MATD_SOCKET=$S/t.sock MAT_LOG=info \
-  ./target/debug/matd 2>$S/log &
+MAT_STORE=$S MAT_MATD_IFACE=eth1 MAT_LOG=info \
+  ./target/debug/matd --socket $S/t.sock 2>$S/log &
 sleep 1
 printf '{"op":"read","node_id":6,"endpoint":1,"cluster":"onoff","attribute":"on-off"}\n' \
   | timeout 5 nc -U $S/t.sock
@@ -1141,7 +1143,7 @@ jarvis 上で（`XDG_RUNTIME_DIR=/run/user/1000` を前置きすること。直�
 
 ```bash
 S=/tmp/matd-e2e; mkdir -p $S
-MAT_LOG=info MAT_MATD_SOCKET=$S/t.sock ~/matd.new --store ~/.config/mat \
+MAT_LOG=info ~/matd.new --store ~/.config/mat --socket $S/t.sock \
   --fabric-index 2 2>$S/log &
 sleep 5
 ~/mat.new --matd $S/t.sock read -n <node> -e 1 -c onoff -a on-off   # cold
