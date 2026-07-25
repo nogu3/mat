@@ -150,6 +150,15 @@ async fn handle_conn(
                 buf.push(b'\n');
                 write_half.write_all(&buf).await?;
                 write_half.flush().await?;
+                // 「センサーが反応しなかった」の切り分けに、購読者が居たか
+                // どうかを残す。フィルタは全て Option なので未指定は省略される。
+                tracing::info!(
+                    node_id = filter.node_id,
+                    endpoint = filter.endpoint,
+                    cluster = filter.cluster,
+                    attribute = filter.attribute,
+                    "listen client attached"
+                );
                 return stream_events(rx, filter, &mut lines, &mut write_half).await;
             }
         }
@@ -176,6 +185,9 @@ async fn stream_events(
     lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> std::io::Result<()> {
+    // 配信件数。切断時に「そもそも 1 件も流れていない」のか
+    // 「流れていたのにクライアントが消えた」のかを区別するため。
+    let mut delivered: u64 = 0;
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
@@ -188,9 +200,15 @@ async fn stream_events(
                     buf.push(b'\n');
                     write_half.write_all(&buf).await?;
                     write_half.flush().await?;
+                    delivered += 1;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "listen client lagged; disconnecting");
+                    tracing::warn!(
+                        skipped = n,
+                        delivered,
+                        node_id = filter.node_id,
+                        "listen client lagged; disconnecting"
+                    );
                     let body = json!({
                         "error": { "kind": "other", "detail": "event stream lagged" },
                         "timestamp": now_iso8601(),
@@ -201,14 +219,30 @@ async fn stream_events(
                     write_half.flush().await?;
                     return Ok(());
                 }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Closed) => {
+                    tracing::info!(
+                        delivered,
+                        node_id = filter.node_id,
+                        reason = "channel_closed",
+                        "listen client detached"
+                    );
+                    return Ok(());
+                }
             },
             line = lines.next_line() => {
                 // クライアント切断（None/Err）でストリーム終了。listen 中の追加
                 // リクエスト行は無視する（この op は接続占有の例外）。
                 match line {
                     Ok(Some(_)) => continue,
-                    _ => return Ok(()),
+                    _ => {
+                        tracing::info!(
+                            delivered,
+                            node_id = filter.node_id,
+                            reason = "client_disconnected",
+                            "listen client detached"
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
