@@ -69,9 +69,18 @@ level 方針は純関数 `classify_op_log` に集約してテストで釘打ち�
 
 **Interfaces:**
 - Consumes: なし（最初のタスク）
-- Produces: `mat_core::log::log_filter_spec(mat_log: Option<&str>, rust_log: Option<&str>) -> Option<String>`
-  と `mat_core::log::log_filter_spec_from_env() -> Option<String>`。以降のタスクは
+- Produces: `mat_core::log::log_filter_candidates(mat_log: Option<&str>, rust_log: Option<&str>) -> Vec<String>`
+  と `mat_core::log::log_filter_candidates_from_env() -> Vec<String>`。以降のタスクは
   これに依存しないが、ログが ANSI なしで出ることを前提に検証手順を書く。
+
+**候補を 1 つに絞らず順序付きで返す理由**（挙動変更ゼロの制約に直結する）:
+旧実装 `EnvFilter::try_from_env("MAT_LOG").or_else(|_| try_from_default_env())` は
+`try_from_env` が**変数未設定のときも、設定されているが不正な指定のときも `Err`**
+を返すため、「`MAT_LOG` が不正なら `RUST_LOG` を使う」挙動を持っていた。指定を
+1 つに先決めしてから 1 回だけパースすると、この経路が失われて既定 level に
+落ちてしまう（`MAT_LOG=garbage!! RUST_LOG=debug` が debug でなく warn/info に
+なる）。候補列を返して呼び出し側が順に `try_new` する形にすれば、空文字の修正と
+旧挙動の保持を同時に満たせる。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -93,35 +102,38 @@ mod tests {
     fn empty_spec_is_treated_as_unset() {
         // 空文字は EnvFilter としては「ディレクティブ 0 個」の有効な指定に
         // なり、ERROR すら出なくなる（実測）。未設定と同じ扱いにする。
-        assert_eq!(log_filter_spec(Some(""), None), None);
-        assert_eq!(log_filter_spec(Some("   "), None), None);
+        assert!(log_filter_candidates(Some(""), None).is_empty());
+        assert!(log_filter_candidates(Some("   "), None).is_empty());
     }
 
     #[test]
-    fn mat_log_wins_over_rust_log() {
+    fn mat_log_comes_before_rust_log() {
         assert_eq!(
-            log_filter_spec(Some("debug"), Some("trace")),
-            Some("debug".to_string())
+            log_filter_candidates(Some("debug"), Some("trace")),
+            vec!["debug".to_string(), "trace".to_string()]
         );
     }
 
     #[test]
     fn empty_mat_log_falls_back_to_rust_log() {
         assert_eq!(
-            log_filter_spec(Some(""), Some("info")),
-            Some("info".to_string())
+            log_filter_candidates(Some(""), Some("info")),
+            vec!["info".to_string()]
         );
     }
 
     #[test]
     fn surrounding_whitespace_is_trimmed() {
-        assert_eq!(log_filter_spec(Some(" info "), None), Some("info".to_string()));
+        assert_eq!(
+            log_filter_candidates(Some(" info "), None),
+            vec!["info".to_string()]
+        );
     }
 
     #[test]
-    fn absent_everywhere_is_none() {
-        assert_eq!(log_filter_spec(None, None), None);
-        assert_eq!(log_filter_spec(None, Some("  ")), None);
+    fn absent_everywhere_is_empty() {
+        assert!(log_filter_candidates(None, None).is_empty());
+        assert!(log_filter_candidates(None, Some("  ")).is_empty());
     }
 }
 ```
@@ -136,33 +148,39 @@ pub mod log;
 - [ ] **Step 2: テストが失敗することを確認**
 
 Run: `cargo test -p mat-core --lib log::`
-Expected: コンパイルエラー `cannot find function 'log_filter_spec' in this scope`
+Expected: コンパイルエラー `cannot find function 'log_filter_candidates' in this scope`
 
 - [ ] **Step 3: 最小の実装を書く**
 
 `crates/mat-core/src/log.rs` の doc コメントの直後、`#[cfg(test)]` の前に足す:
 
 ```rust
-/// `MAT_LOG` / `RUST_LOG` からログフィルタ指定を選ぶ（`MAT_LOG` 優先）。
+/// ログフィルタ指定の候補を `MAT_LOG` → `RUST_LOG` の優先順で返す。
 ///
 /// 空文字・空白のみは **未設定として扱う**。`EnvFilter` としてはディレクティブ
 /// 0 個の有効な指定になり、既定 level に落ちずログが全 OFF になるため
 /// （`systemctl --user set-environment MAT_LOG=...` で一時 debug を入れて
 /// 戻すときに踏みやすい）。
-pub fn log_filter_spec(mat_log: Option<&str>, rust_log: Option<&str>) -> Option<String> {
-    let pick = |v: Option<&str>| {
-        v.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    pick(mat_log).or_else(|| pick(rust_log))
+///
+/// 1 つに絞らず順序付きで返すのは、**パースできない指定を次の候補へ送る**ため。
+/// 旧実装の `try_from_env("MAT_LOG").or_else(|_| try_from_default_env())` は
+/// 「`MAT_LOG` が不正なら `RUST_LOG` を使う」挙動を持っていた（`try_from_env` は
+/// 未設定でも不正でも `Err`）。呼び出し側が順に `try_new` することでそれを保つ。
+pub fn log_filter_candidates(mat_log: Option<&str>, rust_log: Option<&str>) -> Vec<String> {
+    [mat_log, rust_log]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
-/// 環境変数を読んで [`log_filter_spec`] を適用する薄いラッパ。
-pub fn log_filter_spec_from_env() -> Option<String> {
+/// 環境変数を読んで [`log_filter_candidates`] を適用する薄いラッパ。
+pub fn log_filter_candidates_from_env() -> Vec<String> {
     let mat_log = std::env::var("MAT_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
-    log_filter_spec(mat_log.as_deref(), rust_log.as_deref())
+    log_filter_candidates(mat_log.as_deref(), rust_log.as_deref())
 }
 ```
 
@@ -195,9 +213,10 @@ fn main() {
 fn main() {
     // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
     // 既定は info（常駐デーモンなので状態遷移は既定で残す）。空文字は
-    // 未設定扱い（`mat_core::log` 参照）。
-    let filter = mat_core::log::log_filter_spec_from_env()
-        .and_then(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
+    // 未設定扱い、パースできない指定は次の候補へ送る（`mat_core::log` 参照）。
+    let filter = mat_core::log::log_filter_candidates_from_env()
+        .into_iter()
+        .find_map(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -210,8 +229,8 @@ fn main() {
         .init();
 ```
 
-無効なフィルタ文字列のときに既定 level へ落ちる挙動は維持されている
-（`try_new(...).ok()` が `None` → `unwrap_or_else`）。
+無効なフィルタ文字列のときの挙動は旧実装と同じ: `MAT_LOG` が不正なら
+`RUST_LOG` を試し、それも駄目（または未設定）なら既定 level へ落ちる。
 
 - [ ] **Step 6: mat の subscriber を差し替える**
 
@@ -233,9 +252,11 @@ fn init_tracing() {
 
 ```rust
 fn init_tracing() {
-    // 空文字は未設定扱い（`mat_core::log` 参照）。既定は warn。
-    let filter = mat_core::log::log_filter_spec_from_env()
-        .and_then(|s| EnvFilter::try_new(&s).ok())
+    // 空文字は未設定扱い、パースできない指定は次の候補へ送る
+    // （`mat_core::log` 参照）。既定は warn。
+    let filter = mat_core::log::log_filter_candidates_from_env()
+        .into_iter()
+        .find_map(|s| EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| EnvFilter::new("warn"));
     fmt()
         .with_env_filter(filter)
@@ -1197,7 +1218,7 @@ systemctl --user status matd   # 本番が active のままであること
 | 5. listen の attach / detach、lag warn に `delivered` | Task 5 Step 1, 2 |
 | 6. `Op` のアクセサ 4 つ（`name` / `group_id` / `endpoint` / `log_path`） | Task 2 Step 3 |
 | フィールド名に `target` を使わない（`path` にする） | Global Constraints + Task 2 Step 3 |
-| テスト（classify 網羅 / アクセサ代表ケース / `log_filter_spec`） | Task 3 Step 1、Task 2 Step 1、Task 1 Step 1 |
+| テスト（classify 網羅 / アクセサ代表ケース / `log_filter_candidates`） | Task 3 Step 1、Task 2 Step 1、Task 1 Step 1 |
 | 実機 E2E（別 socket に 30 秒、確認 6 項目） | Task 6 Step 6 |
 | README `## Logs (stderr)` | Task 6 Step 1, 2 |
 | バージョン 1.3.0 | Task 6 Step 3 |
@@ -1223,5 +1244,6 @@ systemctl --user status matd   # 本番が active のままであること
   `Option<&str>` で渡す。テストも `as_deref()` で比較している。
 - `Op::group_id()` / `endpoint()` は `Option<u16>`、`node_id()` は既存の
   `Option<u64>`。
-- `mat_core::log::log_filter_spec` は `Option<&str>` × 2 → `Option<String>`。
-  両バイナリは `log_filter_spec_from_env()`（引数なし）を呼ぶ。
+- `mat_core::log::log_filter_candidates` は `Option<&str>` × 2 → `Vec<String>`。
+  両バイナリは `log_filter_candidates_from_env()`（引数なし）を呼び、
+  `.into_iter().find_map(|s| EnvFilter::try_new(&s).ok())` で順に試す。

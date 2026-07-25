@@ -109,10 +109,18 @@ fn classify_op_log(result: &Result<Value, MatError>, elapsed_ms: u128) -> OpLogC
 
 ```rust
 // mat-core
-/// ログフィルタ指定を選ぶ。空文字・空白のみは「未設定」として扱う
-/// （EnvFilter として有効なため、そのまま渡すと全 OFF になる）。
-pub fn log_filter_spec(mat_log: Option<&str>, rust_log: Option<&str>) -> Option<String>
+/// ログフィルタ指定の候補を MAT_LOG → RUST_LOG の優先順で返す。空文字・
+/// 空白のみは「未設定」として扱う（EnvFilter として有効なため、そのまま
+/// 渡すと全 OFF になる）。呼び出し側が順に `EnvFilter::try_new` する。
+pub fn log_filter_candidates(mat_log: Option<&str>, rust_log: Option<&str>) -> Vec<String>
 ```
+
+1 つに絞らず候補列を返すのは**旧挙動を保つため**。旧実装
+`try_from_env("MAT_LOG").or_else(|_| try_from_default_env())` は `try_from_env` が
+未設定でも不正でも `Err` を返すので「`MAT_LOG` が不正なら `RUST_LOG` を使う」
+挙動を持っていた。先に 1 つへ絞ってから 1 回だけパースすると
+`MAT_LOG=garbage!! RUST_LOG=debug` が既定 level に落ちてしまい、「挙動変更ゼロ」に
+反する。
 
 - `matd`: `.with_ansi(false)` 固定（デーモンなので無条件）。既定 level は info を維持。
 - `mat`: `.with_ansi(std::io::stderr().is_terminal())`（対話では色あり、パイプや
