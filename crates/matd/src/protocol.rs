@@ -199,6 +199,109 @@ impl Op {
             | Op::Shutdown => None,
         }
     }
+
+    /// 構造化ログ用の op 名。ソケットプロトコルの `op` タグと同じ snake_case
+    /// （`Op` は `Deserialize` のみなのでタグ文字列を再利用できず、手書きの
+    /// 網羅 match にする — op 追加時にコンパイラが漏れを強制する）。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::Read { .. } => "read",
+            Op::Write { .. } => "write",
+            Op::Invoke { .. } => "invoke",
+            Op::On { .. } => "on",
+            Op::Off { .. } => "off",
+            Op::ColorTemp { .. } => "color_temp",
+            Op::Level { .. } => "level",
+            Op::Color { .. } => "color",
+            Op::Describe { .. } => "describe",
+            Op::GroupProvision { .. } => "group_provision",
+            Op::GroupInvoke { .. } => "group_invoke",
+            Op::GroupColorTemp { .. } => "group_color_temp",
+            Op::GroupLevel { .. } => "group_level",
+            Op::GroupColor { .. } => "group_color",
+            Op::Listen { .. } => "listen",
+            Op::Ping => "ping",
+            Op::Shutdown => "shutdown",
+        }
+    }
+
+    /// group 系 op の対象 group_id（ログ用）。node_id を持たない op の識別に使う。
+    pub fn group_id(&self) -> Option<u16> {
+        match self {
+            Op::GroupProvision { group_id, .. }
+            | Op::GroupInvoke { group_id, .. }
+            | Op::GroupColorTemp { group_id, .. }
+            | Op::GroupLevel { group_id, .. }
+            | Op::GroupColor { group_id, .. } => Some(*group_id),
+            Op::Read { .. }
+            | Op::Write { .. }
+            | Op::Invoke { .. }
+            | Op::On { .. }
+            | Op::Off { .. }
+            | Op::ColorTemp { .. }
+            | Op::Level { .. }
+            | Op::Color { .. }
+            | Op::Describe { .. }
+            | Op::Listen { .. }
+            | Op::Ping
+            | Op::Shutdown => None,
+        }
+    }
+
+    /// ログ用の endpoint。`Listen` の `endpoint` は `Option` だが、この op は
+    /// dispatch に到達しない（`handle_conn` が先取りする）ので None を返す。
+    pub fn endpoint(&self) -> Option<u16> {
+        match self {
+            Op::Read { endpoint, .. }
+            | Op::Write { endpoint, .. }
+            | Op::Invoke { endpoint, .. }
+            | Op::On { endpoint, .. }
+            | Op::Off { endpoint, .. }
+            | Op::ColorTemp { endpoint, .. }
+            | Op::Level { endpoint, .. }
+            | Op::Color { endpoint, .. }
+            | Op::GroupProvision { endpoint, .. }
+            | Op::GroupInvoke { endpoint, .. }
+            | Op::GroupColorTemp { endpoint, .. }
+            | Op::GroupLevel { endpoint, .. }
+            | Op::GroupColor { endpoint, .. } => Some(*endpoint),
+            Op::Describe { .. } | Op::Listen { .. } | Op::Ping | Op::Shutdown => None,
+        }
+    }
+
+    /// ログ用の対象パス。属性系は `cluster/attribute`、コマンド系は
+    /// `cluster/command`。op 名だけで足りるショートカットは None。
+    /// （フィールド名に `target` を使わないのは tracing のマクロが `target:` を
+    /// 特別扱いするため。）
+    pub fn log_path(&self) -> Option<String> {
+        match self {
+            Op::Read {
+                cluster, attribute, ..
+            }
+            | Op::Write {
+                cluster, attribute, ..
+            } => Some(format!("{cluster}/{attribute}")),
+            Op::Invoke {
+                cluster, command, ..
+            }
+            | Op::GroupInvoke {
+                cluster, command, ..
+            } => Some(format!("{cluster}/{command}")),
+            Op::On { .. }
+            | Op::Off { .. }
+            | Op::ColorTemp { .. }
+            | Op::Level { .. }
+            | Op::Color { .. }
+            | Op::Describe { .. }
+            | Op::GroupProvision { .. }
+            | Op::GroupColorTemp { .. }
+            | Op::GroupLevel { .. }
+            | Op::GroupColor { .. }
+            | Op::Listen { .. }
+            | Op::Ping
+            | Op::Shutdown => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -447,5 +550,59 @@ mod tests {
                 ..
             } if n == "red" && rgb == "#ff0000"
         ));
+    }
+
+    #[test]
+    fn name_matches_the_wire_op_tag() {
+        for (line, expected) in [
+            (
+                r#"{"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}"#,
+                "read",
+            ),
+            (
+                r#"{"op":"color_temp","node_id":1,"endpoint":1,"mireds":300,"kelvin":3333}"#,
+                "color_temp",
+            ),
+            (
+                r#"{"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","endpoint":1}"#,
+                "group_invoke",
+            ),
+            (r#"{"op":"ping"}"#, "ping"),
+            (r#"{"op":"shutdown"}"#, "shutdown"),
+        ] {
+            assert_eq!(parse(line).op.name(), expected, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn log_accessors_pick_the_right_fields() {
+        let read = parse(
+            r#"{"op":"read","node_id":6,"endpoint":1,"cluster":"onoff","attribute":"on-off"}"#,
+        )
+        .op;
+        assert_eq!(read.node_id(), Some(6));
+        assert_eq!(read.group_id(), None);
+        assert_eq!(read.endpoint(), Some(1));
+        assert_eq!(read.log_path().as_deref(), Some("onoff/on-off"));
+
+        let group_invoke = parse(
+            r#"{"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","endpoint":1}"#,
+        )
+        .op;
+        assert_eq!(group_invoke.node_id(), None);
+        assert_eq!(group_invoke.group_id(), Some(10));
+        assert_eq!(group_invoke.endpoint(), Some(1));
+        assert_eq!(group_invoke.log_path().as_deref(), Some("onoff/on"));
+
+        // ショートカット op は op 名だけで用が足りるので path を持たない。
+        let on = parse(r#"{"op":"on","node_id":6,"endpoint":1}"#).op;
+        assert_eq!(on.log_path(), None);
+        assert_eq!(on.endpoint(), Some(1));
+
+        // endpoint も group_id も持たない op。
+        let ping = parse(r#"{"op":"ping"}"#).op;
+        assert_eq!(ping.endpoint(), None);
+        assert_eq!(ping.group_id(), None);
+        assert_eq!(ping.log_path(), None);
     }
 }
