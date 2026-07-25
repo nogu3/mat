@@ -1087,7 +1087,12 @@ terminal — so `grep node_id=42` works on a journal or through a pipe.
 
 Fields: `op`, `node_id` / `group_id`, `endpoint`, `path` (`cluster/attribute`
 or `cluster/command`), `elapsed_ms` (the op itself, excluding JSON handling).
-Absent fields are omitted rather than printed as `None`.
+Absent fields are omitted rather than printed as `None`. String values are
+quoted by the formatter, numbers are not:
+
+```
+WARN matd::server: matd op failed op="read" node_id=42 endpoint=1 path="occupancysensing/occupancy" elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
+```
 
 Related lines:
 

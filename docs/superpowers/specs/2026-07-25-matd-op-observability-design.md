@@ -56,11 +56,16 @@
 出力の実物:
 
 ```
-INFO  matd::server: matd op slow op=on node_id=7 endpoint=1 elapsed_ms=1243
-WARN  matd::server: matd op failed op=read node_id=42 endpoint=1 path=occupancysensing/occupancy elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
-INFO  matd::server: matd op rejected op=read node_id=99 endpoint=1 elapsed_ms=1 kind=NodeNotCommissioned detail=node 99 is not commissioned
-DEBUG matd::server: matd op ok op=read node_id=6 endpoint=1 path=onoff/on-off elapsed_ms=94
+INFO  matd::server: matd op slow op="on" node_id=7 endpoint=1 elapsed_ms=1243
+WARN  matd::server: matd op failed op="read" node_id=42 endpoint=1 path="occupancysensing/occupancy" elapsed_ms=8134 kind=Timeout detail=no acknowledgement within MRP retry budget
+INFO  matd::server: matd op rejected op="read" node_id=99 endpoint=1 elapsed_ms=1 kind=NodeNotCommissioned detail=node 99 is not commissioned
+DEBUG matd::server: matd op ok op="read" node_id=6 endpoint=1 path="onoff/on-off" elapsed_ms=94
 ```
+
+文字列フィールドが引用符付きになるのは既定フォーマッタの仕様（`&str` は
+`record_str` → `record_debug` を通るので `{:?}` 整形になる）。数値は素のままなので
+`grep node_id=42` は効く。`%` 整形（Display）を使っている `detail` も素のまま。
+実測で確認済み。
 
 フィールド名に `target` は使わない — `tracing` のマクロは `target:` を特別扱い
 するため、同名のフィールドは避けて `path` にする（cluster/attribute は Matter の
