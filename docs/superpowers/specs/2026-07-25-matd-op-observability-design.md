@@ -85,9 +85,13 @@ tracing の `impl<T: Value> Value for Option<T>` は `None` のとき
 
 ```rust
 enum OpLogClass { Failed, Rejected, Slow, Ok }
-const SLOW_OP_MS: u128 = 300;
-fn classify_op_log(result: &Result<Value, MatError>, elapsed_ms: u128) -> OpLogClass
+const SLOW_OP_MS: u64 = 300;
+fn classify_op_log(result: &Result<Value, MatError>, elapsed_ms: u64) -> OpLogClass
 ```
+
+`elapsed_ms` は `u64`。`Instant::elapsed().as_millis()` は `u128` だが tracing の
+`Value` 実装は `u64` までを当てにできるので、`u64::try_from(...).unwrap_or(u64::MAX)`
+で変換する（`as` キャストや `unwrap()` は使わない）。
 
 - **Failed（warn）** — `Timeout` / `Unreachable` / `SessionFailed` / `Other` /
   `CommissionFailed` / `MatdUnavailable` / `ChildNotFound` / `ChildFailed`。
@@ -189,9 +193,9 @@ pub fn log_filter_candidates(mat_log: Option<&str>, rust_log: Option<&str>) -> V
 
 - `classify_op_log` を `ErrorKind` 全 variant と境界（299ms / 300ms）で網羅。
   これが level 方針の唯一の釘。
-- `Op::name()` / `group_id()` / `log_target()` の代表ケース（網羅性はコンパイラが
-  保証するので全 variant は書かない）。
-- `log_filter_spec` の `Some("")` / 空白のみ / `None` / 有効値 / `RUST_LOG`
+- `Op::name()` / `group_id()` / `endpoint()` / `log_path()` の代表ケース
+  （網羅性はコンパイラが保証するので全 variant は書かない）。
+- `log_filter_candidates` の `Some("")` / 空白のみ / `None` / 有効値 / `RUST_LOG`
   フォールバック（純関数なので環境変数を汚さない）。
 - ANSI とログ本文は単体テストしない（builder 呼び出し 1 行）。`cat -v` で目視する。
 
