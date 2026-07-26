@@ -983,6 +983,7 @@ mod tests {
             node_id: None,
             alias: None,
             thread_dataset: None,
+            transport: crate::cli::TransportArg::Auto,
         })
         .is_err());
     }
