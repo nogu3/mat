@@ -30,6 +30,8 @@ pub struct CommissionRequest {
     pub thread_dataset: Option<Vec<u8>>,
     pub paa_dir: Option<std::path::PathBuf>,
     pub cd_signer_dir: Option<std::path::PathBuf>,
+    /// 経路指定（既定 `Auto`）。
+    pub transport: Transport,
 }
 
 /// setup code をパースした発見キー。QR は 12bit long、manual は 4bit short。
@@ -53,7 +55,6 @@ pub enum Transport {
 
 /// mDNS を引いた結果。I/O は呼び出し側（`discover`）が済ませてから渡す
 /// ——`plan_routes` を純関数に保つため。
-#[allow(dead_code)] // Task 3 で discover() が組み立てる
 enum Discovered {
     /// `--transport ble`: mDNS を引いていない。
     NotConsulted,
@@ -67,7 +68,6 @@ enum Discovered {
 
 /// 試す経路の候補。
 #[derive(Debug)]
-#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
 enum Route {
     OnNetwork {
         target: CommissionTarget,
@@ -77,7 +77,6 @@ enum Route {
 }
 
 impl Route {
-    #[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
     fn label(&self) -> String {
         match self {
             Route::OnNetwork { label, .. } => label.clone(),
@@ -90,7 +89,6 @@ impl Route {
 ///
 /// manual code は 4bit short discriminator しか持たず、BLE scan（12bit 完全
 /// 一致）に使えないため BLE を候補に入れない。
-#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
 fn plan_routes(
     code: &Code,
     transport: Transport,
@@ -215,7 +213,6 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
 /// 除外している。これら 2 つは BLE 経路で PASE 成功・Thread 参加後に出るもので、
 /// デバイスが 120 秒 failsafe 中に我々の部分状態を持つ。ここで別経路を試すと
 /// 部分状態と衝突して不可逆ダメージになる — この検査がその防止線。
-#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
 fn is_dead_end(e: &CommissionError) -> bool {
     use mat_controller::exchange::ExchangeError;
     use mat_controller::pase::PaseError;
@@ -231,6 +228,30 @@ fn is_dead_end(e: &CommissionError) -> bool {
 
 fn commission_error(e: CommissionError) -> MatError {
     MatError::new(kind_of(&e), format!("native commissioning failed: {e}"))
+}
+
+/// 経路要約に載せるための短縮。`MatError::detail` は経路ごとに
+/// `native commissioning...` の接頭辞を持つので、並べるときは畳む。
+fn short_detail(d: &str) -> &str {
+    d.strip_prefix("native commissioning failed: ")
+        .or_else(|| d.strip_prefix("native commissioning: "))
+        .unwrap_or(d)
+}
+
+/// 全経路が尽きたときのエラー。`kind` は最後に試した経路のものを採り、
+/// `detail` に経路ごとの結果を並べる。候補が 1 本だったときは現状の
+/// `MatError` をそのまま返す（表現の互換性）。
+fn compose_failure(failures: &[String], last: MatError) -> MatError {
+    if failures.len() <= 1 {
+        return last;
+    }
+    MatError::new(
+        last.kind,
+        format!(
+            "native commissioning: all routes failed — {}",
+            failures.join("; ")
+        ),
+    )
 }
 
 /// manual code の short discriminator で commissionable 一覧から一意に選ぶ。
@@ -321,6 +342,155 @@ fn resolve_ipk_epoch(
     }
 }
 
+/// mDNS 発見（I/O）。結果を `Discovered` に畳んで `plan_routes` に渡す。
+/// resolve/browse の失敗（timeout 以外）は現状どおりその場で `unreachable`。
+async fn discover(code: &Code, scope_id: u32) -> Result<Discovered, MatError> {
+    match code {
+        Code::Qr { long, .. } => {
+            match dnssd::resolve_commissionable(scope_id, *long, std::time::Duration::from_secs(5))
+                .await
+            {
+                Ok(rn) => {
+                    let label = match rn.addresses.first() {
+                        Some(a) => format!("on-network({a})"),
+                        None => format!("on-network(disc {long})"),
+                    };
+                    Ok(Discovered::Hit {
+                        // 現状どおり Discriminator を渡す（commission_on_network が
+                        // 内部で再 resolve する）。label は表示専用。
+                        target: CommissionTarget::Discriminator(*long),
+                        label,
+                    })
+                }
+                Err(dnssd::DnssdError::Timeout { .. }) => Ok(Discovered::Miss),
+                Err(e) => Err(MatError::new(
+                    ErrorKind::Unreachable,
+                    format!("native commissioning: mdns resolve: {e}"),
+                )),
+            }
+        }
+        Code::Manual { short, .. } => {
+            let list = match dnssd::browse_commissionable(scope_id, dnssd::BROWSE_WINDOW).await {
+                Ok(l) => l,
+                Err(e) => {
+                    return Err(MatError::new(
+                        ErrorKind::Unreachable,
+                        format!("native commissioning: mdns browse: {e}"),
+                    ))
+                }
+            };
+            match pick_by_short_strict(&list, *short)? {
+                Some(c) => {
+                    let Some(addr) = c.addresses.first() else {
+                        return Err(MatError::new(
+                            ErrorKind::Unreachable,
+                            "native commissioning: commissionable found but no address resolved"
+                                .to_string(),
+                        ));
+                    };
+                    let port = c.port.unwrap_or(5540);
+                    let scope = if (addr.segments()[0] & 0xffc0) == 0xfe80 {
+                        scope_id
+                    } else {
+                        0
+                    };
+                    Ok(Discovered::Hit {
+                        target: CommissionTarget::Addr(std::net::SocketAddr::V6(
+                            std::net::SocketAddrV6::new(*addr, port, 0, scope),
+                        )),
+                        label: format!("on-network({addr})"),
+                    })
+                }
+                None => Ok(Discovered::Miss),
+            }
+        }
+    }
+}
+
+/// 1 経路の実行結果。`dead_end` が true なら次の経路へ進んでよい。
+struct RouteFail {
+    err: MatError,
+    dead_end: bool,
+}
+
+async fn run_route(
+    route: &Route,
+    fabric: &CommissioningFabric,
+    req: &CommissionRequest,
+    scope_id: u32,
+    passcode: u32,
+    long: Option<u16>,
+) -> Result<(), RouteFail> {
+    match route {
+        Route::OnNetwork { target, .. } => {
+            let transport = match UdpTransport::bind().await {
+                Ok(t) => std::sync::Arc::new(t),
+                Err(e) => {
+                    return Err(RouteFail {
+                        err: MatError::new(
+                            ErrorKind::Other,
+                            format!("native commissioning: udp bind: {e}"),
+                        ),
+                        dead_end: false,
+                    })
+                }
+            };
+            match commissioning::commission_on_network(
+                transport,
+                fabric,
+                CommissionParams {
+                    passcode,
+                    target: *target,
+                    device_node_id: req.device_node_id,
+                    paa_dir: req.paa_dir.as_deref(),
+                    cd_signer_dir: req.cd_signer_dir.as_deref(),
+                    scope_id,
+                },
+            )
+            .await
+            {
+                Ok(dev) => {
+                    tracing::info!(
+                        node_id = dev.node_id,
+                        fabric_index = ?dev.fabric_index,
+                        "commission executed (native on-network)"
+                    );
+                    Ok(())
+                }
+                Err(other) => {
+                    // 次の経路へ進めるかどうかの判定は常に `is_dead_end` のみが
+                    // 決める（`Discovery(_)` は常に dead end）。`other` を借用
+                    // している間に判定を終えてから、専用文言のための特別扱い
+                    // （`Discovery`）だけをメッセージ生成側で行う。
+                    let dead_end = is_dead_end(&other);
+                    let err = match other {
+                        // 内部 resolve（PASE より前）での空振り。事前 resolve
+                        // 成功後の狭い競合窓だが発見の空振りなので unreachable。
+                        CommissionError::Discovery(e) => MatError::new(
+                            ErrorKind::Unreachable,
+                            format!(
+                                "native commissioning: commissionable disappeared before PASE: {e}"
+                            ),
+                        ),
+                        other => commission_error(other),
+                    };
+                    Err(RouteFail { err, dead_end })
+                }
+            }
+        }
+        Route::Ble => {
+            // BLE は QR コードでしか計画に載らない（plan_routes）。
+            let long = long.expect("ble route is planned only for QR codes");
+            ble_path(fabric, req, passcode, long, scope_id)
+                .await
+                .map_err(|err| RouteFail {
+                    err,
+                    dead_end: false,
+                })
+        }
+    }
+}
+
 pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(), MatError> {
     let code = parse_code(&req.setup_code)?;
 
@@ -367,113 +537,54 @@ pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(
     let ipk_epoch = resolve_ipk_epoch(&main_ini, cfg.fabric_index, &creds)?;
     let commissioning_fabric = CommissioningFabric::from_materials(materials, ipk_epoch);
 
-    // 発見と経路選択（mDNS → BLE）。
-    let (passcode, target) = match code {
-        Code::Qr { passcode, long } => {
-            match dnssd::resolve_commissionable(scope_id, long, std::time::Duration::from_secs(5))
-                .await
-            {
-                Ok(_) => (passcode, CommissionTarget::Discriminator(long)),
-                Err(dnssd::DnssdError::Timeout { .. }) => {
-                    // mDNS に居ない → BLE を試す（ble ビルド + dataset 必須）。
-                    return ble_path(&commissioning_fabric, req, passcode, long, scope_id).await;
-                }
-                Err(e) => {
-                    return Err(MatError::new(
-                        ErrorKind::Unreachable,
-                        format!("native commissioning: mdns resolve: {e}"),
-                    ))
-                }
-            }
-        }
-        Code::Manual { passcode, short } => {
-            let list = match dnssd::browse_commissionable(scope_id, dnssd::BROWSE_WINDOW).await {
-                Ok(l) => l,
-                Err(e) => {
-                    return Err(MatError::new(
-                        ErrorKind::Unreachable,
-                        format!("native commissioning: mdns browse: {e}"),
-                    ))
-                }
-            };
-            match pick_by_short_strict(&list, short)? {
-                Some(c) => {
-                    let Some(addr) = c.addresses.first() else {
-                        return Err(MatError::new(
-                            ErrorKind::Unreachable,
-                            "native commissioning: commissionable found but no address resolved"
-                                .to_string(),
-                        ));
-                    };
-                    let port = c.port.unwrap_or(5540);
-                    let scope = if (addr.segments()[0] & 0xffc0) == 0xfe80 {
-                        scope_id
-                    } else {
-                        0
-                    };
-                    (
-                        passcode,
-                        CommissionTarget::Addr(std::net::SocketAddr::V6(
-                            std::net::SocketAddrV6::new(*addr, port, 0, scope),
-                        )),
-                    )
-                }
-                // manual code は BLE 経路なし（scan は 12bit 完全一致 —
-                // BLE で commission したい場合は QR を使う）。
-                None => {
-                    return Err(MatError::new(
-                        ErrorKind::Unreachable,
-                        "native commissioning: not found via mDNS (manual code cannot use BLE; use the QR payload)"
-                            .to_string(),
-                    ))
-                }
-            }
-        }
+    // 発見（I/O）。--transport ble は mDNS を一切引かない。
+    let discovered = if req.transport == Transport::Ble {
+        Discovered::NotConsulted
+    } else {
+        discover(&code, scope_id).await?
     };
 
-    // UDP bind はローカルのエフェメラルポート取得のみ。M8c-3 で失敗は other。
-    // on-network 実行はここから先（commission_on_network 呼び出し）が実ワイヤ
-    // 接触で、そちらの失敗は `kind_of` 写像。
-    let transport = match UdpTransport::bind().await {
-        Ok(t) => std::sync::Arc::new(t),
-        Err(e) => {
-            return Err(MatError::new(
-                ErrorKind::Other,
-                format!("native commissioning: udp bind: {e}"),
-            ))
-        }
+    let routes = plan_routes(&code, req.transport, &discovered)?;
+    let (passcode, long) = match code {
+        Code::Qr { passcode, long } => (passcode, Some(long)),
+        Code::Manual { passcode, .. } => (passcode, None),
     };
-    let dev = match commissioning::commission_on_network(
-        transport,
-        &commissioning_fabric,
-        CommissionParams {
-            passcode,
-            target,
-            device_node_id: req.device_node_id,
-            paa_dir: req.paa_dir.as_deref(),
-            cd_signer_dir: req.cd_signer_dir.as_deref(),
-            scope_id,
-        },
-    )
-    .await
-    {
-        Ok(d) => d,
-        // 内部 resolve（PASE より前）での空振り。事前 resolve 成功後の狭い競合窓
-        // だが発見の空振りなので unreachable に倒す（M8c-3: フォールバック撤去）。
-        Err(CommissionError::Discovery(e)) => {
-            return Err(MatError::new(
-                ErrorKind::Unreachable,
-                format!("native commissioning: commissionable disappeared before PASE: {e}"),
-            ))
-        }
-        Err(other) => return Err(commission_error(other)),
-    };
+
+    let plan: Vec<String> = routes.iter().map(Route::label).collect();
     tracing::info!(
-        node_id = dev.node_id,
-        fabric_index = ?dev.fabric_index,
-        "commission executed (native on-network)"
+        transport = ?req.transport,
+        routes = ?plan,
+        "commission route plan"
     );
-    Ok(())
+
+    let mut failures: Vec<String> = Vec::new();
+    for (i, route) in routes.iter().enumerate() {
+        let label = route.label();
+        match run_route(route, &commissioning_fabric, req, scope_id, passcode, long).await {
+            Ok(()) => return Ok(()),
+            Err(RouteFail { err, dead_end }) => {
+                failures.push(format!("{label}: {}", short_detail(&err.detail)));
+                let next = routes.get(i + 1);
+                match (dead_end, next) {
+                    (true, Some(n)) => {
+                        tracing::warn!(
+                            from = %label,
+                            to = %n.label(),
+                            reason = %err.detail,
+                            "route dead end — falling back"
+                        );
+                        continue;
+                    }
+                    _ => return Err(compose_failure(&failures, err)),
+                }
+            }
+        }
+    }
+    // plan_routes は空の Vec を返さない（返すなら Err）。
+    Err(MatError::new(
+        ErrorKind::Other,
+        "native commissioning: empty route plan (internal)".to_string(),
+    ))
 }
 
 /// BLE 経路（feature "ble"）。scan の空振りは `commission_ble_thread` 内部で
@@ -922,5 +1033,43 @@ mod tests {
             "operational discovery after thread join"
         )));
         assert!(!is_dead_end(&E::Timeout("no usable operational address")));
+    }
+
+    // ---- Task 3: compose_failure / short_detail ----
+
+    #[test]
+    fn single_route_failure_is_reported_verbatim() {
+        // 候補が 1 本なら現状と 1 文字も変わらない（互換性）。
+        let last = MatError::new(ErrorKind::Timeout, "native commissioning failed: x".to_string());
+        let out = compose_failure(&["ble: native commissioning failed: x".to_string()], last);
+        assert_eq!(out.kind, ErrorKind::Timeout);
+        assert_eq!(out.detail, "native commissioning failed: x");
+    }
+
+    #[test]
+    fn multi_route_failure_lists_every_route() {
+        let last = MatError::new(
+            ErrorKind::Unreachable,
+            "native commissioning: no dataset".to_string(),
+        );
+        let out = compose_failure(
+            &[
+                "on-network(2001:db8::1): pase timed out".to_string(),
+                "ble: no dataset".to_string(),
+            ],
+            last,
+        );
+        // kind は最後に試した経路のものを採る。
+        assert_eq!(out.kind, ErrorKind::Unreachable);
+        assert!(out.detail.starts_with("native commissioning: all routes failed — "));
+        assert!(out.detail.contains("on-network(2001:db8::1): pase timed out"));
+        assert!(out.detail.contains("ble: no dataset"));
+    }
+
+    #[test]
+    fn short_detail_strips_known_prefixes() {
+        assert_eq!(short_detail("native commissioning failed: boom"), "boom");
+        assert_eq!(short_detail("native commissioning: boom"), "boom");
+        assert_eq!(short_detail("boom"), "boom");
     }
 }
