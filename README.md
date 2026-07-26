@@ -68,6 +68,31 @@ mat discover --probe
 mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
+#### Route selection (`--transport`)
+
+`commission` picks how to reach the device. mDNS finding a record only proves the
+record exists — a Thread device's SRP registration outlives the device's
+reachability — so `auto` keeps BLE as a fallback:
+
+| `--transport` | QR payload (`MT:`) | manual code |
+|---|---|---|
+| `auto` (default) | mDNS hit → on-network, then BLE if PASE times out; miss → BLE | mDNS hit → on-network; miss → `unreachable` |
+| `on-network` | mDNS only; never falls back to BLE | same |
+| `ble` | skips mDNS entirely | rejected (exit `2`) |
+
+The fallback fires **only** when PASE exhausts its MRP retry budget (or the device
+disappears before PASE) — i.e. when nothing was ever established on the device. A
+failure after PASE (attestation, NOC, CASE) stops immediately: the device holds
+partial state under its failsafe and must not be re-driven automatically.
+
+A manual code carries only a 4-bit short discriminator, which cannot drive the
+12-bit BLE scan; use the QR payload for BLE.
+
+```bash
+# force BLE (skip mDNS entirely)
+mat commission --target thread --setup-code "MT:Y.K9042C00KA0648G00" --transport ble
+```
+
 `discover` output:
 
 ```json
@@ -1115,6 +1140,9 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 13 | `matd` absent / unreachable (`mat listen` only) |
 | 1 | other |
 
+When `commission` tries more than one route, the reported `kind` and exit code are
+those of the **last** route attempted, and `detail` lists every route's result.
+
 The native backend maps its own transport/IM outcomes onto `3` / `4` / `5` /
 `6`; anything it cannot classify is exit `1`. An operational mDNS resolve
 **timeout** (the node did not advertise within the wait window — often
@@ -1240,6 +1268,7 @@ Environment variables:
 | `MAT_PAA_TRUST_STORE` | directory of PAA root certs for attestation |
 | `MAT_CD_SIGNER_STORE` | CD signer trust store (warn-only if absent) |
 | `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission |
+| `MAT_TRANSPORT` | commission route: `auto` (default) / `on-network` / `ble` |
 | `MAT_PING6_BIN` | override the `ping6` binary used by `diag node --deep` |
 | `MAT_LOG` | `tracing` filter for stderr logs (e.g. `info`); empty counts as unset — see [Logs](#logs-stderr) |
 

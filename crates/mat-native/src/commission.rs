@@ -1040,7 +1040,10 @@ mod tests {
     #[test]
     fn single_route_failure_is_reported_verbatim() {
         // 候補が 1 本なら現状と 1 文字も変わらない（互換性）。
-        let last = MatError::new(ErrorKind::Timeout, "native commissioning failed: x".to_string());
+        let last = MatError::new(
+            ErrorKind::Timeout,
+            "native commissioning failed: x".to_string(),
+        );
         let out = compose_failure(&["ble: native commissioning failed: x".to_string()], last);
         assert_eq!(out.kind, ErrorKind::Timeout);
         assert_eq!(out.detail, "native commissioning failed: x");
@@ -1061,8 +1064,12 @@ mod tests {
         );
         // kind は最後に試した経路のものを採る。
         assert_eq!(out.kind, ErrorKind::Unreachable);
-        assert!(out.detail.starts_with("native commissioning: all routes failed — "));
-        assert!(out.detail.contains("on-network(2001:db8::1): pase timed out"));
+        assert!(out
+            .detail
+            .starts_with("native commissioning: all routes failed — "));
+        assert!(out
+            .detail
+            .contains("on-network(2001:db8::1): pase timed out"));
         assert!(out.detail.contains("ble: no dataset"));
     }
 
