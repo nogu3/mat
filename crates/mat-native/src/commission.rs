@@ -38,6 +38,111 @@ enum Code {
     Manual { passcode: u32, short: u8 },
 }
 
+/// commission の経路指定。`mat` の `--transport` / `MAT_TRANSPORT` に対応する。
+/// clap には依存しない（`ValueEnum` は `crates/mat/src/cli.rs` 側）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// mDNS で見つかればまず on-network、PASE が MRP を使い切ったら BLE。
+    #[default]
+    Auto,
+    /// mDNS のみ。BLE には落ちない。
+    OnNetwork,
+    /// mDNS を一切引かず BLE 直行。
+    Ble,
+}
+
+/// mDNS を引いた結果。I/O は呼び出し側（`discover`）が済ませてから渡す
+/// ——`plan_routes` を純関数に保つため。
+#[allow(dead_code)] // Task 3 で discover() が組み立てる
+enum Discovered {
+    /// `--transport ble`: mDNS を引いていない。
+    NotConsulted,
+    Hit {
+        target: CommissionTarget,
+        /// ログ・エラー要約用のラベル（解決したアドレス等）。
+        label: String,
+    },
+    Miss,
+}
+
+/// 試す経路の候補。
+#[derive(Debug)]
+#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
+enum Route {
+    OnNetwork {
+        target: CommissionTarget,
+        label: String,
+    },
+    Ble,
+}
+
+impl Route {
+    #[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
+    fn label(&self) -> String {
+        match self {
+            Route::OnNetwork { label, .. } => label.clone(),
+            Route::Ble => "ble".to_string(),
+        }
+    }
+}
+
+/// 試す順番を決める純関数。mDNS の I/O は含まない。
+///
+/// manual code は 4bit short discriminator しか持たず、BLE scan（12bit 完全
+/// 一致）に使えないため BLE を候補に入れない。
+#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
+fn plan_routes(
+    code: &Code,
+    transport: Transport,
+    discovered: &Discovered,
+) -> Result<Vec<Route>, MatError> {
+    let is_qr = matches!(code, Code::Qr { .. });
+
+    if transport == Transport::Ble {
+        if !is_qr {
+            return Err(MatError::new(
+                ErrorKind::Other,
+                "native commissioning: --transport ble requires the QR payload \
+                 (manual code has no long discriminator) — should have been rejected by the CLI"
+                    .to_string(),
+            ));
+        }
+        return Ok(vec![Route::Ble]);
+    }
+
+    match discovered {
+        Discovered::Hit { target, label } => {
+            let mut routes = vec![Route::OnNetwork {
+                target: *target,
+                label: label.clone(),
+            }];
+            // auto かつ QR のときだけ BLE を後詰めする。これが本修正の中心:
+            // mDNS のレコードは「存在」しか保証しないので、届かなかったときの
+            // 逃げ道を計画に含めておく。
+            if transport == Transport::Auto && is_qr {
+                routes.push(Route::Ble);
+            }
+            Ok(routes)
+        }
+        Discovered::Miss if is_qr && transport == Transport::Auto => Ok(vec![Route::Ble]),
+        Discovered::Miss if is_qr => Err(MatError::new(
+            ErrorKind::Unreachable,
+            "native commissioning: not found via mDNS (--transport on-network does not fall back to BLE)"
+                .to_string(),
+        )),
+        Discovered::Miss => Err(MatError::new(
+            ErrorKind::Unreachable,
+            "native commissioning: not found via mDNS (manual code cannot use BLE; use the QR payload)"
+                .to_string(),
+        )),
+        Discovered::NotConsulted => Err(MatError::new(
+            ErrorKind::Other,
+            "native commissioning: mdns was not consulted outside --transport ble (internal)"
+                .to_string(),
+        )),
+    }
+}
+
 fn parse_code(s: &str) -> Result<Code, MatError> {
     if s.starts_with("MT:") {
         let p = setup_code::parse_qr(s)
@@ -642,5 +747,93 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::StoreParse);
         // 採用永続もされない。
         assert_eq!(kvs::read_mat_ipk_epoch(&ini, 1).unwrap(), None);
+    }
+
+    // ---- Task 1: plan_routes ----
+
+    fn qr() -> Code {
+        Code::Qr {
+            passcode: 20202021,
+            long: 1082,
+        }
+    }
+
+    fn manual() -> Code {
+        Code::Manual {
+            passcode: 20202021,
+            short: 4,
+        }
+    }
+
+    fn hit() -> Discovered {
+        Discovered::Hit {
+            target: CommissionTarget::Discriminator(1082),
+            label: "on-network(2001:db8::1)".to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_routes_auto_qr_hit_falls_back_to_ble() {
+        let routes = plan_routes(&qr(), Transport::Auto, &hit()).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(matches!(routes[0], Route::OnNetwork { .. }));
+        assert!(matches!(routes[1], Route::Ble));
+    }
+
+    #[test]
+    fn plan_routes_auto_qr_miss_is_ble_only() {
+        let routes = plan_routes(&qr(), Transport::Auto, &Discovered::Miss).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::Ble));
+    }
+
+    #[test]
+    fn plan_routes_auto_manual_hit_is_on_network_only() {
+        // manual code は long discriminator を持たず BLE scan に使えない。
+        let routes = plan_routes(&manual(), Transport::Auto, &hit()).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::OnNetwork { .. }));
+    }
+
+    #[test]
+    fn plan_routes_auto_manual_miss_is_unreachable_with_qr_hint() {
+        let e = plan_routes(&manual(), Transport::Auto, &Discovered::Miss).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert!(e.detail.contains("manual code cannot use BLE"));
+    }
+
+    #[test]
+    fn plan_routes_on_network_qr_hit_never_includes_ble() {
+        let routes = plan_routes(&qr(), Transport::OnNetwork, &hit()).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::OnNetwork { .. }));
+    }
+
+    #[test]
+    fn plan_routes_on_network_qr_miss_is_unreachable() {
+        let e = plan_routes(&qr(), Transport::OnNetwork, &Discovered::Miss).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert!(e.detail.contains("on-network"));
+    }
+
+    #[test]
+    fn plan_routes_on_network_manual_miss_is_unreachable_with_qr_hint() {
+        let e = plan_routes(&manual(), Transport::OnNetwork, &Discovered::Miss).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert!(e.detail.contains("manual code cannot use BLE"));
+    }
+
+    #[test]
+    fn plan_routes_ble_qr_skips_mdns_entirely() {
+        let routes = plan_routes(&qr(), Transport::Ble, &Discovered::NotConsulted).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::Ble));
+    }
+
+    #[test]
+    fn plan_routes_ble_manual_is_internal_error() {
+        // CLI 層が exit 2 で弾く組み合わせ。native まで来たら内部エラー。
+        let e = plan_routes(&manual(), Transport::Ble, &Discovered::NotConsulted).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Other);
     }
 }
