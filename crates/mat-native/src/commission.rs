@@ -89,10 +89,22 @@ impl Route {
 ///
 /// manual code は 4bit short discriminator しか持たず、BLE scan（12bit 完全
 /// 一致）に使えないため BLE を候補に入れない。
+///
+/// `ble_usable` は「この実行で BLE 経路が実際に走れるか」（`ble` feature 付き
+/// ビルド **かつ** `--thread-dataset` あり）。呼び出し側が計算して渡す
+/// ——この関数を純関数（feature フラグもリクエストも読まない）に保つため。
+/// hit 側の後詰めだけがこのフラグで閉じる: 走れない BLE を計画に載せると
+/// 「mDNS で見つからなかった」と嘘をつく `unreachable`（`ble_path` の文言）で
+/// on-network の `timeout` を上書きしてしまい、exit code が 3 → 5 に化ける。
+/// **miss 側は従来どおり無条件で `Route::Ble` を計画する** — 走れないときの
+/// 文言（`... no --thread-dataset for the BLE path` /
+/// `... this build has no BLE support`）が現状の唯一の診断であり、1 バイトも
+/// 変えない。
 fn plan_routes(
     code: &Code,
     transport: Transport,
     discovered: &Discovered,
+    ble_usable: bool,
 ) -> Result<Vec<Route>, MatError> {
     let is_qr = matches!(code, Code::Qr { .. });
 
@@ -114,10 +126,11 @@ fn plan_routes(
                 target: *target,
                 label: label.clone(),
             }];
-            // auto かつ QR のときだけ BLE を後詰めする。これが本修正の中心:
-            // mDNS のレコードは「存在」しか保証しないので、届かなかったときの
-            // 逃げ道を計画に含めておく。
-            if transport == Transport::Auto && is_qr {
+            // auto かつ QR、かつ BLE が実際に走れるときだけ後詰めする。これが
+            // 本修正の中心: mDNS のレコードは「存在」しか保証しないので、
+            // 届かなかったときの逃げ道を計画に含めておく。走れない BLE を
+            // 載せない理由は上の doc コメント参照。
+            if transport == Transport::Auto && is_qr && ble_usable {
                 routes.push(Route::Ble);
             }
             Ok(routes)
@@ -197,16 +210,32 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
 
 /// 「この失敗なら次の経路を試してよい」の判定。
 ///
-/// 対象は PASE 以前のタイムアウトと、PASE の MRP 使い切りと、
-/// 発見の直後喪失のみ。それぞれ：
+/// **安全性の根拠は「PASE 完了前に failsafe は一切 arm されていない」**という
+/// 一点である（PASE そのものが 1 往復だから、ではない —— PASE は 3 往復で、
+/// `Pake1`（`pase.rs:330`）も `Pake3`（`pase.rs:384`）も `Exchange(Timeout)` に
+/// 写るし、`ex.recv(RECV_TIMEOUT)`（`pase.rs:343` / `:389`）はデバイスが我々に
+/// ack を返した **後** にしか走らない）。ここで拾う 3 つはいずれも
+/// `pase::establish` が `Ok` を返す前に出るものであり、`ArmFailSafe` は
+/// `run_credential_steps` の最初のステップ（`commissioning.rs:629`）＝
+/// `pase::establish` の後にしか走らない。したがって failsafe も fabric 状態も
+/// まだ存在せず、別経路でやり直しても中途状態と衝突しない。
+///
+/// 対象は 3 つ：
 ///
 /// 1. ターゲット解決段階（`commissioning.rs:855` → `Timeout("no usable address")`）
-///    — PASE 確立前なので、デバイス側に状態は一切無い。別経路でやり直しても安全。
+///    — `pase::establish` 呼び出し前。
 ///
-/// 2. PASE の MRP 再送尽き（`Pase(Exchange(Timeout))`）— 最初の交換なので
-///    デバイス側に状態は無い。
+/// 2. PASE の MRP 再送尽き（`Pase(Exchange(Timeout))`）。
 ///
-/// 3. mDNS 解決後 PASE 開始前の喪失（`Discovery(_)`）— デバイス側に状態は無い。
+/// 3. mDNS 解決後 PASE 開始前の喪失（`Discovery(_)`）。
+///
+/// **既知の副作用（バグではない）**: PASE 後半（Pake1/Pake3 送信後）で中断すると、
+/// responder 側は PASE 確立スロットを保持したままになることがある
+/// （`pase.rs:363-372` の実機 E2E 知見。`ConfirmMismatch` では明示 StatusReport で
+/// 解放させているが、`Exchange(Timeout)` は相手が無言な経路なので通知できない）。
+/// つまり Pake1/Pake3 の timeout でフォールバックすると、BLE 経路が「PASE を
+/// 受け付けないデバイス」を掴む可能性がある —— その場合の代償は BLE scan
+/// 〜30 秒とその後の PASE 失敗であり、デバイス側に不可逆な状態は残らない。
 ///
 /// **重要: `Timeout("operational discovery after thread join")`（`commissioning.rs:1072`）
 /// と `Timeout("no usable operational address")`（`commissioning.rs:1078`）は意図的に
@@ -426,13 +455,16 @@ async fn run_route(
             let transport = match UdpTransport::bind().await {
                 Ok(t) => std::sync::Arc::new(t),
                 Err(e) => {
+                    // ローカルの bind 失敗は経路に依存しない（BLE 経路も最後に
+                    // UDP を bind する）。別経路へ進んでも同じ理由で落ちるので
+                    // dead_end ではない ＝ 即打ち切り。
                     return Err(RouteFail {
                         err: MatError::new(
                             ErrorKind::Other,
                             format!("native commissioning: udp bind: {e}"),
                         ),
                         dead_end: false,
-                    })
+                    });
                 }
             };
             match commissioning::commission_on_network(
@@ -479,14 +511,20 @@ async fn run_route(
             }
         }
         Route::Ble => {
-            // BLE は QR コードでしか計画に載らない（plan_routes）。
-            let long = long.expect("ble route is planned only for QR codes");
-            ble_path(fabric, req, passcode, long, scope_id)
-                .await
-                .map_err(|err| RouteFail {
-                    err,
+            // BLE は QR コードでしか計画に載らない（plan_routes）。ライブラリ
+            // コードなので不変条件が破れても panic はしない（内部エラー扱い）。
+            let Some(long) = long else {
+                return Err(RouteFail {
+                    err: MatError::new(
+                        ErrorKind::Other,
+                        "native commissioning: ble route planned without a long discriminator \
+                         (internal)"
+                            .to_string(),
+                    ),
                     dead_end: false,
-                })
+                });
+            };
+            ble_path(fabric, req, passcode, long, scope_id).await
         }
     }
 }
@@ -544,11 +582,34 @@ pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(
         discover(&code, scope_id).await?
     };
 
-    let routes = plan_routes(&code, req.transport, &discovered)?;
+    // BLE 経路が実際に走れる条件（feature ビルド + Thread dataset）。片方でも
+    // 欠けると `ble_path` は「mDNS で見つからなかった」と読める unreachable を
+    // 返すため、hit 後の後詰め候補には載せない（plan_routes の doc 参照）。
+    let ble_feature = cfg!(feature = "ble");
+    let has_dataset = req.thread_dataset.is_some();
+    let ble_usable = ble_feature && has_dataset;
+
+    let routes = plan_routes(&code, req.transport, &discovered, ble_usable)?;
     let (passcode, long) = match code {
         Code::Qr { passcode, long } => (passcode, Some(long)),
         Code::Manual { passcode, .. } => (passcode, None),
     };
+
+    // mDNS が hit した auto + QR なのに BLE を後詰めできなかったとき、その理由を
+    // 運用者に伝える（`--thread-dataset` を足せば 2 本目の経路が開く、という
+    // 情報は stderr でしか出ない — stdout の JSON は広げない）。
+    if !ble_usable
+        && req.transport == Transport::Auto
+        && long.is_some()
+        && matches!(discovered, Discovered::Hit { .. })
+    {
+        tracing::info!(
+            ble_feature,
+            thread_dataset = has_dataset,
+            "on-network only: BLE fallback not planned \
+             (needs a build with the \"ble\" feature and --thread-dataset)"
+        );
+    }
 
     let plan: Vec<String> = routes.iter().map(Route::label).collect();
     tracing::info!(
@@ -557,10 +618,34 @@ pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(
         "commission route plan"
     );
 
+    run_plan(&routes, |i| {
+        run_route(
+            &routes[i],
+            &commissioning_fabric,
+            req,
+            scope_id,
+            passcode,
+            long,
+        )
+    })
+    .await
+}
+
+/// 経路計画を順に実行する。`run` は 1 経路ぶんの実行（本番では `run_route`、
+/// テストでは台本化した `RouteFail` を返すクロージャ）を注入する
+/// ——ネットワークに触れずにフォールバックの分岐そのものを固定するため。
+///
+/// 進み方の規則は 1 つだけ: **`dead_end` かつ次の候補があるときだけ次へ進む**。
+/// それ以外は即打ち切り（`compose_failure` で要約）。
+async fn run_plan<F, Fut>(routes: &[Route], mut run: F) -> Result<(), MatError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RouteFail>>,
+{
     let mut failures: Vec<String> = Vec::new();
     for (i, route) in routes.iter().enumerate() {
         let label = route.label();
-        match run_route(route, &commissioning_fabric, req, scope_id, passcode, long).await {
+        match run(i).await {
             Ok(()) => return Ok(()),
             Err(RouteFail { err, dead_end }) => {
                 failures.push(format!("{label}: {}", short_detail(&err.detail)));
@@ -599,6 +684,10 @@ pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(
 /// 検証する `find_commissionable` → `open_link` → `commission_btp_thread` の
 /// 分離フローに立ち入る必要はない——`commission_ble_thread` が同じことを
 /// 内部でやってくれる）。
+///
+/// 戻り値が `RouteFail` なのは、`dead_end` の判定を on-network 腕とまったく
+/// 同じ 1 箇所（`is_dead_end`）から導くため。BLE 経路も
+/// `Pase(Exchange(Timeout))` を出しうる（`commissioning.rs:962`）。
 #[cfg(feature = "ble")]
 async fn ble_path(
     fabric: &CommissioningFabric,
@@ -606,13 +695,17 @@ async fn ble_path(
     passcode: u32,
     long: u16,
     scope_id: u32,
-) -> Result<(), MatError> {
+) -> Result<(), RouteFail> {
     let Some(dataset) = req.thread_dataset.as_deref() else {
-        return Err(MatError::new(
-            ErrorKind::Unreachable,
-            "native commissioning: not found via mDNS and no --thread-dataset for the BLE path"
-                .to_string(),
-        ));
+        return Err(RouteFail {
+            err: MatError::new(
+                ErrorKind::Unreachable,
+                "native commissioning: not found via mDNS and no --thread-dataset for the BLE path"
+                    .to_string(),
+            ),
+            // 資材が無い＝この経路は走れない。別経路の追加根拠にはならない。
+            dead_end: false,
+        });
     };
     match commissioning::commission_ble_thread(
         fabric,
@@ -636,15 +729,23 @@ async fn ble_path(
             );
             Ok(())
         }
-        // BLE scan の空振り（デバイスが見えない）= 発見の空振り → unreachable。
-        Err(CommissionError::Ble {
-            step: "scan",
-            detail,
-        }) => Err(MatError::new(
-            ErrorKind::Unreachable,
-            format!("native commissioning: ble scan: {detail}"),
-        )),
-        Err(other) => Err(commission_error(other)),
+        Err(other) => {
+            // on-network 腕と同じ順序: 借用中に dead_end を確定させてから、
+            // 専用文言（scan 空振り）だけをメッセージ生成側で特別扱いする。
+            let dead_end = is_dead_end(&other);
+            let err = match other {
+                // BLE scan の空振り（デバイスが見えない）= 発見の空振り → unreachable。
+                CommissionError::Ble {
+                    step: "scan",
+                    detail,
+                } => MatError::new(
+                    ErrorKind::Unreachable,
+                    format!("native commissioning: ble scan: {detail}"),
+                ),
+                other => commission_error(other),
+            };
+            Err(RouteFail { err, dead_end })
+        }
     }
 }
 
@@ -655,13 +756,17 @@ async fn ble_path(
     _passcode: u32,
     _long: u16,
     _scope_id: u32,
-) -> Result<(), MatError> {
+) -> Result<(), RouteFail> {
     // mDNS miss + BLE 未コンパイル → unreachable（detail に ble feature を明記）。
-    Err(MatError::new(
-        ErrorKind::Unreachable,
-        "native commissioning: not found via mDNS; this build has no BLE support (feature \"ble\")"
-            .to_string(),
-    ))
+    // この経路は走っていないので dead_end ではない。
+    Err(RouteFail {
+        err: MatError::new(
+            ErrorKind::Unreachable,
+            "native commissioning: not found via mDNS; this build has no BLE support (feature \"ble\")"
+                .to_string(),
+        ),
+        dead_end: false,
+    })
 }
 
 #[cfg(test)]
@@ -915,17 +1020,42 @@ mod tests {
         }
     }
 
+    /// BLE が走れるビルド・資材が揃っている前提の `ble_usable`。
+    const BLE_OK: bool = true;
+    /// `ble` feature 無しビルド、または `--thread-dataset` 未指定。
+    const BLE_UNUSABLE: bool = false;
+
     #[test]
     fn plan_routes_auto_qr_hit_falls_back_to_ble() {
-        let routes = plan_routes(&qr(), Transport::Auto, &hit()).unwrap();
+        let routes = plan_routes(&qr(), Transport::Auto, &hit(), BLE_OK).unwrap();
         assert_eq!(routes.len(), 2);
         assert!(matches!(routes[0], Route::OnNetwork { .. }));
         assert!(matches!(routes[1], Route::Ble));
     }
 
+    /// 回帰固定（最終レビュー指摘 1）: BLE が走れないビルド／資材のときに hit 後
+    /// の後詰めをすると、on-network の `timeout`(exit 3) が「mDNS で見つから
+    /// なかった」と嘘をつく `unreachable`(exit 5) に上書きされる。載せない。
+    #[test]
+    fn plan_routes_auto_qr_hit_omits_ble_when_it_cannot_run() {
+        let routes = plan_routes(&qr(), Transport::Auto, &hit(), BLE_UNUSABLE).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::OnNetwork { .. }));
+    }
+
     #[test]
     fn plan_routes_auto_qr_miss_is_ble_only() {
-        let routes = plan_routes(&qr(), Transport::Auto, &Discovered::Miss).unwrap();
+        let routes = plan_routes(&qr(), Transport::Auto, &Discovered::Miss, BLE_OK).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0], Route::Ble));
+    }
+
+    /// miss 側は `ble_usable` で閉じない: 走れない理由（dataset 無し / feature
+    /// 無し）を述べる `ble_path` の文言が唯一の診断なので、従来どおり計画に
+    /// 載せて実行させる。
+    #[test]
+    fn plan_routes_auto_qr_miss_still_plans_ble_when_it_cannot_run() {
+        let routes = plan_routes(&qr(), Transport::Auto, &Discovered::Miss, BLE_UNUSABLE).unwrap();
         assert_eq!(routes.len(), 1);
         assert!(matches!(routes[0], Route::Ble));
     }
@@ -933,42 +1063,43 @@ mod tests {
     #[test]
     fn plan_routes_auto_manual_hit_is_on_network_only() {
         // manual code は long discriminator を持たず BLE scan に使えない。
-        let routes = plan_routes(&manual(), Transport::Auto, &hit()).unwrap();
+        let routes = plan_routes(&manual(), Transport::Auto, &hit(), BLE_OK).unwrap();
         assert_eq!(routes.len(), 1);
         assert!(matches!(routes[0], Route::OnNetwork { .. }));
     }
 
     #[test]
     fn plan_routes_auto_manual_miss_is_unreachable_with_qr_hint() {
-        let e = plan_routes(&manual(), Transport::Auto, &Discovered::Miss).unwrap_err();
+        let e = plan_routes(&manual(), Transport::Auto, &Discovered::Miss, BLE_OK).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Unreachable);
         assert!(e.detail.contains("manual code cannot use BLE"));
     }
 
     #[test]
     fn plan_routes_on_network_qr_hit_never_includes_ble() {
-        let routes = plan_routes(&qr(), Transport::OnNetwork, &hit()).unwrap();
+        let routes = plan_routes(&qr(), Transport::OnNetwork, &hit(), BLE_OK).unwrap();
         assert_eq!(routes.len(), 1);
         assert!(matches!(routes[0], Route::OnNetwork { .. }));
     }
 
     #[test]
     fn plan_routes_on_network_qr_miss_is_unreachable() {
-        let e = plan_routes(&qr(), Transport::OnNetwork, &Discovered::Miss).unwrap_err();
+        let e = plan_routes(&qr(), Transport::OnNetwork, &Discovered::Miss, BLE_OK).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Unreachable);
         assert!(e.detail.contains("on-network"));
     }
 
     #[test]
     fn plan_routes_on_network_manual_miss_is_unreachable_with_qr_hint() {
-        let e = plan_routes(&manual(), Transport::OnNetwork, &Discovered::Miss).unwrap_err();
+        let e =
+            plan_routes(&manual(), Transport::OnNetwork, &Discovered::Miss, BLE_OK).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Unreachable);
         assert!(e.detail.contains("manual code cannot use BLE"));
     }
 
     #[test]
     fn plan_routes_ble_qr_skips_mdns_entirely() {
-        let routes = plan_routes(&qr(), Transport::Ble, &Discovered::NotConsulted).unwrap();
+        let routes = plan_routes(&qr(), Transport::Ble, &Discovered::NotConsulted, BLE_OK).unwrap();
         assert_eq!(routes.len(), 1);
         assert!(matches!(routes[0], Route::Ble));
     }
@@ -976,7 +1107,8 @@ mod tests {
     #[test]
     fn plan_routes_ble_manual_is_internal_error() {
         // CLI 層が exit 2 で弾く組み合わせ。native まで来たら内部エラー。
-        let e = plan_routes(&manual(), Transport::Ble, &Discovered::NotConsulted).unwrap_err();
+        let e =
+            plan_routes(&manual(), Transport::Ble, &Discovered::NotConsulted, BLE_OK).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Other);
     }
 
@@ -994,6 +1126,12 @@ mod tests {
         assert!(is_dead_end(&E::Pase(PaseError::Exchange(
             ExchangeError::Timeout
         ))));
+        // 事前 resolve 成功後・PASE 開始前の喪失。ArmFailSafe 以前なので状態は無い。
+        assert!(is_dead_end(&E::Discovery(
+            mat_controller::dnssd::DnssdError::Timeout {
+                instance: "x".into()
+            }
+        )));
     }
 
     #[test]
@@ -1037,16 +1175,157 @@ mod tests {
 
     // ---- Task 3: compose_failure / short_detail ----
 
-    #[test]
-    fn single_route_failure_is_reported_verbatim() {
-        // 候補が 1 本なら現状と 1 文字も変わらない（互換性）。
-        let last = MatError::new(
-            ErrorKind::Timeout,
-            "native commissioning failed: x".to_string(),
+    // ---- 最終レビュー指摘 2: run_plan（フォールバック・ループ本体）----
+    //
+    // ここまでのテストは「計画が何か」を固定するだけで、「計画どおりに実行
+    // されるか」を一切固定していなかった（フォールバックを丸ごと殺す変異を
+    // 入れても全部 green だった）。以下は **どの経路が実際に呼ばれたか** を
+    // 記録して固定する。
+
+    fn on_network_route() -> Route {
+        Route::OnNetwork {
+            target: CommissionTarget::Discriminator(1082),
+            label: "on-network(2001:db8::1)".to_string(),
+        }
+    }
+
+    fn route_fail(kind: ErrorKind, detail: &str, dead_end: bool) -> RouteFail {
+        RouteFail {
+            err: MatError::new(kind, detail.to_string()),
+            dead_end,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_plan_advances_to_the_next_route_on_a_dead_end() {
+        let routes = vec![on_network_route(), Route::Ble];
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let out = run_plan(&routes, |i| {
+            calls.borrow_mut().push(i);
+            async move {
+                if i == 0 {
+                    Err(route_fail(
+                        ErrorKind::Timeout,
+                        "native commissioning failed: pase error: no acknowledgement",
+                        true,
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(out.is_ok(), "2 本目の成功が返るはず: {out:?}");
+        assert_eq!(*calls.borrow(), vec![0, 1], "2 本目が実際に試されること");
+    }
+
+    #[tokio::test]
+    async fn run_plan_stops_at_the_first_route_when_it_is_not_a_dead_end() {
+        let routes = vec![on_network_route(), Route::Ble];
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let out = run_plan(&routes, |i| {
+            calls.borrow_mut().push(i);
+            async move {
+                Err(route_fail(
+                    ErrorKind::DeviceRejected,
+                    "native commissioning failed: pase error: confirmation mismatch",
+                    false,
+                ))
+            }
+        })
+        .await;
+
+        let err = out.unwrap_err();
+        assert_eq!(*calls.borrow(), vec![0], "2 本目を試してはいけない");
+        // 1 本しか試していないので現状（フォールバック導入前）と 1 文字も変わらない。
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
+        assert_eq!(
+            err.detail,
+            "native commissioning failed: pase error: confirmation mismatch"
         );
-        let out = compose_failure(&["ble: native commissioning failed: x".to_string()], last);
-        assert_eq!(out.kind, ErrorKind::Timeout);
-        assert_eq!(out.detail, "native commissioning failed: x");
+    }
+
+    #[tokio::test]
+    async fn run_plan_stops_on_success_without_touching_later_routes() {
+        let routes = vec![on_network_route(), Route::Ble];
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let out = run_plan(&routes, |i| {
+            calls.borrow_mut().push(i);
+            async move { Ok(()) }
+        })
+        .await;
+
+        assert!(out.is_ok());
+        assert_eq!(*calls.borrow(), vec![0], "成功したら以降は試さない");
+    }
+
+    #[tokio::test]
+    async fn run_plan_composes_every_failure_and_keeps_the_last_kind() {
+        let routes = vec![on_network_route(), Route::Ble];
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let out = run_plan(&routes, |i| {
+            calls.borrow_mut().push(i);
+            async move {
+                if i == 0 {
+                    Err(route_fail(
+                        ErrorKind::Timeout,
+                        "native commissioning failed: pase error: no acknowledgement",
+                        true,
+                    ))
+                } else {
+                    Err(route_fail(
+                        ErrorKind::Unreachable,
+                        "native commissioning: ble scan: not seen",
+                        false,
+                    ))
+                }
+            }
+        })
+        .await;
+
+        let err = out.unwrap_err();
+        assert_eq!(*calls.borrow(), vec![0, 1]);
+        // kind は最後に試した経路のもの。
+        assert_eq!(err.kind, ErrorKind::Unreachable);
+        assert!(err
+            .detail
+            .starts_with("native commissioning: all routes failed — "));
+        assert!(err
+            .detail
+            .contains("on-network(2001:db8::1): pase error: no acknowledgement"));
+        assert!(err.detail.contains("ble: ble scan: not seen"));
+    }
+
+    /// 候補が 1 本のときは `compose_failure` を通っても現状と 1 文字も変わらない
+    /// ——`compose_failure` を直接叩くのではなく、ループ本体を通して固定する。
+    #[tokio::test]
+    async fn single_route_failure_is_reported_verbatim() {
+        let routes = vec![Route::Ble];
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        // dead_end=true でも「次が無い」ので即返る（唯一の経路が dead end に
+        // なるのは miss + BLE 経路のケース）。
+        let out = run_plan(&routes, |i| {
+            calls.borrow_mut().push(i);
+            async move {
+                Err(route_fail(
+                    ErrorKind::Timeout,
+                    "native commissioning failed: x",
+                    true,
+                ))
+            }
+        })
+        .await;
+
+        let err = out.unwrap_err();
+        assert_eq!(*calls.borrow(), vec![0]);
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert_eq!(err.detail, "native commissioning failed: x");
     }
 
     #[test]

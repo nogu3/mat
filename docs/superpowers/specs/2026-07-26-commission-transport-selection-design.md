@@ -32,13 +32,13 @@ match dnssd::resolve_commissionable(scope_id, long, Duration::from_secs(5)).awai
 2. 以降の再試行 7 回はすべて mDNS hit → on-network → `pase error: no acknowledgement
    within MRP retry budget`。`ping6` はその IPv6 に対して 100% loss。
 3. `MAT_IFACE=wpan0` を指定して mDNS resolve を意図的に空振りさせ BLE 経路に落としたところ、
-   BLE 発見 20 秒で **一発成功**（node 18）。
+   BLE 発見 20 秒で **一発成功**（node N として登録）。
 
 つまり経路の可用性ではなく、経路選択の設計が原因だった。
 
 なお**工場出荷状態の機体では起きない**。SRP レコードが存在しないため mDNS が miss し、
-既定のまま BLE 経路に落ちる（同日、Aqara Door and Window Sensor P2 = node 19 が
-既定設定の attempt 1 で完走）。この不具合が刺さるのは「一度 BLE で Thread 参加まで
+既定のまま BLE 経路に落ちる（同日、別の機体 = Aqara Door and Window Sensor P2 を
+node M として、既定設定の attempt 1 で完走）。この不具合が刺さるのは「一度 BLE で Thread 参加まで
 行ったが完結しなかった機体の再試行」である。commission が途中で落ちること自体は
 弱リンク環境では珍しくないので、再現性は低くない。
 
@@ -90,6 +90,15 @@ env 連携は既存の `--thread-dataset` と同じく clap の `env` 属性で�
 | `on-network` | hit → `[OnNetwork]` / miss → unreachable | 同左 |
 | `ble` | mDNS を引かず `[Ble]` | CLI 層で exit 2 |
 
+- **hit 側の BLE 後詰めは「BLE が実際に走れるとき」だけ**（最終レビュー指摘 1 で
+  追加）。`plan_routes` に `ble_usable: bool`（`cfg!(feature = "ble")` かつ
+  `--thread-dataset` あり）を渡し、呼び出し側で計算する（`plan_routes` は純関数の
+  まま）。走れない BLE を後詰めすると、`ble_path` の「mDNS で見つからなかった」と
+  読める `unreachable`(exit 5) が on-network の `timeout`(exit 3) を上書きし、
+  **本 branch が直そうとしている場面でちょうど exit code が化ける**。載せなかった
+  ときは stderr の `INFO` に理由（feature / dataset のどちらが欠けたか）を出す。
+  **miss 側は無条件で `[Ble]` のまま** — 走れない理由を述べる文言が唯一の診断なので
+  1 バイトも変えない。
 - manual code は long discriminator を持たず BLE scan（12bit 完全一致）に使えないため、
   BLE を候補に入れない。miss 時の文言は現状を維持する
   （`not found via mDNS (manual code cannot use BLE; use the QR payload)`）。
@@ -113,9 +122,22 @@ fn is_dead_end(e: &CommissionError) -> bool {
 }
 ```
 
-- **PASE 以前の失敗のみが対象。** PASE は最初の交換であり、そこに到達する前／そこで
-  MRP を使い切ったということはデバイス側に一切の状態が作られていない。別経路で
+- **安全性の根拠は「PASE 完了前に failsafe は一切 arm されていない」の一点。**
+  「PASE は最初の 1 交換だからデバイス側に状態が無い」ではない —— PASE は 3 往復あり、
+  `Pake1`（`pase.rs:330`）も `Pake3`（`pase.rs:384`）も `Exchange(Timeout)` に写るし、
+  `ex.recv(RECV_TIMEOUT)`（`pase.rs:343` / `:389`）はデバイスが我々に ack を返した
+  **後**にしか走らない。正しい不変条件はこう: ここで拾う 3 つはすべて
+  `pase::establish` が `Ok` を返す前に出るものであり、`ArmFailSafe` は
+  `run_credential_steps` の最初のステップ（`commissioning.rs:629`）＝ `pase::establish`
+  の**後**にしか走らない。よって failsafe も fabric 状態もまだ存在せず、別経路で
   やり直しても中途状態と衝突しない。
+- **既知の副作用（バグではない）。** PASE 後半（Pake1/Pake3 送信後）で中断すると、
+  responder 側が PASE 確立スロットを保持したままになることがある
+  （`pase.rs:363-372` の実機 E2E 知見。`ConfirmMismatch` では明示 StatusReport で
+  解放させているが、`Exchange(Timeout)` は相手が無言な経路なので通知できない）。
+  つまり Pake1/Pake3 の timeout でフォールバックすると、BLE 経路が「PASE を受け付け
+  ないデバイス」を掴む可能性がある。代償は BLE scan 〜30 秒とその後の PASE 失敗で、
+  デバイス側に不可逆な状態は残らない —— 上の安全性の根拠を崩すものではない。
 - 3 つの分岐はそれぞれ実在の生成箇所に対応する:
   `Timeout("no usable address")` = `commission_on_network` のターゲット解決
   （`commissioning.rs:855`、`pase::establish` 呼び出し前）、
@@ -139,7 +161,7 @@ fn is_dead_end(e: &CommissionError) -> bool {
 `kind` は**最後に試した経路**のものを採用し、`detail` に経路ごとの結果を並べる。
 
 ```
-native commissioning: all routes failed — on-network(fd54:…:bd12): pase: no
+native commissioning: all routes failed — on-network(2001:db8::1): pase: no
 acknowledgement within MRP retry budget; ble: not found via mDNS and no
 --thread-dataset for the BLE path
 ```

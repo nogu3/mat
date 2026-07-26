@@ -89,8 +89,12 @@ fn transport_ble_rejects_manual_code() {
         .stderr(predicate::str::contains("QR"));
 }
 
+/// 未知の値が exit 2 になること「だけ」なら `value_enum` の素の挙動なので、
+/// 機能を丸ごと revert しても通ってしまう。ここでは **候補が正確に
+/// `auto` / `on-network` / `ble` の 3 つ**（README・spec の表と同じ集合）で
+/// あることまで固定する — 経路が増減したらこのテストが落ちる。
 #[test]
-fn transport_rejects_unknown_value() {
+fn transport_rejects_unknown_value_and_lists_the_exact_choices() {
     let store = store_with_node5();
     mat(store.path())
         .args([
@@ -103,7 +107,10 @@ fn transport_rejects_unknown_value() {
             "carrier-pigeon",
         ])
         .assert()
-        .code(2);
+        .code(2)
+        .stderr(predicate::str::contains(
+            "[possible values: auto, on-network, ble]",
+        ));
 }
 
 #[test]
