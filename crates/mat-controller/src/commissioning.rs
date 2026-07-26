@@ -518,6 +518,7 @@ pub fn thread_ext_pan_id(dataset: &[u8]) -> Option<[u8; 8]> {
 // 期限切れに任せる（spec 決定 6: 中断ハンドラを持たない一発フロー）。
 
 /// commissioning 対象デバイスの指定方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommissionTarget {
     /// アドレス既知（ローカル E2E、または呼び出し側が別途探索済み）。
     Addr(SocketAddr),
