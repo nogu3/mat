@@ -318,8 +318,8 @@ git commit -m "feat(commission): 経路計画 plan_routes を純関数として�
         use mat_controller::exchange::ExchangeError;
         use mat_controller::pase::PaseError;
 
-        // PASE の MRP 使い切り = 宛先が無言。デバイス側に状態は無い → 次の経路へ。
-        assert!(is_dead_end(&E::Timeout("pase")));
+        // ターゲット解決段階（commissioning.rs:855）— PASE 以前。
+        assert!(is_dead_end(&E::Timeout("no usable address")));
         assert!(is_dead_end(&E::Pase(PaseError::Exchange(
             ExchangeError::Timeout
         ))));
@@ -378,12 +378,18 @@ fn is_dead_end(e: &CommissionError) -> bool {
     use mat_controller::pase::PaseError;
     matches!(
         e,
-        CommissionError::Timeout("pase")
+        // ターゲット解決段階（commissioning.rs:855）— PASE 以前。
+        CommissionError::Timeout("no usable address")
             | CommissionError::Pase(PaseError::Exchange(ExchangeError::Timeout))
             | CommissionError::Discovery(_)
     )
 }
 ```
+
+**`Timeout(_)` へ広げてはならない。** `commissioning.rs:1072/1078` の
+`"operational discovery after thread join"` / `"no usable operational address"` は
+BLE 経路で PASE 成功・Thread 参加の後に出るため、拾うと failsafe 中の機体を
+再駆動することになる。`post_pase_timeouts_are_not_dead_ends` でこれを固定する。
 
 - [ ] **Step 4: テストが通ることを確認**
 

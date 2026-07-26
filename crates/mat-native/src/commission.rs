@@ -199,22 +199,31 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
 
 /// 「この失敗なら次の経路を試してよい」の判定。
 ///
-/// 対象は **PASE の MRP 使い切り**と **PASE 直前の消失**だけ。PASE は最初の
-/// 交換なので、ここで無言だったということはデバイス側に一切の状態が作られて
-/// いない＝別経路でやり直しても中途状態と衝突しない。
+/// 対象は PASE 以前のタイムアウトと、PASE の MRP 使い切りと、
+/// 発見の直後喪失のみ。それぞれ：
 ///
-/// attestation / NOC / CASE / 明示拒否は対象外。デバイスは failsafe 中に我々の
-/// 部分状態を持っている可能性があり、自動で二度目を打ってはならない。判定を
-/// `ErrorKind` ではなく `CommissionError` の段で行うのは、`kind_of` が
-/// `Case(Exchange(Timeout))` も `Timeout` に写してしまい PASE と区別できなく
-/// なるため。
+/// 1. ターゲット解決段階（`commissioning.rs:855` → `Timeout("no usable address")`）
+///    — PASE 確立前なので、デバイス側に状態は一切無い。別経路でやり直しても安全。
+///
+/// 2. PASE の MRP 再送尽き（`Pase(Exchange(Timeout))`）— 最初の交換なので
+///    デバイス側に状態は無い。
+///
+/// 3. mDNS 解決後 PASE 開始前の喪失（`Discovery(_)`）— デバイス側に状態は無い。
+///
+/// **重要: `Timeout("operational discovery after thread join")`（`commissioning.rs:1072`）
+/// と `Timeout("no usable operational address")`（`commissioning.rs:1078`）は意図的に
+/// 除外している。これら 2 つは BLE 経路で PASE 成功・Thread 参加後に出るもので、
+/// デバイスが 120 秒 failsafe 中に我々の部分状態を持つ。ここで別経路を試すと
+/// 部分状態と衝突して不可逆ダメージになる — この検査がその防止線。
 #[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
 fn is_dead_end(e: &CommissionError) -> bool {
     use mat_controller::exchange::ExchangeError;
     use mat_controller::pase::PaseError;
     matches!(
         e,
-        CommissionError::Timeout("pase")
+        // ターゲット解決段階（commissioning.rs:855）— PASE 以前なので
+        // デバイス側に状態は無い。
+        CommissionError::Timeout("no usable address")
             | CommissionError::Pase(PaseError::Exchange(ExchangeError::Timeout))
             | CommissionError::Discovery(_)
     )
@@ -868,8 +877,9 @@ mod tests {
         use mat_controller::exchange::ExchangeError;
         use mat_controller::pase::PaseError;
 
+        // ターゲット解決段階（commissioning.rs:855）— PASE 以前なのでデバイス側に状態は無い。
+        assert!(is_dead_end(&E::Timeout("no usable address")));
         // PASE の MRP 使い切り = 宛先が無言。デバイス側に状態は無い → 次の経路へ。
-        assert!(is_dead_end(&E::Timeout("pase")));
         assert!(is_dead_end(&E::Pase(PaseError::Exchange(
             ExchangeError::Timeout
         ))));
@@ -899,5 +909,18 @@ mod tests {
             step: "add-noc",
             code: 1
         }));
+    }
+
+    #[test]
+    fn post_pase_timeouts_are_not_dead_ends() {
+        use mat_controller::commissioning::CommissionError as E;
+
+        // BLE 経路で PASE 成功後・Thread 参加後に出る 2 つ
+        // （commissioning.rs:1072 / 1078）。デバイスは failsafe 中に我々の
+        // 部分状態を持つので、別経路で再駆動してはならない。
+        assert!(!is_dead_end(&E::Timeout(
+            "operational discovery after thread join"
+        )));
+        assert!(!is_dead_end(&E::Timeout("no usable operational address")));
     }
 }
