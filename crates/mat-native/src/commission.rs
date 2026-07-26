@@ -197,6 +197,29 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
     }
 }
 
+/// 「この失敗なら次の経路を試してよい」の判定。
+///
+/// 対象は **PASE の MRP 使い切り**と **PASE 直前の消失**だけ。PASE は最初の
+/// 交換なので、ここで無言だったということはデバイス側に一切の状態が作られて
+/// いない＝別経路でやり直しても中途状態と衝突しない。
+///
+/// attestation / NOC / CASE / 明示拒否は対象外。デバイスは failsafe 中に我々の
+/// 部分状態を持っている可能性があり、自動で二度目を打ってはならない。判定を
+/// `ErrorKind` ではなく `CommissionError` の段で行うのは、`kind_of` が
+/// `Case(Exchange(Timeout))` も `Timeout` に写してしまい PASE と区別できなく
+/// なるため。
+#[allow(dead_code)] // Task 3 で commission() から呼ばれるまで未使用
+fn is_dead_end(e: &CommissionError) -> bool {
+    use mat_controller::exchange::ExchangeError;
+    use mat_controller::pase::PaseError;
+    matches!(
+        e,
+        CommissionError::Timeout("pase")
+            | CommissionError::Pase(PaseError::Exchange(ExchangeError::Timeout))
+            | CommissionError::Discovery(_)
+    )
+}
+
 fn commission_error(e: CommissionError) -> MatError {
     MatError::new(kind_of(&e), format!("native commissioning failed: {e}"))
 }
@@ -835,5 +858,46 @@ mod tests {
         // CLI 層が exit 2 で弾く組み合わせ。native まで来たら内部エラー。
         let e = plan_routes(&manual(), Transport::Ble, &Discovered::NotConsulted).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Other);
+    }
+
+    // ---- Task 2: is_dead_end ----
+
+    #[test]
+    fn dead_end_is_limited_to_pase_and_predelivery() {
+        use mat_controller::commissioning::CommissionError as E;
+        use mat_controller::exchange::ExchangeError;
+        use mat_controller::pase::PaseError;
+
+        // PASE の MRP 使い切り = 宛先が無言。デバイス側に状態は無い → 次の経路へ。
+        assert!(is_dead_end(&E::Timeout("pase")));
+        assert!(is_dead_end(&E::Pase(PaseError::Exchange(
+            ExchangeError::Timeout
+        ))));
+    }
+
+    #[test]
+    fn case_timeout_is_not_a_dead_end() {
+        use mat_controller::case::CaseError;
+        use mat_controller::commissioning::CommissionError as E;
+        use mat_controller::exchange::ExchangeError;
+
+        // CASE まで来ているならデバイスは failsafe 中に我々の部分状態を持つ。
+        // kind_of では Timeout に写るが、フォールバックしてはいけない。
+        let e = E::Case(CaseError::Exchange(ExchangeError::Timeout));
+        assert_eq!(kind_of(&e), ErrorKind::Timeout);
+        assert!(!is_dead_end(&e));
+    }
+
+    #[test]
+    fn device_rejection_is_not_a_dead_end() {
+        use mat_controller::commissioning::CommissionError as E;
+        use mat_controller::pase::PaseError;
+
+        // 拒否は「届いている」証拠。別経路でも同じ理由で拒否される。
+        assert!(!is_dead_end(&E::Pase(PaseError::ConfirmMismatch)));
+        assert!(!is_dead_end(&E::CommandStatus {
+            step: "add-noc",
+            code: 1
+        }));
     }
 }
