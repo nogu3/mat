@@ -81,9 +81,16 @@ reachability — so `auto` keeps BLE as a fallback:
 | `ble` | skips mDNS entirely | rejected (exit `2`) |
 
 The fallback fires **only** when PASE exhausts its MRP retry budget (or the device
-disappears before PASE) — i.e. when nothing was ever established on the device. A
-failure after PASE (attestation, NOC, CASE) stops immediately: the device holds
-partial state under its failsafe and must not be re-driven automatically.
+disappears before PASE) — i.e. before any failsafe is armed, so nothing was ever
+established on the device. A failure after PASE (attestation, NOC, CASE) stops
+immediately: the device holds partial state under its failsafe and must not be
+re-driven automatically.
+
+After an mDNS **hit**, BLE is added to the plan only when it can actually run — a
+build with the `ble` cargo feature **and** a `--thread-dataset`. Without both,
+`auto` behaves exactly like `on-network` on a hit (an `INFO` line on stderr says
+so), instead of replacing the real on-network error with a BLE one. After an mDNS
+**miss** BLE is always attempted, so the error names whichever piece is missing.
 
 A manual code carries only a 4-bit short discriminator, which cannot drive the
 12-bit BLE scan; use the QR payload for BLE.
