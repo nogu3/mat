@@ -107,16 +107,25 @@ env 連携は既存の `--thread-dataset` と同じく clap の `env` 属性で�
 ```rust
 fn is_dead_end(e: &CommissionError) -> bool {
     matches!(e,
-        CommissionError::Timeout("pase")
+        CommissionError::Timeout("no usable address")
         | CommissionError::Pase(PaseError::Exchange(ExchangeError::Timeout))
         | CommissionError::Discovery(_))
 }
 ```
 
-- **PASE の timeout のみが対象。** PASE は最初の交換であり、ここで MRP を使い切った
-  ということはデバイス側に一切の状態が作られていない。別経路でやり直しても中途状態と
-  衝突しない。
-- `Discovery(_)`（事前 resolve 成功後・PASE 直前に消えた）も同じくワイヤ未接触なので含める。
+- **PASE 以前の失敗のみが対象。** PASE は最初の交換であり、そこに到達する前／そこで
+  MRP を使い切ったということはデバイス側に一切の状態が作られていない。別経路で
+  やり直しても中途状態と衝突しない。
+- 3 つの分岐はそれぞれ実在の生成箇所に対応する:
+  `Timeout("no usable address")` = `commission_on_network` のターゲット解決
+  （`commissioning.rs:855`、`pase::establish` 呼び出し前）、
+  `Pase(Exchange(Timeout))` = PASE 自身の MRP 予算切れ、
+  `Discovery(_)` = 事前 resolve 成功後・PASE 直前に候補が消えた。
+- **`Timeout(_)` へ広げてはならない。** `CommissionError::Timeout` には BLE 経路の
+  post-PASE な 2 つ（`commissioning.rs:1072` の
+  `"operational discovery after thread join"` と `1078` の
+  `"no usable operational address"`）があり、これらは PASE 成功後・Thread 参加後に
+  出る。拾ってしまうと failsafe 中の機体を再駆動することになる。
 - **これ以外はすべて即打ち切り。** attestation / NOC / CASE / 明示拒否（passcode 不一致・
   StatusReport 拒否）/ malformed では、デバイス側に failsafe 中の部分状態がある可能性が
   あるため、自動で二度目を打たない。
