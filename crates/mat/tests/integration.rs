@@ -71,6 +71,49 @@ fn color_temp_requires_exactly_one_of_kelvin_or_mireds() {
 }
 
 #[test]
+fn transport_ble_rejects_manual_code() {
+    // BLE scan は 12bit 完全一致が要る。manual code は 4bit しか持たない。
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "34970112332",
+            "--transport",
+            "ble",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("QR"));
+}
+
+/// 未知の値が exit 2 になること「だけ」なら `value_enum` の素の挙動なので、
+/// 機能を丸ごと revert しても通ってしまう。ここでは **候補が正確に
+/// `auto` / `on-network` / `ble` の 3 つ**（README・spec の表と同じ集合）で
+/// あることまで固定する — 経路が増減したらこのテストが落ちる。
+#[test]
+fn transport_rejects_unknown_value_and_lists_the_exact_choices() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args([
+            "commission",
+            "--target",
+            "192.0.2.10",
+            "--setup-code",
+            "MT:Y.K9042C00KA0648G00",
+            "--transport",
+            "carrier-pigeon",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "[possible values: auto, on-network, ble]",
+        ));
+}
+
+#[test]
 fn color_requires_both_hue_and_sat() {
     let store = store_with_node5();
     mat(store.path())

@@ -17,6 +17,7 @@ use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
 use mat_core::store::{NodeRecord, Store};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     store_path: &Path,
     target: &str,
@@ -25,6 +26,7 @@ pub fn run(
     alias: Option<&str>,
     native: Option<&crate::native_direct::Config<'_>>,
     thread_dataset: Option<&str>,
+    transport: crate::cli::TransportArg,
 ) -> Result<(), MatError> {
     // commission はストアを bootstrap してよい経路（node_id 採番のため）。
     let mut store = Store::open_or_init(store_path)?;
@@ -39,7 +41,7 @@ pub fn run(
             "commission: native backend not configured (internal)",
         )
     })?;
-    native_commission(cfg, &store, setup_code, node_id, thread_dataset)?;
+    native_commission(cfg, &store, setup_code, node_id, thread_dataset, transport)?;
     record_success(&mut store, node_id, target, alias)
 }
 
@@ -49,6 +51,7 @@ fn native_commission(
     setup_code: &str,
     node_id: u64,
     thread_dataset: Option<&str>,
+    transport: crate::cli::TransportArg,
 ) -> Result<(), MatError> {
     let dataset = thread_dataset
         .map(|h| {
@@ -66,6 +69,7 @@ fn native_commission(
         thread_dataset: dataset,
         paa_dir: paa_trust_store_path(store.root()),
         cd_signer_dir: cd_signer_store_path(store.root()),
+        transport: transport.to_native(),
     };
     let ncfg = mat_native::NativeConfig {
         store: store.root().to_path_buf(),
