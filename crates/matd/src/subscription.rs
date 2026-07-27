@@ -1204,4 +1204,71 @@ mod tests {
             "無音 deadline (90s) を待っていないこと: {elapsed:?}"
         );
     }
+
+    /// 確立が 3 回失敗したら backoff ラダー（5s → 10s → 20s）を実際に登り、
+    /// 4 回目で回復する。`next_backoff` の純関数テストはあったが、ループが
+    /// その間隔で再試行することは一度も通されていなかった。
+    #[tokio::test(start_paused = true)]
+    async fn establish_failures_climb_backoff_then_recover() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        est.fail_subscription.store(3, Ordering::SeqCst);
+        let t0 = tokio::time::Instant::now();
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("4 回目の確立で priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(35),
+            "5+10+20 のラダーを実際に登ること: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(75),
+            "4 回目で成功し 40s の次段を待たないこと: {elapsed:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "失敗 3 + 成功 1 = 4 試行（失敗も試行として数える）"
+        );
+    }
+
+    /// pump がセッションエラーで死んだら、無音 deadline (90s) を待たずに
+    /// backoff 5s で再購読する（`run_subscription_once` の `Err` 分岐が
+    /// `Ok(())` を返してループが「購読喪失」として扱う経路）。
+    #[tokio::test(start_paused = true)]
+    async fn pump_session_error_resubscribes_without_waiting_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // 確立の**あと**に注入する = 走っている pump を狙って殺す。
+        let t0 = tokio::time::Instant::now();
+        fail_next_report.store(1, Ordering::SeqCst);
+
+        let ev = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("再購読の priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "無音 deadline (90s) を待たず backoff 5s で戻ること: {elapsed:?}"
+        );
+    }
 }
