@@ -540,7 +540,8 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   place, so `--cluster` can narrow further within that set but never outside
   it — see [Subscriptions (`subscriptions.toml`, optional, matd
   only)](#subscriptions-subscriptionstoml-optional-matd-only) below.
-- `--count` (default `1`) is how many events to receive before exiting `0`.
+- `--count` (default `1`) is how many events to receive before exiting `0`;
+  `0` means no count limit — keep streaming (symmetric with `--timeout-ms 0`).
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
   forever. Reaching `--count` exits `0`; the timeout firing with **zero**
   events received exits `3` (with at least one event received, it still exits
@@ -582,13 +583,18 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   [Errors and exit codes](#errors-and-exit-codes). Events already printed
   before a mid-stream matd loss stay printed; the process still exits `13`
   (not `3`), even if `--count` was not reached.
-- Usage form (a consumer like casa loops itself; `mat`/`matd` never run
+- Usage form (a consumer like casa reacts per line; `mat`/`matd` never run
   automations — see [Backend](#backend) / ARCHITECTURE.md "Design rules"):
   ```bash
-  while ev=$(mat listen --node 21 --cluster occupancysensing --count 1 --timeout-ms 0); do
+  mat listen --node 21 --cluster occupancysensing --count 0 --timeout-ms 0 |
+  while read -r ev; do
     # inspect $ev and react, e.g. mat on / mat off
   done
   ```
+  Prefer this resident stream over respawning one-shot `--count 1` calls in a
+  loop: `matd` fans events out over a live broadcast, so events arriving in
+  the gap between one `listen` exiting and the next attaching (e.g. the rest
+  of a priming burst after its first event) are dropped, not queued.
 
 See [Routing through `matd`](#routing-through-matd) for what `matd` actually
 subscribes to and how events reach it.

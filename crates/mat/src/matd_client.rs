@@ -639,7 +639,7 @@ fn run_listen_stream(
         }
         println!("{v}");
         received += 1;
-        if received >= count {
+        if count > 0 && received >= count {
             return Ok(ExitCode::SUCCESS);
         }
     }
