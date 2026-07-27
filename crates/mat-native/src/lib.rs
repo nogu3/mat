@@ -176,6 +176,12 @@ pub trait SubscribeConn: Send {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError>;
+    /// 購読セッションの生存確認。無音 deadline 到達時、teardown 前に撃つ軽い
+    /// read（endpoint 0 の basicinformation / data-model-revision）。成功 =
+    /// セッション（CASE + 経路）は生きている。**購読自体の生存は証明しない**
+    /// — デバイス側が購読を畳んでいても成功するため、呼び出し側（matd）は
+    /// 連続成功をキャップする（spec 2026-07-27 無音 probe）。
+    async fn probe(&mut self) -> Result<(), MatError>;
 }
 
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
@@ -539,6 +545,20 @@ impl SubscribeConn for SubscriptionSession {
             Err(mat_controller::session::SessionError::Silence) => Ok(None),
             Err(e) => Err(map_session_err(e)),
         }
+    }
+
+    async fn probe(&mut self) -> Result<(), MatError> {
+        use mat_controller::im::{ATTR_DATA_MODEL_REVISION, CLUSTER_BASIC_INFORMATION};
+        self.session
+            .read_attribute(
+                0,
+                CLUSTER_BASIC_INFORMATION,
+                ATTR_DATA_MODEL_REVISION,
+                &self.mrp,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_session_err)
     }
 }
 
@@ -1041,5 +1061,20 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// probe: 既定は成功、fail_probe 注入で残り回数だけ失敗、呼び出しは
+    /// probe_calls で数えられる（matd の延長キャップテストの前提となる fake 契約）。
+    #[tokio::test]
+    async fn fake_sub_conn_probe_succeeds_counts_and_fails_when_injected() {
+        use std::sync::atomic::Ordering;
+        let est = crate::test_support::FakeEstablisher::default();
+        let mut conn = est.establish_subscription(5).await.unwrap();
+        assert!(conn.probe().await.is_ok());
+        assert_eq!(est.probe_calls.load(Ordering::SeqCst), 1);
+        est.fail_probe.store(1, Ordering::SeqCst);
+        assert!(conn.probe().await.is_err());
+        assert!(conn.probe().await.is_ok(), "失敗は注入した回数だけ");
+        assert_eq!(est.probe_calls.load(Ordering::SeqCst), 3);
     }
 }
