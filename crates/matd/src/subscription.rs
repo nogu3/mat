@@ -1271,4 +1271,70 @@ mod tests {
             "無音 deadline (90s) を待たず backoff 5s で戻ること: {elapsed:?}"
         );
     }
+
+    /// 完全無音のまま無音 deadline（max_interval 60s + slack 30s = 90s）を
+    /// 超えたら購読を殺して再購読する（`PumpEnd::BornDeadSilence` 経路を
+    /// 統合で通す最初のテスト）。実機で最も頻繁に踏まれる死に方。
+    #[tokio::test(start_paused = true)]
+    async fn silent_subscription_dies_at_deadline_and_resubscribes() {
+        let (mut rx, _health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        let t0 = tokio::time::Instant::now();
+
+        // live キューへ何も入れない = デバイス発ゼロのまま（born-dead）。
+        let ev = tokio::time::timeout(Duration::from_secs(180), rx.recv())
+            .await
+            .expect("deadline 超過で再購読の priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(90),
+            "deadline より早く購読を殺さないこと: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(120),
+            "deadline + backoff 5s の範囲で再購読すること: {elapsed:?}"
+        );
+    }
+
+    /// 確立に成功したら backoff ラダーがリセットされる。ラダーを 20s まで
+    /// 育ててから確立させ、その購読を殺す。リセットされていれば次の再試行は
+    /// 5s 後、されていなければ 40s 後 — 15s の閾値で明確に区別できる。
+    #[tokio::test(start_paused = true)]
+    async fn backoff_resets_after_successful_establishment() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        est.fail_subscription.store(3, Ordering::SeqCst);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        // 3 回失敗（backoff は 20s まで育つ）→ 4 回目で確立。
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("ラダーを登った先の priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // 確立できた購読を殺す。
+        let t0 = tokio::time::Instant::now();
+        fail_next_report.store(1, Ordering::SeqCst);
+
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("再購読の priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "確立成功で backoff が 5s へリセットされること（未リセットなら 40s）: {elapsed:?}"
+        );
+    }
 }
