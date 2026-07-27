@@ -1656,4 +1656,43 @@ mod tests {
         };
         assert!(ev.priming);
     }
+
+    /// 監査#4 の副次修正: 起動時に store が読めなくても supervisor は次の
+    /// 再読ティックで自己回復する（従来は warn を出して購読ゼロで確定だった）。
+    #[tokio::test(start_paused = true)]
+    async fn manager_recovers_from_unreadable_store_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        // まだ存在しないパス → 初回 Store::open は store_missing で失敗する。
+        let store_path = dir.path().join("store");
+        let est = FakeEstablisher::default();
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let health = Arc::new(SubHealth::new(None));
+        let _handle =
+            spawn_subscription_manager(state, store_path.clone(), tx, None, Arc::clone(&health));
+        // supervisor に初回ティック（読み失敗）を踏ませてから store を作る。
+        // start_paused の単一スレッド実行では、この sleep の await 中に
+        // supervisor タスクが走る。
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut store = mat_core::store::Store::open_or_init(&store_path).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 7,
+                address: Some("192.0.2.12".into()),
+                commissioned_at: "2026-07-27T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        // 次のティック（60s）で購読が張られ priming が届く。
+        let ev = loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv())
+                .await
+                .expect("node7 priming should arrive after store becomes readable")
+                .unwrap();
+            if ev.node_id == 7 {
+                break ev;
+            }
+        };
+        assert!(ev.priming);
+    }
 }
