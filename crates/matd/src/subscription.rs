@@ -530,6 +530,43 @@ mod tests {
     use mat_native::test_support::{onoff_report, FakeEstablisher};
     use serde_json::json;
 
+    /// node 5 だけの台帳と fake establisher で購読マネージャを起動する共通足場。
+    ///
+    /// 戻り値の `TempDir` は**テスト側が束縛して生かし続ける**こと（`_dir` は可、
+    /// `_` は不可 — `_` は即 drop され store ごと消える）。`JoinHandle` も同様に
+    /// 束縛しておく（既存テストの寿命の握り方をそのまま踏襲）。
+    fn spawn_manager(
+        est: FakeEstablisher,
+        clusters: Option<Vec<u32>>,
+    ) -> (
+        broadcast::Receiver<Event>,
+        Arc<SubHealth>,
+        tempfile::TempDir,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                address: Some("192.0.2.10".into()),
+                commissioned_at: "2026-07-20T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, rx) = broadcast::channel(64);
+        let health = Arc::new(SubHealth::new(None));
+        let handles = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            clusters,
+            Arc::clone(&health),
+        );
+        (rx, health, dir, handles)
+    }
+
     #[test]
     fn event_json_uses_chip_tool_names_and_numeric_fallback() {
         let ev = Event {
@@ -710,23 +747,7 @@ mod tests {
     /// broadcast へ流れる。
     #[tokio::test]
     async fn manager_emits_priming_events_from_fake_subscription() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-20T00:00:00+09:00".into(),
-            })
-            .unwrap();
-
-        let native =
-            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles =
-            spawn_subscription_manager(state, dir.path().to_path_buf(), tx, None, health);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -741,29 +762,9 @@ mod tests {
     /// subscribe_wildcard まで届く（絞り込みの配線の釘打ち）。
     #[tokio::test]
     async fn manager_passes_clusters_to_subscribe() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
-            })
-            .unwrap();
-
         let est = FakeEstablisher::default();
-        let seen = std::sync::Arc::clone(&est.sub_clusters);
-        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            Some(vec![0x0006, 0x0406]),
-            health,
-        );
+        let seen = Arc::clone(&est.sub_clusters);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, Some(vec![0x0006, 0x0406]));
 
         // priming イベントが届いた時点で subscribe_wildcard は呼ばれている。
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -836,27 +837,7 @@ mod tests {
     /// 待たず grace+backoff 内（<40s）に再購読 = 2 回目の priming が届く。
     #[tokio::test(start_paused = true)]
     async fn op_grace_triggers_fast_resubscribe() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
-            })
-            .unwrap();
-        let native =
-            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            None,
-            std::sync::Arc::clone(&health),
-        );
+        let (mut rx, health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
         // 1 回目の priming（確立）。
         let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
@@ -887,28 +868,9 @@ mod tests {
     /// 無音 deadline 前に再購読は起きない。
     #[tokio::test(start_paused = true)]
     async fn live_report_clears_pending_without_resubscribe() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-21T00:00:00+09:00".into(),
-            })
-            .unwrap();
         let est = FakeEstablisher::default();
-        let live = std::sync::Arc::clone(&est.sub_live);
-        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            None,
-            std::sync::Arc::clone(&health),
-        );
+        let live = Arc::clone(&est.sub_live);
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
         let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
             .expect("first priming")
@@ -1077,28 +1039,9 @@ mod tests {
     /// キャッシュが live イベントでも更新されること（spec テスト (c)）も同時に釘打ち。
     #[tokio::test(start_paused = true)]
     async fn priming_diff_after_resubscribe_is_promoted_to_recovered_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
-            })
-            .unwrap();
         let est = FakeEstablisher::default();
-        let live = std::sync::Arc::clone(&est.sub_live);
-        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            None,
-            std::sync::Arc::clone(&health),
-        );
+        let live = Arc::clone(&est.sub_live);
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
 
         // 1 回目の priming（on-off=true）: 初見なので昇格しない。
         let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
@@ -1192,27 +1135,7 @@ mod tests {
     /// 無音 deadline 前に殺さない。
     #[tokio::test(start_paused = true)]
     async fn noop_op_does_not_kill_healthy_subscription() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
-            })
-            .unwrap();
-        let native =
-            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            None,
-            std::sync::Arc::clone(&health),
-        );
+        let (mut rx, health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
         // priming（on-off=true）でキャッシュが埋まる。
         let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
@@ -1248,27 +1171,7 @@ mod tests {
     /// grace + backoff 内（<40s）に再購読する。
     #[tokio::test(start_paused = true)]
     async fn changing_op_with_silent_device_triggers_fast_resubscribe() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
-        store
-            .upsert_node(mat_core::store::NodeRecord {
-                node_id: 5,
-                address: Some("192.0.2.10".into()),
-                commissioned_at: "2026-07-24T00:00:00+09:00".into(),
-            })
-            .unwrap();
-        let native =
-            crate::native::NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let state = std::sync::Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let health = std::sync::Arc::new(SubHealth::new(None));
-        let _handles = spawn_subscription_manager(
-            state,
-            dir.path().to_path_buf(),
-            tx,
-            None,
-            std::sync::Arc::clone(&health),
-        );
+        let (mut rx, health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
         let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
             .expect("first priming")
@@ -1299,6 +1202,163 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(40),
             "無音 deadline (90s) を待っていないこと: {elapsed:?}"
+        );
+    }
+
+    /// 確立が 3 回失敗したら backoff ラダー（5s → 10s → 20s）を実際に登り、
+    /// 4 回目で回復する。`next_backoff` の純関数テストはあったが、ループが
+    /// その間隔で再試行することは一度も通されていなかった。
+    #[tokio::test(start_paused = true)]
+    async fn establish_failures_climb_backoff_then_recover() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        est.fail_subscription.store(3, Ordering::SeqCst);
+        let t0 = tokio::time::Instant::now();
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("4 回目の確立で priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(35),
+            "5+10+20 のラダーを実際に登ること: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(40),
+            "経過は 5+10+20 のラダーちょうど（35s）であり、40s の次段は登っていないこと: {elapsed:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "失敗 3 + 成功 1 = 4 試行（失敗も試行として数える）"
+        );
+    }
+
+    /// pump がセッションエラーで死んだら、無音 deadline (90s) を待たずに
+    /// backoff 5s で再購読する（`run_subscription_once` の `Err` 分岐が
+    /// `Ok(())` を返してループが「購読喪失」として扱う経路）。
+    #[tokio::test(start_paused = true)]
+    async fn pump_session_error_resubscribes_without_waiting_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // 確立の**あと**に注入する = 走っている pump を狙って殺す。
+        let t0 = tokio::time::Instant::now();
+        fail_next_report.store(1, Ordering::SeqCst);
+
+        let ev = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("再購読の priming")
+            .unwrap();
+        assert!(ev.priming);
+        // 2 回目の priming が「本物の再確立」から来たことを検証する
+        // （`ev.priming` フラグだけでは推測に留まる）。
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "2 回目の priming は本物の 2 回目の確立から来ていること"
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "無音 deadline (90s) を待たず backoff 5s で戻ること: {elapsed:?}"
+        );
+    }
+
+    /// 完全無音のまま無音 deadline（max_interval 60s + slack 30s = 90s）を
+    /// 超えたら購読を殺して再購読する。実機で最も頻繁に踏まれる死に方。
+    /// なお `BornDeadSilence` と `Silence` は `tracing::info!` のメッセージ
+    /// 文字列が違うだけで制御フローは同一なため、どちらの無音バリアントが
+    /// 選ばれるかはここでは検証できない（できているのは純関数テストの
+    /// `pump_verdict_prioritizes_op_grace_then_silence`）。このテストが
+    /// 固定しているのは、完全無音の購読が 90s deadline で殺されて
+    /// 再購読されるという一点のみ。
+    #[tokio::test(start_paused = true)]
+    async fn silent_subscription_dies_at_deadline_and_resubscribes() {
+        let (mut rx, _health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        let t0 = tokio::time::Instant::now();
+
+        // live キューへ何も入れない = デバイス発ゼロのまま（born-dead）。
+        let ev = tokio::time::timeout(Duration::from_secs(180), rx.recv())
+            .await
+            .expect("deadline 超過で再購読の priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(90),
+            "deadline より早く購読を殺さないこと: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(120),
+            "deadline + backoff 5s の範囲で再購読すること: {elapsed:?}"
+        );
+    }
+
+    /// 確立に成功したら backoff ラダーがリセットされる。ラダーを 20s まで
+    /// 育ててから確立させ、その購読を殺す。リセットされていれば次の再試行は
+    /// 5s 後、されていなければ 40s 後 — 15s の閾値で明確に区別できる。
+    #[tokio::test(start_paused = true)]
+    async fn backoff_resets_after_successful_establishment() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        est.fail_subscription.store(3, Ordering::SeqCst);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        // 3 回失敗（backoff は 20s まで育つ）→ 4 回目で確立。
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("ラダーを登った先の priming")
+            .unwrap();
+        assert!(ev.priming);
+        // このテストの前提: 3 回失敗して実際にラダーを登ったこと。
+        // ここを確認しないと、fail_subscription が何らかの理由で効かなくなり
+        // 1 回目の試行がいきなり成功しても（backoff == 0）本テストは
+        // 「リセットされた/されていない」のどちらとも見分けがつかず、
+        // 何も検証しないまま green で居座ってしまう。
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "失敗 3 + 成功 1 = 4 試行になっていること（このテストの成立前提）"
+        );
+
+        // 確立できた購読を殺す。
+        let t0 = tokio::time::Instant::now();
+        fail_next_report.store(1, Ordering::SeqCst);
+
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("再購読の priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "確立成功で backoff が 5s へリセットされること（未リセットなら 40s）: {elapsed:?}"
         );
     }
 }
