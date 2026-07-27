@@ -119,6 +119,47 @@ fn listen_timeout_with_partial_events_exits_zero() {
 }
 
 #[test]
+fn listen_count_zero_streams_all_events_until_timeout() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    // count 0 = 無期限: 3 件全部流れても exit 0 せず、timeout で打ち切り
+    // （1 件以上受信済みなので exit 0）。
+    let _matd = spawn_fake_matd_stream(socket.clone(), 3, 3000);
+
+    mat_listen(&socket, &["--count", "0", "--timeout-ms", "300"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"occupancy\"").count(3));
+}
+
+#[test]
+fn listen_count_zero_timeout_zero_streams_until_stream_end() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    // count 0 + timeout 0 = 完全無期限: count 到達での exit 0 は発生せず、
+    // ストリームが閉じるまで受け続ける（EOF = matd 落ち扱い exit 13）。
+    let _matd = spawn_fake_matd_stream(socket.clone(), 3, 0);
+
+    mat_listen(&socket, &["--count", "0", "--timeout-ms", "0"])
+        .assert()
+        .code(13)
+        .stdout(predicate::str::contains("\"occupancy\"").count(3));
+}
+
+#[test]
+fn listen_count_zero_timeout_without_events_exits_3() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    // count 0 でも timeout>0 なら従来どおり打ち切り、0 件なら exit 3。
+    let _matd = spawn_fake_matd_stream(socket.clone(), 0, 3000);
+
+    mat_listen(&socket, &["--count", "0", "--timeout-ms", "300"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}
+
+#[test]
 fn listen_without_matd_exits_13() {
     let dir = TempDir::new().unwrap();
     let socket = dir.path().join("matd.sock"); // bind しない
