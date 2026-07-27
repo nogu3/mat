@@ -28,6 +28,20 @@ fn main() -> ExitCode {
     // 引数エラー（exit 2）は clap が直接処理する。
     let args = Cli::parse();
 
+    // `--transport ble` × manual code は成立しない組み合わせ。clap では表現できない
+    // ので、ここで引数エラー（exit 2）として弾く。
+    if let Command::Commission {
+        transport,
+        setup_code,
+        ..
+    } = &args.command
+    {
+        if let Err(e) = cli::validate_transport(*transport, setup_code) {
+            e.emit();
+            return ExitCode::from(2);
+        }
+    }
+
     let store_path = Store::locate(args.store);
 
     // alias 一括解決（aliases.toml が無ければ数値パススルー）。matd 経路も数値しか
@@ -155,6 +169,7 @@ fn main() -> ExitCode {
             node_id,
             alias,
             thread_dataset,
+            transport,
         } => commands::commission::run(
             &store_path,
             target,
@@ -163,6 +178,7 @@ fn main() -> ExitCode {
             alias.as_deref(),
             native_cfg.as_ref(),
             thread_dataset.as_deref(),
+            *transport,
         ),
         Command::Diag {
             action:

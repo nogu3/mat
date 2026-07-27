@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
+use mat_core::error::{ErrorKind, MatError};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +101,17 @@ pub enum Command {
             value_name = "HEX"
         )]
         thread_dataset: Option<String>,
+        /// 経路指定。auto（既定）は mDNS で見つかればまず on-network を試し、
+        /// PASE が MRP 予算を使い切ったら BLE に切り替える。on-network は BLE に
+        /// 落ちない。ble は mDNS を引かず BLE 直行（QR ペイロード必須）。
+        #[arg(
+            long = "transport",
+            env = "MAT_TRANSPORT",
+            value_enum,
+            default_value_t = TransportArg::Auto,
+            value_name = "MODE"
+        )]
+        transport: TransportArg,
     },
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
@@ -527,4 +539,40 @@ pub enum GroupCommand {
         #[arg(long = "nodes", required = true, num_args = 1..)]
         node_ids: Vec<NodeRef>,
     },
+}
+
+/// `--transport` の受け口。`mat-native` は clap に依存しないため、CLI 側に
+/// `ValueEnum` を置いて `mat_native::commission::Transport` へ写す。
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportArg {
+    #[default]
+    Auto,
+    #[value(name = "on-network")]
+    OnNetwork,
+    Ble,
+}
+
+impl TransportArg {
+    pub fn to_native(self) -> mat_native::commission::Transport {
+        use mat_native::commission::Transport;
+        match self {
+            TransportArg::Auto => Transport::Auto,
+            TransportArg::OnNetwork => Transport::OnNetwork,
+            TransportArg::Ble => Transport::Ble,
+        }
+    }
+}
+
+/// `--transport ble` は QR ペイロード（`MT:`）でしか成立しない。矛盾は CLI 引数
+/// エラー（exit 2）として `main` が扱う。
+pub fn validate_transport(t: TransportArg, setup_code: &str) -> Result<(), MatError> {
+    if t == TransportArg::Ble && !setup_code.starts_with("MT:") {
+        return Err(MatError::new(
+            ErrorKind::Other,
+            "--transport ble requires the QR payload (MT:...) — a manual code has no long \
+             discriminator for the BLE scan"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

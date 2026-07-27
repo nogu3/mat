@@ -518,6 +518,7 @@ pub fn thread_ext_pan_id(dataset: &[u8]) -> Option<[u8; 8]> {
 // 期限切れに任せる（spec 決定 6: 中断ハンドラを持たない一発フロー）。
 
 /// commissioning 対象デバイスの指定方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommissionTarget {
     /// アドレス既知（ローカル E2E、または呼び出し側が別途探索済み）。
     Addr(SocketAddr),
@@ -1537,6 +1538,14 @@ impl std::fmt::Display for CommissionError {
 
 impl std::error::Error for CommissionError {}
 
+/// **注意（`mat-native` との結合）**: `CommissionError::Discovery(_)` は
+/// `mat-native::commission::is_dead_end` で「デバイス側に状態が無い ＝ 別の
+/// transport で再試行してよい」と分類される。したがって **PASE 成功後**の
+/// コードで dnssd 呼び出しに `?` を書くと、その失敗が黙って経路リトライの
+/// 対象になり、failsafe 中の機体を別経路で再駆動しうる。
+/// 現状の post-PASE の operational 解決（下の `commission_ble_thread` 内、
+/// 明示 `match` で `CommissionError::Timeout(_)` に畳んでいる箇所）は
+/// この理由で `?` を使っていない。post-PASE に dnssd を足すときは同じ規律で。
 impl From<crate::dnssd::DnssdError> for CommissionError {
     fn from(e: crate::dnssd::DnssdError) -> Self {
         CommissionError::Discovery(e)
