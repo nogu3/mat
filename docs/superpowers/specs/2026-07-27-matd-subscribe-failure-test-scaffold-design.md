@@ -102,7 +102,7 @@ fn take_failure(counter: &AtomicUsize) -> bool {
 **1. `establish_failures_climb_backoff_then_recover`**
 `fail_subscription = 3`。確立が 3 回失敗したあと 4 回目で成功する。
 - priming 到達までの経過が `>= 35s`（5+10+20 のラダーを実際に登った証明）
-- かつ `< 75s`（4 回目の 40s backoff を待っていない = 4 回目で成功している）
+- かつ `< 40s`（5+10+20 = 35s のラダーを登り終わり、40s 段目の backoff には入らない）
 - `calls == 4`
 
 **2. `pump_session_error_resubscribes_without_waiting_deadline`**
@@ -115,7 +115,7 @@ fn take_failure(counter: &AtomicUsize) -> bool {
 確立後、live report を一切入れない（完全無音）。
 - 再 priming までの経過が `>= 90s`（deadline より早く殺さない）
 - かつ `< 120s`（deadline + backoff 5s + スライス誤差の範囲で再購読する）
-- `PumpEnd::BornDeadSilence` 経路を統合で通す最初のテスト
+- 完全無音の購読が 90s deadline で殺されて再購読される（バリアント選択は純関数テスト `pump_verdict_prioritizes_op_grace_then_silence` で固定）
 
 **4. `backoff_resets_after_successful_establishment`**
 `fail_subscription = 3` でラダーを 20s まで育ててから確立させ、その後
