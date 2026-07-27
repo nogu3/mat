@@ -21,9 +21,11 @@ use mat_core::store::Store;
 
 use crate::server::NativeState;
 
-/// 再購読 backoff の初期値 / 上限。
+/// 再購読 backoff の初期値 / 上限。上限は当初 300s だったが、リンク回復後に
+/// 最大 5 分無試行 = センサーの照明 1 回分不発になるため 60s へ短縮
+/// （issue #15、blind 実測 1 日 3.7 時間の主因の一つ）。
 const BACKOFF_INITIAL: Duration = Duration::from_secs(5);
-const BACKOFF_MAX: Duration = Duration::from_secs(300);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// 未確立がこの時間続いたら warn を 1 回出す（弱リンクノードの長期ブラインドを
 /// 本番 info/warn レベルで可視化する — 実測で盲目窓が数時間に達した反省）。
@@ -54,6 +56,23 @@ pub(crate) enum PumpEnd {
     BornDeadSilence,
     /// 生存実績のあと無音 deadline 超過（通常の購読死）。
     Silence,
+}
+
+/// 無音 probe の連続延長キャップ。probe はセッション生存しか証明できず、
+/// デバイス側が購読を畳んでいても成功する — 無制限延長はゾンビ購読の恒久盲目
+/// になるため、デバイス発メッセージ無しの連続成功は 2 回まで（盲目上限
+/// ≈ 3×deadline）。実レポート/keep-alive 受信でリセット。
+#[allow(dead_code)]
+// Task 5 で pump に配線されるまでの一時措置
+pub(crate) const SILENCE_PROBE_MAX: u32 = 2;
+
+/// 無音 deadline 到達時に probe を撃つべきか（純関数）。生存実績ありの無音
+/// （`Silence`）だけが対象 — born-dead は「op 経路は生きてレポート経路だけ
+/// 死んでいる」状態なので op 経路と同型の probe が成功しても何も証明しない。
+#[allow(dead_code)]
+// Task 5 で pump に配線されるまでの一時措置
+pub(crate) fn should_probe(end: &PumpEnd, probes_used: u32) -> bool {
+    matches!(end, PumpEnd::Silence) && probes_used < SILENCE_PROBE_MAX
 }
 
 /// pump を殺すべきか判定する（純関数 — 時計は pump が持つ）。
@@ -697,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_from_5s_capped_at_5min() {
+    fn backoff_doubles_from_5s_capped_at_60s() {
         use std::time::Duration;
         assert_eq!(next_backoff(Duration::ZERO), Duration::from_secs(5));
         assert_eq!(
@@ -705,13 +724,29 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(160)),
-            Duration::from_secs(300)
+            next_backoff(Duration::from_secs(40)),
+            Duration::from_secs(60)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(300)),
-            Duration::from_secs(300)
+            next_backoff(Duration::from_secs(60)),
+            Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn should_probe_only_for_proven_silence_under_cap() {
+        // 生存実績ありの無音だけが probe 対象。キャップ 2 で打ち止め。
+        assert!(should_probe(&PumpEnd::Silence, 0));
+        assert!(should_probe(&PumpEnd::Silence, 1));
+        assert!(!should_probe(&PumpEnd::Silence, 2));
+        // born-dead / op 相関は probe しない（probe 成功が何も証明しないため）。
+        assert!(!should_probe(&PumpEnd::BornDeadSilence, 0));
+        assert!(!should_probe(
+            &PumpEnd::OpGrace {
+                since_op: Duration::from_secs(10)
+            },
+            0
+        ));
     }
 
     #[test]
