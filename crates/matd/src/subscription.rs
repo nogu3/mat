@@ -1,13 +1,14 @@
 //! matd 常駐 Subscribe（spec: 2026-07-20-matd-subscribe-listen-design.md ②）。
 //!
-//! 起動時に KVS から commissioned ノード一覧を読み、ノードごとに購読タスクを
-//! 1 本張る: resolve（常駐 mDNS キャッシュ）→ 専用 CASE → wildcard Subscribe →
-//! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 60s）で再購読。
+//! supervisor が `LEDGER_RESCAN_INTERVAL`（60s）ごとに台帳を読み直し、
+//! 新規ノードへ購読ループを spawn（監査#4）。ノードごと: resolve（常駐 mDNS
+//! キャッシュ）→ 専用 CASE → wildcard Subscribe → ポンプ。失敗・死亡は指数
+//! backoff（5s 開始、上限 60s）で再購読。
 //! イベントは `tokio::sync::broadcast` で listen 接続へ配る。
 //! 状態は持たない（リングバッファ/リプレイ無し — 聞いている間だけ届く契約）。
 //! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection。無音は teardown 前に probe で最大 2 回延長 — spec 2026-07-27 無音 probe）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -374,7 +375,7 @@ pub fn spawn_subscription_manager(
         }
         // 購読ループを張った node_id。台帳は増える一方（削除 API 無し）なので
         // 集合の縮小は考えない。
-        let mut subscribed = std::collections::HashSet::new();
+        let mut subscribed = HashSet::new();
         let mut announced = false;
         let mut read_fail_streak: u32 = 0;
         loop {
