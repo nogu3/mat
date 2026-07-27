@@ -136,6 +136,10 @@ pub struct SecureSession {
     /// ピアから最後に認証済みメッセージを受けた時刻（MRP active/idle 判定用、
     /// spec 4.12.8: 直近受信ありなら SAI で再送）。
     last_rx: Option<Instant>,
+    /// 購読 pump: デコード済み report を返した後に respond_status が失敗した
+    /// ときの持ち越しエラー。次の next_subscription_report 呼び出しが返す
+    /// （report を道連れにせず、セッション死の即時検知も保つ — 監査#1 経路A）。
+    deferred_sub_err: Option<SessionError>,
 }
 
 impl SecureSession {
@@ -160,6 +164,7 @@ impl SecureSession {
             rx_window: RxWindow::new(),
             peer_initiated: std::collections::VecDeque::new(),
             last_rx: None,
+            deferred_sub_err: None,
         }
     }
 
@@ -1073,6 +1078,9 @@ impl SecureSession {
         cfg: &MrpConfig,
     ) -> Result<crate::im::ReportDataMessage, SessionError> {
         use crate::im;
+        if let Some(e) = self.deferred_sub_err.take() {
+            return Err(e);
+        }
         // screen が待避した report が先にあればそれを消費する。
         let msg = if let Some(m) = self.peer_initiated.pop_front() {
             m
@@ -1117,7 +1125,12 @@ impl SecureSession {
             "sub pump: report delivered"
         );
         if !rd.suppress_response {
-            self.respond_status(msg.proto.exchange_id, 0, cfg).await?;
+            if let Err(e) = self.respond_status(msg.proto.exchange_id, 0, cfg).await {
+                // デコード済み report を道連れにしない: report は届け、失敗は
+                // 次回呼び出しへ持ち越す（pump は 5s スライスで即座に気づく）。
+                tracing::debug!(error = %e, "sub pump: status response failed; delivering report, deferring error");
+                self.deferred_sub_err = Some(e);
+            }
         }
         Ok(rd)
     }
@@ -2868,5 +2881,76 @@ mod tests {
         assert_eq!(rd.subscription_id, Some(77));
         assert_eq!(rd.reports.len(), 1);
         assert!(s.peer_initiated.is_empty());
+    }
+
+    /// 監査#1 経路A: 購読 report への StatusResponse が ack されず MRP 予算を
+    /// 使い切っても、デコード済み report は道連れにしない。1 回目の呼び出しは
+    /// Ok(report) を返し、失敗は deferred error として 2 回目の呼び出しで返る
+    /// （read 経路の best-effort と違い、セッション死の即時検知は保つ）。
+    #[tokio::test]
+    async fn respond_status_failure_defers_error_and_still_delivers_report() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let local = transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        // デバイス: report を送るが、以後一切 ack しない（無応答デバイス）。
+        let dev = tokio::spawn(async move {
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 700,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x7777,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let d = seal_message(
+                &R2I,
+                &header,
+                &proto,
+                &subscription_report_payload(9, true, false),
+                DEV_NODE,
+            )
+            .unwrap();
+            device.send_to(&d, local).await.unwrap();
+            // StatusResponse（+再送）を受けるが ack は返さない。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            while tokio::time::timeout(Duration::from_secs(1), device.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {}
+        });
+
+        // 1 回目: respond_status は MRP 予算切れで失敗するが、report は返る。
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .expect("decoded report must survive a failed status response");
+        assert_eq!(rd.subscription_id, Some(9));
+
+        // 2 回目: 持ち越された Timeout が返る（セッション死の即時検知）。
+        let err = s
+            .next_subscription_report(Duration::from_millis(100), &fast_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Timeout), "deferred: {err:?}");
+        dev.await.unwrap();
     }
 }
