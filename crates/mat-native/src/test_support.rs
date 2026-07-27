@@ -26,6 +26,19 @@ pub struct FakeSubConn {
     >,
     /// subscribe_wildcard が受けた clusters の記録先（FakeEstablisher と共有）。
     pub seen_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// 残り回数だけ `next_report` を `SessionFailed` で失敗させる（0 = 常に成功）。
+    /// `FakeEstablisher::fail_next_report` と同一の Arc — テストが確立後に
+    /// 注入して pump を狙って殺せる。
+    pub fail_next_report: std::sync::Arc<AtomicUsize>,
+}
+
+/// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
+/// 0 なら `false`（成功）。fake の「残り失敗回数」表現の共通部品 — bool では
+/// 「N 回失敗してから成功」が表現できず、matd の backoff ラダーが回せない。
+fn take_failure(counter: &AtomicUsize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 /// onoff on-off=true の AttributeReport 1 件を持つ ReportDataMessage を作る
@@ -53,6 +66,7 @@ impl Default for FakeSubConn {
             priming: vec![onoff_report(1, true)],
             live: std::sync::Arc::default(),
             seen_clusters: std::sync::Arc::default(),
+            fail_next_report: std::sync::Arc::default(),
         }
     }
 }
@@ -83,6 +97,12 @@ impl crate::SubscribeConn for FakeSubConn {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+        if take_failure(&self.fail_next_report) {
+            return Err(MatError::new(
+                ErrorKind::SessionFailed,
+                "fake subscription session error",
+            ));
+        }
         if let Some(r) = self.live.lock().unwrap().pop_front() {
             return Ok(Some(r));
         }
@@ -267,6 +287,12 @@ pub struct FakeEstablisher {
     pub sub_live: std::sync::Arc<
         std::sync::Mutex<std::collections::VecDeque<mat_controller::im::ReportDataMessage>>,
     >,
+    /// `establish_subscription` を残り回数だけ `fail_kind` で失敗させる
+    /// （0 = 常に成功）。matd の再確立 backoff ラダーを回すためのカウンタ。
+    pub fail_subscription: std::sync::Arc<AtomicUsize>,
+    /// 払い出す `FakeSubConn` の `next_report` を残り回数だけ失敗させる
+    /// （0 = 常に成功）。Arc 共有なのでテストが確立後に注入できる。
+    pub fail_next_report: std::sync::Arc<AtomicUsize>,
 }
 
 impl Default for FakeEstablisher {
@@ -277,6 +303,8 @@ impl Default for FakeEstablisher {
             fail_kind: ErrorKind::Timeout,
             sub_clusters: std::sync::Arc::default(),
             sub_live: std::sync::Arc::default(),
+            fail_subscription: std::sync::Arc::default(),
+            fail_next_report: std::sync::Arc::default(),
         }
     }
 }
@@ -296,10 +324,15 @@ impl Establisher for FakeEstablisher {
         &self,
         _node_id: u64,
     ) -> Result<Box<dyn crate::SubscribeConn>, MatError> {
+        // 失敗も試行として数える（テストが calls で試行回数を主張できる）。
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if take_failure(&self.fail_subscription) {
+            return Err(MatError::new(self.fail_kind, "fake subscription failure"));
+        }
         Ok(Box::new(FakeSubConn {
             seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
             live: std::sync::Arc::clone(&self.sub_live),
+            fail_next_report: std::sync::Arc::clone(&self.fail_next_report),
             ..Default::default()
         }))
     }
