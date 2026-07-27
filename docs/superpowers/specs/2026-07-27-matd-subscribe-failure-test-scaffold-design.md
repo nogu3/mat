@@ -29,7 +29,7 @@
 | 無音 deadline 到達（`PumpEnd::BornDeadSilence` / `Silence`） | `pump_verdict` の純関数テストのみ |
 | pump の `Err` 分岐（セッション死 → 再購読） | 未テスト |
 
-既存の統合テスト 6 本は全て「op 相関（`SubHealth` の pending）で殺す」経路しか
+既存の統合テスト 7 本は全て「op 相関（`SubHealth` の pending）で殺す」経路しか
 通っていない。実機で最も頻繁に踏まれるのは弱リンクノードの**確立失敗ラダー**と
 **無音死**なので、そこが素通しなのは監査で最も分の悪い抜けだった。
 
@@ -119,7 +119,7 @@ fn take_failure(counter: &AtomicUsize) -> bool {
 
 ### ③ テストヘルパでコピペを畳む
 
-既存の統合テスト 6 本は全て次の 20 行を丸ごとコピペしている:
+既存の統合テスト 7 本は全て次の 20 行を丸ごとコピペしている:
 
 ```rust
 let dir = tempfile::tempdir().unwrap();
@@ -133,7 +133,7 @@ let _handles = spawn_subscription_manager(state, dir.path().to_path_buf(), tx, N
 ```
 
 新規 4 本でこれが更に 80 行増えるので、`mod tests` 内にローカルヘルパを 1 本切り、
-**既存 6 本もそれに寄せる**（触っている場所を整えるのが妥当な範囲。同じ形が 2 種類
+**既存 7 本もそれに寄せる**（触っている場所を整えるのが妥当な範囲。同じ形が 2 種類
 並ぶのを避ける）。
 
 ```rust
@@ -173,6 +173,8 @@ fn spawn_manager(
 - 新しい欠陥の修正（Tier 2 の他項目 ⑤〜⑩、Tier 1 の #1/#3/#4）
 - `matd status` op の新設（別途）
 - 実 CASE / 実 mDNS を使ったテスト（fake の範囲で完結させる）
-- `STUCK_WARN_AFTER`（600s）到達の統合テスト。ログ出力の観測にはトレース
-  キャプチャの足場が別途必要で、`classify_failure` の純関数テストで論理は
-  担保済み。今回は入れない。
+- `STUCK_WARN_AFTER`（600s）到達の統合テスト。1.5.0 で同ファイルにトレース
+  キャプチャの足場（`Buf` + `MakeWriter`、
+  `classify_promotion_emits_info_log_with_old_and_new_values`）が入ったので
+  技術的な障壁は無くなったが、`classify_failure` の純関数テストで論理は担保
+  済みであり今回のスコープには含めない。将来足すなら安い。
