@@ -2,10 +2,10 @@
 //!
 //! 起動時に KVS から commissioned ノード一覧を読み、ノードごとに購読タスクを
 //! 1 本張る: resolve（常駐 mDNS キャッシュ）→ 専用 CASE → wildcard Subscribe →
-//! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 5min）で再購読。
+//! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 60s）で再購読。
 //! イベントは `tokio::sync::broadcast` で listen 接続へ配る。
 //! 状態は持たない（リングバッファ/リプレイ無し — 聞いている間だけ届く契約）。
-//! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection）。
+//! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection。無音は teardown 前に probe で最大 2 回延長 — spec 2026-07-27 無音 probe）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,9 +21,11 @@ use mat_core::store::Store;
 
 use crate::server::NativeState;
 
-/// 再購読 backoff の初期値 / 上限。
+/// 再購読 backoff の初期値 / 上限。上限は当初 300s だったが、リンク回復後に
+/// 最大 5 分無試行 = センサーの照明 1 回分不発になるため 60s へ短縮
+/// （issue #15、blind 実測 1 日 3.7 時間の主因の一つ）。
 const BACKOFF_INITIAL: Duration = Duration::from_secs(5);
-const BACKOFF_MAX: Duration = Duration::from_secs(300);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// 未確立がこの時間続いたら warn を 1 回出す（弱リンクノードの長期ブラインドを
 /// 本番 info/warn レベルで可視化する — 実測で盲目窓が数時間に達した反省）。
@@ -54,6 +56,19 @@ pub(crate) enum PumpEnd {
     BornDeadSilence,
     /// 生存実績のあと無音 deadline 超過（通常の購読死）。
     Silence,
+}
+
+/// 無音 probe の連続延長キャップ。probe はセッション生存しか証明できず、
+/// デバイス側が購読を畳んでいても成功する — 無制限延長はゾンビ購読の恒久盲目
+/// になるため、デバイス発メッセージ無しの連続成功は 2 回まで（盲目上限
+/// ≈ 3×deadline）。実レポート/keep-alive 受信でリセット。
+pub(crate) const SILENCE_PROBE_MAX: u32 = 2;
+
+/// 無音 deadline 到達時に probe を撃つべきか（純関数）。生存実績ありの無音
+/// （`Silence`）だけが対象 — born-dead は「op 経路は生きてレポート経路だけ
+/// 死んでいる」状態なので op 経路と同型の probe が成功しても何も証明しない。
+pub(crate) fn should_probe(end: &PumpEnd, probes_used: u32) -> bool {
+    matches!(end, PumpEnd::Silence) && probes_used < SILENCE_PROBE_MAX
 }
 
 /// pump を殺すべきか判定する（純関数 — 時計は pump が持つ）。
@@ -152,7 +167,7 @@ impl SubHealth {
 }
 
 /// 確立失敗ログの出し分け（純関数 — 時計はループ側が持つ）。
-/// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 5 分毎に永久に失敗し
+/// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 60s 毎に永久に失敗し
 /// 続ける）なので、状態遷移 + 間引きで出す — spec ①。
 #[derive(Debug)]
 pub(crate) enum FailureLog {
@@ -323,7 +338,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
     out
 }
 
-/// 指数 backoff: 5s 開始、倍々、上限 5min。
+/// 指数 backoff: 5s 開始、倍々、上限 60s。
 pub(crate) fn next_backoff(cur: Duration) -> Duration {
     if cur.is_zero() {
         BACKOFF_INITIAL
@@ -470,6 +485,8 @@ async fn run_subscription_once(
     // 確立以降デバイス発を 1 度でも受けたか（born-dead 判定）。
     let mut proven = false;
     let mut last_msg = tokio::time::Instant::now();
+    // 無音 probe による連続延長回数（デバイス発メッセージ受信でリセット）。
+    let mut probes_used: u32 = 0;
     loop {
         if let Some(end) = pump_verdict(
             proven,
@@ -477,7 +494,36 @@ async fn run_subscription_once(
             deadline,
             health.pending_elapsed(node_id),
         ) {
-            // 再購読直後に同じ pending で即再発火しないよう先に消す。
+            if should_probe(&end, probes_used) {
+                match conn.probe().await {
+                    Ok(()) => {
+                        // セッションは生きている — teardown せず deadline を
+                        // 再武装（連続 SILENCE_PROBE_MAX 回まで）。この行の
+                        // 数が「従来なら無駄に殺していた回数」の実測になる。
+                        probes_used += 1;
+                        last_msg = tokio::time::Instant::now();
+                        tracing::info!(
+                            node_id,
+                            probes = probes_used,
+                            "silence probe passed; deadline re-armed"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        health.clear_pending(node_id);
+                        tracing::info!(
+                            node_id,
+                            silent_s = last_msg.elapsed().as_secs(),
+                            kind = ?e.kind,
+                            detail = %e.detail,
+                            "report pump ended (silence past deadline; probe failed)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            // 再購読直後に同じ pending で即再発火しないよう先に消す
+            // （probe 継続時は消さない — op 相関シグナルを保つ）。
             health.clear_pending(node_id);
             match end {
                 PumpEnd::OpGrace { since_op } => tracing::info!(
@@ -493,7 +539,8 @@ async fn run_subscription_once(
                 PumpEnd::Silence => tracing::info!(
                     node_id,
                     silent_s = last_msg.elapsed().as_secs(),
-                    "report pump ended (silence past deadline)"
+                    probes = probes_used,
+                    "report pump ended (silence past deadline; probe extensions exhausted)"
                 ),
             }
             return Ok(());
@@ -504,6 +551,7 @@ async fn run_subscription_once(
             Ok(Some(msg)) => {
                 proven = true;
                 last_msg = tokio::time::Instant::now();
+                probes_used = 0;
                 health.clear_pending(node_id);
                 for ev in events_from_report(node_id, &msg, false) {
                     let _ = events.send(health.observe(ev));
@@ -697,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_from_5s_capped_at_5min() {
+    fn backoff_doubles_from_5s_capped_at_60s() {
         use std::time::Duration;
         assert_eq!(next_backoff(Duration::ZERO), Duration::from_secs(5));
         assert_eq!(
@@ -705,13 +753,29 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(160)),
-            Duration::from_secs(300)
+            next_backoff(Duration::from_secs(40)),
+            Duration::from_secs(60)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(300)),
-            Duration::from_secs(300)
+            next_backoff(Duration::from_secs(60)),
+            Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn should_probe_only_for_proven_silence_under_cap() {
+        // 生存実績ありの無音だけが probe 対象。キャップ 2 で打ち止め。
+        assert!(should_probe(&PumpEnd::Silence, 0));
+        assert!(should_probe(&PumpEnd::Silence, 1));
+        assert!(!should_probe(&PumpEnd::Silence, 2));
+        // born-dead / op 相関は probe しない（probe 成功が何も証明しないため）。
+        assert!(!should_probe(&PumpEnd::BornDeadSilence, 0));
+        assert!(!should_probe(
+            &PumpEnd::OpGrace {
+                since_op: Duration::from_secs(10)
+            },
+            0
+        ));
     }
 
     #[test]
@@ -1314,6 +1378,160 @@ mod tests {
             elapsed < Duration::from_secs(120),
             "deadline + backoff 5s の範囲で再購読すること: {elapsed:?}"
         );
+    }
+
+    /// 無音 probe の延長とキャップ: 生存実績ありの購読が無音になったとき、
+    /// probe 成功で deadline (90s) を 2 回まで再武装し、3 回目の deadline で
+    /// teardown する（合計 ~270s + backoff 5s で再購読）。
+    #[tokio::test(start_paused = true)]
+    async fn silence_probe_extends_twice_then_dies() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let live = Arc::clone(&est.sub_live);
+        let probe_calls = Arc::clone(&est.probe_calls);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        // 生存実績を作る（proven=true — probe は Silence のみ対象）。値は
+        // priming デフォルト（on-off=true）と揃える: 値を変えると再確立時の
+        // priming が差分回復（`classify_against_cache`）に昇格して
+        // `recovered: true` になり、本テストが見たい「本物の再確立」検証を
+        // 汚す（無関係の既存機能との衝突 — brief 記載の `false` から変更）。
+        live.lock().unwrap().push_back(onoff_report(1, true));
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event")
+            .unwrap();
+        assert!(!ev.priming);
+        let t0 = tokio::time::Instant::now();
+
+        // 以後完全無音。probe 成功 2 回分（90s×2）は再購読が起きない。
+        assert!(
+            tokio::time::timeout(Duration::from_secs(260), rx.recv())
+                .await
+                .is_err(),
+            "probe 延長中に再購読してはいけない"
+        );
+        // 3 回目の deadline (270s) + backoff 5s で再購読の priming が届く。
+        let ev = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("exhausted 後の再購読 priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(270),
+            "キャップ 2 回分の延長を使い切ること: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(300),
+            "キャップ後は次の deadline で死ぬこと: {elapsed:?}"
+        );
+        assert_eq!(
+            probe_calls.load(Ordering::SeqCst),
+            2,
+            "probe は延長 2 回分だけ（3 回目は撃たずに teardown）"
+        );
+    }
+
+    /// probe 失敗は従来どおり deadline で即 teardown（延長しない）。
+    #[tokio::test(start_paused = true)]
+    async fn silence_probe_failure_tears_down_at_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let live = Arc::clone(&est.sub_live);
+        est.fail_probe.store(1, Ordering::SeqCst);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        // 値は priming デフォルト（on-off=true）と揃える（上の
+        // `silence_probe_extends_twice_then_dies` と同じ理由）。
+        live.lock().unwrap().push_back(onoff_report(1, true));
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event")
+            .unwrap();
+        assert!(!ev.priming);
+        let t0 = tokio::time::Instant::now();
+
+        // probe が失敗するので 1 回目の deadline (90s) + backoff 5s で再購読。
+        let ev = tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("probe 失敗後の再購読 priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(90),
+            "deadline より早く殺さない: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(120),
+            "probe 失敗は延長せず即 teardown: {elapsed:?}"
+        );
+    }
+
+    /// デバイス発メッセージで probe カウンタがリセットされ、次の無音でも
+    /// 再びフルに 2 回延長できる。
+    #[tokio::test(start_paused = true)]
+    async fn device_message_resets_probe_budget() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let live = Arc::clone(&est.sub_live);
+        let probe_calls = Arc::clone(&est.probe_calls);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event")
+            .unwrap();
+
+        // 1 回目の deadline で probe 延長（probes_used=1）を消費させる。
+        // 95s 待って probe 1 回分を確実に跨ぐ（イベントは来ない）。
+        assert!(tokio::time::timeout(Duration::from_secs(95), rx.recv())
+            .await
+            .is_err());
+        assert_eq!(probe_calls.load(Ordering::SeqCst), 1, "延長 1 回消費済み");
+        // デバイス発メッセージ → カウンタリセット。
+        live.lock().unwrap().push_back(onoff_report(1, true));
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("live event 2")
+            .unwrap();
+        let t0 = tokio::time::Instant::now();
+
+        // リセット後も再びフルに 2 回延長 → 270s±で teardown。
+        assert!(
+            tokio::time::timeout(Duration::from_secs(260), rx.recv())
+                .await
+                .is_err(),
+            "リセット後の延長 2 回分は再購読しない"
+        );
+        let ev = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("再購読 priming")
+            .unwrap();
+        assert!(ev.priming);
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= Duration::from_secs(270), "{elapsed:?}");
+        assert_eq!(probe_calls.load(Ordering::SeqCst), 3, "1 + リセット後 2");
     }
 
     /// 確立に成功したら backoff ラダーがリセットされる。ラダーを 20s まで
