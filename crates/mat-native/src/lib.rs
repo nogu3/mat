@@ -992,4 +992,54 @@ mod tests {
         assert_eq!(msg.reports.len(), 1);
         let _ = FakeSubConn::default(); // 型が公開されていること
     }
+
+    /// fake の失敗カウンタ: 残り回数だけ失敗し、尽きたら成功する
+    /// （matd の再確立ラダーを回すための足場）。既定 0 = 常に成功なので
+    /// 既存テストの挙動は変わらない。
+    #[tokio::test]
+    async fn fake_establisher_fails_subscription_n_times_then_succeeds() {
+        use crate::test_support::FakeEstablisher;
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        est.fail_subscription.store(2, Ordering::SeqCst);
+        for attempt in 1..=2 {
+            let err = match est.establish_subscription(5).await {
+                Err(e) => e,
+                Ok(_) => panic!("attempt {attempt} は失敗するはず"),
+            };
+            assert_eq!(err.kind, ErrorKind::Timeout, "既定 fail_kind を使う");
+        }
+        assert!(
+            est.establish_subscription(5).await.is_ok(),
+            "カウンタが尽きたら成功する"
+        );
+        // 失敗も試行として数える（matd 側テストが calls で試行回数を主張できる）。
+        assert_eq!(est.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// 確立の**あと**に注入した fail_next_report が pump 側（FakeSubConn）へ効く。
+    /// Arc 共有でないとこの順序が表現できない。
+    #[tokio::test]
+    async fn fake_sub_conn_next_report_fails_when_injected_after_establish() {
+        use crate::test_support::FakeEstablisher;
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let mut conn = est.establish_subscription(5).await.unwrap();
+        conn.subscribe_wildcard(&[]).await.unwrap();
+
+        est.fail_next_report.store(1, Ordering::SeqCst);
+        let err = match conn.next_report(std::time::Duration::from_millis(50)).await {
+            Err(e) => e,
+            Ok(_) => panic!("注入した 1 回は Err になるはず"),
+        };
+        assert_eq!(err.kind, ErrorKind::SessionFailed);
+        // 尽きたら従来どおり無音 Ok(None)。
+        assert!(conn
+            .next_report(std::time::Duration::from_millis(50))
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
