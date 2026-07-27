@@ -2,10 +2,10 @@
 //!
 //! 起動時に KVS から commissioned ノード一覧を読み、ノードごとに購読タスクを
 //! 1 本張る: resolve（常駐 mDNS キャッシュ）→ 専用 CASE → wildcard Subscribe →
-//! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 5min）で再購読。
+//! ポンプ。失敗・死亡時は指数 backoff（5s 開始、上限 60s）で再購読。
 //! イベントは `tokio::sync::broadcast` で listen 接続へ配る。
 //! 状態は持たない（リングバッファ/リプレイ無し — 聞いている間だけ届く契約）。
-//! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection）。
+//! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection。無音は teardown 前に probe で最大 2 回延長 — spec 2026-07-27 無音 probe）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -167,7 +167,7 @@ impl SubHealth {
 }
 
 /// 確立失敗ログの出し分け（純関数 — 時計はループ側が持つ）。
-/// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 5 分毎に永久に失敗し
+/// 毎試行 info は常駐ノイズ（弱リンクはバックオフ上限 60s 毎に永久に失敗し
 /// 続ける）なので、状態遷移 + 間引きで出す — spec ①。
 #[derive(Debug)]
 pub(crate) enum FailureLog {
@@ -338,7 +338,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
     out
 }
 
-/// 指数 backoff: 5s 開始、倍々、上限 5min。
+/// 指数 backoff: 5s 開始、倍々、上限 60s。
 pub(crate) fn next_backoff(cur: Duration) -> Duration {
     if cur.is_zero() {
         BACKOFF_INITIAL
