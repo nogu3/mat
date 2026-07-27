@@ -1229,8 +1229,8 @@ mod tests {
             "5+10+20 のラダーを実際に登ること: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(75),
-            "4 回目で成功し 40s の次段を待たないこと: {elapsed:?}"
+            elapsed < Duration::from_secs(40),
+            "経過は 5+10+20 のラダーちょうど（35s）であり、40s の次段は登っていないこと: {elapsed:?}"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1247,6 +1247,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
         let fail_next_report = Arc::clone(&est.fail_next_report);
         let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
 
@@ -1265,6 +1266,13 @@ mod tests {
             .expect("再購読の priming")
             .unwrap();
         assert!(ev.priming);
+        // 2 回目の priming が「本物の再確立」から来たことを検証する
+        // （`ev.priming` フラグだけでは推測に留まる）。
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "2 回目の priming は本物の 2 回目の確立から来ていること"
+        );
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_secs(20),
@@ -1273,8 +1281,13 @@ mod tests {
     }
 
     /// 完全無音のまま無音 deadline（max_interval 60s + slack 30s = 90s）を
-    /// 超えたら購読を殺して再購読する（`PumpEnd::BornDeadSilence` 経路を
-    /// 統合で通す最初のテスト）。実機で最も頻繁に踏まれる死に方。
+    /// 超えたら購読を殺して再購読する。実機で最も頻繁に踏まれる死に方。
+    /// なお `BornDeadSilence` と `Silence` は `tracing::info!` のメッセージ
+    /// 文字列が違うだけで制御フローは同一なため、どちらの無音バリアントが
+    /// 選ばれるかはここでは検証できない（できているのは純関数テストの
+    /// `pump_verdict_prioritizes_op_grace_then_silence`）。このテストが
+    /// 固定しているのは、完全無音の購読が 90s deadline で殺されて
+    /// 再購読されるという一点のみ。
     #[tokio::test(start_paused = true)]
     async fn silent_subscription_dies_at_deadline_and_resubscribes() {
         let (mut rx, _health, _dir, _handles) = spawn_manager(FakeEstablisher::default(), None);
@@ -1311,6 +1324,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
         let fail_next_report = Arc::clone(&est.fail_next_report);
         est.fail_subscription.store(3, Ordering::SeqCst);
         let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
@@ -1321,6 +1335,16 @@ mod tests {
             .expect("ラダーを登った先の priming")
             .unwrap();
         assert!(ev.priming);
+        // このテストの前提: 3 回失敗して実際にラダーを登ったこと。
+        // ここを確認しないと、fail_subscription が何らかの理由で効かなくなり
+        // 1 回目の試行がいきなり成功しても（backoff == 0）本テストは
+        // 「リセットされた/されていない」のどちらとも見分けがつかず、
+        // 何も検証しないまま green で居座ってしまう。
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "失敗 3 + 成功 1 = 4 試行になっていること（このテストの成立前提）"
+        );
 
         // 確立できた購読を殺す。
         let t0 = tokio::time::Instant::now();

@@ -18,6 +18,12 @@
 - `FakeSubConn::next_report` は `Ok(Some)` か、無音で `Ok(None)` のみ。`Err`
   （セッション死）を返す経路が無い。
 
+`subscribe_wildcard` には別途の失敗注入ノブを足していない。`node_subscription_loop`
+から見れば `subscribe_wildcard` のエラーは `establish_subscription` のエラーと
+区別がつかない（どちらも確立前に起きる同じ失敗経路で、`failures` を進めて同じ
+ラダーを登る）ため、`fail_subscription` が両方をまとめて代表できる。専用ノブが
+無いのは見落としではなく、この理由による意図的な非対応。
+
 結果、次が単体テスト（純関数）だけで担保され、ループを回した検証がゼロになって
 いる:
 
@@ -29,9 +35,11 @@
 | 無音 deadline 到達（`PumpEnd::BornDeadSilence` / `Silence`） | `pump_verdict` の純関数テストのみ |
 | pump の `Err` 分岐（セッション死 → 再購読） | 未テスト |
 
-既存の統合テスト 7 本は全て「op 相関（`SubHealth` の pending）で殺す」経路しか
-通っていない。実機で最も頻繁に踏まれるのは弱リンクノードの**確立失敗ラダー**と
-**無音死**なので、そこが素通しなのは監査で最も分の悪い抜けだった。
+既存の統合テスト 7 本のうち 5 本は「op 相関（`SubHealth` の pending）で殺す」
+経路しか通っていない（残り 2 本 `manager_emits_priming_events_from_fake_subscription`
+/ `manager_passes_clusters_to_subscribe` はそもそも何も殺さない）。実機で最も
+頻繁に踏まれるのは弱リンクノードの**確立失敗ラダー**と**無音死**なので、そこが
+素通しなのは監査で最も分の悪い抜けだった。
 
 ## スコープ
 
@@ -114,8 +122,9 @@ fn take_failure(counter: &AtomicUsize) -> bool {
 `fail_next_report = 1` で pump を殺す。
 - 殺してから再 priming までの経過が `< 15s`（リセットされていれば 5s、されて
   いなければ 40s なので明確に区別できる）
-- `node_subscription_loop` の `backoff = Duration::ZERO` / `failures = 0` /
-  `warned = false` リセットが実配線されている釘打ち
+- `node_subscription_loop` の `backoff = Duration::ZERO` リセットが実配線されて
+  いる釘打ち（同時にリセットされる `failures = 0` / `warned = false` はログ
+  レベルにしか影響せず、この統合テストでは観測できないため対象外）
 
 ### ③ テストヘルパでコピペを畳む
 
