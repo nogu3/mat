@@ -136,6 +136,10 @@ pub struct SecureSession {
     /// ピアから最後に認証済みメッセージを受けた時刻（MRP active/idle 判定用、
     /// spec 4.12.8: 直近受信ありなら SAI で再送）。
     last_rx: Option<Instant>,
+    /// 購読 pump: デコード済み report を返した後に respond_status が失敗した
+    /// ときの持ち越しエラー。次の next_subscription_report 呼び出しが返す
+    /// （report を道連れにせず、セッション死の即時検知も保つ — 監査#1 経路A）。
+    deferred_sub_err: Option<SessionError>,
 }
 
 impl SecureSession {
@@ -160,6 +164,7 @@ impl SecureSession {
             rx_window: RxWindow::new(),
             peer_initiated: std::collections::VecDeque::new(),
             last_rx: None,
+            deferred_sub_err: None,
         }
     }
 
@@ -955,7 +960,21 @@ impl SecureSession {
                 else {
                     continue;
                 };
-                if msg.proto.acked_counter == Some(our_counter) {
+                let acked = msg.proto.acked_counter == Some(our_counter);
+                // ack 待ち中に届いた続きチャンク（device 発 ReportData）は
+                // ack 照合の副産物として捨てない — screen_with のフィルタ落ち
+                // 待避と同じ規律で peer_initiated へ積み、購読 API が消費する
+                // （監査#1 経路B）。
+                if msg.proto.protocol_id == im::PROTOCOL_ID_IM
+                    && msg.proto.opcode == im::OPCODE_REPORT_DATA
+                {
+                    if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
+                        tracing::warn!("peer-initiated report buffer full; dropping oldest");
+                        self.peer_initiated.pop_front();
+                    }
+                    self.peer_initiated.push_back(msg);
+                }
+                if acked {
                     return Ok(());
                 }
             }
@@ -1073,6 +1092,9 @@ impl SecureSession {
         cfg: &MrpConfig,
     ) -> Result<crate::im::ReportDataMessage, SessionError> {
         use crate::im;
+        if let Some(e) = self.deferred_sub_err.take() {
+            return Err(e);
+        }
         // screen が待避した report が先にあればそれを消費する。
         let msg = if let Some(m) = self.peer_initiated.pop_front() {
             m
@@ -1117,7 +1139,12 @@ impl SecureSession {
             "sub pump: report delivered"
         );
         if !rd.suppress_response {
-            self.respond_status(msg.proto.exchange_id, 0, cfg).await?;
+            if let Err(e) = self.respond_status(msg.proto.exchange_id, 0, cfg).await {
+                // デコード済み report を道連れにしない: report は届け、失敗は
+                // 次回呼び出しへ持ち越す（pump は 5s スライスで即座に気づく）。
+                tracing::debug!(error = %e, "sub pump: status response failed; delivering report, deferring error");
+                self.deferred_sub_err = Some(e);
+            }
         }
         Ok(rd)
     }
@@ -2868,5 +2895,208 @@ mod tests {
         assert_eq!(rd.subscription_id, Some(77));
         assert_eq!(rd.reports.len(), 1);
         assert!(s.peer_initiated.is_empty());
+    }
+
+    /// 監査#1 経路A: 購読 report への StatusResponse が ack されず MRP 予算を
+    /// 使い切っても、デコード済み report は道連れにしない。1 回目の呼び出しは
+    /// Ok(report) を返し、失敗は deferred error として 2 回目の呼び出しで返る
+    /// （read 経路の best-effort と違い、セッション死の即時検知は保つ）。
+    #[tokio::test]
+    async fn respond_status_failure_defers_error_and_still_delivers_report() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let local = transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        // デバイス: report を送るが、以後一切 ack しない（無応答デバイス）。
+        let dev = tokio::spawn(async move {
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 700,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x7777,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let d = seal_message(
+                &R2I,
+                &header,
+                &proto,
+                &subscription_report_payload(9, true, false),
+                DEV_NODE,
+            )
+            .unwrap();
+            device.send_to(&d, local).await.unwrap();
+            // StatusResponse（+再送）を受けるが ack は返さない。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            while tokio::time::timeout(Duration::from_secs(1), device.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {}
+        });
+
+        // 1 回目: respond_status は MRP 予算切れで失敗するが、report は返る。
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .expect("decoded report must survive a failed status response");
+        assert_eq!(rd.subscription_id, Some(9));
+
+        // 2 回目: 持ち越された Timeout が返る（セッション死の即時検知）。
+        let err = s
+            .next_subscription_report(Duration::from_millis(100), &fast_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Timeout), "deferred: {err:?}");
+        dev.await.unwrap();
+    }
+
+    /// 監査#1 経路B: respond_status の ack 待ち中に届いた続きチャンク
+    /// （StatusResponse への ack を piggyback した ReportData）は破棄せず
+    /// peer_initiated へ待避し、次の next_subscription_report が配信する。
+    #[tokio::test]
+    async fn report_chunk_arriving_during_status_ack_wait_is_not_lost() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let local = transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        let dev = tokio::spawn(async move {
+            // chunk A（more_chunks=true、needs_ack）。
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 800,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x8888,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let d = seal_message(
+                &R2I,
+                &header,
+                &proto,
+                &subscription_report_payload(11, true, true),
+                DEV_NODE,
+            )
+            .unwrap();
+            device.send_to(&d, local).await.unwrap();
+            // StatusResponse を待ち、chunk B（piggyback ack、needs_ack）で応える。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            loop {
+                let (n, from) = device.recv_from(&mut buf).await.unwrap();
+                let (h, p, _) = open_from_controller(&buf[..n]);
+                if p.opcode != crate::im::OPCODE_STATUS_RESPONSE {
+                    continue; // standalone ack 等は読み飛ばす
+                }
+                let header2 = MessageHeader {
+                    session_id: LOCAL_SID,
+                    security_flags: 0,
+                    message_counter: 801,
+                    source_node_id: None,
+                    destination: Destination::None,
+                };
+                let proto2 = ProtocolHeader {
+                    initiator: true,
+                    needs_ack: true,
+                    acked_counter: Some(h.message_counter),
+                    opcode: crate::im::OPCODE_REPORT_DATA,
+                    exchange_id: 0x8888,
+                    protocol_id: crate::im::PROTOCOL_ID_IM,
+                    vendor_id: None,
+                };
+                let d2 = seal_message(
+                    &R2I,
+                    &header2,
+                    &proto2,
+                    &subscription_report_payload(12, false, false),
+                    DEV_NODE,
+                )
+                .unwrap();
+                device.send_to(&d2, from).await.unwrap();
+                break;
+            }
+            // chunk B への StatusResponse に standalone ack を返す（2 回目の
+            // next_subscription_report を完走させる）。
+            loop {
+                let Ok(Ok((n, from))) =
+                    tokio::time::timeout(Duration::from_secs(2), device.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                let (h, p, _) = open_from_controller(&buf[..n]);
+                if p.opcode == crate::im::OPCODE_STATUS_RESPONSE {
+                    let header3 = MessageHeader {
+                        session_id: LOCAL_SID,
+                        security_flags: 0,
+                        message_counter: 802,
+                        source_node_id: None,
+                        destination: Destination::None,
+                    };
+                    let proto3 = ProtocolHeader {
+                        initiator: true,
+                        needs_ack: false,
+                        acked_counter: Some(h.message_counter),
+                        opcode: OPCODE_MRP_STANDALONE_ACK,
+                        exchange_id: p.exchange_id,
+                        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                        vendor_id: None,
+                    };
+                    let d3 = seal_message(&R2I, &header3, &proto3, &[], DEV_NODE).unwrap();
+                    device.send_to(&d3, from).await.unwrap();
+                    break;
+                }
+            }
+        });
+
+        // 1 回目: chunk A が返り、その StatusResponse は chunk B の piggyback
+        // ack で確認される。
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd.subscription_id, Some(11));
+        // chunk B は破棄されず待避済み。
+        assert_eq!(s.peer_initiated.len(), 1, "chunk B must be stashed");
+        // 2 回目: 待避済み chunk B がソケットを読まずに返る。
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd.subscription_id, Some(12));
+        dev.await.unwrap();
     }
 }
