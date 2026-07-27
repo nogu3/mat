@@ -217,9 +217,19 @@ pub(crate) fn classify_against_cache(
     if cache.get(&key).is_some_and(|prev| *prev == ev.value) {
         return ev;
     }
-    let known = cache.contains_key(&key);
-    cache.insert(key, ev.value.clone());
-    if known && ev.priming {
+    let prev = cache.insert(key, ev.value.clone());
+    if let Some(prev) = prev.filter(|_| ev.priming) {
+        // 昇格は journal だけで追えるように INFO で残す（issue #19 — 盲目期間
+        // 中の遷移が消費者へ届いたかの診断で、昇格の有無を間接推定させない）。
+        tracing::info!(
+            node_id = ev.node_id,
+            endpoint = ev.endpoint,
+            cluster = ev.cluster,
+            attribute = ev.attribute,
+            old = %prev,
+            new = %ev.value,
+            "priming diff promoted to recovered event"
+        );
         return Event {
             priming: false,
             recovered: true,
@@ -973,6 +983,73 @@ mod tests {
         let out = classify_against_cache(&mut cache, other);
         assert!(out.priming, "別ノードの初見は昇格しない");
         assert_eq!(cache.len(), 2);
+    }
+
+    /// recovered 昇格は INFO ログで直接確認できる（issue #19: 診断時に
+    /// journal だけで昇格の有無・旧値→新値を追えるようにする）。
+    /// 非昇格（初見・同値）ではログを出さない。
+    #[test]
+    fn classify_promotion_emits_info_log_with_old_and_new_values() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        fn ev(value: serde_json::Value) -> Event {
+            Event {
+                timestamp: "2026-07-27T00:00:00+09:00".to_string(),
+                node_id: 42,
+                endpoint: 1,
+                cluster: 0x0406,
+                attribute: 0x0000,
+                value,
+                priming: true,
+                recovered: false,
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let mut cache: HashMap<ValueKey, serde_json::Value> = HashMap::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = classify_against_cache(&mut cache, ev(json!(0))); // 初見: ログ無し
+            let _ = classify_against_cache(&mut cache, ev(json!(0))); // 同値: ログ無し
+            let _ = classify_against_cache(&mut cache, ev(json!(1))); // 昇格: INFO
+        });
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("recovered").count(),
+            1,
+            "昇格 1 回につき 1 行だけ: {log}"
+        );
+        for needle in [
+            "node_id=42",
+            "cluster=1030",
+            "attribute=0",
+            "old=0",
+            "new=1",
+        ] {
+            assert!(log.contains(needle), "{needle} が無い: {log}");
+        }
     }
 
     /// SubHealth 越しに同じキャッシュを読み書きできる（op 経路と pump の共有点）。
