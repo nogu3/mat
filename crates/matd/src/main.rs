@@ -229,7 +229,9 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     let sub_health = std::sync::Arc::new(matd::subscription::SubHealth::new(sub_clusters.clone()));
     // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
     // ack だけ返り、イベントは流れない — `mat fabric init` 後の再起動で解消）。
-    let _sub_handles = matd::subscription::spawn_subscription_manager(
+    // supervisor は 60s 周期で台帳を再読し、稼働中に commission された
+    // ノードにも購読を張る（監査#4）。
+    let _sub_handle = matd::subscription::spawn_subscription_manager(
         std::sync::Arc::clone(&native),
         store_path.clone(),
         events_tx.clone(),

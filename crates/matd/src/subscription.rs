@@ -347,38 +347,80 @@ pub(crate) fn next_backoff(cur: Duration) -> Duration {
     }
 }
 
-/// commissioned 全ノードへ購読タスクを張る。cluster 絞り込みは subscriptions.toml で
-/// 実装済み（`clusters` パラメータに配線）。今後はノード単位の絞り込み（per-node 粒度）
-/// の検討。native が Unavailable なら何もしない。
+/// 台帳の再読間隔。稼働中に `mat commission` されたノードを最大この遅延で
+/// 拾って購読を張る（監査#4: 従来は起動時スナップショットのみで、稼働中
+/// commission ノードは matd 再起動まで購読されず `mat listen` が無音だった）。
+pub(crate) const LEDGER_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// commissioned 全ノードへ購読タスクを張る supervisor を起動する。
+/// `LEDGER_RESCAN_INTERVAL` ごとに台帳を読み直し、新規ノードに購読ループを
+/// 追加 spawn する（op 経路の `require_node` が毎回 store を開き直すのと同じ
+/// 「常駐中の台帳更新を拾う」規律）。ノード削除は台帳 API に存在しないため
+/// 扱わない。cluster 絞り込みは subscriptions.toml で実装済み（`clusters`
+/// パラメータに配線）。native が Unavailable なら何もしない（`mat fabric
+/// init` 後の再起動で解消 — 再読で直る状態ではないので空回りさせない）。
 pub fn spawn_subscription_manager(
     native: Arc<NativeState>,
     store_path: PathBuf,
     events: broadcast::Sender<Event>,
     clusters: Option<Vec<u32>>,
     health: Arc<SubHealth>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let node_ids: Vec<u64> = match Store::open(&store_path) {
-        Ok(store) => store.nodes().map(|n| n.node_id).collect(),
-        Err(e) => {
-            tracing::warn!(error = %e.detail, "subscription manager: store unreadable; no subscriptions");
-            return Vec::new();
-        }
-    };
+) -> tokio::task::JoinHandle<()> {
     // None = subscriptions.toml 無し = full wildcard（空 slice がワイヤ上の wildcard 形）。
     let clusters: Arc<[u32]> = clusters.unwrap_or_default().into();
-    tracing::info!(nodes = node_ids.len(), "subscription manager starting");
-    node_ids
-        .into_iter()
-        .map(|node_id| {
-            let native = Arc::clone(&native);
-            let events = events.clone();
-            let clusters = Arc::clone(&clusters);
-            let health = Arc::clone(&health);
-            tokio::spawn(async move {
-                node_subscription_loop(node_id, native, events, clusters, health).await
-            })
-        })
-        .collect()
+    tokio::spawn(async move {
+        if !matches!(&*native, NativeState::Ready(_)) {
+            return;
+        }
+        // 購読ループを張った node_id。台帳は増える一方（削除 API 無し）なので
+        // 集合の縮小は考えない。
+        let mut subscribed = std::collections::HashSet::new();
+        let mut announced = false;
+        let mut read_fail_streak: u32 = 0;
+        loop {
+            match Store::open(&store_path) {
+                Ok(store) => {
+                    read_fail_streak = 0;
+                    let node_ids: Vec<u64> = store.nodes().map(|n| n.node_id).collect();
+                    // 初回の成功読みだけ台数つきの starting ログ（現行踏襲）。
+                    // 以降の新規検出はノード単位の info（commission は稀な操作
+                    // なのでノイズにならず、「ログに一切現れない」誤診の罠を潰す）。
+                    let initial = !announced;
+                    if initial {
+                        tracing::info!(nodes = node_ids.len(), "subscription manager starting");
+                        announced = true;
+                    }
+                    for node_id in node_ids {
+                        if !subscribed.insert(node_id) {
+                            continue;
+                        }
+                        if !initial {
+                            tracing::info!(node_id, "ledger rescan: new node; subscribing");
+                        }
+                        let native = Arc::clone(&native);
+                        let events = events.clone();
+                        let clusters = Arc::clone(&clusters);
+                        let health = Arc::clone(&health);
+                        tokio::spawn(async move {
+                            node_subscription_loop(node_id, native, events, clusters, health).await
+                        });
+                    }
+                }
+                Err(e) => {
+                    // ストリーク初回 warn、以降 debug（60 秒ごとの warn 連打を
+                    // 避ける — classify_failure と同じ思想）。transient な失敗
+                    //（flock 競合等）は次のティックで自己回復する。
+                    read_fail_streak += 1;
+                    if read_fail_streak == 1 {
+                        tracing::warn!(error = %e.detail, "subscription manager: store unreadable; will retry");
+                    } else {
+                        tracing::debug!(error = %e.detail, "subscription manager: store unreadable");
+                    }
+                }
+            }
+            tokio::time::sleep(LEDGER_RESCAN_INTERVAL).await;
+        }
+    })
 }
 
 /// 1 ノードの購読ループ。確立 → priming 配信 → ポンプ。失敗・死亡は backoff 再購読。
@@ -590,7 +632,7 @@ mod tests {
         broadcast::Receiver<Event>,
         Arc<SubHealth>,
         tempfile::TempDir,
-        Vec<tokio::task::JoinHandle<()>>,
+        tokio::task::JoinHandle<()>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
@@ -605,14 +647,14 @@ mod tests {
         let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
         let (tx, rx) = broadcast::channel(64);
         let health = Arc::new(SubHealth::new(None));
-        let handles = spawn_subscription_manager(
+        let handle = spawn_subscription_manager(
             state,
             dir.path().to_path_buf(),
             tx,
             clusters,
             Arc::clone(&health),
         );
-        (rx, health, dir, handles)
+        (rx, health, dir, handle)
     }
 
     #[test]
@@ -1578,5 +1620,40 @@ mod tests {
             elapsed < Duration::from_secs(15),
             "確立成功で backoff が 5s へリセットされること（未リセットなら 40s）: {elapsed:?}"
         );
+    }
+
+    /// 監査#4: matd 稼働中に台帳へ追加されたノードの購読が、次の再読ティック
+    /// （60s）で自動的に張られる。従来は起動時スナップショットのみで、稼働中
+    /// commission ノードは matd 再起動まで永久に購読されなかった。
+    #[tokio::test(start_paused = true)]
+    async fn manager_picks_up_node_added_after_start() {
+        let (mut rx, _health, dir, _handle) = spawn_manager(FakeEstablisher::default(), None);
+        // 起動時から台帳に居る node 5 の priming が届く（初回読みは従来どおり）。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("node5 priming should arrive")
+            .unwrap();
+        assert_eq!(ev.node_id, 5);
+        // 稼働中に node 6 を commission（= 台帳へ追記）。
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 6,
+                address: Some("192.0.2.11".into()),
+                commissioned_at: "2026-07-27T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        // 次の再読ティック（60s）以内に node 6 の購読が張られ priming が届く。
+        // node 5 側のイベントが混ざり得るので node 6 が来るまで読み飛ばす。
+        let ev = loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv())
+                .await
+                .expect("node6 priming should arrive within one rescan tick")
+                .unwrap();
+            if ev.node_id == 6 {
+                break ev;
+            }
+        };
+        assert!(ev.priming);
     }
 }
