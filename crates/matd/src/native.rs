@@ -153,10 +153,15 @@ impl NativeBackend {
 
     /// クライアント切断で進行中 op が破棄された後の始末。中途 exchange の
     /// session を次 op に持ち越さないよう slot を破棄する（次回 lazy 再確立）。
-    /// op の future は drop 済みなので内側ロックはすぐ取れる。
+    /// try_lock なのは、取れない = 別接続の op が session を使用中 = 破棄された
+    /// op は Mutex 待ちのまま session に触れていなかったケースだから: 健全な
+    /// warm session を巻き添えにせず、実行中 op の完了待ちで滞留もしない。
     pub async fn drop_session(&self, node_id: u64) {
         let slot = self.slot(node_id).await;
-        *slot.lock().await = None;
+        let attempt = slot.try_lock();
+        if let Ok(mut guard) = attempt {
+            *guard = None;
+        }
     }
 
     /// warm セッションで `op` を実行する。slot が空なら確立。送信が Timeout
@@ -712,6 +717,41 @@ mod tests {
     fn group_settings_ctx_is_none_without_injection() {
         let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         assert!(backend.group_settings_ctx().is_none());
+    }
+
+    #[tokio::test]
+    async fn drop_session_skips_when_another_op_holds_the_lock() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            ..Default::default()
+        };
+        let backend = std::sync::Arc::new(NativeBackend::with_establisher(Box::new(est)));
+        // warm session を作る（establish 1 回目）。
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        // 別 op が実行中のように slot を握った状態で drop_session を呼ぶ。
+        let slot = backend.slot(0x1234).await;
+        let guard = slot.lock().await;
+        backend.drop_session(0x1234).await; // 待たず・破棄せず即返る
+        drop(guard);
+        // session は生きている: 次 op は warm 再利用で establish は 1 回のまま。
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drop_session_clears_when_uncontended() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        backend.drop_session(0x1234).await;
+        // slot は破棄済み: 次 op は再確立する。
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
