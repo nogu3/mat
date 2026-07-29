@@ -33,9 +33,8 @@ const INFO_S3K: &[u8] = b"Sigma3";
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 const STATUS_SUCCESS: (u16, u32, u16) = (0, 0, 0); // (general, protocol id, code)
 
-/// Wait budget for a real (non-ack) response once the previous message has
-/// already been acknowledged — covers device-side TBE compute/verify time.
-const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+/// CASE ハンドシェイク各往復の応答待ち。op 予算設計の成分。
+pub const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// CASE establishment error. `Display` always names the sigma stage and
 /// what was rejected, so callers (M4) have enough to map onto `mat` error
