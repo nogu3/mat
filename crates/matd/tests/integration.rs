@@ -112,11 +112,19 @@ async fn start_matd(
     (socket, handle)
 }
 
+/// FakeEstablisher を注入して matd を起動する（deadline / 切断キャンセルのテスト用）。
+async fn start_matd_with_est(
+    store_path: PathBuf,
+    est: FakeEstablisher,
+) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    let native = NativeBackend::with_establisher(Box::new(est));
+    start_matd(store_path, NativeState::Ready(Box::new(native))).await
+}
+
 /// デフォルトの fake establisher（read_onoff は常に true、read_json は未登録なら
 /// `json!(1)`、invoke/write_tlv は常に成功）で native backend を組んで起動する。
 async fn start_matd_with_fake(store_path: PathBuf) -> (PathBuf, tokio::task::JoinHandle<()>) {
-    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-    start_matd(store_path, NativeState::Ready(Box::new(native))).await
+    start_matd_with_est(store_path, FakeEstablisher::default()).await
 }
 
 /// テストごとに一意な socket 名サフィックスを作る。並列テスト（既定）が同時に
@@ -181,6 +189,41 @@ async fn read_write_invoke_on_ping_and_errors_roundtrip() {
 
     // 未 commission node: node_not_commissioned エラー。
     assert_eq!(resps[5]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
+}
+
+/// Issue #16: deadline_ms がソケット越しに `Instant` 予算として執行されることの
+/// end-to-end 検証。conn_delay 300ms の fake read に対し、deadline_ms=50 は
+/// 構造化 timeout で早期打ち切りされ、0（明示無制限）/未指定（既定 60s）は
+/// 遅くても成功する。
+#[tokio::test]
+async fn deadline_cuts_slow_op_with_structured_timeout() {
+    let (_dir, store_path) = make_store();
+    let est = FakeEstablisher {
+        conn_delay: Some(std::time::Duration::from_millis(300)),
+        ..Default::default()
+    };
+    let (socket, handle) = start_matd_with_est(store_path, est).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","deadline_ms":50}),
+            // 明示無制限（0）は遅くても成功する。
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","deadline_ms":0}),
+            // 未指定（旧クライアント）は既定 60s → 成功する。
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}),
+        ],
+    )
+    .await;
+    assert_eq!(resps[0]["error"]["kind"], "timeout", "resp: {}", resps[0]);
+    assert!(resps[0]["error"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("deadline"));
+    assert_eq!(resps[1]["value"], json!(true), "resp: {}", resps[1]);
+    assert_eq!(resps[2]["value"], json!(true), "resp: {}", resps[2]);
 
     handle.abort();
 }
