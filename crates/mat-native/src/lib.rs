@@ -261,8 +261,8 @@ pub struct CachingResolver {
     cache: dnssd::OperationalCache,
 }
 
-/// cache miss 時にリスナの次アナウンス（周期~30s）を確実に跨ぐ待ち窓。
-const CACHE_MISS_TIMEOUT: Duration = Duration::from_secs(35);
+/// cache miss 時にリスナの次アナウンス（周期~30s）を確実に跨ぐ待ち窓。op 予算設計の成分（Issue #16）。
+pub const CACHE_MISS_TIMEOUT: Duration = Duration::from_secs(35);
 /// キャッシュ充填の poll 間隔（Notify を使わず単純 poll で取りこぼしを防ぐ）。
 const CACHE_POLL: Duration = Duration::from_millis(500);
 
