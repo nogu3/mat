@@ -927,6 +927,32 @@ and asks you to set the override.
 On jarvis (`eth0` + `tailscale0`) and WSL (`eth0`) exactly one candidate remains,
 so autodetect just works.
 
+#### Op timeout budget (`--op-timeout-ms`)
+
+The global `--op-timeout-ms` (env `MAT_OP_TIMEOUT_MS`, default `60000`, `0` =
+unlimited) bounds how long a **single-node** op (`read` / `write` / `invoke` /
+`on` / `off` / `color` / `color-temp` / `level` / `describe`) may run, on
+either path. It is unrelated to `mat listen`'s `--timeout-ms` (that one bounds
+the event stream's receive wait, not a single op).
+
+- **matd path**: the budget rides the request as `deadline_ms` (a relative
+  ms value). `matd` enforces it and returns a structured `timeout` (exit `3`)
+  once the budget is spent. `mat`'s own socket read is given a backstop
+  timeout of budget + 2s, so a request to an old `matd` (which ignores
+  `deadline_ms`) or a `matd` that dies mid-request still surfaces as
+  `timeout` instead of hanging forever — the detail notes the request may
+  already have executed.
+- **Direct path**: the same budget wraps the whole op in a
+  `tokio::time::timeout`; exceeding it is `timeout` (exit `3`) too, so the
+  flag behaves the same regardless of which path answers.
+- A request that omits `deadline_ms` (an old `mat` talking to a new `matd`)
+  gets `matd`'s own default budget of 60s applied — the same number
+  `--op-timeout-ms` defaults to, so old and new clients see the same
+  behavior without needing to agree on anything.
+- Ops outside this list (`discover` / `commission` / `fabric init` /
+  `open-window` / `diag` / `group ...`) ignore `--op-timeout-ms` entirely —
+  unchanged, no read timeout either.
+
 #### Fabric index, sessions, epoch
 
 - `MAT_FABRIC_INDEX` (default `1`) and `MAT_ISSUER_INDEX` (default `0`) select
@@ -936,8 +962,13 @@ so autodetect just works.
   a fabric with another admin the index is usually not `1`.
 - **Warm sessions** (matd only) are held per node indefinitely. A send that
   exhausts MRP retransmission (timeout) discards the session and does one
-  automatic mDNS re-resolve + re-CASE before failing. `mat`'s one-shot session
-  can't be stale, so it never retries — a failure is reported as-is.
+  automatic mDNS re-resolve + re-CASE before failing. That one retry only
+  fires when at least 10s of the op's budget remains (see [Op timeout
+  budget](#op-timeout-budget---op-timeout-ms)); with less left, `matd` skips
+  the re-establish and returns the timeout immediately instead of spending
+  the remaining budget on a retry that cannot finish before the deadline.
+  `mat`'s one-shot session can't be stale, so it never retries — a failure is
+  reported as-is.
 - **Epoch (IPK).** `commission` needs the fabric's epoch IPK (the key `AddNOC`
   hands the device — distinct from the KDF-derived *operational* key that is the
   only one persisted). It is resolved in order: (1) the `mat`-owned KVS key
@@ -1168,7 +1199,7 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 10 | credential store missing / parse failure |
 | 11 | node_id not commissioned |
 | 12 | *(retired in 0.22.0 — historical vacancy)* |
-| 3 | timeout |
+| 3 | timeout (includes a single-node op exceeding its `--op-timeout-ms` budget) |
 | 4 | device rejected |
 | 5 | unreachable / network |
 | 6 | CASE session establishment failed |
@@ -1191,7 +1222,10 @@ is `unreachable` (exit `5`).
   `store_missing` typically means you have not run `mat fabric init` yet.
 - `node_not_commissioned` — node_id not in the store (exit 11)
 - `timeout` (exit 3) / `device_rejected` (exit 4) / `unreachable` (exit 5) —
-  classified from the native transport / IM result
+  classified from the native transport / IM result. `timeout` is also what a
+  single-node op returns once its budget runs out (`--op-timeout-ms` on
+  `mat`, or `matd`'s own 60s default when the request carried none) — see
+  [Op timeout budget](#op-timeout-budget---op-timeout-ms).
 - `session_failed` — IP reachable but CASE (operational secure session) could not
   be established, e.g. an intermittent `CHIP Error 0x54 (Invalid CASE parameter)`
   during the Sigma exchange (exit 6). Distinct from `unreachable` (no IP route)
@@ -1300,6 +1334,7 @@ Environment variables:
 | `MAT_FABRIC_INDEX` / `MAT_ISSUER_INDEX` | `mat` KVS fabric-table / CA-issuer index (default `1` / `0`) |
 | `MAT_MATD_FABRIC_INDEX` / `MAT_MATD_ISSUER_INDEX` | same for `matd` |
 | `MAT_MATD` / `MAT_MATD_SOCKET` | force / opt out of the matd path; pin its socket |
+| `MAT_OP_TIMEOUT_MS` | budget (ms) for a single-node op; default `60000`, `0` = unlimited — see [Op timeout budget](#op-timeout-budget---op-timeout-ms) |
 | `MAT_PAA_TRUST_STORE` | directory of PAA root certs for attestation |
 | `MAT_CD_SIGNER_STORE` | CD signer trust store (warn-only if absent) |
 | `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission |
