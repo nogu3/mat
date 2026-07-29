@@ -352,6 +352,17 @@ impl NativeBackend {
         };
         mat_native::group::send(ctx, group_id, cluster, command, fields).await
     }
+
+    /// group 送信 counter の窓ジャンプ（Issue #14）。ctx 未構成は send と同じ
+    /// Unavailable（消費側で store_parse 化）。
+    pub async fn group_bump(&self) -> mat_native::group::BumpOutcome {
+        let Some(ctx) = &self.engine.group else {
+            return mat_native::group::BumpOutcome::Unavailable(
+                "native group context not configured".into(),
+            );
+        };
+        mat_native::group::bump(ctx).await
+    }
 }
 
 #[cfg(test)]

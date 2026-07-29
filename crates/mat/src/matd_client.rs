@@ -317,6 +317,7 @@ fn to_op(command: &Command) -> Result<Value, ToOpError> {
                 "op": "group_invoke", "group_id": group_id.id()?, "cluster": cluster,
                 "command": command, "args": args, "endpoint": endpoint,
             }),
+            GroupCommand::Bump => json!({ "op": "group_bump" }),
             // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
             // バージョンスキューにも安全なため直経路のみ（matd に op を足さない）。
             GroupCommand::Grant { .. } => return Err(unsupported("group grant")),
@@ -788,6 +789,14 @@ mod tests {
                 "rebind":false
             })
         );
+    }
+
+    #[test]
+    fn group_bump_maps_to_group_bump_op() {
+        let cmd = Command::Group {
+            action: GroupCommand::Bump,
+        };
+        assert_eq!(to_op(&cmd).unwrap(), json!({ "op": "group_bump" }));
     }
 
     #[test]
