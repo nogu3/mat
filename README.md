@@ -938,10 +938,12 @@ the event stream's receive wait, not a single op).
 - **matd path**: the budget rides the request as `deadline_ms` (a relative
   ms value). `matd` enforces it and returns a structured `timeout` (exit `3`)
   once the budget is spent. `mat`'s own socket read is given a backstop
-  timeout of budget + 2s, so a request to an old `matd` (which ignores
-  `deadline_ms`) or a `matd` that dies mid-request still surfaces as
-  `timeout` instead of hanging forever — the detail notes the request may
-  already have executed.
+  timeout of budget + 2s, so an old `matd` (which ignores `deadline_ms`) that
+  is alive but stuck — hung, or just slow to answer — still surfaces as
+  `timeout` instead of hanging forever; the detail notes the request may
+  already have executed. A `matd` that dies mid-request closes the socket
+  instead, which `mat` sees as EOF and reports as `matd_unavailable`
+  (exit `13`), same as any other mid-stream matd loss.
 - **Direct path**: the same budget wraps the whole op in a
   `tokio::time::timeout`; exceeding it is `timeout` (exit `3`) too, so the
   flag behaves the same regardless of which path answers.
