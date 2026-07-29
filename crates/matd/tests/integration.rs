@@ -112,11 +112,19 @@ async fn start_matd(
     (socket, handle)
 }
 
+/// FakeEstablisher を注入して matd を起動する（deadline / 切断キャンセルのテスト用）。
+async fn start_matd_with_est(
+    store_path: PathBuf,
+    est: FakeEstablisher,
+) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    let native = NativeBackend::with_establisher(Box::new(est));
+    start_matd(store_path, NativeState::Ready(Box::new(native))).await
+}
+
 /// デフォルトの fake establisher（read_onoff は常に true、read_json は未登録なら
 /// `json!(1)`、invoke/write_tlv は常に成功）で native backend を組んで起動する。
 async fn start_matd_with_fake(store_path: PathBuf) -> (PathBuf, tokio::task::JoinHandle<()>) {
-    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-    start_matd(store_path, NativeState::Ready(Box::new(native))).await
+    start_matd_with_est(store_path, FakeEstablisher::default()).await
 }
 
 /// テストごとに一意な socket 名サフィックスを作る。並列テスト（既定）が同時に
@@ -181,6 +189,133 @@ async fn read_write_invoke_on_ping_and_errors_roundtrip() {
 
     // 未 commission node: node_not_commissioned エラー。
     assert_eq!(resps[5]["error"]["kind"], "node_not_commissioned");
+
+    handle.abort();
+}
+
+/// Issue #16: deadline_ms がソケット越しに `Instant` 予算として執行されることの
+/// end-to-end 検証。conn_delay 300ms の fake read に対し、deadline_ms=50 は
+/// 構造化 timeout で早期打ち切りされ、0（明示無制限）/未指定（既定 60s）は
+/// 遅くても成功する。
+#[tokio::test]
+async fn deadline_cuts_slow_op_with_structured_timeout() {
+    let (_dir, store_path) = make_store();
+    let est = FakeEstablisher {
+        conn_delay: Some(std::time::Duration::from_millis(300)),
+        ..Default::default()
+    };
+    let (socket, handle) = start_matd_with_est(store_path, est).await;
+
+    let resps = roundtrip(
+        &socket,
+        &[
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","deadline_ms":50}),
+            // 明示無制限（0）は遅くても成功する。
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","deadline_ms":0}),
+            // 未指定（旧クライアント）は既定 60s → 成功する。
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"}),
+        ],
+    )
+    .await;
+    assert_eq!(resps[0]["error"]["kind"], "timeout", "resp: {}", resps[0]);
+    assert!(resps[0]["error"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("deadline"));
+    assert_eq!(resps[1]["value"], json!(true), "resp: {}", resps[1]);
+    assert_eq!(resps[2]["value"], json!(true), "resp: {}", resps[2]);
+
+    handle.abort();
+}
+
+/// Issue #16: mando が mat を kill してソケットを閉じる形の再現。conn A は
+/// 進行中の op（500ms かかる fake read）を残したまま切断する — キャンセルが
+/// 効いていれば、(a) per-node Mutex を待たされず、(b) 中途 session を持ち越さ
+/// ないので次の確立が新規カウントされる。
+#[tokio::test]
+async fn client_disconnect_aborts_op_and_drops_slot() {
+    let (_dir, store_path) = make_store();
+    use tokio::io::AsyncWriteExt;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let est = FakeEstablisher {
+        calls: std::sync::Arc::clone(&calls),
+        conn_delay: Some(std::time::Duration::from_millis(500)),
+        ..Default::default()
+    };
+    let (socket, handle) = start_matd_with_est(store_path, est).await;
+
+    // conn A: read を送って 100ms で切断（mando が mat を kill する形の再現）。
+    let mut a = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            a = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut a = a.expect("could not connect to matd socket");
+    a.write_all(
+        b"{\"op\":\"read\",\"node_id\":1,\"endpoint\":1,\"cluster\":\"onoff\",\"attribute\":\"on-off\"}\n",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    drop(a);
+    // abort 処理（future drop + slot 破棄）が走る猶予。
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // conn B: 同一ノードへ read。キャンセルが効いていれば
+    // (a) Mutex 待ちせず進み、(b) slot 破棄済みなので establish は 2 回目になる。
+    let resps = roundtrip(
+        &socket,
+        &[json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"})],
+    )
+    .await;
+    assert_eq!(resps[0]["value"], json!(true), "resp: {}", resps[0]);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "conn A の establish + slot 破棄後の conn B 再確立で 2 回のはず"
+    );
+
+    handle.abort();
+}
+
+/// select! 化で「op 実行中の追加行を 1 行だけバッファする」経路が追加された
+/// ことの釘打ち。`roundtrip` は 1 行ずつ書いて応答を待ってから次を書く逐次
+/// ヘルパなのでここでは使わず、2 リクエストを一括で書き込んでから両方の応答
+/// を読む専用の往復を行う（バッファされず取りこぼされないことの検証）。
+#[tokio::test]
+async fn pipelined_second_request_is_buffered_not_lost() {
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd_with_fake(store_path).await;
+
+    let mut stream = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = stream.expect("could not connect to matd socket");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    // 2 リクエストを一気に（1 回の write で）送る。
+    let mut buf = Vec::new();
+    buf.extend(serde_json::to_vec(&json!({"id":1,"op":"ping"})).unwrap());
+    buf.push(b'\n');
+    buf.extend(serde_json::to_vec(&json!({"id":2,"op":"ping"})).unwrap());
+    buf.push(b'\n');
+    write_half.write_all(&buf).await.unwrap();
+
+    let r1 = lines.next_line().await.unwrap().expect("no response line");
+    let r2 = lines.next_line().await.unwrap().expect("no response line");
+    let r1: Value = serde_json::from_str(&r1).unwrap();
+    let r2: Value = serde_json::from_str(&r2).unwrap();
+    assert_eq!(r1["id"], json!(1));
+    assert_eq!(r2["id"], json!(2));
 
     handle.abort();
 }

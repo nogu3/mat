@@ -113,9 +113,11 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD_SOCKET"),
         std::env::var_os("MAT_MATD"),
     ) {
-        matd_client::Route::Forced(sockets) => return matd_client::dispatch(&sockets, &command),
+        matd_client::Route::Forced(sockets) => {
+            return matd_client::dispatch(&sockets, &command, args.op_timeout_ms)
+        }
         matd_client::Route::Auto(sockets) => {
-            if let Some(code) = matd_client::dispatch_auto(&sockets, &command) {
+            if let Some(code) = matd_client::dispatch_auto(&sockets, &command, args.op_timeout_ms) {
                 return code;
             }
         }
@@ -144,7 +146,7 @@ fn main() -> ExitCode {
         issuer_index: args.issuer_index,
     });
     if let Some(cfg) = &native_cfg {
-        if let Some(result) = native_direct::run(&command, &store_path, cfg) {
+        if let Some(result) = native_direct::run(&command, &store_path, cfg, args.op_timeout_ms) {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

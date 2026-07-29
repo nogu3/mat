@@ -166,6 +166,27 @@ pub(crate) enum NativeOp {
     },
 }
 
+impl NativeOp {
+    /// `--op-timeout-ms` の適用対象か（spec: 単一ノードの read/write/invoke/
+    /// on/off/color 系/level/describe のみ）。open-window / diag thread /
+    /// group 系 / provision / grant / bump は対象外。
+    fn budget_applies(&self) -> bool {
+        matches!(
+            self,
+            NativeOp::On { .. }
+                | NativeOp::Off { .. }
+                | NativeOp::ReadOnOff { .. }
+                | NativeOp::Color { .. }
+                | NativeOp::ColorTemp { .. }
+                | NativeOp::Level { .. }
+                | NativeOp::ReadAttr { .. }
+                | NativeOp::WriteAttr { .. }
+                | NativeOp::InvokeGeneric { .. }
+                | NativeOp::Describe { .. }
+        )
+    }
+}
+
 /// `mat open-window` の discriminator 未指定時の決定的補完（12-bit に収める）。
 /// main.rs（chip-tool 経路の既定値算出）と `classify`（native 直経路の対象値
 /// 算出）の両方が使う共有式 —— 経路によって既定値がずれないようにする。
@@ -580,6 +601,7 @@ pub(crate) fn run(
     command: &Command,
     store_path: &Path,
     cfg: &Config,
+    op_timeout_ms: u64,
 ) -> Option<Result<(), MatError>> {
     // 専用コマンド層を持つ op は native_direct の担当外（呼び出し側が処理）。
     match command {
@@ -609,7 +631,7 @@ pub(crate) fn run(
             None => return Some(Err(unresolved_op_error(command))),
         },
     };
-    Some(execute(&op, store_path, cfg))
+    Some(execute(&op, store_path, cfg, op_timeout_ms))
 }
 
 /// `classify` / `classify_strict` がともに非対象と判定した native 担当 op の
@@ -669,7 +691,12 @@ fn group_unavailable_error(reason: &str) -> MatError {
     MatError::store_parse(format!("native group send unavailable: {reason}"))
 }
 
-fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatError> {
+fn execute(
+    op: &NativeOp,
+    store_path: &Path,
+    cfg: &Config,
+    op_timeout_ms: u64,
+) -> Result<(), MatError> {
     // store / commission チェックは chip-tool 経路と同一の順序・エラー(exit 10/11)。
     let store = Store::open(store_path)?;
     // group 送信 3 形は require_node をしない（chip-tool 経路の
@@ -735,7 +762,23 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatErro
         let engine = Engine::build(&native_cfg)
             .await
             .map_err(map_engine_build_error)?;
-        run_op(&engine, op).await
+        if op.budget_applies() && op_timeout_ms > 0 {
+            // 直経路にも matd 経路と同じ予算セマンティクス（exit 3）。
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(op_timeout_ms),
+                run_op(&engine, op),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(MatError::new(
+                    mat_core::error::ErrorKind::Timeout,
+                    format!("op deadline exceeded after {op_timeout_ms}ms (direct path)"),
+                )),
+            }
+        } else {
+            run_op(&engine, op).await
+        }
     })
 }
 
@@ -2082,7 +2125,7 @@ mod tests {
         };
         // 専用コマンド層を持つ op は run() が None（store にも触れない —
         // 実在しないパスで良い）。
-        assert!(run(&cmd, std::path::Path::new("/nonexistent"), &cfg).is_none());
+        assert!(run(&cmd, std::path::Path::new("/nonexistent"), &cfg, 60000).is_none());
     }
 
     /// `mat_native::ops::provision_node` が読む group-key-map / acl に妥当な
@@ -2337,5 +2380,114 @@ mod tests {
         assert!(matches!(op, NativeOp::Describe { .. }));
         let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
         run_op(&engine, &op).await.unwrap();
+    }
+
+    #[test]
+    fn budget_applies_only_to_single_node_hotpath_ops() {
+        // 対象: 単一ノードの hotpath op（spec の適用範囲）。
+        assert!(NativeOp::On {
+            node_id: 1,
+            endpoint: 1
+        }
+        .budget_applies());
+        assert!(NativeOp::Off {
+            node_id: 1,
+            endpoint: 1
+        }
+        .budget_applies());
+        assert!(NativeOp::ReadOnOff {
+            node_id: 1,
+            endpoint: 1
+        }
+        .budget_applies());
+        assert!(NativeOp::Describe { node_id: 1 }.budget_applies());
+        // 汎用 read/write/invoke も対象。
+        assert!(NativeOp::ReadAttr {
+            node_id: 1,
+            endpoint: 1,
+            cluster_in: "onoff".to_string(),
+            attribute_in: "on-off".to_string(),
+            cluster: 6,
+            attribute: 0,
+        }
+        .budget_applies());
+        assert!(NativeOp::WriteAttr {
+            node_id: 1,
+            endpoint: 1,
+            cluster_in: "onoff".to_string(),
+            attribute_in: "on-off".to_string(),
+            cluster: 6,
+            attribute: 0,
+            value_in: "true".to_string(),
+            value: mat_core::ids::ScalarValue::Bool(true),
+            timed: false,
+        }
+        .budget_applies());
+        assert!(NativeOp::InvokeGeneric {
+            node_id: 1,
+            endpoint: 1,
+            cluster_in: "onoff".to_string(),
+            command_in: "on".to_string(),
+            cluster: 6,
+            command: 1,
+            fields_tlv: None,
+            timed: false,
+        }
+        .budget_applies());
+
+        // 対象外: open-window（commission フロー）・group 系・bump。
+        assert!(!NativeOp::GroupOnOff {
+            group_id: 1,
+            command_id: 1,
+            command: "on",
+            endpoint: 1,
+        }
+        .budget_applies());
+        assert!(!NativeOp::GroupLevel {
+            group_id: 1,
+            percent: 50,
+            level: 128,
+            transition: 0,
+            endpoint: 1,
+        }
+        .budget_applies());
+        assert!(!NativeOp::GroupInvokeGeneric {
+            group_id: 1,
+            cluster_in: "onoff".to_string(),
+            command_in: "on".to_string(),
+            cluster: 6,
+            command: 1,
+            fields_tlv: None,
+            endpoint: 1,
+        }
+        .budget_applies());
+        assert!(!NativeOp::GroupProvision {
+            group_id: 1,
+            node_ids: vec![1, 2],
+            keyset_id: 1,
+            name: "test".to_string(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        }
+        .budget_applies());
+        assert!(!NativeOp::GroupGrant {
+            group_id: 1,
+            node_ids: vec![1, 2],
+        }
+        .budget_applies());
+        assert!(!NativeOp::GroupBump.budget_applies());
+        assert!(!NativeOp::DiagThread {
+            node_id: 1,
+            endpoint: 1,
+        }
+        .budget_applies());
+        assert!(!NativeOp::OpenWindow {
+            node_id: 1,
+            timeout: 600,
+            iteration: 1,
+            discriminator: 1234,
+        }
+        .budget_applies());
     }
 }

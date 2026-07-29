@@ -116,7 +116,15 @@ async fn handle_conn(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    let mut pending_line: Option<String> = None;
+    loop {
+        let line = match pending_line.take() {
+            Some(l) => l,
+            None => match lines.next_line().await? {
+                Some(l) => l,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -166,7 +174,36 @@ async fn handle_conn(
                 return stream_events(rx, filter, &mut lines, &mut write_half).await;
             }
         }
-        let (response, is_shutdown) = dispatch(&line, &native, &store_path, &health).await;
+        let started = std::time::Instant::now();
+        // ブロックスコープで dispatch future の寿命を区切る: ClientGone で break
+        // した時点ではまだ future が per-node Mutex を握っている可能性があり、
+        // その状態で abort_op（slot 破棄の lock().await）を呼ぶとデッドロック
+        // する。ブロックを抜けて future を drop してから後始末する。
+        let turn = {
+            let dispatch_fut = dispatch(&line, &native, &store_path, &health);
+            tokio::pin!(dispatch_fut);
+            loop {
+                tokio::select! {
+                    res = &mut dispatch_fut => break OpTurn::Done(res),
+                    // op 実行中の追加行は 1 行だけバッファ（逐次セマンティクス維持）。
+                    // バッファ済みなら次の行は読まない（取りこぼし防止）。
+                    next = lines.next_line(), if pending_line.is_none() => match next {
+                        Ok(Some(l)) => pending_line = Some(l),
+                        // クライアント切断: op を破棄する。future drop で per-node
+                        // Mutex が解放され、後続 op の head-of-line blocking が
+                        // 消える（Issue #16）。応答は書かない（相手がいない）。
+                        _ => break OpTurn::ClientGone,
+                    },
+                }
+            }
+        }; // ← ここで dispatch future が drop され、Mutex が解放される
+        let (response, is_shutdown) = match turn {
+            OpTurn::Done(res) => res,
+            OpTurn::ClientGone => {
+                abort_op(&line, &native, started).await;
+                return Ok(());
+            }
+        };
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
@@ -178,6 +215,32 @@ async fn handle_conn(
         }
     }
     Ok(())
+}
+
+/// 1 op の帰結: 応答あり（通常）か、クライアント切断で放棄したか。
+enum OpTurn {
+    Done((Value, bool)),
+    ClientGone,
+}
+
+/// クライアント切断で放棄された op の後始末: 観測ログ + 単一ノード op なら
+/// slot 破棄（drop された op future が session を中途 exchange のまま残しうる）。
+/// `line` の再パースは切断時のみのコストで、通常経路には乗らない。
+async fn abort_op(line: &str, native: &NativeState, started: std::time::Instant) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (op_name, node_id) = match serde_json::from_str::<Request>(line) {
+        Ok(req) => (req.op.name(), req.op.node_id()),
+        Err(_) => ("unknown", None),
+    };
+    tracing::warn!(
+        op = op_name,
+        node_id,
+        elapsed_ms,
+        "op aborted (client disconnected)"
+    );
+    if let (Some(node_id), NativeState::Ready(b)) = (node_id, native) {
+        b.drop_session(node_id).await;
+    }
 }
 
 /// listen ストリーム: フィルタ一致イベントを NDJSON で流し続ける。lag した
@@ -324,6 +387,20 @@ impl ListenFilter {
 /// 「普段と違う」= 弱リンク化 / メッシュ劣化の兆候である。
 const SLOW_OP_MS: u64 = 300;
 
+/// deadline_ms 未指定（旧 mat クライアント）の単一ノード op に適用する既定予算。
+/// per-node Mutex の無期限保持を防ぐ受け皿（Issue #16）。
+const DEFAULT_OP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// リクエストの deadline_ms を絶対時刻へ変換する（単一ノード op 用）。
+/// `Some(0)` = 明示無制限、`Some(n)` = n ms、`None`（旧クライアント）= 既定 60s。
+fn op_deadline(deadline_ms: Option<u64>) -> Option<std::time::Instant> {
+    match deadline_ms {
+        Some(0) => None,
+        Some(n) => Some(std::time::Instant::now() + std::time::Duration::from_millis(n)),
+        None => Some(std::time::Instant::now() + DEFAULT_OP_BUDGET),
+    }
+}
+
 /// op ログの level 方針。ここに集約してテストで釘を打ち、tracing のマクロ
 /// 呼び出し側は薄く保つ。
 #[derive(Debug, PartialEq, Eq)]
@@ -437,7 +514,8 @@ async fn dispatch(
 
     // op の所要時間は run_op のみを測る（JSON パース・応答書き込みは含めない）。
     let started = std::time::Instant::now();
-    let result = run_op(&req.op, native, store_path, health).await;
+    let deadline = op_deadline(req.deadline_ms);
+    let result = run_op(&req.op, native, store_path, health, deadline).await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     log_op(&req.op, &result, elapsed_ms);
 
@@ -471,6 +549,7 @@ async fn run_op(
     native: &NativeState,
     store_path: &Path,
     health: &SubHealth,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Value, MatError> {
     // Ping / Shutdown は native に触れず即応。
     match op {
@@ -490,7 +569,7 @@ async fn run_op(
     };
 
     if is_native_hotpath(op) {
-        let result = native_op(op, native, store_path).await;
+        let result = native_op(op, native, store_path, deadline).await;
         if result.is_ok() {
             // 前提: デバイスは invoke 応答を先に、購読 report を後に送る。
             // report が note_op より先に pump へ届く逆順だと pending が残り
@@ -797,20 +876,25 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
 }
 
 /// native ホットパス op を warm session で実行し、成功 body を組む。
-async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result<Value, MatError> {
+async fn native_op(
+    op: &Op,
+    native: &NativeBackend,
+    store_path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<Value, MatError> {
     // commission 済みか毎回 KVS で確認する。
     if let Some(node_id) = op.node_id() {
         require_node(store_path, node_id)?;
     }
     match op {
         Op::On { node_id, endpoint } => {
-            native.on(*node_id, *endpoint).await?;
+            native.on(*node_id, *endpoint, deadline).await?;
             Ok(mat_core::body::invoke_success(
                 *node_id, *endpoint, "onoff", "on",
             ))
         }
         Op::Off { node_id, endpoint } => {
-            native.off(*node_id, *endpoint).await?;
+            native.off(*node_id, *endpoint, deadline).await?;
             Ok(mat_core::body::invoke_success(
                 *node_id, *endpoint, "onoff", "off",
             ))
@@ -827,7 +911,14 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .color(*node_id, *endpoint, *hue_raw, *saturation_raw, *transition)
+                .color(
+                    *node_id,
+                    *endpoint,
+                    *hue_raw,
+                    *saturation_raw,
+                    *transition,
+                    deadline,
+                )
                 .await?;
             let color = mat_core::color::ResolvedColor {
                 hue_raw: *hue_raw,
@@ -852,7 +943,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .color_temp(*node_id, *endpoint, *mireds, *transition)
+                .color_temp(*node_id, *endpoint, *mireds, *transition, deadline)
                 .await?;
             Ok(mat_core::body::color_temp_success(
                 *node_id,
@@ -870,7 +961,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .level(*node_id, *endpoint, *level, *transition)
+                .level(*node_id, *endpoint, *level, *transition, deadline)
                 .await?;
             Ok(mat_core::body::level_success(
                 *node_id,
@@ -889,7 +980,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             attribute,
         } => {
             if cluster == "onoff" && attribute == "on-off" {
-                let v = native.read_onoff(*node_id, *endpoint).await?;
+                let v = native.read_onoff(*node_id, *endpoint, deadline).await?;
                 Ok(mat_core::body::read_success(
                     *node_id,
                     *endpoint,
@@ -912,7 +1003,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                         ))
                     })?;
                 let v = native
-                    .read_json(*node_id, *endpoint, cluster_id, attr.id)
+                    .read_json(*node_id, *endpoint, cluster_id, attr.id, deadline)
                     .await?;
                 Ok(mat_core::body::read_success(
                     *node_id, *endpoint, cluster, attribute, v,
@@ -944,6 +1035,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                         attr_id,
                         mat_native::scalar_to_tlv(&scalar),
                         timed,
+                        deadline,
                     )
                     .await?;
                 Ok(mat_core::body::write_success(
@@ -974,7 +1066,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                     Some(mat_native::encode_command_fields(&fields))
                 };
                 native
-                    .invoke_generic(*node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed)
+                    .invoke_generic(
+                        *node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed, deadline,
+                    )
                     .await?;
                 Ok(mat_core::body::invoke_success(
                     *node_id, *endpoint, cluster, command,
@@ -982,7 +1076,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             }
         },
         Op::Describe { node_id } => {
-            let endpoints = native.describe(*node_id).await?;
+            let endpoints = native.describe(*node_id, deadline).await?;
             Ok(mat_core::body::describe_success(*node_id, &endpoints))
         }
         _ => Err(MatError::parse_error(
@@ -1112,6 +1206,18 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
 mod tests {
     use super::*;
     use crate::protocol::Op;
+
+    #[test]
+    fn op_deadline_semantics() {
+        // Some(0) = 明示無制限。
+        assert!(op_deadline(Some(0)).is_none());
+        // Some(n) = 今 + n ms（下限だけ確認 — 実行遅延で厳密比較はしない）。
+        let d = op_deadline(Some(5_000)).expect("finite budget");
+        assert!(d <= std::time::Instant::now() + std::time::Duration::from_millis(5_000));
+        // None（旧クライアント）= 既定 60s。
+        let d = op_deadline(None).expect("default budget");
+        assert!(d > std::time::Instant::now() + std::time::Duration::from_secs(59));
+    }
 
     #[test]
     fn listen_filter_matches_by_resolved_ids() {
@@ -1466,7 +1572,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "current-level".into(),
         };
-        let body = native_op(&op, &native, store_with_node_5().path())
+        let body = native_op(&op, &native, store_with_node_5().path(), None)
             .await
             .unwrap();
         // 既存 hotpath_success_body(Read) と同形（node_id/endpoint/cluster/attribute/value）。
@@ -1487,7 +1593,7 @@ mod tests {
             attribute: "acl".into(),
             value: "[]".into(),
         };
-        let err = native_op(&op, &native, store_with_node_5().path())
+        let err = native_op(&op, &native, store_with_node_5().path(), None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1505,7 +1611,7 @@ mod tests {
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
         };
-        let body = native_op(&invoke, &native, dir.path()).await.unwrap();
+        let body = native_op(&invoke, &native, dir.path(), None).await.unwrap();
         // 既存 simple_op(Invoke) と同形（node_id/endpoint/cluster/command/status）。
         assert_eq!(body["node_id"], 5);
         assert_eq!(body["endpoint"], 1);
@@ -1514,7 +1620,9 @@ mod tests {
         assert_eq!(body["status"], "success");
 
         let describe = Op::Describe { node_id: 5 };
-        let body = native_op(&describe, &native, dir.path()).await.unwrap();
+        let body = native_op(&describe, &native, dir.path(), None)
+            .await
+            .unwrap();
         // node_id/endpoints[].{endpoint,clusters} の形。
         assert_eq!(body["node_id"], 5);
         let endpoints = body["endpoints"].as_array().unwrap();
@@ -1641,6 +1749,7 @@ mod tests {
                 &NativeState::Ready(Box::new(native)),
                 &store_path,
                 &SubHealth::new(None),
+                None,
             )
             .await
             .unwrap();
@@ -1674,6 +1783,7 @@ mod tests {
             &NativeState::Ready(Box::new(native)),
             &store_path,
             &SubHealth::new(None),
+            None,
         )
         .await
         .unwrap_err();
@@ -1715,6 +1825,7 @@ mod tests {
             &NativeState::Ready(Box::new(native)),
             &store_path,
             &SubHealth::new(None),
+            None,
         )
         .await
         .unwrap();
@@ -1737,7 +1848,7 @@ mod tests {
         let state = NativeState::Unavailable(build_err.clone());
         let health = SubHealth::new(None);
 
-        let err = run_op(&group_on_op(), &state, &store_path, &health)
+        let err = run_op(&group_on_op(), &state, &store_path, &health, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
@@ -1749,20 +1860,20 @@ mod tests {
             cluster: "onoff".into(),
             attribute: "on-off".into(),
         };
-        let err = run_op(&read, &state, &store_path, &health)
+        let err = run_op(&read, &state, &store_path, &health, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
 
         // Ping/Shutdown だけは native に触れず常に成功する。
         assert_eq!(
-            run_op(&Op::Ping, &state, &store_path, &health)
+            run_op(&Op::Ping, &state, &store_path, &health, None)
                 .await
                 .unwrap(),
             json!({ "pong": true })
         );
         assert_eq!(
-            run_op(&Op::Shutdown, &state, &store_path, &health)
+            run_op(&Op::Shutdown, &state, &store_path, &health, None)
                 .await
                 .unwrap(),
             json!({ "stopping": true })
@@ -1796,6 +1907,7 @@ mod tests {
             &state,
             dir.path(),
             &health,
+            None,
         )
         .await
         .unwrap();
@@ -1821,6 +1933,7 @@ mod tests {
             &state,
             dir.path(),
             &health,
+            None,
         )
         .await
         .unwrap();
@@ -1837,6 +1950,7 @@ mod tests {
             &state,
             dir.path(),
             &health,
+            None,
         )
         .await
         .unwrap();
@@ -1857,6 +1971,7 @@ mod tests {
             &state,
             dir.path(),
             &health,
+            None,
         )
         .await
         .unwrap();
@@ -1877,7 +1992,9 @@ mod tests {
             attribute: "x".into(),
             value: "1".into(),
         };
-        let err = native_op(&op, &native, store.path()).await.unwrap_err();
+        let err = native_op(&op, &native, store.path(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
 
@@ -1889,13 +2006,15 @@ mod tests {
             command: "x".into(),
             args: vec![],
         };
-        let err = native_op(&op, &native, store.path()).await.unwrap_err();
+        let err = native_op(&op, &native, store.path(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
 
         // non-hotpath op（Ping は node_id() が None なので require_node を素通りして
         // catch-all に到達する）
-        let err = native_op(&Op::Ping, &native, store.path())
+        let err = native_op(&Op::Ping, &native, store.path(), None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);

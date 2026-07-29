@@ -51,9 +51,8 @@ pub(crate) fn retrans_base(last_rx: Option<Instant>, cfg: &MrpConfig) -> Duratio
     }
 }
 
-/// MRP の全リトライを使い切るまでの待ち時間合計。reliable transport では
-/// 「同じ体感タイムアウト」で実応答を待つ予算として使う。
-fn total_budget(cfg: &MrpConfig) -> Duration {
+/// MRP 再送が尽きるまでの待ち時間総和。op 予算設計（Issue #16）の成分。
+pub fn total_budget(cfg: &MrpConfig) -> Duration {
     let mut total = Duration::ZERO;
     let mut interval = cfg.initial_interval;
     for _ in 0..=cfg.max_retries {
