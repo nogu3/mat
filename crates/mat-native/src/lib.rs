@@ -344,7 +344,7 @@ impl Engine {
         let transport = UdpTransport::bind().await.map_err(|e| {
             MatError::new(ErrorKind::Other, format!("native: bind udp transport: {e}"))
         })?;
-        // establisher に creds/transport を move する前に、group 送信に要る値を控える。
+        // establisher に creds を move する前に、group 送信に要る値を控える。
         let fabric_id = creds.fabric_id;
         let node_id = creds.node_id;
         let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
