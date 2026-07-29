@@ -151,6 +151,14 @@ impl NativeBackend {
         )
     }
 
+    /// クライアント切断で進行中 op が破棄された後の始末。中途 exchange の
+    /// session を次 op に持ち越さないよう slot を破棄する（次回 lazy 再確立）。
+    /// op の future は drop 済みなので内側ロックはすぐ取れる。
+    pub async fn drop_session(&self, node_id: u64) {
+        let slot = self.slot(node_id).await;
+        *slot.lock().await = None;
+    }
+
     /// warm セッションで `op` を実行する。slot が空なら確立。送信が Timeout
     /// （MRP 尽き=session が死んでいる兆候）なら slot を捨てて1回だけ再確立し再送する。
     /// DeviceRejected / ParseError（コマンドは届き session は健全）は slot 維持で即 Err。

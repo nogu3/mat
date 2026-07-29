@@ -116,7 +116,15 @@ async fn handle_conn(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    let mut pending_line: Option<String> = None;
+    loop {
+        let line = match pending_line.take() {
+            Some(l) => l,
+            None => match lines.next_line().await? {
+                Some(l) => l,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -166,7 +174,36 @@ async fn handle_conn(
                 return stream_events(rx, filter, &mut lines, &mut write_half).await;
             }
         }
-        let (response, is_shutdown) = dispatch(&line, &native, &store_path, &health).await;
+        let started = std::time::Instant::now();
+        // ブロックスコープで dispatch future の寿命を区切る: ClientGone で break
+        // した時点ではまだ future が per-node Mutex を握っている可能性があり、
+        // その状態で abort_op（slot 破棄の lock().await）を呼ぶとデッドロック
+        // する。ブロックを抜けて future を drop してから後始末する。
+        let turn = {
+            let dispatch_fut = dispatch(&line, &native, &store_path, &health);
+            tokio::pin!(dispatch_fut);
+            loop {
+                tokio::select! {
+                    res = &mut dispatch_fut => break OpTurn::Done(res),
+                    // op 実行中の追加行は 1 行だけバッファ（逐次セマンティクス維持）。
+                    // バッファ済みなら次の行は読まない（取りこぼし防止）。
+                    next = lines.next_line(), if pending_line.is_none() => match next {
+                        Ok(Some(l)) => pending_line = Some(l),
+                        // クライアント切断: op を破棄する。future drop で per-node
+                        // Mutex が解放され、後続 op の head-of-line blocking が
+                        // 消える（Issue #16）。応答は書かない（相手がいない）。
+                        _ => break OpTurn::ClientGone,
+                    },
+                }
+            }
+        }; // ← ここで dispatch future が drop され、Mutex が解放される
+        let (response, is_shutdown) = match turn {
+            OpTurn::Done(res) => res,
+            OpTurn::ClientGone => {
+                abort_op(&line, &native, started).await;
+                return Ok(());
+            }
+        };
         let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
         buf.push(b'\n');
         write_half.write_all(&buf).await?;
@@ -178,6 +215,32 @@ async fn handle_conn(
         }
     }
     Ok(())
+}
+
+/// 1 op の帰結: 応答あり（通常）か、クライアント切断で放棄したか。
+enum OpTurn {
+    Done((Value, bool)),
+    ClientGone,
+}
+
+/// クライアント切断で放棄された op の後始末: 観測ログ + 単一ノード op なら
+/// slot 破棄（drop された op future が session を中途 exchange のまま残しうる）。
+/// `line` の再パースは切断時のみのコストで、通常経路には乗らない。
+async fn abort_op(line: &str, native: &NativeState, started: std::time::Instant) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (op_name, node_id) = match serde_json::from_str::<Request>(line) {
+        Ok(req) => (req.op.name(), req.op.node_id()),
+        Err(_) => ("unknown", None),
+    };
+    tracing::warn!(
+        op = op_name,
+        node_id,
+        elapsed_ms,
+        "op aborted (client disconnected)"
+    );
+    if let (Some(node_id), NativeState::Ready(b)) = (node_id, native) {
+        b.drop_session(node_id).await;
+    }
 }
 
 /// listen ストリーム: フィルタ一致イベントを NDJSON で流し続ける。lag した
