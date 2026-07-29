@@ -148,6 +148,8 @@ pub struct FakeConn {
     /// `write_tlv` の TLV ペイロード記録（M8a Task9）: (endpoint, cluster, attribute, tlv_bytes)。
     /// group-key-map マージ検証用。
     written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
+    /// 送信系メソッド冒頭の遅延（deadline 執行テスト用、Issue #16）。None = 遅延なし。
+    pub delay: Option<std::time::Duration>,
 }
 
 impl Default for FakeConn {
@@ -160,6 +162,7 @@ impl Default for FakeConn {
             clusters: HashMap::new(),
             calls: Vec::new(),
             written_tlv: Vec::new(),
+            delay: None,
         }
     }
 }
@@ -210,6 +213,9 @@ impl FakeConn {
 #[async_trait]
 impl NodeConn for FakeConn {
     async fn read_onoff(&mut self, _endpoint: u16) -> Result<bool, MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         let n = self.sent;
         self.sent += 1;
         if self.fail_first_send && n == 0 {
@@ -225,6 +231,9 @@ impl NodeConn for FakeConn {
         _fields: Option<Vec<u8>>,
         _timed: bool,
     ) -> Result<(), MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         self.calls
             .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
         Ok(())
@@ -236,6 +245,9 @@ impl NodeConn for FakeConn {
         cluster: u32,
         attribute: u32,
     ) -> Result<serde_json::Value, MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         if let Some(v) = self.reads.get(&(endpoint, cluster, attribute)) {
             return Ok(v.clone());
         }
@@ -247,6 +259,9 @@ impl NodeConn for FakeConn {
         endpoint: u16,
         cluster: u32,
     ) -> Result<Vec<(u32, serde_json::Value)>, MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         if let Some(rows) = self.clusters.get(&(endpoint, cluster)) {
             return Ok(rows.clone());
         }
@@ -261,6 +276,9 @@ impl NodeConn for FakeConn {
         data_tlv: Vec<u8>,
         _timed: bool,
     ) -> Result<(), MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         let n = self.sent;
         self.sent += 1;
         if self.fail_first_send && n == 0 {
@@ -314,6 +332,10 @@ pub struct FakeEstablisher {
     pub fail_probe: std::sync::Arc<AtomicUsize>,
     /// 全 FakeSubConn と共有する probe 呼び出しカウンタ。
     pub probe_calls: std::sync::Arc<AtomicUsize>,
+    /// 払い出す FakeConn の送信遅延（deadline 執行テスト用、Issue #16）。
+    pub conn_delay: Option<std::time::Duration>,
+    /// establish 自体の遅延（establish フェーズの deadline 執行テスト用）。
+    pub establish_delay: Option<std::time::Duration>,
 }
 
 impl Default for FakeEstablisher {
@@ -328,6 +350,8 @@ impl Default for FakeEstablisher {
             fail_next_report: std::sync::Arc::default(),
             fail_probe: std::sync::Arc::default(),
             probe_calls: std::sync::Arc::default(),
+            conn_delay: None,
+            establish_delay: None,
         }
     }
 }
@@ -335,10 +359,14 @@ impl Default for FakeEstablisher {
 #[async_trait]
 impl Establisher for FakeEstablisher {
     async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
+        if let Some(d) = self.establish_delay {
+            tokio::time::sleep(d).await;
+        }
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeConn {
             fail_first_send: self.fail_first_send && n == 0,
             fail_kind: self.fail_kind,
+            delay: self.conn_delay,
             ..Default::default()
         }))
     }
@@ -479,4 +507,33 @@ pub fn multicast_capable_interfaces() -> Vec<McastCandidate> {
     rest.sort_by_key(|c| c.index);
     up_first.extend(rest);
     up_first
+}
+
+#[cfg(test)]
+mod delay_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn conn_delay_delays_send_ops() {
+        let est = FakeEstablisher {
+            conn_delay: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let mut conn = est.establish(1).await.unwrap();
+        let started = std::time::Instant::now();
+        conn.read_onoff(1).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn establish_delay_delays_establish() {
+        let est = FakeEstablisher {
+            establish_delay: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        est.establish(1).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
 }
