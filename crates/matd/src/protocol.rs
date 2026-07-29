@@ -154,6 +154,9 @@ pub enum Op {
         transition: u16,
         endpoint: u16,
     },
+    /// group 送信 counter の窓ジャンプ（`mat group bump` 相当、Issue #14 応急
+    /// コマンド）。counter は fabric 全体で 1 本 — 対象 group は取らない。
+    GroupBump,
     /// イベントストリーム購読（matd 専用 op）。ack 1 行の後、フィルタ一致
     /// イベントを同接続へ流し続ける（「1行=1往復」の唯一の例外）。全省略 = 全イベント。
     Listen {
@@ -194,6 +197,7 @@ impl Op {
             | Op::GroupColorTemp { .. }
             | Op::GroupLevel { .. }
             | Op::GroupColor { .. }
+            | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
             | Op::Shutdown => None,
@@ -219,6 +223,7 @@ impl Op {
             Op::GroupColorTemp { .. } => "group_color_temp",
             Op::GroupLevel { .. } => "group_level",
             Op::GroupColor { .. } => "group_color",
+            Op::GroupBump => "group_bump",
             Op::Listen { .. } => "listen",
             Op::Ping => "ping",
             Op::Shutdown => "shutdown",
@@ -242,6 +247,7 @@ impl Op {
             | Op::Level { .. }
             | Op::Color { .. }
             | Op::Describe { .. }
+            | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
             | Op::Shutdown => None,
@@ -265,7 +271,9 @@ impl Op {
             | Op::GroupColorTemp { endpoint, .. }
             | Op::GroupLevel { endpoint, .. }
             | Op::GroupColor { endpoint, .. } => Some(*endpoint),
-            Op::Describe { .. } | Op::Listen { .. } | Op::Ping | Op::Shutdown => None,
+            Op::Describe { .. } | Op::GroupBump | Op::Listen { .. } | Op::Ping | Op::Shutdown => {
+                None
+            }
         }
     }
 
@@ -297,6 +305,7 @@ impl Op {
             | Op::GroupColorTemp { .. }
             | Op::GroupLevel { .. }
             | Op::GroupColor { .. }
+            | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
             | Op::Shutdown => None,
@@ -572,6 +581,18 @@ mod tests {
         ] {
             assert_eq!(parse(line).op.name(), expected, "line: {line}");
         }
+    }
+
+    #[test]
+    fn group_bump_parses_with_no_fields() {
+        let r = parse(r#"{"op":"group_bump"}"#);
+        assert!(matches!(r.op, Op::GroupBump));
+        // fabric 全体で counter は 1 本 — node / group / endpoint を持たない。
+        assert_eq!(r.op.node_id(), None);
+        assert_eq!(r.op.group_id(), None);
+        assert_eq!(r.op.endpoint(), None);
+        assert_eq!(r.op.log_path(), None);
+        assert_eq!(r.op.name(), "group_bump");
     }
 
     #[test]

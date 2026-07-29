@@ -289,6 +289,17 @@ async fn group_invoke_without_group_ctx_returns_store_parse() {
     handle.abort();
 }
 
+/// group ctx 未構成の backend への group_bump は send と同じ store_parse。
+#[tokio::test]
+async fn group_bump_without_group_ctx_returns_store_parse() {
+    let (store_dir, store_path) = make_store();
+    let (socket, handle) = start_matd_with_fake(store_path).await;
+    let resps = roundtrip(&socket, &[json!({"op":"group_bump"})]).await;
+    assert_eq!(resps[0]["error"]["kind"], json!("store_parse"));
+    handle.abort();
+    drop(store_dir);
+}
+
 /// group provision の 2 ステップ（controller 側 group state / デバイス側 4
 /// ステップ）ともに native で完遂することを socket 越しに確認する
 /// （個々の native ロジック — ACL マージや rebind 等 — は mat-native/matd::server

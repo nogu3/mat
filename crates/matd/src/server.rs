@@ -524,6 +524,18 @@ async fn run_op(
 
     match op {
         Op::GroupProvision { .. } => group_provision(op, native, store_path).await,
+        Op::GroupBump => {
+            // 前提チェックは group invoke と同じ（store が開けること）。
+            let _store = Store::open(store_path)?;
+            match native.group_bump().await {
+                mat_native::group::BumpOutcome::Bumped { from, to } => {
+                    Ok(mat_core::body::group_bump(from, to))
+                }
+                mat_native::group::BumpOutcome::Unavailable(reason) => {
+                    Err(group_unavailable_error(&reason))
+                }
+            }
+        }
         // ここに来るのは Read/Write/Invoke/GroupInvoke で cluster/attribute/command
         // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Level/Describe は常に
         // is_native_hotpath、GroupColorTemp/GroupColor/GroupLevel は native_group_params が
@@ -640,6 +652,7 @@ fn op_state_target(op: &Op) -> Option<(u64, u16)> {
         | Op::GroupColorTemp { .. }
         | Op::GroupLevel { .. }
         | Op::GroupColor { .. }
+        | Op::GroupBump
         | Op::Listen { .. }
         | Op::Ping
         | Op::Shutdown => None,
@@ -1666,6 +1679,53 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreParse);
         assert!(err.detail.contains("native group send unavailable"));
+    }
+
+    /// Issue #14 応急コマンド: group ctx が構成済みなら `Op::GroupBump` は
+    /// counter を fresh counter file の lazy init 直後の窓（2*COUNTER_EPOCH =
+    /// 8192）だけジャンプし、from/to を body へ載せる。bump は送信を伴わない
+    /// ため multicast join 可否に依存しない（scope_id は lo で足りる）。
+    #[tokio::test]
+    async fn group_bump_dispatch_reports_from_and_to() {
+        let (_dir, store_path) = make_store();
+        let ini = store_path.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+        let counter_path = store_path.join("native_group_counter-bump-test");
+        let _ = std::fs::remove_file(&counter_path);
+        let transport = std::sync::Arc::new(
+            mat_controller::transport::UdpTransport::bind()
+                .await
+                .unwrap(),
+        );
+        let ctx = crate::native::GroupCtx {
+            main_ini: ini,
+            counter_path,
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            scope_id: 1, // lo — bump は送信しないので join 可否は無関係
+            dest_port: 5540,
+            transport,
+            sender: tokio::sync::Mutex::new(None),
+        };
+        let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
+
+        let body = run_op(
+            &Op::GroupBump,
+            &NativeState::Ready(Box::new(native)),
+            &store_path,
+            &SubHealth::new(None),
+        )
+        .await
+        .unwrap();
+
+        let from = body["group_counter"]["from"]
+            .as_u64()
+            .expect("group_counter.from present");
+        let to = body["group_counter"]["to"]
+            .as_u64()
+            .expect("group_counter.to present");
+        assert_eq!(to - from, 8192);
     }
 
     #[tokio::test]
