@@ -13,6 +13,11 @@ pub struct Request {
     /// 呼び出し側の相関 ID（任意）。応答にエコーする。
     #[serde(default)]
     pub id: Option<Value>,
+    /// クライアントの op 予算（相対 ms）。単一ノード op のみに適用される。
+    /// `Some(0)` = 明示無制限、無指定（旧クライアント）= matd 既定 60s
+    /// （server::DEFAULT_OP_BUDGET）。Issue #16。
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
     #[serde(flatten)]
     pub op: Op,
 }
@@ -625,5 +630,30 @@ mod tests {
         assert_eq!(ping.endpoint(), None);
         assert_eq!(ping.group_id(), None);
         assert_eq!(ping.log_path(), None);
+    }
+
+    #[test]
+    fn deadline_ms_parses_and_defaults_to_none() {
+        // 新 mat からの deadline 付きリクエスト。
+        let r = parse(
+            r#"{"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","deadline_ms":15000}"#,
+        );
+        assert_eq!(r.deadline_ms, Some(15000));
+        // 旧 mat（フィールド無し）は None。
+        let r = parse(r#"{"op":"ping"}"#);
+        assert_eq!(r.deadline_ms, None);
+        // 明示 0（無制限）も値として通る。
+        let r = parse(r#"{"op":"on","node_id":3,"endpoint":1,"deadline_ms":0}"#);
+        assert_eq!(r.deadline_ms, Some(0));
+    }
+
+    #[test]
+    fn unknown_top_level_fields_are_tolerated() {
+        // 前方互換の釘打ち: 未知フィールドは無視される（新 mat → 旧 matd で
+        // deadline_ms が未知でも parse_error にならないことの一般形）。
+        let r = parse(
+            r#"{"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","future_field":42}"#,
+        );
+        assert!(matches!(r.op, Op::Read { .. }));
     }
 }
