@@ -99,6 +99,19 @@ impl PersistedGroupCounter {
         Ok(v)
     }
 
+    /// counter 窓を「再起動 1 回相当」前方へジャンプする（Issue #14 応急処置）。
+    /// 次回払い出し値を `ceiling + EPOCH`（= `load()` と同じ算術）へ進め、
+    /// 新 ceiling を先に永続化してから返す。persist 失敗時は状態を変えない
+    /// （旧 ceiling のまま — 送信継続は安全）。
+    /// 返り値は (ジャンプ前の次回値 from, ジャンプ後の次回値 to)。
+    pub fn jump(&mut self) -> io::Result<(u32, u32)> {
+        let from = self.next;
+        let to = self.ceiling.wrapping_add(COUNTER_EPOCH);
+        self.persist(to.wrapping_add(COUNTER_EPOCH))?;
+        self.next = to;
+        Ok((from, to))
+    }
+
     /// Atomic write (tmp + fsync + rename) so a crash never leaves a
     /// truncated value behind.
     fn persist(&mut self, ceiling: u32) -> io::Result<()> {
@@ -256,6 +269,12 @@ impl GroupSender {
             .map_err(GroupSendError::Io)?;
         Ok(counter)
     }
+
+    /// 内包 counter の窓ジャンプ（Issue #14 応急処置）。matd 常駐中は counter の
+    /// 実体（in-memory + flock）が GroupSender 内にあるため、ここを経由する。
+    pub fn bump_counter(&mut self) -> std::io::Result<(u32, u32)> {
+        self.counter.jump()
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +371,39 @@ mod tests {
         let _again = PersistedGroupCounter::load(&p, 0).expect("load after release");
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.lock", p.display())));
+    }
+
+    #[test]
+    fn counter_jump_advances_one_restart_window_and_persists_ahead() {
+        let p = tmp_counter_path("jump");
+        let _ = std::fs::remove_file(&p);
+        let mut c = PersistedGroupCounter::load(&p, 0).unwrap();
+        let first = c.next().unwrap(); // = 4096 (EPOCH)。ceiling = first + EPOCH
+        let (from, to) = c.jump().unwrap();
+        // from = ジャンプしなかった場合の次回値、to = 旧 ceiling + EPOCH。
+        assert_eq!(from, first + 1);
+        assert_eq!(to, first + 2 * COUNTER_EPOCH);
+        // ジャンプ後の払い出しは to から連番。
+        assert_eq!(c.next().unwrap(), to);
+        assert_eq!(c.next().unwrap(), to + 1);
+        // persist-ahead 不変条件: drop → reload しても値が重ならない。
+        drop(c);
+        let mut c2 = PersistedGroupCounter::load(&p, 0).unwrap();
+        assert!(c2.next().unwrap() > to + 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn counter_jump_twice_is_monotonic() {
+        let p = tmp_counter_path("jump2");
+        let _ = std::fs::remove_file(&p);
+        let mut c = PersistedGroupCounter::load(&p, 0).unwrap();
+        let (_, to1) = c.jump().unwrap();
+        let (from2, to2) = c.jump().unwrap();
+        // 2 回目の from は 1 回目の to（間で next() していないので）。
+        assert_eq!(from2, to1);
+        assert!(to2 > to1);
+        let _ = std::fs::remove_file(&p);
     }
 
     use crate::im::{CLUSTER_ON_OFF, CMD_ON_OFF_ON, OPCODE_INVOKE_REQUEST, PROTOCOL_ID_IM};

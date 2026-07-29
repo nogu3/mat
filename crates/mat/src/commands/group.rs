@@ -52,6 +52,11 @@ pub(crate) fn emit_invoke_sent(group_id: u16, cluster: &str, command: &str, endp
     ));
 }
 
+/// `group bump` の出力部（body は `mat_core::body` 共有 — matd 経路と同形）。
+pub(crate) fn emit_bump(from: u32, to: u32) {
+    output::emit(body::group_bump(from, to));
+}
+
 /// `color_temp` の出力部（body は `mat_core::body` 共有）。
 pub(crate) fn emit_color_temp_sent(
     group_id: u16,

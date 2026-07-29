@@ -155,6 +155,12 @@ pub fn group_invoke_sent(group_id: u16, cluster: &str, command: &str, endpoint: 
     })
 }
 
+/// `group bump` の成功 body。counter 窓ジャンプ（Issue #14 応急コマンド —
+/// 受信側リプレイ窓が送信系列より先行した状態を matd 再起動なしで回復する）。
+pub fn group_bump(from: u32, to: u32) -> Value {
+    json!({ "group_counter": { "from": from, "to": to } })
+}
+
 /// `group color-temp` の sent body。
 pub fn group_color_temp_sent(
     group_id: u16,
