@@ -265,6 +265,17 @@ This repo ships two binaries from one install:
   the default socket, falling back to its own native direct path when nothing
   answers); `--matd`/`MAT_MATD=1` force the matd path, `MAT_MATD=0` disables
   probing entirely.
+- **Op budget (deadline), Issue #16.** A single-node op carries a relative-ms
+  budget end to end: `mat`'s `--op-timeout-ms` becomes `deadline_ms` on the
+  matd socket protocol (unset from an old client = `matd`'s own 60s default).
+  Exceeding it discards the warm session slot and returns a structured
+  `timeout` rather than leaving a half-finished session for the next op; the
+  Timeout arm's re-establish-and-resend only fires with ≥10s of budget left,
+  otherwise it returns immediately instead of starting a retry it cannot
+  finish in time. A client disconnecting mid-op drops the in-flight future,
+  releasing the per-node session mutex immediately instead of waiting for the
+  abandoned op to run to completion. Design:
+  `docs/superpowers/specs/2026-07-29-op-deadline-budget-design.md`.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
