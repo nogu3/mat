@@ -146,7 +146,7 @@ fn main() -> ExitCode {
         issuer_index: args.issuer_index,
     });
     if let Some(cfg) = &native_cfg {
-        if let Some(result) = native_direct::run(&command, &store_path, cfg) {
+        if let Some(result) = native_direct::run(&command, &store_path, cfg, args.op_timeout_ms) {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
