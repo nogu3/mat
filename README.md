@@ -1051,8 +1051,9 @@ mypink = "255,182,193"
 - `nodes`: alias → node_id. Accepted by `-n/--node` (read / write / invoke /
   describe / on / off / color-temp / color / level / open-window / diag thread / diag node) and
   by `--nodes` in `group provision` / `diag mesh` (each element resolved independently).
-- `groups`: alias → GroupId. Accepted by `-g/--group` in every `group`
-  subcommand (`provision` / `invoke` / `grant` / `color-temp` / `color` / `level`).
+- `groups`: alias → GroupId. Accepted by `-g/--group` in `group provision` /
+  `invoke` / `grant` / `color-temp` / `color` / `level` (`bump` takes none —
+  the counter is fabric-global).
 - `endpoints`: defined **per node** — the outer key is a node alias or a
   node_id digit string, the inner map is alias → endpoint number (endpoint
   numbers mean different things on different nodes, so there is no global
