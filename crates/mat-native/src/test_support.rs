@@ -30,10 +30,6 @@ pub struct FakeSubConn {
     /// `FakeEstablisher::fail_next_report` と同一の Arc — テストが確立後に
     /// 注入して pump を狙って殺せる。
     pub fail_next_report: std::sync::Arc<AtomicUsize>,
-    /// 残り回数だけ `probe` を失敗させる（0 = 常に成功）。
-    pub fail_probe: std::sync::Arc<AtomicUsize>,
-    /// `probe` の呼び出し回数（FakeEstablisher と共有 — キャップ検証用）。
-    pub probe_calls: std::sync::Arc<AtomicUsize>,
 }
 
 /// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
@@ -71,8 +67,6 @@ impl Default for FakeSubConn {
             live: std::sync::Arc::default(),
             seen_clusters: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
-            fail_probe: std::sync::Arc::default(),
-            probe_calls: std::sync::Arc::default(),
         }
     }
 }
@@ -114,17 +108,6 @@ impl crate::SubscribeConn for FakeSubConn {
         }
         tokio::time::sleep(timeout).await;
         Ok(self.live.lock().unwrap().pop_front())
-    }
-
-    async fn probe(&mut self) -> Result<(), MatError> {
-        self.probe_calls.fetch_add(1, Ordering::SeqCst);
-        if take_failure(&self.fail_probe) {
-            return Err(MatError::new(
-                ErrorKind::SessionFailed,
-                "fake probe failure",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -328,10 +311,6 @@ pub struct FakeEstablisher {
     /// 払い出す `FakeSubConn` の `next_report` を残り回数だけ失敗させる
     /// （0 = 常に成功）。Arc 共有なのでテストが確立後に注入できる。
     pub fail_next_report: std::sync::Arc<AtomicUsize>,
-    /// 払い出す `FakeSubConn` の `probe` を残り回数だけ失敗させる（0 = 常に成功）。
-    pub fail_probe: std::sync::Arc<AtomicUsize>,
-    /// 全 FakeSubConn と共有する probe 呼び出しカウンタ。
-    pub probe_calls: std::sync::Arc<AtomicUsize>,
     /// 払い出す FakeConn の送信遅延（deadline 執行テスト用、Issue #16）。
     pub conn_delay: Option<std::time::Duration>,
     /// establish 自体の遅延（establish フェーズの deadline 執行テスト用）。
@@ -348,8 +327,6 @@ impl Default for FakeEstablisher {
             sub_live: std::sync::Arc::default(),
             fail_subscription: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
-            fail_probe: std::sync::Arc::default(),
-            probe_calls: std::sync::Arc::default(),
             conn_delay: None,
             establish_delay: None,
         }
@@ -384,8 +361,6 @@ impl Establisher for FakeEstablisher {
             seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
             live: std::sync::Arc::clone(&self.sub_live),
             fail_next_report: std::sync::Arc::clone(&self.fail_next_report),
-            fail_probe: std::sync::Arc::clone(&self.fail_probe),
-            probe_calls: std::sync::Arc::clone(&self.probe_calls),
             ..Default::default()
         }))
     }
