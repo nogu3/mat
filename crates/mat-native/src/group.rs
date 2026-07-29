@@ -36,6 +36,42 @@ pub enum GroupOutcome {
     Unavailable(String),
 }
 
+/// group 送信 counter の窓ジャンプ結果。`Unavailable` は send() と同じ
+/// 「native では実行できない」合図（消費側で store_parse ハードエラー化）。
+pub enum BumpOutcome {
+    Bumped { from: u32, to: u32 },
+    Unavailable(String),
+}
+
+/// send / bump 共有の lazy 初期化。`Err(reason)` = native では実行できない
+/// （未 provision・KVS 不備・counter 初期化不能）→ 呼び出し側が
+/// `Unavailable` に写像する。
+fn init_sender(ctx: &GroupCtx, slot: &mut Option<GroupSender>) -> Result<(), String> {
+    if slot.is_some() {
+        return Ok(());
+    }
+    let gdc = match kvs::read_group_data_counter(&ctx.main_ini) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Err("chip-tool g/gdc missing; refusing to start the group counter low".into())
+        }
+        Err(e) => return Err(format!("read g/gdc: {e}")),
+    };
+    let counter = PersistedGroupCounter::load(&ctx.counter_path, gdc)
+        .map_err(|e| format!("group counter store: {e}"))?;
+    let sender = GroupSender::new(
+        Arc::clone(&ctx.transport),
+        ctx.scope_id,
+        ctx.dest_port,
+        ctx.fabric_id,
+        ctx.node_id,
+        counter,
+    )
+    .map_err(|e| format!("multicast socket setup: {e}"))?;
+    *slot = Some(sender);
+    Ok(())
+}
+
 /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
 /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
 /// （socket）だけを Err にする。
@@ -55,39 +91,8 @@ pub async fn send(
         }
     };
     let mut slot = ctx.sender.lock().await;
-    if slot.is_none() {
-        let gdc = match kvs::read_group_data_counter(&ctx.main_ini) {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                return Ok(GroupOutcome::Unavailable(
-                    "chip-tool g/gdc missing; refusing to start the group counter low".into(),
-                ))
-            }
-            Err(e) => return Ok(GroupOutcome::Unavailable(format!("read g/gdc: {e}"))),
-        };
-        let counter = match PersistedGroupCounter::load(&ctx.counter_path, gdc) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(GroupOutcome::Unavailable(format!(
-                    "group counter store: {e}"
-                )))
-            }
-        };
-        match GroupSender::new(
-            Arc::clone(&ctx.transport),
-            ctx.scope_id,
-            ctx.dest_port,
-            ctx.fabric_id,
-            ctx.node_id,
-            counter,
-        ) {
-            Ok(s) => *slot = Some(s),
-            Err(e) => {
-                return Ok(GroupOutcome::Unavailable(format!(
-                    "multicast socket setup: {e}"
-                )))
-            }
-        }
+    if let Err(reason) = init_sender(ctx, &mut slot) {
+        return Ok(GroupOutcome::Unavailable(reason));
     }
     match slot
         .as_mut()
@@ -100,6 +105,23 @@ pub async fn send(
             Ok(GroupOutcome::Sent)
         }
         Err(e) => Err(group_send_error(group_id, e)),
+    }
+}
+
+/// group 送信 counter を matd 再起動 1 回相当ジャンプする（Issue #14 応急処置）。
+/// 送出を伴わないため Err は無く、counter/KVS 系の失敗はすべて
+/// `Unavailable`（persist 失敗含む — counter ストアの書込不能は store 問題）。
+pub async fn bump(ctx: &GroupCtx) -> BumpOutcome {
+    let mut slot = ctx.sender.lock().await;
+    if let Err(reason) = init_sender(ctx, &mut slot) {
+        return BumpOutcome::Unavailable(reason);
+    }
+    match slot.as_mut().expect("built above").bump_counter() {
+        Ok((from, to)) => {
+            tracing::info!(from, to, "group counter bumped (native)");
+            BumpOutcome::Bumped { from, to }
+        }
+        Err(e) => BumpOutcome::Unavailable(format!("group counter store: {e}")),
     }
 }
 
@@ -212,5 +234,65 @@ mod tests {
              datagram (lo excluded — it lacks IFF_MULTICAST on Linux); \
              tried: {tried:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn group_bump_initializes_lazily_and_jumps_forward() {
+        let dir = std::env::temp_dir().join(format!("mat-native-bump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+        let counter_path = dir.join("native_group_counter");
+        let _ = std::fs::remove_file(&counter_path);
+        let transport = Arc::new(UdpTransport::bind().await.unwrap());
+        let ctx = GroupCtx {
+            main_ini: ini.clone(),
+            counter_path,
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            scope_id: 1, // lo — 送信しないので join 可否は無関係
+            dest_port: 5540,
+            transport,
+            sender: Mutex::new(None),
+        };
+        let r = bump(&ctx).await;
+        let BumpOutcome::Bumped { from, to } = r else {
+            panic!("expected Bumped, got Unavailable");
+        };
+        // lazy init 直後: next = start, ceiling = start + EPOCH →
+        // from = start, to = start + 2*EPOCH。
+        assert_eq!(to, from + 2 * mat_controller::group::COUNTER_EPOCH);
+        // 2 回目は単調に先へ。
+        let BumpOutcome::Bumped { from: f2, to: t2 } = bump(&ctx).await else {
+            panic!("second bump");
+        };
+        assert_eq!(f2, to);
+        assert!(t2 > to);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn group_bump_without_gdc_is_unavailable() {
+        // g/gdc 無し ini → send() と同じ Unavailable 理由で拒否。
+        let dir =
+            std::env::temp_dir().join(format!("mat-native-bump-nogdc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let transport = Arc::new(UdpTransport::bind().await.unwrap());
+        let ctx = GroupCtx {
+            main_ini: ini,
+            counter_path: dir.join("native_group_counter"),
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            scope_id: 1,
+            dest_port: 5540,
+            transport,
+            sender: Mutex::new(None),
+        };
+        assert!(matches!(bump(&ctx).await, BumpOutcome::Unavailable(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
