@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -31,6 +32,40 @@ pub(crate) use mat_native::test_support;
 /// per-node の warm session slot。`None` = 未確立 or 破棄済み（次回確立）。
 /// 外側 `Arc` を短時間の外側ロック下で clone し、往復は内側 `Mutex` で直列化する。
 type NodeSlot = Arc<Mutex<Option<Box<dyn NodeConn>>>>;
+
+/// Timeout 腕の再確立+再送に最低限必要な残り予算。warm-cache の mDNS 解決 +
+/// CASE 往復（典型 ~1s）+ MRP 一巡（`mat_controller::exchange::total_budget`
+/// 既定 ≈ 4.74s、`worst_case_send_budget` ≈ 14.74s の内数）+ 応答余裕。
+/// これ未満なら再送が成功しても呼び出し側の予算内に応答を返せない
+/// （Issue #16: 「1 回だけ再確立して再送」が構造的に無駄だった側）。
+pub(crate) const RETRY_MIN_BUDGET: Duration = Duration::from_secs(10);
+
+/// deadline までの残り。None = 無制限。既に過ぎていれば ZERO。
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(Instant::now()))
+}
+
+/// future を残り予算で包む。予算超過はフェーズと経過 ms 入りの Timeout。
+async fn bounded<T>(
+    deadline: Option<Instant>,
+    started: Instant,
+    phase: &str,
+    fut: impl std::future::Future<Output = Result<T, MatError>>,
+) -> Result<T, MatError> {
+    match remaining(deadline) {
+        None => fut.await,
+        Some(rem) => match tokio::time::timeout(rem, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(MatError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "op deadline exceeded after {}ms in {phase}",
+                    started.elapsed().as_millis()
+                ),
+            )),
+        },
+    }
+}
 
 /// warm CASE セッションを per-node に保持する native バックエンド。
 /// エンジン（確立・group 送信）は mat-native と共有し、warm 保持だけが matd の責務。
@@ -121,7 +156,19 @@ impl NativeBackend {
     /// DeviceRejected / ParseError（コマンドは届き session は健全）は slot 維持で即 Err。
     /// それ以外（Other/Unreachable 等 = session 致命の疑い）は再送せず slot を捨てて
     /// 次コマンドでの遅延再確立に委ねる（死んだ session の持ち越しによる恒久 wedge 防止）。
-    async fn with_session<F, T>(&self, node_id: u64, op: F) -> Result<T, MatError>
+    ///
+    /// `deadline`（Issue #16）: `Some` なら establish/send の各フェーズを残り
+    /// 予算で打ち切る（超過は `ErrorKind::Timeout` + フェーズ名 + 経過 ms 入りの
+    /// detail）。フェーズ超過は MRP 尽きと同様に slot を破棄する。ただし
+    /// 再確立+再送は残り予算が [`RETRY_MIN_BUDGET`] 以上のときだけ行う —
+    /// 満たない場合は Timeout をそのまま返し、再確立は撃たない（無駄な
+    /// リトライで応答が確実に遅延超過するのを防ぐ）。`None` = 無制限（従来どおり）。
+    async fn with_session<F, T>(
+        &self,
+        node_id: u64,
+        deadline: Option<Instant>,
+        op: F,
+    ) -> Result<T, MatError>
     where
         F: for<'a> Fn(
             &'a mut Box<dyn NodeConn>,
@@ -129,6 +176,7 @@ impl NativeBackend {
             Box<dyn std::future::Future<Output = Result<T, MatError>> + Send + 'a>,
         >,
     {
+        let started = Instant::now();
         let slot = self.slot(node_id).await;
         let mut guard = slot.lock().await;
         if guard.is_none() {
@@ -137,20 +185,69 @@ impl NativeBackend {
             // 伸びる原因）。再確立側は下の Timeout / その他エラー腕で既に
             // info を出しているので、これで確立の両側が揃う。
             tracing::info!(node_id, "no warm session; establishing");
-            *guard = Some(self.engine.establisher.establish(node_id).await?);
+            *guard = Some(
+                bounded(
+                    deadline,
+                    started,
+                    "establish",
+                    self.engine.establisher.establish(node_id),
+                )
+                .await?,
+            );
         }
-        let result = op(guard.as_mut().expect("established above")).await;
+        let result = bounded(
+            deadline,
+            started,
+            "send",
+            op(guard.as_mut().expect("established above")),
+        )
+        .await;
         match result {
             Ok(v) => Ok(v),
             Err(e) if e.kind == ErrorKind::Timeout => {
-                // MRP 再送尽き=未達の可能性大。捨てて1回だけ再確立→再送。
+                // MRP 再送尽き or deadline 超過=未達の可能性大。どちらも session
+                // は持ち越さない。
+                *guard = None;
+                // 残り予算が RETRY_MIN_BUDGET 未満なら再確立を撃たない（Issue #16:
+                // 呼び出し側の予算内に応答できない再送は最初から無駄）。
+                if let Some(rem) = remaining(deadline) {
+                    if rem < RETRY_MIN_BUDGET {
+                        tracing::info!(
+                            node_id,
+                            remaining_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX),
+                            "skipping re-establish; insufficient budget"
+                        );
+                        return Err(e);
+                    }
+                }
                 tracing::info!(
                     node_id,
                     "native session send timed out; re-establishing once"
                 );
-                *guard = None;
-                *guard = Some(self.engine.establisher.establish(node_id).await?);
-                op(guard.as_mut().expect("re-established")).await
+                *guard = Some(
+                    bounded(
+                        deadline,
+                        started,
+                        "resend-establish",
+                        self.engine.establisher.establish(node_id),
+                    )
+                    .await?,
+                );
+                let retried = bounded(
+                    deadline,
+                    started,
+                    "resend",
+                    op(guard.as_mut().expect("re-established")),
+                )
+                .await;
+                if let Err(e2) = &retried {
+                    // 再送側も slot 衛生を揃える: session 健全なエラー
+                    // （DeviceRejected/ParseError）以外は持ち越さない。
+                    if !matches!(e2.kind, ErrorKind::DeviceRejected | ErrorKind::ParseError) {
+                        *guard = None;
+                    }
+                }
+                retried
             }
             // DeviceRejected（IM status 拒否=届いて処理された、session 健全）と
             // ParseError（値デコード問題、session 健全）は slot 維持で即 Err。
@@ -171,19 +268,35 @@ impl NativeBackend {
         }
     }
 
-    pub async fn read_onoff(&self, node_id: u64, endpoint: u16) -> Result<bool, MatError> {
-        self.with_session(node_id, |c| c.read_onoff(endpoint)).await
+    pub async fn read_onoff(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        deadline: Option<Instant>,
+    ) -> Result<bool, MatError> {
+        self.with_session(node_id, deadline, |c| c.read_onoff(endpoint))
+            .await
     }
 
-    pub async fn on(&self, node_id: u64, endpoint: u16) -> Result<(), MatError> {
-        self.with_session(node_id, |c| {
+    pub async fn on(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        deadline: Option<Instant>,
+    ) -> Result<(), MatError> {
+        self.with_session(node_id, deadline, |c| {
             c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None, false)
         })
         .await
     }
 
-    pub async fn off(&self, node_id: u64, endpoint: u16) -> Result<(), MatError> {
-        self.with_session(node_id, |c| {
+    pub async fn off(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        deadline: Option<Instant>,
+    ) -> Result<(), MatError> {
+        self.with_session(node_id, deadline, |c| {
             c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None, false)
         })
         .await
@@ -196,10 +309,11 @@ impl NativeBackend {
         hue_raw: u8,
         saturation_raw: u8,
         transition: u16,
+        deadline: Option<Instant>,
     ) -> Result<(), MatError> {
         let fields =
             im::encode_move_to_hue_and_saturation_fields(hue_raw, saturation_raw, transition);
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, deadline, move |c| {
             c.invoke(
                 endpoint,
                 CLUSTER_COLOR_CONTROL,
@@ -217,9 +331,10 @@ impl NativeBackend {
         endpoint: u16,
         mireds: u16,
         transition: u16,
+        deadline: Option<Instant>,
     ) -> Result<(), MatError> {
         let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, deadline, move |c| {
             c.invoke(
                 endpoint,
                 CLUSTER_COLOR_CONTROL,
@@ -237,9 +352,10 @@ impl NativeBackend {
         endpoint: u16,
         level: u8,
         transition: u16,
+        deadline: Option<Instant>,
     ) -> Result<(), MatError> {
         let fields = im::encode_move_to_level_fields(level, transition);
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, deadline, move |c| {
             c.invoke(
                 endpoint,
                 CLUSTER_LEVEL_CONTROL,
@@ -258,12 +374,16 @@ impl NativeBackend {
         endpoint: u16,
         cluster: u32,
         attribute: u32,
+        deadline: Option<Instant>,
     ) -> Result<serde_json::Value, MatError> {
-        self.with_session(node_id, move |c| c.read_json(endpoint, cluster, attribute))
-            .await
+        self.with_session(node_id, deadline, move |c| {
+            c.read_json(endpoint, cluster, attribute)
+        })
+        .await
     }
 
     /// 単一属性へ 1 個の TLV 要素を書き込む（汎用 write、M8a Task10）。
+    #[allow(clippy::too_many_arguments)] // deadline（Issue #16）追加で 7→8。分割は可読性を落とすだけ。
     pub async fn write_tlv(
         &self,
         node_id: u64,
@@ -272,14 +392,16 @@ impl NativeBackend {
         attribute: u32,
         data_tlv: Vec<u8>,
         timed: bool,
+        deadline: Option<Instant>,
     ) -> Result<(), MatError> {
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, deadline, move |c| {
             c.write_tlv(endpoint, cluster, attribute, data_tlv.clone(), timed)
         })
         .await
     }
 
     /// 任意のクラスタコマンドを実行する（汎用 invoke、M8a Task10）。
+    #[allow(clippy::too_many_arguments)] // deadline（Issue #16）追加で 7→8。分割は可読性を落とすだけ。
     pub async fn invoke_generic(
         &self,
         node_id: u64,
@@ -288,17 +410,24 @@ impl NativeBackend {
         command: u32,
         fields: Option<Vec<u8>>,
         timed: bool,
+        deadline: Option<Instant>,
     ) -> Result<(), MatError> {
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, deadline, move |c| {
             c.invoke(endpoint, cluster, command, fields.clone(), timed)
         })
         .await
     }
 
     /// ノードを introspect する（`mat describe` 相当、M8a Task10）。
-    pub async fn describe(&self, node_id: u64) -> Result<Vec<(u16, Vec<u64>)>, MatError> {
-        self.with_session(node_id, |c| Box::pin(mat_native::ops::describe(c.as_mut())))
-            .await
+    pub async fn describe(
+        &self,
+        node_id: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<(u16, Vec<u64>)>, MatError> {
+        self.with_session(node_id, deadline, |c| {
+            Box::pin(mat_native::ops::describe(c.as_mut()))
+        })
+        .await
     }
 
     /// group provision のデバイス側 4 ステップを 1 ノードへ実行する
@@ -310,13 +439,16 @@ impl NativeBackend {
     /// （closure 環境への参照は self の匿名生存期間に縛られ 'a と無関係なため
     /// コンパイルが通らない）。値を async ブロックへ move すれば Future 自身が
     /// 所有するため 'a のみで閉じる。
+    ///
+    /// provision は deadline 対象外（spec）— 内部で `with_session(.., None, ..)`
+    /// を渡し、常に無制限予算で実行する。
     pub async fn provision_node(
         &self,
         node_id: u64,
         p: &mat_native::ops::ProvisionNodeParams,
     ) -> Result<(), MatError> {
         let p = p.clone();
-        self.with_session(node_id, move |c| {
+        self.with_session(node_id, None, move |c| {
             let p = p.clone();
             Box::pin(async move { mat_native::ops::provision_node(c.as_mut(), &p).await })
         })
@@ -370,6 +502,90 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn deadline_cuts_send_and_drops_slot() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            conn_delay: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        let deadline = Some(Instant::now() + Duration::from_millis(50));
+        let err = backend
+            .read_onoff(0x1234, 1, deadline)
+            .await
+            .expect_err("deadline must cut the slow send");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(err.detail.contains("in send"), "detail: {}", err.detail);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // slot は破棄済み: 無制限の次 op は再確立してから成功する。
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn deadline_cuts_establish_phase() {
+        let est = FakeEstablisher {
+            establish_delay: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        let deadline = Some(Instant::now() + Duration::from_millis(50));
+        let err = backend
+            .read_onoff(0x1234, 1, deadline)
+            .await
+            .expect_err("deadline must cut the slow establish");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(
+            err.detail.contains("in establish"),
+            "detail: {}",
+            err.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_budget_skips_re_establish() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        // fake の失敗は即時なので、残り予算 ≈ 5s < RETRY_MIN_BUDGET(10s)。
+        let deadline = Some(Instant::now() + Duration::from_secs(5));
+        let err = backend
+            .read_onoff(0x1234, 1, deadline)
+            .await
+            .expect_err("timeout must surface when retry is skipped");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        // 再確立していない: establish は初回の 1 回だけ。
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // slot は破棄済み（MRP 尽きの session は持ち越さない）。
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sufficient_budget_still_re_establishes() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        // 残り予算 ≈ 60s ≥ RETRY_MIN_BUDGET → 従来どおり再確立+再送。
+        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        let v = backend.read_onoff(0x1234, 1, deadline).await.unwrap();
+        assert!(v);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn reuses_warm_session_for_same_node() {
@@ -381,8 +597,8 @@ mod tests {
             ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
-        backend.read_onoff(0x1234, 1).await.unwrap();
-        backend.read_onoff(0x1234, 1).await.unwrap();
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
         // 2 回のコマンドで establish は 1 回だけ（warm 再利用）。
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -398,7 +614,7 @@ mod tests {
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が Timeout → slot 破棄 → 再確立 → 再送成功。
-        let v = backend.read_onoff(0x1234, 1).await.unwrap();
+        let v = backend.read_onoff(0x1234, 1, None).await.unwrap();
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -416,7 +632,7 @@ mod tests {
         // 1 回目の send が DeviceRejected（コマンドは届いている）→ 再確立せず
         // そのままエラーを返す契約 (3)。
         let err = backend
-            .read_onoff(0x1234, 1)
+            .read_onoff(0x1234, 1, None)
             .await
             .expect_err("device rejected must surface as an error");
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
@@ -424,7 +640,7 @@ mod tests {
         // slot は破棄されず維持される: 同ノードへの 2 回目のコマンドは warm 再利用で
         // 成功し、establish は 1 のまま（session 健全なので捨てない）。
         let v = backend
-            .read_onoff(0x1234, 1)
+            .read_onoff(0x1234, 1, None)
             .await
             .expect("warm session must be reused after device_rejected");
         assert!(v);
@@ -444,14 +660,14 @@ mod tests {
         // 1 回目の send が session 致命エラー（Other=復号失敗/counter desync 等）。
         // (a) エラー kind は Other、(b) 再送しない → establish は 1 回のみ。
         let err = backend
-            .read_onoff(0x1234, 1)
+            .read_onoff(0x1234, 1, None)
             .await
             .expect_err("session-fatal error must surface");
         assert_eq!(err.kind, ErrorKind::Other);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // (c) 死んだ session は破棄済み → 2 回目のコマンドで再確立して成功。
         let v = backend
-            .read_onoff(0x1234, 1)
+            .read_onoff(0x1234, 1, None)
             .await
             .expect("session must be lazily re-established after fatal error");
         assert!(v);

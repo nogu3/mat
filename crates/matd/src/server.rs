@@ -804,13 +804,13 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
     }
     match op {
         Op::On { node_id, endpoint } => {
-            native.on(*node_id, *endpoint).await?;
+            native.on(*node_id, *endpoint, None).await?;
             Ok(mat_core::body::invoke_success(
                 *node_id, *endpoint, "onoff", "on",
             ))
         }
         Op::Off { node_id, endpoint } => {
-            native.off(*node_id, *endpoint).await?;
+            native.off(*node_id, *endpoint, None).await?;
             Ok(mat_core::body::invoke_success(
                 *node_id, *endpoint, "onoff", "off",
             ))
@@ -827,7 +827,14 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .color(*node_id, *endpoint, *hue_raw, *saturation_raw, *transition)
+                .color(
+                    *node_id,
+                    *endpoint,
+                    *hue_raw,
+                    *saturation_raw,
+                    *transition,
+                    None,
+                )
                 .await?;
             let color = mat_core::color::ResolvedColor {
                 hue_raw: *hue_raw,
@@ -852,7 +859,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .color_temp(*node_id, *endpoint, *mireds, *transition)
+                .color_temp(*node_id, *endpoint, *mireds, *transition, None)
                 .await?;
             Ok(mat_core::body::color_temp_success(
                 *node_id,
@@ -870,7 +877,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             transition,
         } => {
             native
-                .level(*node_id, *endpoint, *level, *transition)
+                .level(*node_id, *endpoint, *level, *transition, None)
                 .await?;
             Ok(mat_core::body::level_success(
                 *node_id,
@@ -889,7 +896,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             attribute,
         } => {
             if cluster == "onoff" && attribute == "on-off" {
-                let v = native.read_onoff(*node_id, *endpoint).await?;
+                let v = native.read_onoff(*node_id, *endpoint, None).await?;
                 Ok(mat_core::body::read_success(
                     *node_id,
                     *endpoint,
@@ -912,7 +919,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                         ))
                     })?;
                 let v = native
-                    .read_json(*node_id, *endpoint, cluster_id, attr.id)
+                    .read_json(*node_id, *endpoint, cluster_id, attr.id, None)
                     .await?;
                 Ok(mat_core::body::read_success(
                     *node_id, *endpoint, cluster, attribute, v,
@@ -944,6 +951,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                         attr_id,
                         mat_native::scalar_to_tlv(&scalar),
                         timed,
+                        None,
                     )
                     .await?;
                 Ok(mat_core::body::write_success(
@@ -974,7 +982,9 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
                     Some(mat_native::encode_command_fields(&fields))
                 };
                 native
-                    .invoke_generic(*node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed)
+                    .invoke_generic(
+                        *node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed, None,
+                    )
                     .await?;
                 Ok(mat_core::body::invoke_success(
                     *node_id, *endpoint, cluster, command,
@@ -982,7 +992,7 @@ async fn native_op(op: &Op, native: &NativeBackend, store_path: &Path) -> Result
             }
         },
         Op::Describe { node_id } => {
-            let endpoints = native.describe(*node_id).await?;
+            let endpoints = native.describe(*node_id, None).await?;
             Ok(mat_core::body::describe_success(*node_id, &endpoints))
         }
         _ => Err(MatError::parse_error(
