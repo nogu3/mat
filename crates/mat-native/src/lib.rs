@@ -768,6 +768,12 @@ mod tests {
     }
 
     #[test]
+    fn cache_miss_timeout_is_pinned() {
+        // Issue #16: op 予算設計（最悪 45〜60s の導出成分）の釘打ち。
+        assert_eq!(CACHE_MISS_TIMEOUT.as_secs(), 35);
+    }
+
+    #[test]
     fn map_session_err_maps_malformed_message_to_parse_error() {
         // v1 品質修正 4: ピアの壊れた応答（Message 層のパース失敗）は「応答は来た
         // が解釈不能」= `parse_error`。旧実装は catch-all で `other` に落ちていた。
