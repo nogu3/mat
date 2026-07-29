@@ -211,6 +211,8 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                         .map(|n| book.resolve_node(n).map(NodeRef::Id))
                         .collect::<Result<Vec<_>, _>>()?,
                 },
+                // 引数なし（group 指定すら無い）— alias 解決対象が無い。
+                GroupCommand::Bump => GroupCommand::Bump,
                 GroupCommand::ColorTemp {
                     group_id,
                     kelvin,

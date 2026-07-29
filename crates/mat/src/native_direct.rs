@@ -118,6 +118,10 @@ pub(crate) enum NativeOp {
         group_id: u16,
         node_ids: Vec<u64>,
     },
+    /// `mat group bump`（Issue #14 応急）: group 送信 counter を窓ジャンプする
+    /// だけで groupcast 送出は伴わない。matd 稼働中は counter ストアの flock
+    /// が WouldBlock になり `store_parse`（matd と直経路の同時 bump 衝突防止）。
+    GroupBump,
     ReadAttr {
         node_id: u64,
         endpoint: u16,
@@ -379,6 +383,10 @@ fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
                 node_ids: resolved_nodes?,
             }
         }
+        // bump（Issue #14 応急）: 引数無し、常に native 対象。
+        Command::Group {
+            action: GroupCommand::Bump,
+        } => NativeOp::GroupBump,
         // describe / diag thread / open-window（M8a Task8）: 値の符号化を
         // 伴わない読み取り専用 op なので、classify_strict と違い常に
         // Some/None（Err にはならない）。
@@ -683,7 +691,8 @@ fn execute(op: &NativeOp, store_path: &Path, cfg: &Config) -> Result<(), MatErro
         | NativeOp::GroupColor { .. }
         | NativeOp::GroupColorTemp { .. }
         | NativeOp::GroupLevel { .. }
-        | NativeOp::GroupInvokeGeneric { .. } => None,
+        | NativeOp::GroupInvokeGeneric { .. }
+        | NativeOp::GroupBump => None,
         // provision / grant は複数ノード宛（`node_id: Option<u64>` に収まらない）
         // ので、ここで別途 require_node する（chip-tool 経路の `provision`/
         // `grant` と同じ「1つでも未 commission なら exit 11」）。
@@ -1008,6 +1017,21 @@ async fn op_group_invoke_generic(
     Ok(())
 }
 
+async fn op_group_bump(engine: &Engine) -> Result<(), MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(group_ctx_unconfigured_error());
+    };
+    match mat_native::group::bump(ctx).await {
+        mat_native::group::BumpOutcome::Bumped { from, to } => {
+            crate::commands::group::emit_bump(from, to);
+            Ok(())
+        }
+        mat_native::group::BumpOutcome::Unavailable(reason) => {
+            Err(group_unavailable_error(&reason))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn op_group_provision(
     engine: &Engine,
@@ -1311,6 +1335,7 @@ async fn run_op(engine: &Engine, op: &NativeOp) -> Result<(), MatError> {
         NativeOp::GroupGrant { group_id, node_ids } => {
             op_group_grant(engine, *group_id, node_ids).await
         }
+        NativeOp::GroupBump => op_group_bump(engine).await,
         NativeOp::ReadAttr {
             node_id,
             endpoint,
@@ -1725,6 +1750,15 @@ mod tests {
     }
 
     #[test]
+    fn classify_group_bump() {
+        use crate::cli::GroupCommand;
+        let cmd = Command::Group {
+            action: GroupCommand::Bump,
+        };
+        assert!(matches!(classify(&cmd), Some(Ok(NativeOp::GroupBump))));
+    }
+
+    #[test]
     fn group_color_and_color_temp_shapes_are_always_native() {
         use crate::cli::{ColorSpecArgs, GroupCommand};
         use mat_core::alias::GroupRef;
@@ -1784,6 +1818,56 @@ mod tests {
         .await
         .expect_err("group ctx unconfigured must hard-error");
         assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn group_bump_advances_counter_via_engine() {
+        // 直経路の group bump 実行（Issue #14）: stdout emit の中身は検証不能
+        // （emit は unit を返す）でも、Ok(()) と counter ファイルの前進は検証できる。
+        use mat_controller::transport::UdpTransport;
+        use mat_native::group::GroupCtx;
+        use mat_native::test_support::{write_group_fixture_ini, FakeEstablisher};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mat-native-direct-bump-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+        let counter_path = dir.join("native_group_counter");
+        let _ = std::fs::remove_file(&counter_path);
+        let transport = Arc::new(UdpTransport::bind().await.unwrap());
+        let group_ctx = GroupCtx {
+            main_ini: ini,
+            counter_path: counter_path.clone(),
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            scope_id: 1, // lo — bump は送信しないので join 可否は無関係
+            dest_port: 5540,
+            transport,
+            sender: Mutex::new(None),
+        };
+        let engine =
+            mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), Some(group_ctx));
+
+        assert!(!counter_path.exists(), "counter file must not pre-exist");
+        run_op(&engine, &NativeOp::GroupBump)
+            .await
+            .expect("group bump must succeed when group ctx is configured");
+        assert!(
+            counter_path.exists(),
+            "counter file must be created/advanced by bump"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

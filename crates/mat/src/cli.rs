@@ -539,6 +539,12 @@ pub enum GroupCommand {
         #[arg(long = "nodes", required = true, num_args = 1..)]
         node_ids: Vec<NodeRef>,
     },
+
+    /// group 送信 counter を「matd 再起動 1 回相当」前方ジャンプする応急
+    /// コマンド（Issue #14）。受信側のリプレイ窓が送信系列より先行して
+    /// groupcast が黙って捨てられる状態を、matd 再起動なし・常駐購読を
+    /// 落とさずに回復する。counter は fabric 全体で 1 本 — group 指定は無い。
+    Bump,
 }
 
 /// `--transport` の受け口。`mat-native` は clap に依存しないため、CLI 側に
