@@ -740,6 +740,27 @@ Outputs:
   existing group; `grant` runs just the ACL step instead. It is direct path
   only (`--matd` exits 2).
 
+### `mat group bump` — jump the group counter window (first aid)
+
+If some devices silently drop groupcast (unicast fine, group settings
+identical to a working peer), their replay window may have run ahead of the
+controller's send counter. `mat group bump` jumps the counter forward by one
+matd-restart-equivalent window — the same remedy a matd restart applied,
+without dropping warm sessions or resident subscriptions.
+
+```bash
+mat group bump
+```
+
+```json
+{"timestamp":"...","group_counter":{"from":176561405,"to":176569504}}
+```
+
+The counter is fabric-global (one series for all groups), so there is no
+`--group` argument. Routed like other group ops: via matd when one is
+running, else directly (a direct run while matd holds the counter lock
+fails with `store_parse` — use the matd route).
+
 Color / brightness shortcuts for groups (same conversions as the single-node
 `mat color-temp` / `mat color` / `mat level`, delivered as an unacknowledged
 groupcast — the result is `"status": "sent"` only; per-device delivery is not
@@ -828,8 +849,8 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
 - Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
   `color-temp` / `color` / `level` / `describe` / `group` (`provision` /
-  `invoke` / `color-temp` / `color` / `level`; `group grant` is direct only —
-  see Groupcast above). `discover` / `commission` / `fabric init` /
+  `invoke` / `color-temp` / `color` / `level` / `bump`; `group grant` is
+  direct only — see Groupcast above). `discover` / `commission` / `fabric init` /
   `open-window` / `diag` are direct-only: auto-detection skips them silently;
   explicit `--matd` exits `2`. `listen` (below) is the opposite case — it is
   **matd-only**, with no direct-path fallback at all (not even auto-detect
