@@ -20,6 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -27,6 +28,23 @@ use crate::cli::{Command, GroupCommand};
 use mat_core::alias::NodeRef;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::socket::default_socket_candidates;
+
+/// matd の構造化エラーを待つ read timeout の余裕。matd は予算ちょうどで構造化
+/// timeout を返すので、こちらは予算 + slack まで待って必ず先に受け取る。
+/// slack を使い切る（= matd が予算内に応答しない）のは旧 matd か matd 停止。
+const CLIENT_SLACK: Duration = Duration::from_secs(2);
+
+/// 単一ノード op（top-level に node_id を持つ op JSON）へ deadline_ms を付与し、
+/// 適用時の read timeout を返す。非対象 op は無変更・read timeout なし。
+/// 0 = 明示無制限（matd 既定 60s の適用を止める）— read timeout も掛けない。
+fn attach_deadline(op: &mut Value, op_timeout_ms: u64) -> Option<Duration> {
+    let Value::Object(map) = op else { return None };
+    if !map.contains_key("node_id") {
+        return None;
+    }
+    map.insert("deadline_ms".into(), json!(op_timeout_ms));
+    (op_timeout_ms > 0).then(|| Duration::from_millis(op_timeout_ms) + CLIENT_SLACK)
+}
 
 /// mat の実行経路。`resolve_route` が決める。socket は探索候補リスト
 /// （明示指定は 1 本、既定は subdir 新既定 → flat 旧既定の順で connect 試行）。
@@ -95,8 +113,8 @@ fn is_falsy(v: &OsStr) -> bool {
 }
 
 /// `--matd` 指定時のディスパッチ。非対応サブコマンドは CLI 利用の誤り（exit 2）。
-pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
-    let op = match to_op(command) {
+pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> ExitCode {
+    let mut op = match to_op(command) {
         Ok(op) => op,
         // 非対応 op は CLI 利用誤り。kind=other(exit_code()=1) だが exit 2 を
         // 返すのは「2 = CLI 引数エラー」の documented シグナルを保つ意図的な
@@ -121,7 +139,8 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
-    match exchange_on_stream(stream, &op) {
+    let read_timeout = attach_deadline(&mut op, op_timeout_ms);
+    match exchange_on_stream(stream, &op, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {
             e.emit();
@@ -136,9 +155,13 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command) -> ExitCode {
 /// connect した stream をそのまま本リクエストに使う（probe 後の再接続はしない）ので、
 /// フォールバックが起きるのは 1 バイトも送る前だけ。接続後のエラーは matd 経路の
 /// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
-pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode> {
+pub fn dispatch_auto(
+    sockets: &[PathBuf],
+    command: &Command,
+    op_timeout_ms: u64,
+) -> Option<ExitCode> {
     // matd 非対応 op（discover / commission / open-window / diag）は probe せず直経路。
-    let op = match to_op(command) {
+    let mut op = match to_op(command) {
         Ok(op) => op,
         Err(ToOpError::Unsupported(_)) => return None,
         // 実エラーは直経路でも同じ解決関数が同じエラーで失敗する（決定的）。
@@ -161,7 +184,8 @@ pub fn dispatch_auto(sockets: &[PathBuf], command: &Command) -> Option<ExitCode>
     };
     tracing::info!(socket = %socket.display(), "using matd (auto-detected)");
 
-    Some(match exchange_on_stream(stream, &op) {
+    let read_timeout = attach_deadline(&mut op, op_timeout_ms);
+    Some(match exchange_on_stream(stream, &op, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {
             e.emit();
@@ -425,7 +449,11 @@ fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String
 /// v1 品質修正 3: 途中失敗を typed error 化。送受信の I/O 断・応答なし切断は
 /// 「matd がいなくなった」= `matd_unavailable`（送信後はリクエストが実行済みの
 /// 可能性があるので detail で明示）。応答が JSON でないのは `parse_error`。
-fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, MatError> {
+fn exchange_on_stream(
+    mut stream: UnixStream,
+    op: &Value,
+    read_timeout: Option<Duration>,
+) -> Result<Value, MatError> {
     let mut line = serde_json::to_vec(op)
         .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to encode request: {e}")))?;
     line.push(b'\n');
@@ -436,13 +464,29 @@ fn exchange_on_stream(mut stream: UnixStream, op: &Value) -> Result<Value, MatEr
         )
     })?;
 
+    if let Some(t) = read_timeout {
+        stream.set_read_timeout(Some(t)).map_err(|e| {
+            MatError::new(ErrorKind::Other, format!("failed to set read timeout: {e}"))
+        })?;
+    }
+
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
     let n = reader.read_line(&mut resp).map_err(|e| {
-        MatError::new(
-            ErrorKind::MatdUnavailable,
-            format!("failed to read response from matd: {e}; the request may have been executed"),
-        )
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            MatError::new(
+                ErrorKind::Timeout,
+                format!("no response from matd within the op budget: {e}; the request may have been executed"),
+            )
+        } else {
+            MatError::new(
+                ErrorKind::MatdUnavailable,
+                format!("failed to read response from matd: {e}; the request may have been executed"),
+            )
+        }
     })?;
     if n == 0 {
         return Err(MatError::new(
@@ -1038,7 +1082,7 @@ mod tests {
             drop(conn); // 1 行も返さず切断 → クライアント側は EOF
         });
         let stream = UnixStream::connect(&path).unwrap();
-        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" }), None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::MatdUnavailable);
         assert!(
             err.detail.contains("may have been executed"),
@@ -1064,8 +1108,56 @@ mod tests {
             conn.write_all(b"garbage\n").unwrap();
         });
         let stream = UnixStream::connect(&path).unwrap();
-        let err = exchange_on_stream(stream, &json!({ "op": "on" })).unwrap_err();
+        let err = exchange_on_stream(stream, &json!({ "op": "on" }), None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_deadline_only_for_single_node_ops() {
+        // 単一ノード op（top-level node_id あり）: deadline_ms が付き read timeout が返る。
+        let mut op =
+            json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"});
+        let rt = attach_deadline(&mut op, 15_000);
+        assert_eq!(op["deadline_ms"], json!(15_000));
+        assert_eq!(
+            rt,
+            Some(std::time::Duration::from_millis(15_000) + CLIENT_SLACK)
+        );
+
+        // 0 = 明示無制限: フィールドは付く（matd の既定 60s を止める）が read timeout なし。
+        let mut op = json!({"op":"on","node_id":3,"endpoint":1});
+        let rt = attach_deadline(&mut op, 0);
+        assert_eq!(op["deadline_ms"], json!(0));
+        assert_eq!(rt, None);
+
+        // group 系（node_id なし）: 無変更・read timeout なし。
+        let mut op = json!({"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","endpoint":1});
+        let rt = attach_deadline(&mut op, 15_000);
+        assert!(op.get("deadline_ms").is_none());
+        assert_eq!(rt, None);
+
+        // ping / group_bump も対象外。
+        let mut op = json!({"op":"ping"});
+        assert!(attach_deadline(&mut op, 15_000).is_none());
+        assert!(op.get("deadline_ms").is_none());
+    }
+
+    #[test]
+    fn exchange_read_timeout_maps_to_timeout_kind() {
+        // 応答しないサーバ相手に read timeout → ErrorKind::Timeout（exit 3）。
+        let (client, _server) = UnixStream::pair().unwrap();
+        let err = exchange_on_stream(
+            client,
+            &json!({"op":"ping"}),
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .expect_err("must time out");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(
+            err.detail.contains("may have been executed"),
+            "detail: {}",
+            err.detail
+        );
     }
 }

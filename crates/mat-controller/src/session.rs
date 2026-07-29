@@ -20,11 +20,14 @@ use crate::message::{
 };
 use crate::transport::{Transport, MAX_DATAGRAM};
 
-/// How long to wait for a ReportData/InvokeResponse/StatusResponse after the
-/// request's own reliable send already completed (i.e. the response didn't
-/// piggyback on the ack). Generous relative to MRP's own retry budget since
-/// the device may be doing real work (e.g. actuating a relay) before replying.
-const IM_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+/// ack に応答が piggyback しなかった場合の IM 応答待ち。op 予算設計の成分。
+pub const IM_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 単一 op 送信の最悪所要（MRP 再送総和 + IM 応答待ち ≈ 14.74s）。
+/// matd の呼び出し側予算（Issue #16）はこの値を前提に設計する。
+pub fn worst_case_send_budget() -> Duration {
+    crate::exchange::total_budget(&crate::exchange::MrpConfig::default()) + IM_RECV_TIMEOUT
+}
 
 /// チャンク読みの上限。実デバイスの wildcard read は数チャンクで収まる。
 /// 上限到達は「デバイスが more_chunks を返し続けている」異常で、打ち切って
@@ -3098,5 +3101,19 @@ mod tests {
             .unwrap();
         assert_eq!(rd.subscription_id, Some(12));
         dev.await.unwrap();
+    }
+
+    /// Issue #16: op 予算の設計根拠になる成分値を釘打ちする。上流の MRP/IM 既定値を
+    /// 変えるとここが割れ、matd の RETRY_MIN_BUDGET / mat の --op-timeout-ms 既定の
+    /// 再検討が強制される。
+    #[test]
+    fn budget_components_are_pinned() {
+        let mrp = crate::exchange::total_budget(&crate::exchange::MrpConfig::default());
+        // 300 + 480 + 768 + 1228.8 + 1966.08 = 4742.88ms（5 送信の間隔総和）
+        assert_eq!(mrp.as_millis(), 4742);
+        assert_eq!(IM_RECV_TIMEOUT.as_secs(), 10);
+        // 単一 op 送信の最悪 = MRP 総和 + IM 応答待ち
+        assert_eq!(worst_case_send_budget().as_millis(), 14742);
+        assert_eq!(crate::case::RECV_TIMEOUT.as_secs(), 10);
     }
 }

@@ -64,6 +64,19 @@ pub struct Cli {
     )]
     pub issuer_index: u8,
 
+    /// 単一ノード op（read/write/invoke/on/off/color/color-temp/level/describe）
+    /// の予算 ms。matd 経路では deadline としてリクエストに載り、matd が予算内に
+    /// 構造化 timeout（exit 3）を返す。直経路では op 全体を同じ予算で打ち切る。
+    /// 0 = 無制限。`mat listen` の `--timeout-ms`（ストリーム受信予算）とは別物。
+    #[arg(
+        long = "op-timeout-ms",
+        global = true,
+        env = "MAT_OP_TIMEOUT_MS",
+        default_value_t = 60_000,
+        value_name = "MS"
+    )]
+    pub op_timeout_ms: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
