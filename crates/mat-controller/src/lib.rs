@@ -26,6 +26,9 @@ pub mod pase;
 pub mod session;
 pub mod setup_code;
 pub mod spake2p;
+#[cfg(feature = "test-responder")]
+#[doc(hidden)]
+pub mod test_support;
 pub mod tlv;
 pub mod transport;
 pub mod x509;
