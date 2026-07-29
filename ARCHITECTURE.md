@@ -276,6 +276,18 @@ This repo ships two binaries from one install:
   releasing the per-node session mutex immediately instead of waiting for the
   abandoned op to run to completion. Design:
   `docs/superpowers/specs/2026-07-29-op-deadline-budget-design.md`.
+- **Silence-probe extension removed (Issue #15 follow-through, 1.11.0).** The
+  1.6.0 silence probe doubled as a measurement: over 3 days of production
+  journal, ~90% of probes passed (the CASE session was alive at the silence
+  deadline) but device messages resumed after an extension in only 4/108
+  (later window: 0/18) — once a node is silent past max_interval + 30s it
+  stays silent (device-side silent discard, or keep-alive-less firmware),
+  while re-subscribing after teardown costs a median 9s (p90 34s, n=104). The
+  probe extension therefore only delayed dead-subscription detection 330s →
+  up to 990s and rescued nothing: `SubscribeConn::probe()` and the extension
+  cap are removed, silence deadline tears down immediately again, and raising
+  `SILENCE_SLACK` (the issue's original hypothesis) is rejected by the same
+  data. Design: `docs/superpowers/specs/2026-07-30-silence-probe-extension-removal-design.md`.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
@@ -988,8 +1000,9 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   keepalive 周期 ×1.5 の無音でしか効かない」ことが判明。3600s では盲目窓が
   最長 90 分になり核心機能が沈黙するため、300s（盲目窓 ≤7.5 分）へ短縮した —
   2026-07-21 fix spec）、`KeepSubscriptions = false`（matd 再購読時に古い購読を
-  掃除）。失敗・死亡（MaxInterval の 1.5 倍を超える無音）時は指数 backoff
-  （5s 開始、上限 5min）で再購読。リトライは debug ログ、確立/喪失の状態遷移
+  掃除）。失敗・死亡（max_interval + 30s の無音 deadline — 0.28.0 で
+  ×1.5 を置換）時は指数 backoff（5s 開始、上限 60s — 1.6.0 で 5min から
+  短縮、issue #15）で再購読。リトライは debug ログ、確立/喪失の状態遷移
   のみ info。
 - **イベント配信**: 各ノードの購読ポンプ → `tokio::sync::broadcast` → `mat
   listen` 接続ごとの購読者へフィルタ付きでファンアウト。遅い listener の lag
