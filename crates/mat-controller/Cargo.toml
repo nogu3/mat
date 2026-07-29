@@ -10,6 +10,9 @@ description = "From-scratch Matter controller library (Phase 5 backend)"
 # BLE commissioning (bluer は libdbus にリンクするため隔離。
 # 本番 mat/matd の musl クロスビルドはこの feature を使わない)
 ble = ["dep:bluer", "dep:futures-util"]
+# テスト専用 CASE 応答器（test_support モジュール）。プロダクションビルドには
+# 入れない — dev-dependencies 経由でテストビルドのみ有効化する。
+test-responder = []
 
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
@@ -31,6 +34,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 serde_json = { workspace = true }
 
 [dev-dependencies]
+mat-controller = { path = ".", features = ["test-responder"] }
 tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 tempfile = "3"
