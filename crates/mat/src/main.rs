@@ -113,9 +113,11 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD_SOCKET"),
         std::env::var_os("MAT_MATD"),
     ) {
-        matd_client::Route::Forced(sockets) => return matd_client::dispatch(&sockets, &command),
+        matd_client::Route::Forced(sockets) => {
+            return matd_client::dispatch(&sockets, &command, args.op_timeout_ms)
+        }
         matd_client::Route::Auto(sockets) => {
-            if let Some(code) = matd_client::dispatch_auto(&sockets, &command) {
+            if let Some(code) = matd_client::dispatch_auto(&sockets, &command, args.op_timeout_ms) {
                 return code;
             }
         }
