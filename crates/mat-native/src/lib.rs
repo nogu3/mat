@@ -365,12 +365,11 @@ impl Engine {
             transport: Arc::clone(&transport),
             sender: tokio::sync::Mutex::new(None),
         };
-        // CaseEstablisher (CASE 確立) は Arc<Transport> を取る一方、GroupCtx
-        // の multicast 送信は UdpTransport を直接使い続ける（M6b: BTP 対応の
-        // 土台。group 送信は unicast CASE と無関係なので Transport 化しない）。
+        // build が bind する共有 UdpTransport は group multicast 送信専用。
+        // op / 購読の unicast セッションはノードごとに専用ソケットを bind する
+        // （監査#3 / 購読 spec）。
         let establisher = CaseEstablisher {
             creds: Arc::new(creds),
-            transport: Arc::new(Transport::Udp(Arc::clone(&transport))),
             scope_id,
             resolver,
         };
@@ -392,10 +391,10 @@ impl Engine {
     }
 }
 
-/// 実確立器: 保持した資格情報で mDNS 解決 → CASE。
+/// 実確立器: 保持した資格情報で mDNS 解決 → CASE。op セッションのソケットは
+/// ノードごとに専用（監査#3）— 共有ソケットは group multicast 送信のみ。
 struct CaseEstablisher {
     creds: Arc<FabricCredentials>,
-    transport: Arc<Transport>,
     scope_id: u32,
     resolver: Arc<dyn Resolver>,
 }
@@ -403,6 +402,16 @@ struct CaseEstablisher {
 #[async_trait]
 impl Establisher for CaseEstablisher {
     async fn establish(&self, node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
+        // op 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を
+        // recv して screen で捨てる（監査#3）。購読側と同じ規律で
+        // ノードごとに専用 UdpTransport + 専用 CASE を確立する。
+        let transport = UdpTransport::bind()
+            .await
+            .map_err(|e| MatError::new(ErrorKind::Other, format!("native: bind op udp: {e}")))?;
+        // local port は実機切り分け（ss -uanp / tcpdump 突合)の鍵なので
+        // 確立ごとに可視化する（購読側の同名ログと対）。
+        let local = transport.local_addr().ok();
+        let transport = Arc::new(Transport::Udp(Arc::new(transport)));
         let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
         let resolved = self
             .resolver
@@ -413,16 +422,14 @@ impl Establisher for CaseEstablisher {
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
         let mut last: Option<MatError> = None;
         for peer in peers {
-            match case::establish(
-                Arc::clone(&self.transport),
-                peer,
-                &self.creds,
-                node_id,
-                &mrp,
-            )
-            .await
-            {
+            match case::establish(Arc::clone(&transport), peer, &self.creds, node_id, &mrp).await {
                 Ok(session) => {
+                    tracing::info!(
+                        node_id,
+                        local = %local.map(|a| a.to_string()).unwrap_or_default(),
+                        %peer,
+                        "op transport bound (dedicated socket + CASE)"
+                    );
                     return Ok(Box::new(SessionConn { session, mrp }));
                 }
                 Err(e) => {
@@ -1076,5 +1083,111 @@ mod tests {
         assert!(conn.probe().await.is_err());
         assert!(conn.probe().await.is_ok(), "失敗は注入した回数だけ");
         assert_eq!(est.probe_calls.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod dedicated_op_socket_tests {
+    use super::*;
+    use mat_controller::cert::MatterCert;
+    use mat_controller::kvs::SelfIssueMaterials;
+    use mat_controller::test_support as case_ts;
+    use mat_controller::transport::UdpTransport;
+    use std::net::Ipv6Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 呼び出し順に固定ポートを払い出す fake resolver。2 応答器が同一
+    /// fixture 識別（同一 node_id）なので、どちらの establish がどちらの
+    /// 応答器に着いても対称で問題ない。
+    struct FixedPortResolver {
+        ports: Vec<u16>,
+        next: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Resolver for FixedPortResolver {
+        async fn resolve(
+            &self,
+            _scope_id: u32,
+            _cfid: [u8; 8],
+            _node_id: u64,
+            _timeout: Duration,
+        ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError> {
+            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            Ok(dnssd::ResolvedNode {
+                port: self.ports[i],
+                addresses: vec![Ipv6Addr::LOCALHOST],
+                session_idle_interval_ms: Some(50),
+                session_active_interval_ms: Some(50),
+            })
+        }
+    }
+
+    /// 監査#3 の釘打ち: 異なるノードへの並行 op が互いの応答を吸わない。
+    /// ループバックに CASE 応答器を 2 つ立て、並行 establish + read が両方
+    /// 成功し、応答器の観測した initiator ソースポートが異なる（= ノード
+    /// ごとの専用ソケット）ことを assert する。共有ソケットに退行すると
+    /// ポートが一致して確実に落ちる。
+    #[tokio::test]
+    async fn concurrent_establishes_use_dedicated_sockets() {
+        let noc = MatterCert::parse(case_ts::NODE01_NOC).expect("parse fixture NOC");
+        let responder_node_id = noc.node_id().expect("node id");
+        let fabric_id = noc.fabric_id().expect("fabric id");
+        let op_priv: [u8; 32] = case_ts::NODE01_PRIV.try_into().unwrap();
+
+        // 応答器 2 つ（同一識別・別ポート）。
+        let mut handles = Vec::new();
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let t = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap();
+            ports.push(t.local_addr().unwrap().port());
+            handles.push(tokio::spawn(case_ts::responder_task(
+                t,
+                case_ts::INITIATOR_NODE_ID,
+                responder_node_id,
+                case_ts::NODE01_NOC.to_vec(),
+                case_ts::ICA01.to_vec(),
+                op_priv,
+                case_ts::ROOT01_CHIP.to_vec(),
+            )));
+        }
+
+        let materials = SelfIssueMaterials {
+            rcac: case_ts::ROOT01_CHIP.to_vec(),
+            root_private_key: case_ts::ROOT01_PRIV.try_into().unwrap(),
+            ipk_operational: case_ts::IPK,
+            node_id: case_ts::INITIATOR_NODE_ID,
+            fabric_id,
+        };
+        let creds = FabricCredentials::from_self_issued(materials).expect("creds");
+        let est = CaseEstablisher {
+            creds: Arc::new(creds),
+            scope_id: 0,
+            resolver: Arc::new(FixedPortResolver {
+                ports,
+                next: AtomicUsize::new(0),
+            }),
+        };
+
+        let (a, b) = tokio::join!(
+            est.establish(responder_node_id),
+            est.establish(responder_node_id)
+        );
+        let mut a = a.expect("establish 1");
+        let mut b = b.expect("establish 2");
+        let (ra, rb) = tokio::join!(a.read_onoff(1), b.read_onoff(1));
+        // 応答器は on-off=false を返す（clippy: bool_assert_comparison を避け assert! で）。
+        assert!(!ra.expect("read 1"));
+        assert!(!rb.expect("read 2"));
+
+        let sa = handles.pop().unwrap().await.expect("responder 2");
+        let sb = handles.pop().unwrap().await.expect("responder 1");
+        assert_ne!(
+            sa.port(),
+            sb.port(),
+            "op sockets must be dedicated per establish (audit #3)"
+        );
     }
 }
