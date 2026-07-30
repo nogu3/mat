@@ -92,9 +92,6 @@ pub enum Command {
 
     /// fabric への参加（初回 commission / multi-admin join 両対応）。
     Commission {
-        /// 対象の IP アドレスまたは DNS-SD ホスト名。
-        #[arg(long, value_name = "HOST")]
-        target: String,
         /// setup code（QR ペイロード `MT:...` または 11/21桁の manual code）。
         #[arg(long = "setup-code", value_name = "CODE")]
         setup_code: String,

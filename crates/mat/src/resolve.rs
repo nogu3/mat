@@ -22,7 +22,6 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
     Ok(match command {
         Command::Discover { probe } => Command::Discover { probe },
         Command::Commission {
-            target,
             setup_code,
             node_id,
             alias,
@@ -35,7 +34,6 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 book.validate_new_node_alias(name)?;
             }
             Command::Commission {
-                target,
                 setup_code,
                 node_id,
                 alias,

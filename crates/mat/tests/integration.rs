@@ -77,8 +77,6 @@ fn transport_ble_rejects_manual_code() {
     mat(store.path())
         .args([
             "commission",
-            "--target",
-            "192.0.2.10",
             "--setup-code",
             "34970112332",
             "--transport",
@@ -99,8 +97,6 @@ fn transport_rejects_unknown_value_and_lists_the_exact_choices() {
     mat(store.path())
         .args([
             "commission",
-            "--target",
-            "192.0.2.10",
             "--setup-code",
             "MT:Y.K9042C00KA0648G00",
             "--transport",
@@ -580,8 +576,6 @@ fn commission_with_duplicate_alias_exits_2_before_running() {
     mat(store.path())
         .args([
             "commission",
-            "--target",
-            "192.0.2.10",
             "--setup-code",
             "MT:FAKE",
             "--alias",
@@ -598,8 +592,6 @@ fn commission_with_all_digit_alias_exits_2() {
     mat(store.path())
         .args([
             "commission",
-            "--target",
-            "192.0.2.10",
             "--setup-code",
             "MT:FAKE",
             "--alias",
