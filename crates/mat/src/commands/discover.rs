@@ -9,7 +9,8 @@
 //! を持たなくなったため）。
 //! （M8b: 列挙(browse)ベースから切り替え — 実機の advertising proxy が一部ノードの
 //! PTR 列挙に応答しないため、CFID+NodeId 既知の対象を直接 resolve する）。
-//! 既定（`--probe` 無し）は台帳をそのまま出す高速経路で、出力は従来と完全に同一。
+//! 既定（`--probe` 無し）は台帳をそのまま出す高速経路で、node_id / commissioned_at のみ
+//! 出力し、1.13.0 より `address` は不出力（台帳が address を持たなくなったため）。
 //!
 //! commissionable 探索は認証情報不要のため、store 無しでも動く（無ければ空ストアを
 //! bootstrap し、commissioned は空配列になる）。
