@@ -164,6 +164,9 @@ fn weak_link(checks: &Checks) -> bool {
         .thread
         .as_ref()
         .is_some_and(|t| t.neighbor_count <= 1 || t.best_lqi.is_some_and(|l| l < LQI_WEAK));
+    // `diag node` の現行フローでは not-advertising 分岐時 checks.ip は常に
+    // 不在（Issue #18: advertised_any_fabric == false では ip チェックを走らせない）。
+    // この半分は将来 ip が埋まるケースへの備え。
     let ip_weak = checks.ip.as_ref().is_some_and(|i| i.loss_pct >= LOSS_WEAK);
     thread_weak || ip_weak
 }
@@ -225,9 +228,9 @@ pub fn derive_verdict(checks: &Checks) -> Verdict {
                     (None, None) => String::new(),
                 };
                 let summary = if detail.is_empty() {
-                    "IP reachable but not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.".to_string()
+                    "Not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.".to_string()
                 } else {
-                    format!("IP reachable but not advertising Matter on any fabric; weak Thread link ({detail}) — SRP registration likely incomplete.")
+                    format!("Not advertising Matter on any fabric; weak Thread link ({detail}) — SRP registration likely incomplete.")
                 };
                 return verdict(
                     VerdictKind::LinkStarved,
