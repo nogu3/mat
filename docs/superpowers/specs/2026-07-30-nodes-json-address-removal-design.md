@@ -97,7 +97,14 @@ ping6**。
   れば ip チェックは `unavailable`（kind は `no_address_in_store` に代えて
   `mdns_unresolved`）。
 - 効果: stale 値への ping6 誤診が構造的に消え、「いま広告されている実アドレス
-  の生存」を見るようになる。
+  の生存」を見るようになる。特に prefix ローテーション後の stale 値へ ping6
+  して健全ノードを `ip_unreachable` と誤診する現行の実害が消える。
+- トレードオフ（承知の上で採る）: 「広告ゼロだが IP は生きている」ケース
+  （SRP 未登録の弱リンク）では ping6 の宛先が無くなるため、thread 証跡が
+  無ければ verdict は `link_starved` でなく `not_advertised` に落ちる。
+  台帳値が偶然正しいときだけ成立していた区別であり、別ノードの address が
+  入っていれば逆に偽の `link_starved` を出す（Issue #18 の node 16 実測）。
+  信頼できない証拠に基づく区別は捨てる。
 
 ### 6. matd
 
@@ -108,7 +115,7 @@ node_id のみ使用）。テストフィクスチャの address フィールド
 
 - `write_atomic` の失敗（tmp 作成 / 書き込み / fsync / rename のいずれか）は
   ハードエラーで、呼び出し元の既存 kind（store 系は `Other`、alias は既存の
-  写像）のまま detail に段階を明記する。黙って劣化しない。
+  写像）のまま detail にパスと原因を明記する。黙って劣化しない。
 - `diag node --deep` で mDNS 解決に失敗した場合、ping6 は実施不能として
   `unavailable` に畳む（診断コマンドの部分失敗は JSON 内に畳む既存方針の
   踏襲）。
