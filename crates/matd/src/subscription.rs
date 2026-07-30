@@ -640,7 +640,15 @@ async fn run_subscription_once(
     prior_failures: u32,
 ) -> Result<String, mat_core::error::MatError> {
     let mut conn = backend.establish_subscription(node_id).await?;
-    let (info, priming) = conn.subscribe_wildcard(clusters).await?;
+    let (info, priming) = match conn.subscribe_wildcard(clusters).await {
+        Ok(v) => v,
+        Err(e) => {
+            // CASE は成立済み — 放置すると Issue #20 の黙殺経路になる
+            // （establish 自体の失敗はセッションが無いので close 不要、`?` のまま）。
+            conn.close().await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         node_id,
         subscription_id = info.subscription_id,
@@ -667,7 +675,9 @@ async fn run_subscription_once(
     // 確立以降デバイス発を 1 度でも受けたか（born-dead 判定）。
     let mut proven = false;
     let mut last_msg = tokio::time::Instant::now();
-    loop {
+    // pump 終了理由は loop の外まで持ち出して、末尾で必ず close してから返す
+    // （Issue #20: どの終了経路でも死んだセッションを放置しない）。
+    let reason = loop {
         if let Some(end) = pump_verdict(
             proven,
             last_msg.elapsed(),
@@ -683,10 +693,10 @@ async fn run_subscription_once(
                         since_op_s = since_op.as_secs(),
                         "report pump ended (op-correlated: no device message after op)"
                     );
-                    return Ok(format!(
+                    break format!(
                         "op-correlated: no device message {}s after op",
                         since_op.as_secs()
-                    ));
+                    );
                 }
                 PumpEnd::BornDeadSilence => {
                     tracing::info!(
@@ -694,10 +704,10 @@ async fn run_subscription_once(
                         silent_s = last_msg.elapsed().as_secs(),
                         "report pump ended (born-dead: no device message since establishment)"
                     );
-                    return Ok(format!(
+                    break format!(
                         "born-dead: no device message since establishment ({}s silent)",
                         last_msg.elapsed().as_secs()
-                    ));
+                    );
                 }
                 PumpEnd::Silence => {
                     tracing::info!(
@@ -705,10 +715,7 @@ async fn run_subscription_once(
                         silent_s = last_msg.elapsed().as_secs(),
                         "report pump ended (silence past deadline)"
                     );
-                    return Ok(format!(
-                        "silence past deadline ({}s)",
-                        last_msg.elapsed().as_secs()
-                    ));
+                    break format!("silence past deadline ({}s)", last_msg.elapsed().as_secs());
                 }
             }
         }
@@ -733,10 +740,12 @@ async fn run_subscription_once(
                 // 詳細を残す（直後に caller が「subscription lost」を出す）。
                 health.clear_pending(node_id);
                 tracing::info!(node_id, kind = ?e.kind, detail = %e.detail, "report pump ended");
-                return Ok(format!("pump ended: {}", e.detail));
+                break format!("pump ended: {}", e.detail);
             }
         }
-    }
+    };
+    conn.close().await;
+    Ok(reason)
 }
 
 #[cfg(test)]
@@ -1527,6 +1536,70 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(120),
             "deadline + backoff 5s の範囲で再購読すること: {elapsed:?}"
+        );
+    }
+
+    /// pump が無音 deadline で終わるとき close が呼ばれる（Issue #20）。
+    /// close を落とすとデバイスが死んだセッションを「最新」のまま保持し、
+    /// 以後の report をそこへ黙って再アンカーしてしまう。
+    #[tokio::test(start_paused = true)]
+    async fn pump_silence_end_closes_subscription_session() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let close_calls = Arc::clone(&est.sub_close_calls);
+        let (mut rx, _health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        // live キューへ何も入れない = born-dead のまま deadline 到達 → close。
+        let ev = tokio::time::timeout(Duration::from_secs(180), rx.recv())
+            .await
+            .expect("deadline 超過で再購読の priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "無音 deadline で終わった最初の購読セッションが close されていること"
+        );
+    }
+
+    /// subscribe_wildcard が失敗したとき（CASE は成立済み）も close される
+    /// （Issue #20）。establish_subscription 自体の失敗は CASE 未成立なので
+    /// close 不要 — この経路とは区別する。
+    #[tokio::test]
+    async fn subscribe_failure_closes_session() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher {
+            fail_wildcard: true,
+            ..Default::default()
+        };
+        let close_calls = Arc::clone(&est.sub_close_calls);
+        let health = Arc::new(SubHealth::new(None));
+        let (events, _rx) = broadcast::channel(4);
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let err = run_subscription_once(
+            5,
+            &native,
+            &events,
+            &[],
+            &health,
+            tokio::time::Instant::now(),
+            0,
+        )
+        .await
+        .expect_err("subscribe_wildcard 失敗は Err で伝播すること");
+        assert_eq!(err.kind, mat_core::error::ErrorKind::SessionFailed);
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "CASE 成立後の subscribe 失敗でも close されていること"
         );
     }
 

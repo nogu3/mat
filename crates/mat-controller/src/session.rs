@@ -16,7 +16,7 @@ use crate::crypto::{open_message, seal_message, CryptoError, OpenError};
 use crate::exchange::{IncomingMessage, MrpConfig};
 use crate::message::{
     Destination, MessageError, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK,
-    PROTOCOL_ID_SECURE_CHANNEL,
+    OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL,
 };
 use crate::transport::{Transport, MAX_DATAGRAM};
 
@@ -257,6 +257,32 @@ impl SecureSession {
         );
         self.transport.send_to(&datagram, self.peer).await?;
         Ok(())
+    }
+
+    /// CloseSession（StatusReport SUCCESS/secure channel/2）を best-effort で 1 発
+    /// 送る。放置セッションは FP300 系 FW の購読レポート付け替えで常駐購読を
+    /// 黙殺する（Issue #20）ため、セッションを手放す全経路がこれを呼ぶ。
+    /// MRP に乗せない（teardown を ~4.7s の再送予算でブロックしない —
+    /// pase.rs の abort StatusReport と同じ判断）。失敗は握りつぶす。
+    pub async fn send_close_session(&mut self) {
+        let payload = crate::case::encode_status_report(
+            0,
+            u32::from(PROTOCOL_ID_SECURE_CHANNEL),
+            crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION,
+        );
+        let sealed = self.seal(
+            Self::new_exchange_id(),
+            true,
+            PROTOCOL_ID_SECURE_CHANNEL,
+            OPCODE_STATUS_REPORT,
+            false,
+            None,
+            &payload,
+        );
+        if let Ok((datagram, _)) = sealed {
+            let _ = self.transport.send_to(&datagram, self.peer).await;
+            tracing::debug!(peer = %self.peer, "sent CloseSession");
+        }
     }
 
     /// Decrypts a datagram and screens it for the given exchange. Returns
@@ -3115,5 +3141,36 @@ mod tests {
         // 単一 op 送信の最悪 = MRP 総和 + IM 応答待ち
         assert_eq!(worst_case_send_budget().as_millis(), 14742);
         assert_eq!(crate::case::RECV_TIMEOUT.as_secs(), 10);
+    }
+
+    /// CloseSession は needs_ack なしの 1 データグラムで、payload が
+    /// StatusReport(SUCCESS, secure channel, CloseSession=2) であること（Issue #20）。
+    #[tokio::test]
+    async fn close_session_sends_single_best_effort_status_report() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        s.send_close_session().await;
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _) = device.recv_from(&mut buf).await.unwrap();
+        let (_, proto, payload) = open_from_controller(&buf[..n]);
+        assert_eq!(proto.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
+        assert_eq!(proto.opcode, OPCODE_STATUS_REPORT);
+        assert!(!proto.needs_ack, "CloseSession must be best-effort");
+        let (general, proto_id, code) = crate::case::parse_status_report(&payload).unwrap();
+        assert_eq!((general, proto_id, code), (0, 0, 2));
+        // 再送しないこと（MRP に乗せない）。
+        let again =
+            tokio::time::timeout(Duration::from_millis(300), device.recv_from(&mut buf)).await;
+        assert!(again.is_err(), "CloseSession must not be retransmitted");
     }
 }

@@ -33,6 +33,10 @@ const INFO_S3K: &[u8] = b"Sigma3";
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 const STATUS_SUCCESS: (u16, u32, u16) = (0, 0, 0); // (general, protocol id, code)
 
+/// Secure Channel StatusReport の CloseSession protocol code（general=SUCCESS 側。
+/// 同値 2 の `SC_PROTOCOL_CODE_INVALID_PARAMETER` は general=FAILURE 側で別物）。
+pub(crate) const SC_PROTOCOL_CODE_CLOSE_SESSION: u16 = 2;
+
 /// CASE ハンドシェイク各往復の応答待ち。op 予算設計の成分。
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 

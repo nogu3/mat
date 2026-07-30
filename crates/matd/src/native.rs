@@ -67,6 +67,16 @@ async fn bounded<T>(
     }
 }
 
+/// slot の session を手放す前に best-effort CloseSession（Issue #20: 放置
+/// セッションは FP300 系の常駐購読を黙殺する）。Timeout 腕（相手死亡疑い）でも
+/// 送る — 待ちゼロなのでコスト無し。
+async fn close_and_clear(guard: &mut Option<Box<dyn NodeConn>>) {
+    if let Some(conn) = guard.as_mut() {
+        conn.close().await;
+    }
+    *guard = None;
+}
+
 /// warm CASE セッションを per-node に保持する native バックエンド。
 /// エンジン（確立・group 送信）は mat-native と共有し、warm 保持だけが matd の責務。
 pub struct NativeBackend {
@@ -160,7 +170,7 @@ impl NativeBackend {
         let slot = self.slot(node_id).await;
         let attempt = slot.try_lock();
         if let Ok(mut guard) = attempt {
-            *guard = None;
+            close_and_clear(&mut guard).await;
         }
     }
 
@@ -220,7 +230,7 @@ impl NativeBackend {
             Err(e) if e.kind == ErrorKind::Timeout => {
                 // MRP 再送尽き or deadline 超過=未達の可能性大。どちらも session
                 // は持ち越さない。
-                *guard = None;
+                close_and_clear(&mut guard).await;
                 // 残り予算が RETRY_MIN_BUDGET 未満なら再確立を撃たない（Issue #16:
                 // 呼び出し側の予算内に応答できない再送は最初から無駄）。
                 if let Some(rem) = remaining(deadline) {
@@ -257,7 +267,7 @@ impl NativeBackend {
                     // 再送側も slot 衛生を揃える: session 健全なエラー
                     // （DeviceRejected/ParseError）以外は持ち越さない。
                     if !matches!(e2.kind, ErrorKind::DeviceRejected | ErrorKind::ParseError) {
-                        *guard = None;
+                        close_and_clear(&mut guard).await;
                     }
                 }
                 retried
@@ -275,7 +285,7 @@ impl NativeBackend {
                     kind = ?e.kind,
                     "native session error; dropping session for lazy re-establish"
                 );
-                *guard = None;
+                close_and_clear(&mut guard).await;
                 Err(e)
             }
         }
@@ -737,6 +747,40 @@ mod tests {
         // session は生きている: 次 op は warm 再利用で establish は 1 回のまま。
         backend.read_onoff(0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Timeout で slot を捨てる前に close が呼ばれる（Issue #20: 放置セッションを
+    /// FP300 系が常駐購読の再アンカー先にしてしまう）。
+    #[tokio::test]
+    async fn with_session_closes_before_dropping_on_timeout() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            calls: std::sync::Arc::clone(&calls),
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            conn_close_calls: std::sync::Arc::clone(&close_calls),
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        // 1 回目の send が Timeout → 旧 conn を close してから捨て、再確立して再送成功。
+        let v = backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert!(v);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// drop_session でも捨てる前に close が呼ばれる（Issue #20）。
+    #[tokio::test]
+    async fn drop_session_closes_warm_conn() {
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let est = FakeEstablisher {
+            conn_close_calls: std::sync::Arc::clone(&close_calls),
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        backend.drop_session(0x1234).await;
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
