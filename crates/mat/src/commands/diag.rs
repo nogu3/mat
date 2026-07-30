@@ -51,8 +51,7 @@ pub fn node(
     native: Option<&crate::native_direct::Config<'_>>,
 ) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
-    let rec = store.require_node(node_id)?;
-    let address = rec.address.clone();
+    store.require_node(node_id)?;
 
     let mut checks = Checks::default();
     let mut unavailable: Vec<Value> = Vec::new();
@@ -81,7 +80,6 @@ pub fn node(
             &mut checks,
             &mut unavailable,
             node_id,
-            address,
             self_cfid,
             cfg,
             store.root(),
@@ -114,20 +112,57 @@ pub fn node(
     Ok(())
 }
 
-/// `--deep` の補助プローブ。ping6（IP生存）と mDNS 広告確認（native の targeted
-/// resolve、mDNS は dnssd 一本 — Task 11 で avahi-browse フォールバックを撤去）
-/// を実施。
+/// `--deep` の補助プローブ。mDNS 広告確認（native の targeted resolve）を先に
+/// 実施し、解決できたライブアドレスへ ping6（IP生存）する。台帳は address を
+/// 持たない（Issue #18 で撤去）ため、stale 値への誤診経路は存在しない。
 fn deep_probes(
     checks: &mut Checks,
     unavailable: &mut Vec<Value>,
     node_id: u64,
-    address: Option<String>,
     self_cfid: Option<String>,
     cfg: &crate::native_direct::Config<'_>,
     store_root: &Path,
 ) {
-    // ip: ping6
-    match address.as_deref() {
+    // mdns: native targeted resolve（dnssd 一本）。照合は node_id ベース。
+    // ping6 の宛先もここで解決したライブアドレスから得る。
+    let live_target = match crate::probe::mdns(crate::probe::NativeProbe {
+        iface: cfg.iface,
+        fabric_index: cfg.fabric_index,
+        issuer_index: cfg.issuer_index,
+        store_root,
+        node_ids: std::slice::from_ref(&node_id),
+    }) {
+        Ok(instances) => {
+            let advertised_any_fabric = instances.iter().any(|i| i.node_id == node_id);
+            let advertised_self_fabric = self_cfid.as_ref().map(|cfid| {
+                instances
+                    .iter()
+                    .any(|i| &i.compressed_fabric == cfid && i.node_id == node_id)
+            });
+            if self_cfid.is_none() {
+                // native 経路では self_cfid は常に取れる（fabric 資材から算出）ため
+                // 実質到達しない。防御的に残す。
+                unavailable.push(json!({
+                    "check": "mdns_self_fabric",
+                    "kind": "cfid_unavailable",
+                    "detail": "could not obtain self compressed-fabric-id"
+                }));
+            }
+            checks.mdns = Some(MdnsCheck {
+                advertised_self_fabric,
+                advertised_any_fabric,
+            });
+            mat_core::reachability::resolve(node_id, &instances).live_address
+        }
+        Err(e) => {
+            let kind_val = probe_error_kind(&e);
+            unavailable.push(json!({ "check": "mdns", "kind": kind_val, "detail": e.detail }));
+            None
+        }
+    };
+
+    // ip: いま広告されているライブアドレスへ ping6。解決できなければ実施不能。
+    match live_target.as_deref() {
         Some(addr) => match probe_ping6(addr) {
             Ok(stats) => {
                 checks.ip = Some(IpCheck {
@@ -142,50 +177,7 @@ fn deep_probes(
                 unavailable.push(json!({ "check": "ip", "kind": kind_val, "detail": e.detail }))
             }
         },
-        None => unavailable.push(json!({ "check": "ip", "kind": "no_address_in_store" })),
-    }
-
-    // mdns: native targeted resolve（dnssd 一本）
-    match crate::probe::mdns(crate::probe::NativeProbe {
-        iface: cfg.iface,
-        fabric_index: cfg.fabric_index,
-        issuer_index: cfg.issuer_index,
-        store_root,
-        node_ids: std::slice::from_ref(&node_id),
-    }) {
-        Ok(instances) => {
-            // アドレスベースで照合（ストアの address が Some の場合）。
-            // None ならベストエフォートで node_id を使う（この場合 self_fabric は None のまま）。
-            let addr = address.as_deref();
-            let advertised_any_fabric = match addr {
-                Some(a) => instances.iter().any(|i| i.addresses.iter().any(|x| x == a)),
-                None => instances.iter().any(|i| i.node_id == node_id),
-            };
-            let advertised_self_fabric =
-                match (self_cfid.as_ref(), addr) {
-                    (Some(cfid), Some(a)) => Some(instances.iter().any(|i| {
-                        &i.compressed_fabric == cfid && i.addresses.iter().any(|x| x == a)
-                    })),
-                    _ => None,
-                };
-            if self_cfid.is_none() {
-                // native 経路では self_cfid は常に取れる（fabric 資材から算出）ため
-                // 実質到達しない。防御的に残す。
-                unavailable.push(json!({
-                    "check": "mdns_self_fabric",
-                    "kind": "cfid_unavailable",
-                    "detail": "could not obtain self compressed-fabric-id"
-                }));
-            }
-            checks.mdns = Some(MdnsCheck {
-                advertised_self_fabric,
-                advertised_any_fabric,
-            });
-        }
-        Err(e) => {
-            let kind_val = probe_error_kind(&e);
-            unavailable.push(json!({ "check": "mdns", "kind": kind_val, "detail": e.detail }))
-        }
+        None => unavailable.push(json!({ "check": "ip", "kind": "mdns_unresolved" })),
     }
 }
 
