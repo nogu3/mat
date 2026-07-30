@@ -82,6 +82,10 @@ pub trait NodeConn: Send {
         discriminator: u16,
         iterations: u32,
     ) -> Result<(String, String), MatError>;
+    /// セッションを手放す直前の後始末。CloseSession を best-effort 送信する
+    /// （Issue #20: 放置セッションが FP300 系の常駐購読を黙殺する）。fake は
+    /// 既定 no-op で足りるよう default 実装を持つ。
+    async fn close(&mut self) {}
 }
 
 /// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
@@ -176,6 +180,10 @@ pub trait SubscribeConn: Send {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError>;
+    /// セッションを手放す直前の後始末。CloseSession を best-effort 送信する
+    /// （Issue #20: 放置セッションが FP300 系の常駐購読を黙殺する）。fake は
+    /// 既定 no-op で足りるよう default 実装を持つ。
+    async fn close(&mut self) {}
 }
 
 /// ノード宛の warm セッションを新規確立する手段（実 = mDNS+CASE、テスト = fake）。
@@ -547,6 +555,10 @@ impl SubscribeConn for SubscriptionSession {
             Err(e) => Err(map_session_err(e)),
         }
     }
+
+    async fn close(&mut self) {
+        self.session.send_close_session().await;
+    }
 }
 
 #[async_trait]
@@ -648,6 +660,10 @@ impl NodeConn for SessionConn {
         .await
         .map_err(map_commission_err)?;
         Ok((window.manual_code, window.qr_payload))
+    }
+
+    async fn close(&mut self) {
+        self.session.send_close_session().await;
     }
 }
 

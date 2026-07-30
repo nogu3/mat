@@ -30,6 +30,9 @@ pub struct FakeSubConn {
     /// `FakeEstablisher::fail_next_report` と同一の Arc — テストが確立後に
     /// 注入して pump を狙って殺せる。
     pub fail_next_report: std::sync::Arc<AtomicUsize>,
+    /// `close()` の呼び出し回数を数える。establisher に渡してしまうため
+    /// 共有 Arc で観測する（matd の購読テストが使う）。
+    pub close_calls: std::sync::Arc<AtomicUsize>,
 }
 
 /// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
@@ -67,6 +70,7 @@ impl Default for FakeSubConn {
             live: std::sync::Arc::default(),
             seen_clusters: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
+            close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -108,6 +112,11 @@ impl crate::SubscribeConn for FakeSubConn {
         }
         tokio::time::sleep(timeout).await;
         Ok(self.live.lock().unwrap().pop_front())
+    }
+
+    async fn close(&mut self) {
+        self.close_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -287,6 +296,10 @@ impl NodeConn for FakeConn {
             "34970112332".to_string(),
             format!("MT:FAKE0{discriminator:04X}QR0"),
         ))
+    }
+
+    async fn close(&mut self) {
+        self.calls.push("close()".to_string());
     }
 }
 
@@ -510,5 +523,28 @@ mod delay_tests {
         let started = std::time::Instant::now();
         est.establish(1).await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use crate::{NodeConn, SubscribeConn};
+
+    /// close() の default は no-op（fake は上書きで記録する）。
+    #[tokio::test]
+    async fn fake_conn_records_close() {
+        let mut c = FakeConn::default();
+        c.close().await;
+        assert_eq!(c.calls(), ["close()"]);
+    }
+
+    #[tokio::test]
+    async fn fake_sub_conn_records_close() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut c = FakeSubConn::default();
+        c.close_calls = std::sync::Arc::clone(&counter);
+        c.close().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
