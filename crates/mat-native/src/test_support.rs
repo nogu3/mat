@@ -552,9 +552,8 @@ mod close_tests {
 
     #[tokio::test]
     async fn fake_sub_conn_records_close() {
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut c = FakeSubConn::default();
-        c.close_calls = std::sync::Arc::clone(&counter);
+        let counter = std::sync::Arc::clone(&c.close_calls);
         c.close().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
