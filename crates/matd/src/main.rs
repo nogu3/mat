@@ -60,6 +60,8 @@ struct Cli {
 enum Command {
     /// 稼働中の matd を停止する（socket 経由で graceful shutdown）。
     Stop,
+    /// 稼働中 matd の購読とデーモンの現況を JSON で返す（socket 経由）。
+    Status,
 }
 
 fn main() {
@@ -100,7 +102,8 @@ fn main() {
 
 async fn run(cli: Cli) -> Result<(), MatError> {
     match cli.command {
-        Some(Command::Stop) => stop(cli.socket).await,
+        Some(Command::Stop) => admin_op(cli.socket, "shutdown").await,
+        Some(Command::Status) => admin_op(cli.socket, "status").await,
         None => serve_daemon(cli).await,
     }
 }
@@ -253,17 +256,19 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
 
-/// stop: 稼働中 matd の socket に shutdown op を送る。居なければ「not running」で exit 1。
-async fn stop(socket: Option<PathBuf>) -> Result<(), MatError> {
+/// stop / status: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
+/// stdout へ出す。居なければ「not running」で exit 1。
+async fn admin_op(socket: Option<PathBuf>, op: &str) -> Result<(), MatError> {
     let socket = socket.unwrap_or_else(mat_core::socket::default_socket_path);
-    let resp = send_shutdown(&socket).await?;
+    let resp = send_admin_op(&socket, op).await?;
     // 成功応答は stdout（純粋 JSON）。
     println!("{resp}");
     Ok(())
 }
 
-/// socket に `{"op":"shutdown"}` を送り応答 1 行を読む。接続不能は「not running」。
-async fn send_shutdown(socket: &Path) -> Result<Value, MatError> {
+/// socket に `{"op":"<op>"}` を送り応答 1 行を読む。接続不能は「not running」
+/// （応答なし拒否 = stale socket はどの op でも掃除してよい）。
+async fn send_admin_op(socket: &Path, op: &str) -> Result<Value, MatError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -279,10 +284,12 @@ async fn send_shutdown(socket: &Path) -> Result<Value, MatError> {
     })?;
 
     let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_vec(&serde_json::json!({ "op": op })).unwrap();
+    line.push(b'\n');
     write_half
-        .write_all(b"{\"op\":\"shutdown\"}\n")
+        .write_all(&line)
         .await
-        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to send shutdown: {e}")))?;
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to send {op}: {e}")))?;
 
     let mut lines = BufReader::new(read_half).lines();
     let line = lines
