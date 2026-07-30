@@ -47,6 +47,14 @@ impl NativeState {
     }
 }
 
+/// 起動時に確定するデーモン基本情報（status op が返す）。
+pub struct DaemonInfo {
+    pub version: &'static str,
+    pub started: std::time::Instant,
+    pub iface: String,
+    pub fabric_index: u8,
+}
+
 /// ソケットを bind し、接続を受け付け続ける。`Ctrl-C` で抜ける。
 pub async fn serve(
     socket_path: &Path,
@@ -54,6 +62,7 @@ pub async fn serve(
     native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
     health: Arc<SubHealth>,
+    daemon: Arc<DaemonInfo>,
 ) -> std::io::Result<()> {
     tracing::info!(native_ready = native.is_ready(), "matd backend");
     // 前回の残骸を掃除してから bind。
@@ -76,9 +85,11 @@ pub async fn serve(
                 let shutdown = Arc::clone(&shutdown);
                 let events = events.clone();
                 let health = Arc::clone(&health);
+                let daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_conn(stream, native, store_path, shutdown, events, health).await
+                        handle_conn(stream, native, store_path, shutdown, events, health, daemon)
+                            .await
                     {
                         tracing::warn!(error = %e, "connection handler ended with error");
                     }
@@ -112,6 +123,7 @@ async fn handle_conn(
     shutdown: Arc<Notify>,
     events: broadcast::Sender<Event>,
     health: Arc<SubHealth>,
+    daemon: Arc<DaemonInfo>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -180,7 +192,7 @@ async fn handle_conn(
         // その状態で abort_op（slot 破棄の lock().await）を呼ぶとデッドロック
         // する。ブロックを抜けて future を drop してから後始末する。
         let turn = {
-            let dispatch_fut = dispatch(&line, &native, &store_path, &health);
+            let dispatch_fut = dispatch(&line, &native, &store_path, &health, &daemon, &events);
             tokio::pin!(dispatch_fut);
             loop {
                 tokio::select! {
@@ -492,6 +504,8 @@ async fn dispatch(
     native: &NativeState,
     store_path: &Path,
     health: &SubHealth,
+    daemon: &DaemonInfo,
+    events: &broadcast::Sender<Event>,
 ) -> (Value, bool) {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -515,7 +529,12 @@ async fn dispatch(
     // op の所要時間は run_op のみを測る（JSON パース・応答書き込みは含めない）。
     let started = std::time::Instant::now();
     let deadline = op_deadline(req.deadline_ms);
-    let result = run_op(&req.op, native, store_path, health, deadline).await;
+    // status はレジストリ snapshot の JSON 化のみ（デバイス・ワイヤに触れず
+    // per-node Mutex も取らない）— run_op を通さず dispatch で完結する。
+    let result = match &req.op {
+        Op::Status => Ok(status_body(native, store_path, daemon, health, events)),
+        _ => run_op(&req.op, native, store_path, health, deadline).await,
+    };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     log_op(&req.op, &result, elapsed_ms);
 
@@ -560,6 +579,8 @@ async fn run_op(
         Op::Listen { .. } => {
             return Err(MatError::parse_error("listen must be the streaming path"))
         }
+        // status は dispatch が先取りする（防御的に拒否）。
+        Op::Status => return Err(MatError::parse_error("status is handled in dispatch")),
         _ => {}
     }
 
@@ -1191,6 +1212,41 @@ fn group_ctx_unconfigured_error() -> MatError {
     )
 }
 
+/// `status` op の応答ボディ（timestamp / id は dispatch が付ける）。
+fn status_body(
+    native: &NativeState,
+    store_path: &Path,
+    daemon: &DaemonInfo,
+    health: &SubHealth,
+    events: &broadcast::Sender<Event>,
+) -> Value {
+    let native_json = match native {
+        NativeState::Ready(_) => json!("ready"),
+        NativeState::Unavailable(e) => json!({ "kind": e.kind, "detail": e.detail }),
+    };
+    // subscriptions.toml 由来の絞り込み。ids に無いクラスタは数値のまま
+    // （listen イベントの Event::to_json と同じ規律）。無し = wildcard = null。
+    let clusters = health.clusters().map(|ids| {
+        ids.iter()
+            .map(|&id| match mat_core::ids::find_cluster(id) {
+                Some(def) => json!(def.name),
+                None => json!(id),
+            })
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "version": daemon.version,
+        "uptime_s": daemon.started.elapsed().as_secs(),
+        "native": native_json,
+        "iface": daemon.iface,
+        "fabric_index": daemon.fabric_index,
+        "store": store_path.display().to_string(),
+        "subscribed_clusters": clusters,
+        "listen_clients": events.receiver_count(),
+        "nodes": health.status_nodes(),
+    })
+}
+
 /// エラー応答 `{"error":{"kind","detail"}, "id"?, "timestamp"}`。
 fn error_response(id: Option<Value>, e: &MatError) -> Value {
     let mut body = json!({
@@ -1207,6 +1263,47 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
 mod tests {
     use super::*;
     use crate::protocol::Op;
+
+    /// status は Unavailable でも応答し、構築エラーと空 nodes が見える。
+    /// subscribed_clusters は ids 名で返る。
+    #[tokio::test]
+    async fn dispatch_status_reports_native_unavailable() {
+        let (_dir, store_path) = make_store();
+        let state = NativeState::Unavailable(MatError::store_missing("no KVS materials"));
+        let health = SubHealth::new(Some(vec![0x0006]));
+        let daemon = DaemonInfo {
+            version: "test",
+            started: std::time::Instant::now(),
+            iface: "lo".into(),
+            fabric_index: 2,
+        };
+        let (events, rx) = tokio::sync::broadcast::channel::<crate::subscription::Event>(8);
+        drop(rx);
+
+        let (body, is_shutdown) = dispatch(
+            r#"{"op":"status","id":3}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+
+        assert!(!is_shutdown);
+        assert_eq!(body["id"], 3);
+        assert_eq!(body["native"]["kind"], "store_missing");
+        assert_eq!(body["native"]["detail"], "no KVS materials");
+        assert_eq!(body["version"], "test");
+        assert_eq!(body["iface"], "lo");
+        assert_eq!(body["fabric_index"], 2);
+        assert_eq!(body["store"], store_path.display().to_string());
+        assert_eq!(body["subscribed_clusters"], json!(["onoff"]));
+        assert_eq!(body["listen_clients"], 0);
+        assert!(body["nodes"].as_array().unwrap().is_empty());
+        assert!(body["uptime_s"].is_u64());
+        assert!(body["timestamp"].is_string());
+    }
 
     #[test]
     fn op_deadline_semantics() {
