@@ -176,6 +176,10 @@ pub enum Op {
     },
     /// デーモン死活確認（native backend には触れない）。
     Ping,
+    /// 購読とデーモンの現況を返す admin op（`matd status` が送る）。
+    /// Ping と同じく単一 node は持たず、デバイス・ワイヤには触れない
+    /// （dispatch がレジストリ snapshot を JSON 化するだけ）。
+    Status,
     /// デーモンを停止する admin op（native backend には触れない）。`matd stop` が送る。
     /// Ping と同じく単一 node は持たない。
     Shutdown,
@@ -205,6 +209,7 @@ impl Op {
             | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
+            | Op::Status
             | Op::Shutdown => None,
         }
     }
@@ -231,6 +236,7 @@ impl Op {
             Op::GroupBump => "group_bump",
             Op::Listen { .. } => "listen",
             Op::Ping => "ping",
+            Op::Status => "status",
             Op::Shutdown => "shutdown",
         }
     }
@@ -255,6 +261,7 @@ impl Op {
             | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
+            | Op::Status
             | Op::Shutdown => None,
         }
     }
@@ -276,9 +283,12 @@ impl Op {
             | Op::GroupColorTemp { endpoint, .. }
             | Op::GroupLevel { endpoint, .. }
             | Op::GroupColor { endpoint, .. } => Some(*endpoint),
-            Op::Describe { .. } | Op::GroupBump | Op::Listen { .. } | Op::Ping | Op::Shutdown => {
-                None
-            }
+            Op::Describe { .. }
+            | Op::GroupBump
+            | Op::Listen { .. }
+            | Op::Ping
+            | Op::Status
+            | Op::Shutdown => None,
         }
     }
 
@@ -313,6 +323,7 @@ impl Op {
             | Op::GroupBump
             | Op::Listen { .. }
             | Op::Ping
+            | Op::Status
             | Op::Shutdown => None,
         }
     }
@@ -655,5 +666,17 @@ mod tests {
             r#"{"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off","future_field":42}"#,
         );
         assert!(matches!(r.op, Op::Read { .. }));
+    }
+
+    #[test]
+    fn status_has_no_node_and_matches_wire_tag() {
+        // admin op（`matd status` が送る）。native にもデバイスにも触れない。
+        let r = parse(r#"{"op":"status"}"#);
+        assert!(matches!(r.op, Op::Status));
+        assert_eq!(r.op.node_id(), None);
+        assert_eq!(r.op.group_id(), None);
+        assert_eq!(r.op.endpoint(), None);
+        assert_eq!(r.op.log_path(), None);
+        assert_eq!(r.op.name(), "status");
     }
 }
