@@ -83,11 +83,7 @@ fn native_commission(
 }
 
 /// 台帳 upsert + alias + JSON 出力（chip-tool 経路の成功側と共通）。
-fn record_success(
-    store: &mut Store,
-    node_id: u64,
-    alias: Option<&str>,
-) -> Result<(), MatError> {
+fn record_success(store: &mut Store, node_id: u64, alias: Option<&str>) -> Result<(), MatError> {
     store.upsert_node(NodeRecord {
         node_id,
         commissioned_at: output::now_iso8601(),

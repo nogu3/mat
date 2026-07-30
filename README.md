@@ -65,7 +65,7 @@ mat discover --probe
 
 # Join a fabric (first commission OR multi-admin join, both supported)
 # All values here are dummy (RFC 5737 192.0.2.0/24)
-mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5
+mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 #### Route selection (`--transport`)
@@ -97,7 +97,7 @@ A manual code carries only a 4-bit short discriminator, which cannot drive the
 
 ```bash
 # force BLE (skip mDNS entirely)
-mat commission --target thread --setup-code "MT:Y.K9042C00KA0648G00" --transport ble
+mat commission --setup-code "MT:Y.K9042C00KA0648G00" --transport ble
 ```
 
 `discover` output:
@@ -107,7 +107,7 @@ mat commission --target thread --setup-code "MT:Y.K9042C00KA0648G00" --transport
   "timestamp": "2026-06-06T12:34:56+09:00",
   "devices": [
     { "state": "commissionable", "hostname": "B827EBA8C9F0", "addresses": ["192.0.2.10"], "port": 5540, "discriminator": 3840, "vendor_id": 65521, "product_id": 32769 },
-    { "state": "commissioned", "node_id": 5, "address": "192.0.2.10", "commissioned_at": "2026-06-06T12:00:00+09:00" }
+    { "state": "commissioned", "node_id": 5, "commissioned_at": "2026-06-06T12:00:00+09:00" }
   ]
 }
 ```
@@ -116,10 +116,9 @@ With `--probe`, each `commissioned` node is checked against a live mDNS resolve
 (a native targeted `_matter._tcp` lookup per node, run concurrently) and
 annotated:
 
-- `reachable: true` — advertising now; `address` is the live-resolved value
-  (may differ from the ledger).
-- `reachable: false` — not advertising; `address` is the last-known ledger
-  value with `stale: true`.
+- `reachable: true` — advertising now; `address` is the live-resolved value.
+- `reachable: false` — not advertising; no `address` (the ledger stores none —
+  addresses are resolved live, never persisted).
 - `reachable: null` — the mDNS probe could not run (e.g. an interface I/O
   error); reachability is unknown. A diagnostic is logged to stderr.
 
@@ -128,13 +127,13 @@ annotated:
   "timestamp": "2026-06-06T12:34:56+09:00",
   "devices": [
     { "state": "commissioned", "node_id": 5, "address": "192.0.2.99", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": true },
-    { "state": "commissioned", "node_id": 7, "address": "192.0.2.10", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": false, "stale": true },
-    { "state": "commissioned", "node_id": 9, "address": "192.0.2.20", "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": null }
+    { "state": "commissioned", "node_id": 7, "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": false },
+    { "state": "commissioned", "node_id": 9, "commissioned_at": "2026-06-06T12:00:00+09:00", "reachable": null }
   ]
 }
 ```
 
-Without `--probe` the output is unchanged (no `reachable` / `stale`); the
+Without `--probe` the output is unchanged (no `reachable`); the
 ledger is reported as-is and reflects no live reachability. Node-id matching
 is best-effort (a cross-fabric node_id collision could false-positive); for a
 deeper single-node check use `mat diag node --deep`.
@@ -191,7 +190,7 @@ directory of PAA root certificates:
 export MAT_PAA_TRUST_STORE=/path/to/paa-root-certs
 # Option 2: drop the certs under the store, no env needed
 #   <store>/paa-trust-store/   (e.g. ~/.config/mat/paa-trust-store/)
-mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5
+mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
 Resolution order: `MAT_PAA_TRUST_STORE` > `<store>/paa-trust-store/`. If neither
@@ -379,7 +378,7 @@ where `mat invoke` would only return a bare `timeout` / `session_failed`.
 ```bash
 # diag node --node <node_id> [--endpoint EP] [--deep]   (EP defaults to 0)
 mat diag node --node 5            # fast (native IM: operational + thread checks)
-mat diag node --node 5 --deep     # also probe ping6 + native targeted mDNS
+mat diag node --node 5 --deep     # also probe native targeted mDNS + ping6 (to the live-resolved address)
 ```
 
 ```json
@@ -401,8 +400,13 @@ mat diag node --node 5 --deep     # also probe ping6 + native targeted mDNS
 > `not_advertised`, `unresolvable`, `session_failed`, `device_rejected`,
 > `unknown`. Without `--deep` the fast path can't tell `link_starved` (weak
 > Thread link, SRP not registered — **the fabric is intact**) apart from
-> `fabric_missing` (the device dropped our fabric); `--deep` adds the ping6 and
-> mDNS evidence that distinguishes them. Like `diag thread` it returns **partial
+> `fabric_missing` (the device dropped our fabric); `--deep` adds the mDNS and
+> ping6 evidence that distinguishes them. `--deep` resolves the node via a
+> native targeted mDNS lookup first and pings the **live-resolved** address
+> (the ledger stores no address — Issue #18); if the node is not advertising
+> at all there is nothing to ping, the `ip` check lands in `unavailable` as
+> `mdns_unresolved`, and the split then rests on the Thread-side evidence.
+> Like `diag thread` it returns **partial
 > results** (skipped/failed checks go under `unavailable`) and **always exits
 > `0`** with a verdict, even when the node is fully unreachable — the value is in
 > the classification, not an exit code. `--deep` shells out to `ping6` (override
@@ -1175,7 +1179,7 @@ These map onto the existing exit codes (`2` / `10`); the
 To register an alias while commissioning, add `--alias`:
 
 ```bash
-mat commission --target 192.0.2.10 --setup-code "MT:Y.K9042C00KA0648G00" --node 5 --alias living-light
+mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5 --alias living-light
 ```
 
 The name is validated **before** commissioning starts (all-digits / empty /
@@ -1422,7 +1426,7 @@ existing admin opens a commissioning window to issue a one-time code.
    target device and note the issued setup code (`MT:...` or 11-digit).
 2. **Join with `mat`:**
    ```bash
-   mat commission --target <device-ip-or-host> --setup-code "<issued setup code>" --node 5
+   mat commission --setup-code "<issued setup code>" --node 5
    ```
    It returns `{ "node_id": 5, "status": "success" }` and records the ledger in
    `~/.config/mat/nodes.json`.
