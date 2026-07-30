@@ -33,6 +33,11 @@ pub struct FakeSubConn {
     /// `close()` の呼び出し回数を数える。establisher に渡してしまうため
     /// 共有 Arc で観測する（matd の購読テストが使う）。
     pub close_calls: std::sync::Arc<AtomicUsize>,
+    /// `subscribe_wildcard` を fail_kind で失敗させるか。CASE 成立後に
+    /// subscribe だけが失敗する経路（Issue #20: この場合も close が必要）を
+    /// 再現するための軸 — `FakeEstablisher::fail_subscription`（establish
+    /// 自体の失敗、CASE 未成立で close 不要）とは別物。
+    pub fail_wildcard: bool,
 }
 
 /// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
@@ -71,6 +76,7 @@ impl Default for FakeSubConn {
             seen_clusters: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
             close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+            fail_wildcard: false,
         }
     }
 }
@@ -87,6 +93,12 @@ impl crate::SubscribeConn for FakeSubConn {
         ),
         MatError,
     > {
+        if self.fail_wildcard {
+            return Err(MatError::new(
+                ErrorKind::SessionFailed,
+                "fake subscribe_wildcard failure",
+            ));
+        }
         *self.seen_clusters.lock().unwrap() = clusters.to_vec();
         Ok((
             crate::SubscriptionInfo {
@@ -337,6 +349,13 @@ pub struct FakeEstablisher {
     /// 払い出す全 FakeConn が共有する `close_calls`（Issue #20: op 側の
     /// close() 呼び出しをテストが establish 後から観測するための Arc）。
     pub conn_close_calls: std::sync::Arc<AtomicUsize>,
+    /// 払い出す全 FakeSubConn が共有する `close_calls`（Issue #20: 購読 pump
+    /// 側の close() 呼び出しをテストが establish 後から観測するための Arc —
+    /// conn 自体は establish_subscription に渡ってしまい参照が残せない）。
+    pub sub_close_calls: std::sync::Arc<AtomicUsize>,
+    /// 払い出す `FakeSubConn` の `subscribe_wildcard` を失敗させるか
+    /// （Issue #20: CASE 成立後に subscribe だけ失敗する経路の close 検証用）。
+    pub fail_wildcard: bool,
 }
 
 impl Default for FakeEstablisher {
@@ -352,6 +371,8 @@ impl Default for FakeEstablisher {
             conn_delay: None,
             establish_delay: None,
             conn_close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+            sub_close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+            fail_wildcard: false,
         }
     }
 }
@@ -385,6 +406,8 @@ impl Establisher for FakeEstablisher {
             seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
             live: std::sync::Arc::clone(&self.sub_live),
             fail_next_report: std::sync::Arc::clone(&self.fail_next_report),
+            close_calls: std::sync::Arc::clone(&self.sub_close_calls),
+            fail_wildcard: self.fail_wildcard,
             ..Default::default()
         }))
     }
