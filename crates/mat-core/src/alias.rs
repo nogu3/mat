@@ -353,7 +353,7 @@ impl AliasBook {
         let text = toml::to_string_pretty(&self.file).map_err(|e| {
             MatError::new(ErrorKind::Other, format!("cannot serialize aliases: {e}"))
         })?;
-        std::fs::write(&path, text).map_err(|e| {
+        crate::fsatomic::write_atomic(&path, text.as_bytes()).map_err(|e| {
             MatError::new(
                 ErrorKind::Other,
                 format!("cannot write {}: {e}", path.display()),

@@ -10,6 +10,7 @@ pub mod body;
 pub mod color;
 pub mod diag;
 pub mod error;
+pub mod fsatomic;
 pub mod group;
 pub mod ids;
 mod ids_gen;

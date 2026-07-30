@@ -119,7 +119,7 @@ impl Store {
         let text = serde_json::to_string_pretty(&self.ledger).map_err(|e| {
             MatError::new(ErrorKind::Other, format!("cannot serialize ledger: {e}"))
         })?;
-        std::fs::write(&path, text).map_err(|e| {
+        crate::fsatomic::write_atomic(&path, text.as_bytes()).map_err(|e| {
             MatError::new(
                 ErrorKind::Other,
                 format!("cannot write {}: {e}", path.display()),
@@ -196,6 +196,8 @@ mod tests {
             store.require_node(7).unwrap().address.as_deref(),
             Some("192.0.2.10")
         );
+        // atomic write の tmp が残らないこと。
+        assert!(!dir.path().join("nodes.tmp").exists());
     }
 
     #[test]
