@@ -4,7 +4,9 @@
 //! commissioned は `mat` の台帳（KVS）から読む。両者を1つの `devices` 配列にまとめる。
 //!
 //! `--probe` 指定時は commissioned ノードそれぞれへ targeted resolve を並行実行して
-//! ライブ到達性を判定し、`reachable`（true/false/null）と、不達時の `stale` を付与する
+//! ライブ到達性を判定し、`reachable`（true/false/null）を付与し、到達時のみ
+//! ライブ解決アドレスを `address` に出す（`stale` は 1.13.0 で廃止 — 台帳が address
+//! を持たなくなったため）。
 //! （M8b: 列挙(browse)ベースから切り替え — 実機の advertising proxy が一部ノードの
 //! PTR 列挙に応答しないため、CFID+NodeId 既知の対象を直接 resolve する）。
 //! 既定（`--probe` 無し）は台帳をそのまま出す高速経路で、出力は従来と完全に同一。
@@ -94,27 +96,18 @@ pub fn run(
         obj.insert("node_id".into(), json!(n.node_id));
         obj.insert("commissioned_at".into(), json!(n.commissioned_at));
         match (probe, instances.as_deref()) {
-            // 既定: 台帳そのまま（従来出力と同一）。
-            (false, _) => {
-                obj.insert("address".into(), json!(n.address));
-            }
+            // 既定: 台帳そのまま（address は台帳から消えるため出力しない）。
+            (false, _) => {}
             // --probe だがプローブ実施不能 → 到達性不明。
             (true, None) => {
-                obj.insert("address".into(), json!(n.address));
                 obj.insert("reachable".into(), Value::Null);
             }
-            // --probe 成功 → node_id 照合で到達性判定。
+            // --probe 成功 → node_id 照合で到達性判定。address はライブ解決値のみ。
             (true, Some(list)) => {
-                let r = resolve(n.node_id, n.address.as_deref(), list);
+                let r = resolve(n.node_id, list);
                 obj.insert("reachable".into(), json!(r.reachable));
-                if r.reachable {
-                    // ライブ解決アドレスを優先、無ければ台帳値（announce のみ等）。
-                    let addr = r.live_address.or_else(|| n.address.clone());
+                if let Some(addr) = r.live_address {
                     obj.insert("address".into(), json!(addr));
-                } else {
-                    // 据え置きの台帳値に stale 印を付ける。
-                    obj.insert("address".into(), json!(n.address));
-                    obj.insert("stale".into(), json!(true));
                 }
             }
         }
