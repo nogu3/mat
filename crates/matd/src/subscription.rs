@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use mat_controller::im::ReportDataMessage;
+use mat_core::error::MatError;
 use mat_core::output::now_iso8601;
 use mat_core::store::Store;
 
@@ -82,9 +83,36 @@ pub(crate) fn pump_verdict(
     None
 }
 
-/// op 相関ヘルス表: server op 経路（書き手）と購読 pump（読み手）の共有状態。
-/// 「状態変更 op が success したのにデバイス発メッセージが来ない」= レポート
-/// 経路死の証拠、を pending として持つ。ephemeral なランタイム状態のみ
+/// 購読ライフサイクル状態（status op が読む）。「ログに出す状態遷移は
+/// レジストリにも書く」が規律 — 遷移点は node_subscription_loop /
+/// run_subscription_once の既存ログ出力箇所と 1:1。
+#[derive(Debug, Clone)]
+pub(crate) enum NodeSubStatus {
+    /// spawn 直後〜初回確立前のみ。喪失後の再試行中は Down のまま
+    /// （attempts が増える — down_since / classify_failure と同じ見方）。
+    Establishing { since: tokio::time::Instant },
+    /// 購読成立中。last_device_msg はデバイス発メッセージ
+    /// （keep-alive 含む）受信のたび更新。
+    Established {
+        since: tokio::time::Instant,
+        subscription_id: u32,
+        max_interval_s: u16,
+        last_device_msg: tokio::time::Instant,
+    },
+    /// 確立失敗 or 購読喪失で backoff 中（再確立まで持続）。
+    Down {
+        since: tokio::time::Instant,
+        attempts: u32,
+        backoff: Duration,
+        last_error: MatError,
+    },
+}
+
+/// op 相関ヘルス表かつ購読ランタイム状態の共有点: server op 経路（書き手）と
+/// 購読 pump（読み手）の共有状態。「状態変更 op が success したのにデバイス発
+/// メッセージが来ない」= レポート経路死の証拠、を pending として持つ。また
+/// 購読ループの状態遷移（Establishing / Established / Down）を記録し、status op
+/// がこれを読んで応答スキーマを組み立てる。ephemeral なランタイム状態のみ
 /// （設計ルール4の永続状態には該当しない）。
 pub struct SubHealth {
     /// 購読対象クラスタ集合（subscriptions.toml 由来。空 = full wildcard = 全対象）。
@@ -95,6 +123,8 @@ pub struct SubHealth {
     /// server op 経路（読み手: 「この op は本当に値を変えるか」の証明）で共有する。
     /// ephemeral なプロセス内状態のみ（設計ルール4の永続状態には該当しない）。
     values: Mutex<HashMap<ValueKey, serde_json::Value>>,
+    /// node_id → 購読ライフサイクル状態（status op が読む）。
+    status: Mutex<HashMap<u64, NodeSubStatus>>,
 }
 
 impl SubHealth {
@@ -103,6 +133,7 @@ impl SubHealth {
             clusters: clusters.unwrap_or_default(),
             pending: Mutex::new(HashMap::new()),
             values: Mutex::new(HashMap::new()),
+            status: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,6 +182,121 @@ impl SubHealth {
             .unwrap()
             .get(&(node_id, endpoint, cluster, attribute))
             .cloned()
+    }
+
+    /// 購読ループ spawn（初回確立前）。
+    pub(crate) fn mark_establishing(&self, node_id: u64) {
+        self.status.lock().unwrap().insert(
+            node_id,
+            NodeSubStatus::Establishing {
+                since: tokio::time::Instant::now(),
+            },
+        );
+    }
+
+    /// 購読成立（「subscription established」ログと同時に呼ぶ）。
+    pub(crate) fn mark_established(&self, node_id: u64, subscription_id: u32, max_interval_s: u16) {
+        let now = tokio::time::Instant::now();
+        self.status.lock().unwrap().insert(
+            node_id,
+            NodeSubStatus::Established {
+                since: now,
+                subscription_id,
+                max_interval_s,
+                last_device_msg: now,
+            },
+        );
+    }
+
+    /// デバイス発メッセージ受信（keep-alive 含む）。Established のときだけ更新。
+    pub(crate) fn note_device_msg(&self, node_id: u64) {
+        if let Some(NodeSubStatus::Established {
+            last_device_msg, ..
+        }) = self.status.lock().unwrap().get_mut(&node_id)
+        {
+            *last_device_msg = tokio::time::Instant::now();
+        }
+    }
+
+    /// 確立失敗 or 購読喪失（「subscription lost」/ 失敗ログと同時に呼ぶ）。
+    /// since はダウン起点（down_since）、attempts はダウン以降の失敗数。
+    pub(crate) fn mark_down(
+        &self,
+        node_id: u64,
+        since: tokio::time::Instant,
+        attempts: u32,
+        backoff: Duration,
+        last_error: MatError,
+    ) {
+        self.status.lock().unwrap().insert(
+            node_id,
+            NodeSubStatus::Down {
+                since,
+                attempts,
+                backoff,
+                last_error,
+            },
+        );
+    }
+
+    /// 購読対象クラスタ（status 応答用）。空 = full wildcard = None
+    /// （subscribe_config は空リストを起動拒否するので混同はない）。
+    pub(crate) fn clusters(&self) -> Option<&[u32]> {
+        if self.clusters.is_empty() {
+            None
+        } else {
+            Some(&self.clusters)
+        }
+    }
+
+    /// status 応答の nodes 配列（node_id 昇順の安定出力）。期間は全て
+    /// 「今からの経過秒」— 内部時計は tokio::time::Instant で ISO 変換
+    /// 不能なため、経過秒が正直な表現（spec）。
+    pub(crate) fn status_nodes(&self) -> Vec<serde_json::Value> {
+        let status = self.status.lock().unwrap();
+        let mut ids: Vec<u64> = status.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| match &status[&id] {
+                NodeSubStatus::Establishing { since } => serde_json::json!({
+                    "node_id": id,
+                    "state": "establishing",
+                    "for_s": since.elapsed().as_secs(),
+                }),
+                NodeSubStatus::Established {
+                    since,
+                    subscription_id,
+                    max_interval_s,
+                    last_device_msg,
+                } => serde_json::json!({
+                    "node_id": id,
+                    "state": "established",
+                    "for_s": since.elapsed().as_secs(),
+                    "subscription_id": subscription_id,
+                    "max_interval_s": max_interval_s,
+                    "last_device_msg_ago_s": last_device_msg.elapsed().as_secs(),
+                    // 未消化の状態変更 op（op 相関）。通常 null、値が入って
+                    // いれば「op 成功後デバイス発ゼロ」を観測中の瞬間。
+                    "pending_op_ago_s": self.pending_elapsed(id).map(|d| d.as_secs()),
+                }),
+                NodeSubStatus::Down {
+                    since,
+                    attempts,
+                    backoff,
+                    last_error,
+                } => serde_json::json!({
+                    "node_id": id,
+                    "state": "down",
+                    "for_s": since.elapsed().as_secs(),
+                    "attempts": attempts,
+                    "backoff_s": backoff.as_secs(),
+                    "last_error": {
+                        "kind": last_error.kind,
+                        "detail": last_error.detail,
+                    },
+                }),
+            })
+            .collect()
     }
 }
 
@@ -1523,5 +1669,74 @@ mod tests {
             }
         };
         assert!(ev.priming);
+    }
+
+    /// レジストリの遷移と JSON 形（spec の応答スキーマ nodes 配列）。
+    /// tokio::time::Instant なので start_paused + advance で経過秒を決定化できる。
+    #[tokio::test(start_paused = true)]
+    async fn status_nodes_reflects_lifecycle_transitions() {
+        use serde_json::json;
+        let h = SubHealth::new(None);
+        assert!(h.status_nodes().is_empty());
+
+        // establishing: spawn 直後。
+        h.mark_establishing(5);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let n = h.status_nodes();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0]["node_id"], 5);
+        assert_eq!(n[0]["state"], "establishing");
+        assert_eq!(n[0]["for_s"], 2);
+
+        // established: 確立時刻から for_s、受信で last_device_msg_ago_s が縮む。
+        h.mark_established(5, 7, 300);
+        tokio::time::advance(Duration::from_secs(40)).await;
+        h.note_device_msg(5);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let n = h.status_nodes();
+        assert_eq!(n[0]["state"], "established");
+        assert_eq!(n[0]["for_s"], 42);
+        assert_eq!(n[0]["subscription_id"], 7);
+        assert_eq!(n[0]["max_interval_s"], 300);
+        assert_eq!(n[0]["last_device_msg_ago_s"], 2);
+        assert_eq!(n[0]["pending_op_ago_s"], serde_json::Value::Null);
+
+        // op 相関 pending が経過秒で載る。
+        h.note_op(5, 0x0006);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(h.status_nodes()[0]["pending_op_ago_s"], 3);
+
+        // down: attempts / backoff_s / last_error（kind は snake_case 名）。
+        h.clear_pending(5);
+        h.mark_down(
+            5,
+            tokio::time::Instant::now(),
+            3,
+            Duration::from_secs(20),
+            mat_core::error::MatError::new(mat_core::error::ErrorKind::Unreachable, "no route"),
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let n = h.status_nodes();
+        assert_eq!(n[0]["state"], "down");
+        assert_eq!(n[0]["for_s"], 1);
+        assert_eq!(n[0]["attempts"], 3);
+        assert_eq!(n[0]["backoff_s"], 20);
+        assert_eq!(n[0]["last_error"], json!({"kind": "unreachable", "detail": "no route"}));
+
+        // node_id 昇順の安定出力。
+        h.mark_establishing(2);
+        let n = h.status_nodes();
+        assert_eq!(n[0]["node_id"], 2);
+        assert_eq!(n[1]["node_id"], 5);
+    }
+
+    /// clusters(): 空 = full wildcard = None、非空はそのまま。
+    #[test]
+    fn clusters_exposes_narrowing_none_for_wildcard() {
+        assert!(SubHealth::new(None).clusters().is_none());
+        assert_eq!(
+            SubHealth::new(Some(vec![0x0006, 0x0406])).clusters(),
+            Some(&[0x0006u32, 0x0406][..])
+        );
     }
 }
