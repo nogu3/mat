@@ -5,8 +5,7 @@
 //! 開いた window の発行コード（join）でも一様に扱える。Root CA / 自分の NOC は
 //! `mat fabric init` が事前に生成・永続する。
 //!
-//! `target`（IP/DNS）は台帳のメタとして記録する。コード内の discriminator から
-//! mDNS でノードを自前探索する。
+//! コード内の discriminator から mDNS でノードを自前探索する。
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +19,6 @@ use mat_core::store::{NodeRecord, Store};
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     store_path: &Path,
-    target: &str,
     setup_code: &str,
     node_id: Option<u64>,
     alias: Option<&str>,
@@ -42,7 +40,7 @@ pub fn run(
         )
     })?;
     native_commission(cfg, &store, setup_code, node_id, thread_dataset, transport)?;
-    record_success(&mut store, node_id, target, alias)
+    record_success(&mut store, node_id, alias)
 }
 
 fn native_commission(
@@ -88,12 +86,11 @@ fn native_commission(
 fn record_success(
     store: &mut Store,
     node_id: u64,
-    target: &str,
     alias: Option<&str>,
 ) -> Result<(), MatError> {
     store.upsert_node(NodeRecord {
         node_id,
-        address: Some(target.to_string()),
+        address: None,
         commissioned_at: output::now_iso8601(),
     })?;
     if let Some(name) = alias {

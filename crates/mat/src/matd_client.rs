@@ -1031,7 +1031,6 @@ mod tests {
     fn discover_and_commission_are_unsupported() {
         assert!(to_op(&Command::Discover { probe: false }).is_err());
         assert!(to_op(&Command::Commission {
-            target: "192.0.2.1".into(),
             setup_code: "MT:DUMMY".into(),
             node_id: None,
             alias: None,

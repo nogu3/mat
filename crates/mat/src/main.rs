@@ -166,7 +166,6 @@ fn main() -> ExitCode {
             commands::discover::run(&store_path, *probe, native_cfg.as_ref())
         }
         Command::Commission {
-            target,
             setup_code,
             node_id,
             alias,
@@ -174,7 +173,6 @@ fn main() -> ExitCode {
             transport,
         } => commands::commission::run(
             &store_path,
-            target,
             setup_code,
             *node_id,
             alias.as_deref(),
