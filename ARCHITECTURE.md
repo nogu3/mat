@@ -115,7 +115,7 @@ once (multi-admin), so `mat` can run alongside them.
 
 ### Two ways to commission (native, `mat commission`)
 A Matter setup code (QR or 11-digit) is passed the same way to
-`mat commission --target <host-or-ip> --setup-code <code>` (native PASE;
+`mat commission --setup-code <code>` (native PASE;
 `mat-native::commission` auto-selects on-network mDNS vs. BLE+Thread — see
 ["Backend: native"](#backend-native-chip-tool-retired-in-0220)). Only the
 source of the code differs.

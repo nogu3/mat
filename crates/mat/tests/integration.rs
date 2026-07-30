@@ -590,13 +590,7 @@ fn commission_with_duplicate_alias_exits_2_before_running() {
 fn commission_with_all_digit_alias_exits_2() {
     let store = TempDir::new().unwrap();
     mat(store.path())
-        .args([
-            "commission",
-            "--setup-code",
-            "MT:FAKE",
-            "--alias",
-            "42",
-        ])
+        .args(["commission", "--setup-code", "MT:FAKE", "--alias", "42"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("\"kind\":\"other\""));
