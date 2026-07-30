@@ -576,19 +576,21 @@ async fn node_subscription_loop(
     let mut down_since = tokio::time::Instant::now();
     let mut failures: u32 = 0;
     let mut warned = false;
+    health.mark_establishing(node_id);
     loop {
-        match run_subscription_once(
+        let last_error = match run_subscription_once(
             node_id, backend, &events, &clusters, &health, down_since, failures,
         )
         .await
         {
-            Ok(()) => {
+            Ok(reason) => {
                 // 購読が成立して喪失した: 状態遷移なので info、状態リセット。
                 tracing::info!(node_id, "subscription lost; resubscribing");
                 backoff = Duration::ZERO;
                 down_since = tokio::time::Instant::now();
                 failures = 0;
                 warned = false;
+                MatError::new(mat_core::error::ErrorKind::Other, reason)
             }
             Err(e) => {
                 failures += 1;
@@ -616,15 +618,18 @@ async fn node_subscription_loop(
                         tracing::debug!(node_id, kind = ?e.kind, detail = %e.detail, "subscription attempt failed");
                     }
                 }
+                e
             }
-        }
+        };
         backoff = next_backoff(backoff);
+        health.mark_down(node_id, down_since, failures, backoff, last_error);
         tokio::time::sleep(backoff).await;
     }
 }
 
-/// 1 回の購読試行。確立+Subscribe 成立まで到達したら Ok を返して抜ける
-/// （ポンプ死亡=正常喪失）。確立前の失敗は Err。
+/// 1 回の購読試行。確立+Subscribe 成立まで到達したら Ok(reason) を返して抜ける
+/// （ポンプ死亡=正常喪失。reason は pump 終了理由の人間可読文字列で、呼び手が
+/// `Down.last_error` の detail に使う）。確立前の失敗は Err。
 async fn run_subscription_once(
     node_id: u64,
     backend: &crate::native::NativeBackend,
@@ -633,7 +638,7 @@ async fn run_subscription_once(
     health: &SubHealth,
     down_since: tokio::time::Instant,
     prior_failures: u32,
-) -> Result<(), mat_core::error::MatError> {
+) -> Result<String, mat_core::error::MatError> {
     let mut conn = backend.establish_subscription(node_id).await?;
     let (info, priming) = conn.subscribe_wildcard(clusters).await?;
     tracing::info!(
@@ -644,6 +649,7 @@ async fn run_subscription_once(
         attempts = prior_failures + 1,
         "subscription established"
     );
+    health.mark_established(node_id, info.subscription_id, info.max_interval_s);
     // priming は現在状態の全量 — down 中の op はここで配信されるので pending 解除。
     health.clear_pending(node_id);
     for msg in &priming {
@@ -671,23 +677,40 @@ async fn run_subscription_once(
             // 再購読直後に同じ pending で即再発火しないよう先に消す。
             health.clear_pending(node_id);
             match end {
-                PumpEnd::OpGrace { since_op } => tracing::info!(
-                    node_id,
-                    since_op_s = since_op.as_secs(),
-                    "report pump ended (op-correlated: no device message after op)"
-                ),
-                PumpEnd::BornDeadSilence => tracing::info!(
-                    node_id,
-                    silent_s = last_msg.elapsed().as_secs(),
-                    "report pump ended (born-dead: no device message since establishment)"
-                ),
-                PumpEnd::Silence => tracing::info!(
-                    node_id,
-                    silent_s = last_msg.elapsed().as_secs(),
-                    "report pump ended (silence past deadline)"
-                ),
+                PumpEnd::OpGrace { since_op } => {
+                    tracing::info!(
+                        node_id,
+                        since_op_s = since_op.as_secs(),
+                        "report pump ended (op-correlated: no device message after op)"
+                    );
+                    return Ok(format!(
+                        "op-correlated: no device message {}s after op",
+                        since_op.as_secs()
+                    ));
+                }
+                PumpEnd::BornDeadSilence => {
+                    tracing::info!(
+                        node_id,
+                        silent_s = last_msg.elapsed().as_secs(),
+                        "report pump ended (born-dead: no device message since establishment)"
+                    );
+                    return Ok(format!(
+                        "born-dead: no device message since establishment ({}s silent)",
+                        last_msg.elapsed().as_secs()
+                    ));
+                }
+                PumpEnd::Silence => {
+                    tracing::info!(
+                        node_id,
+                        silent_s = last_msg.elapsed().as_secs(),
+                        "report pump ended (silence past deadline)"
+                    );
+                    return Ok(format!(
+                        "silence past deadline ({}s)",
+                        last_msg.elapsed().as_secs()
+                    ));
+                }
             }
-            return Ok(());
         }
         let remaining = deadline.saturating_sub(last_msg.elapsed());
         let slice = PUMP_SLICE.min(remaining);
@@ -696,6 +719,7 @@ async fn run_subscription_once(
                 proven = true;
                 last_msg = tokio::time::Instant::now();
                 health.clear_pending(node_id);
+                health.note_device_msg(node_id);
                 for ev in events_from_report(node_id, &msg, false) {
                     let _ = events.send(health.observe(ev));
                 }
@@ -709,7 +733,7 @@ async fn run_subscription_once(
                 // 詳細を残す（直後に caller が「subscription lost」を出す）。
                 health.clear_pending(node_id);
                 tracing::info!(node_id, kind = ?e.kind, detail = %e.detail, "report pump ended");
-                return Ok(());
+                return Ok(format!("pump ended: {}", e.detail));
             }
         }
     }
@@ -1721,13 +1745,71 @@ mod tests {
         assert_eq!(n[0]["for_s"], 1);
         assert_eq!(n[0]["attempts"], 3);
         assert_eq!(n[0]["backoff_s"], 20);
-        assert_eq!(n[0]["last_error"], json!({"kind": "unreachable", "detail": "no route"}));
+        assert_eq!(
+            n[0]["last_error"],
+            json!({"kind": "unreachable", "detail": "no route"})
+        );
 
         // node_id 昇順の安定出力。
         h.mark_establishing(2);
         let n = h.status_nodes();
         assert_eq!(n[0]["node_id"], 2);
         assert_eq!(n[1]["node_id"], 5);
+    }
+
+    /// manager 経路の統合: established（priming 到達後）→ down（op 相関死 +
+    /// 確立失敗の継続）→ 再 established をレジストリで追える。
+    #[tokio::test(start_paused = true)]
+    async fn status_nodes_tracks_established_down_reestablished() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let fail_subscription = Arc::clone(&est.fail_subscription);
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
+
+        // priming 到達 = established（subscription_id / max_interval は fake の値）。
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        let nodes = health.status_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["node_id"], 5);
+        assert_eq!(nodes[0]["state"], "established");
+        assert_eq!(nodes[0]["subscription_id"], 1);
+        assert_eq!(nodes[0]["max_interval_s"], 60);
+
+        // 以後の確立を失敗させ続けてから op 相関で pump を殺す → down が観測できる。
+        fail_subscription.store(1000, Ordering::SeqCst);
+        health.note_op(5, 0x0006);
+        let mut down = None;
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let nodes = health.status_nodes();
+            if nodes[0]["state"] == "down" {
+                down = Some(nodes[0].clone());
+                break;
+            }
+        }
+        let down = down.expect("status reaches down");
+        // 最初の down は pump 終了理由（op 相関）が last_error に入る。以後の
+        // 確立失敗で attempts が増え、last_error は establish 失敗へ置き換わる —
+        // どちらを観測するかはタイミング次第なので形だけ釘打ちする。
+        assert!(down["for_s"].is_u64());
+        assert!(down["attempts"].is_u64());
+        assert!(down["backoff_s"].as_u64().unwrap() >= 5);
+        assert!(down["last_error"]["kind"].is_string());
+        assert!(down["last_error"]["detail"].is_string());
+
+        // 失敗注入を解除 → 再確立で established に戻る。
+        fail_subscription.store(0, Ordering::SeqCst);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv())
+            .await
+            .expect("re-priming after recovery")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(health.status_nodes()[0]["state"], "established");
     }
 
     /// clusters(): 空 = full wildcard = None、非空はそのまま。
