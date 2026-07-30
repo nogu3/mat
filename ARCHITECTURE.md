@@ -297,6 +297,30 @@ This repo ships two binaries from one install:
   registry is a 1:1 mirror of the log narrative, not a second source of truth.
   Design: `docs/superpowers/specs/2026-07-30-matd-status-design.md`, plan:
   `docs/superpowers/plans/2026-07-30-matd-status.md`.
+- **CloseSession on teardown (Issue #20, 1.14.0).** `mat` never sent a
+  CloseSession and never resumed a session (by design, per the header
+  comment in `mat-controller/src/case.rs`) — every teardown just dropped
+  the CASE session in place. The Aqara FP300 (node16) re-anchors
+  subscription reports and keep-alives onto the **newest** same-fabric
+  CASE session, so the moment an abandoned session becomes newest it turns
+  into a black hole: after MRP exhausts its 5 retransmissions the device
+  silently discards the resident subscription, and matd stays blind until
+  its 330s silence deadline fires — wire-proven 2026-07-30, reproduced
+  within ±1s by firing a single `mat diag thread` against a live
+  subscription (pcap evidence in Issue #20). chip-sdk controllers (HA)
+  don't hit this because they reuse one CASE session for both ops and the
+  subscription. Fix: `SecureSession::send_close_session` sends a
+  best-effort Secure Channel StatusReport (`SUCCESS`, `secure-channel`,
+  code 2) — one encrypted datagram, no ack wait, no MRP retransmission —
+  immediately before a session is handed back, wired into all three
+  teardown families: `mat`'s one-shot direct-path ops (`diag` included,
+  since it is always direct-path), matd's warm-op session release, and
+  matd's subscription-pump exit paths (including the subscribe-failure
+  path). `send_reliable` was rejected because teardown must not block on
+  the ~4.7s MRP retransmission budget — the same precedent as `pase.rs`'s
+  abort StatusReport and the 2026-07-30 removal of the pre-teardown
+  silence probe. Design:
+  `docs/superpowers/specs/2026-07-30-close-session-design.md`.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
