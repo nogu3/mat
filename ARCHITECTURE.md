@@ -321,6 +321,17 @@ This repo ships two binaries from one install:
   abort StatusReport and the 2026-07-30 removal of the pre-teardown
   silence probe. Design:
   `docs/superpowers/specs/2026-07-30-close-session-design.md`.
+  **Real-device E2E caveat (2026-07-31):** the FP300 itself is NOT cured —
+  bidirectional pcap shows the CloseSession datagram on the wire, yet the
+  device still re-anchors its next keep-alive onto the closed session and
+  the subscription dies exactly as before (twice, reproducibly; either the
+  FW ignores CloseSession or SED indirect delivery hands it over only at
+  the next wake — too late either way). CloseSession therefore ships as
+  session hygiene for well-behaved devices, not as the Issue #20 fix; the
+  FP300 fix is a follow-up (direct-op hint to matd → immediate
+  resubscribe). The same E2E also surfaced a second, CASE-independent
+  death mode (subscription dies right after back-to-back reports ~1.7s
+  apart) tracked separately.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
