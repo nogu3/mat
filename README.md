@@ -116,7 +116,8 @@ With `--probe`, each `commissioned` node is checked against a live mDNS resolve
 (a native targeted `_matter._tcp` lookup per node, run concurrently) and
 annotated:
 
-- `reachable: true` — advertising now; `address` is the live-resolved value.
+- `reachable: true` — advertising now; `address` is the live-resolved value
+  (absent if the instance advertises no addresses — announce-only).
 - `reachable: false` — not advertising; no `address` (the ledger stores none —
   addresses are resolved live, never persisted).
 - `reachable: null` — the mDNS probe could not run (e.g. an interface I/O
@@ -385,13 +386,13 @@ mat diag node --node 5 --deep     # also probe native targeted mDNS + ping6 (to 
 {
   "timestamp": "...", "node_id": 5, "endpoint": 0,
   "verdict": "link_starved",
-  "summary": "IP reachable but not advertising Matter on any fabric; weak Thread link — SRP registration likely incomplete.",
+  "summary": "Not advertising Matter on any fabric; weak Thread link (best LQI 3) — SRP registration likely incomplete.",
   "checks": {
-    "ip":   { "ok": true, "loss_pct": 50, "rtt_ms": 168.0, "method": "ping6" },
     "mdns": { "advertised_self_fabric": false, "advertised_any_fabric": false },
     "operational": { "resolved": false, "kind": "timeout" },
     "thread": { "neighbor_count": 1, "best_lqi": 3, "routing_role": 2 }
   },
+  "unavailable": [ { "check": "ip", "kind": "mdns_unresolved" } ],
   "recommendation": "Improve the Thread link (move the device near a router) or wait; do NOT factory reset — the fabric is intact."
 }
 ```
@@ -405,7 +406,11 @@ mat diag node --node 5 --deep     # also probe native targeted mDNS + ping6 (to 
 > native targeted mDNS lookup first and pings the **live-resolved** address
 > (the ledger stores no address — Issue #18); if the node is not advertising
 > at all there is nothing to ping, the `ip` check lands in `unavailable` as
-> `mdns_unresolved`, and the split then rests on the Thread-side evidence.
+> `mdns_unresolved`, and the split then rests on the Thread-side evidence. A
+> failed mDNS probe itself (e.g. an interface I/O error) also lands `ip` as
+> `mdns_unresolved`; the two cases are distinguishable because the
+> probe-failure case additionally reports a `{"check": "mdns", ...}` entry
+> under `unavailable`.
 > Like `diag thread` it returns **partial
 > results** (skipped/failed checks go under `unavailable`) and **always exits
 > `0`** with a verdict, even when the node is fully unreachable — the value is in

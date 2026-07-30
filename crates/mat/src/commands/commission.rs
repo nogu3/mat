@@ -82,7 +82,7 @@ fn native_commission(
     rt.block_on(mat_native::commission::commission(&ncfg, &req))
 }
 
-/// 台帳 upsert + alias + JSON 出力（chip-tool 経路の成功側と共通）。
+/// 台帳 upsert + alias + JSON 出力。
 fn record_success(store: &mut Store, node_id: u64, alias: Option<&str>) -> Result<(), MatError> {
     store.upsert_node(NodeRecord {
         node_id,
