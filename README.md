@@ -820,6 +820,45 @@ matd stop                             # default socket
 matd stop --socket /run/mat/matd.sock
 ```
 
+Ask the running daemon what it is doing with `matd status` — one JSON line on
+stdout with daemon basics and the per-node state of the resident subscriptions
+(the same lifecycle the logs narrate: `establishing` → `established` →
+`down` with backoff and the last error). Durations are all "seconds ago"
+fields; `subscribed_clusters` mirrors `subscriptions.toml` (`null` = full
+wildcard); `pending_op_ago_s` is non-null only while a state-changing op has
+gone unanswered by the device (the op-correlation window):
+
+```bash
+matd status                           # default socket
+matd status --socket /run/mat/matd.sock
+```
+
+```json
+{
+  "timestamp": "2026-06-03T12:34:56+09:00",
+  "version": "1.12.0",
+  "uptime_s": 86400,
+  "native": "ready",
+  "iface": "wpan0",
+  "fabric_index": 1,
+  "store": "/home/user/.config/mat",
+  "subscribed_clusters": ["onoff", "occupancysensing"],
+  "listen_clients": 1,
+  "nodes": [
+    {"node_id": 5, "state": "established", "for_s": 3600,
+     "subscription_id": 7, "max_interval_s": 300,
+     "last_device_msg_ago_s": 42, "pending_op_ago_s": null},
+    {"node_id": 6, "state": "down", "for_s": 120, "attempts": 14,
+     "backoff_s": 60, "last_error": {"kind": "unreachable", "detail": "..."}}
+  ]
+}
+```
+
+If the native backend failed to build at startup, `native` carries that error
+(`{"kind": "store_missing", ...}`) and `nodes` is empty. If no daemon answers
+the socket, `matd status` exits `1` with `matd not running at ...` (same
+contract as `matd stop`).
+
 Only one `matd` runs per socket: startup takes an exclusive `flock` on
 `<socket>.lock`, so a second launch on the same socket exits `1` with `matd
 already running (lock held at ...)` instead of silently hijacking it.

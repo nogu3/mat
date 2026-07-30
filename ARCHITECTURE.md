@@ -288,6 +288,15 @@ This repo ships two binaries from one install:
   cap are removed, silence deadline tears down immediately again, and raising
   `SILENCE_SLACK` (the issue's original hypothesis) is rejected by the same
   data. Design: `docs/superpowers/specs/2026-07-30-silence-probe-extension-removal-design.md`.
+- **`matd status` (stability audit Tier 2 ⑥, 1.12.0).** A new socket admin op,
+  `status`, exposes what the resident daemon is doing without shelling out to
+  `ss -uanp` and inferring from socket counts. It is backed by `SubHealth`, a
+  per-node subscription-lifecycle registry (`Establishing` / `Established` /
+  `Down`, with attempts/backoff/last-error while down) that the subscription
+  loop updates at exactly the points it already logs a transition — the
+  registry is a 1:1 mirror of the log narrative, not a second source of truth.
+  Design: `docs/superpowers/specs/2026-07-30-matd-status-design.md`, plan:
+  `docs/superpowers/plans/2026-07-30-matd-status.md`.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
