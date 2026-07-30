@@ -208,7 +208,10 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
 
     let native = std::sync::Arc::new(native);
     // listen へのイベント配信路。購読 → broadcast → listen 接続（spec ②）。
-    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(1024);
+    // 初期 receiver は即 drop する（status の listen_clients を 1 過大にしない
+    // — 受信者ゼロの send エラーは購読側で正常扱い済み）。
+    let (events_tx, initial_rx) = tokio::sync::broadcast::channel(1024);
+    drop(initial_rx);
     // 常駐購読のクラスタ絞り込み（subscriptions.toml、無し = full wildcard）。
     // 設定不備は fail-fast: 黙って wildcard に落ちると弱リンク対策が無効化
     // されたことに気づけない（ambiguous iface autodetect と同じ規律）。
@@ -239,7 +242,13 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         std::sync::Arc::clone(&sub_health),
     );
 
-    server::serve(&socket, store_path, native, events_tx, sub_health)
+    let daemon = std::sync::Arc::new(server::DaemonInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        started: std::time::Instant::now(),
+        iface: iface.clone(),
+        fabric_index: cli.fabric_index,
+    });
+    server::serve(&socket, store_path, native, events_tx, sub_health, daemon)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }

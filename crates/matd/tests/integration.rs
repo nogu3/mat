@@ -83,8 +83,14 @@ async fn start_matd_with_events(
     let tx2 = tx.clone();
     let native = std::sync::Arc::new(native);
     let health = std::sync::Arc::new(matd::subscription::SubHealth::new(None));
+    let daemon = std::sync::Arc::new(matd::server::DaemonInfo {
+        version: "test",
+        started: std::time::Instant::now(),
+        iface: "lo".into(),
+        fabric_index: 1,
+    });
     let handle = tokio::spawn(async move {
-        let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health).await;
+        let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health, daemon).await;
     });
     (socket, handle, tx)
 }
@@ -616,4 +622,42 @@ async fn lagged_listener_gets_error_line_and_disconnect() {
     assert!(lines.next_line().await.unwrap().is_none());
 
     handle.abort();
+}
+
+/// status op: ワイヤ越しのスキーマ骨格。listen クライアントが付くと
+/// listen_clients に反映される。
+#[tokio::test]
+async fn status_op_returns_daemon_snapshot() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, _handle) =
+        start_matd(store_path.clone(), NativeState::Ready(Box::new(native))).await;
+
+    let resps = roundtrip(&socket, &[json!({"op":"status","id":9})]).await;
+    let r = &resps[0];
+    assert_eq!(r["id"], 9);
+    assert_eq!(r["native"], "ready");
+    assert_eq!(r["iface"], "lo");
+    assert_eq!(r["fabric_index"], 1);
+    assert_eq!(r["version"], "test");
+    assert_eq!(r["listen_clients"], 0);
+    assert_eq!(r["subscribed_clusters"], Value::Null);
+    assert!(r["nodes"].as_array().unwrap().is_empty());
+    assert_eq!(r["store"], store_path.display().to_string());
+    assert!(r["uptime_s"].is_u64());
+    assert!(r["timestamp"].is_string());
+
+    // listen を 1 本張る（ack を読むまで）→ listen_clients = 1。
+    let stream = UnixStream::connect(&socket).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"op\":\"listen\"}\n")
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(read_half).lines();
+    let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ack["listening"], json!(true));
+
+    let resps = roundtrip(&socket, &[json!({"op":"status"})]).await;
+    assert_eq!(resps[0]["listen_clients"], 1);
 }
