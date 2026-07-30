@@ -784,55 +784,74 @@ fn execute(
 
 async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(endpoint, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None, false)
-        .await?;
-    tracing::info!(
-        node_id,
-        cluster = "onoff",
-        command = "on",
-        "invoke executed (native direct)"
-    );
-    crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "on");
-    Ok(())
+    // 成否によらず close してから返す（Issue #20: 放置セッションは FP300 系の
+    // 常駐購読を黙殺する）。
+    let result = async {
+        conn.invoke(endpoint, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None, false)
+            .await?;
+        tracing::info!(
+            node_id,
+            cluster = "onoff",
+            command = "on",
+            "invoke executed (native direct)"
+        );
+        crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "on");
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_off(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(
-        endpoint,
-        im::CLUSTER_ON_OFF,
-        im::CMD_ON_OFF_OFF,
-        None,
-        false,
-    )
-    .await?;
-    tracing::info!(
-        node_id,
-        cluster = "onoff",
-        command = "off",
-        "invoke executed (native direct)"
-    );
-    crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "off");
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.invoke(
+            endpoint,
+            im::CLUSTER_ON_OFF,
+            im::CMD_ON_OFF_OFF,
+            None,
+            false,
+        )
+        .await?;
+        tracing::info!(
+            node_id,
+            cluster = "onoff",
+            command = "off",
+            "invoke executed (native direct)"
+        );
+        crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "off");
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_read_onoff(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    let v = conn.read_onoff(endpoint).await?;
-    tracing::info!(
-        node_id,
-        cluster = "onoff",
-        attribute = "on-off",
-        "read executed (native direct)"
-    );
-    crate::commands::read::emit_read_success(
-        node_id,
-        endpoint,
-        "onoff",
-        "on-off",
-        serde_json::json!(v),
-    );
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        let v = conn.read_onoff(endpoint).await?;
+        tracing::info!(
+            node_id,
+            cluster = "onoff",
+            attribute = "on-off",
+            "read executed (native direct)"
+        );
+        crate::commands::read::emit_read_success(
+            node_id,
+            endpoint,
+            "onoff",
+            "on-off",
+            serde_json::json!(v),
+        );
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_color(
@@ -845,22 +864,28 @@ async fn op_color(
     let fields =
         im::encode_move_to_hue_and_saturation_fields(color.hue_raw, color.sat_raw, transition);
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(
-        endpoint,
-        im::CLUSTER_COLOR_CONTROL,
-        im::CMD_MOVE_TO_HUE_AND_SATURATION,
-        Some(fields),
-        false,
-    )
-    .await?;
-    tracing::info!(
-        node_id,
-        cluster = "colorcontrol",
-        command = "move-to-hue-and-saturation",
-        "invoke executed (native direct)"
-    );
-    crate::commands::invoke::emit_color_success(node_id, endpoint, color, transition);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.invoke(
+            endpoint,
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(fields),
+            false,
+        )
+        .await?;
+        tracing::info!(
+            node_id,
+            cluster = "colorcontrol",
+            command = "move-to-hue-and-saturation",
+            "invoke executed (native direct)"
+        );
+        crate::commands::invoke::emit_color_success(node_id, endpoint, color, transition);
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_color_temp(
@@ -873,22 +898,30 @@ async fn op_color_temp(
 ) -> Result<(), MatError> {
     let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(
-        endpoint,
-        im::CLUSTER_COLOR_CONTROL,
-        im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-        Some(fields),
-        false,
-    )
-    .await?;
-    tracing::info!(
-        node_id,
-        cluster = "colorcontrol",
-        command = "move-to-color-temperature",
-        "invoke executed (native direct)"
-    );
-    crate::commands::invoke::emit_color_temp_success(node_id, endpoint, kelvin, mireds, transition);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.invoke(
+            endpoint,
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(fields),
+            false,
+        )
+        .await?;
+        tracing::info!(
+            node_id,
+            cluster = "colorcontrol",
+            command = "move-to-color-temperature",
+            "invoke executed (native direct)"
+        );
+        crate::commands::invoke::emit_color_temp_success(
+            node_id, endpoint, kelvin, mireds, transition,
+        );
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_level(
@@ -901,22 +934,28 @@ async fn op_level(
 ) -> Result<(), MatError> {
     let fields = im::encode_move_to_level_fields(level, transition);
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(
-        endpoint,
-        im::CLUSTER_LEVEL_CONTROL,
-        im::CMD_MOVE_TO_LEVEL,
-        Some(fields),
-        false,
-    )
-    .await?;
-    tracing::info!(
-        node_id,
-        cluster = "levelcontrol",
-        command = "move-to-level",
-        "invoke executed (native direct)"
-    );
-    crate::commands::invoke::emit_level_success(node_id, endpoint, percent, level, transition);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.invoke(
+            endpoint,
+            im::CLUSTER_LEVEL_CONTROL,
+            im::CMD_MOVE_TO_LEVEL,
+            Some(fields),
+            false,
+        )
+        .await?;
+        tracing::info!(
+            node_id,
+            cluster = "levelcontrol",
+            command = "move-to-level",
+            "invoke executed (native direct)"
+        );
+        crate::commands::invoke::emit_level_success(node_id, endpoint, percent, level, transition);
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_group_onoff(
@@ -1113,9 +1152,12 @@ async fn op_group_provision(
             endpoint,
             epoch_key: epoch_key_bytes,
         };
-        mat_native::ops::provision_node(&mut *conn, &p)
+        // 成否によらず close してから次ノードへ（Issue #20）。
+        let result = mat_native::ops::provision_node(&mut *conn, &p)
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
+        conn.close().await;
+        result?;
     }
 
     tracing::info!(
@@ -1134,10 +1176,12 @@ async fn op_group_grant(engine: &Engine, group_id: u16, node_ids: &[u64]) -> Res
     let mut unchanged: Vec<u64> = Vec::new();
     for &node_id in node_ids {
         let mut conn = engine.establisher.establish(node_id).await?;
-        if mat_native::ops::ensure_group_acl(&mut *conn, group_id)
+        // 成否によらず close してから次ノードへ（Issue #20）。
+        let result = mat_native::ops::ensure_group_acl(&mut *conn, group_id)
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?
-        {
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
+        conn.close().await;
+        if result? {
             updated.push(node_id);
         } else {
             unchanged.push(node_id);
@@ -1158,10 +1202,16 @@ async fn op_read_attr(
     attribute: u32,
 ) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    let v = conn.read_json(endpoint, cluster, attribute).await?;
-    tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
-    crate::commands::read::emit_read_success(node_id, endpoint, cluster_in, attribute_in, v);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        let v = conn.read_json(endpoint, cluster, attribute).await?;
+        tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
+        crate::commands::read::emit_read_success(node_id, endpoint, cluster_in, attribute_in, v);
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1178,28 +1228,34 @@ async fn op_write_attr(
     timed: bool,
 ) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.write_tlv(
-        endpoint,
-        cluster,
-        attribute,
-        mat_native::scalar_to_tlv(value),
-        timed,
-    )
-    .await?;
-    tracing::info!(
-        node_id,
-        cluster,
-        attribute,
-        "write executed (native direct)"
-    );
-    crate::commands::write::emit_write_success(
-        node_id,
-        endpoint,
-        cluster_in,
-        attribute_in,
-        value_in,
-    );
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.write_tlv(
+            endpoint,
+            cluster,
+            attribute,
+            mat_native::scalar_to_tlv(value),
+            timed,
+        )
+        .await?;
+        tracing::info!(
+            node_id,
+            cluster,
+            attribute,
+            "write executed (native direct)"
+        );
+        crate::commands::write::emit_write_success(
+            node_id,
+            endpoint,
+            cluster_in,
+            attribute_in,
+            value_in,
+        );
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1215,40 +1271,63 @@ async fn op_invoke_generic(
     timed: bool,
 ) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    conn.invoke(endpoint, cluster, command, fields_tlv.clone(), timed)
-        .await?;
-    tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
-    crate::commands::invoke::emit_invoke_success(node_id, endpoint, cluster_in, command_in);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        conn.invoke(endpoint, cluster, command, fields_tlv.clone(), timed)
+            .await?;
+        tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
+        crate::commands::invoke::emit_invoke_success(node_id, endpoint, cluster_in, command_in);
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_describe(engine: &Engine, node_id: u64) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    let endpoints = mat_native::ops::describe(&mut *conn).await?;
-    tracing::info!(node_id, "describe executed (native direct)");
-    crate::commands::describe::emit_describe_success(node_id, &endpoints);
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        let endpoints = mat_native::ops::describe(&mut *conn).await?;
+        tracing::info!(node_id, "describe executed (native direct)");
+        crate::commands::describe::emit_describe_success(node_id, &endpoints);
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_diag_thread(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    let snap = mat_native::ops::diag_thread(&mut *conn, endpoint).await?;
-    // wildcard read は per-attribute の失敗を出さないため native 経路の
-    // unavailable は通常空だが、スキーマ整合のため chip-tool 経路と同じ
-    // 形（{"attribute", "kind"}）へ変換して渡す。
-    let unavailable: Vec<serde_json::Value> = snap
-        .unavailable
-        .iter()
-        .map(|(attr, kind)| {
-            serde_json::json!({
-                "attribute": attr,
-                "kind": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        let snap = mat_native::ops::diag_thread(&mut *conn, endpoint).await?;
+        // wildcard read は per-attribute の失敗を出さないため native 経路の
+        // unavailable は通常空だが、スキーマ整合のため chip-tool 経路と同じ
+        // 形（{"attribute", "kind"}）へ変換して渡す。
+        let unavailable: Vec<serde_json::Value> = snap
+            .unavailable
+            .iter()
+            .map(|(attr, kind)| {
+                serde_json::json!({
+                    "attribute": attr,
+                    "kind": serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
+                })
             })
-        })
-        .collect();
-    tracing::info!(node_id, endpoint, "diag thread executed (native direct)");
-    crate::commands::diag::emit_diag_thread_success(node_id, endpoint, snap.fields, unavailable);
-    Ok(())
+            .collect();
+        tracing::info!(node_id, endpoint, "diag thread executed (native direct)");
+        crate::commands::diag::emit_diag_thread_success(
+            node_id,
+            endpoint,
+            snap.fields,
+            unavailable,
+        );
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 async fn op_open_window(
@@ -1259,24 +1338,30 @@ async fn op_open_window(
     discriminator: u16,
 ) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    // timeout は chip-tool 経路と同じ u32 CLI 値、window API は u16
-    // （spec 上 window timeout は 16-bit）。飽和させて渡す。
-    let timeout_u16 = u16::try_from(timeout).unwrap_or(u16::MAX);
-    let (manual_code, qr_payload) = conn
-        .open_window(timeout_u16, discriminator, iteration)
-        .await?;
-    tracing::info!(
-        node_id,
-        discriminator,
-        "open-window executed (native direct)"
-    );
-    crate::commands::open_window::emit_open_window_success(
-        node_id,
-        &manual_code,
-        &qr_payload,
-        timeout,
-    );
-    Ok(())
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        // timeout は chip-tool 経路と同じ u32 CLI 値、window API は u16
+        // （spec 上 window timeout は 16-bit）。飽和させて渡す。
+        let timeout_u16 = u16::try_from(timeout).unwrap_or(u16::MAX);
+        let (manual_code, qr_payload) = conn
+            .open_window(timeout_u16, discriminator, iteration)
+            .await?;
+        tracing::info!(
+            node_id,
+            discriminator,
+            "open-window executed (native direct)"
+        );
+        crate::commands::open_window::emit_open_window_success(
+            node_id,
+            &manual_code,
+            &qr_payload,
+            timeout,
+        );
+        Ok(())
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 /// 確立 → 1 op → 破棄。値を返す op（read）は emit まで行う。ディスパッチのみ —
@@ -1526,6 +1611,9 @@ async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> Di
                 Err(e) => Err(e.kind),
                 Ok(snap) => mat_native::ops::thread_check_from_snapshot(&snap).map_err(|e| e.kind),
             };
+            // 成否によらず close してから返す（Issue #20）。establish 自体の
+            // 失敗（Err 腕）はセッションが無いので close 不要。
+            conn.close().await;
             (resolved, op_kind, thread)
         }
     };
@@ -1592,24 +1680,30 @@ async fn mesh_probe_one(
     node_id: u64,
 ) -> Result<mat_core::mesh::ProbeData, MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
-    let snap = mat_native::ops::diag_thread(&mut *conn, 0).await?;
-    let identity = match mat_native::ops::thread_identity(&mut *conn, 0).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(node_id, kind = ?e.kind,
-                "network-interfaces read failed; continuing without self-identity");
-            None
-        }
-    };
-    tracing::info!(
-        node_id,
-        has_identity = identity.is_some(),
-        "mesh probe executed (native direct)"
-    );
-    Ok(mat_core::mesh::ProbeData {
-        thread: snap.fields,
-        identity,
-    })
+    // 成否によらず close してから返す（Issue #20）。
+    let result = async {
+        let snap = mat_native::ops::diag_thread(&mut *conn, 0).await?;
+        let identity = match mat_native::ops::thread_identity(&mut *conn, 0).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(node_id, kind = ?e.kind,
+                    "network-interfaces read failed; continuing without self-identity");
+                None
+            }
+        };
+        tracing::info!(
+            node_id,
+            has_identity = identity.is_some(),
+            "mesh probe executed (native direct)"
+        );
+        Ok(mat_core::mesh::ProbeData {
+            thread: snap.fields,
+            identity,
+        })
+    }
+    .await;
+    conn.close().await;
+    result
 }
 
 #[cfg(test)]
@@ -1954,6 +2048,54 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// op 成功時に close が呼ばれる（Issue #20）: 放置セッションが FP300 系の
+    /// 常駐購読を黙殺する対策。conn は establisher 側に move されるため、
+    /// `FakeConn::close_calls`（establish 後も参照できる共有 Arc）で観測する。
+    #[tokio::test]
+    async fn op_on_closes_session_on_success() {
+        use mat_native::test_support::FakeEstablisher;
+        use std::sync::atomic::Ordering;
+        let est = FakeEstablisher::default();
+        let close_calls = std::sync::Arc::clone(&est.conn_close_calls);
+        let engine = mat_native::Engine::with_parts(Box::new(est), None);
+        run_op(
+            &engine,
+            &NativeOp::On {
+                node_id: 5,
+                endpoint: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// op 失敗時（invoke/read がエラー）でも close が呼ばれる（Issue #20）。
+    #[tokio::test]
+    async fn op_closes_session_on_failure() {
+        use mat_core::error::ErrorKind;
+        use mat_native::test_support::FakeEstablisher;
+        use std::sync::atomic::Ordering;
+        let est = FakeEstablisher {
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            ..Default::default()
+        };
+        let close_calls = std::sync::Arc::clone(&est.conn_close_calls);
+        let engine = mat_native::Engine::with_parts(Box::new(est), None);
+        let err = run_op(
+            &engine,
+            &NativeOp::ReadOnOff {
+                node_id: 5,
+                endpoint: 1,
+            },
+        )
+        .await
+        .expect_err("timeout must surface");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

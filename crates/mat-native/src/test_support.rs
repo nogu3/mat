@@ -142,6 +142,10 @@ pub struct FakeConn {
     written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
     /// 送信系メソッド冒頭の遅延（deadline 執行テスト用、Issue #16）。None = 遅延なし。
     pub delay: Option<std::time::Duration>,
+    /// `close()` の呼び出し回数。establisher へ渡してしまい conn 自体への参照が
+    /// 残せないテスト（native_direct.rs の直経路 op テスト）向けに、
+    /// `FakeSubConn::close_calls` と同じ手法で外部 Arc に記録する（Issue #20）。
+    pub close_calls: std::sync::Arc<AtomicUsize>,
 }
 
 impl Default for FakeConn {
@@ -155,6 +159,7 @@ impl Default for FakeConn {
             calls: Vec::new(),
             written_tlv: Vec::new(),
             delay: None,
+            close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -300,6 +305,7 @@ impl NodeConn for FakeConn {
 
     async fn close(&mut self) {
         self.calls.push("close()".to_string());
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -328,6 +334,9 @@ pub struct FakeEstablisher {
     pub conn_delay: Option<std::time::Duration>,
     /// establish 自体の遅延（establish フェーズの deadline 執行テスト用）。
     pub establish_delay: Option<std::time::Duration>,
+    /// 払い出す全 FakeConn が共有する `close_calls`（Issue #20: op 側の
+    /// close() 呼び出しをテストが establish 後から観測するための Arc）。
+    pub conn_close_calls: std::sync::Arc<AtomicUsize>,
 }
 
 impl Default for FakeEstablisher {
@@ -342,6 +351,7 @@ impl Default for FakeEstablisher {
             fail_next_report: std::sync::Arc::default(),
             conn_delay: None,
             establish_delay: None,
+            conn_close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -357,6 +367,7 @@ impl Establisher for FakeEstablisher {
             fail_first_send: self.fail_first_send && n == 0,
             fail_kind: self.fail_kind,
             delay: self.conn_delay,
+            close_calls: std::sync::Arc::clone(&self.conn_close_calls),
             ..Default::default()
         }))
     }
