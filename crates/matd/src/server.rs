@@ -1602,7 +1602,6 @@ mod tests {
         store
             .upsert_node(mat_core::store::NodeRecord {
                 node_id: 1,
-                address: Some("192.0.2.10".into()),
                 commissioned_at: "2026-06-08T00:00:00+09:00".into(),
             })
             .unwrap();
@@ -1618,7 +1617,6 @@ mod tests {
         store
             .upsert_node(mat_core::store::NodeRecord {
                 node_id: 5,
-                address: Some("192.0.2.10".into()),
                 commissioned_at: "2026-06-08T00:00:00+09:00".into(),
             })
             .unwrap();
@@ -1986,7 +1984,6 @@ mod tests {
         store
             .upsert_node(mat_core::store::NodeRecord {
                 node_id: 5,
-                address: Some("192.0.2.10".into()),
                 commissioned_at: "2026-07-21T00:00:00+09:00".into(),
             })
             .unwrap();

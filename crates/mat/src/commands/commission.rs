@@ -90,7 +90,6 @@ fn record_success(
 ) -> Result<(), MatError> {
     store.upsert_node(NodeRecord {
         node_id,
-        address: None,
         commissioned_at: output::now_iso8601(),
     })?;
     if let Some(name) = alias {
