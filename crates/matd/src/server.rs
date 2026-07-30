@@ -734,6 +734,7 @@ fn op_state_target(op: &Op) -> Option<(u64, u16)> {
         | Op::GroupBump
         | Op::Listen { .. }
         | Op::Ping
+        | Op::Status
         | Op::Shutdown => None,
     }
 }
