@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorKind, MatError};
 
 /// commission 済みノード1件の台帳エントリ。
+///
+/// address は保存しない（Issue #18 で撤去）: 実行時は常に mDNS 解決であり、
+/// 保存した IP は Thread prefix 再構成で原理的に stale になる。旧形式ファイル
+/// （address 付き）は serde が未知フィールドを無視して読め、次の書き込みで消える。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeRecord {
     pub node_id: u64,
-    /// commission したアドレス（IP / DNS-SD ホスト）。診断用。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
     /// commission 完了時刻（ISO 8601）。
     pub commissioned_at: String,
 }
@@ -185,17 +186,13 @@ mod tests {
             store
                 .upsert_node(NodeRecord {
                     node_id: 7,
-                    address: Some("192.0.2.10".into()),
                     commissioned_at: "2026-06-06T00:00:00+09:00".into(),
                 })
                 .unwrap();
         }
         // 再オープンして永続を確認。
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            store.require_node(7).unwrap().address.as_deref(),
-            Some("192.0.2.10")
-        );
+        assert_eq!(store.require_node(7).unwrap().node_id, 7);
         // atomic write の tmp が残らないこと。
         assert!(!dir.path().join("nodes.tmp").exists());
     }
@@ -206,5 +203,26 @@ mod tests {
         std::fs::write(dir.path().join("nodes.json"), "{ not json").unwrap();
         let err = Store::open(dir.path()).unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreParse);
+    }
+
+    #[test]
+    fn old_format_ledger_with_address_parses_and_sheds_it_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.json"),
+            r#"{"version":1,"nodes":{"5":{"node_id":5,"address":"192.0.2.10","commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
+        )
+        .unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.require_node(5).unwrap().node_id, 5);
+        // 次の台帳書き込みで旧フィールドは自然に消える。
+        store
+            .upsert_node(NodeRecord {
+                node_id: 6,
+                commissioned_at: "2026-01-02T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("nodes.json")).unwrap();
+        assert!(!text.contains("address"));
     }
 }

@@ -30,7 +30,6 @@ fn make_store() -> (tempfile::TempDir, PathBuf) {
     store
         .upsert_node(NodeRecord {
             node_id: 1,
-            address: Some("192.0.2.10".into()),
             commissioned_at: "2026-06-08T00:00:00+09:00".into(),
         })
         .unwrap();
