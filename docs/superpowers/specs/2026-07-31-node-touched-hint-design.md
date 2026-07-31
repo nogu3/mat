@@ -61,10 +61,14 @@ SED の indirect 配送が次回起床＝手遅れにしか届かないか — �
     `touched: direct-path session superseded` — 既存の「subscription lost;
     resubscribing」フローに乗せる）→ **バックオフ無しで即再確立**。
   - バックオフ待ち（down）中 → バックオフを打ち切って即再試行。
-  - 再確立が既に進行中 → 何もしない（進行中の再購読自体が「最新セッション」を
-    塗り替えるので目的達成済み）。
+  - 再確立が既に進行中 → フラグが残り、確立直後の pump が次スライスで
+    Touched 終了して**もう1サイクル**張り直す（実装の実挙動、2026-07-31 最終
+    レビューで確定）。ヒント到着 = より新しいセッションの存在なので保守的に
+    正しく、フラグは消費されるため有界。「何もしない」ではない。
   - 該当ノードに購読が無い（台帳外 / listen 対象外）→ no-op。
-  - いずれも INFO ログ 1 行（node_id + 発生元 external/internal）。
+  - INFO ログは external（server 受信時 `source="external"`）のみ。internal は
+    `no warm session; establishing` と `pump ended (touched...)` の隣接で判読
+    （専用ログは未実装 — 必要になったら追加）。
 - 未知 op として旧 matd に送った場合のエラーは mat 側で握りつぶす
   （バージョン混在期の後方互換）。
 
