@@ -143,6 +143,11 @@ pub struct SecureSession {
     /// ときの持ち越しエラー。次の next_subscription_report 呼び出しが返す
     /// （report を道連れにせず、セッション死の即時検知も保つ — 監査#1 経路A）。
     deferred_sub_err: Option<SessionError>,
+    /// 最後に受けたピア発 needs_ack メッセージの (exchange_id, counter)。
+    /// seal が同一 exchange への次の送信に piggyback ack として自動添付する
+    /// （spec 4.12.5.2.2 / Issue #21: standalone ack の RF 喪失時、これが
+    /// 無いとピアの MRP が未充足のまま残り、FP300 は購読を silent 破棄する）。
+    pending_peer_ack: Option<(u16, u32)>,
 }
 
 impl SecureSession {
@@ -168,6 +173,7 @@ impl SecureSession {
             peer_initiated: std::collections::VecDeque::new(),
             last_rx: None,
             deferred_sub_err: None,
+            pending_peer_ack: None,
         }
     }
 
@@ -209,6 +215,22 @@ impl SecureSession {
         payload: &[u8],
     ) -> Result<(Vec<u8>, u32), SessionError> {
         let needs_ack = needs_ack && !self.transport.is_reliable();
+        // ピア発 needs_ack メッセージへの pending ack を、同一 exchange への
+        // 次の送信に piggyback する（呼び出し元が明示した ack が優先）。
+        // standalone ack は screen で即時送信済みだが、それが RF で失われた
+        // ときの唯一の回収経路がこの piggyback（Issue #21）。冪等なので
+        // 二重 ack は無害。消費は 1 回（stale な exchange id との偶然一致で
+        // 古い counter を ack し続けないため）。
+        let acked_counter = match acked_counter {
+            Some(c) => Some(c),
+            None => match self.pending_peer_ack {
+                Some((ex, c)) if ex == exchange_id => {
+                    self.pending_peer_ack = None;
+                    Some(c)
+                }
+                _ => None,
+            },
+        };
         let message_counter = self.counter.next();
         let header = MessageHeader {
             session_id: self.peer_session_id,
@@ -358,6 +380,9 @@ impl SecureSession {
             // （デバイス起点など）宛の重複を誤った exchange/role で ack する
             // と相手が突合できず、再送予算を使い切るまでリトライし続ける。
             if proto.needs_ack && !self.transport.is_reliable() {
+                // 重複再送 = こちらの ack が届いていない証拠。再 ack に加え、
+                // 同一 exchange への次の送信でも piggyback できるよう記録する。
+                self.pending_peer_ack = Some((proto.exchange_id, header.message_counter));
                 self.send_standalone_ack(
                     proto.exchange_id,
                     !proto.initiator,
@@ -372,6 +397,7 @@ impl SecureSession {
         // 再送を待たない）。exchange フィルタは配送の可否だけを決め、ack の
         // 有無には影響しない。
         if proto.needs_ack && !self.transport.is_reliable() {
+            self.pending_peer_ack = Some((proto.exchange_id, header.message_counter));
             self.send_standalone_ack(proto.exchange_id, !proto.initiator, header.message_counter)
                 .await?;
         }
@@ -2770,6 +2796,101 @@ mod tests {
             .await
             .unwrap();
         assert!(ka.reports.is_empty()); // keep-alive
+        dev_task.await.unwrap();
+    }
+
+    /// 実機バグの釘（Issue #21）: needs_ack な購読 ReportData への
+    /// StatusResponse は、その report の message counter を piggyback ack
+    /// しなければならない。standalone ack が RF で失われたとき、デバイスは
+    /// SR を受け取っても report の MRP が未充足のままになり（FP300 実測:
+    /// 完了済み exchange の report を再送 → その後購読を silent 破棄）、
+    /// piggyback だけがこの経路を塞ぐ。
+    #[tokio::test]
+    async fn status_response_piggybacks_ack_of_report() {
+        let device = bind_local().await;
+        let peer = device.local_addr().unwrap();
+        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let local = transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&transport),
+            peer,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+
+        const REPORT_COUNTER: u32 = 500;
+        let dev_task = tokio::spawn(async move {
+            // デバイス起点 exchange（initiator=true）の needs_ack ReportData。
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: REPORT_COUNTER,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x7777,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let report = seal_message(
+                &R2I,
+                &header,
+                &proto,
+                &subscription_report_payload(42, true, false),
+                DEV_NODE,
+            )
+            .unwrap();
+            device.send_to(&report, local).await.unwrap();
+            // standalone ack と StatusResponse の両方が届く。SR を拾って
+            // piggyback ack を検査し、SR には ack を返して exchange を閉じる。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            loop {
+                let (n, from) = device.recv_from(&mut buf).await.unwrap();
+                let (h, p, _) = open_from_controller(&buf[..n]);
+                if p.opcode != crate::im::OPCODE_STATUS_RESPONSE {
+                    continue;
+                }
+                assert_eq!(
+                    p.acked_counter,
+                    Some(REPORT_COUNTER),
+                    "StatusResponse must piggyback the report's ack"
+                );
+                // SR への ack はデバイスが initiator の exchange 上で返す。
+                let ack_header = MessageHeader {
+                    session_id: LOCAL_SID,
+                    security_flags: 0,
+                    message_counter: REPORT_COUNTER + 1,
+                    source_node_id: None,
+                    destination: Destination::None,
+                };
+                let ack_proto = ProtocolHeader {
+                    initiator: true,
+                    needs_ack: false,
+                    acked_counter: Some(h.message_counter),
+                    opcode: OPCODE_MRP_STANDALONE_ACK,
+                    exchange_id: 0x7777,
+                    protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                    vendor_id: None,
+                };
+                let ack = seal_message(&R2I, &ack_header, &ack_proto, &[], DEV_NODE).unwrap();
+                device.send_to(&ack, from).await.unwrap();
+                break;
+            }
+        });
+
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd.subscription_id, Some(42));
         dev_task.await.unwrap();
     }
 
