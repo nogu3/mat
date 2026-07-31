@@ -82,6 +82,12 @@ async fn close_and_clear(guard: &mut Option<Box<dyn NodeConn>>) {
 pub struct NativeBackend {
     engine: mat_native::Engine,
     sessions: Mutex<HashMap<u64, NodeSlot>>,
+    /// 新規 CASE セッション確立を外側へ知らせる汎用フック（Issue #20 経路2）。
+    /// native.rs は subscription.rs を知らないため node_id だけを渡す薄い
+    /// コールバックにする — 呼び出し元（main.rs）が `SubHealth::note_touched`
+    /// を注入する。`OnceLock` は `&self` で set できる（プロセス起動時に
+    /// `Arc<NativeBackend>` 経由で 1 回だけ注入する用途に合う）。
+    on_new_session: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// 手動 `Debug`: `Engine` / warm セッションは `Debug` を持たず、
@@ -114,7 +120,15 @@ impl NativeBackend {
         Self {
             engine,
             sessions: Mutex::new(HashMap::new()),
+            on_new_session: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 新規 CASE セッション確立（cold establish / resend-establish）のたびに
+    /// `cb(node_id)` を呼ぶよう登録する。プロセス寿命で 1 回だけ呼ぶ想定
+    /// （2 回目以降の呼び出しは無視 — `OnceLock` の性質）。
+    pub fn set_on_new_session(&self, cb: Box<dyn Fn(u64) + Send + Sync>) {
+        let _ = self.on_new_session.set(cb);
     }
 
     /// テスト用: 任意の Establisher を注入する（group 送信は無効）。`pub`（cfg(test)
@@ -199,6 +213,43 @@ impl NativeBackend {
             Box<dyn std::future::Future<Output = Result<T, MatError>> + Send + 'a>,
         >,
     {
+        let (result, established_new) = self.with_session_inner(node_id, deadline, op).await;
+        // セッションを新設した = デバイスの「最新セッション」が op 用に変わった。
+        // FP300 はここへ購読レポートを付け替えるので、購読側へ即時張り直しを
+        // 合図する（Issue #20 経路2 — 2026-07-30 17:09 hold-time write 事故の
+        // 再発防止）。op の成否確定後・関数を抜ける直前に高々1回だけ発火する。
+        //
+        // 既知の限界: この warm op セッションは張り直した購読セッションより
+        // 新しいまま残り続けるため、直後にさらにレポートがこちらへ向く余地は
+        // 残る。それでも matd の warm ソケットは MRP ack を返す生きたソケット
+        // なので黒穴にはならず、次の張り直しで購読側が最新化される
+        // （セッション統合は spec の非目標 — ここではしない）。
+        if established_new {
+            if let Some(cb) = self.on_new_session.get() {
+                cb(node_id);
+            }
+        }
+        result
+    }
+
+    /// [`with_session`] の本体。戻り値の第2要素は、この呼び出し中に新規
+    /// CASE セッションを確立したか（cold establish / resend-establish の
+    /// いずれか）— 呼び出し元がコールバック発火を1箇所に集約するための
+    /// シグナル。
+    async fn with_session_inner<F, T>(
+        &self,
+        node_id: u64,
+        deadline: Option<Instant>,
+        op: F,
+    ) -> (Result<T, MatError>, bool)
+    where
+        F: for<'a> Fn(
+            &'a mut Box<dyn NodeConn>,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<T, MatError>> + Send + 'a>,
+        >,
+    {
+        let mut established_new = false;
         let started = Instant::now();
         let slot = self.slot(node_id).await;
         let mut guard = slot.lock().await;
@@ -208,15 +259,20 @@ impl NativeBackend {
             // 伸びる原因）。再確立側は下の Timeout / その他エラー腕で既に
             // info を出しているので、これで確立の両側が揃う。
             tracing::info!(node_id, "no warm session; establishing");
-            *guard = Some(
-                bounded(
-                    deadline,
-                    started,
-                    "establish",
-                    self.engine.establisher.establish(node_id),
-                )
-                .await?,
-            );
+            match bounded(
+                deadline,
+                started,
+                "establish",
+                self.engine.establisher.establish(node_id),
+            )
+            .await
+            {
+                Ok(conn) => {
+                    *guard = Some(conn);
+                    established_new = true;
+                }
+                Err(e) => return (Err(e), established_new),
+            }
         }
         let result = bounded(
             deadline,
@@ -226,7 +282,7 @@ impl NativeBackend {
         )
         .await;
         match result {
-            Ok(v) => Ok(v),
+            Ok(v) => (Ok(v), established_new),
             Err(e) if e.kind == ErrorKind::Timeout => {
                 // MRP 再送尽き or deadline 超過=未達の可能性大。どちらも session
                 // は持ち越さない。
@@ -240,22 +296,27 @@ impl NativeBackend {
                             remaining_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX),
                             "skipping re-establish; insufficient budget"
                         );
-                        return Err(e);
+                        return (Err(e), established_new);
                     }
                 }
                 tracing::info!(
                     node_id,
                     "native session send timed out; re-establishing once"
                 );
-                *guard = Some(
-                    bounded(
-                        deadline,
-                        started,
-                        "resend-establish",
-                        self.engine.establisher.establish(node_id),
-                    )
-                    .await?,
-                );
+                match bounded(
+                    deadline,
+                    started,
+                    "resend-establish",
+                    self.engine.establisher.establish(node_id),
+                )
+                .await
+                {
+                    Ok(conn) => {
+                        *guard = Some(conn);
+                        established_new = true;
+                    }
+                    Err(e2) => return (Err(e2), established_new),
+                }
                 let retried = bounded(
                     deadline,
                     started,
@@ -270,11 +331,13 @@ impl NativeBackend {
                         close_and_clear(&mut guard).await;
                     }
                 }
-                retried
+                (retried, established_new)
             }
             // DeviceRejected（IM status 拒否=届いて処理された、session 健全）と
             // ParseError（値デコード問題、session 健全）は slot 維持で即 Err。
-            Err(e) if matches!(e.kind, ErrorKind::DeviceRejected | ErrorKind::ParseError) => Err(e),
+            Err(e) if matches!(e.kind, ErrorKind::DeviceRejected | ErrorKind::ParseError) => {
+                (Err(e), established_new)
+            }
             // それ以外（Other/Unreachable 等 = 復号失敗・カウンタ desync・不正フレーム
             // 等で session が死んだ疑い）。応答が受かった可能性があるので再送はしないが、
             // 死んだ session を持ち続けると恒久 wedge になる。slot を捨てて次コマンドで
@@ -286,7 +349,7 @@ impl NativeBackend {
                     "native session error; dropping session for lazy re-establish"
                 );
                 close_and_clear(&mut guard).await;
-                Err(e)
+                (Err(e), established_new)
             }
         }
     }
@@ -796,6 +859,57 @@ mod tests {
         // slot は破棄済み: 次 op は再確立する。
         backend.read_onoff(0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// cold establish で op を完了するとコールバックが1回発火する
+    /// （Issue #20 経路2: 内部トリガ）。
+    #[tokio::test]
+    async fn cold_establish_fires_on_new_session() {
+        let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let fired2 = std::sync::Arc::clone(&fired);
+        backend.set_on_new_session(Box::new(move |_node_id| {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        }));
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// warm 再利用（同一 node への 2 回目の op）ではコールバックは発火しない
+    /// — 発火は新設時のみ。
+    #[tokio::test]
+    async fn warm_reuse_does_not_fire() {
+        let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let fired2 = std::sync::Arc::clone(&fired);
+        backend.set_on_new_session(Box::new(move |_node_id| {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        }));
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        // cold 1回 → 2回目の op（warm 再利用）→ 計1回のまま。
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// send Timeout 後の resend-establish（1 op 内での cold + 再確立）でも
+    /// コールバックは発火する（op 完了後・1回のみ）。
+    #[tokio::test]
+    async fn resend_establish_fires_on_new_session() {
+        let est = FakeEstablisher {
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            ..Default::default()
+        };
+        let backend = NativeBackend::with_establisher(Box::new(est));
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let fired2 = std::sync::Arc::clone(&fired);
+        backend.set_on_new_session(Box::new(move |_node_id| {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        }));
+        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        // 同一 with_session 呼び出し内で cold + resend-establish の 2 回
+        // 新設が起きても発火は 1 回のみ（op 完了後に一度だけ判定するため）。
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
