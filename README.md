@@ -1079,6 +1079,18 @@ and `diag node --deep` do a native **targeted** mDNS resolve per ledger node
 advertising proxies that answer direct instance queries but omit instances from
 PTR enumeration, so enumerate-and-match under-reports.
 
+Running the op direct is not the same as `matd` never hearing about it: every
+node-targeted op that establishes a CASE session — `open-window`, `diag
+thread` / `diag node` / `diag mesh` (once per touched node) and `group
+grant` included — sends a single fire-and-forget `node_touched` hint to
+`matd` (if one is running) right after the op closes, so a resident
+subscription for that node resubscribes immediately instead of waiting on
+matd's 330s silence deadline (Issue #20, 1.15.0; see ARCHITECTURE.md). The
+op itself still runs entirely on the direct path either way — `matd` never
+executes it, only reacts afterward — and `discover` / `commission` / `fabric
+init` send no hint at all (no CASE session, or, for `commission`, no
+subscription yet to refresh).
+
 ```bash
 mat --iface eth0 on --node 5
 # or: MAT_IFACE=eth0 MAT_FABRIC_INDEX=2 mat group invoke --group 10 --cluster onoff --command on
