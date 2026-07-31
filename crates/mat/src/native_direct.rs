@@ -782,6 +782,18 @@ fn execute(
     })
 }
 
+/// close + matd への node_touched ヒント送信をまとめた終端処理（Issue #20
+/// 拡張）。close 同様、op の成否に関わらず呼ぶ（establish 自体の失敗は conn
+/// が無いので呼び出し側は `?` で早期 return し、ここには来ない）。
+///
+/// ヒント送信はブロッキング std I/O（`matd_client::hint_node_touched`）だが、
+/// ここは one-shot CLI の `block_on` 直下で他に走っている非同期タスクが無い
+/// ため async 化する価値が無い（呼び出し元コメント参照）。
+async fn finish_conn(conn: &mut Box<dyn mat_native::NodeConn>, node_id: u64) {
+    conn.close().await;
+    crate::matd_client::hint_node_touched(node_id);
+}
+
 async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
     // 成否によらず close してから返す（Issue #20: 放置セッションは FP300 系の
@@ -799,7 +811,7 @@ async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatEr
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -825,7 +837,7 @@ async fn op_off(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatE
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -850,7 +862,7 @@ async fn op_read_onoff(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -884,7 +896,7 @@ async fn op_color(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -920,7 +932,7 @@ async fn op_color_temp(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -954,7 +966,7 @@ async fn op_level(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1156,7 +1168,7 @@ async fn op_group_provision(
         let result = mat_native::ops::provision_node(&mut *conn, &p)
             .await
             .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
-        conn.close().await;
+        finish_conn(&mut conn, node_id).await;
         result?;
     }
 
@@ -1180,7 +1192,7 @@ async fn op_group_grant(engine: &Engine, group_id: u16, node_ids: &[u64]) -> Res
         let result = mat_native::ops::ensure_group_acl(&mut *conn, group_id)
             .await
             .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
-        conn.close().await;
+        finish_conn(&mut conn, node_id).await;
         if result? {
             updated.push(node_id);
         } else {
@@ -1210,7 +1222,7 @@ async fn op_read_attr(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1254,7 +1266,7 @@ async fn op_write_attr(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1280,7 +1292,7 @@ async fn op_invoke_generic(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1294,7 +1306,7 @@ async fn op_describe(engine: &Engine, node_id: u64) -> Result<(), MatError> {
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1326,7 +1338,7 @@ async fn op_diag_thread(engine: &Engine, node_id: u64, endpoint: u16) -> Result<
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1360,7 +1372,7 @@ async fn op_open_window(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1613,7 +1625,7 @@ async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> Di
             };
             // 成否によらず close してから返す（Issue #20）。establish 自体の
             // 失敗（Err 腕）はセッションが無いので close 不要。
-            conn.close().await;
+            finish_conn(&mut conn, node_id).await;
             (resolved, op_kind, thread)
         }
     };
@@ -1702,7 +1714,7 @@ async fn mesh_probe_one(
         })
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -2097,6 +2109,18 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Timeout);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
+
+    // finish_conn（close + node_touched ヒント）のテスト方針（review fix
+    // round 1）: 当初はここに env `MAT_MATD_SOCKET` を書き換える 2 テストを
+    // 置いていたが、本ファイルの他の #[tokio::test]（FakeEstablisher 経由で
+    // op を実行する全テスト、op_on_closes_session_on_success 等）も
+    // finish_conn → hint_node_touched 経由でプロセスグローバルな
+    // `MAT_MATD_SOCKET` を間接的に読むため、専用ロックで直列化してもロック外の
+    // 無関係なテストとレースし得た（ヒント送信が偶然一時ソケットを掴む）。
+    // ヒントの中身の検証は env 非依存の `matd_client::hint_node_touched_at`
+    // 単体テスト（3 本）に一本化し、「finish_conn が close を呼ぶ」ことは
+    // 既存の op_on_closes_session_on_success / op_closes_session_on_failure
+    // （close_calls ベース）で引き続き担保する。
 
     #[test]
     fn generic_read_is_native_when_names_resolve() {

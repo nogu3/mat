@@ -66,7 +66,8 @@ async fn roundtrip(socket: &std::path::Path, requests: &[Value]) -> Vec<Value> {
 }
 
 /// serve に渡す broadcast と、その送信ハンドルを返す版。listen 系テストが
-/// イベントを注入するのに使う。
+/// イベントを注入するのに使う。health ハンドルも返す — node_touched のような
+/// SubHealth 直結の op をテストから観測するため（呼び手が不要なら `_health` で捨てる）。
 async fn start_matd_with_events(
     store_path: PathBuf,
     native: NativeState,
@@ -75,6 +76,7 @@ async fn start_matd_with_events(
     PathBuf,
     tokio::task::JoinHandle<()>,
     tokio::sync::broadcast::Sender<matd::subscription::Event>,
+    std::sync::Arc<matd::subscription::SubHealth>,
 ) {
     let socket = std::env::temp_dir().join(format!("matd-test-{}.sock", rand_suffix()));
     let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
@@ -82,6 +84,7 @@ async fn start_matd_with_events(
     let tx2 = tx.clone();
     let native = std::sync::Arc::new(native);
     let health = std::sync::Arc::new(matd::subscription::SubHealth::new(None));
+    let health2 = std::sync::Arc::clone(&health);
     let daemon = std::sync::Arc::new(matd::server::DaemonInfo {
         version: "test",
         started: std::time::Instant::now(),
@@ -89,9 +92,9 @@ async fn start_matd_with_events(
         fabric_index: 1,
     });
     let handle = tokio::spawn(async move {
-        let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health, daemon).await;
+        let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health2, daemon).await;
     });
-    (socket, handle, tx)
+    (socket, handle, tx, health)
 }
 
 fn occupancy_event(node_id: u64) -> matd::subscription::Event {
@@ -113,7 +116,7 @@ async fn start_matd(
     store_path: PathBuf,
     native: NativeState,
 ) -> (PathBuf, tokio::task::JoinHandle<()>) {
-    let (socket, handle, _tx) = start_matd_with_events(store_path, native, 16).await;
+    let (socket, handle, _tx, _health) = start_matd_with_events(store_path, native, 16).await;
     (socket, handle)
 }
 
@@ -534,7 +537,7 @@ async fn native_unavailable_answers_every_op_with_build_error_but_keeps_serving(
 async fn listen_acks_then_streams_filtered_events() {
     let (_dir, store_path) = make_store();
     let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-    let (socket, handle, tx) =
+    let (socket, handle, tx, _health) =
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
 
     // 接続して listen（node 21 のみ）
@@ -581,7 +584,7 @@ async fn lagged_listener_gets_error_line_and_disconnect() {
     let (_dir, store_path) = make_store();
     let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
     // capacity 1: listener が読む前に多数流すと必ず lag する。
-    let (socket, handle, tx) =
+    let (socket, handle, tx, _health) =
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 1).await;
 
     let mut stream = None;
@@ -659,4 +662,27 @@ async fn status_op_returns_daemon_snapshot() {
 
     let resps = roundtrip(&socket, &[json!({"op":"status"})]).await;
     assert_eq!(resps[0]["listen_clients"], 1);
+}
+
+/// node_touched は即 ack し、SubHealth に touched が立つ（Issue #20）。native には
+/// 触れない（dispatch が Status と同じく短絡する）。
+#[tokio::test]
+async fn node_touched_acks_and_flags_health() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, handle, _tx, health) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
+
+    let resps = roundtrip(&socket, &[json!({"id":1,"op":"node_touched","node_id":16})]).await;
+
+    let r = &resps[0];
+    assert_eq!(r["id"], json!(1));
+    assert_eq!(r["resubscribing"], json!(true));
+    assert!(r["timestamp"].is_string());
+    assert!(
+        health.touched(16),
+        "SubHealth should have touched flag set for node 16"
+    );
+
+    handle.abort();
 }

@@ -52,6 +52,11 @@ pub(crate) fn silence_deadline(max_interval_s: u16) -> Duration {
 /// pump 終了理由（純関数 `pump_verdict` の出力 — ログ文言の出し分けに使う）。
 #[derive(Debug, PartialEq)]
 pub(crate) enum PumpEnd {
+    /// note_touched: 直経路 op / cold establish がこのノードのセッションを
+    /// 新設した合図（Issue #20）。他の全終了理由より優先して判定する —
+    /// 「セッションが塗り替えられた」ことは既に確定しているので、無音 /
+    /// op 相関の判定を待つ意味がない。
+    Touched,
     /// 状態変更 op から OP_GRACE 経過してもデバイス発ゼロ（op 相関の born-dead 検知）。
     OpGrace { since_op: Duration },
     /// 確立以降デバイス発ゼロのまま無音 deadline 超過（born-dead）。
@@ -61,13 +66,18 @@ pub(crate) enum PumpEnd {
 }
 
 /// pump を殺すべきか判定する（純関数 — 時計は pump が持つ）。
-/// op 相関を無音 deadline より先に評価する（そちらが常に早く満ちるため）。
+/// touched を最優先、次いで op 相関を無音 deadline より先に評価する
+/// （そちらが常に早く満ちるため）。
 pub(crate) fn pump_verdict(
+    touched: bool,
     proven: bool,
     since_last_msg: Duration,
     deadline: Duration,
     pending_op: Option<Duration>,
 ) -> Option<PumpEnd> {
+    if touched {
+        return Some(PumpEnd::Touched);
+    }
     if let Some(since_op) = pending_op {
         if since_op >= OP_GRACE {
             return Some(PumpEnd::OpGrace { since_op });
@@ -125,6 +135,18 @@ pub struct SubHealth {
     values: Mutex<HashMap<ValueKey, serde_json::Value>>,
     /// node_id → 購読ライフサイクル状態（status op が読む）。
     status: Mutex<HashMap<u64, NodeSubStatus>>,
+    /// node_id → touched フラグ + 起床用 Notify（Issue #20）。pump は
+    /// cancel-unsafe なのでフラグ+スライスポーリングで拾い、backoff 睡眠だけ
+    /// Notify で起こす。同じ Mutex<HashMap> に同居させない理由: flag と
+    /// Notify のライフサイクルが pending/status とは別軸（フラグの消費が
+    /// Notify の使い回し防止と一体で、専用の消費 API が要る）。
+    touched: Mutex<HashMap<u64, TouchedState>>,
+}
+
+/// [`SubHealth::touched`] の per-node 状態。
+struct TouchedState {
+    flag: bool,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl SubHealth {
@@ -134,6 +156,7 @@ impl SubHealth {
             pending: Mutex::new(HashMap::new()),
             values: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
+            touched: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,6 +183,70 @@ impl SubHealth {
             .unwrap()
             .get(&node_id)
             .map(|t| t.elapsed())
+    }
+
+    /// 直経路 op / cold establish がこのノードのセッションを新設した合図。
+    /// FP300 系はレポートを最新セッションへ付け替えるため、購読を即時
+    /// 張り直して「最新」を購読セッションに塗り替える（Issue #20、spec
+    /// 2026-07-31-node-touched-hint）。pump は cancel-unsafe なので
+    /// フラグ+スライスポーリング、バックオフ睡眠だけ Notify で起こす。
+    /// 購読が無いノード（pump 不在）でも安全な no-op — フラグは誰も読まない。
+    /// 呼び手は dispatch の `node_touched` op（server.rs、外部トリガ）と
+    /// `NativeBackend::on_new_session` 経由の内部トリガ（main.rs、Issue #20
+    /// 経路2 — cold establish / resend-establish のたび）の2系統。`pub`
+    /// なのは後者が bin crate（main.rs）から呼ぶため — `pub(crate)` は
+    /// lib crate 内に閉じ、bin/lib で crate 境界が別になる cargo の構成上
+    /// main.rs からは見えない。
+    pub fn note_touched(&self, node_id: u64) {
+        let mut map = self.touched.lock().unwrap();
+        let entry = map.entry(node_id).or_insert_with(|| TouchedState {
+            flag: false,
+            notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        entry.flag = true;
+        entry.notify.notify_one();
+    }
+
+    /// touched フラグが立っているか（消費はしない — pump_verdict の判定用）。
+    /// pub: integration test（socket 越しの node_touched op）が外部から観測する。
+    pub fn touched(&self, node_id: u64) -> bool {
+        self.touched
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .is_some_and(|s| s.flag)
+    }
+
+    /// touched シグナルを消費する。フラグを倒すだけでなく Notify も
+    /// 新品へ差し替える — 差し替えないと「pump 実行中に来た note_touched」の
+    /// notify_one() permit が Notify に残留し、それより後の無関係な backoff
+    /// 待ち（select! の notified()）を横取りして即時起床させてしまう
+    /// （バックオフの意味が壊れる）。呼び手は 2 箇所: pump が Touched で
+    /// 終わる直前と、backoff 睡眠が touch_notify で短絡起床したとき。
+    pub(crate) fn clear_touched(&self, node_id: u64) {
+        self.touched.lock().unwrap().insert(
+            node_id,
+            TouchedState {
+                flag: false,
+                notify: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+    }
+
+    /// ノード毎 Notify の lazy 生成（backoff 睡眠の起床に使う）。
+    pub(crate) fn touch_notify(&self, node_id: u64) -> Arc<tokio::sync::Notify> {
+        Arc::clone(
+            &self
+                .touched
+                .lock()
+                .unwrap()
+                .entry(node_id)
+                .or_insert_with(|| TouchedState {
+                    flag: false,
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                })
+                .notify,
+        )
     }
 
     /// pump が受けた 1 イベントをキャッシュへ反映し、差分 priming なら昇格して返す。
@@ -590,6 +677,14 @@ async fn node_subscription_loop(
                 down_since = tokio::time::Instant::now();
                 failures = 0;
                 warned = false;
+                // Touched は「セッションが塗り替えられた」ことが確定している
+                // 喪失 — バックオフで待つ理由がない（Issue #20）。文字列
+                // prefix で運ぶのは、戻り値を enum 化するより既存コードへの
+                // 摩擦が小さいため（reason は元々ログ/last_error 用の人間可読
+                // 文字列で、enum 化すると呼び出し全箇所の型が変わる）。
+                if reason.starts_with("touched:") {
+                    continue;
+                }
                 MatError::new(mat_core::error::ErrorKind::Other, reason)
             }
             Err(e) => {
@@ -623,7 +718,21 @@ async fn node_subscription_loop(
         };
         backoff = next_backoff(backoff);
         health.mark_down(node_id, down_since, failures, backoff, last_error);
-        tokio::time::sleep(backoff).await;
+        // sleep(backoff) は cancel-safe（pump の next_report と違い、ここは
+        // 途中で打ち切っても失うステートが無い）なので、backoff 中に来た
+        // note_touched はここで select! で拾って即座に再試行へ回す
+        // （Issue #20）。起床側で touched を消費する — 消費しないと、この
+        // 起床が使い切ったはずの touched シグナルが次の run_subscription_once
+        // 先頭の health.touched() 判定に残り、確立直後の pump を無条件で
+        // Touched 即終了させてしまう（無限に近い張り直しループになる）。
+        let touch_notify = health.touch_notify(node_id);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = touch_notify.notified() => {
+                backoff = Duration::ZERO;
+                health.clear_touched(node_id);
+            }
+        }
     }
 }
 
@@ -679,6 +788,7 @@ async fn run_subscription_once(
     // （Issue #20: どの終了経路でも死んだセッションを放置しない）。
     let reason = loop {
         if let Some(end) = pump_verdict(
+            health.touched(node_id),
             proven,
             last_msg.elapsed(),
             deadline,
@@ -687,6 +797,17 @@ async fn run_subscription_once(
             // 再購読直後に同じ pending で即再発火しないよう先に消す。
             health.clear_pending(node_id);
             match end {
+                PumpEnd::Touched => {
+                    // フラグ消費は「touched: ...」腕の中だけで行う — pump が
+                    // Touched 以外の理由（op 相関 / 無音）で終わったときに
+                    // 誤って隣の touched シグナルを消してしまわないため。
+                    health.clear_touched(node_id);
+                    tracing::info!(
+                        node_id,
+                        "report pump ended (touched: direct-path session superseded)"
+                    );
+                    break "touched: direct-path session superseded".to_string();
+                }
                 PumpEnd::OpGrace { since_op } => {
                     tracing::info!(
                         node_id,
@@ -1009,9 +1130,10 @@ mod tests {
     fn pump_verdict_prioritizes_op_grace_then_silence() {
         let dl = Duration::from_secs(330);
         // 平常: 何も返さない。
-        assert!(pump_verdict(true, Duration::from_secs(10), dl, None).is_none());
+        assert!(pump_verdict(false, true, Duration::from_secs(10), dl, None).is_none());
         // op から OP_GRACE 未満はまだ待つ。
         assert!(pump_verdict(
+            false,
             true,
             Duration::from_secs(10),
             dl,
@@ -1021,6 +1143,7 @@ mod tests {
         // op から OP_GRACE 経過でデバイス発ゼロ → op 相関死。
         assert!(matches!(
             pump_verdict(
+                false,
                 true,
                 Duration::from_secs(15),
                 dl,
@@ -1030,12 +1153,24 @@ mod tests {
         ));
         // 無音 deadline 超過: 生存実績なし → born-dead、あり → 通常無音死。
         assert!(matches!(
-            pump_verdict(false, Duration::from_secs(330), dl, None),
+            pump_verdict(false, false, Duration::from_secs(330), dl, None),
             Some(PumpEnd::BornDeadSilence)
         ));
         assert!(matches!(
-            pump_verdict(true, Duration::from_secs(330), dl, None),
+            pump_verdict(false, true, Duration::from_secs(330), dl, None),
             Some(PumpEnd::Silence)
+        ));
+        // touched は他の全条件より優先される — op 相関/無音条件を同時に
+        // 満たしていても Touched が勝つ（Issue #20）。
+        assert!(matches!(
+            pump_verdict(
+                true,
+                true,
+                Duration::from_secs(330),
+                dl,
+                Some(Duration::from_secs(10))
+            ),
+            Some(PumpEnd::Touched)
         ));
     }
 
@@ -1880,6 +2015,140 @@ mod tests {
             .unwrap();
         assert!(ev.priming);
         assert_eq!(health.status_nodes()[0]["state"], "established");
+    }
+
+    /// note_touched で pump がスライス内に終了し、バックオフ無しで再確立する
+    /// （Issue #20）。FakeEstablisher の establish 回数と経過時間で検証する。
+    #[tokio::test(start_paused = true)]
+    async fn touched_ends_pump_and_resubscribes_without_backoff() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let t0 = tokio::time::Instant::now();
+        health.note_touched(5);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("touched による再確立の priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "touched が本物の再確立を引き起こしていること"
+        );
+        let elapsed = t0.elapsed();
+        // 検知は PUMP_SLICE(5s) の周期ポーリングに縛られる（cancel-unsafe な
+        // next_report を割り込めないため）が、backoff(5s) は挟まない — 挟むなら
+        // 10s 以上になるはずなのでその手前で区別する。
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "backoff を挟まずに再確立すること（挟むと PUMP_SLICE+backoff=10s 以上）: {elapsed:?}"
+        );
+    }
+
+    /// バックオフ睡眠中の note_touched が sleep を打ち切って即再試行する。
+    #[tokio::test(start_paused = true)]
+    async fn touched_wakes_backoff_sleep() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        // 2 回確立を失敗させ backoff を 5s → 10s へ育てる。
+        est.fail_subscription.store(2, Ordering::SeqCst);
+        let t0 = tokio::time::Instant::now();
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
+
+        // 1 回目の失敗backoff(5s)を消化させ、2 回目の失敗backoff(10s)の
+        // 途中（t=8s）で捕まえる。
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "2 回目の確立試行（失敗）まで進んでいること（本テストの前提）"
+        );
+        health.note_touched(5);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("touched による再確立の priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "touched が 3 回目の確立を即座に引き起こしたこと"
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "2 回目の backoff(10s) の残り待ち時間を消化しないこと（消化すると t=15s 以降になる）: {elapsed:?}"
+        );
+
+        // 使い残しの touched フラグ/Notify permit が次サイクルへ漏れて
+        // 即座に再々終了しないこと（PUMP_SLICE×2 生存確認）。
+        assert!(
+            tokio::time::timeout(PUMP_SLICE * 2, rx.recv())
+                .await
+                .is_err(),
+            "backoff 短絡で消費した touched が使い回されないこと"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "余計な再確立が起きていないこと"
+        );
+    }
+
+    /// touched フラグは消費後クリアされ、次周回で再発火しない。
+    #[tokio::test(start_paused = true)]
+    async fn touched_flag_is_consumed_once() {
+        use std::sync::atomic::Ordering;
+
+        let est = FakeEstablisher::default();
+        let calls = Arc::clone(&est.calls);
+        let (mut rx, health, _dir, _handles) = spawn_manager(est, None);
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        health.note_touched(5);
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("touched による再確立の priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "touched で 1 回だけ再確立されること"
+        );
+
+        // touched フラグは消費済み — 以後 PUMP_SLICE×2 生存しても即終了しない。
+        assert!(
+            tokio::time::timeout(PUMP_SLICE * 2, rx.recv())
+                .await
+                .is_err(),
+            "touched フラグが使い回されて即再終了しないこと"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "余計な再確立が起きていないこと"
+        );
     }
 
     /// clusters(): 空 = full wildcard = None、非空はそのまま。

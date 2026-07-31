@@ -245,6 +245,15 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         std::sync::Arc::clone(&sub_health),
     );
 
+    // 内部トリガ（Issue #20 経路2）: native が新規 CASE セッションを確立する
+    // たび（cold establish / resend-establish）に SubHealth へ即時張り直しを
+    // 合図する。native.rs は subscription.rs を知らない汎用コールバックなので、
+    // 注入は組み立てが揃うここ（sub_health 構築後・server::serve より前）で行う。
+    if let server::NativeState::Ready(b) = native.as_ref() {
+        let sub_health_for_hint = std::sync::Arc::clone(&sub_health);
+        b.set_on_new_session(Box::new(move |n| sub_health_for_hint.note_touched(n)));
+    }
+
     let daemon = std::sync::Arc::new(server::DaemonInfo {
         version: env!("CARGO_PKG_VERSION"),
         started: std::time::Instant::now(),
