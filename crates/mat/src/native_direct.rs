@@ -782,6 +782,18 @@ fn execute(
     })
 }
 
+/// close + matd への node_touched ヒント送信をまとめた終端処理（Issue #20
+/// 拡張）。close 同様、op の成否に関わらず呼ぶ（establish 自体の失敗は conn
+/// が無いので呼び出し側は `?` で早期 return し、ここには来ない）。
+///
+/// ヒント送信はブロッキング std I/O（`matd_client::hint_node_touched`）だが、
+/// ここは one-shot CLI の `block_on` 直下で他に走っている非同期タスクが無い
+/// ため async 化する価値が無い（呼び出し元コメント参照）。
+async fn finish_conn(conn: &mut Box<dyn mat_native::NodeConn>, node_id: u64) {
+    conn.close().await;
+    crate::matd_client::hint_node_touched(node_id);
+}
+
 async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatError> {
     let mut conn = engine.establisher.establish(node_id).await?;
     // 成否によらず close してから返す（Issue #20: 放置セッションは FP300 系の
@@ -799,7 +811,7 @@ async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatEr
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -825,7 +837,7 @@ async fn op_off(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatE
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -850,7 +862,7 @@ async fn op_read_onoff(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -884,7 +896,7 @@ async fn op_color(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -920,7 +932,7 @@ async fn op_color_temp(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -954,7 +966,7 @@ async fn op_level(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1156,7 +1168,7 @@ async fn op_group_provision(
         let result = mat_native::ops::provision_node(&mut *conn, &p)
             .await
             .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
-        conn.close().await;
+        finish_conn(&mut conn, node_id).await;
         result?;
     }
 
@@ -1180,7 +1192,7 @@ async fn op_group_grant(engine: &Engine, group_id: u16, node_ids: &[u64]) -> Res
         let result = mat_native::ops::ensure_group_acl(&mut *conn, group_id)
             .await
             .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)));
-        conn.close().await;
+        finish_conn(&mut conn, node_id).await;
         if result? {
             updated.push(node_id);
         } else {
@@ -1210,7 +1222,7 @@ async fn op_read_attr(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1254,7 +1266,7 @@ async fn op_write_attr(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1280,7 +1292,7 @@ async fn op_invoke_generic(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1294,7 +1306,7 @@ async fn op_describe(engine: &Engine, node_id: u64) -> Result<(), MatError> {
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1326,7 +1338,7 @@ async fn op_diag_thread(engine: &Engine, node_id: u64, endpoint: u16) -> Result<
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1360,7 +1372,7 @@ async fn op_open_window(
         Ok(())
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -1613,7 +1625,7 @@ async fn diag_im_with_engine(engine: &Engine, node_id: u64, endpoint: u16) -> Di
             };
             // 成否によらず close してから返す（Issue #20）。establish 自体の
             // 失敗（Err 腕）はセッションが無いので close 不要。
-            conn.close().await;
+            finish_conn(&mut conn, node_id).await;
             (resolved, op_kind, thread)
         }
     };
@@ -1702,7 +1714,7 @@ async fn mesh_probe_one(
         })
     }
     .await;
-    conn.close().await;
+    finish_conn(&mut conn, node_id).await;
     result
 }
 
@@ -2096,6 +2108,69 @@ mod tests {
         .expect_err("timeout must surface");
         assert_eq!(err.kind, ErrorKind::Timeout);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `MAT_MATD_SOCKET` はプロセス全体で共有される env なので、これに依存する
+    /// `finish_conn` テスト同士が並行実行で競合しないようロックで直列化する
+    /// （serial_test は本クレートの依存に無いための自前の代替）。async 区間
+    /// をまたいで保持するため tokio の非同期 Mutex を使う（std Mutex だと
+    /// await をまたいだ保持で clippy `await_holding_lock` に引っかかる）。
+    static MATD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// finish_conn は close に加えて matd へ node_touched ヒントを送る
+    /// （Issue #20 拡張）。close 自体は op_on_closes_session_on_success /
+    /// op_closes_session_on_failure が finish_conn 経由で担保済みなので、
+    /// ここではヒント送信の有無だけを見る。
+    #[tokio::test]
+    async fn finish_conn_sends_hint_when_matd_socket_present() {
+        let _guard = MATD_SOCKET_ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            let mut conn = conn;
+            conn.write_all(b"{\"resubscribing\":true}\n").unwrap();
+            req
+        });
+
+        std::env::set_var("MAT_MATD_SOCKET", &path);
+
+        use mat_native::test_support::FakeEstablisher;
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let mut conn = engine.establisher.establish(5).await.unwrap();
+        finish_conn(&mut conn, 5).await;
+
+        std::env::remove_var("MAT_MATD_SOCKET");
+
+        let req = server.join().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(v, serde_json::json!({"op":"node_touched","node_id":5}));
+    }
+
+    /// matd 不在（socket に誰もいない）でも finish_conn は panic せず、op 結果
+    /// に影響を与えず完走する。
+    #[tokio::test]
+    async fn finish_conn_is_silent_without_matd() {
+        let _guard = MATD_SOCKET_ENV_LOCK.lock().await;
+
+        // 既定候補（XDG_RUNTIME_DIR 由来）に実 matd が居るかもしれない開発機でも
+        // 決定的に「不在」を再現するため、明示的に存在しないパスへ向ける。
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.sock");
+        std::env::set_var("MAT_MATD_SOCKET", &missing);
+
+        use mat_native::test_support::FakeEstablisher;
+        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let mut conn = engine.establisher.establish(5).await.unwrap();
+        finish_conn(&mut conn, 5).await; // panic しないことを確認
+
+        std::env::remove_var("MAT_MATD_SOCKET");
     }
 
     #[test]

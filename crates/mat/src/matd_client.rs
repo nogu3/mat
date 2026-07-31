@@ -428,6 +428,56 @@ fn unsupported(name: &str) -> ToOpError {
     ))
 }
 
+/// 直経路 op（native_direct）完了後、matd がいれば `node_touched` ヒントを送る
+/// fire-and-forget 通知（Issue #20）。常駐購読が古いセッションを掴んだままに
+/// なるのを防ぐための best-effort で、matd 不在・旧 matd（`parse_error` 応答）・
+/// タイムアウトなど全ての失敗は呼び出し側（native_direct の op 結果 / exit code）
+/// に一切影響させない（`tracing::debug!` のみ）。`attach_deadline` /
+/// `emit_response` は使わない専用送信路。
+pub(crate) fn hint_node_touched(node_id: u64) {
+    let sockets = sockets_from_env_or_default(std::env::var_os("MAT_MATD_SOCKET"));
+    hint_node_touched_at(&sockets, node_id);
+}
+
+/// [`hint_node_touched`] の socket 候補注入版（テスト用に env 非依存の核）。
+fn hint_node_touched_at(sockets: &[PathBuf], node_id: u64) {
+    let (stream, socket) = match connect_candidates(sockets) {
+        Ok(s) => s,
+        Err(detail) => {
+            tracing::debug!(node_id, error = %detail, "node_touched hint: matd unreachable");
+            return;
+        }
+    };
+    if let Err(e) = send_hint_line(stream, node_id) {
+        tracing::debug!(
+            node_id,
+            socket = %socket.display(),
+            error = %e,
+            "node_touched hint: send/recv failed"
+        );
+    }
+}
+
+/// `{"op":"node_touched","node_id":N}` を 1 行送り、応答を 1 行読み捨てる。
+///
+/// ブロッキング I/O（std `UnixStream` の read timeout）を使うのは、呼び出し元が
+/// one-shot CLI の終了間際で他に走っている非同期タスクが無いため（async 化す
+/// る価値が無い）。応答本体には関心が無い（ack `{"resubscribing":true}` でも
+/// 旧 matd の `parse_error` でも同じ扱い）ので、300ms 上限で読み捨てるだけで
+/// 十分（matd 応答が来ない＝matd 停止/ハング相当、これ以上待つ理由が無い）。
+fn send_hint_line(mut stream: UnixStream, node_id: u64) -> std::io::Result<()> {
+    let op = json!({ "op": "node_touched", "node_id": node_id });
+    let mut line = serde_json::to_vec(&op)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    let _ = reader.read_line(&mut resp); // 応答は読み捨てるだけ（内容不問）
+    Ok(())
+}
+
 /// 候補 socket へ順に connect し、最初に成功した stream と使用パスを返す。
 /// 全滅は Err（試行した全パスと各エラーを列挙 — Forced 経路のエラー detail 用）。
 fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String> {
@@ -1110,6 +1160,60 @@ mod tests {
         let err = exchange_on_stream(stream, &json!({ "op": "on" }), None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         server.join().unwrap();
+    }
+
+    /// Issue #20: 直経路 op 後の fire-and-forget ヒント。matd がいれば
+    /// `{"op":"node_touched","node_id":N}` を 1 行送る（応答は読み捨て）。
+    #[test]
+    fn hint_node_touched_sends_op_line_to_matd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            let mut conn = conn;
+            conn.write_all(b"{\"resubscribing\":true}\n").unwrap();
+            req
+        });
+
+        hint_node_touched_at(&[path], 42);
+
+        let req = server.join().unwrap();
+        let v: Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(v, json!({"op":"node_touched","node_id":42}));
+    }
+
+    /// 旧 matd（node_touched 未対応）は `parse_error` を返してくるが、
+    /// ヒント送信側はその応答も内容を見ずに読み捨てるだけで完走する。
+    #[test]
+    fn hint_node_touched_ignores_old_matd_parse_error_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            let mut conn = conn;
+            conn.write_all(b"{\"error\":{\"kind\":\"parse_error\",\"detail\":\"unknown op\"}}\n")
+                .unwrap();
+        });
+
+        hint_node_touched_at(&[path], 7); // panic せず完走すること
+
+        server.join().unwrap();
+    }
+
+    /// matd 不在（socket に誰もいない）でも panic せず、戻り値なしで完走する。
+    #[test]
+    fn hint_node_touched_is_silent_without_matd() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.sock");
+        hint_node_touched_at(&[missing], 1);
     }
 
     #[test]
