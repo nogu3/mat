@@ -358,6 +358,30 @@ This repo ships two binaries from one install:
   a version-skewed upgrade. Design:
   `docs/superpowers/specs/2026-07-31-node-touched-hint-design.md`.
 
+- **MRP piggyback ack on responses (Issue #21, 1.16.0).** Second, CASE-free
+  FP300 subscription death, wire-proven 2026-07-31: the device delivers a
+  needs_ack ReportData, receives and acks our StatusResponse, then 1.7s
+  later *retransmits the same report (same message counter)* and goes
+  permanently silent toward matd while chatting on with HA. Reading: our
+  immediate standalone ack was lost on the weak RF hop, and because
+  `respond_status` sealed the SR with `acked_counter: None`, the SR the
+  device demonstrably received could not satisfy its MRP — the device
+  retransmitted into our dedup path (re-ack + drop, correct per spec) and
+  its FW then discarded the subscription. chip-sdk piggybacks pending acks
+  on every same-exchange response, which is why HA's subscription to the
+  same device survives. Fix: `SecureSession` keeps a one-slot
+  `pending_peer_ack` — `screen_with` records the (exchange, counter) of
+  every peer-initiated needs_ack message it acks, and `seal` auto-attaches
+  it to the next message sent on that same exchange (an explicit
+  caller-supplied ack wins; consumed once). This covers the subscription
+  StatusResponse and the chunk-continuation StatusResponses in
+  priming/reads (`send_reliable` path) alike; the immediate standalone ack
+  is kept (double-acking is idempotent). The 07:14 death shape from the
+  same capture — clean cycle completion, then the device simply skips its
+  next keep-alive during an RF dropout — is device-side subscription
+  teardown the controller cannot prevent; the 330s silence deadline plus
+  resubscribe remains the recovery for that shape.
+
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
 schema, exit-code classification, group key logic) and the shared engine
