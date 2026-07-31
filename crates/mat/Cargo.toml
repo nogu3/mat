@@ -28,5 +28,5 @@ assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 mat-native = { workspace = true, features = ["test-support"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 async-trait.workspace = true
