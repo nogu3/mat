@@ -2110,68 +2110,17 @@ mod tests {
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// `MAT_MATD_SOCKET` はプロセス全体で共有される env なので、これに依存する
-    /// `finish_conn` テスト同士が並行実行で競合しないようロックで直列化する
-    /// （serial_test は本クレートの依存に無いための自前の代替）。async 区間
-    /// をまたいで保持するため tokio の非同期 Mutex を使う（std Mutex だと
-    /// await をまたいだ保持で clippy `await_holding_lock` に引っかかる）。
-    static MATD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// finish_conn は close に加えて matd へ node_touched ヒントを送る
-    /// （Issue #20 拡張）。close 自体は op_on_closes_session_on_success /
-    /// op_closes_session_on_failure が finish_conn 経由で担保済みなので、
-    /// ここではヒント送信の有無だけを見る。
-    #[tokio::test]
-    async fn finish_conn_sends_hint_when_matd_socket_present() {
-        let _guard = MATD_SOCKET_ENV_LOCK.lock().await;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("matd.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader, Write};
-            let (conn, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut req = String::new();
-            reader.read_line(&mut req).unwrap();
-            let mut conn = conn;
-            conn.write_all(b"{\"resubscribing\":true}\n").unwrap();
-            req
-        });
-
-        std::env::set_var("MAT_MATD_SOCKET", &path);
-
-        use mat_native::test_support::FakeEstablisher;
-        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let mut conn = engine.establisher.establish(5).await.unwrap();
-        finish_conn(&mut conn, 5).await;
-
-        std::env::remove_var("MAT_MATD_SOCKET");
-
-        let req = server.join().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&req).unwrap();
-        assert_eq!(v, serde_json::json!({"op":"node_touched","node_id":5}));
-    }
-
-    /// matd 不在（socket に誰もいない）でも finish_conn は panic せず、op 結果
-    /// に影響を与えず完走する。
-    #[tokio::test]
-    async fn finish_conn_is_silent_without_matd() {
-        let _guard = MATD_SOCKET_ENV_LOCK.lock().await;
-
-        // 既定候補（XDG_RUNTIME_DIR 由来）に実 matd が居るかもしれない開発機でも
-        // 決定的に「不在」を再現するため、明示的に存在しないパスへ向ける。
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("no-such.sock");
-        std::env::set_var("MAT_MATD_SOCKET", &missing);
-
-        use mat_native::test_support::FakeEstablisher;
-        let engine = mat_native::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let mut conn = engine.establisher.establish(5).await.unwrap();
-        finish_conn(&mut conn, 5).await; // panic しないことを確認
-
-        std::env::remove_var("MAT_MATD_SOCKET");
-    }
+    // finish_conn（close + node_touched ヒント）のテスト方針（review fix
+    // round 1）: 当初はここに env `MAT_MATD_SOCKET` を書き換える 2 テストを
+    // 置いていたが、本ファイルの他の #[tokio::test]（FakeEstablisher 経由で
+    // op を実行する全テスト、op_on_closes_session_on_success 等）も
+    // finish_conn → hint_node_touched 経由でプロセスグローバルな
+    // `MAT_MATD_SOCKET` を間接的に読むため、専用ロックで直列化してもロック外の
+    // 無関係なテストとレースし得た（ヒント送信が偶然一時ソケットを掴む）。
+    // ヒントの中身の検証は env 非依存の `matd_client::hint_node_touched_at`
+    // 単体テスト（3 本）に一本化し、「finish_conn が close を呼ぶ」ことは
+    // 既存の op_on_closes_session_on_success / op_closes_session_on_failure
+    // （close_calls ベース）で引き続き担保する。
 
     #[test]
     fn generic_read_is_native_when_names_resolve() {
