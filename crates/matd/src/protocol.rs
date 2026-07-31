@@ -183,6 +183,11 @@ pub enum Op {
     /// デーモンを停止する admin op（native backend には触れない）。`matd stop` が送る。
     /// Ping と同じく単一 node は持たない。
     Shutdown,
+    /// 外部（mat 直経路等）が対象ノードへ触れた合図。SubHealth に touched を立てて
+    /// 購読の即時張り直しを促す（Issue #20）。native には触れないため Status と同じく
+    /// dispatch で短絡する。`node_id()` は意図的に None — abort_op の drop_session /
+    /// deadline 対象にしない（fire-and-forget、再購読完了を待たない契約）。
+    NodeTouched { node_id: u64 },
 }
 
 impl Op {
@@ -210,7 +215,8 @@ impl Op {
             | Op::Listen { .. }
             | Op::Ping
             | Op::Status
-            | Op::Shutdown => None,
+            | Op::Shutdown
+            | Op::NodeTouched { .. } => None,
         }
     }
 
@@ -238,6 +244,7 @@ impl Op {
             Op::Ping => "ping",
             Op::Status => "status",
             Op::Shutdown => "shutdown",
+            Op::NodeTouched { .. } => "node_touched",
         }
     }
 
@@ -262,7 +269,8 @@ impl Op {
             | Op::Listen { .. }
             | Op::Ping
             | Op::Status
-            | Op::Shutdown => None,
+            | Op::Shutdown
+            | Op::NodeTouched { .. } => None,
         }
     }
 
@@ -288,7 +296,8 @@ impl Op {
             | Op::Listen { .. }
             | Op::Ping
             | Op::Status
-            | Op::Shutdown => None,
+            | Op::Shutdown
+            | Op::NodeTouched { .. } => None,
         }
     }
 
@@ -324,7 +333,8 @@ impl Op {
             | Op::Listen { .. }
             | Op::Ping
             | Op::Status
-            | Op::Shutdown => None,
+            | Op::Shutdown
+            | Op::NodeTouched { .. } => None,
         }
     }
 }
