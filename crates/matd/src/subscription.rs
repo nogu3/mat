@@ -191,10 +191,7 @@ impl SubHealth {
     /// 2026-07-31-node-touched-hint）。pump は cancel-unsafe なので
     /// フラグ+スライスポーリング、バックオフ睡眠だけ Notify で起こす。
     /// 購読が無いノード（pump 不在）でも安全な no-op — フラグは誰も読まない。
-    /// 本番の呼び手（server dispatch / NativeBackend コールバック）は
-    /// 後続タスクで配線する — このタスクでは pump/supervisor 側の消費経路
-    /// だけを仕上げるため、現時点ではテストからしか呼ばれない。
-    #[allow(dead_code)]
+    /// 本番の呼び手は dispatch の `node_touched` op（server.rs）。
     pub(crate) fn note_touched(&self, node_id: u64) {
         let mut map = self.touched.lock().unwrap();
         let entry = map.entry(node_id).or_insert_with(|| TouchedState {
@@ -206,7 +203,8 @@ impl SubHealth {
     }
 
     /// touched フラグが立っているか（消費はしない — pump_verdict の判定用）。
-    pub(crate) fn touched(&self, node_id: u64) -> bool {
+    /// pub: integration test（socket 越しの node_touched op）が外部から観測する。
+    pub fn touched(&self, node_id: u64) -> bool {
         self.touched
             .lock()
             .unwrap()
