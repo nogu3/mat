@@ -191,8 +191,13 @@ impl SubHealth {
     /// 2026-07-31-node-touched-hint）。pump は cancel-unsafe なので
     /// フラグ+スライスポーリング、バックオフ睡眠だけ Notify で起こす。
     /// 購読が無いノード（pump 不在）でも安全な no-op — フラグは誰も読まない。
-    /// 本番の呼び手は dispatch の `node_touched` op（server.rs）。
-    pub(crate) fn note_touched(&self, node_id: u64) {
+    /// 呼び手は dispatch の `node_touched` op（server.rs、外部トリガ）と
+    /// `NativeBackend::on_new_session` 経由の内部トリガ（main.rs、Issue #20
+    /// 経路2 — cold establish / resend-establish のたび）の2系統。`pub`
+    /// なのは後者が bin crate（main.rs）から呼ぶため — `pub(crate)` は
+    /// lib crate 内に閉じ、bin/lib で crate 境界が別になる cargo の構成上
+    /// main.rs からは見えない。
+    pub fn note_touched(&self, node_id: u64) {
         let mut map = self.touched.lock().unwrap();
         let entry = map.entry(node_id).or_insert_with(|| TouchedState {
             flag: false,
