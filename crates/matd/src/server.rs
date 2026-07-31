@@ -533,6 +533,17 @@ async fn dispatch(
     // per-node Mutex も取らない）— run_op を通さず dispatch で完結する。
     let result = match &req.op {
         Op::Status => Ok(status_body(native, store_path, daemon, health, events)),
+        // native 不要・per-node Mutex 不要 — SubHealth に合図して即 ack。
+        // 再購読完了は待たない（ヒントは fire-and-forget が契約、Issue #20）。
+        Op::NodeTouched { node_id } => {
+            health.note_touched(*node_id);
+            tracing::info!(
+                node_id = *node_id,
+                source = "external",
+                "node touched; resubscribing"
+            );
+            Ok(json!({ "resubscribing": true }))
+        }
         _ => run_op(&req.op, native, store_path, health, deadline).await,
     };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -756,7 +767,8 @@ fn op_state_target(op: &Op) -> Option<(u64, u16)> {
         | Op::Listen { .. }
         | Op::Ping
         | Op::Status
-        | Op::Shutdown => None,
+        | Op::Shutdown
+        | Op::NodeTouched { .. } => None,
     }
 }
 
