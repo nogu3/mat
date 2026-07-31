@@ -332,6 +332,31 @@ This repo ships two binaries from one install:
   resubscribe). The same E2E also surfaced a second, CASE-independent
   death mode (subscription dies right after back-to-back reports ~1.7s
   apart) tracked separately.
+- **`node_touched` hint — immediate resubscribe (Issue #20, 1.15.0).** The
+  1.14.0 E2E caveat above proved CloseSession alone doesn't fix the FP300:
+  the datagram lands on the wire, yet the device still re-anchors its next
+  keep-alive onto the closed session and the resident subscription dies
+  exactly as before. Waiting on device-side good behavior is a dead end, so
+  1.15.0 stops trying to prevent the re-anchor and instead reacts to it: the
+  side that just created a new same-fabric CASE session self-reports to
+  `matd`, which immediately resubscribes the affected node — no session
+  merging, no device-side fix needed, the "newest session" is simply
+  repainted onto a live subscription before the device's next report can be
+  lost to the abandoned one. Two paths feed the same trigger: 経路1 is
+  `mat`'s own direct-path ops (`diag` included) firing a fire-and-forget
+  `node_touched` line over the matd socket after `finish_conn`'s close, only
+  when a CASE session was actually established; 経路2 is `matd`'s own
+  internal cold-establish (or resend-establish) inside a warm op, calling
+  the same trigger in-process without a socket round trip. Either path
+  cancels the node's pump (if running) or cuts a backoff wait short and
+  re-establishes with **zero backoff** — a pump already re-establishing is
+  left alone (redundant). This shrinks the blind window from the 330s
+  silence deadline (worst case ~5.5min) to one resubscribe cycle (measured
+  CASE + priming ≈1.5–10s). Backward compat: a `matd` predating 1.15.0
+  answers `node_touched` with `parse_error` (unknown op), which `mat`
+  swallows — the hint degrades to a no-op, not a failure, on either side of
+  a version-skewed upgrade. Design:
+  `docs/superpowers/specs/2026-07-31-node-touched-hint-design.md`.
 
 Both binaries share a library crate `mat-core` (the `parse` / `output` /
 `error` / `group` / `acl` modules: shared value normalization, the JSON
