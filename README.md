@@ -1084,7 +1084,11 @@ node-targeted op that ends up establishing a CASE session **on the direct
 path** sends a single fire-and-forget `node_touched` hint to `matd` (if one
 is running) right after the op closes, so a resident subscription for that
 node resubscribes immediately instead of waiting on matd's 330s silence
-deadline (Issue #20, 1.15.0; see ARCHITECTURE.md). That covers the
+deadline (Issue #20, 1.15.0; see ARCHITECTURE.md). An op cut short by
+`--op-timeout-ms` sends the same hint when the deadline fires (Issue #22,
+1.17.0): the timed-out attempt may already have established a CASE
+session the device re-anchors onto, and the close itself can no longer
+be sent. That covers the
 always-direct ops above (`open-window`, `diag thread` / `diag node` / `diag
 mesh` — once per touched node — and `group grant`), but just as much any
 normally-matd-routed op (`on` / `off` / `read` / `write` / `invoke` /
