@@ -764,22 +764,48 @@ fn execute(
             .map_err(map_engine_build_error)?;
         if op.budget_applies() && op_timeout_ms > 0 {
             // 直経路にも matd 経路と同じ予算セマンティクス（exit 3）。
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(op_timeout_ms),
+            run_op_with_deadline(
                 run_op(&engine, op),
+                op_timeout_ms,
+                node_id,
+                crate::matd_client::hint_node_touched,
             )
             .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(MatError::new(
-                    mat_core::error::ErrorKind::Timeout,
-                    format!("op deadline exceeded after {op_timeout_ms}ms (direct path)"),
-                )),
-            }
         } else {
             run_op(&engine, op).await
         }
     })
+}
+
+/// budget 対象 op への deadline 適用。超過時は `run_op` future ごと drop される
+/// ため `finish_conn` の close+hint が走らない（Issue #22）。close はセッション
+/// 所有権が future と共に drop 済みで送れないが、`hint`（実体は
+/// `matd_client::hint_node_touched`）だけ撃てば常駐購読側の救済は成立する。
+async fn run_op_with_deadline<F>(
+    fut: F,
+    op_timeout_ms: u64,
+    node_id: Option<u64>,
+    hint: impl FnOnce(u64),
+) -> Result<(), MatError>
+where
+    F: std::future::Future<Output = Result<(), MatError>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_millis(op_timeout_ms), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            match node_id {
+                Some(id) => hint(id),
+                // budget_applies() は現状すべて単一ノード op なのでここは
+                // 到達しない。将来 multi-node op が対象化されたときに
+                // ヒントが黙って消えないよう痕跡だけ残す。
+                None => tracing::debug!("op deadline exceeded without node_id; hint skipped"),
+            }
+            Err(MatError::new(
+                mat_core::error::ErrorKind::Timeout,
+                format!("op deadline exceeded after {op_timeout_ms}ms (direct path)"),
+            ))
+        }
+    }
 }
 
 /// close + matd への node_touched ヒント送信をまとめた終端処理（Issue #20
@@ -2655,5 +2681,46 @@ mod tests {
             discriminator: 1234,
         }
         .budget_applies());
+    }
+
+    /// Issue #22: deadline 超過で run_op ごと drop されると finish_conn の
+    /// close+hint が走らない。Err 腕で node_touched ヒントだけは撃つこと
+    /// （close はセッション所有権が drop 済みで送れない）。
+    #[test]
+    fn op_deadline_fires_node_touched_hint_on_timeout() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let hinted = std::cell::RefCell::new(None);
+        let err = rt
+            .block_on(run_op_with_deadline(
+                std::future::pending(),
+                10,
+                Some(42),
+                |id| *hinted.borrow_mut() = Some(id),
+            ))
+            .unwrap_err();
+        assert!(matches!(err.kind, mat_core::error::ErrorKind::Timeout));
+        assert_eq!(*hinted.borrow(), Some(42));
+    }
+
+    /// deadline 内に完了した op は結果をそのまま返し、ヒントは撃たない
+    /// （完了時のヒントは finish_conn の責務 — 二重送信しない)。
+    #[test]
+    fn op_deadline_passes_through_completion_without_hint() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let hinted = std::cell::RefCell::new(None);
+        let result = rt.block_on(run_op_with_deadline(
+            std::future::ready(Ok(())),
+            10_000,
+            Some(42),
+            |id| *hinted.borrow_mut() = Some(id),
+        ));
+        assert!(result.is_ok());
+        assert_eq!(*hinted.borrow(), None);
     }
 }
