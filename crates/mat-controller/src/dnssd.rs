@@ -542,7 +542,12 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             }
             _ => RData::Other,
         };
-        records.push(Record { name, rdata, ttl, cache_flush });
+        records.push(Record {
+            name,
+            rdata,
+            ttl,
+            cache_flush,
+        });
         pos = rdata_pos + rdlen;
     }
     Ok(records)
@@ -2579,7 +2584,8 @@ mod tests {
     #[test]
     fn parse_message_reads_cache_flush_bit() {
         let addr: Ipv6Addr = "fd00::1".parse().unwrap();
-        let with = parse_message(&synth_aaaa_class("h.local", 120, addr, 0x8000 | CLASS_IN)).unwrap();
+        let with =
+            parse_message(&synth_aaaa_class("h.local", 120, addr, 0x8000 | CLASS_IN)).unwrap();
         assert!(with[0].cache_flush);
         let without = parse_message(&synth_aaaa_class("h.local", 120, addr, CLASS_IN)).unwrap();
         assert!(!without[0].cache_flush);
@@ -2598,14 +2604,24 @@ mod tests {
         let new: Ipv6Addr = "fd00::2".parse().unwrap();
 
         let msg = synth_response(service, target, 5540, &["SII=5000"], old);
-        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         assert_eq!(cache.get(service).unwrap().addresses, vec![old]);
 
         tokio::time::advance(Duration::from_secs(2)).await;
 
         // 再アドレス化: cache-flush 付き AAAA（synth_aaaa_only は cache-flush|IN）。
         let msg2 = synth_aaaa_only(target, 120, new);
-        fold_operational_into_cache(&parse_message(&msg2).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&msg2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         assert_eq!(
             cache.get(service).unwrap().addresses,
             vec![new],
@@ -2625,15 +2641,34 @@ mod tests {
         let a2: Ipv6Addr = "fd00::2".parse().unwrap();
 
         let m1 = synth_aaaa_only(target, 120, a1);
-        fold_operational_into_cache(&parse_message(&m1).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&m1).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         tokio::time::advance(Duration::from_millis(500)).await;
         let m2 = synth_aaaa_only(target, 120, a2);
-        fold_operational_into_cache(&parse_message(&m2).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&m2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
 
         let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
-        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         let node = cache.get(service).unwrap();
-        assert_eq!(node.addresses.len(), 2, "both burst datagrams must survive the 1s grace");
+        assert_eq!(
+            node.addresses.len(),
+            2,
+            "both burst datagrams must survive the 1s grace"
+        );
         assert!(node.addresses.contains(&a1) && node.addresses.contains(&a2));
     }
 
@@ -2707,13 +2742,28 @@ mod tests {
 
         // cache-flush 無し（class=IN のみ）なので物理削除は起きない。
         let m1 = synth_aaaa_class(target, 120, a1, CLASS_IN);
-        fold_operational_into_cache(&parse_message(&m1).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&m1).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         tokio::time::advance(Duration::from_secs(2)).await;
         let m2 = synth_aaaa_class(target, 120, a2, CLASS_IN);
-        fold_operational_into_cache(&parse_message(&m2).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&m2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
 
         let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
-        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         assert_eq!(
             cache.get(service).unwrap().addresses,
             vec![a2, a1],
@@ -2734,14 +2784,27 @@ mod tests {
             let a = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i + 1);
             addrs.push(a);
             let m = synth_aaaa_class(target, 120, a, CLASS_IN);
-            fold_operational_into_cache(&parse_message(&m).unwrap(), &mut fold, &cache, Instant::now());
+            fold_operational_into_cache(
+                &parse_message(&m).unwrap(),
+                &mut fold,
+                &cache,
+                Instant::now(),
+            );
             tokio::time::advance(Duration::from_secs(2)).await;
         }
         let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
-        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
         let node = cache.get(service).unwrap();
         assert_eq!(node.addresses.len(), MAX_ADDRS_PER_HOST);
-        assert!(!node.addresses.contains(&addrs[0]), "oldest must be evicted");
+        assert!(
+            !node.addresses.contains(&addrs[0]),
+            "oldest must be evicted"
+        );
         assert_eq!(node.addresses[0], addrs[8], "newest must be first");
     }
 
