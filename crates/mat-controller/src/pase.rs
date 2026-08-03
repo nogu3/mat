@@ -521,6 +521,7 @@ mod tests {
                 active_interval: Duration::from_millis(50),
                 max_retries: 2,
                 backoff: 1.0,
+                jitter: 0.0,
             }
         }
 

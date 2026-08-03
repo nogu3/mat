@@ -96,6 +96,7 @@ async fn pase_over_btp_sends_unreliable_pbkdf_request() {
             active_interval: Duration::from_millis(200),
             max_retries: 1,
             backoff: 1.0,
+            jitter: 0.0,
         },
     )
     .await;

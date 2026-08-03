@@ -568,10 +568,36 @@ pub(crate) fn next_backoff(cur: Duration) -> Duration {
     }
 }
 
+/// backoff の実 sleep に乗せるジッタ: cap 適用後の名目値 × [0.75, 1.25)。
+/// cap 後に掛けるので、長期障害で全ノードが BACKOFF_MAX に飽和しても実待ちは
+/// 45〜75s に散り続け、リトライ波が再同期しない（cap 前に掛けると飽和ノードが
+/// 全員ちょうど 60s で再同期する — 監査⑧）。`mark_down` / status の表示は
+/// 名目値のまま（表示はエンベロープの説明であって実 sleep の予告ではない）。
+pub(crate) fn jittered_backoff(nominal: Duration, r: f64) -> Duration {
+    nominal.mul_f64(0.75 + 0.5 * r)
+}
+
 /// 台帳の再読間隔。稼働中に `mat commission` されたノードを最大この遅延で
 /// 拾って購読を張る（監査#4: 従来は起動時スナップショットのみで、稼働中
 /// commission ノードは matd 再起動まで購読されず `mat listen` が無音だった）。
 pub(crate) const LEDGER_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 起動 herd の stagger 刻み。同一ティックで複数ノードを spawn するとき、
+/// バッチ内 index × この値だけ初回確立を遅らせる（本番 13 台 → 0〜12s に
+/// 均等分散）。デプロイ再起動のたびに全ノード同時 CASE で BR 無線が CCA
+/// 飽和 → no-ack 1〜2 分、が監査⑧の実 symptom。乱数でなく index 均等なのは
+/// herd が単一プロセス内の現象で、均等間隔が厳密に非衝突なため。
+pub(crate) const STAGGER_STEP: Duration = Duration::from_secs(1);
+
+/// バッチ内 index → 初期遅延（純関数）。バッチ 1 = 遅延ゼロ（rescan の
+/// 単発追加を現行どおり即購読に保つ）。
+pub(crate) fn stagger_delay(batch_index: usize, batch_len: usize) -> Duration {
+    if batch_len <= 1 {
+        Duration::ZERO
+    } else {
+        STAGGER_STEP * u32::try_from(batch_index).unwrap_or(u32::MAX)
+    }
+}
 
 /// commissioned 全ノードへ購読タスクを張る supervisor を起動する。
 /// `LEDGER_RESCAN_INTERVAL` ごとに台帳を読み直し、新規ノードに購読ループを
@@ -611,19 +637,25 @@ pub fn spawn_subscription_manager(
                         tracing::info!(nodes = node_ids.len(), "subscription manager starting");
                         announced = true;
                     }
-                    for node_id in node_ids {
-                        if !subscribed.insert(node_id) {
-                            continue;
-                        }
+                    // このティックで新規に張るノードだけを先にバッチとして
+                    // 確定してから index つきで spawn する（stagger_delay の
+                    // 分母はこのバッチのサイズ。台帳全体のサイズではない）。
+                    let new_nodes: Vec<u64> = node_ids
+                        .into_iter()
+                        .filter(|id| subscribed.insert(*id))
+                        .collect();
+                    for (i, node_id) in new_nodes.iter().copied().enumerate() {
                         if !initial {
                             tracing::info!(node_id, "ledger rescan: new node; subscribing");
                         }
+                        let delay = stagger_delay(i, new_nodes.len());
                         let native = Arc::clone(&native);
                         let events = events.clone();
                         let clusters = Arc::clone(&clusters);
                         let health = Arc::clone(&health);
                         tokio::spawn(async move {
-                            node_subscription_loop(node_id, native, events, clusters, health).await
+                            node_subscription_loop(node_id, delay, native, events, clusters, health)
+                                .await
                         });
                     }
                 }
@@ -649,6 +681,7 @@ pub fn spawn_subscription_manager(
 /// （弱リンクノードを常駐ノイズにしない規律は不変）。
 async fn node_subscription_loop(
     node_id: u64,
+    initial_delay: Duration,
     native: Arc<NativeState>,
     events: broadcast::Sender<Event>,
     clusters: Arc<[u32]>,
@@ -664,6 +697,16 @@ async fn node_subscription_loop(
     let mut failures: u32 = 0;
     let mut warned = false;
     health.mark_establishing(node_id);
+    if !initial_delay.is_zero() {
+        // 起動バッチの stagger（監査⑧）。establishing 表示にしてから待つ —
+        // status に現れない 12 秒を作らない。
+        tracing::debug!(
+            node_id,
+            delay_s = initial_delay.as_secs(),
+            "staggering initial subscribe"
+        );
+        tokio::time::sleep(initial_delay).await;
+    }
     loop {
         let last_error = match run_subscription_once(
             node_id, backend, &events, &clusters, &health, down_since, failures,
@@ -726,8 +769,9 @@ async fn node_subscription_loop(
         // 先頭の health.touched() 判定に残り、確立直後の pump を無条件で
         // Touched 即終了させてしまう（無限に近い張り直しループになる）。
         let touch_notify = health.touch_notify(node_id);
+        let sleep_dur = jittered_backoff(backoff, mat_controller::exchange::unit_random());
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(sleep_dur) => {}
             _ = touch_notify.notified() => {
                 backoff = Duration::ZERO;
                 health.clear_touched(node_id);
@@ -1056,6 +1100,27 @@ mod tests {
             next_backoff(Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    /// backoff jitter: cap 後の名目値 × [0.75, 1.25)。中央値（r=0.5）は名目値
+    /// のまま = 設計軌道（down_s 中央値 7-9s）を変えない。
+    #[test]
+    fn jittered_backoff_range_preserves_median() {
+        let n = Duration::from_secs(60);
+        assert_eq!(jittered_backoff(n, 0.0), Duration::from_secs(45));
+        assert_eq!(jittered_backoff(n, 0.5), n);
+        assert!(jittered_backoff(n, 0.999_999) < Duration::from_secs(75));
+        assert_eq!(jittered_backoff(Duration::ZERO, 0.7), Duration::ZERO);
+    }
+
+    /// 起動 stagger: 同一ティックのバッチ(>1)だけ index × 1s に分散。
+    /// rescan の単発追加（バッチ 1）は現行どおり遅延ゼロ。
+    #[test]
+    fn stagger_delay_spreads_batches_only() {
+        assert_eq!(stagger_delay(0, 1), Duration::ZERO);
+        assert_eq!(stagger_delay(0, 13), Duration::ZERO);
+        assert_eq!(stagger_delay(1, 13), Duration::from_secs(1));
+        assert_eq!(stagger_delay(12, 13), Duration::from_secs(12));
     }
 
     #[test]
@@ -1583,12 +1648,12 @@ mod tests {
         assert!(ev.priming);
         let elapsed = t0.elapsed();
         assert!(
-            elapsed >= Duration::from_secs(35),
-            "5+10+20 のラダーを実際に登ること: {elapsed:?}"
+            elapsed >= Duration::from_secs(26),
+            "5+10+20 のラダーを実際に登ること（jitter で最小 ×0.75）: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(40),
-            "経過は 5+10+20 のラダーちょうど（35s）であり、40s の次段は登っていないこと: {elapsed:?}"
+            elapsed < Duration::from_secs(45),
+            "経過は 5+10+20 のラダーちょうど（35s）範囲であり、次段は登っていないこと（jitter で最大 ×1.25）: {elapsed:?}"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1898,6 +1963,53 @@ mod tests {
             }
         };
         assert!(ev.priming);
+    }
+
+    /// 起動バッチ(>1)はノード毎に STAGGER_STEP ずつずれて確立する（監査⑧）。
+    /// priming 到着の仮想時刻差で stagger を観測する。
+    #[tokio::test(start_paused = true)]
+    async fn initial_batch_staggers_subscriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let mut store = mat_core::store::Store::open_or_init(&store_path).unwrap();
+        for node_id in [1u64, 2u64] {
+            store
+                .upsert_node(mat_core::store::NodeRecord {
+                    node_id,
+                    commissioned_at: "2026-08-03T00:00:00+09:00".into(),
+                })
+                .unwrap();
+        }
+        let est = FakeEstablisher::default();
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let health = Arc::new(SubHealth::new(None));
+        let _handle =
+            spawn_subscription_manager(state, store_path.clone(), tx, None, Arc::clone(&health));
+        // 2 ノードぶんの priming 初着時刻（仮想時計）を記録する。
+        let mut first_seen: std::collections::HashMap<u64, tokio::time::Instant> =
+            std::collections::HashMap::new();
+        while first_seen.len() < 2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv())
+                .await
+                .expect("both nodes should prime")
+                .unwrap();
+            first_seen
+                .entry(ev.node_id)
+                .or_insert_with(tokio::time::Instant::now);
+        }
+        // 台帳列挙順は保証されないため、両向きの絶対差で stagger を検証する。
+        let (t1, t2) = (first_seen[&1], first_seen[&2]);
+        let gap = if t1 >= t2 {
+            t1.duration_since(t2)
+        } else {
+            t2.duration_since(t1)
+        };
+        assert!(
+            gap >= STAGGER_STEP,
+            "batch spawn should stagger by STAGGER_STEP, gap={gap:?}"
+        );
     }
 
     /// レジストリの遷移と JSON 形（spec の応答スキーマ nodes 配列）。
