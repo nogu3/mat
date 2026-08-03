@@ -401,6 +401,9 @@ struct Record {
     name: String,
     rdata: RData,
     ttl: u32,
+    /// RFC 6762 §10.2 の cache-flush ビット（class フィールド最上位）。class
+    /// 自体の検証は従来通りしない（mDNS は IN-only）。
+    cache_flush: bool,
 }
 
 /// Smallest possible record: 1-byte root name + type(2) + class(2) +
@@ -465,8 +468,8 @@ fn be32(buf: &[u8], pos: usize) -> Result<u32, DnssdError> {
 }
 
 /// Parses the answer + authority + additional records of one DNS message.
-/// Record classes are ignored (mDNS is IN-only; the cache-flush bit lives in
-/// the class field and must not break parsing).
+/// Record classes are not validated (mDNS is IN-only); only the RFC 6762
+/// cache-flush bit (top bit of the class field) is surfaced on each record.
 fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     if buf.len() < 12 {
         return Err(DnssdError::Malformed("short header"));
@@ -486,6 +489,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     for _ in 0..total {
         let (name, p) = read_name(buf, pos)?;
         let rtype = be16(buf, p)?;
+        let cache_flush = be16(buf, p + 2)? & 0x8000 != 0;
         let ttl = be32(buf, p + 4)?;
         let rdlen = usize::from(be16(buf, p + 8)?);
         let rdata_pos = p + 10;
@@ -538,7 +542,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             }
             _ => RData::Other,
         };
-        records.push(Record { name, rdata, ttl });
+        records.push(Record { name, rdata, ttl, cache_flush });
         pos = rdata_pos + rdlen;
     }
     Ok(records)
@@ -2513,17 +2517,33 @@ mod tests {
         m
     }
 
-    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+    /// class を指定できる AAAA 単独メッセージ（cache-flush ビット検証用）。
+    fn synth_aaaa_class(name: &str, ttl: u32, addr: Ipv6Addr, class: u16) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
         m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // qd 0, an 1
         push_name(&mut m, name);
         m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01]); // cache-flush|IN
+        m.extend_from_slice(&class.to_be_bytes());
         m.extend_from_slice(&ttl.to_be_bytes());
         m.extend_from_slice(&16u16.to_be_bytes());
         m.extend_from_slice(&addr.octets());
         m
+    }
+
+    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+        synth_aaaa_class(name, ttl, addr, 0x8000 | CLASS_IN) // cache-flush|IN
+    }
+
+    /// RFC 6762 §10.2 の cache-flush ビット（class 最上位）を Record に保持する。
+    /// class 自体は従来通り検証しない。
+    #[test]
+    fn parse_message_reads_cache_flush_bit() {
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        let with = parse_message(&synth_aaaa_class("h.local", 120, addr, 0x8000 | CLASS_IN)).unwrap();
+        assert!(with[0].cache_flush);
+        let without = parse_message(&synth_aaaa_class("h.local", 120, addr, CLASS_IN)).unwrap();
+        assert!(!without[0].cache_flush);
     }
 
     #[test]
