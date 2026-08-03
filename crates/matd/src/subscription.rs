@@ -568,6 +568,15 @@ pub(crate) fn next_backoff(cur: Duration) -> Duration {
     }
 }
 
+/// backoff の実 sleep に乗せるジッタ: cap 適用後の名目値 × [0.75, 1.25)。
+/// cap 後に掛けるので、長期障害で全ノードが BACKOFF_MAX に飽和しても実待ちは
+/// 45〜75s に散り続け、リトライ波が再同期しない（cap 前に掛けると飽和ノードが
+/// 全員ちょうど 60s で再同期する — 監査⑧）。`mark_down` / status の表示は
+/// 名目値のまま（表示はエンベロープの説明であって実 sleep の予告ではない）。
+pub(crate) fn jittered_backoff(nominal: Duration, r: f64) -> Duration {
+    nominal.mul_f64(0.75 + 0.5 * r)
+}
+
 /// 台帳の再読間隔。稼働中に `mat commission` されたノードを最大この遅延で
 /// 拾って購読を張る（監査#4: 従来は起動時スナップショットのみで、稼働中
 /// commission ノードは matd 再起動まで購読されず `mat listen` が無音だった）。
@@ -726,8 +735,9 @@ async fn node_subscription_loop(
         // 先頭の health.touched() 判定に残り、確立直後の pump を無条件で
         // Touched 即終了させてしまう（無限に近い張り直しループになる）。
         let touch_notify = health.touch_notify(node_id);
+        let sleep_dur = jittered_backoff(backoff, mat_controller::exchange::unit_random());
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(sleep_dur) => {}
             _ = touch_notify.notified() => {
                 backoff = Duration::ZERO;
                 health.clear_touched(node_id);
@@ -1056,6 +1066,17 @@ mod tests {
             next_backoff(Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    /// backoff jitter: cap 後の名目値 × [0.75, 1.25)。中央値（r=0.5）は名目値
+    /// のまま = 設計軌道（down_s 中央値 7-9s）を変えない。
+    #[test]
+    fn jittered_backoff_range_preserves_median() {
+        let n = Duration::from_secs(60);
+        assert_eq!(jittered_backoff(n, 0.0), Duration::from_secs(45));
+        assert_eq!(jittered_backoff(n, 0.5), n);
+        assert!(jittered_backoff(n, 0.999_999) < Duration::from_secs(75));
+        assert_eq!(jittered_backoff(Duration::ZERO, 0.7), Duration::ZERO);
     }
 
     #[test]
@@ -1583,12 +1604,12 @@ mod tests {
         assert!(ev.priming);
         let elapsed = t0.elapsed();
         assert!(
-            elapsed >= Duration::from_secs(35),
-            "5+10+20 のラダーを実際に登ること: {elapsed:?}"
+            elapsed >= Duration::from_secs(26),
+            "5+10+20 のラダーを実際に登ること（jitter で最小 ×0.75）: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(40),
-            "経過は 5+10+20 のラダーちょうど（35s）であり、40s の次段は登っていないこと: {elapsed:?}"
+            elapsed < Duration::from_secs(45),
+            "経過は 5+10+20 のラダーちょうど（35s）範囲であり、次段は登っていないこと（jitter で最大 ×1.25）: {elapsed:?}"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
