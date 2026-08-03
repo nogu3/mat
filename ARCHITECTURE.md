@@ -345,7 +345,8 @@ This repo ships two binaries from one install:
   lost to the abandoned one. Two paths feed the same trigger: 経路1 is
   `mat`'s own direct-path ops (`diag` included) firing a fire-and-forget
   `node_touched` line over the matd socket after `finish_conn`'s close, only
-  when a CASE session was actually established; 経路2 is `matd`'s own
+  when a CASE session was actually established (or, since 1.17.0, when the
+  op deadline expires — see below); 経路2 is `matd`'s own
   internal cold-establish (or resend-establish) inside a warm op, calling
   the same trigger in-process without a socket round trip. Either path
   cancels the node's pump (if running) or cuts a backoff wait short and
@@ -357,6 +358,13 @@ This repo ships two binaries from one install:
   swallows — the hint degrades to a no-op, not a failure, on either side of
   a version-skewed upgrade. Design:
   `docs/superpowers/specs/2026-07-31-node-touched-hint-design.md`.
+  1.17.0 (Issue #22) closes 経路1's deadline gap: `--op-timeout-ms` drops
+  the whole op future on expiry, so neither close nor hint ran — exactly
+  the "unstable node" case the hint exists for, regressing the blind
+  window to the 330s deadline. The timeout arm now fires the hint itself
+  (unconditionally — whether CASE got established is unknowable from
+  outside the dropped future, and a spurious hint is a cheap no-op; the
+  close stays unsendable since session ownership died with the future).
 
 - **MRP piggyback ack on responses (Issue #21, 1.16.0).** Second, CASE-free
   FP300 subscription death, wire-proven 2026-07-31: the device delivers a
