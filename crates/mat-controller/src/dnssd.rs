@@ -1318,7 +1318,21 @@ fn fold_operational_into_cache(
                     }
                     if let Some(entry) = list.iter_mut().find(|(a, _)| a == addr) {
                         entry.1 = now;
-                    } else if list.len() < MAX_ADDRS_PER_HOST {
+                    } else {
+                        if list.len() >= MAX_ADDRS_PER_HOST {
+                            // 満杯: 最古 last_seen を追い出して新アドレスを学習する。
+                            // 旧来の「新規拒否」は全 stale 時に恒久 unreachable を
+                            // 招いた（監査⑤の欠陥 2）。
+                            if let Some(i) = list
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, (_, seen))| *seen)
+                                .map(|(i, _)| i)
+                            {
+                                let (evicted, _) = list.remove(i);
+                                tracing::debug!(host = %host, addr = %evicted, "aaaa evicted (pool full)");
+                            }
+                        }
                         list.push((*addr, now));
                     }
                 }
@@ -1344,8 +1358,12 @@ fn fold_operational_into_cache(
         if addrs.is_empty() {
             continue;
         }
-        let mut addresses: Vec<Ipv6Addr> = addrs.iter().map(|(a, _)| *a).collect();
-        addresses.sort_by_key(is_link_local);
+        // 非 LL 優先はそのまま、同群内は last_seen の新しい順（監査⑤）。現役
+        // アドレスは約 30s 周期の再広告で常に最新なので、確立ループ（最初の
+        // 成功で早期リターン）は常に現アドレスから試す。
+        let mut entries = addrs.clone();
+        entries.sort_by_key(|(a, seen)| (is_link_local(a), std::cmp::Reverse(*seen)));
+        let addresses: Vec<Ipv6Addr> = entries.into_iter().map(|(a, _)| a).collect();
         let txt = fold.txt.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
         let node = ResolvedNode {
             port: *port,
@@ -2674,6 +2692,57 @@ mod tests {
             .get(service)
             .expect("the 70th distinct host's AAAA must not be starved by a global cap");
         assert_eq!(node.addresses, vec![last_addr]);
+    }
+
+    /// バックストップ（cache-flush を立てない実装向け・監査⑤の欠陥 1）:
+    /// 旧アドレスは残るが、後から見たアドレスが先頭に並び先に試される。
+    #[tokio::test(start_paused = true)]
+    async fn fold_freshness_orders_latest_first() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let a2: Ipv6Addr = "fd00::2".parse().unwrap();
+
+        // cache-flush 無し（class=IN のみ）なので物理削除は起きない。
+        let m1 = synth_aaaa_class(target, 120, a1, CLASS_IN);
+        fold_operational_into_cache(&parse_message(&m1).unwrap(), &mut fold, &cache, Instant::now());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let m2 = synth_aaaa_class(target, 120, a2, CLASS_IN);
+        fold_operational_into_cache(&parse_message(&m2).unwrap(), &mut fold, &cache, Instant::now());
+
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        assert_eq!(
+            cache.get(service).unwrap().addresses,
+            vec![a2, a1],
+            "freshest address must be tried first"
+        );
+    }
+
+    /// 満杯 8 本での学習拒否の反転（監査⑤の欠陥 2 = 成功基準 2）: 9 本目は
+    /// 最古を追い出して学習される。恒久 unreachable の根絶。
+    #[tokio::test(start_paused = true)]
+    async fn fold_full_pool_evicts_oldest_not_newest() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let mut addrs = Vec::new();
+        for i in 0..9u16 {
+            let a = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i + 1);
+            addrs.push(a);
+            let m = synth_aaaa_class(target, 120, a, CLASS_IN);
+            fold_operational_into_cache(&parse_message(&m).unwrap(), &mut fold, &cache, Instant::now());
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        fold_operational_into_cache(&parse_message(&msg).unwrap(), &mut fold, &cache, Instant::now());
+        let node = cache.get(service).unwrap();
+        assert_eq!(node.addresses.len(), MAX_ADDRS_PER_HOST);
+        assert!(!node.addresses.contains(&addrs[0]), "oldest must be evicted");
+        assert_eq!(node.addresses[0], addrs[8], "newest must be first");
     }
 
     /// 立ち去ったノード(A)の完成後、A に触れない無関係な datagram を挟んでも
