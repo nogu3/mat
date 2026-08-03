@@ -74,12 +74,14 @@ pub(crate) fn retrans_base(last_rx: Option<Instant>, cfg: &MrpConfig) -> Duratio
     }
 }
 
-/// MRP 再送が尽きるまでの待ち時間総和。op 予算設計（Issue #16）の成分。
+/// MRP 再送が尽きるまでの待ち時間総和（ジッタ最悪値込みの上界）。op 予算
+/// 設計（Issue #16）の成分 — 実待ちは各項 × (1 + jitter·r) なので、上界は
+/// r=1 で見積もる。
 pub fn total_budget(cfg: &MrpConfig) -> Duration {
     let mut total = Duration::ZERO;
     let mut interval = cfg.initial_interval;
     for _ in 0..=cfg.max_retries {
-        total += interval;
+        total += interval.mul_f64(1.0 + cfg.jitter);
         interval = interval.mul_f64(cfg.backoff);
     }
     total
@@ -738,6 +740,22 @@ mod tests {
         assert!(
             draws.iter().any(|r| *r != draws[0]),
             "16 draws all identical"
+        );
+    }
+
+    /// total_budget はジッタ最悪値込みの上界（Issue #16 の op 予算が実待ちより
+    /// 短くならない）。jitter=0 なら従来値。
+    #[test]
+    fn total_budget_includes_jitter_worst_case() {
+        let cfg = MrpConfig::default();
+        let base: Duration = {
+            let mut c = cfg.clone();
+            c.jitter = 0.0;
+            total_budget(&c)
+        };
+        assert_eq!(
+            total_budget(&cfg).as_millis(),
+            base.mul_f64(1.0 + MRP_BACKOFF_JITTER).as_millis()
         );
     }
 }

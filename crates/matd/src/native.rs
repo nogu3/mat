@@ -35,7 +35,7 @@ type NodeSlot = Arc<Mutex<Option<Box<dyn NodeConn>>>>;
 
 /// Timeout 腕の再確立+再送に最低限必要な残り予算。warm-cache の mDNS 解決 +
 /// CASE 往復（典型 ~1s）+ MRP 一巡（`mat_controller::exchange::total_budget`
-/// 既定 ≈ 4.74s、`worst_case_send_budget` ≈ 14.74s の内数）+ 応答余裕。
+/// 既定 ≈ 5.93s、`worst_case_send_budget` ≈ 15.93s の内数）+ 応答余裕。
 /// これ未満なら再送が成功しても呼び出し側の予算内に応答を返せない
 /// （Issue #16: 「1 回だけ再確立して再送」が構造的に無駄だった側）。
 pub(crate) const RETRY_MIN_BUDGET: Duration = Duration::from_secs(10);

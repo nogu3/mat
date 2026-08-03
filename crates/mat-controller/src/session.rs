@@ -23,7 +23,7 @@ use crate::transport::{Transport, MAX_DATAGRAM};
 /// ack に応答が piggyback しなかった場合の IM 応答待ち。op 予算設計の成分。
 pub const IM_RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 単一 op 送信の最悪所要（MRP 再送総和 + IM 応答待ち ≈ 14.74s）。
+/// 単一 op 送信の最悪所要（MRP 再送総和 + IM 応答待ち ≈ 15.93s（ジッタ最悪値込み））。
 /// matd の呼び出し側予算（Issue #16）はこの値を前提に設計する。
 pub fn worst_case_send_budget() -> Duration {
     crate::exchange::total_budget(&crate::exchange::MrpConfig::default()) + IM_RECV_TIMEOUT
@@ -33,18 +33,6 @@ pub fn worst_case_send_budget() -> Duration {
 /// 上限到達は「デバイスが more_chunks を返し続けている」異常で、打ち切って
 /// エラーにする（無限拘束の防止）。
 const MAX_REPORT_CHUNKS: usize = 64;
-/// MRP の全リトライを使い切るまでの待ち時間合計。reliable transport では
-/// 「同じ体感タイムアウト」で実応答を待つ予算として使う（`exchange.rs` の
-/// 同名関数と同じ計算——secure 経路にも同じゲーティングを対称に適用する）。
-fn total_budget(cfg: &MrpConfig) -> Duration {
-    let mut total = Duration::ZERO;
-    let mut interval = cfg.initial_interval;
-    for _ in 0..=cfg.max_retries {
-        total += interval;
-        interval = interval.mul_f64(cfg.backoff);
-    }
-    total
-}
 
 /// `screen_with` の配送フィルタ。ack/dedup はフィルタに依らず常に行う。
 #[derive(Clone, Copy)]
@@ -453,7 +441,7 @@ impl SecureSession {
             let (datagram, _) =
                 self.seal(exchange_id, true, protocol_id, opcode, false, None, payload)?;
             self.transport.send_to(&datagram, self.peer).await?;
-            let budget = total_budget(cfg);
+            let budget = crate::exchange::total_budget(cfg);
             return match self.recv(exchange_id, budget).await {
                 Ok(msg) => Ok(Some(msg)),
                 Err(e) => Err(e),
@@ -3259,11 +3247,12 @@ mod tests {
     #[test]
     fn budget_components_are_pinned() {
         let mrp = crate::exchange::total_budget(&crate::exchange::MrpConfig::default());
-        // 300 + 480 + 768 + 1228.8 + 1966.08 = 4742.88ms（5 送信の間隔総和）
-        assert_eq!(mrp.as_millis(), 4742);
+        // ジッタ最悪値込み: 4742.88 × 1.25 = 5928.6ms（5 送信の間隔総和 × (1 + jitter)）
+        assert_eq!(mrp.as_millis(), 5928);
         assert_eq!(IM_RECV_TIMEOUT.as_secs(), 10);
-        // 単一 op 送信の最悪 = MRP 総和 + IM 応答待ち
-        assert_eq!(worst_case_send_budget().as_millis(), 14742);
+        // 単一 op 送信の最悪 = MRP 総和（ジッタ最悪値込み） + IM 応答待ち
+        // = 4742.88 × 1.25 + 10000 = 15928.6ms（切り捨て）
+        assert_eq!(worst_case_send_budget().as_millis(), 15928);
         assert_eq!(crate::case::RECV_TIMEOUT.as_secs(), 10);
     }
 
