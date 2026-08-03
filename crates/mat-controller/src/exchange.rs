@@ -12,6 +12,24 @@ use crate::message::{
 };
 use crate::transport::{Transport, MAX_DATAGRAM};
 
+/// spec 4.12.2.1 MRP_BACKOFF_JITTER: 再送待ちジッタ係数の既定上限。
+pub const MRP_BACKOFF_JITTER: f64 = 0.25;
+
+/// [0,1) の一様乱数。getrandom 失敗時は 0.5 へ退避 — jitter は品質であって
+/// 正しさではないので、ここでは panic させない（暗号用途には使わないこと）。
+pub fn unit_random() -> f64 {
+    let mut b = [0u8; 8];
+    if getrandom::getrandom(&mut b).is_err() {
+        return 0.5;
+    }
+    (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// 1 回の再送待ちへジッタを乗せる（純関数 — r は `unit_random()` の値）。
+pub fn jittered_interval(interval: Duration, jitter: f64, r: f64) -> Duration {
+    interval.mul_f64(1.0 + jitter * r)
+}
+
 /// MRP retransmission parameters (spec 4.12; defaults follow chip defaults).
 #[derive(Debug, Clone)]
 pub struct MrpConfig {
@@ -25,6 +43,10 @@ pub struct MrpConfig {
     pub active_interval: Duration,
     pub max_retries: u32,
     pub backoff: f64,
+    /// 各再送待ちに乗せるジッタ係数の上限（spec 4.12.2.1 MRP_BACKOFF_JITTER）。
+    /// 実待ち = interval × (1 + jitter · r)、r ∈ [0,1)。0.0 = ジッタ無し
+    /// （テストの決定論用）。
+    pub jitter: f64,
 }
 
 impl Default for MrpConfig {
@@ -34,6 +56,7 @@ impl Default for MrpConfig {
             active_interval: Duration::from_millis(300),
             max_retries: 4,
             backoff: 1.6,
+            jitter: MRP_BACKOFF_JITTER,
         }
     }
 }
@@ -357,6 +380,7 @@ mod tests {
             active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
+            jitter: 0.0,
         }
     }
 
@@ -439,6 +463,7 @@ mod tests {
             active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
+            jitter: 0.0,
         };
 
         let responder_task = tokio::spawn(async move {
@@ -692,5 +717,27 @@ mod tests {
         let err = ex.recv(Duration::from_millis(200)).await.unwrap_err();
         assert!(matches!(err, ExchangeError::Timeout));
         responder_task.await.unwrap();
+    }
+
+    /// jitter 純関数: r=0 で恒等、jitter=0 で恒等、上限は ×(1+jitter) 未満。
+    #[test]
+    fn jittered_interval_bounds() {
+        let base = Duration::from_millis(300);
+        assert_eq!(jittered_interval(base, 0.25, 0.0), base);
+        assert_eq!(jittered_interval(base, 0.0, 0.9), base);
+        let hi = jittered_interval(base, 0.25, 0.999_999);
+        assert!(hi > base && hi < base.mul_f64(1.25));
+    }
+
+    /// unit_random: [0,1) に収まり、壊れて定数化していない（16 連続一致は
+    /// 実装破損以外で起きない）。
+    #[test]
+    fn unit_random_in_range_and_varies() {
+        let draws: Vec<f64> = (0..16).map(|_| unit_random()).collect();
+        assert!(draws.iter().all(|r| (0.0..1.0).contains(r)));
+        assert!(
+            draws.iter().any(|r| *r != draws[0]),
+            "16 draws all identical"
+        );
     }
 }
