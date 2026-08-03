@@ -66,6 +66,7 @@ pub fn fast_cfg() -> MrpConfig {
         active_interval: Duration::from_millis(50),
         max_retries: 3,
         backoff: 1.0,
+        jitter: 0.0,
     }
 }
 

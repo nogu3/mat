@@ -24,7 +24,7 @@ use crate::case;
 use crate::cert::{self, MatterCert};
 use crate::crypto;
 use crate::dnssd;
-use crate::exchange::MrpConfig;
+use crate::exchange::{MrpConfig, MRP_BACKOFF_JITTER};
 use crate::fabric::{self, FabricCredentials};
 use crate::im;
 use crate::kvs::SelfIssueMaterials;
@@ -930,6 +930,7 @@ pub async fn commission_btp_thread(
         active_interval: Duration::from_secs(15),
         max_retries: 1,
         backoff: 1.0,
+        jitter: MRP_BACKOFF_JITTER,
     };
     let xpan = thread_ext_pan_id(params.thread_dataset).ok_or(CommissionError::Malformed {
         step: "thread-dataset",
@@ -1018,6 +1019,7 @@ pub async fn commission_btp_thread(
         active_interval: Duration::from_secs(60), // Thread join 待ち予算を保つ
         max_retries: 0,
         backoff: 1.0,
+        jitter: MRP_BACKOFF_JITTER,
     };
     let resp = pase
         .invoke_for_data(
