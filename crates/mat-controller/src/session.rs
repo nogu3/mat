@@ -1237,6 +1237,7 @@ mod tests {
             active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
+            jitter: 0.0,
         }
     }
 
@@ -1304,6 +1305,7 @@ mod tests {
             active_interval: Duration::from_millis(50),
             max_retries: 2,
             backoff: 1.0,
+            jitter: 0.0,
         };
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -1701,6 +1703,7 @@ mod tests {
             active_interval: Duration::from_millis(50),
             max_retries: 1,
             backoff: 1.0,
+            jitter: 0.0,
         };
 
         let dev = tokio::spawn(async move {
