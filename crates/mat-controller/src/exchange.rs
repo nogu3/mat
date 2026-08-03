@@ -280,7 +280,7 @@ impl<'t> UnsecuredExchange<'t> {
         let mut attempts = 0u32;
         loop {
             self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now() + interval;
+            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
