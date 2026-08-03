@@ -401,6 +401,9 @@ struct Record {
     name: String,
     rdata: RData,
     ttl: u32,
+    /// RFC 6762 §10.2 の cache-flush ビット（class フィールド最上位）。class
+    /// 自体の検証は従来通りしない（mDNS は IN-only）。
+    cache_flush: bool,
 }
 
 /// Smallest possible record: 1-byte root name + type(2) + class(2) +
@@ -465,8 +468,8 @@ fn be32(buf: &[u8], pos: usize) -> Result<u32, DnssdError> {
 }
 
 /// Parses the answer + authority + additional records of one DNS message.
-/// Record classes are ignored (mDNS is IN-only; the cache-flush bit lives in
-/// the class field and must not break parsing).
+/// Record classes are not validated (mDNS is IN-only); only the RFC 6762
+/// cache-flush bit (top bit of the class field) is surfaced on each record.
 fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     if buf.len() < 12 {
         return Err(DnssdError::Malformed("short header"));
@@ -486,6 +489,7 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
     for _ in 0..total {
         let (name, p) = read_name(buf, pos)?;
         let rtype = be16(buf, p)?;
+        let cache_flush = be16(buf, p + 2)? & 0x8000 != 0;
         let ttl = be32(buf, p + 4)?;
         let rdlen = usize::from(be16(buf, p + 8)?);
         let rdata_pos = p + 10;
@@ -538,7 +542,12 @@ fn parse_message(buf: &[u8]) -> Result<Vec<Record>, DnssdError> {
             }
             _ => RData::Other,
         };
-        records.push(Record { name, rdata, ttl });
+        records.push(Record {
+            name,
+            rdata,
+            ttl,
+            cache_flush,
+        });
         pos = rdata_pos + rdlen;
     }
     Ok(records)
@@ -1225,6 +1234,11 @@ const MAX_FOLD_ENTRIES: usize = 256;
 /// が MAX_FOLD_ENTRIES 未満である限り starve しない。
 const MAX_ADDRS_PER_HOST: usize = 8;
 
+/// RFC 6762 §10.2: cache-flush 受信時に破棄してよいのは「1 秒より古い」記録
+/// だけ。この猶予が、同一アナウンス burst が複数データグラムに分割された
+/// 場合の相互破壊を防ぐ。
+const CACHE_FLUSH_GRACE: Duration = Duration::from_secs(1);
+
 /// 常駐 mDNS listener（[`run_operational_cache`]）がプロセス寿命で保持する、
 /// 有界・自己更新型の operational レコード蓄積。旧実装（[`InstAcc`] 相当を
 /// 1個の HashMap + 1個のグローバル共有 `aaaa: Vec` に貯める設計）には2つの
@@ -1245,9 +1259,10 @@ struct OperationalFold {
     srv: HashMap<String, (u16, String, u32)>,
     /// instance_lower → TXT 文字列群。
     txt: HashMap<String, Vec<Vec<u8>>>,
-    /// host_lower(SRV target) → アドレス群（dedup、[`MAX_ADDRS_PER_HOST`] で
-    /// 頭打ち）。
-    addrs: HashMap<String, Vec<Ipv6Addr>>,
+    /// host_lower(SRV target) → (アドレス, last_seen)。dedup、
+    /// [`MAX_ADDRS_PER_HOST`] で頭打ち。last_seen は鮮度順ソートと
+    /// cache-flush / 満杯 evict の判定材料（監査⑤）。
+    addrs: HashMap<String, Vec<(Ipv6Addr, Instant)>>,
 }
 
 /// `records`（1 データグラム分）を `fold` へ畳み込み、その datagram に現れた
@@ -1264,6 +1279,7 @@ fn fold_operational_into_cache(
     records: &[Record],
     fold: &mut OperationalFold,
     cache: &OperationalCache,
+    now: Instant,
 ) {
     let mut touched: HashSet<String> = HashSet::new();
 
@@ -1293,8 +1309,36 @@ fn fold_operational_into_cache(
                 let is_new_host = !fold.addrs.contains_key(&host);
                 if !(is_new_host && fold.addrs.len() >= MAX_FOLD_ENTRIES) {
                     let list = fold.addrs.entry(host.clone()).or_default();
-                    if list.len() < MAX_ADDRS_PER_HOST && !list.contains(addr) {
-                        list.push(*addr);
+                    if r.cache_flush {
+                        // cache-flush: 1 秒より古い既存アドレスは「現在の広告に
+                        // 含まれない」ものとして物理削除する（stale を先に試す
+                        // 79s 浪費と恒久 unreachable の元 — 監査⑤）。
+                        list.retain(|(a, seen)| {
+                            let keep = now.duration_since(*seen) <= CACHE_FLUSH_GRACE;
+                            if !keep {
+                                tracing::debug!(host = %host, addr = %a, "aaaa evicted (cache-flush)");
+                            }
+                            keep
+                        });
+                    }
+                    if let Some(entry) = list.iter_mut().find(|(a, _)| a == addr) {
+                        entry.1 = now;
+                    } else {
+                        if list.len() >= MAX_ADDRS_PER_HOST {
+                            // 満杯: 最古 last_seen を追い出して新アドレスを学習する。
+                            // 旧来の「新規拒否」は全 stale 時に恒久 unreachable を
+                            // 招いた（監査⑤の欠陥 2）。
+                            if let Some(i) = list
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, (_, seen))| *seen)
+                                .map(|(i, _)| i)
+                            {
+                                let (evicted, _) = list.remove(i);
+                                tracing::debug!(host = %host, addr = %evicted, "aaaa evicted (pool full)");
+                            }
+                        }
+                        list.push((*addr, now));
                     }
                 }
                 // この host を SRV target に持つ既知 instance を touched に。
@@ -1319,8 +1363,12 @@ fn fold_operational_into_cache(
         if addrs.is_empty() {
             continue;
         }
-        let mut addresses = addrs.clone();
-        addresses.sort_by_key(is_link_local);
+        // 非 LL 優先はそのまま、同群内は last_seen の新しい順（監査⑤）。現役
+        // アドレスは約 30s 周期の再広告で常に最新なので、確立ループ（最初の
+        // 成功で早期リターン）は常に現アドレスから試す。
+        let mut entries = addrs.clone();
+        entries.sort_by_key(|(a, seen)| (is_link_local(a), std::cmp::Reverse(*seen)));
+        let addresses: Vec<Ipv6Addr> = entries.into_iter().map(|(a, _)| a).collect();
         let txt = fold.txt.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
         let node = ResolvedNode {
             port: *port,
@@ -1351,7 +1399,7 @@ async fn run_operational_cache(
             recv = sock.recv_from(&mut buf) => {
                 let Ok((n, _)) = recv else { continue; };
                 let Ok(records) = parse_message(&buf[..n]) else { continue; };
-                fold_operational_into_cache(&records, &mut fold, &cache);
+                fold_operational_into_cache(&records, &mut fold, &cache, Instant::now());
             }
             req = requests.recv() => {
                 match req {
@@ -1500,7 +1548,7 @@ mod tests {
         );
         let records = parse_message(&msg).unwrap();
         let mut fold = OperationalFold::default();
-        fold_operational_into_cache(&records, &mut fold, &cache);
+        fold_operational_into_cache(&records, &mut fold, &cache, Instant::now());
 
         let node = cache
             .get("AB7DE08802E0CD54-0000000000000005._matter._tcp.local")
@@ -1524,7 +1572,7 @@ mod tests {
         );
         let records = parse_message(&msg).unwrap();
         let mut fold = OperationalFold::default();
-        fold_operational_into_cache(&records, &mut fold, &cache);
+        fold_operational_into_cache(&records, &mut fold, &cache, Instant::now());
         assert!(cache.get("ABCD1234._matterc._udp.local").is_none());
     }
 
@@ -2513,17 +2561,115 @@ mod tests {
         m
     }
 
-    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+    /// class を指定できる AAAA 単独メッセージ（cache-flush ビット検証用）。
+    fn synth_aaaa_class(name: &str, ttl: u32, addr: Ipv6Addr, class: u16) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
         m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // qd 0, an 1
         push_name(&mut m, name);
         m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01]); // cache-flush|IN
+        m.extend_from_slice(&class.to_be_bytes());
         m.extend_from_slice(&ttl.to_be_bytes());
         m.extend_from_slice(&16u16.to_be_bytes());
         m.extend_from_slice(&addr.octets());
         m
+    }
+
+    fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {
+        synth_aaaa_class(name, ttl, addr, 0x8000 | CLASS_IN) // cache-flush|IN
+    }
+
+    /// RFC 6762 §10.2 の cache-flush ビット（class 最上位）を Record に保持する。
+    /// class 自体は従来通り検証しない。
+    #[test]
+    fn parse_message_reads_cache_flush_bit() {
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        let with =
+            parse_message(&synth_aaaa_class("h.local", 120, addr, 0x8000 | CLASS_IN)).unwrap();
+        assert!(with[0].cache_flush);
+        let without = parse_message(&synth_aaaa_class("h.local", 120, addr, CLASS_IN)).unwrap();
+        assert!(!without[0].cache_flush);
+    }
+
+    /// アドレスローテーション（監査⑤の欠陥 1）: cache-flush 付きの新 AAAA が
+    /// 届いたら、1 秒より古い旧アドレスは物理削除され、キャッシュは新アドレス
+    /// のみになる。
+    #[tokio::test(start_paused = true)]
+    async fn fold_cache_flush_evicts_stale_addresses() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let old: Ipv6Addr = "fd00::1".parse().unwrap();
+        let new: Ipv6Addr = "fd00::2".parse().unwrap();
+
+        let msg = synth_response(service, target, 5540, &["SII=5000"], old);
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        assert_eq!(cache.get(service).unwrap().addresses, vec![old]);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        // 再アドレス化: cache-flush 付き AAAA（synth_aaaa_only は cache-flush|IN）。
+        let msg2 = synth_aaaa_only(target, 120, new);
+        fold_operational_into_cache(
+            &parse_message(&msg2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        assert_eq!(
+            cache.get(service).unwrap().addresses,
+            vec![new],
+            "stale address must be physically removed on cache-flush"
+        );
+    }
+
+    /// RFC 6762 §10.2 の 1 秒猶予: 同一アナウンス burst の分割データグラム
+    /// （≤1s 間隔）は cache-flush でも互いを消さない。
+    #[tokio::test(start_paused = true)]
+    async fn fold_cache_flush_grace_keeps_same_burst() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let a2: Ipv6Addr = "fd00::2".parse().unwrap();
+
+        let m1 = synth_aaaa_only(target, 120, a1);
+        fold_operational_into_cache(
+            &parse_message(&m1).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let m2 = synth_aaaa_only(target, 120, a2);
+        fold_operational_into_cache(
+            &parse_message(&m2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        let node = cache.get(service).unwrap();
+        assert_eq!(
+            node.addresses.len(),
+            2,
+            "both burst datagrams must survive the 1s grace"
+        );
+        assert!(node.addresses.contains(&a1) && node.addresses.contains(&a2));
     }
 
     #[test]
@@ -2536,7 +2682,7 @@ mod tests {
 
         let msg1 = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
         let records1 = parse_message(&msg1).unwrap();
-        fold_operational_into_cache(&records1, &mut fold, &cache);
+        fold_operational_into_cache(&records1, &mut fold, &cache, Instant::now());
         assert!(
             cache.get(service).is_none(),
             "SRV without AAAA must not cache yet"
@@ -2544,7 +2690,7 @@ mod tests {
 
         let msg2 = synth_aaaa_only(target, 120, addr);
         let records2 = parse_message(&msg2).unwrap();
-        fold_operational_into_cache(&records2, &mut fold, &cache);
+        fold_operational_into_cache(&records2, &mut fold, &cache, Instant::now());
 
         let node = cache
             .get(service)
@@ -2569,18 +2715,97 @@ mod tests {
             last_addr = addr;
             let msg = synth_aaaa_only(&host, 120, addr);
             let records = parse_message(&msg).unwrap();
-            fold_operational_into_cache(&records, &mut fold, &cache);
+            fold_operational_into_cache(&records, &mut fold, &cache, Instant::now());
         }
         let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
         let target = "host69.local"; // 70 番目 (旧 64 上限を上回る)
         let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
         let records = parse_message(&msg).unwrap();
-        fold_operational_into_cache(&records, &mut fold, &cache);
+        fold_operational_into_cache(&records, &mut fold, &cache, Instant::now());
 
         let node = cache
             .get(service)
             .expect("the 70th distinct host's AAAA must not be starved by a global cap");
         assert_eq!(node.addresses, vec![last_addr]);
+    }
+
+    /// バックストップ（cache-flush を立てない実装向け・監査⑤の欠陥 1）:
+    /// 旧アドレスは残るが、後から見たアドレスが先頭に並び先に試される。
+    #[tokio::test(start_paused = true)]
+    async fn fold_freshness_orders_latest_first() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let a1: Ipv6Addr = "fd00::1".parse().unwrap();
+        let a2: Ipv6Addr = "fd00::2".parse().unwrap();
+
+        // cache-flush 無し（class=IN のみ）なので物理削除は起きない。
+        let m1 = synth_aaaa_class(target, 120, a1, CLASS_IN);
+        fold_operational_into_cache(
+            &parse_message(&m1).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let m2 = synth_aaaa_class(target, 120, a2, CLASS_IN);
+        fold_operational_into_cache(
+            &parse_message(&m2).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        assert_eq!(
+            cache.get(service).unwrap().addresses,
+            vec![a2, a1],
+            "freshest address must be tried first"
+        );
+    }
+
+    /// 満杯 8 本での学習拒否の反転（監査⑤の欠陥 2 = 成功基準 2）: 9 本目は
+    /// 最古を追い出して学習される。恒久 unreachable の根絶。
+    #[tokio::test(start_paused = true)]
+    async fn fold_full_pool_evicts_oldest_not_newest() {
+        let (cache, _rx) = OperationalCache::new();
+        let mut fold = OperationalFold::default();
+        let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
+        let target = "hosta.local";
+        let mut addrs = Vec::new();
+        for i in 0..9u16 {
+            let a = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, i + 1);
+            addrs.push(a);
+            let m = synth_aaaa_class(target, 120, a, CLASS_IN);
+            fold_operational_into_cache(
+                &parse_message(&m).unwrap(),
+                &mut fold,
+                &cache,
+                Instant::now(),
+            );
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        let msg = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
+        fold_operational_into_cache(
+            &parse_message(&msg).unwrap(),
+            &mut fold,
+            &cache,
+            Instant::now(),
+        );
+        let node = cache.get(service).unwrap();
+        assert_eq!(node.addresses.len(), MAX_ADDRS_PER_HOST);
+        assert!(
+            !node.addresses.contains(&addrs[0]),
+            "oldest must be evicted"
+        );
+        assert_eq!(node.addresses[0], addrs[8], "newest must be first");
     }
 
     /// 立ち去ったノード(A)の完成後、A に触れない無関係な datagram を挟んでも
@@ -2598,7 +2823,7 @@ mod tests {
 
         let msg_a = synth_response(service_a, target_a, 5540, &["SII=5000"], addr_a);
         let records_a = parse_message(&msg_a).unwrap();
-        fold_operational_into_cache(&records_a, &mut fold, &cache);
+        fold_operational_into_cache(&records_a, &mut fold, &cache, Instant::now());
         assert!(
             cache.get(service_a).is_some(),
             "A should be cached initially"
@@ -2614,7 +2839,7 @@ mod tests {
         let addr_b: Ipv6Addr = "fd54:4b81:8cce:1::b".parse().unwrap();
         let msg_unrelated = synth_aaaa_only("unrelated.local", 120, addr_b);
         let records_unrelated = parse_message(&msg_unrelated).unwrap();
-        fold_operational_into_cache(&records_unrelated, &mut fold, &cache);
+        fold_operational_into_cache(&records_unrelated, &mut fold, &cache, Instant::now());
 
         tokio::time::advance(Duration::from_secs(2)).await; // 合計 +121s
         assert!(
