@@ -684,8 +684,8 @@ fn map_resolve_err(node_id: u64, e: dnssd::DnssdError) -> MatError {
 
 /// SecureSession のエラーを mat の ErrorKind へ写像する（経路によらず分類を揃える）。
 fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
-    use mat_controller::session::SessionError;
     use mat_controller::im::ImError;
+    use mat_controller::session::SessionError;
     match e {
         // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
         SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
@@ -797,9 +797,15 @@ mod tests {
         // 本当のデバイス拒否（StatusResponse/AttributeStatus/CommandStatus）だけ。
         use mat_controller::im::ImError;
         use mat_controller::session::SessionError;
-        let e = map_session_err(SessionError::Im(ImError::Malformed("truncated report data")));
+        let e = map_session_err(SessionError::Im(ImError::Malformed(
+            "truncated report data",
+        )));
         assert_eq!(e.kind, ErrorKind::ParseError);
         let e = map_session_err(SessionError::Im(ImError::UnsupportedValue));
+        assert_eq!(e.kind, ErrorKind::ParseError);
+        let e = map_session_err(SessionError::Im(ImError::Tlv(
+            mat_controller::tlv::TlvError::InvalidType(0xFF),
+        )));
         assert_eq!(e.kind, ErrorKind::ParseError);
         let e = map_session_err(SessionError::Im(ImError::StatusResponse(0x80)));
         assert_eq!(e.kind, ErrorKind::DeviceRejected);
