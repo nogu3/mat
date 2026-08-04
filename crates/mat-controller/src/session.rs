@@ -1217,7 +1217,34 @@ impl SecureSession {
         if msg.proto.opcode != im::OPCODE_REPORT_DATA {
             return Err(SessionError::UnexpectedOpcode(msg.proto.opcode));
         }
-        let rd = im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+        // 監査⑨: デコード失敗でも購読は殺さない。認証済み（MIC 検証済み）の
+        // デバイス発メッセージなので生存の証拠としては正しく、空 rd
+        // （= keep-alive 相当）に差し替えて届ける。suppress_response は読めない
+        // ので false 扱い → 下の分岐が StatusResponse(0) で exchange を閉じる
+        // （1.16.0 ワイヤ実測: 実デバイスの購読レポートは suppress=false +
+        // StatusResponse 期待。suppress=true の相手への余計な SR は exchange
+        // 終端で無害）。
+        let rd = match im::decode_report_data_message(&msg.payload) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(
+                    exchange_id = msg.proto.exchange_id,
+                    payload_len = msg.payload.len(),
+                    error = %e,
+                    "sub pump: undecodable report; delivering as empty"
+                );
+                tracing::debug!(
+                    payload_head = %payload_head_hex(&msg.payload),
+                    "undecodable report payload"
+                );
+                im::ReportDataMessage {
+                    reports: Vec::new(),
+                    subscription_id: None,
+                    more_chunks: false,
+                    suppress_response: false,
+                }
+            }
+        };
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             subscription_id = rd.subscription_id,
@@ -2944,6 +2971,74 @@ mod tests {
             .await
             .unwrap();
         assert!(ka.reports.is_empty()); // keep-alive
+        dev_task.await.unwrap();
+    }
+
+    /// 監査⑨: 非デコード可能な live report は購読を殺さない — 空 rd
+    /// （keep-alive 相当）として届き、StatusResponse(0) で exchange を閉じ、
+    /// 次の正常 report は通常配送される。
+    #[tokio::test]
+    async fn next_subscription_report_survives_undecodable_report() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 200,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x7779,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            // garbage report（struct start だけで途中切れ = デコード不能）
+            let d = seal_message(&R2I, &header, &proto, &[0x15], DEV_NODE).unwrap();
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            // StatusResponse(0) が同 exchange に返る
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(p.exchange_id, 0x7779);
+            assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
+            // 正常 report（別 exchange）は通常配送される
+            let mut h2 = header;
+            h2.message_counter = 201;
+            let mut p2 = proto;
+            p2.exchange_id = 0x777a;
+            let d = seal_message(
+                &R2I,
+                &h2,
+                &p2,
+                &subscription_report_payload(42, true, false),
+                DEV_NODE,
+            )
+            .unwrap();
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p3, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p3.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(p3.exchange_id, 0x777a);
+        });
+
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .expect("undecodable report must not kill the pump");
+        assert!(rd.reports.is_empty());
+        assert_eq!(rd.subscription_id, None);
+        let rd2 = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd2.subscription_id, Some(42));
         dev_task.await.unwrap();
     }
 
