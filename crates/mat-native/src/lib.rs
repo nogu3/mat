@@ -693,16 +693,20 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
         // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
         SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
-        SessionError::Im(
-            ImError::StatusResponse(_)
-            | ImError::AttributeStatus(_)
-            | ImError::CommandStatus { .. },
-        ) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
-        // こちらのデコーダが応答を解釈できなかった（監査⑨）→ 応答は来たが
-        // 解釈不能 = parse_error（Message(_) と同じ規律）。variant 追加時に
-        // ここで分類を決めさせるため wildcard にしない。
-        SessionError::Im(ImError::Tlv(_) | ImError::Malformed(_) | ImError::UnsupportedValue) => {
-            MatError::new(ErrorKind::ParseError, format!("native: {e}"))
+        // デコード失敗（Tlv/Malformed/UnsupportedValue）は「応答は来たが解釈
+        // 不能」= parse_error（Message(_) と同じ規律）。内側 match は wildcard
+        // なしの全 variant 列挙 — ImError の variant 追加時にここがコンパイル
+        // エラーになり分類を決めさせる（外側の `_` に黙って落とさない）。
+        SessionError::Im(ref im) => {
+            let kind = match im {
+                ImError::StatusResponse(_)
+                | ImError::AttributeStatus(_)
+                | ImError::CommandStatus { .. } => ErrorKind::DeviceRejected,
+                ImError::Tlv(_) | ImError::Malformed(_) | ImError::UnsupportedValue => {
+                    ErrorKind::ParseError
+                }
+            };
+            MatError::new(kind, format!("native: {e}"))
         }
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
         // ピアの応答がメッセージ層で壊れている → 応答は来た（不達ではない）が
