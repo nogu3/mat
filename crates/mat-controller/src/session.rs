@@ -34,6 +34,16 @@ pub fn worst_case_send_budget() -> Duration {
 /// エラーにする（無限拘束の防止）。
 const MAX_REPORT_CHUNKS: usize = 64;
 
+/// デコード失敗 payload の先頭を hex で（未知エンコーディングの事後診断用、
+/// debug ログ専用）。
+fn payload_head_hex(payload: &[u8]) -> String {
+    payload
+        .iter()
+        .take(64)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// `screen_with` の配送フィルタ。ack/dedup はフィルタに依らず常に行う。
 #[derive(Clone, Copy)]
 enum ScreenFilter {
@@ -1083,8 +1093,32 @@ impl SecureSession {
         loop {
             match msg.proto.opcode {
                 im::OPCODE_REPORT_DATA => {
-                    let rd =
-                        im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+                    // 監査⑨: デコード失敗でも購読は殺さない。認証済み（MIC 検証
+                    // 済み）のチャンクなので ack して先へ進み、失われるのはこの
+                    // チャンクの属性値だけ（matd の state cache は次のレポートで
+                    // 自己回復）。空 rd を push するのは MAX_REPORT_CHUNKS の
+                    // flood 防御を非デコード可能チャンクにも効かせるため。
+                    let rd = match im::decode_report_data_message(&msg.payload) {
+                        Ok(rd) => rd,
+                        Err(e) => {
+                            tracing::warn!(
+                                exchange_id,
+                                payload_len = msg.payload.len(),
+                                error = %e,
+                                "subscribe: undecodable priming chunk; acking and continuing"
+                            );
+                            tracing::debug!(
+                                payload_head = %payload_head_hex(&msg.payload),
+                                "undecodable priming chunk payload"
+                            );
+                            im::ReportDataMessage {
+                                reports: Vec::new(),
+                                subscription_id: None,
+                                more_chunks: false,
+                                suppress_response: false,
+                            }
+                        }
+                    };
                     tracing::debug!(
                         exchange_id,
                         reports = rd.reports.len(),
@@ -1183,7 +1217,34 @@ impl SecureSession {
         if msg.proto.opcode != im::OPCODE_REPORT_DATA {
             return Err(SessionError::UnexpectedOpcode(msg.proto.opcode));
         }
-        let rd = im::decode_report_data_message(&msg.payload).map_err(SessionError::Im)?;
+        // 監査⑨: デコード失敗でも購読は殺さない。認証済み（MIC 検証済み）の
+        // デバイス発メッセージなので生存の証拠としては正しく、空 rd
+        // （= keep-alive 相当）に差し替えて届ける。suppress_response は読めない
+        // ので false 扱い → 下の分岐が StatusResponse(0) で exchange を閉じる
+        // （1.16.0 ワイヤ実測: 実デバイスの購読レポートは suppress=false +
+        // StatusResponse 期待。suppress=true の相手への余計な SR は exchange
+        // 終端で無害）。
+        let rd = match im::decode_report_data_message(&msg.payload) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(
+                    exchange_id = msg.proto.exchange_id,
+                    payload_len = msg.payload.len(),
+                    error = %e,
+                    "sub pump: undecodable report; delivering as empty"
+                );
+                tracing::debug!(
+                    payload_head = %payload_head_hex(&msg.payload),
+                    "undecodable report payload"
+                );
+                im::ReportDataMessage {
+                    reports: Vec::new(),
+                    subscription_id: None,
+                    more_chunks: false,
+                    suppress_response: false,
+                }
+            }
+        };
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             subscription_id = rd.subscription_id,
@@ -2732,6 +2793,119 @@ mod tests {
         dev_task.await.unwrap();
     }
 
+    /// 監査⑨: 非デコード可能な priming チャンクは購読を殺さない —
+    /// warn + StatusResponse(0) + 空 rd 差し替えで続行し、ハンドシェイクは成立する。
+    #[tokio::test]
+    async fn subscribe_wildcard_survives_undecodable_priming_chunk() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_SUBSCRIBE_REQUEST);
+            let ex = p.exchange_id;
+            // garbage チャンク（struct start だけで途中切れ = デコード不能）
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                9200,
+                &[0x15],
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            // garbage にも StatusResponse(0) が返る
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p2, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p2.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
+            // 正常チャンク（more=false）→ StatusResponse(0) → SubscribeResponse
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                9201,
+                &subscription_report_payload(44, true, false),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p3, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p3.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_SUBSCRIBE_RESPONSE,
+                None,
+                false,
+                9202,
+                &subscribe_response_payload(44, 120),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+        });
+
+        let (resp, priming) = s
+            .subscribe_wildcard(0, 3600, false, &[], &fast_cfg())
+            .await
+            .expect("undecodable priming chunk must not kill the subscribe");
+        assert_eq!(resp.subscription_id, 44);
+        assert_eq!(priming.len(), 2);
+        assert!(priming[0].reports.is_empty()); // salvage 差し替えの空 rd
+        assert_eq!(priming[1].reports[0].data, Some(serde_json::json!(true)));
+        dev_task.await.unwrap();
+    }
+
+    /// 監査⑨の flood 防御維持: 非デコード可能チャンクも MAX_REPORT_CHUNKS に
+    /// 数えられ、超過で subscribe は Malformed で失敗する（無限チャンク防御が
+    /// salvage で消えていないことの釘打ち）。
+    #[tokio::test]
+    async fn subscribe_wildcard_undecodable_chunks_still_count_toward_chunk_cap() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, _) = open_from_controller(&buf[..n]);
+            let ex = p.exchange_id;
+            // cap(64)+1 = 65 チャンク送る。65 個目は push で cap を超えて
+            // subscribe が Err で抜けるため、StatusResponse は 64 回しか返らない。
+            for i in 0..=(MAX_REPORT_CHUNKS as u32) {
+                let d = device_datagram(
+                    ex,
+                    crate::im::PROTOCOL_ID_IM,
+                    crate::im::OPCODE_REPORT_DATA,
+                    None,
+                    false,
+                    9300 + i,
+                    &[0x15],
+                );
+                dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+                if (i as usize) < MAX_REPORT_CHUNKS {
+                    let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+                    let (_, p2, _) = open_from_controller(&buf[..n]);
+                    assert_eq!(p2.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+                }
+            }
+        });
+
+        let err = s
+            .subscribe_wildcard(0, 3600, false, &[], &fast_cfg())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::Im(crate::im::ImError::Malformed("too many report chunks"))
+            ),
+            "err: {err:?}"
+        );
+        dev_task.await.unwrap();
+    }
+
     /// ポンプ: デバイス起点の新 exchange（initiator=true）で届く ReportData を受け、
     /// StatusResponse(0) で閉じる。keep-alive（空 report）も受かる。
     #[tokio::test]
@@ -2797,6 +2971,74 @@ mod tests {
             .await
             .unwrap();
         assert!(ka.reports.is_empty()); // keep-alive
+        dev_task.await.unwrap();
+    }
+
+    /// 監査⑨: 非デコード可能な live report は購読を殺さない — 空 rd
+    /// （keep-alive 相当）として届き、StatusResponse(0) で exchange を閉じ、
+    /// 次の正常 report は通常配送される。
+    #[tokio::test]
+    async fn next_subscription_report_survives_undecodable_report() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 200,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: crate::im::OPCODE_REPORT_DATA,
+                exchange_id: 0x7779,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            // garbage report（struct start だけで途中切れ = デコード不能）
+            let d = seal_message(&R2I, &header, &proto, &[0x15], DEV_NODE).unwrap();
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            // StatusResponse(0) が同 exchange に返る
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(p.exchange_id, 0x7779);
+            assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
+            // 正常 report（別 exchange）は通常配送される
+            let mut h2 = header;
+            h2.message_counter = 201;
+            let mut p2 = proto;
+            p2.exchange_id = 0x777a;
+            let d = seal_message(
+                &R2I,
+                &h2,
+                &p2,
+                &subscription_report_payload(42, true, false),
+                DEV_NODE,
+            )
+            .unwrap();
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p3, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p3.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            assert_eq!(p3.exchange_id, 0x777a);
+        });
+
+        let rd = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .expect("undecodable report must not kill the pump");
+        assert!(rd.reports.is_empty());
+        assert_eq!(rd.subscription_id, None);
+        let rd2 = s
+            .next_subscription_report(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rd2.subscription_id, Some(42));
         dev_task.await.unwrap();
     }
 
