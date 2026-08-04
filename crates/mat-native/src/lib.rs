@@ -685,6 +685,7 @@ fn map_resolve_err(node_id: u64, e: dnssd::DnssdError) -> MatError {
 /// SecureSession のエラーを mat の ErrorKind へ写像する（経路によらず分類を揃える）。
 fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     use mat_controller::session::SessionError;
+    use mat_controller::im::ImError;
     match e {
         // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
         SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
@@ -692,7 +693,17 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
         // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
         SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
-        SessionError::Im(_) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
+        SessionError::Im(
+            ImError::StatusResponse(_)
+            | ImError::AttributeStatus(_)
+            | ImError::CommandStatus { .. },
+        ) => MatError::new(ErrorKind::DeviceRejected, format!("native: {e}")),
+        // こちらのデコーダが応答を解釈できなかった（監査⑨）→ 応答は来たが
+        // 解釈不能 = parse_error（Message(_) と同じ規律）。variant 追加時に
+        // ここで分類を決めさせるため wildcard にしない。
+        SessionError::Im(ImError::Tlv(_) | ImError::Malformed(_) | ImError::UnsupportedValue) => {
+            MatError::new(ErrorKind::ParseError, format!("native: {e}"))
+        }
         SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
         // ピアの応答がメッセージ層で壊れている → 応答は来た（不達ではない）が
         // 解釈不能 = parse_error（v1 品質修正 4）。
@@ -777,6 +788,28 @@ mod tests {
             mat_controller::message::MessageError::Truncated,
         ));
         assert_eq!(e.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn map_session_err_splits_im_decode_failure_from_device_rejection() {
+        // 監査⑨: デコード失敗（Tlv/Malformed/UnsupportedValue）は「応答は来たが
+        // 解釈不能」= parse_error（Message(_) と同じ規律）。device_rejected は
+        // 本当のデバイス拒否（StatusResponse/AttributeStatus/CommandStatus）だけ。
+        use mat_controller::im::ImError;
+        use mat_controller::session::SessionError;
+        let e = map_session_err(SessionError::Im(ImError::Malformed("truncated report data")));
+        assert_eq!(e.kind, ErrorKind::ParseError);
+        let e = map_session_err(SessionError::Im(ImError::UnsupportedValue));
+        assert_eq!(e.kind, ErrorKind::ParseError);
+        let e = map_session_err(SessionError::Im(ImError::StatusResponse(0x80)));
+        assert_eq!(e.kind, ErrorKind::DeviceRejected);
+        let e = map_session_err(SessionError::Im(ImError::AttributeStatus(0x86)));
+        assert_eq!(e.kind, ErrorKind::DeviceRejected);
+        let e = map_session_err(SessionError::Im(ImError::CommandStatus {
+            status: 0x01,
+            cluster_status: None,
+        }));
+        assert_eq!(e.kind, ErrorKind::DeviceRejected);
     }
 
     #[test]
