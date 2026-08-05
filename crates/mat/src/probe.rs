@@ -1,6 +1,6 @@
-//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時、native の**台帳ノードごとの
-//! targeted resolve 並行実行**（`mat-controller::dnssd::resolve_operational`、
-//! M8b）を実施する。M8c-3 Task 11 で `avahi-browse` フォールバックを撤去 —
+//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時、native の**単一共有ソケット経由での
+//! 台帳ノード一括 targeted resolve**（`mat-controller::dnssd::resolve_operational_many`、
+//! 監査⑩）を実施する。M8c-3 Task 11 で `avahi-browse` フォールバックを撤去 —
 //! mDNS は dnssd 一本で、I/O エラーもそのままエラーを返す（フォールバック先が
 //! 無い）。
 //!
@@ -9,7 +9,7 @@
 //! 一切応答しない（KA suppression 後も、tcpdump で確認）一方、targeted な
 //! resolve（CASE が使うのと同じ経路）は同ノードに成功する（native read 実証
 //! 済み、2026-07-17）。probe は対象ノードの CFID/NodeId が既知なので、列挙で
-//! 発見する必要がなく、resolve を並行実行すれば十分。
+//! 発見する必要がなく、resolve を（単一ソケットで）まとめて実行すれば十分。
 //!
 //! socket I/O を伴うため副作用なしの `mat-core` ではなくバイナリ側に置く。
 //! `diag node --deep` と `discover --probe` が共有する。
@@ -50,7 +50,7 @@ pub fn mdns(p: NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
     resolve_ledger_nodes(&p)
 }
 
-/// 台帳ノードそれぞれへ `resolve_operational` を並行実行する（M8b）。
+/// 台帳のすべてのノードを `resolve_operational_many` で単一ソケット経由で resolve する（監査⑩）。
 /// 失敗源ごとに ErrorKind を作り分ける（mat-native/lib.rs・commission.rs の
 /// 資材エラー写像に合わせる — Task 11 レビュー修正）。
 fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
