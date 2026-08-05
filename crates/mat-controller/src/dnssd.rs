@@ -636,6 +636,8 @@ impl OperationalQuery {
 /// The outer `Err` is a socket-level I/O failure (bind/send — the whole
 /// batch is unresolvable, e.g. an interface without multicast). Per-node
 /// results are `Ok(ResolvedNode)` or `Err(Timeout)`, in `node_ids` order.
+/// Duplicate entries in `node_ids` are tolerated but resolve one resend tick
+/// (~1s) apart — each answer feeds only the first unresolved matching query.
 pub async fn resolve_operational_many(
     scope_id: u32,
     compressed_fabric_id: &[u8; 8],
