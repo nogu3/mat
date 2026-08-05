@@ -128,7 +128,7 @@ mat fabric init
 - If you are joining a fabric that was created by `chip-tool` (fixed-epoch),
   you do **not** run `fabric init` — the first native `commission` verifies the
   fixed epoch against the fabric's KVS materials and adopts it (see
-  [Backend](#backend), "epoch").
+  [Backend](backend.md#backend), "epoch").
 
 #### Attestation / PAA trust store
 
@@ -164,7 +164,7 @@ All device-addressing commands take named flags: `--node` (required),
 (`-n` / `-e` / `-c` / `-a`) for terser typing. `--node` / `--endpoint` take the
 numeric Matter identifiers; optionally, if `<store>/aliases.toml` exists, they
 also accept a locally defined name that `mat` resolves to the number right after
-arg parsing (see [Aliases](#aliases-aliasestoml-optional)). Without that file,
+arg parsing (see [Aliases](configuration.md#aliases-aliasestoml-optional)). Without that file,
 numbers are the only form, exactly as before.
 
 ```bash
@@ -440,7 +440,7 @@ mat diag mesh --nodes 5 16
 > both), and `node:<node_id>` for a fabric node whose probe never got far
 > enough to read either (e.g. cluster 0x33 unreadable). Unknown participants
 > get a `label` from `aliases.toml`'s `[thread]` section (see
-> [Aliases](#aliases-aliasestoml-optional) above) instead of an `alias`,
+> [Aliases](configuration.md#aliases-aliasestoml-optional) above) instead of an `alias`,
 > which is reserved for commissioned nodes' own node alias.
 >
 > A fabric node `mat` could not self-identify (probe failure, cluster 0x33
@@ -499,7 +499,7 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   exists, only its listed clusters are ever subscribed by `matd` in the first
   place, so `--cluster` can narrow further within that set but never outside
   it — see [Subscriptions (`subscriptions.toml`, optional, matd
-  only)](#subscriptions-subscriptionstoml-optional-matd-only) below.
+  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only) below.
 - `--count` (default `1`) is how many events to receive before exiting `0`;
   `0` means no count limit — keep streaming (symmetric with `--timeout-ms 0`).
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
@@ -540,11 +540,11 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   event's arrival.
 - `matd` absent, refusing the connection, or dying mid-stream is
   `matd_unavailable` (exit **13**) — see
-  [Errors and exit codes](#errors-and-exit-codes). Events already printed
+  [Errors and exit codes](errors.md#errors-and-exit-codes). Events already printed
   before a mid-stream matd loss stay printed; the process still exits `13`
   (not `3`), even if `--count` was not reached.
 - Usage form (a consumer like casa reacts per line; `mat`/`matd` never run
-  automations — see [Backend](#backend) / ARCHITECTURE.md "Design rules"):
+  automations — see [Backend](backend.md#backend) / ARCHITECTURE.md "Design rules"):
   ```bash
   mat listen --node 21 --cluster occupancysensing --count 0 --timeout-ms 0 |
   while read -r ev; do
@@ -606,7 +606,7 @@ chip-tool-compatible INI form). Logical group names ("the living-room lights")
 are out of scope —
 `mat` takes a numeric GroupId (`-g/--group` and `--nodes` also accept an
 alias from the optional `aliases.toml`, which is just a local nickname for the
-number; see [Aliases](#aliases-aliasestoml-optional)).
+number; see [Aliases](configuration.md#aliases-aliasestoml-optional)).
 
 ```bash
 # Provision: burn the key set + mapping + ACL group entry into every node, and
@@ -899,7 +899,7 @@ not just when a `mat` caller happens to be polling.
   `DataVersionFilter`, and LIT ICD check-in registration. Cluster-level
   narrowing of what gets subscribed **is** implemented — see
   [Subscriptions (`subscriptions.toml`, optional, matd
-  only)](#subscriptions-subscriptionstoml-optional-matd-only) below.
+  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only) below.
 
 ### Native backend internals
 

@@ -165,9 +165,9 @@ in-process. There is no `chip-tool` (or any other external controller)
 subprocess.
 
 - **Route selection is per-op:** matd auto-discovery (if a `matd` answers the
-  probed socket) -> `mat`'s own native direct path. See README's
-  [Routing through `matd`](./README.md#routing-through-matd) and
-  [Native backend internals](./README.md#native-backend-internals) for
+  probed socket) -> `mat`'s own native direct path. See
+  [Routing through `matd`](./docs/commands.md#routing-through-matd) and
+  [Native backend internals](./docs/commands.md#native-backend-internals) for
   interface autodetect (`MAT_IFACE` / `MAT_MATD_IFACE`), fabric index, warm
   vs. one-shot sessions, the shared groupcast counter, epoch adoption, and the
   scalar-only generic write/invoke rule.

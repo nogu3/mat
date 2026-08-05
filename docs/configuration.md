@@ -94,7 +94,7 @@ Resolution rules:
   notation only).
 
 These map onto the existing exit codes (`2` / `10`); the
-[Errors and exit codes](#errors-and-exit-codes) table is unchanged.
+[Errors and exit codes](errors.md#errors-and-exit-codes) table is unchanged.
 
 To register an alias while commissioning, add `--alias`:
 
@@ -111,7 +111,7 @@ alias is a hand edit of the file — there is no management subcommand.
 ## Subscriptions (`subscriptions.toml`, optional, matd only)
 
 By default `matd`'s resident Subscribe (see [Resident Subscribe and `mat
-listen`](#resident-subscribe-and-mat-listen)) is a full **wildcard**: every
+listen`](commands.md#resident-subscribe-and-mat-listen)) is a full **wildcard**: every
 endpoint/cluster/attribute, on every commissioned node. If
 `<store>/subscriptions.toml` exists, `matd` narrows that to just the listed
 clusters' paths instead.
