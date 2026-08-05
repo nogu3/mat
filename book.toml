@@ -1,0 +1,9 @@
+[book]
+title = "mat"
+description = "CLI for controlling Matter devices — a native Rust Matter controller with pure structured JSON output"
+src = "docs"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/nogu3/mat"
+site-url = "/mat/"
