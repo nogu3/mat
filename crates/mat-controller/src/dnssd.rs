@@ -139,9 +139,13 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
 /// here — it puts the sockets in a load-balancing group that hashes *each*
 /// incoming datagram (multicast included) to a single member, so the
 /// responder's multicast answer lands on avahi at random and our resolve flakes
-/// (observed intermittently across all nodes, 2026-07-19). Unicast delivery to
-/// the shared port is not guaranteed to reach us, but we rely on the multicast
-/// answer this responder sends anyway.
+/// (observed intermittently across all nodes, 2026-07-19). Unicast delivery
+/// to the shared port reaches only ONE bound socket (the most recently
+/// bound), and a real responder — avahi acting as the SRP advertising
+/// proxy, captured on the wire 2026-08-05 — honors QU and answers by
+/// unicast. Concurrent resolvers must therefore share one socket
+/// ([`resolve_operational_many`]); per-node sockets silently lose answers
+/// to whichever socket bound last (audit ⑩'s real mechanism).
 ///
 /// Outgoing multicast is pinned to the interface — `sin6_scope_id` alone can
 /// leak a datagram out a VPN interface (see `transport.rs`) — with hop limit
@@ -576,40 +580,108 @@ fn txt_u32(strings: &[Vec<u8>], key: &str) -> Option<u32> {
     None
 }
 
-/// Resolves one operational node via a one-shot legacy unicast mDNS query:
-/// SRV + TXT for the instance in one message, then AAAA for the SRV target
-/// if no bundled additional record carried it. The query is resent every
-/// second until `timeout` elapses.
-pub async fn resolve_operational(
+/// [`resolve_operational_many`] の per-node fold 状態。単発 resolver が
+/// ローカル変数で持っていたものの持ち上げ。
+struct OperationalQuery {
+    node_id: u64,
+    service: String,
+    srv: Option<(u16, String)>,
+    txt: Option<Vec<Vec<u8>>>,
+    aaaa: Vec<(String, Ipv6Addr)>,
+    aaaa_queried: bool,
+    resolved: Option<ResolvedNode>,
+}
+
+impl OperationalQuery {
+    /// SRV + target 一致アドレス ≥1 が揃っていれば完成させる。
+    fn try_finish(&mut self) {
+        if self.resolved.is_some() {
+            return;
+        }
+        let Some((port, target)) = &self.srv else {
+            return;
+        };
+        let mut addresses: Vec<Ipv6Addr> = Vec::new();
+        for (name, addr) in &self.aaaa {
+            if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
+                addresses.push(*addr);
+            }
+        }
+        if addresses.is_empty() {
+            return;
+        }
+        // Non-link-local first (stable sort keeps response order within
+        // each class).
+        addresses.sort_by_key(is_link_local);
+        let strings = self.txt.as_deref().unwrap_or(&[]);
+        self.resolved = Some(ResolvedNode {
+            port: *port,
+            addresses,
+            session_idle_interval_ms: txt_u32(strings, "SII"),
+            session_active_interval_ms: txt_u32(strings, "SAI"),
+        });
+    }
+}
+
+/// Resolves many operational nodes over ONE shared mDNS socket, folding
+/// answers per instance name. Sharing the socket is load-bearing, not an
+/// optimization: a responder honoring the QU bit (avahi as the SRP
+/// advertising proxy — jarvis pcap, 2026-08-05) answers by unicast, and a
+/// unicast datagram to the shared port 5353 is delivered to only ONE bound
+/// socket. With per-node sockets (the pre-1.21.0 probe) every answer lands
+/// on an arbitrary socket whose per-instance filter silently discards it
+/// (audit ⑩'s real mechanism). Queries for unresolved instances are resent
+/// every second until `timeout`.
+///
+/// The outer `Err` is a socket-level I/O failure (bind/send — the whole
+/// batch is unresolvable, e.g. an interface without multicast). Per-node
+/// results are `Ok(ResolvedNode)` or `Err(Timeout)`, in `node_ids` order.
+pub async fn resolve_operational_many(
     scope_id: u32,
     compressed_fabric_id: &[u8; 8],
-    node_id: u64,
+    node_ids: &[u64],
     timeout: Duration,
-) -> Result<ResolvedNode, DnssdError> {
-    let instance = operational_instance(compressed_fabric_id, node_id);
-    let service = format!("{instance}._matter._tcp.local");
+) -> Result<Vec<(u64, Result<ResolvedNode, DnssdError>)>, DnssdError> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
     let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
-
-    let mut srv: Option<(u16, String)> = None;
-    let mut txt: Option<Vec<Vec<u8>>> = None;
-    let mut aaaa: Vec<(String, Ipv6Addr)> = Vec::new();
-    let mut aaaa_queried = false;
+    let mut queries: Vec<OperationalQuery> = node_ids
+        .iter()
+        .map(|&node_id| OperationalQuery {
+            node_id,
+            service: format!(
+                "{}._matter._tcp.local",
+                operational_instance(compressed_fabric_id, node_id)
+            ),
+            srv: None,
+            txt: None,
+            aaaa: Vec::new(),
+            aaaa_queried: false,
+            resolved: None,
+        })
+        .collect();
 
     let deadline = Instant::now() + timeout;
     let mut next_send = Instant::now();
     let mut buf = [0u8; 1500];
     loop {
+        if queries.iter().all(|q| q.resolved.is_some()) {
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         if now >= next_send {
-            let q = encode_query(0, &[(&service, TYPE_SRV), (&service, TYPE_TXT)]);
-            sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
-            if let Some((_, target)) = &srv {
-                let q = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
-                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
+            for q in queries.iter().filter(|q| q.resolved.is_none()) {
+                let msg = encode_query(0, &[(&q.service, TYPE_SRV), (&q.service, TYPE_TXT)]);
+                sock.send_to(&msg, dest).await.map_err(DnssdError::Io)?;
+                if let Some((_, target)) = &q.srv {
+                    let msg = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
+                    sock.send_to(&msg, dest).await.map_err(DnssdError::Io)?;
+                }
             }
             next_send = now + QUERY_RESEND_INTERVAL;
         }
@@ -624,47 +696,80 @@ pub async fn resolve_operational(
         };
         for r in records {
             match r.rdata {
-                RData::Srv { port, target } if r.name.eq_ignore_ascii_case(&service) => {
-                    prune_aaaa(&mut aaaa, &target);
-                    srv = Some((port, target));
+                RData::Srv { port, target } => {
+                    if let Some(q) = queries
+                        .iter_mut()
+                        .find(|q| q.resolved.is_none() && r.name.eq_ignore_ascii_case(&q.service))
+                    {
+                        prune_aaaa(&mut q.aaaa, &target);
+                        q.srv = Some((port, target));
+                    }
                 }
-                RData::Txt(strings) if r.name.eq_ignore_ascii_case(&service) => {
-                    txt = Some(strings);
+                RData::Txt(strings) => {
+                    if let Some(q) = queries
+                        .iter_mut()
+                        .find(|q| q.resolved.is_none() && r.name.eq_ignore_ascii_case(&q.service))
+                    {
+                        q.txt = Some(strings);
+                    }
                 }
                 RData::Aaaa(addr) => {
-                    let target = srv.as_ref().map(|(_, t)| t.as_str());
-                    push_aaaa(&mut aaaa, target, r.name, addr);
+                    // AAAA は instance 名を持たない — SRV target 既知なら
+                    // その名前で、未知なら候補として各未解決ノードに fold。
+                    for q in queries.iter_mut().filter(|q| q.resolved.is_none()) {
+                        let target = q.srv.as_ref().map(|(_, t)| t.as_str());
+                        push_aaaa(&mut q.aaaa, target, r.name.clone(), addr);
+                    }
                 }
                 _ => {}
             }
         }
-        if let Some((port, target)) = &srv {
-            let mut addresses: Vec<Ipv6Addr> = Vec::new();
-            for (name, addr) in &aaaa {
-                if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
-                    addresses.push(*addr);
+        let mut followups: Vec<String> = Vec::new();
+        for q in queries.iter_mut() {
+            q.try_finish();
+            if q.resolved.is_none() && !q.aaaa_queried {
+                if let Some((_, target)) = &q.srv {
+                    followups.push(target.clone());
+                    q.aaaa_queried = true;
                 }
             }
-            if !addresses.is_empty() {
-                // Non-link-local first (stable sort keeps response order
-                // within each class).
-                addresses.sort_by_key(is_link_local);
-                let strings = txt.as_deref().unwrap_or(&[]);
-                return Ok(ResolvedNode {
-                    port: *port,
-                    addresses,
-                    session_idle_interval_ms: txt_u32(strings, "SII"),
-                    session_active_interval_ms: txt_u32(strings, "SAI"),
-                });
-            }
-            if !aaaa_queried {
-                let q = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
-                sock.send_to(&q, dest).await.map_err(DnssdError::Io)?;
-                aaaa_queried = true;
-            }
+        }
+        for target in followups {
+            let msg = encode_query(0, &[(target.as_str(), TYPE_AAAA)]);
+            sock.send_to(&msg, dest).await.map_err(DnssdError::Io)?;
         }
     }
-    Err(DnssdError::Timeout { instance: service })
+    Ok(queries
+        .into_iter()
+        .map(|q| match q.resolved {
+            Some(node) => (q.node_id, Ok(node)),
+            None => (
+                q.node_id,
+                Err(DnssdError::Timeout {
+                    instance: q.service,
+                }),
+            ),
+        })
+        .collect())
+}
+
+/// Resolves one operational node — a thin wrapper over
+/// [`resolve_operational_many`] with a single-element batch, so the single
+/// and concurrent paths share one engine and cannot diverge (audit ⑩).
+pub async fn resolve_operational(
+    scope_id: u32,
+    compressed_fabric_id: &[u8; 8],
+    node_id: u64,
+    timeout: Duration,
+) -> Result<ResolvedNode, DnssdError> {
+    let mut results =
+        resolve_operational_many(scope_id, compressed_fabric_id, &[node_id], timeout).await?;
+    match results.pop() {
+        Some((_, res)) => res,
+        None => Err(DnssdError::Malformed(
+            "resolve_operational_many returned no result",
+        )),
+    }
 }
 
 /// Long-discriminator サブタイプ名（spec §4.3.1: `_L<discriminator>._sub.
@@ -1653,6 +1758,39 @@ mod tests {
         }))
     }
 
+    /// avahi（SRP advertising proxy）型 responder の模擬: クエリを受信し、
+    /// **問い合わせ元アドレスへの unicast でのみ**応答する（QU 準拠。
+    /// 2026-08-05 jarvis pcap で確定した挙動）。served に無い instance には
+    /// 応答しない。unicast は同一ポート多重 bind の 1 ソケットにしか配達
+    /// されないため、並行 resolve がソケットを共有しない限り他ノード宛の
+    /// 答えを黙殺する — という本番機序をそのまま再現する。
+    fn spawn_unicast_responder(
+        scope_id: u32,
+        served: Vec<(String, Vec<u8>)>,
+    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        let sock = bind_mdns_socket(scope_id)?;
+        Ok(tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                // 簡易クエリ判定: instance の先頭ラベル（16+1+16 hex で一意）が
+                // ワイヤに現れていればそのインスタンスへの質問とみなす。
+                for (service, msg) in &served {
+                    let first_label = service.split('.').next().unwrap_or("");
+                    if !first_label.is_empty()
+                        && buf[..n]
+                            .windows(first_label.len())
+                            .any(|w| w == first_label.as_bytes())
+                    {
+                        let _ = sock.send_to(msg, from).await;
+                    }
+                }
+            }
+        }))
+    }
+
     /// resolve_commissionable が、マルチキャストでしか応答しない responder
     /// （実機 OTBR proxy と同型）の commissionable 広告を受信できること。
     /// resolver が ephemeral ソケット（5353 非 bind・ff02::fb 未 join）だと
@@ -1771,6 +1909,68 @@ mod tests {
             "no multicast-capable interface delivered the multicast-only \
              operational answer to resolve_operational (lo excluded — it lacks \
              IFF_MULTICAST on Linux); tried: {tried:?}"
+        );
+    }
+
+    /// 並行 resolve の本丸回帰（監査⑩ 完結）: unicast でしか応答しない
+    /// responder（avahi 型）に対し、複数 instance の同時 resolve が単一共有
+    /// ソケットで全て解決できること。応答が来ない instance を 1 つ混ぜ、
+    /// それだけが Timeout になる（無応答ノードのソケットが他ノードの
+    /// unicast を吸うブラックホールの根絶）ことも釘打ちする。
+    #[tokio::test]
+    async fn resolve_operational_many_demuxes_unicast_only_responses() {
+        let cfid: [u8; 8] = 0xAB7D_E088_02E0_CD54u64.to_be_bytes();
+        let silent: u64 = 7;
+        let served: Vec<(String, Vec<u8>)> = [5u64, 6]
+            .iter()
+            .map(|&id| {
+                let service = format!("{}._matter._tcp.local", operational_instance(&cfid, id));
+                let msg = synth_response(
+                    &service,
+                    &format!("ucastonly-{id}.local"),
+                    5540,
+                    &["SII=5000"],
+                    format!("fd00::{id}").parse().unwrap(),
+                );
+                (service, msg)
+            })
+            .collect();
+        let mut tried = Vec::new();
+        for (name, idx) in multicast_ifaces() {
+            let Ok(responder) = spawn_unicast_responder(idx, served.clone()) else {
+                tried.push(format!("{name}(idx={idx}): responder bind failed"));
+                continue;
+            };
+            let res =
+                resolve_operational_many(idx, &cfid, &[5, 6, silent], Duration::from_millis(1500))
+                    .await;
+            responder.abort();
+            match res {
+                Ok(results) => {
+                    let ok: Vec<u64> = results
+                        .iter()
+                        .filter(|(_, r)| r.is_ok())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if ok == vec![5, 6] {
+                        for (id, r) in &results {
+                            if *id == silent {
+                                assert!(
+                                    matches!(r, Err(DnssdError::Timeout { .. })),
+                                    "silent node must time out: {r:?}"
+                                );
+                            }
+                        }
+                        return; // 最初に届いた iface で十分 — PASS。
+                    }
+                    tried.push(format!("{name}(idx={idx}): resolved only {ok:?}"));
+                }
+                Err(e) => tried.push(format!("{name}(idx={idx}): {e:?}")),
+            }
+        }
+        panic!(
+            "no multicast-capable interface delivered the unicast-only \
+             answers to resolve_operational_many; tried: {tried:?}"
         );
     }
 
