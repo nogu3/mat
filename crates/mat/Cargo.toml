@@ -1,6 +1,6 @@
 [package]
 name = "mat"
-description = "Matter device control CLI — normalizes chip-tool output to a structured JSON schema"
+description = "Matter device control CLI — drives a native Rust Matter controller in-process and emits pure structured JSON"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
