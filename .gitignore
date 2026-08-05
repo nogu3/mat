@@ -26,3 +26,5 @@
 
 # Python ビルド生成物
 __pycache__/
+
+/book/
