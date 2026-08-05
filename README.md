@@ -171,6 +171,10 @@ mat fabric init
 - The generated IPK epoch is random (16 bytes from the OS CSPRNG), not
   `chip-tool`'s old fixed `temporary ipk 01` constant. The key material never
   appears on stdout — only the fabric identifiers.
+- The store is groupcast-ready from the start: the global group data counter
+  (`g/gdc`) is seeded with a random spec-range value, the same discipline the
+  upstream SDK uses on first boot. (A missing `g/gdc` makes `mat` refuse group
+  sends rather than start the counter low.)
 - **It refuses if the store already holds a KVS** (no `--force`); re-initialize
   by deleting the store's `.ini` files by hand. Any other command run before
   `fabric init` returns `store_missing` (exit 10) with a hint to run it.
