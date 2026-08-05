@@ -1,6 +1,6 @@
-//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時、native の**台帳ノードごとの
-//! targeted resolve 並行実行**（`mat-controller::dnssd::resolve_operational`、
-//! M8b）を実施する。M8c-3 Task 11 で `avahi-browse` フォールバックを撤去 —
+//! mDNS プローブ。`--iface`（`MAT_IFACE`）設定時、native の**単一共有ソケット経由での
+//! 台帳ノード一括 targeted resolve**（`mat-controller::dnssd::resolve_operational_many`、
+//! 監査⑩）を実施する。M8c-3 Task 11 で `avahi-browse` フォールバックを撤去 —
 //! mDNS は dnssd 一本で、I/O エラーもそのままエラーを返す（フォールバック先が
 //! 無い）。
 //!
@@ -9,12 +9,22 @@
 //! 一切応答しない（KA suppression 後も、tcpdump で確認）一方、targeted な
 //! resolve（CASE が使うのと同じ経路）は同ノードに成功する（native read 実証
 //! 済み、2026-07-17）。probe は対象ノードの CFID/NodeId が既知なので、列挙で
-//! 発見する必要がなく、resolve を並行実行すれば十分。
+//! 発見する必要がなく、resolve を（単一ソケットで）まとめて実行すれば十分。
 //!
 //! socket I/O を伴うため副作用なしの `mat-core` ではなくバイナリ側に置く。
 //! `diag node --deep` と `discover --probe` が共有する。
-
-use std::time::Duration;
+//!
+//! resolve 窓は establish（mat-native）と同じ
+//! `dnssd::OPERATIONAL_RESOLVE_TIMEOUT`（8s）を共有する（監査⑩、1.21.0）。
+//! かつて probe 独自の 3s 窓を持っており、resolve に 3〜8 秒かかる健全
+//! ノードを「CASE なら届くのに reachable:false」と誤報していた。全ノード
+//! 並行実行のため、台帳が何ノードあっても総所要時間はおよそ窓 1 つ分。
+//!
+//! resolve はノード毎ソケットの並行実行ではなく **単一共有ソケット**
+//! （`dnssd::resolve_operational_many`）で行う（監査⑩ 完結、1.21.0）。
+//! avahi（SRP advertising proxy）は QU に unicast で応答し、unicast は
+//! 同一ポート多重 bind の 1 ソケットにしか配達されないため、ノード毎
+//! ソケットでは他ノード宛の答えが黙殺され健全ノードを誤報していた。
 
 use mat_controller::{dnssd, fabric, kvs};
 use mat_core::diag::MatterInstance;
@@ -30,21 +40,17 @@ pub struct NativeProbe<'a> {
     pub node_ids: &'a [u64],
 }
 
-/// 1 ノードあたりの resolve タイムアウト。全ノード並行実行のため、
-/// 台帳が何ノードあっても総所要時間はおよそこの値に収まる。
-const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// `_matter._tcp` の到達性を判定する。native の targeted resolve を並行実行
 /// する。結果 0 件は正常（Ok(vec![])）。失敗はそのままエラーを返す
 /// （フォールバック先が無い — Task 11）。失敗源ごとに ErrorKind を作り分ける
 /// （Task 11 レビュー修正）: iface 解決失敗は `Other`、KVS 資材の読み取り /
 /// NOC 自己発行失敗は `StoreMissing`（`mat fabric init` 未実施のヒント付き）、
-/// 全ノード I/O エラーのみ `Unreachable`。
+/// ソケット bind/send の I/O 失敗（全ノード共倒れ）は `Unreachable`。
 pub fn mdns(p: NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
     resolve_ledger_nodes(&p)
 }
 
-/// 台帳ノードそれぞれへ `resolve_operational` を並行実行する（M8b）。
+/// 台帳のすべてのノードを `resolve_operational_many` で単一ソケット経由で resolve する（監査⑩）。
 /// 失敗源ごとに ErrorKind を作り分ける（mat-native/lib.rs・commission.rs の
 /// 資材エラー写像に合わせる — Task 11 レビュー修正）。
 fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
@@ -89,43 +95,25 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
                 format!("native mDNS probe: build async runtime: {e}"),
             )
         })?;
-    let results: Vec<(u64, Result<dnssd::ResolvedNode, dnssd::DnssdError>)> = rt.block_on(async {
-        let mut set = tokio::task::JoinSet::new();
-        for &node_id in p.node_ids {
-            set.spawn(async move {
-                let res =
-                    dnssd::resolve_operational(scope_id, &cfid, node_id, PROBE_RESOLVE_TIMEOUT)
-                        .await;
-                (node_id, res)
-            });
-        }
-        let mut out = Vec::with_capacity(p.node_ids.len());
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(pair) => out.push(pair),
-                Err(e) => tracing::debug!(error = %e, "probe: resolve task join failed"),
-            }
-        }
-        out
-    });
 
-    // 全ノードが Io エラーの場合はハードエラーを返す（例: MAT_IFACE=lo では
-    // multicast send 自体が全ノードで失敗する。フォールバック先は無い —
-    // Task 11 で撤去済み）。混在時は成功分を返す（個々の Timeout/Malformed は
-    // 「不達」として扱い、全滅ではない）。
-    let all_io_err = !results.is_empty()
-        && results
-            .iter()
-            .all(|(_, r)| matches!(r, Err(dnssd::DnssdError::Io(_))));
-    if all_io_err {
-        return Err(MatError::new(
-            ErrorKind::Unreachable,
-            format!(
-                "native mDNS probe failed on {}: all ledger node resolves failed with an I/O error",
-                p.iface
-            ),
-        ));
-    }
+    // 単一共有ソケットで全ノードを resolve する（監査⑩: ノード毎ソケット
+    // だと avahi の unicast 応答が最新 bind の 1 ソケットに吸われ、他ノード
+    // の resolver が答えを黙殺する）。外側 Err はソケット bind/send の I/O
+    // 失敗 = 全ノード共倒れの環境問題（例: MAT_IFACE=lo では multicast send
+    // 自体が失敗する。フォールバック先は無い — Task 11 で撤去済み）。
+    let results = rt
+        .block_on(dnssd::resolve_operational_many(
+            scope_id,
+            &cfid,
+            p.node_ids,
+            dnssd::OPERATIONAL_RESOLVE_TIMEOUT,
+        ))
+        .map_err(|e| {
+            MatError::new(
+                ErrorKind::Unreachable,
+                format!("native mDNS probe failed on {}: {e}", p.iface),
+            )
+        })?;
 
     let cfid_hex = cfid_hex(&cfid);
     let mut list = Vec::new();
