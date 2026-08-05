@@ -1,6 +1,5 @@
 # Backend
 
-
 `mat`'s backend is a **native, from-scratch Rust Matter controller** (crate
 `mat-controller`, driven through the shared `mat-native` engine) — TLV, CASE,
 IM, groupcast, mDNS, and commissioning (on-network + BLE+Thread) are all
@@ -20,7 +19,7 @@ Environment variables:
 
 | variable | purpose |
 |---|---|
-| `MAT_STORE` | credential store path (see resolution order above) |
+| `MAT_STORE` | credential store path (see the resolution order in [Configuration](configuration.md#credential-store)) |
 | `MAT_IFACE` | override interface autodetect for `mat`'s direct path |
 | `MAT_MATD_IFACE` | override interface autodetect for `matd` |
 | `MAT_FABRIC_INDEX` / `MAT_ISSUER_INDEX` | `mat` KVS fabric-table / CA-issuer index (default `1` / `0`) |

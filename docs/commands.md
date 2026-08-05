@@ -440,7 +440,7 @@ mat diag mesh --nodes 5 16
 > both), and `node:<node_id>` for a fabric node whose probe never got far
 > enough to read either (e.g. cluster 0x33 unreadable). Unknown participants
 > get a `label` from `aliases.toml`'s `[thread]` section (see
-> [Aliases](configuration.md#aliases-aliasestoml-optional) above) instead of an `alias`,
+> [Aliases](configuration.md#aliases-aliasestoml-optional)) instead of an `alias`,
 > which is reserved for commissioned nodes' own node alias.
 >
 > A fabric node `mat` could not self-identify (probe failure, cluster 0x33
@@ -499,7 +499,7 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   exists, only its listed clusters are ever subscribed by `matd` in the first
   place, so `--cluster` can narrow further within that set but never outside
   it — see [Subscriptions (`subscriptions.toml`, optional, matd
-  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only) below.
+  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only).
 - `--count` (default `1`) is how many events to receive before exiting `0`;
   `0` means no count limit — keep streaming (symmetric with `--timeout-ms 0`).
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
@@ -899,7 +899,7 @@ not just when a `mat` caller happens to be polling.
   `DataVersionFilter`, and LIT ICD check-in registration. Cluster-level
   narrowing of what gets subscribed **is** implemented — see
   [Subscriptions (`subscriptions.toml`, optional, matd
-  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only) below.
+  only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only).
 
 ### Native backend internals
 

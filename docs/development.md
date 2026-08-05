@@ -1,6 +1,5 @@
 # Development
 
-
 Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
 
 ```bash

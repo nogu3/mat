@@ -1,6 +1,5 @@
 # Errors and exit codes
 
-
 Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 
 | code | meaning |

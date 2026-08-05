@@ -1,7 +1,7 @@
 # mat
 
-`mat` is a CLI for controlling Matter devices: a from-scratch, pure-Rust
-native Matter controller that runs in-process and prints pure structured
+`mat` is a CLI for controlling Matter devices: it drives a from-scratch,
+pure-Rust native Matter controller in-process and prints pure structured
 JSON on stdout.
 
 This site is the command and configuration reference. For the project
