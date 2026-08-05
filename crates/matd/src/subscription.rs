@@ -149,6 +149,15 @@ struct TouchedState {
     notify: Arc<tokio::sync::Notify>,
 }
 
+/// SubHealth 専用の poison 耐性 lock。保持スレッドが panic して毒化した
+/// Mutex からデータを回収して続行する。各テーブルは ephemeral な単発
+/// insert/remove のみで guard 跨ぎの複合不変条件が無く、毒化を伝播させて
+/// 全 hot-path（op 経路 / pump / status op）を panic させるより回収が正しい
+/// （安定性監査 Tier 3 の保険枠 — 到達可能な panic は精読では未発見）。
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl SubHealth {
     pub fn new(clusters: Option<Vec<u32>>) -> Self {
         Self {
@@ -165,24 +174,17 @@ impl SubHealth {
         if !self.clusters.is_empty() && !self.clusters.contains(&cluster) {
             return;
         }
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(node_id, tokio::time::Instant::now());
+        locked(&self.pending).insert(node_id, tokio::time::Instant::now());
     }
 
     /// デバイス発メッセージ（keep-alive 含む）や priming を受けた — pending 解除。
     pub fn clear_pending(&self, node_id: u64) {
-        self.pending.lock().unwrap().remove(&node_id);
+        locked(&self.pending).remove(&node_id);
     }
 
     /// 未消化 op からの経過時間（無ければ None）。
     pub fn pending_elapsed(&self, node_id: u64) -> Option<Duration> {
-        self.pending
-            .lock()
-            .unwrap()
-            .get(&node_id)
-            .map(|t| t.elapsed())
+        locked(&self.pending).get(&node_id).map(|t| t.elapsed())
     }
 
     /// 直経路 op / cold establish がこのノードのセッションを新設した合図。
@@ -198,7 +200,7 @@ impl SubHealth {
     /// lib crate 内に閉じ、bin/lib で crate 境界が別になる cargo の構成上
     /// main.rs からは見えない。
     pub fn note_touched(&self, node_id: u64) {
-        let mut map = self.touched.lock().unwrap();
+        let mut map = locked(&self.touched);
         let entry = map.entry(node_id).or_insert_with(|| TouchedState {
             flag: false,
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -210,11 +212,7 @@ impl SubHealth {
     /// touched フラグが立っているか（消費はしない — pump_verdict の判定用）。
     /// pub: integration test（socket 越しの node_touched op）が外部から観測する。
     pub fn touched(&self, node_id: u64) -> bool {
-        self.touched
-            .lock()
-            .unwrap()
-            .get(&node_id)
-            .is_some_and(|s| s.flag)
+        locked(&self.touched).get(&node_id).is_some_and(|s| s.flag)
     }
 
     /// touched シグナルを消費する。フラグを倒すだけでなく Notify も
@@ -224,7 +222,7 @@ impl SubHealth {
     /// （バックオフの意味が壊れる）。呼び手は 2 箇所: pump が Touched で
     /// 終わる直前と、backoff 睡眠が touch_notify で短絡起床したとき。
     pub(crate) fn clear_touched(&self, node_id: u64) {
-        self.touched.lock().unwrap().insert(
+        locked(&self.touched).insert(
             node_id,
             TouchedState {
                 flag: false,
@@ -236,10 +234,7 @@ impl SubHealth {
     /// ノード毎 Notify の lazy 生成（backoff 睡眠の起床に使う）。
     pub(crate) fn touch_notify(&self, node_id: u64) -> Arc<tokio::sync::Notify> {
         Arc::clone(
-            &self
-                .touched
-                .lock()
-                .unwrap()
+            &locked(&self.touched)
                 .entry(node_id)
                 .or_insert_with(|| TouchedState {
                     flag: false,
@@ -252,7 +247,7 @@ impl SubHealth {
     /// pump が受けた 1 イベントをキャッシュへ反映し、差分 priming なら昇格して返す。
     /// listen クライアントの有無と無関係に呼ぶ（状態追跡は購読が生きている限り継続）。
     pub(crate) fn observe(&self, ev: Event) -> Event {
-        let mut cache = self.values.lock().unwrap();
+        let mut cache = locked(&self.values);
         classify_against_cache(&mut cache, ev)
     }
 
@@ -264,16 +259,14 @@ impl SubHealth {
         cluster: u32,
         attribute: u32,
     ) -> Option<serde_json::Value> {
-        self.values
-            .lock()
-            .unwrap()
+        locked(&self.values)
             .get(&(node_id, endpoint, cluster, attribute))
             .cloned()
     }
 
     /// 購読ループ spawn（初回確立前）。
     pub(crate) fn mark_establishing(&self, node_id: u64) {
-        self.status.lock().unwrap().insert(
+        locked(&self.status).insert(
             node_id,
             NodeSubStatus::Establishing {
                 since: tokio::time::Instant::now(),
@@ -284,7 +277,7 @@ impl SubHealth {
     /// 購読成立（「subscription established」ログと同時に呼ぶ）。
     pub(crate) fn mark_established(&self, node_id: u64, subscription_id: u32, max_interval_s: u16) {
         let now = tokio::time::Instant::now();
-        self.status.lock().unwrap().insert(
+        locked(&self.status).insert(
             node_id,
             NodeSubStatus::Established {
                 since: now,
@@ -299,7 +292,7 @@ impl SubHealth {
     pub(crate) fn note_device_msg(&self, node_id: u64) {
         if let Some(NodeSubStatus::Established {
             last_device_msg, ..
-        }) = self.status.lock().unwrap().get_mut(&node_id)
+        }) = locked(&self.status).get_mut(&node_id)
         {
             *last_device_msg = tokio::time::Instant::now();
         }
@@ -315,7 +308,7 @@ impl SubHealth {
         backoff: Duration,
         last_error: MatError,
     ) {
-        self.status.lock().unwrap().insert(
+        locked(&self.status).insert(
             node_id,
             NodeSubStatus::Down {
                 since,
@@ -340,7 +333,7 @@ impl SubHealth {
     /// 「今からの経過秒」— 内部時計は tokio::time::Instant で ISO 変換
     /// 不能なため、経過秒が正直な表現（spec）。
     pub(crate) fn status_nodes(&self) -> Vec<serde_json::Value> {
-        let status = self.status.lock().unwrap();
+        let status = locked(&self.status);
         let mut ids: Vec<u64> = status.keys().copied().collect();
         ids.sort_unstable();
         ids.into_iter()
@@ -2072,6 +2065,71 @@ mod tests {
         let n = h.status_nodes();
         assert_eq!(n[0]["node_id"], 2);
         assert_eq!(n[1]["node_id"], 5);
+    }
+
+    /// 監査 Tier 3: 保持スレッドの panic で Mutex が毒化しても、SubHealth の
+    /// 全経路（op 相関 / touched / 値キャッシュ / status レジストリ）は panic
+    /// せず動き続ける。中身は ephemeral な健全性テーブルのみで複合不変条件が
+    /// 無く、毒化の巻き添えで matd の hot-path 全部を落とす方が実害が大きい。
+    #[test]
+    fn subhealth_survives_poisoned_locks() {
+        use serde_json::json;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn poison<T>(m: &Mutex<T>) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = m.lock().unwrap();
+                panic!("poison lock for test");
+            }));
+        }
+
+        let h = SubHealth::new(None);
+        poison(&h.pending);
+        poison(&h.values);
+        poison(&h.status);
+        poison(&h.touched);
+
+        // pending（op 相関）。
+        h.note_op(5, 0x0006);
+        assert!(h.pending_elapsed(5).is_some());
+        h.clear_pending(5);
+        assert!(h.pending_elapsed(5).is_none());
+
+        // touched（Issue #20 ヒント）。
+        h.note_touched(5);
+        assert!(h.touched(5));
+        let _notify = h.touch_notify(5);
+        h.clear_touched(5);
+        assert!(!h.touched(5));
+
+        // values（最終既知値キャッシュ）。
+        let ev = Event {
+            timestamp: "2026-08-05T00:00:00+09:00".to_string(),
+            node_id: 5,
+            endpoint: 1,
+            cluster: 0x0006,
+            attribute: 0x0000,
+            value: json!(true),
+            priming: false,
+            recovered: false,
+        };
+        let _ = h.observe(ev);
+        assert_eq!(h.cached_value(5, 1, 0x0006, 0x0000), Some(json!(true)));
+
+        // status レジストリ（status op）。
+        h.mark_establishing(5);
+        h.mark_established(5, 7, 300);
+        h.note_device_msg(5);
+        h.mark_down(
+            5,
+            tokio::time::Instant::now(),
+            1,
+            Duration::from_secs(5),
+            mat_core::error::MatError::new(mat_core::error::ErrorKind::Unreachable, "no route"),
+        );
+        let n = h.status_nodes();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0]["state"], "down");
     }
 
     /// manager 経路の統合: established（priming 到達後）→ down（op 相関死 +
