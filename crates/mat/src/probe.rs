@@ -13,8 +13,12 @@
 //!
 //! socket I/O を伴うため副作用なしの `mat-core` ではなくバイナリ側に置く。
 //! `diag node --deep` と `discover --probe` が共有する。
-
-use std::time::Duration;
+//!
+//! resolve 窓は establish（mat-native）と同じ
+//! `dnssd::OPERATIONAL_RESOLVE_TIMEOUT`（8s）を共有する（監査⑩、1.21.0）。
+//! かつて probe 独自の 3s 窓を持っており、resolve に 3〜8 秒かかる健全
+//! ノードを「CASE なら届くのに reachable:false」と誤報していた。全ノード
+//! 並行実行のため、台帳が何ノードあっても総所要時間はおよそ窓 1 つ分。
 
 use mat_controller::{dnssd, fabric, kvs};
 use mat_core::diag::MatterInstance;
@@ -29,10 +33,6 @@ pub struct NativeProbe<'a> {
     /// 到達性を判定したい台帳ノード（diag は対象 1 ノードのみ）。
     pub node_ids: &'a [u64],
 }
-
-/// 1 ノードあたりの resolve タイムアウト。全ノード並行実行のため、
-/// 台帳が何ノードあっても総所要時間はおよそこの値に収まる。
-const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `_matter._tcp` の到達性を判定する。native の targeted resolve を並行実行
 /// する。結果 0 件は正常（Ok(vec![])）。失敗はそのままエラーを返す
@@ -93,9 +93,13 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
         let mut set = tokio::task::JoinSet::new();
         for &node_id in p.node_ids {
             set.spawn(async move {
-                let res =
-                    dnssd::resolve_operational(scope_id, &cfid, node_id, PROBE_RESOLVE_TIMEOUT)
-                        .await;
+                let res = dnssd::resolve_operational(
+                    scope_id,
+                    &cfid,
+                    node_id,
+                    dnssd::OPERATIONAL_RESOLVE_TIMEOUT,
+                )
+                .await;
                 (node_id, res)
             });
         }
