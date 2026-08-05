@@ -5,8 +5,7 @@ mind on every change.
 
 `mat` is a CLI for controlling Matter devices. It drives a native, from-scratch
 Rust Matter controller (crate `mat-controller`, via the shared `mat-native`
-engine) in-process and emits `mat`'s JSON schema. (`chip-tool` was the backend
-through Phase 5 M8c-2; it was fully retired in 0.22.0 / M8c-3.) For the full
+engine) in-process and emits `mat`'s JSON schema. For the full
 design, scope, the `mat` / `matd` split, and roadmap, read
 [ARCHITECTURE.md](./ARCHITECTURE.md). For usage, read [README.md](./README.md).
 This file is the short list of constraints you must not break.
@@ -15,9 +14,7 @@ This file is the short list of constraints you must not break.
 
 1. **Protocol code lives only in the backend crates.** No TLV, no CASE, no
    multicast routing inside `mat` / `matd` command layers — that all
-   belongs to the backend crates (`mat-controller` / `mat-native`, Phase 5).
-   As of M8c-3 the native backend is the only path (`chip-tool` retired); the
-   command layers still never speak the protocol.
+   belongs to the backend crates (`mat-controller` / `mat-native`).
 2. **stdout is pure structured JSON only.** Emit the result in `mat`'s schema.
    No human decoration (color, progress, prompts).
 3. **Diagnostics go to stderr as structured logs** (`tracing`).
@@ -26,8 +23,8 @@ This file is the short list of constraints you must not break.
 
 ## Scope reminders (do not add these to `mat`)
 
-- Resolving human names on the wire or in the backend (chip-tool / matd always
-  receive numeric values). The only exception: if `<store>/aliases.toml`
+- Resolving human names on the wire or in the backend (the backend / matd
+  always receive numeric values). The only exception: if `<store>/aliases.toml`
   exists, the CLI layer resolves node / group / endpoint aliases — and color
   names via `[colors]` (RGB-defined, overriding the built-in color table in
   `mat-core`) — to numbers right after arg parsing — optional, local, and
@@ -69,28 +66,21 @@ This file is the short list of constraints you must not break.
 - `mat`'s errors use `{"error": {"kind": "...", "detail": "..."}}`.
   `detail` should be specific enough for an AI to decide recovery (e.g.
   `"Node 12 is unreachable"`).
-- `kind` values are stable and documented in README ("Errors and exit codes").
-  Examples: `store_missing` / `store_parse` / `node_not_commissioned` /
-  `commission_failed` / `timeout` / `unreachable` / `session_failed` /
-  `device_rejected` / `parse_error` / `matd_unavailable` / `other`.
-  (`child_not_found` / `child_failed` still exist for wire compat but are not
-  emitted as top-level errors since 0.22.0 — chip-tool retired.)
+- `kind` values are stable; the full list is in README ("Errors and exit
+  codes"). (`child_not_found` / `child_failed` exist for wire compat only;
+  never emitted as top-level errors.)
 
 ### exit codes
-See the table in [README.md](./README.md#errors-and-exit-codes). In short:
-`0` success, `2` CLI arg error, `10` store missing/parse, `11` not commissioned,
-`3` timeout, `4` device rejected, `5` unreachable, `6` CASE session
-establishment failed, `13` matd absent (`mat listen` only), `1` other. Exit
-`12` (chip-tool not found) is a retired, historical vacancy as of 0.22.0. The
-native backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back
-to `parse_error` + `1`.
+See the table in [README.md](./README.md#errors-and-exit-codes). The native
+backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
+`parse_error` + `1`. Exit `12` is a retired vacancy.
 
 ## Backend (native)
 
 - The backend is native and pure Rust (crate `mat-controller`, via the shared
   `mat-native` engine): TLV, CASE, IM, groupcast, mDNS, and commissioning
-  (on-network + BLE+Thread) run in-process. There is **no** `chip-tool` (or any
-  external controller) subprocess — it was fully retired in 0.22.0 (M8c-3).
+  (on-network + BLE+Thread) run in-process. There is **no** external
+  controller subprocess (`chip-tool` is fully retired).
 - Route selection is per-op: matd auto-discovery (if a `matd` answers the probed
   socket) -> `mat`'s own native direct path. There is no third fallback tier.
 - The interface is **auto-detected** every run (up/multicast/non-loopback/
@@ -118,8 +108,8 @@ to `parse_error` + `1`.
   the opposite case and the first of its kind: it is **matd-only**, with no
   direct-path fallback at all (subscriptions need a resident daemon). See
   README for the exact op list.
-- The backend is still replaceable in principle: `mat` couples to it only
-  through `mat`'s own JSON schema. Subcommands and output schema are the contract.
+- `mat` couples to the backend only through `mat`'s own JSON schema —
+  subcommands and output schema are the contract.
 - **Fragile parts (keep tests):** (1) the **chip-tool INI KVS compatibility** —
   base64 TLV records with upstream `GroupDataProviderImpl` link discipline
   (`mat-controller::kvs` / `group_settings`); an upstream format assumption
@@ -136,32 +126,21 @@ to `parse_error` + `1`.
 ## Roadmap discipline
 
 Phases go **in order** (see ARCHITECTURE.md). Do not start the next phase until
-the current one is fully done (all tests pass, acceptance criteria met). Phases
-0–4 are implemented, real-device E2E included (Phase 4 = `matd`, the resident
-binary with warm CASE sessions; a separate binary in this repo). **Phase 5**
-(native backend: from-scratch Rust controller, crate `mat-controller`) is done
-through M8c-3 — `chip-tool` retired, native is the only path — see
-`docs/superpowers/specs/2026-07-10-phase5-backend-direction-design.md` and the
-M8c-3 record in ARCHITECTURE.md.
+the current one is fully done (all tests pass, acceptance criteria met).
+Phases 0–5 are complete, real-device E2E included (Phase 4 = `matd`, the
+resident binary; Phase 5 = the native backend, `mat-controller` — records in
+ARCHITECTURE.md).
 
 ## Development commands
 
-Tasks are defined with [Task](https://taskfile.dev) (`task` lists them).
+Tasks are defined with [Task](https://taskfile.dev) — run `task` to list them
+(build / install / test / clippy / fmt / check / dist:arm64 / docker:*).
 
-```bash
-task build            # release build -> target/release/{mat,matd}
-task install          # install both binaries into ~/.cargo/bin
-task run -- discover  # run (native backend)
-task test             # tests (native FakeConn + binary integration; no real devices)
-task clippy           # lint (-D warnings)
-task fmt              # format
-task check            # CI equivalent (fmt:check + clippy + test)
+Run `task check` (CI equivalent: fmt:check + clippy + test) before any commit.
+Matter uses mDNS / IPv6 multicast, so Docker runs require host networking
+(`docker run --network host`).
 
-task dist:arm64       # aarch64-gnu + BLE deploy build -> dist/arm64/{mat,matd}
-task docker:build     # slim x86_64 image (mat/matd only)
-task docker:run -- discover
-task docker:test      # no local toolchain needed
-```
+## Compact instructions
 
-Run `task check` before any commit. Matter uses mDNS / IPv6 multicast, so Docker
-runs require host networking (`docker run --network host`).
+When compacting, preserve: node ids and their observed device states, version
+numbers and deploy status, open issue numbers, and verbatim error/log output.
