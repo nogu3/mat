@@ -1137,11 +1137,12 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
 ## Things we never do
 
 - Implement TLV / CASE / multicast routing inside `mat` or `matd` command
-  layers (protocol code lives only in the `mat-controller` crate; the
-  chip-tool delegation path remains until Phase 5 lands).
+  layers (protocol code lives only in the `mat-controller` / `mat-native`
+  backend crates).
 - Hold human names or logical groups in `mat` (out of scope; exception: the
   optional `aliases.toml` name→number map for node / group / endpoint, see
-  above — it resolves to numbers before anything reaches chip-tool/matd).
+  above — it resolves to numbers before anything reaches the backend or
+  `matd`).
 - Add session cache, subscriptions, a daemon, or an internal scheduler to `mat`
   (that is `matd`'s role, a separate binary).
 - Bring a Matter bridge (becoming a Matter device) into `mat`.
