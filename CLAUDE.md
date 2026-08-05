@@ -107,7 +107,7 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   protocol — they always run on `mat`'s own one-shot direct path. `listen` is
   the opposite case and the first of its kind: it is **matd-only**, with no
   direct-path fallback at all (subscriptions need a resident daemon). See
-  README for the exact op list.
+  docs/commands.md ("Routing through matd") for the exact op list.
 - `mat` couples to the backend only through `mat`'s own JSON schema —
   subcommands and output schema are the contract.
 - **Fragile parts (keep tests):** (1) the **chip-tool INI KVS compatibility** —
