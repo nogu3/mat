@@ -36,7 +36,7 @@ is `unreachable` (exit `5`).
   classified from the native transport / IM result. `timeout` is also what a
   single-node op returns once its budget runs out (`--op-timeout-ms` on
   `mat`, or `matd`'s own 60s default when the request carried none) — see
-  [Op timeout budget](#op-timeout-budget---op-timeout-ms).
+  [Op timeout budget](commands.md#op-timeout-budget---op-timeout-ms).
 - `session_failed` — IP reachable but CASE (operational secure session) could not
   be established, e.g. an intermittent `CHIP Error 0x54 (Invalid CASE parameter)`
   during the Sigma exchange (exit 6). Distinct from `unreachable` (no IP route)
@@ -114,7 +114,7 @@ Related lines:
   (`client_disconnected` / `channel_closed`).
 - `subscription established` / `report pump ended` / `subscription lost;
   resubscribing` (info) — the resident Subscribe lifecycle (see
-  [Subscriptions](#subscriptions-subscriptionstoml-optional-matd-only)).
+  [Subscriptions](configuration.md#subscriptions-subscriptionstoml-optional-matd-only)).
 
 `journalctl -p warning` gives you just the degradation.
 

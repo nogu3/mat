@@ -66,12 +66,12 @@ This file is the short list of constraints you must not break.
 - `mat`'s errors use `{"error": {"kind": "...", "detail": "..."}}`.
   `detail` should be specific enough for an AI to decide recovery (e.g.
   `"Node 12 is unreachable"`).
-- `kind` values are stable; the full list is in README ("Errors and exit
-  codes"). (`child_not_found` / `child_failed` exist for wire compat only;
-  never emitted as top-level errors.)
+- `kind` values are stable; the full list is in docs/errors.md. (`child_not_found`
+  / `child_failed` exist for wire compat only; never emitted as top-level
+  errors.)
 
 ### exit codes
-See the table in [README.md](./README.md#errors-and-exit-codes). The native
+See the table in [docs/errors.md](./docs/errors.md). The native
 backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
 `parse_error` + `1`. Exit `12` is a retired vacancy.
 
