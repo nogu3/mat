@@ -1,13 +1,19 @@
 //! Message counters and replay-protection window (spec §4.5).
 
+/// spec 4.5.1 のランダム初期値 [1, 2^28]。セッションの `TxCounter` と、
+/// fabric bootstrap の `g/gdc` 初期化（`write_kvs_bootstrap`）が共有する。
+pub fn random_initial() -> u32 {
+    let mut b = [0u8; 4];
+    getrandom::getrandom(&mut b).expect("os rng");
+    (u32::from_le_bytes(b) & 0x0FFF_FFFF) + 1
+}
+
 /// Outgoing message counter, randomly initialized per spec 4.5.1.
 pub struct TxCounter(u32);
 
 impl TxCounter {
     pub fn new_random() -> Self {
-        let mut b = [0u8; 4];
-        getrandom::getrandom(&mut b).expect("os rng");
-        Self((u32::from_le_bytes(b) & 0x0FFF_FFFF) + 1)
+        Self(random_initial())
     }
 
     /// Returns the current counter value and advances.
