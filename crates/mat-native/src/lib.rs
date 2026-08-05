@@ -221,8 +221,9 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-/// mDNS 解決 timeout。SII が来ない場合でも過度に待たない上限。
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
+/// mDNS 解決 timeout（`dnssd::OPERATIONAL_RESOLVE_TIMEOUT` の別名 — probe と
+/// 共有、監査⑩）。SII が来ない場合でも過度に待たない上限。
+const RESOLVE_TIMEOUT: Duration = dnssd::OPERATIONAL_RESOLVE_TIMEOUT;
 
 /// establish の mDNS 解決を差し替え可能にする抽象。`mat`（一発）は
 /// [`OneShotResolver`]（キャッシュ無し＝設計ルール4）、`matd` は

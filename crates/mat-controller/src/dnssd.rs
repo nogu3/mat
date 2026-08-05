@@ -61,6 +61,13 @@ const MRP_DEFAULT_IDLE_MS: u32 = 500;
 const MRP_DEFAULT_ACTIVE_MS: u32 = 300;
 const MRP_MAX_INTERVAL_MS: u32 = 3_600_000;
 const QUERY_RESEND_INTERVAL: Duration = Duration::from_secs(1);
+/// CASE 前 targeted resolve（[`resolve_operational`]）の共通窓。establish
+/// （mat-native）と probe（mat の `discover --probe` / `diag node --deep`）が
+/// 共有し、「CASE が届く範囲 = probe が reachable と言う範囲」を定義上
+/// 一致させる。監査⑩: probe 独自の 3s 窓が establish の 8s と乖離し、
+/// Thread メッシュ + advertising proxy 経由で resolve に 3〜8 秒かかる
+/// 健全ノードを `reachable:false` と誤報していた。
+pub const OPERATIONAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Resolver error. `Timeout` names the instance so the operator can
 /// cross-check advertising with `avahi-browse -rtp _matter._tcp`.
