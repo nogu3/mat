@@ -165,9 +165,9 @@ in-process. There is no `chip-tool` (or any other external controller)
 subprocess.
 
 - **Route selection is per-op:** matd auto-discovery (if a `matd` answers the
-  probed socket) -> `mat`'s own native direct path. See README's
-  [Routing through `matd`](./README.md#routing-through-matd) and
-  [Native backend internals](./README.md#native-backend-internals) for
+  probed socket) -> `mat`'s own native direct path. See
+  [Routing through `matd`](./docs/commands.md#routing-through-matd) and
+  [Native backend internals](./docs/commands.md#native-backend-internals) for
   interface autodetect (`MAT_IFACE` / `MAT_MATD_IFACE`), fabric index, warm
   vs. one-shot sessions, the shared groupcast counter, epoch adoption, and the
   scalar-only generic write/invoke rule.
@@ -1137,11 +1137,12 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
 ## Things we never do
 
 - Implement TLV / CASE / multicast routing inside `mat` or `matd` command
-  layers (protocol code lives only in the `mat-controller` crate; the
-  chip-tool delegation path remains until Phase 5 lands).
+  layers (protocol code lives only in the `mat-controller` / `mat-native`
+  backend crates).
 - Hold human names or logical groups in `mat` (out of scope; exception: the
   optional `aliases.toml` name→number map for node / group / endpoint, see
-  above — it resolves to numbers before anything reaches chip-tool/matd).
+  above — it resolves to numbers before anything reaches the backend or
+  `matd`).
 - Add session cache, subscriptions, a daemon, or an internal scheduler to `mat`
   (that is `matd`'s role, a separate binary).
 - Bring a Matter bridge (becoming a Matter device) into `mat`.
