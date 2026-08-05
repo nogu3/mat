@@ -1370,6 +1370,8 @@ impl CommissioningFabric {
     ///   main ini  … f/<idx>/r = RCAC(TLV) / f/<idx>/n = admin NOC(TLV)
     ///               f/<idx>/k/0 = IPK keyset blob（3 スロット、終端 0xFFFF）
     ///               mat/f/<idx>/ipk-epoch = ランダム epoch（mat 専用キー）
+    ///               g/gdc = Global Group Data Counter（spec 4.5.1 レンジの
+    ///               ランダム初期値、u32 LE — 欠落だと groupcast 永久不可）
     /// 既に KVS があれば `KvsError::AlreadyExists`（上書きしない — 誤 store
     /// パスでのサイレント別 fabric 生成を防ぐ、spec ユーザー決定）。
     pub fn write_kvs_bootstrap(
@@ -1432,6 +1434,11 @@ impl CommissioningFabric {
             &crate::kvs::mat_ipk_epoch_key(fabric_index),
             &self.ipk_epoch,
         );
+        // g/gdc（Global Group Data Counter）: これが無いと mat-native の
+        // init_sender が groupcast を永久拒否する（低い counter で始めると
+        // 受信側 replay 窓に全弾落とされるため欠落=拒否が正しい）。SDK の
+        // GroupOutgoingCounters と同様、初回はランダム初期化して永続する。
+        main.set("g/gdc", &crate::counter::random_initial().to_le_bytes());
         main.commit()?;
         Ok(())
     }
@@ -1625,6 +1632,21 @@ mod tests {
             fab.write_kvs_bootstrap(dir.path(), 1, 0),
             Err(crate::kvs::KvsError::AlreadyExists)
         ));
+    }
+
+    /// 監査 Tier 3: bootstrap が `g/gdc` を書かないと、fabric init 由来の
+    /// ストアでは `mat-native::group::init_sender` が「counter を低く始め
+    /// られない」と groupcast / bump を永久拒否する。初期値は spec 4.5.1 の
+    /// ランダムレンジ [1, 2^28]（`TxCounter::new_random` と同じ規律）。
+    #[test]
+    fn bootstrap_writes_group_data_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let fab = CommissioningFabric::generate(1, 112233).unwrap();
+        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
+        let gdc = crate::kvs::read_group_data_counter(&dir.path().join("chip_tool_config.ini"))
+            .unwrap()
+            .expect("g/gdc persisted by bootstrap");
+        assert!((1..=(1u32 << 28)).contains(&gdc), "gdc: {gdc}");
     }
 
     #[test]
