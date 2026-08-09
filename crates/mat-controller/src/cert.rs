@@ -509,6 +509,38 @@ fn check_ca_cert(
     Ok(())
 }
 
+/// NOC（リーフ）の Matter プロファイル検査: cA=false、KeyUsage は
+/// digitalSignature 必須かつ keyCertSign/cRLSign 禁止、EKU は
+/// clientAuth と serverAuth の両方を含むこと（Matter 1.4 §6.5）。
+/// 拡張欠落は拒否（fail-closed）。
+fn check_noc_leaf(noc: &MatterCert) -> Result<(), CertError> {
+    match noc.basic_constraints() {
+        Some((false, _)) => {}
+        _ => return Err(CertError::Malformed("noc end-entity basic-constraint")),
+    }
+    let Some(bits) = noc.key_usage() else {
+        return Err(CertError::Malformed("noc key-usage"));
+    };
+    if bits & KEY_USAGE_DIGITAL_SIGNATURE == 0 {
+        return Err(CertError::Malformed("noc digitalSignature key-usage"));
+    }
+    if bits & (KEY_USAGE_KEY_CERT_SIGN | KEY_USAGE_CRL_SIGN) != 0 {
+        return Err(CertError::Malformed(
+            "noc key-usage (keyCertSign/cRLSign set)",
+        ));
+    }
+    let eku = noc.extensions.iter().find_map(|e| match e {
+        CertExtension::ExtendedKeyUsage(v) => Some(v.as_slice()),
+        _ => None,
+    });
+    match eku {
+        Some(v) if v.contains(&EKU_CLIENT_AUTH) && v.contains(&EKU_SERVER_AUTH) => Ok(()),
+        _ => Err(CertError::Malformed(
+            "noc clientAuth+serverAuth extended-key-usage",
+        )),
+    }
+}
+
 /// Verify a NOC's signature chain up to `rcac`, optionally through `icac`,
 /// and cross-check issuer/subject DN linkage and fabric-id consistency.
 pub fn verify_noc_chain(
@@ -551,6 +583,7 @@ pub fn verify_noc_chain(
     if noc.issuer != signer.subject {
         return Err(CertError::Malformed("noc issuer != signer subject"));
     }
+    check_noc_leaf(noc)?;
     if noc.node_id().is_none() || noc.fabric_id().is_none() {
         return Err(CertError::Malformed("noc missing node/fabric id"));
     }
@@ -1258,5 +1291,96 @@ mod tests {
             .unwrap();
         let direct = issue_noc(&op_pub, 0x1B669, 1, &shallow_root, &root_priv, &[9]).unwrap();
         verify_noc_chain(&direct, None, &shallow_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_noc_leaf_constraint_violations() {
+        let (rcac, root_key, noc, _) = fresh_chain();
+
+        // cA=true の NOC
+        let ca_noc = mutate_and_resign(&noc, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::BasicConstraints { is_ca, .. } = e {
+                    *is_ca = true;
+                }
+            }
+        });
+        let err = verify_noc_chain(&ca_noc, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc end-entity basic-constraint")
+        ));
+
+        // basicConstraints 欠落
+        let bc_missing = mutate_and_resign(&noc, &root_key, |exts| {
+            exts.retain(|e| !matches!(e, CertExtension::BasicConstraints { .. }));
+        });
+        let err = verify_noc_chain(&bc_missing, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc end-entity basic-constraint")
+        ));
+
+        // keyUsage 欠落
+        let ku_missing = mutate_and_resign(&noc, &root_key, |exts| {
+            exts.retain(|e| !matches!(e, CertExtension::KeyUsage(_)));
+        });
+        let err = verify_noc_chain(&ku_missing, None, &rcac).unwrap_err();
+        assert!(matches!(err, CertError::Malformed("noc key-usage")));
+
+        // digitalSignature 無し
+        let no_ds = mutate_and_resign(&noc, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::KeyUsage(bits) = e {
+                    *bits = KEY_USAGE_CRL_SIGN;
+                }
+            }
+        });
+        let err = verify_noc_chain(&no_ds, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc digitalSignature key-usage")
+        ));
+
+        // keyCertSign が立っている（digitalSignature があっても拒否）
+        let cert_sign = mutate_and_resign(&noc, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::KeyUsage(bits) = e {
+                    *bits = KEY_USAGE_DIGITAL_SIGNATURE | KEY_USAGE_KEY_CERT_SIGN;
+                }
+            }
+        });
+        let err = verify_noc_chain(&cert_sign, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc key-usage (keyCertSign/cRLSign set)")
+        ));
+
+        // EKU 欠落
+        let eku_missing = mutate_and_resign(&noc, &root_key, |exts| {
+            exts.retain(|e| !matches!(e, CertExtension::ExtendedKeyUsage(_)));
+        });
+        let err = verify_noc_chain(&eku_missing, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc clientAuth+serverAuth extended-key-usage")
+        ));
+
+        // EKU に serverAuth だけ（clientAuth 欠け）
+        let eku_partial = mutate_and_resign(&noc, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::ExtendedKeyUsage(v) = e {
+                    *v = vec![EKU_SERVER_AUTH];
+                }
+            }
+        });
+        let err = verify_noc_chain(&eku_partial, None, &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("noc clientAuth+serverAuth extended-key-usage")
+        ));
+
+        // 正常系: 無改変チェーンは引き続き通る
+        verify_noc_chain(&noc, None, &rcac).unwrap();
     }
 }
