@@ -1527,7 +1527,9 @@ pub enum CommissionError {
         debug_text: Option<String>,
     },
     /// 呼び出し側引数の値域違反。デバイスへ invoke を送る前に検出する。
-    InvalidArgument { what: &'static str },
+    InvalidArgument {
+        what: &'static str,
+    },
 }
 
 impl std::fmt::Display for CommissionError {

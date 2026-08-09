@@ -209,7 +209,9 @@ pub(crate) fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamRe
     let responder_session_id =
         responder_session_id.ok_or(PaseError::Malformed("responder session id"))?;
     if responder_session_id == 0 {
-        return Err(PaseError::Malformed("responder session id must be non-zero"));
+        return Err(PaseError::Malformed(
+            "responder session id must be non-zero",
+        ));
     }
 
     Ok(PbkdfParamResponse {
@@ -741,7 +743,9 @@ mod tests {
         w.end_container();
         assert!(matches!(
             decode_pbkdf_param_response(&w.finish()),
-            Err(PaseError::Malformed("responder session id must be non-zero"))
+            Err(PaseError::Malformed(
+                "responder session id must be non-zero"
+            ))
         ));
     }
 

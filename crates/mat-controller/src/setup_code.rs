@@ -30,10 +30,16 @@ impl std::fmt::Display for SetupCodeError {
                 write!(f, "manual code first digit must be 0-7")
             }
             SetupCodeError::VidPidMismatch => {
-                write!(f, "manual code VID/PID presence flag contradicts its length")
+                write!(
+                    f,
+                    "manual code VID/PID presence flag contradicts its length"
+                )
             }
             SetupCodeError::NonCanonicalBase38 => {
-                write!(f, "QR base38 chunk exceeds its byte range (non-canonical encoding)")
+                write!(
+                    f,
+                    "QR base38 chunk exceeds its byte range (non-canonical encoding)"
+                )
             }
         }
     }
@@ -491,10 +497,7 @@ mod tests {
     fn rejects_manual_code_first_digit_over_7() {
         // digit1 は 3-bit (vid_pid<<2 | disc上位2bit) なので 8/9 は不正。
         let code = manual_code_with_check("8005491233");
-        assert_eq!(
-            parse_manual_code(&code),
-            Err(SetupCodeError::BadFirstDigit)
-        );
+        assert_eq!(parse_manual_code(&code), Err(SetupCodeError::BadFirstDigit));
     }
 
     #[test]
