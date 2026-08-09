@@ -756,6 +756,7 @@ fn execute(
         let native_cfg = NativeConfig {
             store: store.root().to_path_buf(),
             iface: cfg.iface.to_string(),
+            thread_iface: None,
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -1007,7 +1008,7 @@ async fn op_group_onoff(
         return Err(group_ctx_unconfigured_error());
     };
     match mat_native::group::send(ctx, group_id, im::CLUSTER_ON_OFF, command_id, None).await? {
-        GroupOutcome::Sent => {
+        GroupOutcome::Sent { .. } => {
             crate::commands::group::emit_invoke_sent(group_id, "onoff", command, endpoint);
         }
         GroupOutcome::Unavailable(reason) => {
@@ -1038,7 +1039,7 @@ async fn op_group_color(
     )
     .await?
     {
-        GroupOutcome::Sent => {
+        GroupOutcome::Sent { .. } => {
             crate::commands::group::emit_color_sent(group_id, color, transition, endpoint);
         }
         GroupOutcome::Unavailable(reason) => {
@@ -1069,7 +1070,7 @@ async fn op_group_color_temp(
     )
     .await?
     {
-        GroupOutcome::Sent => {
+        GroupOutcome::Sent { .. } => {
             crate::commands::group::emit_color_temp_sent(
                 group_id, kelvin, mireds, transition, endpoint,
             );
@@ -1102,7 +1103,7 @@ async fn op_group_level(
     )
     .await?
     {
-        GroupOutcome::Sent => {
+        GroupOutcome::Sent { .. } => {
             crate::commands::group::emit_level_sent(group_id, percent, level, transition, endpoint);
         }
         GroupOutcome::Unavailable(reason) => {
@@ -1127,7 +1128,7 @@ async fn op_group_invoke_generic(
         return Err(group_ctx_unconfigured_error());
     };
     match mat_native::group::send(ctx, group_id, cluster, command, fields_tlv.clone()).await? {
-        GroupOutcome::Sent => {
+        GroupOutcome::Sent { .. } => {
             crate::commands::group::emit_invoke_sent(group_id, cluster_in, command_in, endpoint);
         }
         GroupOutcome::Unavailable(reason) => {
@@ -1607,6 +1608,7 @@ pub(crate) fn diag_im_probe(
         let native_cfg = NativeConfig {
             store: store_root.to_path_buf(),
             iface: cfg.iface.to_string(),
+            thread_iface: None,
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -1692,6 +1694,7 @@ pub(crate) fn diag_mesh_probe(
         let native_cfg = NativeConfig {
             store: store_root.to_path_buf(),
             iface: cfg.iface.to_string(),
+            thread_iface: None,
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -2025,9 +2028,12 @@ mod tests {
             fabric_index: 2,
             fabric_id: 1,
             node_id: 0x0001_0001,
-            scope_id: 1, // lo — bump は送信しないので join 可否は無関係
+            egress: vec![mat_controller::group::GroupEgress {
+                iface: "lo".into(), // 送信しないので join 可否は無関係
+                transport,
+                scope_id: 1,
+            }],
             dest_port: 5540,
-            transport,
             sender: Mutex::new(None),
         };
         let engine =

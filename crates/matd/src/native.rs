@@ -922,6 +922,7 @@ mod tests {
         let cfg = NativeConfig {
             store: std::path::PathBuf::from("/nonexistent"),
             iface: "lo".into(),
+            thread_iface: None,
             fabric_index: 1,
             issuer_index: 0,
         };

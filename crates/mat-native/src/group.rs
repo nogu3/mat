@@ -4,12 +4,14 @@
 //! （M8c-3: chip-tool フォールバック撤去）。
 
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use mat_controller::group::{GroupSender, PersistedGroupCounter};
+use mat_controller::group::{GroupEgress, GroupSender, PersistedGroupCounter};
 use mat_controller::kvs;
+#[cfg(test)]
 use mat_controller::transport::UdpTransport;
 use mat_core::error::{ErrorKind, MatError};
 
@@ -22,9 +24,9 @@ pub struct GroupCtx {
     pub fabric_index: u8,
     pub fabric_id: u64,
     pub node_id: u64,
-    pub scope_id: u32,
+    /// 送出先リスト。先頭 = 運用 iface（従来挙動）。
+    pub egress: Vec<GroupEgress>,
     pub dest_port: u16,
-    pub transport: Arc<UdpTransport>,
     pub sender: Mutex<Option<GroupSender>>,
 }
 
@@ -32,7 +34,7 @@ pub struct GroupCtx {
 /// KVS 不備等）」で、消費側（mat / matd）が `store_parse` の per-op
 /// ハードエラーへ変換する合図（M8c-3: chip-tool フォールバック撤去）。
 pub enum GroupOutcome {
-    Sent,
+    Sent { egress: Vec<String> },
     Unavailable(String),
 }
 
@@ -60,8 +62,7 @@ fn init_sender(ctx: &GroupCtx, slot: &mut Option<GroupSender>) -> Result<(), Str
     let counter = PersistedGroupCounter::load(&ctx.counter_path, gdc)
         .map_err(|e| format!("group counter store: {e}"))?;
     let sender = GroupSender::new(
-        Arc::clone(&ctx.transport),
-        ctx.scope_id,
+        ctx.egress.clone(),
         ctx.dest_port,
         ctx.fabric_id,
         ctx.node_id,
@@ -100,9 +101,9 @@ pub async fn send(
         .send_invoke(&creds, group_id, cluster, command, fields.as_deref())
         .await
     {
-        Ok(counter) => {
-            tracing::info!(group_id, counter, "groupcast sent (native)");
-            Ok(GroupOutcome::Sent)
+        Ok((counter, sent)) => {
+            tracing::info!(group_id, counter, egress = %sent.join("+"), "groupcast sent (native)");
+            Ok(GroupOutcome::Sent { egress: sent })
         }
         Err(e) => Err(group_send_error(group_id, e)),
     }
@@ -199,9 +200,12 @@ mod tests {
                 fabric_index: 2,
                 fabric_id: 1,
                 node_id: 0x0001_0001,
-                scope_id: cand.index,
+                egress: vec![GroupEgress {
+                    iface: cand.name.clone(),
+                    transport,
+                    scope_id: cand.index,
+                }],
                 dest_port: port,
-                transport,
                 sender: Mutex::new(None),
             };
             // send 失敗も次候補へ（join 失敗と同じ扱い）: docker0 / veth* /
@@ -218,7 +222,7 @@ mod tests {
                     continue;
                 }
             };
-            assert!(matches!(r, GroupOutcome::Sent));
+            assert!(matches!(r, GroupOutcome::Sent { .. }));
 
             let mut buf = [0u8; 1280];
             let result = tokio::time::timeout(
@@ -262,9 +266,12 @@ mod tests {
             fabric_index: 2,
             fabric_id: 1,
             node_id: 0x0001_0001,
-            scope_id: 1, // lo — 送信しないので join 可否は無関係
+            egress: vec![GroupEgress {
+                iface: "lo".into(), // 送信しないので join 可否は無関係
+                transport,
+                scope_id: 1,
+            }],
             dest_port: 5540,
-            transport,
             sender: Mutex::new(None),
         };
         let r = bump(&ctx).await;
@@ -298,9 +305,12 @@ mod tests {
             fabric_index: 2,
             fabric_id: 1,
             node_id: 0x0001_0001,
-            scope_id: 1,
+            egress: vec![GroupEgress {
+                iface: "lo".into(),
+                transport,
+                scope_id: 1,
+            }],
             dest_port: 5540,
-            transport,
             sender: Mutex::new(None),
         };
         assert!(matches!(bump(&ctx).await, BumpOutcome::Unavailable(_)));

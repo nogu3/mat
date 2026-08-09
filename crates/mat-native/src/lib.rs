@@ -26,12 +26,22 @@ pub mod ops;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+/// Thread iface の決定結果。明示（解決失敗=ハードエラー）と自動検出
+/// （解決失敗=warn+劣化続行）で失敗時の規律が違う（spec 設計 3）。
+#[derive(Debug, Clone)]
+pub enum ThreadIfaceChoice {
+    Explicit(String),
+    Auto(String),
+}
+
 /// native バックエンドの起動設定。
 pub struct NativeConfig {
     /// chip-tool KVS のあるディレクトリ（chip-tool の --storage-directory と同一）。
     pub store: std::path::PathBuf,
     /// mDNS scope に使う Thread mesh の iface 名。
     pub iface: String,
+    /// groupcast の第 2 egress に使う Thread TUN iface 名（`None` = LAN 単独）。
+    pub thread_iface: Option<ThreadIfaceChoice>,
     /// KVS fabric テーブルの index（jarvis 本番は 2、alpha は 1）。
     pub fabric_index: u8,
     /// CA issuer index（既定 0）。
@@ -225,6 +235,33 @@ impl std::fmt::Debug for Engine {
 /// 共有、監査⑩）。SII が来ない場合でも過度に待たない上限。
 const RESOLVE_TIMEOUT: Duration = dnssd::OPERATIONAL_RESOLVE_TIMEOUT;
 
+/// thread iface 選択を egress 追加判断に写像する純関数（テスト対象）。
+/// 戻り: `Ok(Some(name, scope_id))` = 第 2 egress を張る、`Ok(None)` = LAN
+/// 単独、`Err(detail)` = ハードエラー（明示指定の解決失敗のみ — 自動検出の
+/// 解決失敗は warn+劣化続行で `Ok(None)` に写像する、spec 設計 3）。
+fn thread_egress_decision(
+    choice: &Option<ThreadIfaceChoice>,
+    resolve: impl Fn(&str) -> Result<u32, String>,
+) -> Result<Option<(String, u32)>, String> {
+    match choice {
+        None => Ok(None),
+        Some(ThreadIfaceChoice::Explicit(name)) => match resolve(name) {
+            Ok(idx) => Ok(Some((name.clone(), idx))),
+            Err(e) => Err(format!(
+                "native: resolve thread iface {name:?} index: {e} (explicit MAT_THREAD_IFACE must resolve)"
+            )),
+        },
+        Some(ThreadIfaceChoice::Auto(name)) => match resolve(name) {
+            Ok(idx) => Ok(Some((name.clone(), idx))),
+            Err(e) => {
+                tracing::warn!(iface = %name, error = %e,
+                    "thread iface auto-detected but unresolvable; groupcast stays LAN-only");
+                Ok(None)
+            }
+        },
+    }
+}
+
 /// establish の mDNS 解決を差し替え可能にする抽象。`mat`（一発）は
 /// [`OneShotResolver`]（キャッシュ無し＝設計ルール4）、`matd` は
 /// `CachingResolver`（常駐キャッシュ、Task 5）を注入する。
@@ -357,15 +394,48 @@ impl Engine {
             cfid,
         };
         let transport = Arc::new(transport);
+        let mut egress = vec![mat_controller::group::GroupEgress {
+            iface: cfg.iface.clone(),
+            transport: Arc::clone(&transport),
+            scope_id,
+        }];
+        match thread_egress_decision(&cfg.thread_iface, |n| {
+            mat_controller::dnssd::iface_index(n).map_err(|e| e.to_string())
+        }) {
+            Ok(Some((name, tsid))) => {
+                // Thread egress は専用 socket（LAN 側の IPV6_MULTICAST_IF と独立）。
+                match UdpTransport::bind().await {
+                    Ok(t) => {
+                        tracing::info!(iface = %name, "groupcast thread egress enabled");
+                        egress.push(mat_controller::group::GroupEgress {
+                            iface: name,
+                            transport: Arc::new(t),
+                            scope_id: tsid,
+                        });
+                    }
+                    Err(e) => match &cfg.thread_iface {
+                        Some(ThreadIfaceChoice::Explicit(_)) => {
+                            return Err(MatError::new(
+                                ErrorKind::Other,
+                                format!("native: bind thread egress socket: {e}"),
+                            ));
+                        }
+                        _ => tracing::warn!(error = %e,
+                            "thread egress socket bind failed; groupcast stays LAN-only"),
+                    },
+                }
+            }
+            Ok(None) => {}
+            Err(detail) => return Err(MatError::new(ErrorKind::Other, detail)),
+        }
         let group = group::GroupCtx {
             main_ini,
             counter_path: cfg.store.join("native_group_counter"),
             fabric_index: cfg.fabric_index,
             fabric_id,
             node_id,
-            scope_id,
+            egress,
             dest_port: MATTER_PORT,
-            transport: Arc::clone(&transport),
             sender: tokio::sync::Mutex::new(None),
         };
         // build が bind する共有 UdpTransport は group multicast 送信専用。
@@ -741,6 +811,34 @@ fn map_commission_err(e: mat_controller::commissioning::CommissionError) -> MatE
 mod tests {
     use super::*;
 
+    #[test]
+    fn thread_egress_explicit_failure_is_hard_error() {
+        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Explicit("wpan9".into())), |_| {
+            Err("no such iface".into())
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn thread_egress_auto_failure_degrades_to_lan_only() {
+        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Auto("wpan0".into())), |_| {
+            Err("no such iface".into())
+        });
+        assert_eq!(r.unwrap(), None);
+    }
+
+    #[test]
+    fn thread_egress_resolved_returns_scope() {
+        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Auto("wpan0".into())), |_| Ok(7));
+        assert_eq!(r.unwrap(), Some(("wpan0".into(), 7)));
+    }
+
+    #[test]
+    fn thread_egress_none_is_lan_only() {
+        let r = thread_egress_decision(&None, |_| unreachable!());
+        assert_eq!(r.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn generic_read_write_via_fake() {
         use crate::test_support::FakeEstablisher;
@@ -872,6 +970,7 @@ mod tests {
         let cfg = NativeConfig {
             store: dir.path().to_path_buf(),
             iface: "lo".to_string(),
+            thread_iface: None,
             fabric_index: 1,
             issuer_index: 0,
         };

@@ -72,6 +72,7 @@ fn native_commission(
     let ncfg = mat_native::NativeConfig {
         store: store.root().to_path_buf(),
         iface: cfg.iface.to_string(),
+        thread_iface: None,
         fabric_index: cfg.fabric_index,
         issuer_index: cfg.issuer_index,
     };

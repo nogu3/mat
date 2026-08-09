@@ -191,12 +191,19 @@ pub fn build_group_datagram(
     )
 }
 
+/// groupcast の送出先 1 本分。transport は egress 専用（unicast と共有しない）。
+#[derive(Clone)]
+pub struct GroupEgress {
+    pub iface: String,
+    pub transport: Arc<UdpTransport>,
+    pub scope_id: u32,
+}
+
 /// Send-only groupcast path. Holds no per-group key state: credentials are
 /// passed per call (the caller re-reads the KVS so re-provisioned keys are
 /// picked up immediately).
 pub struct GroupSender {
-    transport: Arc<UdpTransport>,
-    scope_id: u32,
+    egress: Vec<GroupEgress>,
     dest_port: u16,
     fabric_id: u64,
     source_node_id: u64,
@@ -204,27 +211,31 @@ pub struct GroupSender {
 }
 
 impl GroupSender {
-    /// Configures the shared socket's multicast hop limit and assembles the
+    /// Configures each egress socket's multicast hop limit and assembles the
     /// sender. `dest_port` is `message::MATTER_PORT` in production (tests
-    /// point it at an ephemeral receiver).
+    /// point it at an ephemeral receiver). `egress` must have at least one
+    /// entry; the first is the operating iface (previous single-egress
+    /// behavior), later entries (e.g. a Thread TUN) receive the same
+    /// datagram in addition.
     pub fn new(
-        transport: Arc<UdpTransport>,
-        scope_id: u32,
+        egress: Vec<GroupEgress>,
         dest_port: u16,
         fabric_id: u64,
         source_node_id: u64,
         counter: PersistedGroupCounter,
     ) -> std::io::Result<Self> {
-        transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
-        // 宛先 sockaddr の sin6_scope_id だけでは egress iface を選べない環境が
+        // 各 egress socket に hop limit と IPV6_MULTICAST_IF を焼く
+        //（宛先 sockaddr の sin6_scope_id だけでは egress iface を選べない環境が
         // ある（VPN 系の広い v6 経路が multicast の経路解決を勝ち、実機で
         // tailscale0 へ流出 → LAN に出ず 0/7 不達）。IPV6_MULTICAST_IF で明示
         // 固定する。multicast 送信専用オプションなので共有 socket の unicast
-        // には影響しない。
-        transport.set_multicast_if_v6(scope_id)?;
+        // には影響しない）。
+        for e in &egress {
+            e.transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
+            e.transport.set_multicast_if_v6(e.scope_id)?;
+        }
         Ok(Self {
-            transport,
-            scope_id,
+            egress,
             dest_port,
             fabric_id,
             source_node_id,
@@ -232,8 +243,12 @@ impl GroupSender {
         })
     }
 
-    /// Fire-and-forget groupcast InvokeRequest (single send, no response,
-    /// no retransmit). Returns the message counter used, for logging.
+    /// Fire-and-forget groupcast InvokeRequest: the same encrypted datagram
+    /// is sent once per configured egress (no response, no retransmit).
+    /// Returns the message counter used and the iface names that accepted
+    /// the send, for logging. Only fails (returning the first error) if
+    /// every egress fails — a partial failure (e.g. the Thread TUN egress
+    /// down while LAN succeeds) still counts as delivered.
     pub async fn send_invoke(
         &mut self,
         creds: &GroupCredentials,
@@ -241,7 +256,7 @@ impl GroupSender {
         cluster: u32,
         command: u32,
         fields_tlv: Option<&[u8]>,
-    ) -> Result<u32, GroupSendError> {
+    ) -> Result<(u32, Vec<String>), GroupSendError> {
         let counter = self.counter.next().map_err(GroupSendError::Io)?;
         let mut ex = [0u8; 2];
         getrandom::getrandom(&mut ex).expect("os rng");
@@ -256,18 +271,32 @@ impl GroupSender {
             fields_tlv,
         )
         .map_err(GroupSendError::Crypto)?;
-        let dest = SocketAddr::V6(SocketAddrV6::new(
-            group_multicast_addr(self.fabric_id, group_id),
-            self.dest_port,
-            0,
-            // multicast 宛先では sin6_scope_id が送出 iface を選ぶ
-            self.scope_id,
-        ));
-        self.transport
-            .send_to(&datagram, dest)
-            .await
-            .map_err(GroupSendError::Io)?;
-        Ok(counter)
+        let mut sent = Vec::new();
+        let mut first_err: Option<std::io::Error> = None;
+        for e in &self.egress {
+            let dest = SocketAddr::V6(SocketAddrV6::new(
+                group_multicast_addr(self.fabric_id, group_id),
+                self.dest_port,
+                0,
+                // multicast 宛先では sin6_scope_id が送出 iface を選ぶ
+                e.scope_id,
+            ));
+            match e.transport.send_to(&datagram, dest).await {
+                Ok(_) => sent.push(e.iface.clone()),
+                Err(err) => {
+                    tracing::warn!(iface = %e.iface, error = %err, "groupcast egress send failed");
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        if sent.is_empty() {
+            return Err(GroupSendError::Io(
+                first_err.unwrap_or_else(|| std::io::Error::other("no egress")),
+            ));
+        }
+        Ok((counter, sent))
     }
 
     /// 内包 counter の窓ジャンプ（Issue #14 応急処置）。matd 常駐中は counter の
@@ -515,8 +544,12 @@ mod tests {
         let p = tmp_counter_path("mcastif");
         let _ = std::fs::remove_file(&p);
         let counter = PersistedGroupCounter::load(&p, 0).unwrap();
-        let _s =
-            GroupSender::new(std::sync::Arc::clone(&transport), 1, 5540, 1, 2, counter).unwrap();
+        let egress = vec![GroupEgress {
+            iface: "test".into(),
+            transport: std::sync::Arc::clone(&transport),
+            scope_id: 1,
+        }];
+        let _s = GroupSender::new(egress, 5540, 1, 2, counter).unwrap();
         assert_eq!(transport.multicast_if_v6().unwrap(), 1);
         let _ = std::fs::remove_file(&p);
     }
@@ -543,8 +576,12 @@ mod tests {
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
-            let mut s =
-                GroupSender::new(transport, cand.index, port, 1, 0x0001_0001, counter).unwrap();
+            let egress = vec![GroupEgress {
+                iface: cand.name.clone(),
+                transport,
+                scope_id: cand.index,
+            }];
+            let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
             // Send failures must not poison the run either: docker0 / veth* /
             // WSL2's loopback0 advertise IFF_UP|IFF_MULTICAST but carry no
             // IPv6 source address, so the ff35::/16 send fails with
@@ -554,7 +591,7 @@ mod tests {
                 .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
                 .await
             {
-                Ok(c) => c,
+                Ok((c, _sent)) => c,
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
                     tried.push(format!(
@@ -587,6 +624,86 @@ mod tests {
         panic!(
             "no multicast-capable interface delivered a loopback groupcast \
              datagram (lo excluded — it lacks IFF_MULTICAST on Linux); \
+             tried: {tried:?}"
+        );
+    }
+
+    /// egress リスト方式の中核: 1 本の GroupSender::send_invoke が複数
+    /// egress へ同一 datagram を送出する。`lo` は multicast join できないため、
+    /// 2 egress とも同じ iface（同じ scope_id）を使い、独立ソケット 1 本で
+    /// 同一バイト列が 2 回届くことで「egress ごとに 1 回送出された」ことを
+    /// 固定する。join できる候補は `multicast_capable_interfaces` の走査で
+    /// 探す（`group_sender_multicast_loops_back_locally` と同じ流儀 —
+    /// docker0/veth* 等 join はできても send が ENETUNREACH/EADDRNOTAVAIL で
+    /// 落ちる候補があるため、送出失敗も次候補へ送る）。
+    #[tokio::test]
+    async fn send_invoke_emits_identical_datagram_on_each_egress() {
+        let addr = group_multicast_addr(1, 10);
+        let mut tried = Vec::new();
+
+        for cand in multicast_capable_interfaces() {
+            let recv1 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            if recv1.join_multicast_v6(&addr, cand.index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+                continue;
+            }
+            let port = recv1.local_addr().unwrap().port();
+
+            let e1 = GroupEgress {
+                iface: "egress-a".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: cand.index,
+            };
+            let e2 = GroupEgress {
+                iface: "egress-b".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: cand.index,
+            };
+            let p = tmp_counter_path(&format!("dual-egress-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let creds = test_creds();
+            let mut s = GroupSender::new(vec![e1, e2], port, 1, 0x0001_0001, counter).unwrap();
+            let (counter_used, sent) = match s.send_invoke(&creds, 10, 6, 1, None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue;
+                }
+            };
+            assert_eq!(sent, vec!["egress-a".to_string(), "egress-b".to_string()]);
+            assert!(counter_used > 0);
+
+            // 同一バイト列が 2 回届く（egress ごとに 1 回）。
+            let mut buf1 = [0u8; 1280];
+            let r1 = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv1.recv_from(&mut buf1),
+            )
+            .await;
+            let mut buf2 = [0u8; 1280];
+            let r2 = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv1.recv_from(&mut buf2),
+            )
+            .await;
+            let _ = std::fs::remove_file(&p);
+            match (r1, r2) {
+                (Ok(Ok((n1, _))), Ok(Ok((n2, _)))) => {
+                    assert_eq!(&buf1[..n1], &buf2[..n2], "同一 counter の同一 datagram");
+                    return; // 配達できる iface が見つかった時点で PASS。
+                }
+                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+            }
+        }
+
+        panic!(
+            "no multicast-capable interface delivered dual-egress groupcast \
+             datagrams (lo excluded — it lacks IFF_MULTICAST on Linux); \
              tried: {tried:?}"
         );
     }

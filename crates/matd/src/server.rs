@@ -621,7 +621,7 @@ async fn run_op(
                     .group_invoke(group_id, cluster, command, fields)
                     .await?
                 {
-                    crate::native::GroupOutcome::Sent => Ok(sent_body),
+                    crate::native::GroupOutcome::Sent { .. } => Ok(sent_body),
                     crate::native::GroupOutcome::Unavailable(reason) => {
                         Err(group_unavailable_error(&reason))
                     }
@@ -1845,9 +1845,12 @@ mod tests {
                 fabric_index: 2,
                 fabric_id: 1,
                 node_id: 0x0001_0001,
-                scope_id: cand.index,
+                egress: vec![mat_controller::group::GroupEgress {
+                    iface: cand.name.clone(),
+                    transport,
+                    scope_id: cand.index,
+                }],
                 dest_port: port,
-                transport,
                 sender: tokio::sync::Mutex::new(None),
             };
             let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
@@ -1929,9 +1932,12 @@ mod tests {
             fabric_index: 2,
             fabric_id: 1,
             node_id: 0x0001_0001,
-            scope_id: 1, // lo — bump は送信しないので join 可否は無関係
+            egress: vec![mat_controller::group::GroupEgress {
+                iface: "lo".into(), // 送信しないので join 可否は無関係
+                transport,
+                scope_id: 1,
+            }],
             dest_port: 5540,
-            transport,
             sender: tokio::sync::Mutex::new(None),
         };
         let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));

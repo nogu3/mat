@@ -160,6 +160,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     let cfg = matd::native::NativeConfig {
         store: store_path.clone(),
         iface: iface.clone(),
+        thread_iface: None,
         fabric_index: cli.fabric_index,
         issuer_index: cli.issuer_index,
     };
