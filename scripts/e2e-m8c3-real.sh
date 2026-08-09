@@ -664,14 +664,22 @@ stage2_main() {
   scp "$MATD_BIN" "$MAT_E2E_HOST:$REMOTE_MATD_BIN"
   ssh -n "$MAT_E2E_HOST" "chmod +x '$REMOTE_MAT_BIN' '$REMOTE_MATD_BIN'"
 
+  # 期待バージョンはこの checkout の Cargo.toml（workspace.package.version）から
+  # 導出する — ハードコードすると version bump のたびに転送直後で必ず FAIL する
+  # （監査 Tier 1 ③、0.22.0 固定だった名残）。`cargo pkgid` の出力は
+  # `path+file:///...#1.24.0` 形式（名前がディレクトリ名と異なる場合は
+  # `#name@1.24.0`）なので `#` 以降 → `@` 以降の順で剥がす。
+  local EXPECTED_VERSION
+  EXPECTED_VERSION=$(cargo pkgid -p mat | sed 's/.*#//; s/.*@//')
+  [ -n "$EXPECTED_VERSION" ] || { echo "FAIL: cargo pkgid から期待バージョンを導出できない" >&2; exit 1; }
   local VER_OUT
   VER_OUT=$(ssh -n "$MAT_E2E_HOST" "'$REMOTE_MAT_BIN' --version")
   echo "$VER_OUT"
-  printf '%s' "$VER_OUT" | grep -q '0\.22\.0' || { echo "FAIL: リモート mat --version が 0.22.0 でない: $VER_OUT" >&2; exit 1; }
+  printf '%s' "$VER_OUT" | grep -qF "$EXPECTED_VERSION" || { echo "FAIL: リモート mat --version が $EXPECTED_VERSION でない: $VER_OUT" >&2; exit 1; }
   VER_OUT=$(ssh -n "$MAT_E2E_HOST" "'$REMOTE_MATD_BIN' --version")
   echo "$VER_OUT"
-  printf '%s' "$VER_OUT" | grep -q '0\.22\.0' || { echo "FAIL: リモート matd --version が 0.22.0 でない: $VER_OUT" >&2; exit 1; }
-  echo "PASS: 配布成果物確認（aarch64 動的リンク + --version 0.22.0、mat/matd 両方）"
+  printf '%s' "$VER_OUT" | grep -qF "$EXPECTED_VERSION" || { echo "FAIL: リモート matd --version が $EXPECTED_VERSION でない: $VER_OUT" >&2; exit 1; }
+  echo "PASS: 配布成果物確認（aarch64 動的リンク + --version $EXPECTED_VERSION、mat/matd 両方）"
 
   local STORE_ARG=()
   [ -n "$STORE" ] && STORE_ARG=(--store "$STORE")
