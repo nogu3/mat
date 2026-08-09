@@ -428,7 +428,68 @@ pub async fn establish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{Destination, MessageHeader, ProtocolHeader};
     use crate::tlv::{Reader, Tag, Value};
+    use crate::transport::{UdpTransport, MAX_DATAGRAM};
+
+    fn fast_cfg() -> MrpConfig {
+        MrpConfig {
+            initial_interval: Duration::from_millis(50),
+            active_interval: Duration::from_millis(50),
+            max_retries: 2,
+            backoff: 1.0,
+            jitter: 0.0,
+        }
+    }
+
+    fn build_unsecured(
+        counter: u32,
+        opcode: u8,
+        exchange_id: u16,
+        acked_counter: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let header = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter: counter,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: false,
+            needs_ack: false,
+            acked_counter,
+            opcode,
+            exchange_id,
+            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        };
+        let mut buf = header.encoded();
+        proto.encode(&mut buf);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
+            .await
+            .expect("fake device timed out waiting for a datagram")
+            .expect("recv_from io error");
+        (buf[..n].to_vec(), from)
+    }
+
+    /// Decodes an unsecured (session id 0) datagram into its headers +
+    /// payload, or `None` if malformed.
+    fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Vec<u8>)> {
+        let (h, off) = MessageHeader::decode(buf).ok()?;
+        if h.session_id != 0 {
+            return None;
+        }
+        let (p, boff) = ProtocolHeader::decode(&buf[off..]).ok()?;
+        Some((h, p, buf[off + boff..].to_vec()))
+    }
 
     #[test]
     fn pbkdf_param_request_shape() {
@@ -511,19 +572,7 @@ mod tests {
     /// and `cB` can just be garbage bytes.
     #[tokio::test]
     async fn confirm_mismatch_sends_abort_status_report() {
-        use crate::message::{Destination, MessageHeader, ProtocolHeader};
-        use crate::transport::{UdpTransport, MAX_DATAGRAM};
         use p256::elliptic_curve::sec1::ToEncodedPoint;
-
-        fn fast_cfg() -> MrpConfig {
-            MrpConfig {
-                initial_interval: Duration::from_millis(50),
-                active_interval: Duration::from_millis(50),
-                max_retries: 2,
-                backoff: 1.0,
-                jitter: 0.0,
-            }
-        }
 
         /// A syntactically valid (on-curve, non-identity) P-256 point that is
         /// *not* the real SPAKE2+ shareV — good enough to reach the cB check.
@@ -540,55 +589,6 @@ mod tests {
                         .expect("uncompressed p256 point is 65 bytes");
                 }
             }
-        }
-
-        fn build_unsecured(
-            counter: u32,
-            opcode: u8,
-            exchange_id: u16,
-            acked_counter: Option<u32>,
-            payload: &[u8],
-        ) -> Vec<u8> {
-            let header = MessageHeader {
-                session_id: 0,
-                security_flags: 0,
-                message_counter: counter,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: false,
-                needs_ack: false,
-                acked_counter,
-                opcode,
-                exchange_id,
-                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                vendor_id: None,
-            };
-            let mut buf = header.encoded();
-            proto.encode(&mut buf);
-            buf.extend_from_slice(payload);
-            buf
-        }
-
-        async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let (n, from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
-                .await
-                .expect("fake device timed out waiting for a datagram")
-                .expect("recv_from io error");
-            (buf[..n].to_vec(), from)
-        }
-
-        /// Decodes an unsecured (session id 0) datagram into its headers +
-        /// payload, or `None` if malformed.
-        fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Vec<u8>)> {
-            let (h, off) = MessageHeader::decode(buf).ok()?;
-            if h.session_id != 0 {
-                return None;
-            }
-            let (p, boff) = ProtocolHeader::decode(&buf[off..]).ok()?;
-            Some((h, p, buf[off + boff..].to_vec()))
         }
 
         let responder_transport = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
