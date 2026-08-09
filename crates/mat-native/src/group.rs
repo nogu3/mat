@@ -204,9 +204,20 @@ mod tests {
                 transport,
                 sender: Mutex::new(None),
             };
-            let r = send(&ctx, 10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
-                .await
-                .unwrap();
+            // send 失敗も次候補へ（join 失敗と同じ扱い）: docker0 / veth* /
+            // WSL2 の loopback0 は IFF_UP|IFF_MULTICAST を立てるが IPv6 送信元
+            // アドレスを持たず、ff35::/16 宛送信が EADDRNOTAVAIL で落ちる —
+            // 実 NIC の候補が後ろに控えている。
+            let r = match send(&ctx, 10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {}",
+                        cand.name, cand.index, e.detail
+                    ));
+                    continue;
+                }
+            };
             assert!(matches!(r, GroupOutcome::Sent));
 
             let mut buf = [0u8; 1280];

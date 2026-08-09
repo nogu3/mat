@@ -545,10 +545,25 @@ mod tests {
             let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
             let mut s =
                 GroupSender::new(transport, cand.index, port, 1, 0x0001_0001, counter).unwrap();
-            let sent_counter = s
+            // Send failures must not poison the run either: docker0 / veth* /
+            // WSL2's loopback0 advertise IFF_UP|IFF_MULTICAST but carry no
+            // IPv6 source address, so the ff35::/16 send fails with
+            // EADDRNOTAVAIL — the next candidate (a real NIC) can still
+            // deliver.
+            let sent_counter = match s
                 .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
                 .await
-                .unwrap();
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue;
+                }
+            };
 
             let mut buf = [0u8; 1280];
             let result = tokio::time::timeout(

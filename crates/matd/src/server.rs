@@ -1852,7 +1852,12 @@ mod tests {
             };
             let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
 
-            let body = run_op(
+            // A send failure just moves on to the next candidate (same
+            // treatment as a join failure): docker0 / veth* / WSL2's
+            // loopback0 advertise IFF_UP|IFF_MULTICAST but carry no IPv6
+            // source address, so the ff35::/16 send fails with EADDRNOTAVAIL
+            // — a real NIC candidate can still deliver.
+            let body = match run_op(
                 &group_on_op(),
                 &NativeState::Ready(Box::new(native)),
                 &store_path,
@@ -1860,7 +1865,10 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
             assert_eq!(body["status"], "sent"); // native 経路のみで成功
             let mut buf = [0u8; 1280];
             let result = tokio::time::timeout(
