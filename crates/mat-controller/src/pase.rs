@@ -43,6 +43,27 @@ const GENERAL_CODE_FAILURE: u16 = 1;
 /// 表・SPAKE2+ 確認不一致など、handshake データ自体が拒否される場合）。
 const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 
+/// spec §3.9 の PBKDF 制約（CRYPTO_PBKDF_ITERATIONS_MIN/MAX）。iterations の
+/// 範囲は commissioning.rs の open-window 引数検証も同じ値を参照する。
+pub(crate) const PBKDF_ITERATIONS_MIN: u32 = 1000;
+pub(crate) const PBKDF_ITERATIONS_MAX: u32 = 100_000;
+const PBKDF_SALT_LEN_MIN: usize = 16;
+const PBKDF_SALT_LEN_MAX: usize = 32;
+
+/// PBKDFParamResponse の iterations / salt 長を spec §3.9 の範囲に強制する。
+/// unsecured 交換なので on-path 偽造で iterations=u32::MAX を注入されると
+/// 同期 PBKDF2 が数時間回る（current_thread ランタイムなので timeout も
+/// 効かない）—— PBKDF2 実行前に必ず呼ぶ。Err は Malformed に渡す detail。
+fn validate_pbkdf_params(iterations: u32, salt_len: usize) -> Result<(), &'static str> {
+    if !(PBKDF_ITERATIONS_MIN..=PBKDF_ITERATIONS_MAX).contains(&iterations) {
+        return Err("pbkdf iterations out of range");
+    }
+    if !(PBKDF_SALT_LEN_MIN..=PBKDF_SALT_LEN_MAX).contains(&salt_len) {
+        return Err("pbkdf salt length out of range");
+    }
+    Ok(())
+}
+
 /// Wait budget for a real (non-ack) response once the previous message has
 /// already been acknowledged — covers device-side PBKDF/SPAKE2+ compute time.
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -314,6 +335,22 @@ pub async fn establish(
     }
     let resp_payload = msg.payload;
     let resp = decode_pbkdf_param_response(&resp_payload)?;
+
+    // spec §3.9 範囲外の PBKDF パラメータは PBKDF2 実行前に拒否する。黙って
+    // 諦めると responder が Pake1 待ちのままセッション確立スロットを保持し
+    // 続け、直後の再試行が固まる（cB 不一致経路と同じ理由 — そちらの
+    // コメント参照）ので、StatusReport を send_once で一度だけ送ってから返す。
+    if let Err(what) = validate_pbkdf_params(resp.iterations, resp.salt.len()) {
+        let sr = encode_status_report(
+            GENERAL_CODE_FAILURE,
+            u32::from(PROTOCOL_ID_SECURE_CHANNEL),
+            SC_PROTOCOL_CODE_INVALID_PARAMETER,
+        );
+        let _ = ex
+            .send_once(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_STATUS_REPORT, &sr)
+            .await;
+        return Err(PaseError::Malformed(what));
+    }
 
     // 3. PAKE context (spec §4.13.1.2).
     let mut hasher = Sha256::new();
@@ -676,5 +713,88 @@ mod tests {
 
         let result = establish_task.await.expect("establish task panicked");
         assert!(matches!(result, Err(PaseError::ConfirmMismatch)));
+    }
+
+    #[test]
+    fn validates_pbkdf_params_bounds() {
+        // spec §3.9: iterations 1000..=100_000, salt 16..=32 bytes。境界値は受理。
+        assert!(validate_pbkdf_params(1000, 16).is_ok());
+        assert!(validate_pbkdf_params(100_000, 32).is_ok());
+        assert!(validate_pbkdf_params(999, 16).is_err());
+        assert!(validate_pbkdf_params(100_001, 16).is_err());
+        assert!(validate_pbkdf_params(1000, 15).is_err());
+        assert!(validate_pbkdf_params(1000, 33).is_err());
+    }
+
+    /// Fake device が spec §3.9 範囲外の iterations (999) を返したとき、
+    /// initiator が PBKDF2 実行前に中断し、abort StatusReport
+    /// (FAILURE / SecureChannel / kInvalidParameter) を同一 exchange で送る
+    /// ことを検証する。999 を使うのは、検証が未実装でも PBKDF2 が一瞬で
+    /// 終わり、テストが（ハングではなく）即 fail するようにするため。
+    #[tokio::test]
+    async fn bad_pbkdf_params_send_abort_status_report() {
+        let responder_transport = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let responder_addr = responder_transport.local_addr().unwrap();
+        let initiator_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+
+        let cfg = fast_cfg();
+        let establish_task = {
+            let transport = Arc::clone(&initiator_transport);
+            let cfg = cfg.clone();
+            tokio::spawn(async move { establish(transport, responder_addr, 20202021, &cfg).await })
+        };
+
+        // --- PBKDFParamRequest -> 範囲外 iterations の PBKDFParamResponse ---
+        let (req_buf, initiator_addr) = recv_dg(&responder_transport).await;
+        let (req_header, req_proto, _req_payload) =
+            decode_unsecured(&req_buf).expect("valid PBKDFParamRequest datagram");
+        assert_eq!(req_proto.opcode, OPCODE_PBKDF_PARAM_REQUEST);
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &[1u8; 32]); // initiatorRandom echo (ignored)
+        w.put_bytes(Tag::Context(2), &[2u8; 32]); // responderRandom (ignored)
+        w.put_uint(Tag::Context(3), 0xBEEF); // responderSessionId
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), 999); // iterations: spec 下限 1000 未満
+        w.put_bytes(Tag::Context(2), b"0123456789abcdef"); // salt (16B, 正当)
+        w.end_container();
+        w.end_container();
+        let resp_dg = build_unsecured(
+            100,
+            OPCODE_PBKDF_PARAM_RESPONSE,
+            req_proto.exchange_id,
+            Some(req_header.message_counter),
+            &w.finish(),
+        );
+        responder_transport
+            .send_to(&resp_dg, initiator_addr)
+            .await
+            .unwrap();
+
+        // --- 次のデータグラムは Pake1 ではなく abort StatusReport のはず ---
+        let (abort_buf, _) = recv_dg(&responder_transport).await;
+        let (_abort_header, abort_proto, abort_payload) =
+            decode_unsecured(&abort_buf).expect("valid abort datagram");
+        assert_eq!(abort_proto.opcode, OPCODE_STATUS_REPORT);
+        assert_eq!(abort_proto.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
+        assert_eq!(abort_proto.exchange_id, req_proto.exchange_id);
+        let (general_code, protocol_id, protocol_code) =
+            parse_status_report(&abort_payload).expect("well-formed StatusReport");
+        assert_eq!(general_code, GENERAL_CODE_FAILURE);
+        assert_eq!(protocol_id, u32::from(PROTOCOL_ID_SECURE_CHANNEL));
+        assert_eq!(protocol_code, SC_PROTOCOL_CODE_INVALID_PARAMETER);
+
+        let result = establish_task.await.expect("establish task panicked");
+        assert!(matches!(
+            result,
+            Err(PaseError::Malformed("pbkdf iterations out of range"))
+        ));
     }
 }
