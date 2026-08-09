@@ -206,9 +206,14 @@ pub(crate) fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamRe
         }
     }
 
+    let responder_session_id =
+        responder_session_id.ok_or(PaseError::Malformed("responder session id"))?;
+    if responder_session_id == 0 {
+        return Err(PaseError::Malformed("responder session id must be non-zero"));
+    }
+
     Ok(PbkdfParamResponse {
-        responder_session_id: responder_session_id
-            .ok_or(PaseError::Malformed("responder session id"))?,
+        responder_session_id,
         iterations: iterations.ok_or(PaseError::Malformed("iterations"))?,
         salt: salt.ok_or(PaseError::Malformed("salt"))?,
     })
@@ -422,7 +427,15 @@ pub async fn establish(
         .await
         .map_err(PaseError::Exchange)?;
     let msg3 = match resp3 {
-        Some(m) => m,
+        Some(m) => {
+            // On a reliable transport (BTP) MRP is disabled, so the peer's
+            // response carries no piggybacked ack — skip the ack check there.
+            // Over UDP the real response must ack the request we just sent.
+            if !transport.is_reliable() && m.proto.acked_counter != ex.last_sent_counter() {
+                return Err(PaseError::NotAcked);
+            }
+            m
+        }
         None => ex.recv(RECV_TIMEOUT).await.map_err(PaseError::Exchange)?,
     };
     if msg3.proto.opcode != OPCODE_STATUS_REPORT {
@@ -713,6 +726,23 @@ mod tests {
 
         let result = establish_task.await.expect("establish task panicked");
         assert!(matches!(result, Err(PaseError::ConfirmMismatch)));
+    }
+
+    #[test]
+    fn rejects_zero_responder_session_id() {
+        // 0 は予約値。CASE 側 (case.rs の Sigma2 decode) と対称の扱い。
+        let mut w = crate::tlv::Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(3), 0); // responderSessionId = 0
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), 1000);
+        w.put_bytes(Tag::Context(2), b"0123456789abcdef");
+        w.end_container();
+        w.end_container();
+        assert!(matches!(
+            decode_pbkdf_param_response(&w.finish()),
+            Err(PaseError::Malformed("responder session id must be non-zero"))
+        ));
     }
 
     #[test]
