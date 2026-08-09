@@ -12,6 +12,7 @@ pub enum SetupCodeError {
     PasscodeOutOfRange,
     BadFirstDigit,
     VidPidMismatch,
+    NonCanonicalBase38,
 }
 
 impl std::fmt::Display for SetupCodeError {
@@ -30,6 +31,9 @@ impl std::fmt::Display for SetupCodeError {
             }
             SetupCodeError::VidPidMismatch => {
                 write!(f, "manual code VID/PID presence flag contradicts its length")
+            }
+            SetupCodeError::NonCanonicalBase38 => {
+                write!(f, "QR base38 chunk exceeds its byte range (non-canonical encoding)")
             }
         }
     }
@@ -122,7 +126,7 @@ fn base38_decode(s: &str) -> Result<Vec<u8>, SetupCodeError> {
     let full_groups = len / 5;
     let mut out = Vec::with_capacity(full_groups * 3 + 2);
     for g in 0..full_groups {
-        let value = decode_base38_chunk(&bytes[g * 5..g * 5 + 5])?;
+        let value = decode_base38_chunk(&bytes[g * 5..g * 5 + 5], 3)?;
         out.push((value & 0xFF) as u8);
         out.push(((value >> 8) & 0xFF) as u8);
         out.push(((value >> 16) & 0xFF) as u8);
@@ -130,12 +134,12 @@ fn base38_decode(s: &str) -> Result<Vec<u8>, SetupCodeError> {
     let tail_start = full_groups * 5;
     match tail {
         4 => {
-            let value = decode_base38_chunk(&bytes[tail_start..tail_start + 4])?;
+            let value = decode_base38_chunk(&bytes[tail_start..tail_start + 4], 2)?;
             out.push((value & 0xFF) as u8);
             out.push(((value >> 8) & 0xFF) as u8);
         }
         2 => {
-            let value = decode_base38_chunk(&bytes[tail_start..tail_start + 2])?;
+            let value = decode_base38_chunk(&bytes[tail_start..tail_start + 2], 1)?;
             out.push((value & 0xFF) as u8);
         }
         _ => {}
@@ -143,11 +147,15 @@ fn base38_decode(s: &str) -> Result<Vec<u8>, SetupCodeError> {
     Ok(out)
 }
 
-fn decode_base38_chunk(chars: &[u8]) -> Result<u64, SetupCodeError> {
+fn decode_base38_chunk(chars: &[u8], out_bytes: usize) -> Result<u64, SetupCodeError> {
     let mut value: u64 = 0;
     for (i, &c) in chars.iter().enumerate() {
         let digit = base38_char_value(c).ok_or(SetupCodeError::BadChar)?;
         value += u64::from(digit) * 38u64.pow(i as u32);
+    }
+    // チャンクが表現するバイト数を超える値は非正準エンコーディング。
+    if value >> (8 * out_bytes) != 0 {
+        return Err(SetupCodeError::NonCanonicalBase38);
     }
     Ok(value)
 }
@@ -498,5 +506,22 @@ mod tests {
             parse_manual_code(&code),
             Err(SetupCodeError::VidPidMismatch)
         );
+    }
+
+    #[test]
+    fn rejects_non_canonical_base38_chunks() {
+        // '9' の digit 値は 9。5 文字 "99999" = 9*(1+38+38²+38³+38⁴)
+        // = 19,273,419 > 0xFFFFFF(3 byte 上限) → 非正準。
+        assert_eq!(
+            base38_decode("99999"),
+            Err(SetupCodeError::NonCanonicalBase38)
+        );
+        // 4 文字 "9999" = 507,195 > 0xFFFF(2 byte 上限)
+        assert_eq!(
+            base38_decode("9999"),
+            Err(SetupCodeError::NonCanonicalBase38)
+        );
+        // 2 文字 "99" = 351 > 0xFF(1 byte 上限)
+        assert_eq!(base38_decode("99"), Err(SetupCodeError::NonCanonicalBase38));
     }
 }
