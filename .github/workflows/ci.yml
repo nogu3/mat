@@ -1,5 +1,9 @@
 # task check 相当（fmt:check + clippy + test）を PR / main push で回す。
 # テストは trait-level FakeConn 単体テスト + backend フリーの binary 統合テストを含む。実 chip-tool は不要。
+# ble feature（bluer → libdbus）も clippy + test でコンパイルする — これが無いと
+# ble.rs / commissioning.rs の BLE 経路の初コンパイルが手動 `task dist:arm64`
+# = デプロイ直前になる（監査 Tier 1 ②）。実機 BLE を要するテストは
+# #[ignore] 付きなのでコンパイルのみでスキップされる。
 name: CI
 
 on:
@@ -19,9 +23,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: install libdbus (ble feature)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: fmt
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (ble)
+        run: cargo clippy --all-targets --features ble -- -D warnings
       - name: test
         run: cargo test
+      - name: test (ble)
+        run: cargo test -p mat-controller --features ble
