@@ -586,6 +586,9 @@ Output:
   response plus `timeout`.
 - If `--discriminator` is omitted, it is derived from the node_id
   deterministically (kept within 12 bits).
+- `--iteration` must be in `1000..=100000` (spec §3.9) and `--discriminator`
+  within 12 bits (`0..=4095`). Out-of-range values fail fast with
+  `parse_error` before any invoke is sent.
 - **"Share many devices in one QR" is not possible in Matter** (one commission
   per device). Fronting many devices is a bridge, a separate project, not `mat`.
   `open-window` shares native devices one at a time.
