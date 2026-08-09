@@ -9,6 +9,9 @@ pub enum SetupCodeError {
     BadCheckDigit,
     BadPrefix,
     ZeroPasscode,
+    PasscodeOutOfRange,
+    BadFirstDigit,
+    VidPidMismatch,
 }
 
 impl std::fmt::Display for SetupCodeError {
@@ -19,6 +22,15 @@ impl std::fmt::Display for SetupCodeError {
             SetupCodeError::BadCheckDigit => write!(f, "manual code check digit mismatch"),
             SetupCodeError::BadPrefix => write!(f, "QR payload is missing the \"MT:\" prefix"),
             SetupCodeError::ZeroPasscode => write!(f, "setup passcode must not be zero"),
+            SetupCodeError::PasscodeOutOfRange => {
+                write!(f, "setup passcode exceeds the Matter maximum (99999998)")
+            }
+            SetupCodeError::BadFirstDigit => {
+                write!(f, "manual code first digit must be 0-7")
+            }
+            SetupCodeError::VidPidMismatch => {
+                write!(f, "manual code VID/PID presence flag contradicts its length")
+            }
         }
     }
 }
@@ -316,6 +328,16 @@ pub fn parse_manual_code(s: &str) -> Result<ManualCode, SetupCodeError> {
     }
 
     let digit1 = u32::from(digits[0]);
+
+    // digit1 は (vid_pid_present << 2) | 短縮 discriminator 上位 2bit の
+    // 3-bit 値（spec §5.1.3.1）。8/9 は表現外、bit2 は桁数と一致すべき。
+    if digit1 > 7 {
+        return Err(SetupCodeError::BadFirstDigit);
+    }
+    if (digit1 >> 2 == 1) != (s.len() == 21) {
+        return Err(SetupCodeError::VidPidMismatch);
+    }
+
     let short_disc_top2 = digit1 & 0x3;
 
     let digits2_6 = digits_to_u32(&digits[1..6]);
@@ -329,6 +351,11 @@ pub fn parse_manual_code(s: &str) -> Result<ManualCode, SetupCodeError> {
 
     if passcode == 0 {
         return Err(SetupCodeError::ZeroPasscode);
+    }
+
+    if passcode > 99_999_998 {
+        // digits7_10 が 9999 まで振れるので 27-bit を超える値が構成できる。
+        return Err(SetupCodeError::PasscodeOutOfRange);
     }
 
     Ok(ManualCode {
@@ -371,6 +398,13 @@ mod tests {
     // 周知のテストペア: chip 全クラスタアプリの onboarding payload。
     // passcode 20202021 / long discriminator 3840 / VID 0xFFF1 / PID 0x8001。
     const QR: &str = "MT:-24J0AFN00KA0648G00";
+
+    /// body（check digit 抜き）から検証付き manual code を組み立てる。
+    fn manual_code_with_check(body: &str) -> String {
+        let digits = digits_of(body).unwrap();
+        let check = verhoeff_check_digit(&digits);
+        format!("{body}{check}")
+    }
 
     #[test]
     fn parses_known_qr() {
@@ -432,5 +466,37 @@ mod tests {
     #[should_panic(expected = "passcode must be ≤ 99,999,998")]
     fn encode_manual_code_panics_on_oversize_passcode() {
         let _ = encode_manual_code(1u32 << 27, 15);
+    }
+
+    #[test]
+    fn rejects_manual_code_passcode_over_limit() {
+        // digit1=0, digits2_6=16383 (disc=0, low14=0x3FFF), digits7_10=9999
+        // → passcode = (9999<<14)|16383 = 163,839,999 > 99,999,998
+        let code = manual_code_with_check("0163839999");
+        assert_eq!(
+            parse_manual_code(&code),
+            Err(SetupCodeError::PasscodeOutOfRange)
+        );
+    }
+
+    #[test]
+    fn rejects_manual_code_first_digit_over_7() {
+        // digit1 は 3-bit (vid_pid<<2 | disc上位2bit) なので 8/9 は不正。
+        let code = manual_code_with_check("8005491233");
+        assert_eq!(
+            parse_manual_code(&code),
+            Err(SetupCodeError::BadFirstDigit)
+        );
+    }
+
+    #[test]
+    fn rejects_manual_code_vid_pid_flag_mismatch() {
+        // 11 桁（VID/PID なし）なのに digit1 の bit2 (vid_pid_present) が 1。
+        // passcode 20202021: low14=549 → digits2_6="00549", digits7_10="1233"。
+        let code = manual_code_with_check("4005491233");
+        assert_eq!(
+            parse_manual_code(&code),
+            Err(SetupCodeError::VidPidMismatch)
+        );
     }
 }
