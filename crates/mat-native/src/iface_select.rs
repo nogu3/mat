@@ -53,6 +53,28 @@ pub fn select(infos: &[IfaceInfo]) -> Result<String, SelectError> {
     }
 }
 
+/// Thread TUN 自動検出（groupcast egress 用 — spec 設計 1）。
+/// 名前が `wpan` で始まり IFF_UP|IFF_MULTICAST な iface がちょうど 1 本
+/// あればそれ。0 または複数は None（従来動作 = LAN 単独送出）。
+/// operstate は見ない — TUN は carrier 概念が無く "unknown" になる。
+pub fn detect_thread_iface(infos: &[IfaceInfo]) -> Option<String> {
+    let mut names: Vec<&IfaceInfo> = infos
+        .iter()
+        .filter(|i| {
+            i.name.starts_with("wpan") && i.flags & IFF_UP != 0 && i.flags & IFF_MULTICAST != 0
+        })
+        .collect();
+    match names.len() {
+        1 => Some(names.remove(0).name.clone()),
+        _ => None,
+    }
+}
+
+/// `detect_thread_iface` の実走査版。scan 失敗も None（auto は best-effort）。
+pub fn detect_thread_iface_auto() -> Option<String> {
+    scan().ok().and_then(|infos| detect_thread_iface(&infos))
+}
+
 /// `/sys/class/net` + `/proc/net/if_inet6` を走査して候補を集め、`select` する。
 /// 失敗はすべて kind `other`（新 kind は設けない — spec 設計 4）。
 pub fn autodetect() -> Result<String, MatError> {
@@ -166,5 +188,43 @@ mod tests {
             Err(SelectError::Ambiguous(names)) => assert_eq!(names, vec!["eth0", "wlan0"]),
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    // wpan0 (OTBR TUN): up|pointopoint|multicast, operstate は "unknown"(=up 扱いしない)
+    const WPAN: u32 = 0x1 | 0x10 | 0x1000;
+
+    #[test]
+    fn thread_iface_detects_single_wpan() {
+        let infos = [
+            ifi("eth0", ETH, true, true),
+            ifi("wpan0", WPAN, false, true), // operstate unknown → up=false でも採用
+        ];
+        assert_eq!(detect_thread_iface(&infos), Some("wpan0".into()));
+    }
+
+    #[test]
+    fn thread_iface_requires_wpan_prefix() {
+        // tailscale0 は wpan と同じ flags 形状だが名前で不採用
+        let infos = [
+            ifi("eth0", ETH, true, true),
+            ifi("tailscale0", TS, true, true),
+        ];
+        assert_eq!(detect_thread_iface(&infos), None);
+    }
+
+    #[test]
+    fn thread_iface_ambiguous_wpan_is_none() {
+        let infos = [
+            ifi("wpan0", WPAN, true, true),
+            ifi("wpan1", WPAN, true, true),
+        ];
+        assert_eq!(detect_thread_iface(&infos), None);
+    }
+
+    #[test]
+    fn thread_iface_down_wpan_is_none() {
+        // IFF_UP なし
+        let infos = [ifi("wpan0", 0x10 | 0x1000, false, true)];
+        assert_eq!(detect_thread_iface(&infos), None);
     }
 }
