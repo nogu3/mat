@@ -1182,6 +1182,27 @@ pub struct OpenedWindow {
     pub window_timeout_s: u16,
 }
 
+/// open-window 引数の値域検証。iterations は PASE と同じ spec §3.9 範囲、
+/// discriminator は 12-bit。違反は invoke 送信前に InvalidArgument で弾く —
+/// 特に discriminator 超過は、デバイスが受理してしまうと window 開放後に
+/// setup_code の assert で panic して生成 passcode が失われ、開いた window
+/// が放置されるため、送信前に止める順序が重要。
+fn validate_window_params(discriminator: u16, iterations: u32) -> Result<(), CommissionError> {
+    if discriminator > 0x0FFF {
+        return Err(CommissionError::InvalidArgument {
+            what: "discriminator must fit in 12 bits (<= 0x0FFF)",
+        });
+    }
+    if !(crate::pase::PBKDF_ITERATIONS_MIN..=crate::pase::PBKDF_ITERATIONS_MAX)
+        .contains(&iterations)
+    {
+        return Err(CommissionError::InvalidArgument {
+            what: "iterations must be in 1000..=100000",
+        });
+    }
+    Ok(())
+}
+
 /// Enhanced Commissioning Method（spec §5.5）で一時的な commissioning
 /// window を開く。既存の operational CASE セッション上で
 /// `AdministratorCommissioning::OpenCommissioningWindow` を送る——PASE は使
@@ -1198,6 +1219,7 @@ pub async fn open_commissioning_window(
     iterations: u32,
     cfg: &MrpConfig,
 ) -> Result<OpenedWindow, CommissionError> {
+    validate_window_params(discriminator, iterations)?;
     let passcode = random_valid_passcode();
     let mut salt = [0u8; 32];
     getrandom::getrandom(&mut salt).expect("os rng");
@@ -1504,6 +1526,8 @@ pub enum CommissionError {
         status: u8,
         debug_text: Option<String>,
     },
+    /// 呼び出し側引数の値域違反。デバイスへ invoke を送る前に検出する。
+    InvalidArgument { what: &'static str },
 }
 
 impl std::fmt::Display for CommissionError {
@@ -1540,6 +1564,9 @@ impl std::fmt::Display for CommissionError {
                     write!(f, " ({t})")?;
                 }
                 Ok(())
+            }
+            CommissionError::InvalidArgument { what } => {
+                write!(f, "commissioning: invalid argument: {what}")
             }
         }
     }
@@ -1917,5 +1944,25 @@ mod tests {
         assert_eq!(f.fabric_id, 0xFAB2);
         assert_eq!(f.ipk_epoch, [9u8; 16]);
         assert_eq!(f.admin_node_id, 0xAA55);
+    }
+
+    #[test]
+    fn validates_window_params() {
+        // 境界値は受理
+        assert!(validate_window_params(0x0FFF, 1000).is_ok());
+        assert!(validate_window_params(0, 100_000).is_ok());
+        // 範囲外は InvalidArgument
+        assert!(matches!(
+            validate_window_params(0x1000, 1000),
+            Err(CommissionError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_window_params(0, 999),
+            Err(CommissionError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_window_params(0, 100_001),
+            Err(CommissionError::InvalidArgument { .. })
+        ));
     }
 }

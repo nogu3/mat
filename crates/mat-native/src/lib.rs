@@ -730,6 +730,9 @@ fn map_commission_err(e: mat_controller::commissioning::CommissionError) -> MatE
             MatError::new(ErrorKind::DeviceRejected, format!("native: {e}"))
         }
         CommissionError::Timeout(_) => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
+        CommissionError::InvalidArgument { .. } => {
+            MatError::new(ErrorKind::ParseError, format!("native: {e}"))
+        }
         _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
     }
 }
@@ -821,6 +824,16 @@ mod tests {
             cluster_status: None,
         }));
         assert_eq!(e.kind, ErrorKind::DeviceRejected);
+    }
+
+    #[test]
+    fn invalid_argument_maps_to_parse_error() {
+        let e = map_commission_err(
+            mat_controller::commissioning::CommissionError::InvalidArgument {
+                what: "iterations must be in 1000..=100000",
+            },
+        );
+        assert_eq!(e.kind, ErrorKind::ParseError);
     }
 
     #[test]

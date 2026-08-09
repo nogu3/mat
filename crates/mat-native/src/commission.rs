@@ -203,7 +203,9 @@ fn kind_of(e: &CommissionError) -> ErrorKind {
             ErrorKind::DeviceRejected
         }
         CommissionError::NetworkConfig { .. } => ErrorKind::Unreachable,
-        CommissionError::Malformed { .. } | CommissionError::Csr(_) => ErrorKind::ParseError,
+        CommissionError::Malformed { .. }
+        | CommissionError::Csr(_)
+        | CommissionError::InvalidArgument { .. } => ErrorKind::ParseError,
         _ => ErrorKind::CommissionFailed,
     }
 }
