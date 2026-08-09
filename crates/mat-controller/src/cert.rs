@@ -414,6 +414,23 @@ impl MatterCert {
         self.subject_matter_id(21)
     }
 
+    /// basicConstraints 拡張の (is_ca, path_len)。拡張が無ければ None。
+    pub fn basic_constraints(&self) -> Option<(bool, Option<u8>)> {
+        self.extensions.iter().find_map(|e| match e {
+            CertExtension::BasicConstraints { is_ca, path_len } => Some((*is_ca, *path_len)),
+            _ => None,
+        })
+    }
+
+    /// KeyUsage 拡張のビット値（TLV named-bit、LSB=digitalSignature）。
+    /// 拡張が無ければ None。
+    pub fn key_usage(&self) -> Option<u16> {
+        self.extensions.iter().find_map(|e| match e {
+            CertExtension::KeyUsage(bits) => Some(*bits),
+            _ => None,
+        })
+    }
+
     /// Encode this certificate back to Matter TLV — inverse of `parse`.
     /// Field/extension order follows the parsed struct (which preserves TLV order).
     pub fn to_tlv(&self) -> Vec<u8> {
@@ -1021,5 +1038,15 @@ mod tests {
         let reparsed = MatterCert::parse(&noc.to_tlv()).unwrap();
         assert_eq!(reparsed.node_id(), Some(0x1B669));
         reparsed.verify_signed_by(&root.pub_key).unwrap();
+    }
+
+    #[test]
+    fn basic_constraints_and_key_usage_accessors() {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let node = MatterCert::parse(NODE_CHIP).unwrap();
+        assert_eq!(root.basic_constraints(), Some((true, None)));
+        assert_eq!(root.key_usage(), Some(0x0060)); // keyCertSign | cRLSign
+        assert_eq!(node.basic_constraints(), Some((false, None)));
+        assert_eq!(node.key_usage(), Some(0x0001)); // digitalSignature
     }
 }
