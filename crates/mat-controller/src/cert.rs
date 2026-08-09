@@ -490,6 +490,25 @@ fn write_extension(w: &mut Writer, ext: &CertExtension) {
     }
 }
 
+/// RCAC / ICAC 共通の CA 制約検査: basicConstraints cA=true + KeyUsage
+/// keyCertSign（RFC 5280 §6.1.4(k)/(n)、Matter 1.4 §6.6.4 が MUST 参照）。
+/// Matter 運用証明書では両拡張とも必須なので、欠落も拒否(fail-closed)。
+fn check_ca_cert(
+    cert: &MatterCert,
+    not_ca: &'static str,
+    no_key_cert_sign: &'static str,
+) -> Result<(), CertError> {
+    match cert.basic_constraints() {
+        Some((true, _)) => {}
+        _ => return Err(CertError::Malformed(not_ca)),
+    }
+    match cert.key_usage() {
+        Some(bits) if bits & KEY_USAGE_KEY_CERT_SIGN != 0 => {}
+        _ => return Err(CertError::Malformed(no_key_cert_sign)),
+    }
+    Ok(())
+}
+
 /// Verify a NOC's signature chain up to `rcac`, optionally through `icac`,
 /// and cross-check issuer/subject DN linkage and fabric-id consistency.
 pub fn verify_noc_chain(
@@ -498,11 +517,31 @@ pub fn verify_noc_chain(
     rcac: &MatterCert,
 ) -> Result<(), CertError> {
     rcac.verify_signed_by(&rcac.pub_key)?; // self-signed root
+    check_ca_cert(
+        rcac,
+        "rcac cA basic-constraint",
+        "rcac keyCertSign key-usage",
+    )?;
     let signer = match icac {
         Some(ica) => {
             ica.verify_signed_by(&rcac.pub_key)?;
             if ica.issuer != rcac.subject {
                 return Err(CertError::Malformed("icac issuer != rcac subject"));
+            }
+            check_ca_cert(
+                ica,
+                "icac cA basic-constraint",
+                "icac keyCertSign key-usage",
+            )?;
+            // Matter プロファイル: ICAC の pathLen は存在するなら 0 のみ。
+            if let Some((_, Some(pl))) = ica.basic_constraints() {
+                if pl != 0 {
+                    return Err(CertError::Malformed("icac path-len (must be 0)"));
+                }
+            }
+            // RFC 5280 §6.1.4(m): root の pathLen=0 は中間 CA を許さない。
+            if let Some((_, Some(0))) = rcac.basic_constraints() {
+                return Err(CertError::Malformed("rcac path-len (0 forbids an icac)"));
             }
             ica
         }
@@ -1048,5 +1087,176 @@ mod tests {
         assert_eq!(root.key_usage(), Some(0x0060)); // keyCertSign | cRLSign
         assert_eq!(node.basic_constraints(), Some((false, None)));
         assert_eq!(node.key_usage(), Some(0x0001)); // digitalSignature
+    }
+
+    /// テスト用: 新規 RCAC とそこから発行した NOC、および双方の秘密鍵。
+    fn fresh_chain() -> (MatterCert, [u8; 32], MatterCert, [u8; 32]) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let (rcac, root_key) = generate_rcac().unwrap();
+        let op = crate::case::random_p256_secret();
+        let op_priv: [u8; 32] = op.to_bytes().into();
+        let op_pub: [u8; 65] = op
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
+        (rcac, root_key, noc, op_priv)
+    }
+
+    /// テスト用: 拡張リストを書き換えた複製を作り、指定鍵で署名し直す。
+    fn mutate_and_resign(
+        cert: &MatterCert,
+        signer_key: &[u8; 32],
+        f: impl FnOnce(&mut Vec<CertExtension>),
+    ) -> MatterCert {
+        let mut c = cert.clone();
+        f(&mut c.extensions);
+        let tbs = c.tbs_der().unwrap();
+        c.signature = crate::crypto::sign_ecdsa_p256(signer_key, &tbs).unwrap();
+        c
+    }
+
+    #[test]
+    fn rejects_forged_chain_with_noc_as_icac() {
+        // 監査 Tier1① の攻撃再現: fabric 内ノード A が自分の NOC_A を ICAC に
+        // 仕立て、A の運用鍵で偽 NOC_X（subject=node X, issuer=NOC_A.subject）を
+        // 発行して積む。CA 制約検査が無いと署名・DN・fabric-id 全てを通過する。
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let (rcac, _root_key, noc_a, a_op_priv) = fresh_chain();
+        let x = crate::case::random_p256_secret();
+        let x_pub: [u8; 65] = x
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        // issue_noc は issuer の subject を偽 NOC の issuer に写すので、
+        // NOC_A を「発行者」に渡すだけで攻撃チェーンが組み上がる。
+        let fake_noc = issue_noc(&x_pub, 0xBEEF, 0xFAB1, &noc_a, &a_op_priv, &[7]).unwrap();
+        let err = verify_noc_chain(&fake_noc, Some(&noc_a), &rcac).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("icac cA basic-constraint")
+        ));
+    }
+
+    #[test]
+    fn rejects_rcac_without_ca_constraints() {
+        let (rcac, root_key, noc, _) = fresh_chain();
+
+        // cA=false の RCAC（noc の署名は rcac 鍵のままなので CA 検査だけで落ちる）
+        let not_ca = mutate_and_resign(&rcac, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::BasicConstraints { is_ca, .. } = e {
+                    *is_ca = false;
+                }
+            }
+        });
+        let err = verify_noc_chain(&noc, None, &not_ca).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("rcac cA basic-constraint")
+        ));
+
+        // keyCertSign を落とした RCAC
+        let no_sign = mutate_and_resign(&rcac, &root_key, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::KeyUsage(bits) = e {
+                    *bits = KEY_USAGE_CRL_SIGN;
+                }
+            }
+        });
+        let err = verify_noc_chain(&noc, None, &no_sign).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("rcac keyCertSign key-usage")
+        ));
+
+        // basicConstraints 拡張ごと欠落も拒否（fail-closed）
+        let bc_missing = mutate_and_resign(&rcac, &root_key, |exts| {
+            exts.retain(|e| !matches!(e, CertExtension::BasicConstraints { .. }));
+        });
+        let err = verify_noc_chain(&noc, None, &bc_missing).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("rcac cA basic-constraint")
+        ));
+    }
+
+    #[test]
+    fn rejects_icac_constraint_violations() {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let ica = MatterCert::parse(ICA_CHIP).unwrap();
+        let node = MatterCert::parse(NODE_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+
+        // cA=false の ICAC
+        let not_ca = mutate_and_resign(&ica, &root_priv, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::BasicConstraints { is_ca, .. } = e {
+                    *is_ca = false;
+                }
+            }
+        });
+        let err = verify_noc_chain(&node, Some(&not_ca), &root).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("icac cA basic-constraint")
+        ));
+
+        // keyCertSign を落とした ICAC
+        let no_sign = mutate_and_resign(&ica, &root_priv, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::KeyUsage(bits) = e {
+                    *bits = KEY_USAGE_CRL_SIGN;
+                }
+            }
+        });
+        let err = verify_noc_chain(&node, Some(&no_sign), &root).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("icac keyCertSign key-usage")
+        ));
+
+        // pathLen=1 の ICAC（Matter プロファイル: 存在するなら 0 のみ）
+        let deep = mutate_and_resign(&ica, &root_priv, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::BasicConstraints { path_len, .. } = e {
+                    *path_len = Some(1);
+                }
+            }
+        });
+        let err = verify_noc_chain(&node, Some(&deep), &root).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("icac path-len (must be 0)")
+        ));
+
+        // RCAC pathLen=0 なのに ICAC 付きチェーン（RFC 5280 §6.1.4(m)）
+        let shallow_root = mutate_and_resign(&root, &root_priv, |exts| {
+            for e in exts.iter_mut() {
+                if let CertExtension::BasicConstraints { path_len, .. } = e {
+                    *path_len = Some(0);
+                }
+            }
+        });
+        let err = verify_noc_chain(&node, Some(&ica), &shallow_root).unwrap_err();
+        assert!(matches!(
+            err,
+            CertError::Malformed("rcac path-len (0 forbids an icac)")
+        ));
+
+        // pathLen=0 自体は 2-cert チェーンでは合法
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let direct = issue_noc(&op_pub, 0x1B669, 1, &shallow_root, &root_priv, &[9]).unwrap();
+        verify_noc_chain(&direct, None, &shallow_root).unwrap();
     }
 }
