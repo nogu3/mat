@@ -22,6 +22,8 @@ Environment variables:
 | `MAT_STORE` | credential store path (see the resolution order in [Configuration](configuration.md#credential-store)) |
 | `MAT_IFACE` | override interface autodetect for `mat`'s direct path |
 | `MAT_MATD_IFACE` | override interface autodetect for `matd` |
+| `MAT_THREAD_IFACE` | override Thread TUN interface autodetect for `mat`'s groupcast egress; unset = auto-select if exactly one multicast-capable `wpan*` iface is up, else LAN-only — see [Groupcast egress](commands.md#groupcast-egress-lan--thread-tun) |
+| `MAT_MATD_THREAD_IFACE` | same, for `matd` |
 | `MAT_FABRIC_INDEX` / `MAT_ISSUER_INDEX` | `mat` KVS fabric-table / CA-issuer index (default `1` / `0`) |
 | `MAT_MATD_FABRIC_INDEX` / `MAT_MATD_ISSUER_INDEX` | same for `matd` |
 | `MAT_MATD` / `MAT_MATD_SOCKET` | force / opt out of the matd path; pin its socket |

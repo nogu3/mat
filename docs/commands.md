@@ -1028,7 +1028,8 @@ Groupcast is sent on the operational interface (the same one mDNS uses), and
 injection, no dependency on another border router's multicast relay). The
 Thread interface is picked once at startup: `--thread-iface` /
 `MAT_THREAD_IFACE` (`MAT_MATD_THREAD_IFACE` for `matd`) wins; otherwise, if
-exactly one `wpan*` interface is up it is auto-selected; otherwise groupcast
+exactly one multicast-capable `wpan*` interface is up it is auto-selected;
+otherwise groupcast
 stays LAN-only (previous behavior). An explicitly configured interface that
 fails to resolve is a hard error on `mat`'s one-shot direct path; for `matd`
 it starts up regardless, but every op then fails with that error — it does
