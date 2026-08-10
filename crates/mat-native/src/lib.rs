@@ -239,26 +239,37 @@ const RESOLVE_TIMEOUT: Duration = dnssd::OPERATIONAL_RESOLVE_TIMEOUT;
 /// 戻り: `Ok(Some(name, scope_id))` = 第 2 egress を張る、`Ok(None)` = LAN
 /// 単独、`Err(detail)` = ハードエラー（明示指定の解決失敗のみ — 自動検出の
 /// 解決失敗は warn+劣化続行で `Ok(None)` に写像する、spec 設計 3）。
+///
+/// `op_iface`（`cfg.iface`、運用 iface）と thread iface 名が一致する場合は
+/// 解決すら試みず `Ok(None)`（info ログのみ）— `MAT_IFACE=wpan0` かつ
+/// wpan0 自動検出のように同一 iface へ二重に egress を張ってしまう構成の
+/// 回避（監査 Minor-1）。explicit / auto どちらの由来でも同じ規律（同一
+/// iface への二重送出は単に無駄で、ハードエラーにする理由がない）。
 fn thread_egress_decision(
+    op_iface: &str,
     choice: &Option<ThreadIfaceChoice>,
     resolve: impl Fn(&str) -> Result<u32, String>,
 ) -> Result<Option<(String, u32)>, String> {
-    match choice {
-        None => Ok(None),
-        Some(ThreadIfaceChoice::Explicit(name)) => match resolve(name) {
-            Ok(idx) => Ok(Some((name.clone(), idx))),
-            Err(e) => Err(format!(
-                "native: resolve thread iface {name:?} index: {e} (explicit MAT_THREAD_IFACE must resolve)"
-            )),
-        },
-        Some(ThreadIfaceChoice::Auto(name)) => match resolve(name) {
-            Ok(idx) => Ok(Some((name.clone(), idx))),
-            Err(e) => {
-                tracing::warn!(iface = %name, error = %e,
-                    "thread iface auto-detected but unresolvable; groupcast stays LAN-only");
-                Ok(None)
-            }
-        },
+    let (name, explicit) = match choice {
+        None => return Ok(None),
+        Some(ThreadIfaceChoice::Explicit(name)) => (name, true),
+        Some(ThreadIfaceChoice::Auto(name)) => (name, false),
+    };
+    if name == op_iface {
+        tracing::info!(iface = %name,
+            "thread iface matches operating iface; skipping duplicate groupcast egress");
+        return Ok(None);
+    }
+    match resolve(name) {
+        Ok(idx) => Ok(Some((name.clone(), idx))),
+        Err(e) if explicit => Err(format!(
+            "native: resolve thread iface {name:?} index: {e} (explicit MAT_THREAD_IFACE must resolve)"
+        )),
+        Err(e) => {
+            tracing::warn!(iface = %name, error = %e,
+                "thread iface auto-detected but unresolvable; groupcast stays LAN-only");
+            Ok(None)
+        }
     }
 }
 
@@ -399,7 +410,7 @@ impl Engine {
             transport: Arc::clone(&transport),
             scope_id,
         }];
-        match thread_egress_decision(&cfg.thread_iface, |n| {
+        match thread_egress_decision(&cfg.iface, &cfg.thread_iface, |n| {
             mat_controller::dnssd::iface_index(n).map_err(|e| e.to_string())
         }) {
             Ok(Some((name, tsid))) => {
@@ -813,29 +824,63 @@ mod tests {
 
     #[test]
     fn thread_egress_explicit_failure_is_hard_error() {
-        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Explicit("wpan9".into())), |_| {
-            Err("no such iface".into())
-        });
+        let r = thread_egress_decision(
+            "eth0",
+            &Some(ThreadIfaceChoice::Explicit("wpan9".into())),
+            |_| Err("no such iface".into()),
+        );
         assert!(r.is_err());
     }
 
     #[test]
     fn thread_egress_auto_failure_degrades_to_lan_only() {
-        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Auto("wpan0".into())), |_| {
-            Err("no such iface".into())
-        });
+        let r = thread_egress_decision(
+            "eth0",
+            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
+            |_| Err("no such iface".into()),
+        );
         assert_eq!(r.unwrap(), None);
     }
 
     #[test]
     fn thread_egress_resolved_returns_scope() {
-        let r = thread_egress_decision(&Some(ThreadIfaceChoice::Auto("wpan0".into())), |_| Ok(7));
+        let r = thread_egress_decision(
+            "eth0",
+            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
+            |_| Ok(7),
+        );
         assert_eq!(r.unwrap(), Some(("wpan0".into(), 7)));
     }
 
     #[test]
     fn thread_egress_none_is_lan_only() {
-        let r = thread_egress_decision(&None, |_| unreachable!());
+        let r = thread_egress_decision("eth0", &None, |_| unreachable!());
+        assert_eq!(r.unwrap(), None);
+    }
+
+    /// 監査 Minor-1: 運用 iface（`cfg.iface`）と thread iface が同名なら
+    /// `resolve` すら呼ばず第 2 egress を張らない（`MAT_IFACE=wpan0` +
+    /// wpan0 自動検出の同一 iface 二重送出を回避）。`resolve` を
+    /// `unreachable!()` にして「呼ばれないこと」自体を固定する。
+    #[test]
+    fn thread_egress_same_as_op_iface_is_skipped_without_resolving_auto() {
+        let r = thread_egress_decision(
+            "wpan0",
+            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
+            |_| unreachable!("resolve must not be called when thread iface == op iface"),
+        );
+        assert_eq!(r.unwrap(), None);
+    }
+
+    /// 同上、explicit 指定でも同じ規律（同一 iface はハードエラーにせず
+    /// 単に第 2 egress を張らない）。
+    #[test]
+    fn thread_egress_same_as_op_iface_is_skipped_without_resolving_explicit() {
+        let r = thread_egress_decision(
+            "wpan0",
+            &Some(ThreadIfaceChoice::Explicit("wpan0".into())),
+            |_| unreachable!("resolve must not be called when thread iface == op iface"),
+        );
         assert_eq!(r.unwrap(), None);
     }
 

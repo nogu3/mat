@@ -217,6 +217,15 @@ impl GroupSender {
     /// entry; the first is the operating iface (previous single-egress
     /// behavior), later entries (e.g. a Thread TUN) receive the same
     /// datagram in addition.
+    ///
+    /// per-egress setsockopt 失敗の扱い（監査 I-1）: `new()` はどの egress が
+    /// explicit 指定でどれが auto 検出由来かを知らない（そこは呼び出し側 —
+    /// `mat-native::Engine::build` — の責務で、explicit 指定の thread iface の
+    /// 解決/bind 失敗は build 側で既にハードエラー化されている）。ここでは
+    /// 由来を問わず一律「setsockopt に失敗した egress は warn ログを出して
+    /// スキップ（脱落）」とし、生存 egress が 1 本でも残れば `Ok` で継続する。
+    /// 単一 egress 構成（従来）で失敗すれば生存ゼロになるので従来どおり
+    /// `Err`（絶対互換）。全 egress が失敗した場合も `Err`。
     pub fn new(
         egress: Vec<GroupEgress>,
         dest_port: u16,
@@ -230,12 +239,27 @@ impl GroupSender {
         // tailscale0 へ流出 → LAN に出ず 0/7 不達）。IPV6_MULTICAST_IF で明示
         // 固定する。multicast 送信専用オプションなので共有 socket の unicast
         // には影響しない）。
-        for e in &egress {
-            e.transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
-            e.transport.set_multicast_if_v6(e.scope_id)?;
+        let mut survivors = Vec::with_capacity(egress.len());
+        let mut last_err: Option<std::io::Error> = None;
+        for e in egress {
+            let result = e
+                .transport
+                .set_multicast_hops_v6(MULTICAST_HOP_LIMIT)
+                .and_then(|()| e.transport.set_multicast_if_v6(e.scope_id));
+            match result {
+                Ok(()) => survivors.push(e),
+                Err(err) => {
+                    tracing::warn!(iface = %e.iface, error = %err,
+                        "groupcast egress multicast socket option setup failed; dropping this egress");
+                    last_err = Some(err);
+                }
+            }
+        }
+        if survivors.is_empty() {
+            return Err(last_err.unwrap_or_else(|| std::io::Error::other("no egress configured")));
         }
         Ok(Self {
-            egress,
+            egress: survivors,
             dest_port,
             fabric_id,
             source_node_id,
@@ -706,5 +730,133 @@ mod tests {
              datagrams (lo excluded — it lacks IFF_MULTICAST on Linux); \
              tried: {tried:?}"
         );
+    }
+
+    /// 監査 I-1 の中核: egress 2 本のうち 1 本が setsockopt に失敗しても
+    /// `GroupSender::new` は Err にならず、生存 egress だけで送信を継続する
+    /// （その egress の scope_id への setsockopt 失敗を「不正 ifindex」で
+    /// シミュレートする — 例えば otbr-agent 再起動で wpan0 の ifindex が
+    /// stale 化した状況に相当）。不正 ifindex への setsockopt が本当に失敗
+    /// する保証は環境依存（コンテナ等ではカーネルが緩い場合がある）ため、
+    /// 各候補で先に「本当に失敗するか」を確認し、失敗しない環境ではその
+    /// 候補をスキップして次を試す。どの候補でも固定できなければ確認不能
+    /// として（panic せず）ログのみ残す。
+    #[tokio::test]
+    async fn new_drops_failing_egress_and_send_invoke_reports_survivors_only() {
+        use crate::transport::UdpTransport;
+
+        let addr = group_multicast_addr(1, 10);
+        let mut tried = Vec::new();
+        const BOGUS_SCOPE_ID: u32 = 0x7fff_fffe;
+
+        for cand in multicast_capable_interfaces() {
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            if recv.join_multicast_v6(&addr, cand.index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+                continue;
+            }
+            let port = recv.local_addr().unwrap().port();
+
+            let bad_transport = Arc::new(UdpTransport::bind().await.unwrap());
+            if bad_transport.set_multicast_if_v6(BOGUS_SCOPE_ID).is_ok() {
+                // この環境は bogus ifindex への setsockopt を許してしまう —
+                // 失敗を再現できないので次候補へ（skip、fail 扱いにしない）。
+                tried.push(format!(
+                    "{}(idx={}): bogus scope_id {BOGUS_SCOPE_ID} accepted by this \
+                     environment, cannot exercise the failure path",
+                    cand.name, cand.index
+                ));
+                continue;
+            }
+
+            let good = GroupEgress {
+                iface: "egress-good".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: cand.index,
+            };
+            let bad = GroupEgress {
+                iface: "egress-bad".into(),
+                transport: bad_transport,
+                scope_id: BOGUS_SCOPE_ID,
+            };
+
+            let p = tmp_counter_path(&format!("bad-egress-drop-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let mut s = GroupSender::new(vec![good, bad], port, 1, 0x0001_0001, counter)
+                .expect("生存 egress が1本ある限り Ok（監査 I-1）");
+            assert_eq!(
+                s.egress.len(),
+                1,
+                "setsockopt に失敗した egress は脱落しているはず"
+            );
+            assert_eq!(s.egress[0].iface, "egress-good");
+
+            let creds = test_creds();
+            let (_, sent) = match s.send_invoke(&creds, 10, 6, 1, None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue;
+                }
+            };
+            assert_eq!(
+                sent,
+                vec!["egress-good".to_string()],
+                "sent には生存 egress 名だけが入る"
+            );
+
+            let mut buf = [0u8; 1280];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            let _ = std::fs::remove_file(&p);
+            match result {
+                Ok(Ok(_)) => return, // 配達確認まで取れた時点で PASS。
+                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+            }
+        }
+        eprintln!(
+            "no candidate could exercise the bad-egress-drop path in this environment \
+             (skip, not a failure); tried: {tried:?}"
+        );
+    }
+
+    /// 監査 I-1: 全 egress の setsockopt が失敗する場合は従来どおり `Err`
+    /// のまま（単一 egress 構成の絶対互換維持）。
+    #[tokio::test]
+    async fn new_returns_err_when_all_egress_fail() {
+        use crate::transport::UdpTransport;
+        const BOGUS_SCOPE_ID: u32 = 0x7fff_fffe;
+
+        let transport = Arc::new(UdpTransport::bind().await.unwrap());
+        if transport.set_multicast_if_v6(BOGUS_SCOPE_ID).is_ok() {
+            eprintln!(
+                "environment accepts bogus scope_id {BOGUS_SCOPE_ID}; cannot exercise \
+                 the all-fail path, skipping"
+            );
+            return;
+        }
+
+        let egress = vec![GroupEgress {
+            iface: "egress-bad".into(),
+            transport,
+            scope_id: BOGUS_SCOPE_ID,
+        }];
+        let p = tmp_counter_path("all-egress-fail");
+        let _ = std::fs::remove_file(&p);
+        let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+        let result = GroupSender::new(egress, 5540, 1, 1, counter);
+        assert!(
+            result.is_err(),
+            "全 egress が setsockopt 失敗なら Err のまま（後方互換）"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 }
