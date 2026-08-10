@@ -43,6 +43,11 @@ struct Cli {
     #[arg(long, env = "MAT_MATD_IFACE")]
     iface: Option<String>,
 
+    /// groupcast を追加送出する Thread TUN の iface 名（例: wpan0)。未設定なら
+    /// `wpan*` がちょうど 1 本あるとき自動採用。明示指定の解決失敗は起動拒否。
+    #[arg(long, env = "MAT_MATD_THREAD_IFACE")]
+    thread_iface: Option<String>,
+
     /// KVS fabric テーブルの index（jarvis 本番は 2、alpha は 1）。
     #[arg(long, env = "MAT_MATD_FABRIC_INDEX", default_value_t = 1)]
     fabric_index: u8,
@@ -154,13 +159,25 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         },
     };
 
+    // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
+    // 自動検出（失敗は None のまま — LAN 単独送出。mat 本体 main.rs と同じ流儀）。
+    let thread_iface = match &cli.thread_iface {
+        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
+        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
+            tracing::info!(iface = %n, "thread iface auto-detected (matd groupcast egress)");
+            mat_native::ThreadIfaceChoice::Auto(n)
+        }),
+    };
+
     // native 構築失敗（KVS 資材が読めない等）は致命にしない。matd は起動を続け、
     // 以後の全リクエストへこの構築エラーをそのまま返す（M8c-3: chip-tool
-    // フォールバックが撤去されたため、per-op ハードエラーで運転する）。
+    // フォールバックが撤去されたため、per-op ハードエラーで運転する）。thread_iface
+    // 明示指定の解決失敗（Engine::build がハードエラーを返す、Task 3）もこの
+    // 既存の分岐に合流する — 追加コードは不要（Step 2 確認事項、詳細は下記）。
     let cfg = matd::native::NativeConfig {
         store: store_path.clone(),
         iface: iface.clone(),
-        thread_iface: None,
+        thread_iface: thread_iface.clone(),
         fabric_index: cli.fabric_index,
         issuer_index: cli.issuer_index,
     };
@@ -186,7 +203,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
 
     let native = match matd::native::NativeBackend::build_with_resolver(&cfg, resolver).await {
         Ok(b) => {
-            tracing::info!(%iface, fabric_index = cli.fabric_index, "native backend enabled");
+            tracing::info!(%iface, thread_iface = ?thread_iface, fabric_index = cli.fabric_index, "native backend enabled");
             server::NativeState::Ready(Box::new(b))
         }
         Err(mut e) => {
