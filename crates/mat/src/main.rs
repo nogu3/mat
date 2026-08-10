@@ -140,8 +140,18 @@ fn main() -> ExitCode {
             }
         },
     };
+    // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
+    // 自動検出（失敗は warn のみ — LAN 単独送出にフォールバック、spec 設計 3）。
+    let thread_iface: Option<mat_native::ThreadIfaceChoice> = match &args.thread_iface {
+        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
+        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
+            tracing::info!(iface = %n, "thread iface auto-detected (groupcast egress)");
+            mat_native::ThreadIfaceChoice::Auto(n)
+        }),
+    };
     let native_cfg = Some(native_direct::Config {
         iface: &iface_owned,
+        thread_iface,
         fabric_index: args.fabric_index,
         issuer_index: args.issuer_index,
     });

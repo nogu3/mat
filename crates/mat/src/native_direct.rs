@@ -26,6 +26,7 @@ use crate::cli::{Command, DiagCommand, GroupCommand};
 
 pub(crate) struct Config<'a> {
     pub iface: &'a str,
+    pub thread_iface: Option<mat_native::ThreadIfaceChoice>,
     pub fabric_index: u8,
     pub issuer_index: u8,
 }
@@ -756,7 +757,7 @@ fn execute(
         let native_cfg = NativeConfig {
             store: store.root().to_path_buf(),
             iface: cfg.iface.to_string(),
-            thread_iface: None,
+            thread_iface: cfg.thread_iface.clone(),
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -1612,7 +1613,7 @@ pub(crate) fn diag_im_probe(
         let native_cfg = NativeConfig {
             store: store_root.to_path_buf(),
             iface: cfg.iface.to_string(),
-            thread_iface: None,
+            thread_iface: cfg.thread_iface.clone(),
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -1698,7 +1699,7 @@ pub(crate) fn diag_mesh_probe(
         let native_cfg = NativeConfig {
             store: store_root.to_path_buf(),
             iface: cfg.iface.to_string(),
-            thread_iface: None,
+            thread_iface: cfg.thread_iface.clone(),
             fabric_index: cfg.fabric_index,
             issuer_index: cfg.issuer_index,
         };
@@ -2322,6 +2323,7 @@ mod tests {
         };
         let cfg = Config {
             iface: "lo",
+            thread_iface: None,
             fabric_index: 1,
             issuer_index: 0,
         };

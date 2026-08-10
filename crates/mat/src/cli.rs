@@ -44,6 +44,12 @@ pub struct Cli {
     #[arg(long, global = true, env = "MAT_IFACE", value_name = "IFACE")]
     pub iface: Option<String>,
 
+    /// groupcast を追加送出する Thread TUN の iface 名（例: wpan0）。未設定なら
+    /// `wpan*` がちょうど 1 本あるとき自動採用。明示指定の解決失敗はハード
+    /// エラー、自動検出の失敗は warn + LAN 単独送出（spec 設計 3）。
+    #[arg(long, global = true, env = "MAT_THREAD_IFACE", value_name = "IFACE")]
+    pub thread_iface: Option<String>,
+
     /// native 直経路が読む KVS fabric テーブルの index。
     #[arg(
         long,
