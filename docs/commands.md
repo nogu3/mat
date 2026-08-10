@@ -1021,6 +1021,23 @@ life of the process.
   route priority already sends every group op to it first, so you normally never
   reach for `MAT_MATD=0`.
 
+#### Groupcast egress (LAN + Thread TUN)
+
+Groupcast is sent on the operational interface (the same one mDNS uses), and
+— when a Thread TUN is available — **also directly on that interface** (MPL
+injection, no dependency on another border router's multicast relay). The
+Thread interface is picked once at startup: `--thread-iface` /
+`MAT_THREAD_IFACE` (`MAT_MATD_THREAD_IFACE` for `matd`) wins; otherwise, if
+exactly one `wpan*` interface is up it is auto-selected; otherwise groupcast
+stays LAN-only (previous behavior). An explicitly configured interface that
+fails to resolve is a hard error on `mat`'s one-shot direct path; for `matd`
+it starts up regardless, but every op then fails with that error — it does
+not silently degrade. An auto-detected interface that fails to resolve
+instead degrades to LAN-only with a warning. The same
+datagram (same counter) goes out on every egress — receivers drop the
+duplicate via replay protection. The result JSON reports the interfaces
+actually used: `"egress": ["eth0", "wpan0"]`.
+
 #### Ops that never route through `matd`
 
 `discover`, `commission`, `fabric init`, `open-window`, `diag thread` / `diag

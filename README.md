@@ -65,7 +65,10 @@ Errors are structured the same way (stderr, stable `kind` + exit code — see
   controller is needed — the backend is native and pure Rust.
 - Matter uses mDNS / IPv6 multicast, so on a real network the host must be able
   to send and receive these. `mat` auto-detects the network interface (override
-  with `MAT_IFACE`; see [Backend](./docs/backend.md)).
+  with `MAT_IFACE`; see [Backend](./docs/backend.md)). Groupcast also sends
+  directly on a Thread TUN interface when one is available, in addition to the
+  LAN path (override with `MAT_THREAD_IFACE`; see [Groupcast
+  egress](./docs/commands.md#groupcast-egress-lan--thread-tun)).
 - BLE commissioning (BLE+Thread) is an opt-in `ble` cargo feature (pulls in
   `libdbus`); the default build and local `task check` do not need it. Deploy
   builds enable it — see [Backend](./docs/backend.md).
