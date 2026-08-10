@@ -43,8 +43,9 @@ struct Cli {
     #[arg(long, env = "MAT_MATD_IFACE")]
     iface: Option<String>,
 
-    /// groupcast を追加送出する Thread TUN の iface 名（例: wpan0)。未設定なら
-    /// `wpan*` がちょうど 1 本あるとき自動採用。明示指定の解決失敗は起動拒否。
+    /// groupcast を追加送出する Thread TUN の iface 名（例: wpan0）。未設定なら
+    /// `wpan*` がちょうど 1 本あるとき自動採用。明示指定の解決失敗は以後の
+    /// 全 op がエラーになる（matd status で確認可。起動そのものは拒否しない）。
     #[arg(long, env = "MAT_MATD_THREAD_IFACE")]
     thread_iface: Option<String>,
 

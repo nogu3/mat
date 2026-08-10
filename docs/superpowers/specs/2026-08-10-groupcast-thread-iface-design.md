@@ -48,7 +48,9 @@ counter 永続化・`bump` は無変更。
 ### 3. 失敗時の規律（既存の設定思想と同じ）
 
 - **明示指定**の thread iface が解決・bind できない → ハードエラー
-  （matd は起動拒否）。明示設定は黙って劣化しない。
+  （`mat` 直経路は起動拒否。`matd` は M8c-3 の既存 native 構築失敗ハンドリング
+  に合流し、起動は継続するが以後の全 op がこのエラーを返す — silent degrade
+  はしない・`matd status` で可視）。明示設定は黙って劣化しない。
 - **自動検出**の thread iface が bind できない → warn ログ + LAN 単独で続行
   （auto は best-effort、absent = 挙動不変の既存規律）。
 - 送出時に片方の sendto が失敗 → 他方が出せていれば `"sent"`（warn ログ）。
