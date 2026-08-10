@@ -614,14 +614,14 @@ async fn run_op(
 
     if let Some(result) = native_group_params(op) {
         return match result {
-            Ok((group_id, cluster, command, fields, sent_body)) => {
+            Ok((group_id, cluster, command, fields, build_body)) => {
                 // chip-tool 撤去前と同じ前提チェック（store が開けること）。
                 let _store = Store::open(store_path)?;
                 match native
                     .group_invoke(group_id, cluster, command, fields)
                     .await?
                 {
-                    crate::native::GroupOutcome::Sent { .. } => Ok(sent_body),
+                    crate::native::GroupOutcome::Sent { egress } => Ok(build_body(&egress)),
                     crate::native::GroupOutcome::Unavailable(reason) => {
                         Err(group_unavailable_error(&reason))
                     }
@@ -790,10 +790,17 @@ pub(crate) fn note_op_expectation(op: &Op, health: &SubHealth) {
     }
 }
 
+/// 成功 body ビルダー。`egress`(実送信後にしか判らない iface 名の配列)を
+/// 受けて sent body を組む(`Box<dyn FnOnce>` を裸で使うと clippy
+/// `type_complexity` に触れるため alias 化)。
+type SentBodyBuilder = Box<dyn FnOnce(&[String]) -> Value + Send>;
+
 /// `native_group_params` の Ok 内訳: (group_id, cluster_id, command_id, fields_tlv,
-/// 成功時 sent body)。body は op 変種が確定しているここで組む(旧 `group_sent_body`
-/// の `let … else unreachable!` を型で排除)。
-type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>, Value);
+/// 成功時 sent body ビルダー)。body の固定部は op 変種が確定しているここで
+/// 決める(旧 `group_sent_body` の `let … else unreachable!` を型で排除)が、
+/// `egress` は実送信(`group_invoke`)後にしか判らないため、body 生成はクロージャ
+/// で遅延する。
+type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>, SentBodyBuilder);
 
 /// group 送信 op の native 適用判定。`GroupInvoke` の cluster/command/引数は
 /// mat-core::ids の `classify_invoke` に通す（onoff 限定を撤廃 — M8a
@@ -826,9 +833,16 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                 } else {
                     Some(mat_native::encode_command_fields(&fields))
                 };
-                let sent_body =
-                    mat_core::body::group_invoke_sent(*group_id, cluster, command, *endpoint);
-                Some(Ok((*group_id, cluster_id, cmd_id, fields_tlv, sent_body)))
+                let group_id_v = *group_id;
+                let cluster = cluster.clone();
+                let command = command.clone();
+                let endpoint_v = *endpoint;
+                let build_body: SentBodyBuilder = Box::new(move |egress| {
+                    mat_core::body::group_invoke_sent(
+                        group_id_v, &cluster, &command, endpoint_v, egress,
+                    )
+                });
+                Some(Ok((*group_id, cluster_id, cmd_id, fields_tlv, build_body)))
             }
         },
         Op::GroupColorTemp {
@@ -837,43 +851,50 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
             kelvin,
             transition,
             endpoint,
-        } => Some(Ok((
-            *group_id,
-            im::CLUSTER_COLOR_CONTROL,
-            im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-            Some(im::encode_move_to_color_temperature_fields(
-                *mireds,
-                *transition,
-            )),
-            mat_core::body::group_color_temp_sent(
-                *group_id,
-                *kelvin,
-                *mireds,
-                *transition,
-                *endpoint,
-            ),
-        ))),
+        } => {
+            let (group_id, mireds, kelvin, transition, endpoint) =
+                (*group_id, *mireds, *kelvin, *transition, *endpoint);
+            let build_body: SentBodyBuilder = Box::new(move |egress| {
+                mat_core::body::group_color_temp_sent(
+                    group_id, kelvin, mireds, transition, endpoint, egress,
+                )
+            });
+            Some(Ok((
+                group_id,
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+                Some(im::encode_move_to_color_temperature_fields(
+                    mireds, transition,
+                )),
+                build_body,
+            )))
+        }
         Op::GroupLevel {
             group_id,
             level,
             percent,
             transition,
             endpoint,
-        } => Some(Ok((
-            *group_id,
-            im::CLUSTER_LEVEL_CONTROL,
-            im::CMD_MOVE_TO_LEVEL,
-            Some(im::encode_move_to_level_fields(*level, *transition)),
-            mat_core::body::group_level_sent(
-                *group_id,
-                mat_core::body::LevelEcho {
-                    percent: *percent,
-                    level: *level,
-                },
-                *transition,
-                *endpoint,
-            ),
-        ))),
+        } => {
+            let (group_id, level, percent, transition, endpoint) =
+                (*group_id, *level, *percent, *transition, *endpoint);
+            let build_body: SentBodyBuilder = Box::new(move |egress| {
+                mat_core::body::group_level_sent(
+                    group_id,
+                    mat_core::body::LevelEcho { percent, level },
+                    transition,
+                    endpoint,
+                    egress,
+                )
+            });
+            Some(Ok((
+                group_id,
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL,
+                Some(im::encode_move_to_level_fields(level, transition)),
+                build_body,
+            )))
+        }
         Op::GroupColor {
             group_id,
             hue_raw,
@@ -893,6 +914,18 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                 name: name.clone(),
                 rgb: rgb.clone(),
             };
+            let group_id_v = *group_id;
+            let transition_v = *transition;
+            let endpoint_v = *endpoint;
+            let build_body: SentBodyBuilder = Box::new(move |egress| {
+                mat_core::body::group_color_sent(
+                    group_id_v,
+                    &color,
+                    transition_v,
+                    endpoint_v,
+                    egress,
+                )
+            });
             Some(Ok((
                 *group_id,
                 im::CLUSTER_COLOR_CONTROL,
@@ -902,7 +935,7 @@ fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
                     *saturation_raw,
                     *transition,
                 )),
-                mat_core::body::group_color_sent(*group_id, &color, *transition, *endpoint),
+                build_body,
             )))
         }
         _ => None,
@@ -1508,7 +1541,12 @@ mod tests {
             args: vec!["1".into()],
             endpoint: 1,
         };
-        let err = native_group_params(&with_args).unwrap().unwrap_err();
+        // build_body ビルダーが `Debug` を実装しないため unwrap_err は使えない
+        // （T: Debug 境界）— match で明示的に取り出す。
+        let err = match native_group_params(&with_args).unwrap() {
+            Err(e) => e,
+            Ok(_) => panic!("expected parse_error for over-argumented onoff on"),
+        };
         assert_eq!(err.kind, ErrorKind::ParseError);
 
         // onoff 以外の cluster も、名前解決できれば native 対象（onoff 限定は

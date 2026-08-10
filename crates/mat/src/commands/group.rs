@@ -46,9 +46,15 @@ pub(crate) fn emit_provision_success(
 }
 
 /// `invoke` の出力部（body は `mat_core::body` 共有）。
-pub(crate) fn emit_invoke_sent(group_id: u16, cluster: &str, command: &str, endpoint: u16) {
+pub(crate) fn emit_invoke_sent(
+    group_id: u16,
+    cluster: &str,
+    command: &str,
+    endpoint: u16,
+    egress: &[String],
+) {
     output::emit(body::group_invoke_sent(
-        group_id, cluster, command, endpoint,
+        group_id, cluster, command, endpoint, egress,
     ));
 }
 
@@ -58,31 +64,36 @@ pub(crate) fn emit_bump(from: u32, to: u32) {
 }
 
 /// `color_temp` の出力部（body は `mat_core::body` 共有）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_color_temp_sent(
     group_id: u16,
     kelvin: u32,
     mireds: u16,
     transition: u16,
     endpoint: u16,
+    egress: &[String],
 ) {
     output::emit(body::group_color_temp_sent(
-        group_id, kelvin, mireds, transition, endpoint,
+        group_id, kelvin, mireds, transition, endpoint, egress,
     ));
 }
 
 /// `level` の出力部（body は `mat_core::body` 共有）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_level_sent(
     group_id: u16,
     percent: u8,
     level: u8,
     transition: u16,
     endpoint: u16,
+    egress: &[String],
 ) {
     output::emit(body::group_level_sent(
         group_id,
         body::LevelEcho { percent, level },
         transition,
         endpoint,
+        egress,
     ));
 }
 
@@ -92,9 +103,10 @@ pub(crate) fn emit_color_sent(
     color: &ResolvedColor,
     transition: u16,
     endpoint: u16,
+    egress: &[String],
 ) {
     output::emit(body::group_color_sent(
-        group_id, color, transition, endpoint,
+        group_id, color, transition, endpoint, egress,
     ));
 }
 

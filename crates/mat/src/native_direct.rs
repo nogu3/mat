@@ -1008,8 +1008,8 @@ async fn op_group_onoff(
         return Err(group_ctx_unconfigured_error());
     };
     match mat_native::group::send(ctx, group_id, im::CLUSTER_ON_OFF, command_id, None).await? {
-        GroupOutcome::Sent { .. } => {
-            crate::commands::group::emit_invoke_sent(group_id, "onoff", command, endpoint);
+        GroupOutcome::Sent { egress } => {
+            crate::commands::group::emit_invoke_sent(group_id, "onoff", command, endpoint, &egress);
         }
         GroupOutcome::Unavailable(reason) => {
             return Err(group_unavailable_error(&reason));
@@ -1039,8 +1039,8 @@ async fn op_group_color(
     )
     .await?
     {
-        GroupOutcome::Sent { .. } => {
-            crate::commands::group::emit_color_sent(group_id, color, transition, endpoint);
+        GroupOutcome::Sent { egress } => {
+            crate::commands::group::emit_color_sent(group_id, color, transition, endpoint, &egress);
         }
         GroupOutcome::Unavailable(reason) => {
             return Err(group_unavailable_error(&reason));
@@ -1070,9 +1070,9 @@ async fn op_group_color_temp(
     )
     .await?
     {
-        GroupOutcome::Sent { .. } => {
+        GroupOutcome::Sent { egress } => {
             crate::commands::group::emit_color_temp_sent(
-                group_id, kelvin, mireds, transition, endpoint,
+                group_id, kelvin, mireds, transition, endpoint, &egress,
             );
         }
         GroupOutcome::Unavailable(reason) => {
@@ -1103,8 +1103,10 @@ async fn op_group_level(
     )
     .await?
     {
-        GroupOutcome::Sent { .. } => {
-            crate::commands::group::emit_level_sent(group_id, percent, level, transition, endpoint);
+        GroupOutcome::Sent { egress } => {
+            crate::commands::group::emit_level_sent(
+                group_id, percent, level, transition, endpoint, &egress,
+            );
         }
         GroupOutcome::Unavailable(reason) => {
             return Err(group_unavailable_error(&reason));
@@ -1128,8 +1130,10 @@ async fn op_group_invoke_generic(
         return Err(group_ctx_unconfigured_error());
     };
     match mat_native::group::send(ctx, group_id, cluster, command, fields_tlv.clone()).await? {
-        GroupOutcome::Sent { .. } => {
-            crate::commands::group::emit_invoke_sent(group_id, cluster_in, command_in, endpoint);
+        GroupOutcome::Sent { egress } => {
+            crate::commands::group::emit_invoke_sent(
+                group_id, cluster_in, command_in, endpoint, &egress,
+            );
         }
         GroupOutcome::Unavailable(reason) => {
             return Err(group_unavailable_error(&reason));

@@ -143,14 +143,22 @@ pub fn describe_success(node_id: u64, endpoints: &[(u16, Vec<u64>)]) -> Value {
     })
 }
 
-/// `group invoke` の sent body。
-pub fn group_invoke_sent(group_id: u16, cluster: &str, command: &str, endpoint: u16) -> Value {
+/// `group invoke` の sent body。`egress` は実際に送出した iface 名の配列
+/// (LAN 単独でも常に出す — 後方互換な追加フィールド)。
+pub fn group_invoke_sent(
+    group_id: u16,
+    cluster: &str,
+    command: &str,
+    endpoint: u16,
+    egress: &[String],
+) -> Value {
     json!({
         "group_id": group_id,
         "cluster": cluster,
         "command": command,
         "endpoint": endpoint,
         "status": "sent",
+        "egress": egress,
         "note": GROUPCAST_NOTE,
     })
 }
@@ -161,13 +169,14 @@ pub fn group_bump(from: u32, to: u32) -> Value {
     json!({ "group_counter": { "from": from, "to": to } })
 }
 
-/// `group color-temp` の sent body。
+/// `group color-temp` の sent body。`egress` は `group_invoke_sent` と同義。
 pub fn group_color_temp_sent(
     group_id: u16,
     kelvin: u32,
     mireds: u16,
     transition: u16,
     endpoint: u16,
+    egress: &[String],
 ) -> Value {
     json!({
         "group_id": group_id,
@@ -178,12 +187,19 @@ pub fn group_color_temp_sent(
         "transition": transition,
         "endpoint": endpoint,
         "status": "sent",
+        "egress": egress,
         "note": GROUPCAST_NOTE,
     })
 }
 
-/// `group level` の sent body。
-pub fn group_level_sent(group_id: u16, echo: LevelEcho, transition: u16, endpoint: u16) -> Value {
+/// `group level` の sent body。`egress` は `group_invoke_sent` と同義。
+pub fn group_level_sent(
+    group_id: u16,
+    echo: LevelEcho,
+    transition: u16,
+    endpoint: u16,
+    egress: &[String],
+) -> Value {
     json!({
         "group_id": group_id,
         "cluster": "levelcontrol",
@@ -193,16 +209,19 @@ pub fn group_level_sent(group_id: u16, echo: LevelEcho, transition: u16, endpoin
         "transition": transition,
         "endpoint": endpoint,
         "status": "sent",
+        "egress": egress,
         "note": GROUPCAST_NOTE,
     })
 }
 
-/// `group color` の sent body。name / rgb は指定時のみキーが現れる。
+/// `group color` の sent body。name / rgb は指定時のみキーが現れる。`egress`
+/// は `group_invoke_sent` と同義。
 pub fn group_color_sent(
     group_id: u16,
     color: &ResolvedColor,
     transition: u16,
     endpoint: u16,
+    egress: &[String],
 ) -> Value {
     let mut body = json!({
         "group_id": group_id,
@@ -215,6 +234,7 @@ pub fn group_color_sent(
         "transition": transition,
         "endpoint": endpoint,
         "status": "sent",
+        "egress": egress,
         "note": GROUPCAST_NOTE,
     });
     if let Some(name) = &color.name {
@@ -388,10 +408,11 @@ mod tests {
     #[test]
     fn group_invoke_sent_shape() {
         assert_eq!(
-            group_invoke_sent(10, "onoff", "on", 1),
+            group_invoke_sent(10, "onoff", "on", 1, &["eth0".into(), "wpan0".into()]),
             json!({
                 "group_id": 10, "cluster": "onoff", "command": "on",
                 "endpoint": 1, "status": "sent",
+                "egress": ["eth0", "wpan0"],
                 "note": "unacknowledged groupcast; per-device delivery not confirmed",
             })
         );
@@ -400,12 +421,13 @@ mod tests {
     #[test]
     fn group_color_temp_sent_shape() {
         assert_eq!(
-            group_color_temp_sent(10, 2700, 370, 0, 1),
+            group_color_temp_sent(10, 2700, 370, 0, 1, &["eth0".into(), "wpan0".into()]),
             json!({
                 "group_id": 10, "cluster": "colorcontrol",
                 "command": "move-to-color-temperature",
                 "kelvin": 2700, "mireds": 370, "transition": 0,
                 "endpoint": 1, "status": "sent",
+                "egress": ["eth0", "wpan0"],
                 "note": "unacknowledged groupcast; per-device delivery not confirmed",
             })
         );
@@ -421,13 +443,15 @@ mod tests {
                     level: 127
                 },
                 0,
-                1
+                1,
+                &["eth0".into(), "wpan0".into()]
             ),
             json!({
                 "group_id": 10, "cluster": "levelcontrol",
                 "command": "move-to-level",
                 "percent": 50, "level": 127, "transition": 0,
                 "endpoint": 1, "status": "sent",
+                "egress": ["eth0", "wpan0"],
                 "note": "unacknowledged groupcast; per-device delivery not confirmed",
             })
         );
@@ -436,13 +460,14 @@ mod tests {
     #[test]
     fn group_color_sent_shape() {
         assert_eq!(
-            group_color_sent(10, &color_fixture(), 0, 1),
+            group_color_sent(10, &color_fixture(), 0, 1, &["eth0".into(), "wpan0".into()]),
             json!({
                 "group_id": 10, "cluster": "colorcontrol",
                 "command": "move-to-hue-and-saturation",
                 "hue": 240, "saturation": 100,
                 "hue_raw": 169, "saturation_raw": 254,
                 "transition": 0, "endpoint": 1, "status": "sent",
+                "egress": ["eth0", "wpan0"],
                 "note": "unacknowledged groupcast; per-device delivery not confirmed",
                 "name": "blue",
             })
@@ -460,7 +485,7 @@ mod tests {
             rgb: Some("#ff0000".to_string()),
         };
         assert_eq!(
-            group_color_sent(10, &color, 0, 1),
+            group_color_sent(10, &color, 0, 1, &["eth0".into()]),
             json!({
                 "group_id": 10, "cluster": "colorcontrol",
                 "command": "move-to-hue-and-saturation",
@@ -468,6 +493,7 @@ mod tests {
                 "hue_raw": 10, "saturation_raw": 254,
                 "transition": 0, "endpoint": 1,
                 "status": "sent", "note": GROUPCAST_NOTE,
+                "egress": ["eth0"],
                 "name": "red", "rgb": "#ff0000",
             })
         );
