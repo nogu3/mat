@@ -271,9 +271,9 @@ pub async fn connect(mut link: GattLink, window: u8) -> Result<(BtpParams, Trans
 
 struct SessionState {
     tx_seq: u8,        // 次に使う自分の sequence
-    peer_acked: u8,    // peer が ack 済みの自分の最新 seq（初期値 0 = 未 ack 相当）
+    peer_acked: u8,    // peer が ack 済みの自分の最新 seq（255 = 番兵、未 ack）
     unacked: u8,       // 未 ack の自分のフレーム数
-    last_rx_seq: u8,   // 受信した最新の peer seq
+    last_rx_seq: u8,   // 受信した最新の peer seq（255 = 番兵、未受信）
     pending_ack: bool, // peer へ ack を返す義務があるか
     reasm: Reassembler,
     // レビュー指摘対応（fix wave 1）:
@@ -285,9 +285,12 @@ impl SessionState {
     fn new() -> Self {
         Self {
             tx_seq: 0,
-            peer_acked: 0,
+            // 「まだ何も ack / 受信していない」の番兵 255。u8 wrap 会計で初回
+            // seq=0 が (255+1)=0 として自然に繋がる。0 初期化だと自分の初回
+            // フレーム（seq=0）への ack が newly=0 となり永久未計上だった。
+            peer_acked: 0u8.wrapping_sub(1),
             unacked: 0,
-            last_rx_seq: 0,
+            last_rx_seq: 0u8.wrapping_sub(1),
             pending_ack: false,
             reasm: Reassembler::new(),
             last_ack_progress: tokio::time::Instant::now(),
@@ -724,6 +727,56 @@ mod tests {
         assert!(msg.is_none());
         assert_eq!(st.peer_acked, 1);
         assert_eq!(st.unacked, 1); // 4 - 3
+    }
+
+    #[test]
+    fn ack_of_seq0_is_counted() {
+        // 自分の初回フレーム（seq=0）への ack が計上されること。旧実装は
+        // peer_acked 初期値 0 のせいで newly = 0.wrapping_sub(0) = 0 になり、
+        // 幽霊 unacked=1 が恒久残留していた（実効ウィンドウ -1 + watchdog
+        // 述語 unacked>0 の汚染）。
+        let mut st = SessionState::new();
+        st.tx_seq = 1; // seq=0 を 1 枚送った直後
+        st.unacked = 1;
+        let pkt = Packet {
+            beginning: false,
+            ending: false,
+            ack: Some(0),
+            seq: Some(0),
+            msg_len: None,
+            payload: vec![],
+        };
+        assert!(process_incoming(&pkt, &mut st).unwrap().is_none());
+        assert_eq!(st.unacked, 0);
+        assert_eq!(st.peer_acked, 0);
+    }
+
+    #[tokio::test]
+    async fn btp_window_one_device_accepts_second_message() {
+        // window_size=1 のデバイス相手に 2 通目が送れること（監査の具体症状:
+        // 幽霊 unacked=1 で実効ウィンドウが 0 になり、ack 済みなのに 2 通目が
+        // ウィンドウ待ちで詰まる）。send_to は actor のキューに積むだけで
+        // 完了してしまうので、詰まりの観測は peripheral 側の受信で行う。
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 1).await;
+            let (m1, s1) = p.recv_message().await;
+            assert_eq!(m1, b"first");
+            p.send_ack(s1).await;
+            let (m2, _) = p.recv_message().await;
+            assert_eq!(m2, b"second");
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        t.send_to(b"first", crate::transport::RELIABLE_PEER)
+            .await
+            .unwrap();
+        t.send_to(b"second", crate::transport::RELIABLE_PEER)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), peripheral)
+            .await
+            .expect("second message must not stall on a ghost unacked frame")
+            .unwrap();
     }
 
     // --- Session actor: fake peripheral + connect() tests (Task 3) ---
