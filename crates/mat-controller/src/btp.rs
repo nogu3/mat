@@ -306,13 +306,23 @@ fn process_incoming(pkt: &Packet, st: &mut SessionState) -> Result<Option<Vec<u8
     if let Some(a) = pkt.ack {
         // a..=直前 tx_seq-1 のうち ack された分を勘定（u8 wrap 対応）。
         let newly = a.wrapping_sub(st.peer_acked);
+        // 送っていないフレームへの ack は本物の破損（GATT indication は
+        // ATT 層で信頼配送）— spec 準拠で close。newly == 0 の重複 ack は
+        // piggyback で毎フレーム来る合法パターン。
+        if newly > st.unacked {
+            return Err(BtpError::Protocol("ack for unsent frame"));
+        }
         if newly > 0 {
             st.last_ack_progress = tokio::time::Instant::now();
         }
-        st.unacked = st.unacked.saturating_sub(newly);
+        st.unacked -= newly;
         st.peer_acked = a;
     }
     if let Some(s) = pkt.seq {
+        // indication は順序保証されるため連番以外は破損 — spec 準拠で close。
+        if s != st.last_rx_seq.wrapping_add(1) {
+            return Err(BtpError::Protocol("out-of-order seq"));
+        }
         st.last_rx_seq = s;
         st.pending_ack = true;
         // payload が空 = standalone ack/keepalive（Reassembler::push と同じ
@@ -386,7 +396,7 @@ async fn run_session(
                             break;
                         }
                     }
-                    Err(e) => { tracing::warn!(error=%e, "btp reassembly failed"); break; }
+                    Err(e) => { tracing::warn!(error=%e, "btp protocol violation"); break; }
                 }
             }
             msg = out_rx.recv() => {
@@ -1109,5 +1119,54 @@ mod tests {
             .await
             .expect("peripheral must not hang")
             .unwrap();
+    }
+
+    // --- Tier3: inbound ack/seq validation (Task 2) ---
+
+    #[tokio::test]
+    async fn btp_closes_on_ack_for_unsent_frame() {
+        // 送っていないフレームへの ack（newly > unacked）は本物の破損
+        // （GATT indication は ATT 層で信頼配送）— spec 準拠でセッション close。
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 4).await;
+            // client は sequenced フレームを 1 枚も送っていないのに ack=5
+            p.to_client
+                .send(encode_standalone_ack(0, 5).to_vec())
+                .await
+                .unwrap();
+            p // drop するとチャネル閉鎖で修正なしでも close してしまう — 生かして返す
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let p = peripheral.await.unwrap();
+        let mut buf = [0u8; 64];
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), t.recv_from(&mut buf))
+            .await
+            .expect("session must close on invalid ack")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        drop(p);
+    }
+
+    #[tokio::test]
+    async fn btp_closes_on_seq_gap() {
+        // 連番でない seq も同様に close（indication は順序保証されるため、
+        // 飛びは本物のバグか破損）。
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 4).await;
+            p.send_message(b"ok", 244, None).await; // seq=0 正常
+                                                    // seq=1 を飛ばして seq=2
+            let frame =
+                encode_data_packet(2, None, SegmentPos::First { ending: true }, Some(2), b"ng");
+            p.to_client.send(frame).await.unwrap();
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = t.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        let err = t.recv_from(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        peripheral.await.unwrap();
     }
 }
