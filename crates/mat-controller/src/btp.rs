@@ -402,7 +402,10 @@ async fn run_session(
             msg = out_rx.recv() => {
                 let Some(msg) = msg else { break }; // アプリ側 drop → 終了
                 tracing::debug!(len = msg.len(), "btp tx message");
-                if send_message(&mut link, &mut st, &params, &msg, &in_tx).await.is_err() { break; }
+                if let Err(e) = send_message(&mut link, &mut st, &params, &msg, &in_tx).await {
+                    tracing::warn!(error = %e, "btp send failed — closing session");
+                    break;
+                }
                 keepalive.reset();
             }
             _ = keepalive.tick() => {
@@ -486,6 +489,9 @@ async fn send_message(
                     if st.unacked < params.window_size {
                         send_standalone(link, st).await?;
                     }
+                    // owed ack を piggyback しない非準拠 peer が相手だと、双方が
+                    // window-full で ack 待ちのまま噛み合わないケースがあり得る
+                    // が、この待機は上の timeout(ACK_TIMEOUT, ...) で必ず解ける。
                 }
                 None => {
                     // ここで unacked が減っていれば直後にゲートが開くので、
