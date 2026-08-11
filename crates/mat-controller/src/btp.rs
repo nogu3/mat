@@ -458,6 +458,11 @@ async fn send_message(
     msg: &[u8],
     in_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), BtpError> {
+    // 宣言長（Beginning segment の Message Length）は u16。超過は切り捨てず
+    // 拒否する（Matter メッセージは実際には遥かに小さい — 防御）。
+    if msg.len() > usize::from(u16::MAX) {
+        return Err(BtpError::Protocol("message too long for btp"));
+    }
     let mut off = 0usize;
     let mut first = true;
     while first || off < msg.len() {
@@ -474,7 +479,13 @@ async fn send_message(
                     if in_tx.send(m).await.is_err() {
                         return Err(BtpError::Closed);
                     }
-                    send_standalone(link, st).await?;
+                    // ウィンドウに残量があるときだけ即 ack。満杯なら
+                    // pending_ack を立てたまま piggyback / keepalive /
+                    // proactive ack に任せる（keepalive 経路と同じガード —
+                    // 無条件送出はこちらの送信ウィンドウ違反）。
+                    if st.unacked < params.window_size {
+                        send_standalone(link, st).await?;
+                    }
                 }
                 None => {
                     // ここで unacked が減っていれば直後にゲートが開くので、
@@ -1037,6 +1048,83 @@ mod tests {
             .await
             .expect("peripheral task must not hang")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_no_standalone_ack_while_window_full() {
+        // window=1: 2 セグメント送信の 1 枚目で満杯。待機中に peer のメッセージが
+        // 完成しても、残量ゼロのまま standalone ack を送ってはならない（こちらの
+        // 送信ウィンドウ違反になる）。ack はウィンドウ解放後に送られる。
+        let (link, mut p) = fake_link();
+        let msg: Vec<u8> = (0u8..40).collect(); // segment 30 → 2 フレーム
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(30, 1).await;
+            let f1 = p.from_client.recv().await.unwrap();
+            let s1 = Packet::decode(&f1).unwrap().seq.unwrap();
+            // ack を積まない完全なメッセージ → client のウィンドウは満杯のまま
+            p.send_message(b"hi", 30, None).await;
+            // 満杯の間は standalone ack を含む一切のフレームが来てはならない
+            let blocked =
+                tokio::time::timeout(std::time::Duration::from_millis(300), p.from_client.recv())
+                    .await;
+            assert!(
+                blocked.is_err(),
+                "client must not send while window is full"
+            );
+            p.send_ack(s1).await; // 解放
+                                  // 解放後は溜まっていた ack（proactive、ウィンドウを再消費する）を
+                                  // 都度 ack で返しながら、2 枚目のデータセグメントを待つ。
+            loop {
+                let f = p.from_client.recv().await.unwrap();
+                let pkt = Packet::decode(&f).unwrap();
+                if !pkt.payload.is_empty() {
+                    break;
+                }
+                p.send_ack(pkt.seq.unwrap()).await;
+            }
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let send_fut = t.send_to(&msg, crate::transport::RELIABLE_PEER);
+        let mut buf = [0u8; 64];
+        let recv_fut = t.recv_from(&mut buf);
+        let (send_res, recv_res) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(send_fut, recv_fut)
+        })
+        .await
+        .expect("send/recv must not hang");
+        send_res.unwrap();
+        let (n, _) = recv_res.unwrap();
+        assert_eq!(&buf[..n], b"hi");
+        tokio::time::timeout(std::time::Duration::from_secs(2), peripheral)
+            .await
+            .expect("peripheral must not hang")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn btp_rejects_message_longer_than_u16_max() {
+        // 宣言長は u16。65535 を超えるメッセージは `as u16` の黙った切り捨てでは
+        // なくエラー（セッション close）にする。
+        let (link, mut p) = fake_link();
+        let peripheral = tokio::spawn(async move {
+            p.do_handshake(244, 8).await;
+            // 修正後はデータフレームが 1 枚も来ないまま writer が閉じる。
+            // 切り捨てられた宣言長（70000 % 65536 = 4464）が流れてきたら失敗。
+            while let Some(frame) = p.from_client.recv().await {
+                let pkt = Packet::decode(&frame).unwrap();
+                assert_ne!(pkt.msg_len, Some(4464), "truncated msg_len leaked");
+            }
+        });
+        let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();
+        let msg = vec![0u8; 70_000];
+        let _ = t.send_to(&msg, crate::transport::RELIABLE_PEER).await;
+        let mut buf = [0u8; 64];
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), t.recv_from(&mut buf))
+            .await
+            .expect("session must close promptly on oversized message")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        peripheral.await.unwrap();
     }
 
     // --- Fix wave 1: keepalive/ack-timeout bounding, proactive inbound ack ---
