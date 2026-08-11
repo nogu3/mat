@@ -54,7 +54,14 @@ pub async fn find_commissionable(
     timeout: Duration,
 ) -> Result<bluer::Device, BtpError> {
     adapter.set_powered(true).await.map_err(gatt("power"))?;
-    let mut events = adapter.discover_devices().await.map_err(gatt("discover"))?;
+    // discover_devices() は DeviceAdded しか流さず、BlueZ にキャッシュ済みの
+    // デバイスがスキャン開始後に広告を始めるケース（目の前でペアリング
+    // ボタンを押す）を検出できない。_with_changes はプロパティ変更時にも
+    // DeviceAdded を再発行するため、以降のマッチループは無変更でよい。
+    let mut events = adapter
+        .discover_devices_with_changes()
+        .await
+        .map_err(gatt("discover"))?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
