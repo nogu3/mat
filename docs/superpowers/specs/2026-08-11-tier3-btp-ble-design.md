@@ -25,6 +25,15 @@ Tier 3 は BTP セッション状態機械の会計バグと BLE スキャンの
 - `Option<u8>` 案は却下 — 送受 2 箇所を Option 化するより番兵の方が変更が小さく、
   既存の wrap 会計（`wrapping_sub` / `wrapping_add`）と自然に噛み合う。
 
+**是正（2026-08-11、実機 E2E で発覚）**: `last_rx_seq` の 255 番兵は誤りだった。
+BTP では peripheral の handshake response が暗黙に seq 0 を消費する（CHIP
+BtpEngine::Init: central 側 `mRxNextSeqNum = 1`、peripheral 側は handshake
+response 送信でウィンドウを 1 消費し ack を待つ）。よって初回データフレームの
+期待 seq は 1 であり、`last_rx_seq` は 0 初期化（= handshake response 受信済み
+相当）が正しい。255 番兵だと実機（Nanoleaf）の正しい初回フレーム seq=1 を
+out-of-order 誤判定して PASE が落ちる。`peer_acked = 255` は正しいまま
+（handshake request は seq を消費しない非対称）。
+
 ## 変更 2: 受信 ack / seq の妥当性検証（btp.rs `process_incoming`）— spec 準拠 close
 
 ユーザー決定 2026-08-11: spec 準拠でセッション close（warn-only ではない）。

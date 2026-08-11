@@ -273,7 +273,7 @@ struct SessionState {
     tx_seq: u8,        // 次に使う自分の sequence
     peer_acked: u8,    // peer が ack 済みの自分の最新 seq（255 = 番兵、未 ack）
     unacked: u8,       // 未 ack の自分のフレーム数
-    last_rx_seq: u8,   // 受信した最新の peer seq（255 = 番兵、未受信）
+    last_rx_seq: u8,   // 受信した最新の peer seq（初期 0 = handshake response が暗黙消費）
     pending_ack: bool, // peer へ ack を返す義務があるか
     reasm: Reassembler,
     // レビュー指摘対応（fix wave 1）:
@@ -285,12 +285,18 @@ impl SessionState {
     fn new() -> Self {
         Self {
             tx_seq: 0,
-            // 「まだ何も ack / 受信していない」の番兵 255。u8 wrap 会計で初回
+            // 「まだ何も ack されていない」の番兵 255。u8 wrap 会計で初回
             // seq=0 が (255+1)=0 として自然に繋がる。0 初期化だと自分の初回
             // フレーム（seq=0）への ack が newly=0 となり永久未計上だった。
             peer_acked: 0u8.wrapping_sub(1),
             unacked: 0,
-            last_rx_seq: 0u8.wrapping_sub(1),
+            // 0 = peripheral の handshake response が暗黙に seq 0 を消費した状態。
+            // 初回データフレームの期待 seq は 1（CHIP BtpEngine::Init の central 側
+            // mRxNextSeqNum = 1 と同値）。255 番兵にすると期待が 0 になり、実機
+            // （Nanoleaf）の正しい初回フレーム seq=1 を out-of-order 誤判定して
+            // PASE が落ちる（2026-08-11 jarvis 実機で確認）。tx 側と非対称なのは
+            // handshake request（write）が seq を消費しないため。
+            last_rx_seq: 0,
             pending_ack: false,
             reasm: Reassembler::new(),
             last_ack_progress: tokio::time::Instant::now(),
@@ -746,7 +752,7 @@ mod tests {
             beginning: false,
             ending: false,
             ack: Some(1),
-            seq: Some(0),
+            seq: Some(1),
             msg_len: None,
             payload: vec![],
         };
@@ -769,13 +775,38 @@ mod tests {
             beginning: false,
             ending: false,
             ack: Some(0),
-            seq: Some(0),
+            seq: Some(1),
             msg_len: None,
             payload: vec![],
         };
         assert!(process_incoming(&pkt, &mut st).unwrap().is_none());
         assert_eq!(st.unacked, 0);
         assert_eq!(st.peer_acked, 0);
+    }
+
+    #[test]
+    fn first_peer_data_frame_is_seq1_not_seq0() {
+        // peripheral の handshake response が暗黙に seq 0 を消費するため、
+        // 初回データフレームは seq=1 が正（CHIP BtpEngine: central の
+        // mRxNextSeqNum=1）。seq=0 で始める peer は非準拠として close。
+        let mut st = SessionState::new();
+        let mk = |s: u8| Packet {
+            beginning: false,
+            ending: false,
+            ack: None,
+            seq: Some(s),
+            msg_len: None,
+            payload: vec![],
+        };
+        assert!(
+            process_incoming(&mk(1), &mut st).is_ok(),
+            "seq 1 must be accepted first"
+        );
+        let mut st2 = SessionState::new();
+        assert!(
+            process_incoming(&mk(0), &mut st2).is_err(),
+            "seq 0 first is out-of-order"
+        );
     }
 
     #[tokio::test]
@@ -827,7 +858,8 @@ mod tests {
             FakePeripheral {
                 from_client: wrx,
                 to_client: itx,
-                tx_seq: 0,
+                // handshake response が seq 0 を暗黙消費済み → データは 1 始まり
+                tx_seq: 1,
                 reasm: Reassembler::new(),
             },
         )
@@ -1183,13 +1215,13 @@ mod tests {
         let peripheral = tokio::spawn(async move {
             p.do_handshake(30, 2).await;
             let seg1 = encode_data_packet(
-                0,
+                1,
                 None,
                 SegmentPos::First { ending: false },
                 Some(60),
                 &msg[..26],
             );
-            let seg2 = encode_data_packet(1, None, SegmentPos::Middle, None, &msg[26..54]);
+            let seg2 = encode_data_packet(2, None, SegmentPos::Middle, None, &msg[26..54]);
             p.to_client.send(seg1).await.unwrap();
             p.to_client.send(seg2).await.unwrap();
             // Must see a proactive ack after segment 1 (threshold=1) before
@@ -1198,7 +1230,7 @@ mod tests {
             let ack_pkt = Packet::decode(&ack_frame).unwrap();
             assert!(ack_pkt.payload.is_empty(), "expected standalone ack");
             assert!(ack_pkt.ack.is_some());
-            let seg3 = encode_data_packet(2, None, SegmentPos::Last, None, &msg[54..]);
+            let seg3 = encode_data_packet(3, None, SegmentPos::Last, None, &msg[54..]);
             p.to_client.send(seg3).await.unwrap();
             p
         });
@@ -1226,7 +1258,7 @@ mod tests {
             p.do_handshake(244, 4).await;
             // client は sequenced フレームを 1 枚も送っていないのに ack=5
             p.to_client
-                .send(encode_standalone_ack(0, 5).to_vec())
+                .send(encode_standalone_ack(1, 5).to_vec())
                 .await
                 .unwrap();
             p // drop するとチャネル閉鎖で修正なしでも close してしまう — 生かして返す
@@ -1249,10 +1281,10 @@ mod tests {
         let (link, mut p) = fake_link();
         let peripheral = tokio::spawn(async move {
             p.do_handshake(244, 4).await;
-            p.send_message(b"ok", 244, None).await; // seq=0 正常
-                                                    // seq=1 を飛ばして seq=2
+            p.send_message(b"ok", 244, None).await; // seq=1 正常
+                                                    // seq=2 を飛ばして seq=3
             let frame =
-                encode_data_packet(2, None, SegmentPos::First { ending: true }, Some(2), b"ng");
+                encode_data_packet(3, None, SegmentPos::First { ending: true }, Some(2), b"ng");
             p.to_client.send(frame).await.unwrap();
         });
         let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();

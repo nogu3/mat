@@ -74,10 +74,10 @@ async fn pase_over_btp_sends_unreliable_pbkdf_request() {
             rp.encode(&mut b);
             b
         };
-        // 1 フレームで送る（BTP data packet, seq=1 相当は fake 側管理: seq 0 は
-        // まだ使っていないので 0 から）
+        // 1 フレームで送る（BTP data packet, handshake response が seq 0 を
+        // 暗黙消費するため、データフレームは seq 1 から）
         let frame = btp::encode_data_packet(
-            0,
+            1,
             None,
             SegmentPos::First { ending: true },
             Some(reply.len() as u16),
