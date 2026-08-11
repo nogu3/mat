@@ -74,9 +74,14 @@ bluer の再通知規律はコードから断定できない（監査時の申�
   `unacked == 0` / `peer_acked == 0` になること（`process_incoming` 直接）。
 - **window_size=1 で 2 通目が送れる**: FakePeripheral（window=1）相手に 2 通
   連続送信が完了すること（監査の具体症状の回帰）。
-- **健全セッションはウォッチドッグで死なない**: 全 ack 済み状態で
-  ACK_TIMEOUT 超のアイドルを経てもセッションが生きていること
-  （start_paused、現行コードでは幽霊 unacked=1 のせいで死ぬ）。
+- ~~健全セッションのウォッチドッグ生存~~（計画時に差し替え）: actor レベルの
+  生存テストはバグを弁別できない。standalone ack 自体が sequenced で ack を
+  誘発するため、素直に ack を返す相手とは 2.5s 周期の ack 往復が続き、バグ有り
+  でも毎周期 `newly=1` の進捗が記録されて watchdog は発火しない（失われるのは
+  初回 seq=0 の ack 計上 1 回だけ）。逆に相手が 15s 沈黙すれば修正後も keepalive
+  ack が真に未 ack となり close する（正しい挙動）。ウォッチドッグ述語
+  `unacked > 0` の健全性は上記「seq-0 ack の計上」会計テスト
+  （全 ack 後に `unacked == 0` へ戻る）で担保する。
 - **不正 ack で close**: 送っていない seq への ack（`newly > unacked`）で
   セッションが閉じ、Transport 側が BrokenPipe を観測すること。
 - **連番飛び seq で close**: seq 0 の次に seq 2 を受けたら close。
