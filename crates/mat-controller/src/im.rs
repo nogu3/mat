@@ -49,6 +49,28 @@ pub const CMD_ADD_GROUP: u32 = 0x00;
 /// requests (including groupcast, which arrives with `authMode = Group`).
 pub const CLUSTER_ACCESS_CONTROL: u32 = 0x001F;
 pub const ATTR_ACL: u32 = 0x0000;
+/// Descriptor cluster (spec §9.5). Every endpoint's mandatory
+/// "what am I / what's under me" cluster — `mat-device`'s `datamodel`
+/// serves it on endpoint 0.
+pub const CLUSTER_DESCRIPTOR: u32 = 0x001D;
+pub const ATTR_DEVICE_TYPE_LIST: u32 = 0x0000;
+pub const ATTR_SERVER_LIST: u32 = 0x0001;
+pub const ATTR_PARTS_LIST: u32 = 0x0003;
+/// RootNode device type (spec §9.2.2), the `DeviceTypeList` entry for
+/// endpoint 0.
+pub const DEVICE_TYPE_ROOT_NODE: u32 = 0x0016;
+pub const ATTR_VENDOR_NAME: u32 = 0x0001;
+pub const ATTR_VENDOR_ID: u32 = 0x0002;
+pub const ATTR_PRODUCT_NAME: u32 = 0x0003;
+pub const ATTR_PRODUCT_ID: u32 = 0x0004;
+
+/// IM status codes (spec §8.10.1, Table "Status Code Table"). Only the
+/// values `mat-device`'s data model dispatch actually returns today.
+pub const STATUS_SUCCESS: u8 = 0x00;
+pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
+pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
+pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
+pub const STATUS_UNSUPPORTED_CLUSTER: u8 = 0xC3;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -702,6 +724,50 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
     })
 }
 
+/// One attribute value to report: server-side counterpart of
+/// `AttributeReport`. `value_tlv` must be one complete, well-formed TLV
+/// element (any top-level tag; re-tagged on splice) — the attribute's `Data`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrReportOut {
+    pub endpoint: u16,
+    pub cluster: u32,
+    pub attribute: u32,
+    pub data_version: u32,
+    pub value_tlv: Vec<u8>,
+}
+
+/// ReportDataMessage (spec §8.9.2): server-side encode, mirroring
+/// `decode_report_data_message`/`decode_report_data`'s nesting. Shape (see
+/// `test_support::report_data_false_suppressed`, the fixture this was
+/// modeled on): `struct{1: array[struct{1: struct{0:DataVersion,
+/// 1:list{2:endpoint,3:cluster,4:attribute}, 2:Data}}], 4:SuppressResponse,
+/// 255:IM_REVISION}`. Every report is a data (not status) AttributeReportIB
+/// — `mat-device`'s data model reports read failures via StatusResponse at
+/// the read-request level today, not per-path AttributeStatusIB.
+pub fn encode_report_data(reports: &[AttrReportOut], suppress_response: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(1)); // AttributeReportIBs
+    for report in reports {
+        w.start_struct(Tag::Anonymous); // AttributeReportIB
+        w.start_struct(Tag::Context(1)); // AttributeDataIB
+        w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
+        w.start_list(Tag::Context(1)); // Path
+        w.put_uint(Tag::Context(2), u64::from(report.endpoint));
+        w.put_uint(Tag::Context(3), u64::from(report.cluster));
+        w.put_uint(Tag::Context(4), u64::from(report.attribute));
+        w.end_container(); // Path
+        w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
+        w.end_container(); // AttributeDataIB
+        w.end_container(); // AttributeReportIB
+    }
+    w.end_container(); // AttributeReportIBs
+    w.put_bool(Tag::Context(4), suppress_response); // SuppressResponse
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
 /// ReadRequestMessage (spec §8.9.2) の wildcard 版: AttributePathIB から
 /// attribute を省略し、cluster 内の全属性を要求する。
 pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
@@ -719,6 +785,66 @@ pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
+}
+
+/// Decoded AttributePathIB (spec §8.9.2.2) from a ReadRequest: server-side
+/// counterpart of `encode_read_request`/`encode_read_request_cluster`.
+/// `None` fields are wildcards (omitted on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttrPathIn {
+    pub endpoint: Option<u16>,
+    pub cluster: Option<u32>,
+    pub attribute: Option<u32>,
+}
+
+/// ReadRequestMessage (spec §8.9.2): server-side decode of
+/// `encode_read_request`/`encode_read_request_cluster`'s payload. Returns
+/// every AttributePathIB in `AttributeRequests` (tag 0) — unlike the
+/// client-side `decode_report_data*` helpers, a device must answer every
+/// path a controller asks for, not just the first.
+pub fn decode_read_request(payload: &[u8]) -> Result<Vec<AttrPathIn>, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut paths = Vec::new();
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated read request"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ArrayStart) => {
+                // AttributeRequests
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated attribute requests"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::ListStart => {
+                            let (endpoint, cluster, attribute, _) =
+                                decode_attribute_path_ib(&mut r)?;
+                            paths.push(AttrPathIn {
+                                endpoint,
+                                cluster,
+                                attribute,
+                            });
+                        }
+                        Value::StructStart | Value::ArrayStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed(
+                                "unexpected element in attribute requests",
+                            ))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(paths)
 }
 
 /// SubscribeRequestMessage (spec §8.10)。`clusters` が空なら全フィールド省略の
@@ -1052,6 +1178,147 @@ pub fn encode_group_invoke_request(
     w.finish()
 }
 
+/// Decoded InvokeRequestMessage for a single command: server-side
+/// counterpart of `encode_invoke_request`/`encode_invoke_request_timed`.
+/// `fields_tlv` is empty when the request carried no CommandFields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvokeRequestIn {
+    pub endpoint: u16,
+    pub cluster: u32,
+    pub command: u32,
+    pub fields_tlv: Vec<u8>,
+    pub suppress_response: bool,
+    pub timed: bool,
+}
+
+/// `decode_request_command_data_ib`'s return: (endpoint, cluster, command,
+/// fields_tlv).
+type RequestCommandDataFields = (Option<u16>, Option<u32>, Option<u32>, Vec<u8>);
+
+/// CommandDataIB (spec §8.9.4.2): `{0: CommandPath{0:endpoint,1:cluster,
+/// 2:command}, 1: CommandFields}`, request-side variant that also extracts
+/// the path (`decode_command_data_ib` only extracts fields, for the
+/// response side where the path is already known to the caller). Assumes
+/// the caller already consumed the anonymous `StructStart` opening this
+/// CommandDataIB (an InvokeRequests entry).
+fn decode_request_command_data_ib(r: &mut Reader) -> Result<RequestCommandDataFields, ImError> {
+    let mut endpoint = None;
+    let mut cluster = None;
+    let mut command = None;
+    let mut fields_tlv = Vec::new();
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated command data ib"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::ListStart) => {
+                // CommandPath
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated command path"))?;
+                    match (e2.tag, e2.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (Tag::Context(0), Value::Uint(v)) => {
+                            endpoint = Some(u16::try_from(v).map_err(|_| {
+                                ImError::Malformed("command path endpoint out of range")
+                            })?);
+                        }
+                        (Tag::Context(1), Value::Uint(v)) => {
+                            cluster = Some(u32::try_from(v).map_err(|_| {
+                                ImError::Malformed("command path cluster out of range")
+                            })?);
+                        }
+                        (Tag::Context(2), Value::Uint(v)) => {
+                            command = Some(u32::try_from(v).map_err(|_| {
+                                ImError::Malformed("command path command out of range")
+                            })?);
+                        }
+                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                            skip_container(r)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (Tag::Context(1), Value::StructStart) => {
+                // CommandFields: re-tag to Anonymous, same convention as
+                // `decode_command_data_ib`'s response-side echo.
+                let mut w = Writer::new();
+                copy_value(&mut w, r, Tag::Anonymous, Value::StructStart)?;
+                fields_tlv = w.finish();
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((endpoint, cluster, command, fields_tlv))
+}
+
+/// InvokeRequestMessage (spec §8.9.4): server-side decode of
+/// `encode_invoke_request`/`encode_invoke_request_timed`'s payload. Only
+/// the first InvokeRequestIB is interpreted (mirrors `decode_invoke_response`'s
+/// single-command scope).
+pub fn decode_invoke_request(payload: &[u8]) -> Result<InvokeRequestIn, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut suppress_response = false;
+    let mut timed = false;
+    let mut endpoint = None;
+    let mut cluster = None;
+    let mut command = None;
+    let mut fields_tlv = Vec::new();
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated invoke request"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Bool(b)) => suppress_response = b,
+            (Tag::Context(1), Value::Bool(b)) => timed = b,
+            (Tag::Context(2), Value::ArrayStart) => {
+                // InvokeRequests
+                let mut first = true;
+                loop {
+                    let e2 = r
+                        .next()?
+                        .ok_or(ImError::Malformed("truncated invoke requests"))?;
+                    match e2.value {
+                        Value::ContainerEnd => break,
+                        Value::StructStart if first => {
+                            let (ep, cl, cmd, fields) = decode_request_command_data_ib(&mut r)?;
+                            endpoint = ep;
+                            cluster = cl;
+                            command = cmd;
+                            fields_tlv = fields;
+                            first = false;
+                        }
+                        Value::StructStart => skip_container(&mut r)?,
+                        _ => {
+                            return Err(ImError::Malformed("unexpected element in invoke requests"))
+                        }
+                    }
+                }
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(InvokeRequestIn {
+        endpoint: endpoint.ok_or(ImError::Malformed("invoke request without endpoint"))?,
+        cluster: cluster.ok_or(ImError::Malformed("invoke request without cluster"))?,
+        command: command.ok_or(ImError::Malformed("invoke request without command"))?,
+        fields_tlv,
+        suppress_response,
+        timed,
+    })
+}
+
 /// StatusIB (spec §8.9.2.3) inside a CommandStatusIB: `{0: status, 1: cluster_status}`.
 /// Assumes the caller already consumed the `StructStart` (tag 1) opening it.
 fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
@@ -1313,6 +1580,78 @@ pub fn decode_invoke_response_data(payload: &[u8]) -> Result<InvokeResponseData,
     result.ok_or(ImError::Malformed(
         "invoke response without InvokeResponseIB",
     ))
+}
+
+/// InvokeResponseMessage (spec §8.9.4) for a single command's
+/// CommandStatusIB (status, not data): server-side counterpart of
+/// `decode_invoke_response`/`decode_invoke_response_data`. Echoes the
+/// CommandPath (spec §8.9.4.2) so a well-behaved controller can correlate
+/// the status against the command it invoked.
+pub fn encode_invoke_response_status(
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    status: u8,
+    cluster_status: Option<u8>,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(1)); // InvokeResponses
+    w.start_struct(Tag::Anonymous); // InvokeResponseIB
+    w.start_struct(Tag::Context(1)); // CommandStatusIB
+    w.start_list(Tag::Context(0)); // CommandPath
+    w.put_uint(Tag::Context(0), u64::from(endpoint));
+    w.put_uint(Tag::Context(1), u64::from(cluster));
+    w.put_uint(Tag::Context(2), u64::from(command));
+    w.end_container(); // CommandPath
+    w.start_struct(Tag::Context(1)); // StatusIB
+    w.put_uint(Tag::Context(0), u64::from(status));
+    if let Some(cs) = cluster_status {
+        w.put_uint(Tag::Context(1), u64::from(cs));
+    }
+    w.end_container(); // StatusIB
+    w.end_container(); // CommandStatusIB
+    w.end_container(); // InvokeResponseIB
+    w.end_container(); // InvokeResponses
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
+}
+
+/// InvokeResponseMessage (spec §8.9.4) for a single command's CommandDataIB
+/// (a successful invocation that returns data — e.g. a cluster's response
+/// command). `fields_tlv` must be one complete, well-formed TLV element
+/// (any top-level tag; re-tagged on splice) holding the response
+/// CommandFields struct, or an empty slice for a data response with no
+/// fields. `response_command` goes in the echoed CommandPath's CommandId,
+/// same field `decode_command_data_ib`'s caller ignores today (it only
+/// needs the fields) but that a spec-faithful controller would use to
+/// distinguish response commands from the invoked one.
+pub fn encode_invoke_response_data(
+    endpoint: u16,
+    cluster: u32,
+    response_command: u32,
+    fields_tlv: &[u8],
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(1)); // InvokeResponses
+    w.start_struct(Tag::Anonymous); // InvokeResponseIB
+    w.start_struct(Tag::Context(0)); // CommandDataIB
+    w.start_list(Tag::Context(0)); // CommandPath
+    w.put_uint(Tag::Context(0), u64::from(endpoint));
+    w.put_uint(Tag::Context(1), u64::from(cluster));
+    w.put_uint(Tag::Context(2), u64::from(response_command));
+    w.end_container(); // CommandPath
+    if !fields_tlv.is_empty() {
+        w.put_raw_element(Tag::Context(1), fields_tlv); // CommandFields
+    }
+    w.end_container(); // CommandDataIB
+    w.end_container(); // InvokeResponseIB
+    w.end_container(); // InvokeResponses
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container(); // outer struct
+    w.finish()
 }
 
 /// StatusResponseMessage (spec §8.9.3): `{0: Status, 255: revision}`.
@@ -2434,5 +2773,150 @@ mod tests {
         let j = tlv_element_to_json(&mut r, first).unwrap();
         assert_eq!(j["0"], serde_json::json!(10));
         assert_eq!(j["1"], serde_json::json!("grp10"));
+    }
+
+    // Task 7: server-direction codecs, checked against the pre-existing
+    // client-direction halves (not just self-inverse).
+
+    #[test]
+    fn invoke_request_roundtrip() {
+        let payload = encode_invoke_request(1, 0x0006, 1, None);
+        let req = decode_invoke_request(&payload).unwrap();
+        assert_eq!((req.endpoint, req.cluster, req.command), (1, 0x0006, 1));
+        assert!(req.fields_tlv.is_empty());
+        assert!(!req.suppress_response);
+        assert!(!req.timed);
+    }
+
+    #[test]
+    fn invoke_request_roundtrip_with_fields() {
+        let mut fw = Writer::new();
+        fw.start_struct(Tag::Anonymous);
+        fw.put_uint(Tag::Context(0), 42);
+        fw.end_container();
+        let fields = fw.finish();
+        let payload =
+            encode_invoke_request(1, CLUSTER_LEVEL_CONTROL, CMD_MOVE_TO_LEVEL, Some(&fields));
+        let req = decode_invoke_request(&payload).unwrap();
+        assert_eq!(
+            (req.endpoint, req.cluster, req.command),
+            (1, CLUSTER_LEVEL_CONTROL, CMD_MOVE_TO_LEVEL)
+        );
+        let mut r = Reader::new(&req.fields_tlv);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(j["0"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn read_request_roundtrip() {
+        let payload = encode_read_request(1, CLUSTER_ON_OFF, ATTR_ON_OFF);
+        let paths = decode_read_request(&payload).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].endpoint, Some(1));
+        assert_eq!(paths[0].cluster, Some(CLUSTER_ON_OFF));
+        assert_eq!(paths[0].attribute, Some(ATTR_ON_OFF));
+    }
+
+    #[test]
+    fn read_request_cluster_wildcard_roundtrip() {
+        let payload = encode_read_request_cluster(0, CLUSTER_DESCRIPTOR);
+        let paths = decode_read_request(&payload).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].endpoint, Some(0));
+        assert_eq!(paths[0].cluster, Some(CLUSTER_DESCRIPTOR));
+        assert_eq!(paths[0].attribute, None);
+    }
+
+    #[test]
+    fn invoke_response_status_decodes_with_client_decoder() {
+        let payload = encode_invoke_response_status(1, 0x0006, 1, 0, None);
+        let out = decode_invoke_response(&payload).unwrap();
+        assert_eq!(out.status, 0);
+    }
+
+    #[test]
+    fn invoke_response_status_carries_cluster_status() {
+        let payload =
+            encode_invoke_response_status(1, 0x0006, 1, STATUS_UNSUPPORTED_COMMAND, Some(0x42));
+        let out = decode_invoke_response(&payload).unwrap();
+        assert_eq!(out.status, STATUS_UNSUPPORTED_COMMAND);
+        assert_eq!(out.cluster_status, Some(0x42));
+        let data = decode_invoke_response_data(&payload).unwrap();
+        assert_eq!(data.status, STATUS_UNSUPPORTED_COMMAND);
+        assert_eq!(data.cluster_status, Some(0x42));
+        assert!(data.fields_tlv.is_none());
+    }
+
+    #[test]
+    fn invoke_response_data_decodes_with_client_decoder() {
+        let mut fw = Writer::new();
+        fw.start_struct(Tag::Anonymous);
+        fw.put_bool(Tag::Context(0), true);
+        fw.end_container();
+        let fields = fw.finish();
+        let payload = encode_invoke_response_data(1, CLUSTER_ON_OFF, 0x00, &fields);
+        let data = decode_invoke_response_data(&payload).unwrap();
+        assert_eq!(data.status, 0);
+        let fields_tlv = data.fields_tlv.expect("expected CommandFields");
+        let mut r = Reader::new(&fields_tlv);
+        let first = r.next().unwrap().unwrap();
+        let j = tlv_element_to_json(&mut r, first).unwrap();
+        assert_eq!(j["0"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn report_data_decodes_with_client_decoder() {
+        let mut w = Writer::new();
+        w.put_bool(Tag::Anonymous, true);
+        let payload = encode_report_data(
+            &[AttrReportOut {
+                endpoint: 0,
+                cluster: 0x0028,
+                attribute: 0,
+                data_version: 1,
+                value_tlv: w.finish(),
+            }],
+            true,
+        );
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports.len(), 1);
+        assert!(msg.suppress_response);
+        assert_eq!(msg.reports[0].endpoint, Some(0));
+        assert_eq!(msg.reports[0].cluster, Some(0x0028));
+        assert_eq!(msg.reports[0].attribute, Some(0));
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn report_data_multiple_reports_decode() {
+        let mut w1 = Writer::new();
+        w1.put_uint(Tag::Anonymous, 12);
+        let mut w2 = Writer::new();
+        w2.put_uint(Tag::Anonymous, 1);
+        let payload = encode_report_data(
+            &[
+                AttrReportOut {
+                    endpoint: 0,
+                    cluster: CLUSTER_BASIC_INFORMATION,
+                    attribute: ATTR_DATA_MODEL_REVISION,
+                    data_version: 1,
+                    value_tlv: w1.finish(),
+                },
+                AttrReportOut {
+                    endpoint: 0,
+                    cluster: CLUSTER_BASIC_INFORMATION,
+                    attribute: ATTR_VENDOR_ID,
+                    data_version: 1,
+                    value_tlv: w2.finish(),
+                },
+            ],
+            false,
+        );
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports.len(), 2);
+        assert!(!msg.suppress_response);
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(12)));
+        assert_eq!(msg.reports[1].data, Some(serde_json::json!(1)));
     }
 }

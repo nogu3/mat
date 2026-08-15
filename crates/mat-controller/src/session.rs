@@ -3693,23 +3693,11 @@ mod tests {
         assert!(again.is_err(), "CloseSession must not be retransmitted");
     }
 
-    /// Task 7 の `im::encode_invoke_response_status` が無いので、InvokeResponse
-    /// (status=0) のペイロードを手組みする。`decode_invoke_response` が読むのは
-    /// トップレベル struct → tag1 の InvokeResponses array → 最初の要素
-    /// (InvokeResponseIB) の tag0 (CommandDataIB) の有無だけ（中身は skip される
-    /// ので空でよい）— これで outcome.status == 0 になる。
+    /// InvokeResponse (status=0) payload, built with Task 7's server-side
+    /// encoder — `decode_invoke_response` only reads the status out (the
+    /// echoed CommandPath is skipped), so `outcome.status == 0` either way.
     fn invoke_response_status_ok() -> Vec<u8> {
-        use crate::tlv::{Tag, Writer};
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.start_array(Tag::Context(1)); // InvokeResponses
-        w.start_struct(Tag::Anonymous); // InvokeResponseIB
-        w.start_struct(Tag::Context(0)); // CommandDataIB (success, no fields)
-        w.end_container();
-        w.end_container();
-        w.end_container();
-        w.end_container();
-        w.finish()
+        crate::im::encode_invoke_response_status(1, 0x0006, 1, 0, None)
     }
 
     /// T5 の要: `new_device_role` で構築したデバイス役セッションが、
