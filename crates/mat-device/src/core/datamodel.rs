@@ -20,11 +20,6 @@ use mat_controller::tlv::{Tag, Writer};
 /// version 1.
 const UNVERSIONED: u32 = 1;
 
-/// Matter test vendor ID range (spec §2.5.2): 0xFFF1-0xFFF4 are reserved
-/// for testing and never assigned to a real vendor.
-const TEST_VENDOR_ID: u64 = 0xFFF1;
-/// Arbitrary product ID within the test vendor's namespace.
-const TEST_PRODUCT_ID: u64 = 0x8000;
 /// Data model schema revision `mat-device` claims to implement (spec
 /// §7.13, DataModelRevision). Not spec-load-bearing for M1 — just needs to
 /// be a plausible, stable value.
@@ -129,13 +124,20 @@ impl Node {
     /// RootNode, ServerList, PartsList) and BasicInformation
     /// (DataModelRevision, VendorID, ProductID, VendorName="mat",
     /// ProductName="matv") — the minimum a Matter node must expose.
-    pub fn with_root_endpoint() -> Self {
+    /// `vendor_id`/`product_id` come from the runtime's `DeviceConfig` (the
+    /// same values advertised in mDNS TXT records and the commissioning
+    /// QR/manual code) so BasicInformation doesn't drift from what the
+    /// device actually announces itself as.
+    pub fn with_root_endpoint(vendor_id: u16, product_id: u16) -> Self {
         let mut node = Self::new();
         node.add_endpoint(
             0,
             vec![
                 Box::new(DescriptorHandler) as Box<dyn ClusterHandler>,
-                Box::new(BasicInformationHandler) as Box<dyn ClusterHandler>,
+                Box::new(BasicInformationHandler {
+                    vendor_id,
+                    product_id,
+                }) as Box<dyn ClusterHandler>,
             ],
         );
         node
@@ -235,7 +237,18 @@ impl Node {
         let Some(attribute) = path.attribute else {
             return Ok(None);
         };
-        let Some(value_tlv) = handler.read(attribute) else {
+        // ServerList (spec §9.5) must reflect the clusters actually
+        // registered on this endpoint — including ones added after
+        // `with_root_endpoint` (e.g. a device runtime's commissioning
+        // clusters via `add_cluster`), so it's derived here from the
+        // registry rather than left to `DescriptorHandler`'s own `read`
+        // (which has no visibility into its siblings).
+        let value_tlv = if cluster == im::CLUSTER_DESCRIPTOR && attribute == im::ATTR_SERVER_LIST {
+            Some(encode_server_list(clusters))
+        } else {
+            handler.read(attribute)
+        };
+        let Some(value_tlv) = value_tlv else {
             return Err(im::STATUS_UNSUPPORTED_ATTRIBUTE);
         };
         Ok(Some(AttrReportOut {
@@ -324,6 +337,19 @@ fn str_value(v: &str) -> Vec<u8> {
     w.finish()
 }
 
+/// Encodes the Descriptor cluster's `ServerList` (spec §9.5) from the
+/// clusters actually registered on the endpoint — see `Node::resolve_read`'s
+/// override for why this lives here rather than in `DescriptorHandler`.
+fn encode_server_list(clusters: &[Box<dyn ClusterHandler>]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for handler in clusters {
+        w.put_uint(Tag::Anonymous, u64::from(handler.cluster_id()));
+    }
+    w.end_container();
+    w.finish()
+}
+
 /// Descriptor cluster (spec §9.5), mandatory on every endpoint. `mat-device`
 /// serves it only on endpoint 0 for now (a flat, single-endpoint node —
 /// `PartsList` is always empty).
@@ -346,14 +372,9 @@ impl ClusterHandler for DescriptorHandler {
                 w.end_container();
                 Some(w.finish())
             }
-            im::ATTR_SERVER_LIST => {
-                let mut w = Writer::new();
-                w.start_array(Tag::Anonymous);
-                w.put_uint(Tag::Anonymous, u64::from(im::CLUSTER_DESCRIPTOR));
-                w.put_uint(Tag::Anonymous, u64::from(im::CLUSTER_BASIC_INFORMATION));
-                w.end_container();
-                Some(w.finish())
-            }
+            // ATTR_SERVER_LIST is intercepted and derived from the endpoint's
+            // actual cluster registry by `Node::resolve_read` — never
+            // reaches here (see that override's doc comment).
             im::ATTR_PARTS_LIST => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
@@ -373,7 +394,10 @@ impl ClusterHandler for DescriptorHandler {
 /// BasicInformation cluster (spec §11.1), mandatory on endpoint 0. M1 only
 /// serves the identity attributes a controller reads during commissioning;
 /// the rest of the cluster (writable NodeLabel, etc.) is future scope.
-struct BasicInformationHandler;
+struct BasicInformationHandler {
+    vendor_id: u16,
+    product_id: u16,
+}
 
 impl ClusterHandler for BasicInformationHandler {
     fn cluster_id(&self) -> u32 {
@@ -383,8 +407,8 @@ impl ClusterHandler for BasicInformationHandler {
     fn read(&self, attribute: u32) -> Option<Vec<u8>> {
         match attribute {
             im::ATTR_DATA_MODEL_REVISION => Some(uint_value(DATA_MODEL_REVISION)),
-            im::ATTR_VENDOR_ID => Some(uint_value(TEST_VENDOR_ID)),
-            im::ATTR_PRODUCT_ID => Some(uint_value(TEST_PRODUCT_ID)),
+            im::ATTR_VENDOR_ID => Some(uint_value(u64::from(self.vendor_id))),
+            im::ATTR_PRODUCT_ID => Some(uint_value(u64::from(self.product_id))),
             im::ATTR_VENDOR_NAME => Some(str_value("mat")),
             im::ATTR_PRODUCT_NAME => Some(str_value("matv")),
             _ => None,
@@ -404,7 +428,7 @@ mod tests {
 
     #[test]
     fn read_basic_information_data_model_revision() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_read_request(
             0,
             im::CLUSTER_BASIC_INFORMATION,
@@ -427,7 +451,7 @@ mod tests {
 
     #[test]
     fn read_descriptor_device_type_list_is_root_node() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_DEVICE_TYPE_LIST);
         let (opcode, payload) = node
             .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
@@ -443,7 +467,7 @@ mod tests {
 
     #[test]
     fn read_unknown_attribute_yields_status_response() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, 0xFFFF);
         let (opcode, payload) = node
             .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
@@ -455,7 +479,7 @@ mod tests {
 
     #[test]
     fn invoke_unknown_cluster_returns_unsupported_cluster() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_invoke_request(0, 0x9999, 0, None);
         let (opcode, payload) = node
             .handle_im(im::OPCODE_INVOKE_REQUEST, &req, &mut InvokeCtx::default())
@@ -467,7 +491,7 @@ mod tests {
 
     #[test]
     fn invoke_known_cluster_unknown_command_returns_unsupported_command() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_invoke_request(0, im::CLUSTER_BASIC_INFORMATION, 0x7F, None);
         let (opcode, payload) = node
             .handle_im(im::OPCODE_INVOKE_REQUEST, &req, &mut InvokeCtx::default())
@@ -479,12 +503,90 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_rejected() {
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let err = node
             .handle_im(im::OPCODE_WRITE_REQUEST, &[], &mut InvokeCtx::default())
             .unwrap_err();
         assert!(
             matches!(err, ImServerError::UnsupportedOpcode(op) if op == im::OPCODE_WRITE_REQUEST)
+        );
+    }
+
+    #[test]
+    fn read_basic_information_vendor_and_product_id() {
+        let mut node = Node::with_root_endpoint(0x1234, 0x5678);
+        let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_VENDOR_ID);
+        let (_, payload) = node
+            .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
+            .unwrap();
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(0x1234)));
+
+        let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_PRODUCT_ID);
+        let (_, payload) = node
+            .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
+            .unwrap();
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(0x5678)));
+    }
+
+    /// Descriptor's ServerList (spec §9.5) must include every cluster
+    /// actually registered on the endpoint — not just the two
+    /// `with_root_endpoint` starts with — once a device runtime's
+    /// commissioning clusters (`device.rs`: GeneralCommissioning,
+    /// OperationalCredentials) are added via `add_cluster`.
+    #[test]
+    fn descriptor_server_list_reflects_registered_clusters() {
+        use mat_controller::commissioning::{
+            CLUSTER_GENERAL_COMMISSIONING, CLUSTER_OPERATIONAL_CREDENTIALS,
+        };
+
+        struct DummyHandler(u32);
+        impl ClusterHandler for DummyHandler {
+            fn cluster_id(&self) -> u32 {
+                self.0
+            }
+            fn read(&self, _attribute: u32) -> Option<Vec<u8>> {
+                None
+            }
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields_tlv: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+        }
+
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(0, Box::new(DummyHandler(CLUSTER_GENERAL_COMMISSIONING)));
+        node.add_cluster(0, Box::new(DummyHandler(CLUSTER_OPERATIONAL_CREDENTIALS)));
+
+        let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_SERVER_LIST);
+        let (opcode, payload) = node
+            .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
+            .unwrap();
+        assert_eq!(opcode, im::OPCODE_REPORT_DATA);
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports.len(), 1);
+        let ids: Vec<u64> = msg.reports[0]
+            .data
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                u64::from(im::CLUSTER_DESCRIPTOR),
+                u64::from(im::CLUSTER_BASIC_INFORMATION),
+                u64::from(CLUSTER_GENERAL_COMMISSIONING),
+                u64::from(CLUSTER_OPERATIONAL_CREDENTIALS),
+            ]
         );
     }
 }

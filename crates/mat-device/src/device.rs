@@ -123,7 +123,7 @@ impl Device {
         let fabric_store = FabricStore::with_persist(Box::new(store_in_dir(&config.store_dir)));
         let comm_server = CommissioningServer::new(dev, fabric_store);
 
-        let mut node = Node::with_root_endpoint();
+        let mut node = Node::with_root_endpoint(config.vendor_id, config.product_id);
         let (general_commissioning, operational_credentials) = comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);
         node.add_cluster(0, operational_credentials);
