@@ -21,6 +21,10 @@
 //! asymmetric between the two roles, so a mistake on one side breaks the
 //! handshake). It is not a substitute for on-wire interop, only the best
 //! pre-live guard.
+//!
+//! `pase_responder_task` (below) is the PASE counterpart and follows a
+//! narrower version of this doctrine — see its own doc comment for why it
+//! reuses `spake2p`'s primitives directly instead of re-defining them.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -547,6 +551,23 @@ pub async fn responder_task(
 /// secured IM ReadRequest with ReportData(on-off=false). PASE sessions are
 /// unauthenticated: both nonce node ids are 0 (spec §4.13).
 ///
+/// RESIDUAL RISK — narrower than the CASE `responder_task` above: unlike
+/// that responder (which re-implements HKDF/ECDH by hand so both sides are
+/// fully independent), this one deliberately calls the *same* `spake2p`
+/// primitives the initiator uses (`derive_w0_w1`, `build_transcript`,
+/// `split_hash`, `confirmation_keys`, `hmac32`, `encode_point`/
+/// `decode_point` — reusing them is intended, not an oversight; only the
+/// top-level verifier composition `Y = y·P + w0·N` / `Z = y·(X − w0·M)` /
+/// `V = y·L` is independently written here, mirroring the prover's
+/// `x·P + w0·M` / `(pB − w0·N)·x` / `(pB − w0·N)·w1` in `Spake2pProver`).
+/// So this test's guarantee is narrower than CASE's: it catches
+/// orientation, framing, confirmation-direction (cA vs cB), and key-
+/// schedule-wiring bugs (those are asymmetric between initiator and
+/// responder), but a defect *inside* the shared `spake2p` primitives
+/// themselves would affect both roles identically and stay invisible here
+/// — it is not a substitute for the RFC 9383 test vectors
+/// (`rfc9383_p256_vector`) or on-wire interop for that class of bug.
+///
 /// Returns the initiator's observed source `SocketAddr` (same contract as
 /// `responder_task`).
 pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> SocketAddr {
@@ -591,6 +612,9 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         );
     };
 
+    // Fixed (not randomized like CASE's `responder_task`): this responder
+    // serves exactly one self-contained test run, so a collision-checked
+    // random nonzero value would add ceremony without buying anything here.
     let resp_session_id: u16 = 0xB0B1;
 
     // --- PBKDFParamResponse ---
