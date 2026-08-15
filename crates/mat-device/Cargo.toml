@@ -1,0 +1,24 @@
+[package]
+name = "mat-device"
+description = "Matter device-side stack (PASE/CASE responder, IM server) — backend for matv (M1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["net"]
+net = ["dep:tokio", "dep:mat-core"]
+
+[dependencies]
+mat-controller = { workspace = true }
+mat-core = { workspace = true, optional = true }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"], optional = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+mat-controller = { workspace = true, features = ["test-responder"] }
+tempfile = { workspace = true }

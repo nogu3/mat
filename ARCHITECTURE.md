@@ -49,9 +49,11 @@ above it is not `mat`'s concern.
   out of scope. See "Two kinds of groups" below.
 - **Being a Matter device (a bridge).** `mat` only controls Matter devices. Re-
   publishing non-Matter devices as Matter devices for Alexa / Apple / Google is a
-  separate kind of program that *becomes* a Matter device. That belongs in a
-  separate project, not here. Mixing controller and device turns the tool into a
-  home automation hub, which is not the goal.
+  separate kind of program that *becomes* a Matter device. That does not mix
+  into the `mat` / `matd` binaries; the device role lives alongside them as the
+  sibling crate `mat-device` plus a separate binary `matv` (see the 2026-08-15
+  spec). Mixing controller and device *inside `mat`/`matd`* would turn the tool
+  into a home automation hub, which is not the goal.
 - **Scenes, automation, and voice/UI entry points.** "Set many devices to this
   state" logic, and the triggers for it, are out of scope. `mat` fires one shot
   at one device.
@@ -1145,7 +1147,9 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   `matd`).
 - Add session cache, subscriptions, a daemon, or an internal scheduler to `mat`
   (that is `matd`'s role, a separate binary).
-- Bring a Matter bridge (becoming a Matter device) into `mat`.
+- Bring a Matter bridge (becoming a Matter device) into the `mat`/`matd`
+  binaries. The device role lives in the sibling crate `mat-device` plus a
+  separate binary `matv` (see the 2026-08-15 spec).
 - Hold scenes, automation, or voice/UI entry points in `mat`.
 - Render or display QR images on stdout (emit the `qr_payload` string only).
 - Commit credentials, real topology, or real certificates to the repo.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mat-core", "crates/mat", "crates/matd", "crates/mat-controller", "crates/mat-native"]
+members = ["crates/mat-core", "crates/mat", "crates/matd", "crates/mat-controller", "crates/mat-native", "crates/mat-device"]
 
 [workspace.package]
 version = "1.28.0"

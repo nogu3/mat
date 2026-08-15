@@ -31,6 +31,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: clippy (ble)
         run: cargo clippy --all-targets --features ble -- -D warnings
+      - name: check (mat-device core, no I/O)
+        run: cargo check -p mat-device --no-default-features
       - name: test
         run: cargo test
       - name: test (ble)

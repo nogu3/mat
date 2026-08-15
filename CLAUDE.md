@@ -41,7 +41,9 @@ This file is the short list of constraints you must not break.
   `matd`'s resident Subscribe and streams what `matd` sends (matd-only op, no
   direct fallback; `matd` absent is `matd_unavailable`, exit 13).
 - Scenes, automation, voice/UI entry points (out of scope).
-- Being a Matter device / a bridge (a separate project).
+- Being a Matter device / a bridge (not mixed into `mat`/`matd`; the device
+  role lives alongside them as the sibling crate `mat-device` plus a separate
+  binary `matv`, see the 2026-08-15 spec).
 - Rendering or displaying QR images (emit the `qr_payload` string only).
 
 ## Output conventions
