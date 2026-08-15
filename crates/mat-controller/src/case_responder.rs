@@ -277,7 +277,21 @@ impl CaseResponderCore {
         );
         let sig2 = sign_ecdsa_p256(&fabric.op_private_key, &tbs2)
             .map_err(|_| CaseCoreError::Crypto("sigma2 signature"))?;
-        let tbe2 = encode_tbe(&fabric.noc_tlv, fabric.icac_tlv.as_deref(), &sig2);
+        // Sigma2Resume (spec §4.14.2's abbreviated-resume path) is out of M2
+        // scope — this responder always answers with a full Sigma2, so the
+        // resumption id it hands out is never redeemed. It still has to be
+        // present and 16 bytes: chip's Sigma2 parser expects TBE2's tag 4
+        // unconditionally (the top known Echo-interop risk this task fixes),
+        // so we generate and embed one per handshake without persisting it
+        // anywhere.
+        let mut resumption_id = [0u8; 16];
+        getrandom::getrandom(&mut resumption_id).expect("os rng");
+        let tbe2 = encode_tbe(
+            &fabric.noc_tlv,
+            fabric.icac_tlv.as_deref(),
+            &sig2,
+            Some(&resumption_id),
+        );
         let encrypted2 = encrypt_payload(&s2k, TBE2_NONCE, b"", &tbe2)
             .map_err(|_| CaseCoreError::Crypto("sigma2 payload too large"))?;
 
@@ -389,7 +403,9 @@ struct Sigma1Fields {
 
 /// Parses Sigma1: `struct{1: random, 2: session_id, 3: dest_id, 4: eph_pub,
 /// ...}` (any optional fields past tag 4 — resumption, session params — are
-/// ignored; `case::encode_sigma1` never sends them).
+/// ignored; `case::encode_sigma1` never sends them). Resumption fields (tag
+/// 6/7) are deliberately tolerated and ignored — full-handshake fallback per
+/// spec §4.14.2; Sigma2Resume is out of M2 scope.
 fn parse_sigma1(payload: &[u8]) -> Result<Sigma1Fields, CaseCoreError> {
     let mut r = Reader::new(payload);
     match r
@@ -550,9 +566,18 @@ fn encode_tbs(
 }
 
 /// TBE plaintext (encrypted into Sigma2's `encrypted2`):
-/// `struct{1: noc, [2: icac], 3: signature}`. Byte-identical shape to
-/// `case.rs`'s private `encode_tbe3` (used there for TBE3).
-fn encode_tbe(noc: &[u8], icac: Option<&[u8]>, sig: &[u8; 64]) -> Vec<u8> {
+/// `struct{1: noc, [2: icac], 3: signature, [4: resumptionID]}` (spec
+/// §4.14.2). `resumption_id` is `Some` only for TBE2 (TBS3/TBE3 have no
+/// resumption id — the *initiator* builds TBE3 in `case.rs`, not this
+/// module, and never passes one). Byte-identical shape to `case.rs`'s
+/// private `encode_tbe3` when `resumption_id` is `None` (used there for
+/// TBE3).
+fn encode_tbe(
+    noc: &[u8],
+    icac: Option<&[u8]>,
+    sig: &[u8; 64],
+    resumption_id: Option<&[u8; 16]>,
+) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_bytes(Tag::Context(1), noc);
@@ -560,6 +585,9 @@ fn encode_tbe(noc: &[u8], icac: Option<&[u8]>, sig: &[u8; 64]) -> Vec<u8> {
         w.put_bytes(Tag::Context(2), icac);
     }
     w.put_bytes(Tag::Context(3), sig);
+    if let Some(id) = resumption_id {
+        w.put_bytes(Tag::Context(4), id);
+    }
     w.end_container();
     w.finish()
 }
@@ -666,6 +694,101 @@ mod tests {
         let (session_id, eph) = decode_sigma2_session_id_and_eph(&sigma2_bytes);
         assert_eq!(session_id, 0xB0B1);
         assert_ne!(eph, [0u8; 65]); // a real ephemeral point was generated
+    }
+
+    #[test]
+    fn sigma2_tbe_carries_a_16_byte_resumption_id() {
+        let f = fabric();
+        let mut core = CaseResponderCore::new(vec![f.clone()], 0xB0B1);
+
+        let initiator_secret = random_p256_secret();
+        let initiator_eph = eph_pub_bytes(&initiator_secret);
+        let initiator_random = [0x42u8; 32];
+        let dest_id = case_destination_id(
+            &f.ipk_operational,
+            &initiator_random,
+            &f.root_public_key,
+            f.fabric_id,
+            f.node_id,
+        );
+        let sigma1 = encode_sigma1(&initiator_random, 0x1234, &dest_id, &initiator_eph);
+        let CaseOutput::Reply(sigma2, _) = core.on_message(OPCODE_SIGMA1, &sigma1).unwrap() else {
+            panic!("expected Reply")
+        };
+
+        // Sigma2 から responder_random(1)/eph(3)/encrypted2(4) を取り出し S2K を導出
+        let mut r = Reader::new(&sigma2);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let (mut rrand, mut reph, mut enc2) = (None, None, None);
+        loop {
+            let el = r.next().unwrap().expect("truncated sigma2");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(1), Value::Bytes(b)) => {
+                    rrand = Some(<[u8; 32]>::try_from(b).unwrap())
+                }
+                (Tag::Context(3), Value::Bytes(b)) => reph = Some(<[u8; 65]>::try_from(b).unwrap()),
+                (Tag::Context(4), Value::Bytes(b)) => enc2 = Some(b.to_vec()),
+                _ => {}
+            }
+        }
+        let (rrand, reph, enc2) = (rrand.unwrap(), reph.unwrap(), enc2.unwrap());
+        let shared = ecdh(&initiator_secret, &reph).unwrap();
+        let sigma1_hash = sha256(&sigma1);
+        let mut s2k_salt = Vec::new();
+        s2k_salt.extend_from_slice(&f.ipk_operational);
+        s2k_salt.extend_from_slice(&rrand);
+        s2k_salt.extend_from_slice(&reph);
+        s2k_salt.extend_from_slice(&sigma1_hash);
+        let s2k = derive_sigma_key(&shared, &s2k_salt, INFO_S2K);
+        let tbe2 = decrypt_payload(&s2k, TBE2_NONCE, b"", &enc2).unwrap();
+
+        // TBE2 の tag 4 = 16 byte resumption id
+        let mut r = Reader::new(&tbe2);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut resumption = None;
+        loop {
+            let el = r.next().unwrap().expect("truncated tbe2");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(4), Value::Bytes(b)) => resumption = Some(b.to_vec()),
+                _ => {}
+            }
+        }
+        assert_eq!(resumption.expect("tbe2 resumption id").len(), 16);
+    }
+
+    #[test]
+    fn resumption_sigma1_falls_back_to_full_sigma2() {
+        let f = fabric();
+        let mut core = CaseResponderCore::new(vec![f.clone()], 0xB0B1);
+        let initiator_secret = random_p256_secret();
+        let initiator_eph = eph_pub_bytes(&initiator_secret);
+        let initiator_random = [0x42u8; 32];
+        let dest_id = case_destination_id(
+            &f.ipk_operational,
+            &initiator_random,
+            &f.root_public_key,
+            f.fabric_id,
+            f.node_id,
+        );
+        // encode_sigma1 相当 + resumptionID(6) + initiatorResumeMIC(7) を後置
+        let sigma1 = {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(1), &initiator_random);
+            w.put_uint(Tag::Context(2), 0x1234);
+            w.put_bytes(Tag::Context(3), &dest_id);
+            w.put_bytes(Tag::Context(4), &initiator_eph);
+            w.put_bytes(Tag::Context(6), &[0xAB; 16]); // 知らない resumptionID
+            w.put_bytes(Tag::Context(7), &[0xCD; 16]); // resume MIC
+            w.end_container();
+            w.finish()
+        };
+        let CaseOutput::Reply(_, opcode) = core.on_message(OPCODE_SIGMA1, &sigma1).unwrap() else {
+            panic!("expected full Sigma2 fallback")
+        };
+        assert_eq!(opcode, OPCODE_SIGMA2);
     }
 
     #[test]
@@ -787,7 +910,7 @@ mod tests {
 
         let tbs3 = encode_tbs(&fake_noc_tlv, None, &initiator_eph, &responder_eph_pub);
         let sig3 = sign_ecdsa_p256(&fake_op_priv, &tbs3).expect("sign tbs3");
-        let tbe3 = encode_tbe(&fake_noc_tlv, None, &sig3);
+        let tbe3 = encode_tbe(&fake_noc_tlv, None, &sig3, None);
         let encrypted3 = encrypt_payload(&s3k, TBE3_NONCE, b"", &tbe3).expect("encrypt tbe3");
         let sigma3 = {
             let mut w = Writer::new();
