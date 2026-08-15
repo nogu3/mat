@@ -158,3 +158,118 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         }
     }
 }
+
+/// Unit tests for `load_config`'s validation logic — pure function, no
+/// process spawn needed (the spawn-based `tests/cli.rs` only exercises the
+/// happy path end-to-end; these cover each rejection reason directly, per
+/// review round 1: "no automated tests for the config-validation error
+/// paths").
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `body` as `matv.toml` under a fresh tempdir and returns its
+    /// path (dir kept alive by the caller holding the `TempDir`).
+    fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("matv.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    const VALID_BASE: &str = "passcode = 20202021\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\niface = \"lo\"\n";
+
+    #[test]
+    fn accepts_a_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), VALID_BASE);
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.passcode, 20_202_021);
+        assert_eq!(cfg.discriminator, 3840);
+        assert_eq!(cfg.iface, "lo");
+    }
+
+    #[test]
+    fn rejects_passcode_in_deny_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "passcode = 11111111\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\niface = \"lo\"\n",
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("11111111"),
+            "error should mention the offending passcode: {err}"
+        );
+        assert!(
+            err.contains("disallowed"),
+            "error should explain why it's rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_discriminator_at_or_above_4096() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "passcode = 20202021\ndiscriminator = 4096\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\niface = \"lo\"\n",
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("4096"),
+            "error should mention the offending discriminator: {err}"
+        );
+        assert!(
+            err.contains("12 bits"),
+            "error should explain the 12-bit limit: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_passcode_out_of_valid_range() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100_000_000 is out of range but not itself in INVALID_PASSCODES —
+        // isolates the range check from the deny-list check (which runs
+        // second in `load_config`).
+        let path = write_config(
+            dir.path(),
+            "passcode = 100000000\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\niface = \"lo\"\n",
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("100000000"),
+            "error should mention the offending passcode: {err}"
+        );
+        assert!(
+            err.contains("1..="),
+            "error should mention the valid range: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_config_missing_required_field() {
+        let dir = tempfile::tempdir().unwrap();
+        // `iface` omitted entirely (the Task 12 addition not in the brief's
+        // illustrative TOML — deliberately mandatory, see `FileConfig`'s
+        // doc comment).
+        let path = write_config(
+            dir.path(),
+            "passcode = 20202021\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\n",
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("iface"),
+            "error should mention the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unreadable_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.toml");
+        let err = load_config(&missing).unwrap_err();
+        assert!(
+            err.contains("does-not-exist.toml"),
+            "error should mention the offending path: {err}"
+        );
+    }
+}
