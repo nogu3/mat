@@ -593,6 +593,7 @@ mod tests {
     const NODE01_PRIV: &[u8] = include_bytes!("../tests/fixtures/node01_01_privkey.bin");
     const ICA01: &[u8] = include_bytes!("../tests/fixtures/ica01_chip.bin");
     const ROOT01_CHIP: &[u8] = include_bytes!("../tests/fixtures/root01_chip.bin");
+    const ROOT01_PRIV: &[u8] = include_bytes!("../tests/fixtures/root01_privkey.bin");
 
     fn fabric() -> CaseFabric {
         let noc_cert = MatterCert::parse(NODE01_NOC).expect("parse node01_01 noc");
@@ -708,6 +709,97 @@ mod tests {
         assert!(matches!(
             core.on_message(OPCODE_SIGMA1, &sigma1),
             Err(CaseCoreError::UnexpectedMessage(op)) if op == OPCODE_SIGMA1
+        ));
+    }
+
+    /// Drives a *real* Sigma3 (correct S3K, correct TBS3 signature) whose
+    /// NOC chains cleanly to our root — `verify_noc_chain` alone would
+    /// accept it — but whose subject carries a *different* fabric id than
+    /// the fabric we selected in Sigma1/Sigma2. This is the case
+    /// `PeerFabricMismatch` exists for (new authorization-relevant logic,
+    /// not ported from `test_support`'s original hand-rolled responder — no
+    /// prior test exercised it). Everything up to the fabric-id comparison
+    /// must succeed for this test to be meaningful, so a broken/inverted
+    /// comparison would go undetected without it.
+    #[test]
+    fn rejects_peer_noc_chaining_to_our_root_with_a_different_fabric_id() {
+        let f = fabric();
+        let mut core = CaseResponderCore::new(vec![f.clone()], 0xB0B1);
+
+        // --- Sigma1 -> Sigma2, keeping the initiator's ephemeral secret
+        // around (unlike `build_sigma1`) so we can carry the handshake
+        // through to a real Sigma3 below. ---
+        let initiator_secret = random_p256_secret();
+        let initiator_eph = eph_pub_bytes(&initiator_secret);
+        let initiator_random = [0x42u8; 32];
+        let dest_id = case_destination_id(
+            &f.ipk_operational,
+            &initiator_random,
+            &f.root_public_key,
+            f.fabric_id,
+            f.node_id,
+        );
+        let sigma1 = encode_sigma1(&initiator_random, 0x1234, &dest_id, &initiator_eph);
+        let CaseOutput::Reply(sigma2, _opcode) = core.on_message(OPCODE_SIGMA1, &sigma1).unwrap()
+        else {
+            panic!("expected Reply");
+        };
+        let (_responder_session_id, responder_eph_pub) = decode_sigma2_session_id_and_eph(&sigma2);
+        let shared = ecdh(&initiator_secret, &responder_eph_pub).expect("ecdh");
+
+        // --- A second NOC, signed by the SAME root01 key (so
+        // `verify_noc_chain` succeeds), but with a fabric id different from
+        // `f.fabric_id` — the case `PeerFabricMismatch` guards against. ---
+        let root_cert = MatterCert::parse(ROOT01_CHIP).expect("parse root01");
+        let root_priv: [u8; 32] = ROOT01_PRIV.try_into().expect("32 bytes");
+        let wrong_fabric_id = f.fabric_id.wrapping_add(1);
+        let fake_op_secret = random_p256_secret();
+        let fake_op_pub = eph_pub_bytes(&fake_op_secret);
+        let fake_op_priv: [u8; 32] = fake_op_secret.to_bytes().into();
+        let mut serial = [0u8; 8];
+        getrandom::getrandom(&mut serial).expect("os rng");
+        serial[0] &= 0x7F; // BER INTEGER minimal positive form
+        let fake_noc = crate::cert::issue_noc(
+            &fake_op_pub,
+            0xAAAA_BBBB,
+            wrong_fabric_id,
+            &root_cert,
+            &root_priv,
+            &serial,
+        )
+        .expect("issue second noc under root01");
+        // Sanity: this NOC really does chain to our root, so the failure we
+        // assert below is specifically the fabric-id check, not an
+        // (unrelated) chain-verification failure.
+        verify_noc_chain(&fake_noc, None, &root_cert).expect("fake noc chains to root01");
+        let fake_noc_tlv = fake_noc.to_tlv();
+
+        // --- Real Sigma3: correct S3K, correct TBS3 signature under the
+        // fake NOC's own key. ---
+        let mut s1s2 = Vec::with_capacity(sigma1.len() + sigma2.len());
+        s1s2.extend_from_slice(&sigma1);
+        s1s2.extend_from_slice(&sigma2);
+        let sigma12_hash = sha256(&s1s2);
+        let mut s3k_salt = Vec::with_capacity(16 + 32);
+        s3k_salt.extend_from_slice(&f.ipk_operational);
+        s3k_salt.extend_from_slice(&sigma12_hash);
+        let s3k = derive_sigma_key(&shared, &s3k_salt, INFO_S3K);
+
+        let tbs3 = encode_tbs(&fake_noc_tlv, None, &initiator_eph, &responder_eph_pub);
+        let sig3 = sign_ecdsa_p256(&fake_op_priv, &tbs3).expect("sign tbs3");
+        let tbe3 = encode_tbe(&fake_noc_tlv, None, &sig3);
+        let encrypted3 = encrypt_payload(&s3k, TBE3_NONCE, b"", &tbe3).expect("encrypt tbe3");
+        let sigma3 = {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(1), &encrypted3);
+            w.end_container();
+            w.finish()
+        };
+
+        assert!(matches!(
+            core.on_message(OPCODE_SIGMA3, &sigma3),
+            Err(CaseCoreError::PeerFabricMismatch)
         ));
     }
 }
