@@ -17,6 +17,8 @@
 
 use std::path::Path;
 
+use sha2::Digest;
+
 use crate::cert::{KEY_USAGE_CRL_SIGN, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_KEY_CERT_SIGN};
 use crate::tlv::{Reader, Tag, Value};
 use crate::x509::{parse_x509, DerReader, X509Cert, X509Error};
@@ -467,6 +469,7 @@ fn verify_cd_signature_warn(signer_info: &Option<CdSignerInfo>, cd_signer_ders: 
 }
 
 /// CMS SignerInfo から取り出した、署名検証に必要な最小情報。
+#[derive(Debug)]
 struct CdSignerInfo {
     /// 署名対象バイト列（signedAttrs があればそれを SET として再タグ付けした
     /// もの、無ければ eContent そのもの）。
@@ -530,8 +533,49 @@ fn parse_cms_signed_data(der: &[u8]) -> Result<(Vec<u8>, Option<CdSignerInfo>), 
         Ok(c) => c,
         Err(_) => return Ok((cd_tlv, None)),
     };
-    let signer_info = parse_signer_info(first, &cd_tlv).ok();
+    let signer_info = match parse_signer_info(first, &cd_tlv) {
+        Ok(v) => Some(v),
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "certification declaration signerInfo rejected — continuing"
+            );
+            None
+        }
+    };
     Ok((cd_tlv, signer_info))
+}
+
+/// CMS messageDigest 属性 OID 1.2.840.113549.1.9.4（内容バイト）。
+const OID_CMS_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+
+/// signedAttrs（[0] の中身 = SET OF Attribute の要素列）から messageDigest
+/// 属性を探し、`SHA-256(econtent)` と一致することを確認する（CMS §5.4:
+/// signedAttrs 使用時は messageDigest が eContent を署名に結合する。これが
+/// 無いと signedAttrs への正しい署名が eContent と無関係でも通ってしまう）。
+fn verify_message_digest_attr(attrs: &[u8], econtent: &[u8]) -> Result<(), &'static str> {
+    let mut r = DerReader::new(attrs);
+    while !r.is_empty() {
+        let attr = r.expect(0x30).map_err(|_| "bad signedAttrs attribute")?;
+        let mut ar = DerReader::new(attr);
+        let oid = ar
+            .expect(0x06)
+            .map_err(|_| "bad signedAttrs attribute oid")?;
+        if oid != OID_CMS_MESSAGE_DIGEST {
+            continue;
+        }
+        let vals = ar.expect(0x31).map_err(|_| "bad messageDigest value set")?;
+        let mut vr = DerReader::new(vals);
+        let digest = vr
+            .expect(0x04)
+            .map_err(|_| "messageDigest not an octet string")?;
+        let actual: [u8; 32] = sha2::Sha256::digest(econtent).into();
+        if digest == actual {
+            return Ok(());
+        }
+        return Err("signedAttrs messageDigest does not match econtent");
+    }
+    Err("signedAttrs missing messageDigest")
 }
 
 /// `SignerInfo ::= SEQ { version, sid SignerIdentifier, digestAlgorithm,
@@ -547,10 +591,11 @@ fn parse_signer_info(content: &[u8], econtent: &[u8]) -> Result<CdSignerInfo, &'
 
     let mut signed_bytes = econtent.to_vec();
     if r.peek_tag() == Some(0xA0) {
-        let (_, _content, raw) = r.read().map_err(|_| "bad signedAttrs")?;
+        let (_, content, raw) = r.read().map_err(|_| "bad signedAttrs")?;
         if raw.is_empty() {
             return Err("empty signedAttrs");
         }
+        verify_message_digest_attr(content, econtent)?;
         let mut reencoded = Vec::with_capacity(raw.len());
         reencoded.push(0x31); // [0] IMPLICIT -> SET タグに戻す
         reencoded.extend_from_slice(&raw[1..]);
@@ -1368,5 +1413,74 @@ mod tests {
         let (cd, parsed_nonce) = parse_elements(&w.finish()).unwrap();
         assert_eq!(cd, b"real-cd");
         assert_eq!(parsed_nonce, nonce);
+    }
+
+    // --- Task 5: CMS signedAttrs の messageDigest 結合 ---
+
+    /// SignerInfo DER を合成する（version=3, sid=SKID 風ダミー, digestAlg,
+    /// signedAttrs（呼び出し側指定）, sigAlg, signature）。
+    fn make_signer_info(signed_attrs: Option<&[u8]>) -> Vec<u8> {
+        use crate::asn1;
+        let mut parts: Vec<Vec<u8>> = vec![
+            asn1::integer(&[3]),
+            asn1::octet_string(b"sid-dummy"), // SignerIdentifier（CHOICE、中身は読まれない）
+            asn1::seq(&[&asn1::oid(&[
+                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+            ])]), // sha256
+        ];
+        if let Some(attrs) = signed_attrs {
+            parts.push(asn1::context_constructed(0, attrs));
+        }
+        parts.push(asn1::seq(&[&asn1::oid(&[
+            0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,
+        ])])); // ecdsa-sha256
+        parts.push(asn1::octet_string(&[0u8; 8])); // signature（形だけ）
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        // parse_signer_info は SEQ の**中身**を受け取る（呼び出し側で expect(0x30) 済み）
+        refs.concat()
+    }
+
+    /// messageDigest 属性 1 つだけの signedAttrs 内容（[0] の中身）を合成する。
+    fn message_digest_attr(digest: &[u8]) -> Vec<u8> {
+        use crate::asn1;
+        asn1::seq(&[
+            &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04]), // 1.2.840.113549.1.9.4
+            &asn1::set_of(&[&asn1::octet_string(digest)]),
+        ])
+    }
+
+    #[test]
+    fn signer_info_accepts_matching_message_digest() {
+        use sha2::{Digest, Sha256};
+        let econtent = b"cd-tlv-bytes";
+        let digest: [u8; 32] = Sha256::digest(econtent).into();
+        let attrs = message_digest_attr(&digest);
+        let si = make_signer_info(Some(&attrs));
+        let info = parse_signer_info(&si, econtent).unwrap();
+        // signedAttrs 使用時の署名対象は SET(0x31) に再タグ付けされたもの
+        assert_eq!(info.signed_bytes[0], 0x31);
+    }
+
+    #[test]
+    fn signer_info_rejects_mismatched_message_digest() {
+        let attrs = message_digest_attr(&[0xEE; 32]);
+        let si = make_signer_info(Some(&attrs));
+        let err = parse_signer_info(&si, b"cd-tlv-bytes").unwrap_err();
+        assert_eq!(err, "signedAttrs messageDigest does not match econtent");
+    }
+
+    #[test]
+    fn signer_info_rejects_missing_message_digest() {
+        use crate::asn1;
+        // signedAttrs はあるが messageDigest 属性が無い（contentType だけ）
+        let attrs = asn1::seq(&[
+            &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03]),
+            &asn1::set_of(&[&asn1::oid(&[
+                0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x19,
+            ])]),
+        ]);
+        let si = make_signer_info(Some(&attrs));
+        let err = parse_signer_info(&si, b"cd-tlv-bytes").unwrap_err();
+        assert_eq!(err, "signedAttrs missing messageDigest");
     }
 }
