@@ -304,7 +304,7 @@ async fn direct_drive_self_commission_reaches_operational_case() {
     let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
         .expect("device should have written its PAA DER at Device::new");
 
-    tokio::spawn(async move {
+    let device_task = tokio::spawn(async move {
         let _ = device.run().await;
     });
 
@@ -327,15 +327,72 @@ async fn direct_drive_self_commission_reaches_operational_case() {
         assert_eq!(entries[0].node_id, DEVICE_NODE_ID);
     }
 
-    // Restart path: a second `Device::new` over the same store_dir must
-    // reload without error (this is what "operational advert re-published"
-    // depends on inside `net::runtime::run` — see its restart-path doc
-    // comment; a full mDNS assertion belongs in the live test below).
-    let restarted = Device::new(device_config(store_dir.path().to_path_buf()));
-    assert!(
-        restarted.is_ok(),
-        "Device::new should reload the persisted fabric store across a restart: {:?}",
-        restarted.err()
+    // Restart path (full acceptance-criterion check, not just the reload
+    // smoke test above): the spec's acceptance includes "CASE still answers
+    // after a restart" (再起動後も CASE 応答が生きている) — proving that
+    // needs actually killing the first `Device::run`, standing up a *new*
+    // `Device` over the same `store_dir`, and driving a fresh CASE
+    // establishment plus a secured read against it, not just confirming
+    // `Device::new` doesn't error.
+    device_task.abort();
+    let _ = device_task.await;
+
+    let restarted = Device::new(device_config(store_dir.path().to_path_buf()))
+        .expect("Device::new should reload the persisted fabric store across a restart");
+    let restarted_addr = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        restarted.local_addr().port(),
+    );
+    tokio::spawn(async move {
+        let _ = restarted.run().await;
+    });
+
+    let cfg = fast_cfg();
+    let creds = fabric.admin_credentials().expect("admin credentials");
+    let case_transport = Arc::new(Transport::Udp(Arc::new(
+        UdpTransport::bind().await.unwrap(),
+    )));
+    let mut session = None;
+    let mut last_err = None;
+    for _ in 0..10 {
+        match case::establish(
+            Arc::clone(&case_transport),
+            restarted_addr,
+            &creds,
+            DEVICE_NODE_ID,
+            &cfg,
+        )
+        .await
+        {
+            Ok(s) => {
+                session = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+    let mut session =
+        session.unwrap_or_else(|| panic!("CASE re-establish after restart failed: {last_err:?}"));
+
+    // A secured read after the post-restart CASE must actually work — not
+    // just the handshake. VendorID mirrors what this restarted `Device` was
+    // configured with (see `device_config`), so this also re-confirms the
+    // BasicInformation VendorID wiring survives a restart.
+    let value = session
+        .read_attribute(
+            0,
+            mat_controller::im::CLUSTER_BASIC_INFORMATION,
+            mat_controller::im::ATTR_VENDOR_ID,
+            &cfg,
+        )
+        .await
+        .expect("secured read after restart CASE should succeed");
+    assert_eq!(
+        value,
+        mat_controller::im::ImValue::Uint(u64::from(VENDOR_ID))
     );
 }
 
