@@ -277,6 +277,94 @@ impl Spake2pProver {
     }
 }
 
+/// SPAKE2+ 完了後の共有材料（verifier 側）。`c_b` は自分（verifier =
+/// device）が相手に送る確認メッセージ、`expected_c_a` は相手（prover）から
+/// 届くはずの確認メッセージの期待値、`k_e` はセッション鍵導出用の暗号鍵
+/// (spec §3.10.3)。`k_e` は実質的にセッション鍵の種であり秘密情報 —
+/// `Debug` は意図的に実装しない（`PakeShared` と同じ理由）。
+pub struct PakeVerifierShared {
+    pub c_b: [u8; 32],
+    pub expected_c_a: [u8; 32],
+    pub k_e: [u8; 16],
+}
+
+/// SPAKE2+ verifier（device 側 = B 側）。w0/L/y を保持する。いずれも秘密の
+/// パスコード由来の値 / 一時乱数であり、このリポジトリは public なので
+/// `Debug` は絶対に derive しない（`Spake2pProver` と同じ理由）。
+pub struct Spake2pVerifier {
+    w0: Scalar,
+    l: ProjectivePoint,
+    y: Scalar,
+}
+
+impl Spake2pVerifier {
+    /// パスコードから直接 verifier を作る（w0/w1 を導出し L = w1*P を計算）。
+    /// `y` は毎回新規の乱数（spec §3.10 手順1）。
+    pub fn from_passcode(passcode: u32, salt: &[u8], iterations: u32) -> Self {
+        let (w0, w1) = derive_w0_w1(passcode, salt, iterations);
+        let l = ProjectivePoint::GENERATOR * w1;
+        Self {
+            w0,
+            l,
+            y: random_scalar(),
+        }
+    }
+
+    /// `compute_verifier` が出力する PAKEPasscodeVerifier（w0(32B) ||
+    /// L(65B uncompressed SEC1)）から verifier を作る。open-window 発行時に
+    /// 保存しておいた検証材料から、パスコード自体を持たずに verifier 役を
+    /// 再構成できる（spec §3.10 / §5.4.2）。
+    pub fn from_verifier_material(material: &[u8; 97]) -> Result<Self, SpakeError> {
+        let w0 = scalar_from_be_bytes_mod_n(&material[..32]);
+        let l = decode_point(&material[32..])?;
+        Ok(Self {
+            w0,
+            l,
+            y: random_scalar(),
+        })
+    }
+
+    /// pB = y*P + w0*N （RFC 9383 §3.2 の verifier 側 shareV、spec §3.10 手順1）。
+    pub fn p_b(&self) -> [u8; 65] {
+        let n = decode_point(&SPAKE_N).expect("SPAKE_N is a valid embedded constant");
+        let p_b = ProjectivePoint::GENERATOR * self.y + n * self.w0;
+        encode_point(&p_b)
+    }
+
+    /// SPAKE2+ を完了する（spec §3.10 手順2-3）。`p_a` は相手（prover）から
+    /// 届いた shareP。戻り値の `c_b` を相手に送り、相手の確認メッセージが
+    /// `expected_c_a` と一致することを確認してからセッションを確立する。
+    pub fn finish(
+        &self,
+        p_a: &[u8],
+        context: &[u8],
+        id_p: &[u8],
+        id_v: &[u8],
+    ) -> Result<PakeVerifierShared, SpakeError> {
+        let p_a_point = decode_point(p_a)?;
+        let m = decode_point(&SPAKE_M).expect("SPAKE_M is a valid embedded constant");
+        let z = (p_a_point - m * self.w0) * self.y;
+        let v = self.l * self.y;
+        let p_b = self.p_b();
+        let tt = build_transcript(context, id_p, id_v, p_a, &p_b, &z, &v, &self.w0);
+        let (k_a, k_e) = split_hash(&tt);
+        let (kc_a, kc_b) = confirmation_keys(&k_a);
+        Ok(PakeVerifierShared {
+            c_b: hmac32(&kc_b, p_a),
+            expected_c_a: hmac32(&kc_a, &p_b),
+            k_e,
+        })
+    }
+
+    /// テスト専用アクセサ。同じ乱数 `y` を二つの verifier に注入できないため
+    /// `p_b()` 同士は比較できない。代わりに `w0`/`L`（内部の秘密材料）の
+    /// 一致で `from_passcode` と `from_verifier_material` の等価性を検証する。
+    #[cfg(test)]
+    pub(crate) fn w0_l_bytes(&self) -> ([u8; 32], [u8; 65]) {
+        (self.w0.to_bytes().into(), encode_point(&self.l))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +487,31 @@ mod tests {
             p.finish(&[0u8; 65], b"c", b"", b""),
             Err(SpakeError::BadPoint)
         ));
+    }
+
+    #[test]
+    fn prover_and_verifier_agree() {
+        let salt = b"SPAKE2P Key Salt";
+        let (w0, w1) = derive_w0_w1(20202021, salt, 1000);
+        let prover = Spake2pProver::new(w0, w1);
+        let verifier = Spake2pVerifier::from_passcode(20202021, salt, 1000);
+        let p_a = prover.p_a();
+        let p_b = verifier.p_b();
+        let ctx = [0x5A; 32];
+        let vs = verifier.finish(&p_a, &ctx, b"", b"").unwrap();
+        let ps = prover.finish(&p_b, &ctx, b"", b"").unwrap();
+        assert_eq!(ps.c_a, vs.expected_c_a);
+        assert_eq!(ps.expected_c_b, vs.c_b);
+        assert_eq!(ps.k_e, vs.k_e);
+    }
+
+    #[test]
+    fn verifier_material_roundtrip() {
+        let salt = b"SPAKE2P Key Salt";
+        let material = compute_verifier(20202021, salt, 1000);
+        let v1 = Spake2pVerifier::from_passcode(20202021, salt, 1000);
+        let v2 = Spake2pVerifier::from_verifier_material(&material).unwrap();
+        // 同じ乱数 y を注入できないため、p_b 同士ではなく w0/L の一致で検証する。
+        assert_eq!(v1.w0_l_bytes(), v2.w0_l_bytes());
     }
 }

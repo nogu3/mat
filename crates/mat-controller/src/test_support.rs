@@ -545,28 +545,26 @@ pub async fn responder_task(
 // ============================================================================
 
 /// The test-only PASE responder: the mirror of `pase::establish` with the
-/// roles swapped, using real SPAKE2+ *verifier* math (Y = y·P + w0·N,
-/// Z = y·(X − w0·M), V = y·L with L = w1·P). Serves PBKDFParamRequest →
-/// PBKDFParamResponse → Pake1/2/3 → StatusReport(success), then answers one
-/// secured IM ReadRequest with ReportData(on-off=false). PASE sessions are
+/// roles swapped, using the real SPAKE2+ *verifier* role
+/// (`spake2p::Spake2pVerifier`: Y = y·P + w0·N, Z = y·(X − w0·M), V = y·L
+/// with L = w1·P). Serves PBKDFParamRequest → PBKDFParamResponse →
+/// Pake1/2/3 → StatusReport(success), then answers one secured IM
+/// ReadRequest with ReportData(on-off=false). PASE sessions are
 /// unauthenticated: both nonce node ids are 0 (spec §4.13).
 ///
 /// RESIDUAL RISK — narrower than the CASE `responder_task` above: unlike
 /// that responder (which re-implements HKDF/ECDH by hand so both sides are
-/// fully independent), this one deliberately calls the *same* `spake2p`
-/// primitives the initiator uses (`derive_w0_w1`, `build_transcript`,
-/// `split_hash`, `confirmation_keys`, `hmac32`, `encode_point`/
-/// `decode_point` — reusing them is intended, not an oversight; only the
-/// top-level verifier composition `Y = y·P + w0·N` / `Z = y·(X − w0·M)` /
-/// `V = y·L` is independently written here, mirroring the prover's
-/// `x·P + w0·M` / `(pB − w0·N)·x` / `(pB − w0·N)·w1` in `Spake2pProver`).
-/// So this test's guarantee is narrower than CASE's: it catches
-/// orientation, framing, confirmation-direction (cA vs cB), and key-
-/// schedule-wiring bugs (those are asymmetric between initiator and
-/// responder), but a defect *inside* the shared `spake2p` primitives
-/// themselves would affect both roles identically and stay invisible here
-/// — it is not a substitute for the RFC 9383 test vectors
-/// (`rfc9383_p256_vector`) or on-wire interop for that class of bug.
+/// fully independent), this one calls `spake2p::Spake2pVerifier` — the same
+/// production verifier-role type the initiator's `Spake2pProver` is proven
+/// to agree with in `prover_and_verifier_agree` (`spake2p.rs`). So a defect
+/// *inside* `Spake2pVerifier`/`Spake2pProver`'s shared math or key schedule
+/// would affect both roles identically and stay invisible here. What this
+/// test DOES catch is PASE wire-protocol bugs: opcode/tag framing,
+/// PBKDFParamRequest/Response and Pake1/2/3 message layout, confirmation-
+/// direction (cA vs cB) wiring, and the session-key handoff into the
+/// secured IM exchange (those are asymmetric between initiator and
+/// responder) — it is not a substitute for the RFC 9383 test vectors
+/// (`rfc9383_p256_vector`) or on-wire interop for math-level bugs.
 ///
 /// Returns the initiator's observed source `SocketAddr` (same contract as
 /// `responder_task`).
@@ -576,7 +574,6 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         OPCODE_PBKDF_PARAM_RESPONSE,
     };
     use crate::spake2p;
-    use p256::ProjectivePoint;
 
     const ITERATIONS: u32 = 1000;
     const SALT: &[u8; 16] = b"SPAKE2P Key Salt";
@@ -682,21 +679,14 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     };
 
     // --- SPAKE2+ verifier 計算 ---
-    let (w0, w1) = spake2p::derive_w0_w1(passcode, SALT, ITERATIONS);
-    let y = spake2p::random_scalar();
-    let m = spake2p::decode_point(&spake2p::SPAKE_M).expect("SPAKE_M constant");
-    let n = spake2p::decode_point(&spake2p::SPAKE_N).expect("SPAKE_N constant");
-    let p_b_point = ProjectivePoint::GENERATOR * y + n * w0;
-    let p_b = spake2p::encode_point(&p_b_point);
-    let p_a_point = spake2p::decode_point(&p_a).expect("pA on curve");
-    let z = (p_a_point - m * w0) * y;
-    let l = ProjectivePoint::GENERATOR * w1;
-    let v = l * y;
-    let tt = spake2p::build_transcript(&context, b"", b"", &p_a, &p_b, &z, &v, &w0);
-    let (k_a, k_e) = spake2p::split_hash(&tt);
-    let (kc_a, kc_b) = spake2p::confirmation_keys(&k_a);
-    let c_b = spake2p::hmac32(&kc_b, &p_a);
-    let expected_c_a = spake2p::hmac32(&kc_a, &p_b);
+    let verifier = spake2p::Spake2pVerifier::from_passcode(passcode, SALT, ITERATIONS);
+    let p_b = verifier.p_b();
+    let shared = verifier
+        .finish(&p_a, &context, b"", b"")
+        .expect("pA on curve");
+    let k_e = shared.k_e;
+    let c_b = shared.c_b;
+    let expected_c_a = shared.expected_c_a;
 
     // --- Pake2 ---
     let pake2_payload = {
