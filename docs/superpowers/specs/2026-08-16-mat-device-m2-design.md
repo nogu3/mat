@@ -57,7 +57,7 @@ matv を**単一 OnOff 仮想デバイス**として Echo と相互運用させ�
 ## テスト戦略
 
 - 各プロトコル修正は TDD。mat-controller に initiator 側（wildcard read・subscribe 発行）が実装済みのため、多くは自己閉ループの統合テストが書ける
-- **例外: CASE resumption**。controller の initiator は resumption を送らない（`case.rs` に「No optional fields (resumption...) are sent」と明記、Sigma2 の resumptionID も無視）。resumptionID の存在は unit テスト（TBE2 encode 検証）で担保し、resumption 要求 Sigma1 への fallback はテスト資産として controller 側に resumption 発行を足して閉ループ化する（`test_support` と同格の test 資産扱い）
+- **例外: CASE resumption**。controller の initiator は resumption を送らない（`case.rs` に「No optional fields (resumption...) are sent」と明記、Sigma2 の resumptionID も無視）。resumptionID の存在は unit テスト（TBE2 を initiator 側鍵材料で復号して検証）で担保し、resumption 要求 Sigma1 への fallback は resumption フィールド（tag 6/7）を手組みした Sigma1 を responder core に食わせる unit テストで担保する（controller に resumption 発行を実装するより安価に同じ検証ができる）。実地の裏取りは chip-tool ゲートの再起動再接続ステップ
 - chip-tool ゲート・Echo ゲートは統合テストの外側の実機ゲートとして扱う（M1 の `e2e:device:m1` と同じ位置づけ）
 
 ## スコープ外（M2）
