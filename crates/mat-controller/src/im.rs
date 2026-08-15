@@ -105,6 +105,23 @@ pub const STATUS_FAILSAFE_REQUIRED: u8 = 0xCA;
 /// (Task 9) returns this when a command's `CommandFields` TLV fails to
 /// decode.
 pub const STATUS_INVALID_COMMAND: u8 = 0x85;
+/// "The received request cannot be handled" (spec §8.10.1 Table 8-19) —
+/// `mat-device`'s data model dispatch (`core::datamodel::Node::handle_im`)
+/// returns this `StatusResponse` for any opcode it has no handler for
+/// (M2 scope: only `ReadRequest`/`InvokeRequest` are implemented —
+/// `WriteRequest`/`SubscribeRequest`/etc. all land here) instead of
+/// silently dropping the request.
+pub const STATUS_INVALID_ACTION: u8 = 0x80;
+
+/// Global attribute ids every cluster exposes (spec §7.13, Table
+/// "Global Attributes"). `core::datamodel::Node` synthesizes these itself
+/// (`ClusterHandler::attributes()` only enumerates cluster-specific
+/// attributes) — see that module's `read_attribute_value`.
+pub const ATTR_GENERATED_COMMAND_LIST: u32 = 0xFFF8;
+pub const ATTR_ACCEPTED_COMMAND_LIST: u32 = 0xFFF9;
+pub const ATTR_ATTRIBUTE_LIST: u32 = 0xFFFB;
+pub const ATTR_FEATURE_MAP: u32 = 0xFFFC;
+pub const ATTR_CLUSTER_REVISION: u32 = 0xFFFD;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
@@ -770,36 +787,97 @@ pub struct AttrReportOut {
     pub value_tlv: Vec<u8>,
 }
 
+/// One AttributeReportIB (spec §8.9.2.2) to encode: either attribute data
+/// (`AttrReportOut`, the `{1: AttributeDataIB}` shape) or a per-path failure
+/// (`{0: AttributeStatusIB}`) — server-side counterpart of what
+/// `decode_report_data_message` already decodes both variants of
+/// (`AttributeReport::{data, status}`). `core::datamodel::Node::read_entries`
+/// (mat-device) is this type's main producer: wildcard-expanded reads that
+/// hit an unresolvable *concrete* path segment report a per-path status
+/// instead of failing the whole read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportEntryOut {
+    Data(AttrReportOut),
+    Status {
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+        status: u8,
+    },
+}
+
 /// ReportDataMessage (spec §8.9.2): server-side encode, mirroring
-/// `decode_report_data_message`/`decode_report_data`'s nesting. Shape (see
-/// `test_support::report_data_false_suppressed`, the fixture this was
-/// modeled on): `struct{1: array[struct{1: struct{0:DataVersion,
-/// 1:list{2:endpoint,3:cluster,4:attribute}, 2:Data}}], 4:SuppressResponse,
-/// 255:IM_REVISION}`. Every report is a data (not status) AttributeReportIB
-/// — `mat-device`'s data model reports read failures via StatusResponse at
-/// the read-request level today, not per-path AttributeStatusIB.
-pub fn encode_report_data(reports: &[AttrReportOut], suppress_response: bool) -> Vec<u8> {
+/// `decode_report_data_message`'s nesting. Shape: `struct{0:
+/// SubscriptionId?, 1: array[AttributeReportIB], 3: MoreChunkedMessages?,
+/// 4: SuppressResponse, 255: IM_REVISION}`, where each AttributeReportIB is
+/// either `{1: struct{0:DataVersion, 1:list{2:endpoint,3:cluster,
+/// 4:attribute}, 2:Data}}` (data) or `{0: struct{0:
+/// list{2:endpoint,3:cluster,4:attribute}, 1: struct{0:status}}}` (status —
+/// AttributeStatusIB, spec §8.9.6). The general (subscription-capable,
+/// mixed data/status) encoder; `encode_report_data` is the read-only
+/// convenience wrapper over it.
+pub fn encode_report_data_entries(
+    entries: &[ReportEntryOut],
+    suppress_response: bool,
+    subscription_id: Option<u32>,
+    more_chunks: bool,
+) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
+    if let Some(sub_id) = subscription_id {
+        w.put_uint(Tag::Context(0), u64::from(sub_id));
+    }
     w.start_array(Tag::Context(1)); // AttributeReportIBs
-    for report in reports {
+    for entry in entries {
         w.start_struct(Tag::Anonymous); // AttributeReportIB
-        w.start_struct(Tag::Context(1)); // AttributeDataIB
-        w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
-        w.start_list(Tag::Context(1)); // Path
-        w.put_uint(Tag::Context(2), u64::from(report.endpoint));
-        w.put_uint(Tag::Context(3), u64::from(report.cluster));
-        w.put_uint(Tag::Context(4), u64::from(report.attribute));
-        w.end_container(); // Path
-        w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
-        w.end_container(); // AttributeDataIB
+        match entry {
+            ReportEntryOut::Data(report) => {
+                w.start_struct(Tag::Context(1)); // AttributeDataIB
+                w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
+                w.start_list(Tag::Context(1)); // Path
+                w.put_uint(Tag::Context(2), u64::from(report.endpoint));
+                w.put_uint(Tag::Context(3), u64::from(report.cluster));
+                w.put_uint(Tag::Context(4), u64::from(report.attribute));
+                w.end_container(); // Path
+                w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
+                w.end_container(); // AttributeDataIB
+            }
+            ReportEntryOut::Status {
+                endpoint,
+                cluster,
+                attribute,
+                status,
+            } => {
+                w.start_struct(Tag::Context(0)); // AttributeStatusIB
+                w.start_list(Tag::Context(0)); // Path
+                w.put_uint(Tag::Context(2), u64::from(*endpoint));
+                w.put_uint(Tag::Context(3), u64::from(*cluster));
+                w.put_uint(Tag::Context(4), u64::from(*attribute));
+                w.end_container(); // Path
+                w.start_struct(Tag::Context(1)); // StatusIB
+                w.put_uint(Tag::Context(0), u64::from(*status));
+                w.end_container(); // StatusIB
+                w.end_container(); // AttributeStatusIB
+            }
+        }
         w.end_container(); // AttributeReportIB
     }
     w.end_container(); // AttributeReportIBs
+    if more_chunks {
+        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages
+    }
     w.put_bool(Tag::Context(4), suppress_response); // SuppressResponse
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
+}
+
+/// `encode_report_data_entries` convenience wrapper for the common read
+/// case: every report is data (no per-path failures), no subscription id,
+/// no chunking.
+pub fn encode_report_data(reports: &[AttrReportOut], suppress_response: bool) -> Vec<u8> {
+    let entries: Vec<ReportEntryOut> = reports.iter().cloned().map(ReportEntryOut::Data).collect();
+    encode_report_data_entries(&entries, suppress_response, None, false)
 }
 
 /// ReadRequestMessage (spec §8.9.2) の wildcard 版: AttributePathIB から
@@ -2952,5 +3030,110 @@ mod tests {
         assert!(!msg.suppress_response);
         assert_eq!(msg.reports[0].data, Some(serde_json::json!(12)));
         assert_eq!(msg.reports[1].data, Some(serde_json::json!(1)));
+    }
+
+    /// Hand-reads the wire bytes of one `ReportEntryOut::Status` entry to
+    /// pin the exact AttributeStatusIB nesting (spec §8.9.6):
+    /// `AttributeReportIB{0: AttributeStatusIB{0: Path(list), 1:
+    /// StatusIB{0: status}}}` — the shape `decode_attribute_status_ib_full`
+    /// (this file's client-side `decode_report_data_message` decoder)
+    /// already expects.
+    #[test]
+    fn encode_report_data_entries_status_ib_wire_shape() {
+        let payload = encode_report_data_entries(
+            &[ReportEntryOut::Status {
+                endpoint: 1,
+                cluster: CLUSTER_ON_OFF,
+                attribute: ATTR_ON_OFF,
+                status: STATUS_UNSUPPORTED_ATTRIBUTE,
+            }],
+            true,
+            None,
+            false,
+        );
+        let mut r = Reader::new(&payload);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart); // outer struct
+
+        let reports = r.next().unwrap().unwrap();
+        assert_eq!(reports.tag, Tag::Context(1));
+        assert_eq!(reports.value, Value::ArrayStart); // AttributeReportIBs
+
+        let report_ib = r.next().unwrap().unwrap();
+        assert_eq!(report_ib.value, Value::StructStart); // AttributeReportIB
+
+        let status_ib = r.next().unwrap().unwrap();
+        assert_eq!(status_ib.tag, Tag::Context(0));
+        assert_eq!(status_ib.value, Value::StructStart); // AttributeStatusIB
+
+        let path = r.next().unwrap().unwrap();
+        assert_eq!(path.tag, Tag::Context(0));
+        assert_eq!(path.value, Value::ListStart); // Path
+
+        let ep = r.next().unwrap().unwrap();
+        assert_eq!((ep.tag, ep.value), (Tag::Context(2), Value::Uint(1)));
+        let cl = r.next().unwrap().unwrap();
+        assert_eq!(
+            (cl.tag, cl.value),
+            (Tag::Context(3), Value::Uint(u64::from(CLUSTER_ON_OFF)))
+        );
+        let attr = r.next().unwrap().unwrap();
+        assert_eq!(
+            (attr.tag, attr.value),
+            (Tag::Context(4), Value::Uint(u64::from(ATTR_ON_OFF)))
+        );
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd); // end Path
+
+        let status_field = r.next().unwrap().unwrap();
+        assert_eq!(status_field.tag, Tag::Context(1));
+        assert_eq!(status_field.value, Value::StructStart); // StatusIB
+
+        let status = r.next().unwrap().unwrap();
+        assert_eq!(
+            (status.tag, status.value),
+            (
+                Tag::Context(0),
+                Value::Uint(u64::from(STATUS_UNSUPPORTED_ATTRIBUTE))
+            )
+        );
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd); // end StatusIB
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd); // end AttributeStatusIB
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd); // end AttributeReportIB
+    }
+
+    /// A mixed data+status batch, plus a subscription id, decodes correctly
+    /// with the client-side decoder — the realistic path
+    /// `core::datamodel::Node::read_entries` (mat-device) exercises.
+    #[test]
+    fn encode_report_data_entries_mixed_data_and_status_decodes() {
+        let mut w = Writer::new();
+        w.put_bool(Tag::Anonymous, true);
+        let payload = encode_report_data_entries(
+            &[
+                ReportEntryOut::Data(AttrReportOut {
+                    endpoint: 0,
+                    cluster: CLUSTER_BASIC_INFORMATION,
+                    attribute: ATTR_VENDOR_ID,
+                    data_version: 1,
+                    value_tlv: w.finish(),
+                }),
+                ReportEntryOut::Status {
+                    endpoint: 0,
+                    cluster: CLUSTER_BASIC_INFORMATION,
+                    attribute: 0x7777,
+                    status: STATUS_UNSUPPORTED_ATTRIBUTE,
+                },
+            ],
+            true,
+            Some(42),
+            false,
+        );
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.subscription_id, Some(42));
+        assert_eq!(msg.reports.len(), 2);
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(true)));
+        assert_eq!(msg.reports[0].status, None);
+        assert_eq!(msg.reports[1].data, None);
+        assert_eq!(msg.reports[1].attribute, Some(0x7777));
+        assert_eq!(msg.reports[1].status, Some(STATUS_UNSUPPORTED_ATTRIBUTE));
     }
 }

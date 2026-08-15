@@ -60,7 +60,7 @@ use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, MAX_DATAGRAM};
 
 use crate::core::commissioning::CommissioningServer;
-use crate::core::datamodel::{InvokeCtx, Node};
+use crate::core::datamodel::{InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
 use crate::core::pase::PaseVerifierConfig;
@@ -331,7 +331,13 @@ pub(crate) async fn run(
         }
     }
 
-    let mut current_session: Option<(u16, SecureSession)> = None;
+    // Third tuple element: the session's fabric index (spec §7.9) — `0` for
+    // PASE (no fabric yet), the CASE-selected fabric otherwise. Carried
+    // through to every `ReadRequest` this session serves via `ReadCtx`
+    // (`serve_secured`/`serve_secured_message`), so e.g. Operational
+    // Credentials' `CurrentFabricIndex` reflects the reading session, not a
+    // hardcoded value.
+    let mut current_session: Option<(u16, SecureSession, u8)> = None;
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
@@ -385,7 +391,7 @@ pub(crate) async fn run(
                                     0, // PASE: both sides are node id 0 (spec §4.13)
                                     0,
                                 );
-                                current_session = Some((local_session_id, session));
+                                current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
                             }
                             // Established failure: best-effort responder, nothing
                             // more to do — the initiator's own retry/StatusReport
@@ -402,8 +408,8 @@ pub(crate) async fn run(
                                 local_session_id,
                             )
                             .await;
-                            if let Ok((session, _fabric_index)) = outcome {
-                                current_session = Some((local_session_id, session));
+                            if let Ok((session, fabric_index)) = outcome {
+                                current_session = Some((local_session_id, session, fabric_index));
                             }
                         }
                         UnsecuredFlow::Ignore => {}
@@ -413,7 +419,7 @@ pub(crate) async fn run(
 
                 // Secured traffic: only ever the current session (sequential,
                 // one-at-a-time — see module doc).
-                let Some((sid, session)) = current_session.as_mut() else {
+                let Some((sid, session, fabric_index)) = current_session.as_mut() else {
                     continue;
                 };
                 if header.session_id != *sid {
@@ -423,6 +429,7 @@ pub(crate) async fn run(
                     &buf[..n],
                     peer,
                     session,
+                    *fabric_index,
                     &mut node,
                     &comm_server,
                     mdns_ctx.as_ref(),
@@ -467,6 +474,7 @@ async fn serve_secured(
     buf: &[u8],
     from: SocketAddr,
     session: &mut SecureSession,
+    fabric_index: u8,
     node: &mut Node,
     comm_server: &CommissioningServer,
     mdns: Option<&MdnsCtx>,
@@ -476,7 +484,7 @@ async fn serve_secured(
         Ok(None) => return,
         Err(_) => return, // decrypt/screen failure — drop, don't kill the session on noise
     };
-    serve_secured_message(msg, session, node, comm_server, mdns).await;
+    serve_secured_message(msg, session, fabric_index, node, comm_server, mdns).await;
 
     // While `reply_reliable` (inside `serve_secured_message`) was waiting
     // for the ack of *that* reply, a new peer-initiated request on a
@@ -492,7 +500,7 @@ async fn serve_secured(
         if buffered.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
             continue;
         }
-        serve_secured_message(buffered, session, node, comm_server, mdns).await;
+        serve_secured_message(buffered, session, fabric_index, node, comm_server, mdns).await;
     }
 }
 
@@ -502,10 +510,12 @@ async fn serve_secured(
 /// by fabric count growth, CommissioningComplete by decoding the request).
 /// Split out from `serve_secured` so both the datagram just read off the
 /// socket and any buffered peer-initiated request drained afterward go
-/// through the identical path.
+/// through the identical path. `fabric_index` is this session's fabric
+/// index (0 for PASE) — threaded into `ReadCtx` for every `ReadRequest`.
 async fn serve_secured_message(
     msg: mat_controller::exchange::IncomingMessage,
     session: &mut SecureSession,
+    fabric_index: u8,
     node: &mut Node,
     comm_server: &CommissioningServer,
     mdns: Option<&MdnsCtx>,
@@ -528,8 +538,10 @@ async fn serve_secured_message(
     let mut ctx = InvokeCtx {
         attestation_challenge: session.attestation_challenge(),
     };
+    let read_ctx = ReadCtx { fabric_index };
     let fabrics_before = comm_server.fabrics().len();
-    let Ok((resp_opcode, resp_payload)) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx)
+    let Ok((resp_opcode, resp_payload)) =
+        node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
     else {
         return;
     };
@@ -844,7 +856,16 @@ mod tests {
         // which is what makes the drain loop kick in afterward.
         let mut buf = [0u8; MAX_DATAGRAM];
         let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
-        serve_secured(&buf[..n], from, &mut session, &mut node, &comm_server, None).await;
+        serve_secured(
+            &buf[..n],
+            from,
+            &mut session,
+            0,
+            &mut node,
+            &comm_server,
+            None,
+        )
+        .await;
 
         ctrl_task.await.unwrap();
     }

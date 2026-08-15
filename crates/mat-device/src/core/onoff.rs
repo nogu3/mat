@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mat_controller::im;
 use mat_controller::tlv::{Tag, Writer};
 
-use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply};
+use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 
 pub struct OnOffHandler {
     state: Arc<AtomicBool>,
@@ -36,7 +36,11 @@ impl ClusterHandler for OnOffHandler {
         im::CLUSTER_ON_OFF
     }
 
-    fn read(&self, attribute: u32) -> Option<Vec<u8>> {
+    fn attributes(&self) -> Vec<u32> {
+        vec![im::ATTR_ON_OFF]
+    }
+
+    fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
             im::ATTR_ON_OFF => {
                 let mut w = Writer::new();
@@ -63,7 +67,7 @@ impl ClusterHandler for OnOffHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply};
+    use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
     use mat_controller::im;
 
     #[test]
@@ -78,7 +82,7 @@ mod tests {
         h.invoke(im::CMD_ON_OFF_TOGGLE, &[], &mut InvokeCtx::default());
         assert!(!state.load(std::sync::atomic::Ordering::SeqCst));
         // read は TLV bool
-        let tlv = h.read(im::ATTR_ON_OFF).unwrap();
+        let tlv = h.read(im::ATTR_ON_OFF, &ReadCtx::default()).unwrap();
         let mut r = mat_controller::tlv::Reader::new(&tlv);
         assert_eq!(
             r.next().unwrap().unwrap().value,

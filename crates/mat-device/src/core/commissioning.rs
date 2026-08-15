@@ -44,7 +44,7 @@ use mat_controller::im;
 use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::{generate_csr, DevAttestation};
 
-use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply};
+use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::fabric_store::{FabricEntry, FabricStore};
 
 /// Response command ids (spec §11.10.6 / §11.17.6 — the comments next to
@@ -76,9 +76,8 @@ const NOC_STATUS_MISSING_CSR: u8 = 4;
 const NOC_STATUS_TABLE_FULL: u8 = 5;
 
 /// General Commissioning (0x0030) attribute ids this server serves (spec
-/// §11.10.5). `CurrentFabricIndex(5)` is deliberately absent — it needs the
-/// session's fabric index, which the `read` signature doesn't carry yet;
-/// Task 5's `ReadCtx` adds it.
+/// §11.10.5). This cluster has no `CurrentFabricIndex` — that attribute is
+/// Operational Credentials' (see the `ATTR_OC_*` consts below).
 const ATTR_GC_BREADCRUMB: u32 = 0;
 const ATTR_GC_BASIC_COMMISSIONING_INFO: u32 = 1;
 const ATTR_GC_REGULATORY_CONFIG: u32 = 2;
@@ -86,12 +85,16 @@ const ATTR_GC_LOCATION_CAPABILITY: u32 = 3;
 const ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION: u32 = 4;
 
 /// Node Operational Credentials (0x003E) attribute ids this server serves
-/// (spec §11.17.5).
+/// (spec §11.17.5). `CurrentFabricIndex(5)` was deliberately absent through
+/// Task 4 — it needs the session's fabric index, which the old `read`
+/// signature didn't carry; Task 5's `ReadCtx` adds it (see
+/// `read_operational_credentials`).
 const ATTR_OC_NOCS: u32 = 0;
 const ATTR_OC_FABRICS: u32 = 1;
 const ATTR_OC_SUPPORTED_FABRICS: u32 = 2;
 const ATTR_OC_COMMISSIONED_FABRICS: u32 = 3;
 const ATTR_OC_TRUSTED_ROOT_CERTIFICATES: u32 = 4;
+const ATTR_OC_CURRENT_FABRIC_INDEX: u32 = 5;
 
 /// Placeholder Certification Declaration bytes signed into
 /// `AttestationResponse`'s `AttestationElements`. `mat-device` has no real
@@ -252,7 +255,17 @@ impl ClusterHandler for GeneralCommissioningHandler {
         CLUSTER_GENERAL_COMMISSIONING
     }
 
-    fn read(&self, attribute: u32) -> Option<Vec<u8>> {
+    fn attributes(&self) -> Vec<u32> {
+        vec![
+            ATTR_GC_BREADCRUMB,
+            ATTR_GC_BASIC_COMMISSIONING_INFO,
+            ATTR_GC_REGULATORY_CONFIG,
+            ATTR_GC_LOCATION_CAPABILITY,
+            ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION,
+        ]
+    }
+
+    fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         self.0
             .lock()
             .expect("commissioning server mutex poisoned")
@@ -275,11 +288,22 @@ impl ClusterHandler for OperationalCredentialsHandler {
         CLUSTER_OPERATIONAL_CREDENTIALS
     }
 
-    fn read(&self, attribute: u32) -> Option<Vec<u8>> {
+    fn attributes(&self) -> Vec<u32> {
+        vec![
+            ATTR_OC_NOCS,
+            ATTR_OC_FABRICS,
+            ATTR_OC_SUPPORTED_FABRICS,
+            ATTR_OC_COMMISSIONED_FABRICS,
+            ATTR_OC_TRUSTED_ROOT_CERTIFICATES,
+            ATTR_OC_CURRENT_FABRIC_INDEX,
+        ]
+    }
+
+    fn read(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         self.0
             .lock()
             .expect("commissioning server mutex poisoned")
-            .read_operational_credentials(attribute)
+            .read_operational_credentials(attribute, ctx)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
@@ -317,9 +341,7 @@ impl Inner {
     }
 
     /// General Commissioning attribute reads (spec §11.10.5). Answers the
-    /// fixed set chip-tool/Echo read during and right after commissioning;
-    /// `CurrentFabricIndex(5)` is out of scope here (see the `ATTR_GC_*`
-    /// consts' doc comment) — Task 5's `ReadCtx` adds it.
+    /// fixed set chip-tool/Echo read during and right after commissioning.
     fn read_general_commissioning(&self, attribute: u32) -> Option<Vec<u8>> {
         match attribute {
             ATTR_GC_BREADCRUMB => Some(uint_value(0)),
@@ -340,13 +362,17 @@ impl Inner {
 
     /// Node Operational Credentials attribute reads (spec §11.17.5),
     /// reflecting whatever `AddNOC` has installed into `self.store` so far.
-    fn read_operational_credentials(&self, attribute: u32) -> Option<Vec<u8>> {
+    /// `CurrentFabricIndex` (spec §11.17.5.3) is the reading session's own
+    /// fabric index — carried in `ctx` (`ReadCtx`), not derivable from
+    /// `self.store` alone.
+    fn read_operational_credentials(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
             ATTR_OC_NOCS => Some(self.encode_nocs()),
             ATTR_OC_FABRICS => Some(self.encode_fabrics()),
             ATTR_OC_SUPPORTED_FABRICS => Some(uint_value(5)),
             ATTR_OC_COMMISSIONED_FABRICS => Some(uint_value(self.store.entries().len() as u64)),
             ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates()),
+            ATTR_OC_CURRENT_FABRIC_INDEX => Some(uint_value(u64::from(ctx.fabric_index))),
             _ => None,
         }
     }
@@ -806,7 +832,7 @@ mod tests {
         let server = test_server();
         let (gc, _) = server.into_cluster_handlers();
         let tlv = gc
-            .read(ATTR_GC_BASIC_COMMISSIONING_INFO)
+            .read(ATTR_GC_BASIC_COMMISSIONING_INFO, &ReadCtx::default())
             .expect("BasicCommissioningInfo");
 
         let mut r = Reader::new(&tlv);
@@ -831,24 +857,26 @@ mod tests {
         let server = test_server();
         let (gc, _) = server.into_cluster_handlers();
 
-        let breadcrumb = gc.read(ATTR_GC_BREADCRUMB).expect("Breadcrumb");
+        let breadcrumb = gc
+            .read(ATTR_GC_BREADCRUMB, &ReadCtx::default())
+            .expect("Breadcrumb");
         let mut r = Reader::new(&breadcrumb);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0));
 
         let regulatory = gc
-            .read(ATTR_GC_REGULATORY_CONFIG)
+            .read(ATTR_GC_REGULATORY_CONFIG, &ReadCtx::default())
             .expect("RegulatoryConfig");
         let mut r = Reader::new(&regulatory);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0));
 
         let location = gc
-            .read(ATTR_GC_LOCATION_CAPABILITY)
+            .read(ATTR_GC_LOCATION_CAPABILITY, &ReadCtx::default())
             .expect("LocationCapability");
         let mut r = Reader::new(&location);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(2));
 
         let concurrent = gc
-            .read(ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION)
+            .read(ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION, &ReadCtx::default())
             .expect("SupportsConcurrentConnection");
         let mut r = Reader::new(&concurrent);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Bool(true));
@@ -860,7 +888,7 @@ mod tests {
         let (_, oc) = server.into_cluster_handlers();
 
         // NOCs(0): array[ struct{1: noc_tlv, 2: icac_tlv?, 254: fabric_index} ]
-        let nocs_tlv = oc.read(ATTR_OC_NOCS).expect("NOCs");
+        let nocs_tlv = oc.read(ATTR_OC_NOCS, &ReadCtx::default()).expect("NOCs");
         let mut r = Reader::new(&nocs_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
         assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
@@ -880,7 +908,9 @@ mod tests {
 
         // Fabrics(1): array[ struct{1: root_public_key, 2: admin_vendor_id,
         // 3: fabric_id, 4: node_id, 5: label, 254: fabric_index} ]
-        let fabrics_tlv = oc.read(ATTR_OC_FABRICS).expect("Fabrics");
+        let fabrics_tlv = oc
+            .read(ATTR_OC_FABRICS, &ReadCtx::default())
+            .expect("Fabrics");
         let mut r = Reader::new(&fabrics_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
         assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
@@ -909,25 +939,43 @@ mod tests {
 
         // SupportedFabrics / CommissionedFabrics are plain scalars.
         let supported = oc
-            .read(ATTR_OC_SUPPORTED_FABRICS)
+            .read(ATTR_OC_SUPPORTED_FABRICS, &ReadCtx::default())
             .expect("SupportedFabrics");
         let mut r = Reader::new(&supported);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(5));
 
         let commissioned = oc
-            .read(ATTR_OC_COMMISSIONED_FABRICS)
+            .read(ATTR_OC_COMMISSIONED_FABRICS, &ReadCtx::default())
             .expect("CommissionedFabrics");
         let mut r = Reader::new(&commissioned);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
 
         // TrustedRootCertificates(4): array[ bytes(root_tlv) ]
         let roots_tlv = oc
-            .read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES)
+            .read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &ReadCtx::default())
             .expect("TrustedRootCertificates");
         let mut r = Reader::new(&roots_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
         let el = r.next().unwrap().expect("one root cert");
         assert!(matches!(el.value, Value::Bytes(_)));
+    }
+
+    /// `CurrentFabricIndex` (spec §11.17.5.3) echoes back the *reading
+    /// session's* fabric index from `ReadCtx`, not anything derived from
+    /// the fabric table — it's session-scoped, so two different sessions
+    /// against the same installed fabric would report their own selected
+    /// index (M2 has one fabric, but the attribute's whole point is not
+    /// assuming that).
+    #[test]
+    fn oc_current_fabric_index_reflects_read_ctx() {
+        let server = commissioned_server();
+        let (_, oc) = server.into_cluster_handlers();
+
+        let tlv = oc
+            .read(ATTR_OC_CURRENT_FABRIC_INDEX, &ReadCtx { fabric_index: 1 })
+            .expect("CurrentFabricIndex");
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
     }
 
     #[test]
@@ -1226,7 +1274,12 @@ mod tests {
             Some(&encode_arm_fail_safe(120, 1)),
         );
         let (opcode, payload) = node
-            .handle_im(im::OPCODE_INVOKE_REQUEST, &req, &mut ctx)
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut ctx,
+                &crate::core::datamodel::ReadCtx::default(),
+            )
             .unwrap();
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = im::decode_invoke_response_data(&payload).unwrap();
@@ -1242,7 +1295,12 @@ mod tests {
             Some(&encode_cert_chain_request(CERT_TYPE_DAC)),
         );
         let (opcode, payload) = node
-            .handle_im(im::OPCODE_INVOKE_REQUEST, &req, &mut ctx)
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut ctx,
+                &crate::core::datamodel::ReadCtx::default(),
+            )
             .unwrap();
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = im::decode_invoke_response_data(&payload).unwrap();
