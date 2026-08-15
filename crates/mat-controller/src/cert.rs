@@ -25,9 +25,9 @@ pub const NOC_VALIDITY_SECS: u32 = 315_360_000;
 // EKU (Matter TLV enum values): serverAuth=1, clientAuth=2. NOC uses client, server.
 const EKU_CLIENT_AUTH: u64 = 2;
 const EKU_SERVER_AUTH: u64 = 1;
-const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 0x0001;
-const KEY_USAGE_KEY_CERT_SIGN: u16 = 0x0020;
-const KEY_USAGE_CRL_SIGN: u16 = 0x0040;
+pub(crate) const KEY_USAGE_DIGITAL_SIGNATURE: u16 = 0x0001;
+pub(crate) const KEY_USAGE_KEY_CERT_SIGN: u16 = 0x0020;
+pub(crate) const KEY_USAGE_CRL_SIGN: u16 = 0x0040;
 
 /// Build and sign a NOC (2-cert chain: signed directly by `issuer`, no ICAC).
 /// `issuer` is the RCAC (self-signed root); `issuer_private_key` its op key.
@@ -802,7 +802,7 @@ fn extension_der(ext: &CertExtension) -> Result<Vec<u8>, CertError> {
 /// digitalSignature = bit 0) -> DER BIT STRING bit `i` at
 /// `bytes[i/8] |= 0x80 >> (i%8)`, trailing zero octets trimmed.
 /// Supports up to bit 8 (decipherOnly), i.e. at most 2 octets.
-fn key_usage_bits(bits: u16) -> (u8, Vec<u8>) {
+pub(crate) fn key_usage_bits(bits: u16) -> (u8, Vec<u8>) {
     let mut bytes = [0u8; 2];
     let mut highest: Option<u32> = None;
     for i in 0..16u32 {

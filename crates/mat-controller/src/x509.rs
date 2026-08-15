@@ -19,6 +19,7 @@ const OID_ECDSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
 const OID_SKID: &[u8] = &[0x55, 0x1D, 0x0E]; // 2.5.29.14
 const OID_AKID: &[u8] = &[0x55, 0x1D, 0x23]; // 2.5.29.35
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13]; // 2.5.29.19
+const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F]; // 2.5.29.15
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
 const OID_MATTER_VID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x01]; // 1.3.6.1.4.1.37244.2.1
 const OID_MATTER_PID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x02]; // 1.3.6.1.4.1.37244.2.2
@@ -81,6 +82,10 @@ pub struct X509Cert {
     pub not_before: Option<String>,
     /// Validity.notAfter の生文字列。意味は `not_before` と同じ。
     pub not_after: Option<String>,
+    /// KeyUsage 拡張（OID 2.5.29.15）。RFC 5280 named-bit を LSB=
+    /// digitalSignature の u16 に正規化（cert.rs の KEY_USAGE_* と同じビット
+    /// 割当）。拡張自体が無ければ `None`。
+    pub key_usage: Option<u16>,
 }
 
 impl X509Cert {
@@ -220,6 +225,7 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
     let mut skid = None;
     let mut akid = None;
     let mut is_ca = None;
+    let mut key_usage = None;
     if t.peek_tag() == Some(0xA3) {
         let ext_wrap = t.expect(0xA3)?;
         let mut ew = DerReader::new(ext_wrap);
@@ -245,8 +251,10 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
                 }
             } else if oid_bytes == OID_BASIC_CONSTRAINTS {
                 is_ca = Some(parse_basic_constraints(value)?);
+            } else if oid_bytes == OID_KEY_USAGE {
+                key_usage = Some(parse_key_usage(value)?);
             }
-            // 他の拡張（KeyUsage 等）は読み捨てる。
+            // 他の拡張は読み捨てる。
         }
     }
 
@@ -265,6 +273,7 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
         is_ca,
         not_before,
         not_after,
+        key_usage,
     })
 }
 
@@ -285,6 +294,24 @@ fn parse_basic_constraints(value: &[u8]) -> Result<bool, X509Error> {
     }
     let b = sr.expect(0x01)?;
     Ok(b.first().copied().unwrap_or(0) != 0)
+}
+
+/// KeyUsage 拡張値（DER BIT STRING）を LSB=digitalSignature の named-bit u16 に
+/// 正規化する（cert.rs の KEY_USAGE_* 定数と同じビット割当）。
+fn parse_key_usage(value: &[u8]) -> Result<u16, X509Error> {
+    let mut vr = DerReader::new(value);
+    let bits = vr.expect(0x03)?;
+    if bits.is_empty() {
+        return Err(X509Error::Der("empty keyUsage bit string"));
+    }
+    let mut out = 0u16;
+    for i in 0..9usize {
+        let byte = 1 + i / 8;
+        if byte < bits.len() && bits[byte] & (0x80 >> (i % 8)) != 0 {
+            out |= 1 << i;
+        }
+    }
+    Ok(out)
 }
 
 /// `Validity ::= SEQ { notBefore Time, notAfter Time }` から 2 つの Time の
@@ -462,7 +489,7 @@ fn extract_hex_tag(s: &str, prefix: &str) -> Option<u16> {
 pub(crate) mod test_support {
     use super::{
         asn1, OID_AKID, OID_BASIC_CONSTRAINTS, OID_CN, OID_ECDSA_SHA256, OID_EC_PUBLIC_KEY,
-        OID_MATTER_PID, OID_MATTER_VID, OID_PRIME256V1, OID_SKID,
+        OID_KEY_USAGE, OID_MATTER_PID, OID_MATTER_VID, OID_PRIME256V1, OID_SKID,
     };
 
     /// 最小の自己/他者署名 X.509 証明書を合成する（DER バイト列）。
@@ -494,6 +521,7 @@ pub(crate) mod test_support {
             is_ca,
             if is_ca { None } else { vid_pid },
             vid_pid,
+            if is_ca { Some(0x0060) } else { Some(0x0001) },
         )
     }
 
@@ -503,6 +531,7 @@ pub(crate) mod test_support {
     /// vid_pid を落とす）が邪魔になるケース — 例: cA=true なのに DAC 相当の
     /// Name 構造を持つ「不正な DAC」を合成して attestation の cA 拒否分岐
     /// **だけ** を踏ませたいテスト — 用。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn make_test_cert_ext(
         subject: &[u8],
         issuer: &[u8],
@@ -511,6 +540,7 @@ pub(crate) mod test_support {
         emit_ca_basic_constraints: bool,
         issuer_vid_pid: Option<(u16, u16)>,
         subject_vid_pid: Option<(u16, u16)>,
+        key_usage: Option<u16>,
     ) -> Vec<u8> {
         use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -549,6 +579,9 @@ pub(crate) mod test_support {
         }
         ext_items.push(skid_ext(&subject_skid));
         ext_items.push(akid_ext(&signer_skid));
+        if let Some(bits) = key_usage {
+            ext_items.push(key_usage_ext(bits));
+        }
         let ext_refs: Vec<&[u8]> = ext_items.iter().map(Vec::as_slice).collect();
         let extensions = asn1::context_constructed(3, &asn1::seq(&ext_refs));
 
@@ -624,6 +657,18 @@ pub(crate) mod test_support {
         let value = asn1::seq(&[&asn1::boolean(true)]);
         asn1::seq(&[
             &asn1::oid(OID_BASIC_CONSTRAINTS),
+            &asn1::boolean(true),
+            &asn1::octet_string(&value),
+        ])
+    }
+
+    /// KeyUsage 拡張（critical、RFC 5280 §4.2.1.3）。ビット割当は cert.rs の
+    /// KEY_USAGE_*（LSB=digitalSignature）。
+    fn key_usage_ext(bits: u16) -> Vec<u8> {
+        let (unused, bytes) = crate::cert::key_usage_bits(bits);
+        let value = asn1::bit_string(unused, &bytes);
+        asn1::seq(&[
+            &asn1::oid(OID_KEY_USAGE),
             &asn1::boolean(true),
             &asn1::octet_string(&value),
         ])
@@ -733,20 +778,26 @@ mod tests {
         // openssl x509 -text で確認済み: Root01/ICA01 は CA:TRUE、
         // Node01_01 は CA:FALSE、Validity は 3 通とも
         // 2020-10-15T14:23:43Z 〜 2040-10-15T14:23:42Z（UTCTime）。
+        // KeyUsage は openssl x509 -text -noout で確認済み:
+        // Root01/ICA01 = critical, Certificate Sign + CRL Sign (0x0060)、
+        // Node01_01 = critical, Digital Signature (0x0001)。
         let root = parse_x509(ROOT01_DER).unwrap();
         assert_eq!(root.is_ca, Some(true));
         assert_eq!(root.not_before.as_deref(), Some("201015142343Z"));
         assert_eq!(root.not_after.as_deref(), Some("401015142342Z"));
+        assert_eq!(root.key_usage, Some(0x0060));
 
         let ica = parse_x509(ICA01_DER).unwrap();
         assert_eq!(ica.is_ca, Some(true));
         assert_eq!(ica.not_before.as_deref(), Some("201015142343Z"));
         assert_eq!(ica.not_after.as_deref(), Some("401015142342Z"));
+        assert_eq!(ica.key_usage, Some(0x0060));
 
         let node = parse_x509(NODE01_01_DER).unwrap();
         assert_eq!(node.is_ca, Some(false));
         assert_eq!(node.not_before.as_deref(), Some("201015142343Z"));
         assert_eq!(node.not_after.as_deref(), Some("401015142342Z"));
+        assert_eq!(node.key_usage, Some(0x0001));
     }
 
     #[test]
@@ -757,5 +808,17 @@ mod tests {
         let der = make_test_cert(b"leaf", b"leaf", &key, &key, false, None);
         let cert = parse_x509(&der).unwrap();
         assert_eq!(cert.is_ca, None);
+    }
+
+    #[test]
+    fn parses_key_usage_from_test_certs() {
+        let key = random_p256_secret();
+        // make_test_cert: CA には keyCertSign|cRLSign、leaf には
+        // digitalSignature が既定で付く。
+        let ca = parse_x509(&make_test_cert(b"root", b"root", &key, &key, true, None)).unwrap();
+        assert_eq!(ca.key_usage, Some(0x0060));
+        let leaf_der = make_test_cert(b"leaf", b"root", &random_p256_secret(), &key, false, None);
+        let leaf = parse_x509(&leaf_der).unwrap();
+        assert_eq!(leaf.key_usage, Some(0x0001));
     }
 }

@@ -770,6 +770,7 @@ mod tests {
             false,
             Some((0xFFF2, 0x8001)),
             Some((0xFFF1, 0x8001)),
+            Some(0x0001),
         );
         let nonce = [5u8; 32];
         let challenge = [6u8; 16];
@@ -817,6 +818,7 @@ mod tests {
             false,
             None,
             Some((0xFFF1, 0x8001)),
+            Some(0x0001),
         );
         let dac = make_test_cert(
             b"dac",
@@ -881,6 +883,7 @@ mod tests {
             true,
             Some((0xFFF1, 0x8001)),
             Some((0xFFF1, 0x8001)),
+            Some(0x0001),
         );
         let nonce = [5u8; 32];
         let challenge = [6u8; 16];
