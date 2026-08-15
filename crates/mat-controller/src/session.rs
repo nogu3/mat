@@ -175,6 +175,37 @@ impl SecureSession {
         }
     }
 
+    /// デバイス役の構築: `new()` はこちらが exchange initiator（コントローラ）
+    /// であることを前提にしている（`seal` は常に `keys.i2r` で封じ、`screen` は
+    /// 常に `keys.r2i` で開ける）。デバイス役は鍵の使い方が逆（自分が送るのは
+    /// `r2i`、相手から届くのは `i2r`）なので、`keys` の i2r/r2i を入れ替えて
+    /// `new()` に渡す薄い糖衣。session id / node id は呼び出し側が「自分（デバイス）
+    /// の local/peer」として渡す通常どおりの値でよい（`new()` と同じ意味）。
+    pub fn new_device_role(
+        transport: Arc<Transport>,
+        peer: SocketAddr,
+        local_session_id: u16,
+        peer_session_id: u16,
+        keys: SessionKeys,
+        local_node_id: u64,
+        peer_node_id: u64,
+    ) -> Self {
+        let swapped = SessionKeys {
+            i2r: keys.r2i,
+            r2i: keys.i2r,
+            attestation_challenge: keys.attestation_challenge,
+        };
+        Self::new(
+            transport,
+            peer,
+            local_session_id,
+            peer_session_id,
+            swapped,
+            local_node_id,
+            peer_node_id,
+        )
+    }
+
     pub fn peer_node_id(&self) -> u64 {
         self.peer_node_id
     }
@@ -1040,6 +1071,129 @@ impl SecureSession {
                 if acked {
                     return Ok(());
                 }
+            }
+            attempts += 1;
+            if attempts > cfg.max_retries {
+                return Err(SessionError::Timeout);
+            }
+            interval = interval.mul_f64(cfg.backoff);
+        }
+    }
+
+    /// デバイス役: peer-initiated のリクエストを 1 件受ける。ack 送出/重複排除は
+    /// `screen_with` が(フィルタに関わらず)常に処理するため、ここでは
+    /// `ScreenFilter::AnyPeerInitiated` で待ち受けて最初の実メッセージ（standalone
+    /// ack を除く）を返すだけでよい。`next_subscription_report` のポンプと同型
+    /// （あちらは opcode を `ReportData` に固定してデコードまでするのに対し、
+    /// こちらはデコードせず `IncomingMessage` を生で返す汎用版）。screen が
+    /// フィルタ落ちで `peer_initiated` に待避したメッセージがあれば先にそれを
+    /// 返す（待避条件は今のところ ReportData のみだが、将来の待避種別が増えても
+    /// 取りこぼさないよう同じ規律に倣う）。
+    pub async fn recv_request(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<IncomingMessage, SessionError> {
+        if let Some(m) = self.peer_initiated.pop_front() {
+            return Ok(m);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SessionError::Timeout);
+            }
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let Ok(recv) =
+                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
+            else {
+                return Err(SessionError::Timeout);
+            };
+            let (n, from) = recv?;
+            let Some(msg) = self
+                .screen_with(&buf[..n], from, ScreenFilter::AnyPeerInitiated)
+                .await?
+            else {
+                continue;
+            };
+            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
+            {
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
+
+    /// デバイス役: `request` が乗っていた exchange（`request.proto.exchange_id`）
+    /// へ `initiator:false` で応答する。`respond_status`（IM StatusResponse 専用）
+    /// の一般形 — 任意の `protocol_id`/`opcode`/`payload` を送れる。UDP では
+    /// needs_ack + 再送でピアの ack を待ち、ack の代わりに同一 exchange への実
+    /// メッセージが届いたらそれを返す（`send_reliable` と対称的な契約）。Reliable
+    /// transport は 1 回送るだけ（呼び出し元が明示的に応答を待ちたい場合は続けて
+    /// `recv_request`/`recv` を呼べばよい — `ReliableChannel` はバッファするので
+    /// 送信の取りこぼしはない）。
+    pub async fn reply_reliable(
+        &mut self,
+        request: &IncomingMessage,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<Option<IncomingMessage>, SessionError> {
+        let exchange_id = request.proto.exchange_id;
+        if self.transport.is_reliable() {
+            let (datagram, _) = self.seal(
+                exchange_id,
+                false,
+                protocol_id,
+                opcode,
+                false,
+                None,
+                payload,
+            )?;
+            self.transport.send_to(&datagram, self.peer).await?;
+            return Ok(None);
+        }
+        let (datagram, our_counter) =
+            self.seal(exchange_id, false, protocol_id, opcode, true, None, payload)?;
+        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
+        let mut attempts = 0u32;
+        loop {
+            self.transport.send_to(&datagram, self.peer).await?;
+            let deadline = Instant::now()
+                + crate::exchange::jittered_interval(
+                    interval,
+                    cfg.jitter,
+                    crate::exchange::unit_random(),
+                );
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let Ok(recv) =
+                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                let (n, from) = recv?;
+                let Some(msg) = self
+                    .screen_with(&buf[..n], from, ScreenFilter::PeerExchange(exchange_id))
+                    .await?
+                else {
+                    continue;
+                };
+                let acked = msg.proto.acked_counter == Some(our_counter);
+                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
+                if is_standalone_ack {
+                    if acked {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                return Ok(Some(msg));
             }
             attempts += 1;
             if attempts > cfg.max_retries {
@@ -3537,5 +3691,77 @@ mod tests {
         let again =
             tokio::time::timeout(Duration::from_millis(300), device.recv_from(&mut buf)).await;
         assert!(again.is_err(), "CloseSession must not be retransmitted");
+    }
+
+    /// Task 7 の `im::encode_invoke_response_status` が無いので、InvokeResponse
+    /// (status=0) のペイロードを手組みする。`decode_invoke_response` が読むのは
+    /// トップレベル struct → tag1 の InvokeResponses array → 最初の要素
+    /// (InvokeResponseIB) の tag0 (CommandDataIB) の有無だけ（中身は skip される
+    /// ので空でよい）— これで outcome.status == 0 になる。
+    fn invoke_response_status_ok() -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1)); // InvokeResponses
+        w.start_struct(Tag::Anonymous); // InvokeResponseIB
+        w.start_struct(Tag::Context(0)); // CommandDataIB (success, no fields)
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.finish()
+    }
+
+    /// T5 の要: `new_device_role` で構築したデバイス役セッションが、
+    /// `recv_request` でコントローラの InvokeRequest を受け、`reply_reliable` で
+    /// InvokeResponse を返す往復が `SecureSession::invoke` から見て成功すること。
+    /// 鍵/セッション id/ノード id の入れ替えが 1 か所でも狂うと open/seal の
+    /// どちらかが失敗し invoke がエラーになるので、これは入れ替えの正しさの
+    /// 実質的な検証も兼ねる。
+    #[tokio::test]
+    async fn device_role_session_serves_invoke() {
+        use crate::im;
+        let (ta, tb) = ReliableChannel::pair();
+        let keys = SessionKeys {
+            i2r: [1; 16],
+            r2i: [2; 16],
+            attestation_challenge: [0; 16],
+        };
+        let cfg = fast_cfg();
+        let mut ctrl = SecureSession::new(
+            Arc::new(ta),
+            RELIABLE_PEER,
+            10,
+            20,
+            SessionKeys {
+                i2r: keys.i2r,
+                r2i: keys.r2i,
+                attestation_challenge: keys.attestation_challenge,
+            },
+            111,
+            222,
+        );
+        let mut dev =
+            SecureSession::new_device_role(Arc::new(tb), RELIABLE_PEER, 20, 10, keys, 222, 111);
+        let server = tokio::spawn(async move {
+            let req = dev
+                .recv_request(Duration::from_secs(5))
+                .await
+                .expect("device recv_request");
+            assert_eq!(req.proto.opcode, im::OPCODE_INVOKE_REQUEST);
+            let resp = invoke_response_status_ok();
+            dev.reply_reliable(
+                &req,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_RESPONSE,
+                &resp,
+                &fast_cfg(),
+            )
+            .await
+            .expect("device reply_reliable");
+        });
+        let out = ctrl.invoke(1, 0x0006, 1, None, &cfg).await.unwrap();
+        assert_eq!(out.status, 0);
+        server.await.unwrap();
     }
 }
