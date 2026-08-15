@@ -20,7 +20,7 @@ use std::path::Path;
 use sha2::Digest;
 
 use crate::cert::{KEY_USAGE_CRL_SIGN, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_KEY_CERT_SIGN};
-use crate::tlv::{Reader, Tag, Value};
+use crate::tlv::{Reader, Tag, Value, Writer};
 use crate::x509::{parse_x509, DerReader, X509Cert, X509Error};
 
 /// Attestation 検証エラー。strict 系のバリアントのみがここに現れる
@@ -89,6 +89,31 @@ pub fn load_der_dir(dir: &Path) -> Result<Vec<Vec<u8>>, AttestationError> {
         out.push(std::fs::read(&path)?);
     }
     Ok(out)
+}
+
+/// `AttestationElements ::= TLV struct { 1: certification_declaration OCTET
+/// STRING, 2: attestation_nonce OCTET STRING(32), 3: timestamp UINT }` を
+/// 組み立てる。検証側（`verify_device_attestation`/`parse_elements`）と
+/// デバイス側の attestation 応答生成（Task 9）の両方が同じエンコードを
+/// 使えるよう、ここに切り出してある。
+pub fn encode_attestation_elements(cd: &[u8], nonce: &[u8; 32], timestamp: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(1), cd);
+    w.put_bytes(Tag::Context(2), nonce);
+    w.put_uint(Tag::Context(3), u64::from(timestamp));
+    w.end_container();
+    w.finish()
+}
+
+/// DAC 署名対象（TBS）= `elements ‖ attestation_challenge`（spec §11.17.3.1
+/// の AttestationResponse 署名対象）。検証側・デバイス側（Task 9）で同じ
+/// 結合ロジックを共有するための切り出し。
+pub fn attestation_tbs(elements: &[u8], challenge: &[u8; 16]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(elements.len() + challenge.len());
+    msg.extend_from_slice(elements);
+    msg.extend_from_slice(challenge);
+    msg
 }
 
 /// Device Attestation を検証する（spec §6.2 / §11.17）。
@@ -206,9 +231,7 @@ pub fn verify_device_attestation(
     warn_if_out_of_validity("paa", &paa);
 
     // --- attestation 署名（厳格）: DAC 秘密鍵が elements‖challenge に署名したか ---
-    let mut msg = Vec::with_capacity(elements.len() + attestation_challenge.len());
-    msg.extend_from_slice(elements);
-    msg.extend_from_slice(attestation_challenge);
+    let msg = attestation_tbs(elements, attestation_challenge);
     crate::crypto::verify_ecdsa_p256(&dac.public_key, &msg, signature)
         .map_err(|_| AttestationError::Signature)?;
 
@@ -727,18 +750,12 @@ mod tests {
     }
 
     fn elements(nonce: &[u8; 32]) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_bytes(Tag::Context(1), b"fake-cd"); // CD は warn 経路なので偽物で良い
-        w.put_bytes(Tag::Context(2), nonce);
-        w.put_uint(Tag::Context(3), 0); // timestamp
-        w.end_container();
-        w.finish()
+        // CD は warn 経路なので偽物で良い。
+        encode_attestation_elements(b"fake-cd", nonce, 0)
     }
 
     fn sign(fix: &Fixture, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
-        let mut msg = elements.to_vec();
-        msg.extend_from_slice(challenge);
+        let msg = attestation_tbs(elements, challenge);
         let priv_bytes: [u8; 32] = fix.dac_key.to_bytes().into();
         sign_ecdsa_p256(&priv_bytes, &msg).unwrap()
     }
@@ -1467,6 +1484,32 @@ mod tests {
         let si = make_signer_info(Some(&attrs));
         let err = parse_signer_info(&si, b"cd-tlv-bytes").unwrap_err();
         assert_eq!(err, "signedAttrs messageDigest does not match econtent");
+    }
+
+    // --- Task 8: 開発用チェーン生成 ↔ verify_device_attestation の相互検証 ---
+
+    #[test]
+    fn dev_generated_chain_passes_verify_device_attestation() {
+        use crate::x509::generate_dev_attestation;
+
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let nonce = [7u8; 32];
+        let challenge = [8u8; 16];
+        let el = encode_attestation_elements(b"dummy-cd", &nonce, 12345);
+        let tbs = attestation_tbs(&el, &challenge);
+        let sig = sign_ecdsa_p256(&da.dac_private_key, &tbs).unwrap();
+
+        verify_device_attestation(
+            &da.dac_der,
+            &da.pai_der,
+            std::slice::from_ref(&da.paa_der),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap();
     }
 
     #[test]

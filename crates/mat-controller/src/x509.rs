@@ -480,6 +480,71 @@ fn extract_hex_tag(s: &str, prefix: &str) -> Option<u16> {
     u16::from_str_radix(hex, 16).ok()
 }
 
+/// 開発用 DAC 証明書チェーンと `dac_der`/`pai_der`/`paa_der` に対応する
+/// DAC 秘密鍵。**本番のデバイス identity ではない** — `generate_dev_attestation`
+/// が毎回その場生成する使い捨て鍵で署名するだけの自己完結チェーンで、CSA の
+/// 実 PAA にも量産デバイスの秘密鍵にもつながらない。
+#[derive(Debug, Clone)]
+pub struct DevAttestation {
+    /// 自己署名 PAA（Product Attestation Authority）証明書の DER。
+    pub paa_der: Vec<u8>,
+    /// PAA が署名した PAI（Product Attestation Intermediate）証明書の DER。
+    pub pai_der: Vec<u8>,
+    /// PAI が署名した DAC（Device Attestation Certificate）証明書の DER。
+    pub dac_der: Vec<u8>,
+    /// `dac_der` に対応する P-256 秘密鍵（raw 32B）。
+    pub dac_private_key: [u8; 32],
+}
+
+/// 開発/テスト用の PAA→PAI→DAC 証明書チェーンをその場生成する
+/// （VID/PID 拡張・basicConstraints・keyUsage 込み）。
+///
+/// **開発・テスト専用の attestation 素材であり、本番のデバイス identity では
+/// ない。** 本物の Matter 認証（CSA 発行の PAA/PAI、量産デバイスの秘密鍵管理）
+/// は M2 以降もスコープ外 — ここで作るのはローカルプロセス内の使い捨て鍵
+/// だけで署名された、`attestation::verify_device_attestation`（cA・keyUsage・
+/// VID/PID・AKID/SKID 制約）を通すためだけのチェーン。
+pub fn generate_dev_attestation(vid: u16, pid: u16) -> Result<DevAttestation, X509Error> {
+    let paa_key = crate::case::random_p256_secret();
+    let pai_key = crate::case::random_p256_secret();
+    let dac_key = crate::case::random_p256_secret();
+
+    let paa_der =
+        test_support::make_test_cert(b"dev paa", b"dev paa", &paa_key, &paa_key, true, None);
+    let pai_der = test_support::make_test_cert(
+        b"dev pai",
+        b"dev paa",
+        &pai_key,
+        &paa_key,
+        true,
+        Some((vid, pid)),
+    );
+    let dac_der = test_support::make_test_cert(
+        b"dev dac",
+        b"dev pai",
+        &dac_key,
+        &pai_key,
+        false,
+        Some((vid, pid)),
+    );
+
+    let dac_private_key: [u8; 32] = dac_key.to_bytes().into();
+
+    Ok(DevAttestation {
+        paa_der,
+        pai_der,
+        dac_der,
+        dac_private_key,
+    })
+}
+
+/// 開発用鍵で自己署名 PKCS#10 CSR を生成する。**本番の証明書発行フロー
+/// （実 CA への提出）にはまだ繋がらない** — `parse_csr` で検証できる形の
+/// CSR を用意するだけの開発/テスト用ヘルパ。
+pub fn generate_csr(secret: &p256::SecretKey) -> Result<Vec<u8>, X509Error> {
+    Ok(test_support::make_test_csr(secret))
+}
+
 /// Task 5（attestation.rs）のテストが DAC→PAI→PAA フィクスチャチェーンを
 /// 組み立てるのに再利用するテスト用証明書合成ヘルパ。`#[cfg(test)]` ではなく
 /// 常時コンパイルされる `pub(crate)`（クレート内の他モジュールのテストから
@@ -808,6 +873,27 @@ mod tests {
         let der = make_test_cert(b"leaf", b"leaf", &key, &key, false, None);
         let cert = parse_x509(&der).unwrap();
         assert_eq!(cert.is_ca, None);
+    }
+
+    // --- Task 8: dev attestation チェーン / CSR 生成 ---
+
+    #[test]
+    fn dev_attestation_chain_verifies() {
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let dac = parse_x509(&da.dac_der).unwrap();
+        let pai = parse_x509(&da.pai_der).unwrap();
+        let paa = parse_x509(&da.paa_der).unwrap();
+        dac.verify_signed_by(&pai).unwrap();
+        pai.verify_signed_by(&paa).unwrap();
+        assert_eq!(dac.vid, Some(0xFFF1));
+    }
+
+    #[test]
+    fn generated_csr_parses() {
+        let secret = random_p256_secret();
+        let csr = generate_csr(&secret).unwrap();
+        let pubkey = parse_csr(&csr).unwrap();
+        assert_eq!(pubkey.len(), 65);
     }
 
     #[test]
