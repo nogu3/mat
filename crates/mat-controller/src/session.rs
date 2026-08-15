@@ -3764,4 +3764,221 @@ mod tests {
         assert_eq!(out.status, 0);
         server.await.unwrap();
     }
+
+    /// レビュー対応: `device_role_session_serves_invoke` は `ReliableChannel`
+    /// (is_reliable()==true) を使うため `reply_reliable` の UDP/MRP 分岐（1 発
+    /// 送って `Ok(None)` を返すだけ）しか通らない。needs_ack + 再送ループ、
+    /// `ScreenFilter::PeerExchange` でのマッチ、ack 到達での完了は未検証だった。
+    /// この test はプレーンな `UdpTransport` 2 本で `SecureSession::new`（役割の
+    /// 入れ替えは `new_device_role` 側で既に別途検証済みなので、ここでは MRP
+    /// 機構そのものの検証に集中するため素の `new` を使う — `respond_status` の
+    /// 既存 UDP テスト群と同じ流儀）を組み、デバイス起点(initiator=true)の
+    /// リクエストを `recv_request` で受け、`reply_reliable` の最初の送信をわざと
+    /// ack せず、再送された 2 発目にだけ standalone ack を返して完了
+    /// (`Ok(None)`) することを検証する。
+    #[tokio::test]
+    async fn reply_reliable_udp_retransmits_until_acked() {
+        use crate::im;
+        let device = bind_local().await;
+        let dev_addr = device.local_addr().unwrap();
+        let s_transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let s_addr = s_transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&s_transport),
+            dev_addr,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        const REQ_EXCHANGE: u16 = 0xABCD;
+        let resp_payload = invoke_response_status_ok();
+
+        let dev_task = tokio::spawn(async move {
+            // デバイス起点(initiator=true)の InvokeRequest を送る（recv_request の
+            // 材料。ack は要求しない — このテストの主眼は応答側の再送なので、
+            // リクエスト自体の MRP は関与させない）。
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 100,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_INVOKE_REQUEST,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            device.send_to(&req_dg, s_addr).await.unwrap();
+
+            // 1 発目: 受けるだけで ack しない（再送を誘発する）。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n1, _) = device.recv_from(&mut buf).await.unwrap();
+            let (_, p1, body1) = open_from_controller(&buf[..n1]);
+            assert_eq!(p1.exchange_id, REQ_EXCHANGE);
+            assert!(!p1.initiator, "reply must be initiator:false");
+            assert!(p1.needs_ack, "UDP reply must request an ack");
+            assert_eq!(p1.protocol_id, im::PROTOCOL_ID_IM);
+            assert_eq!(p1.opcode, im::OPCODE_INVOKE_RESPONSE);
+            assert_eq!(body1, invoke_response_status_ok());
+
+            // 2 発目（再送）: 同一内容が再送されてくること。今度は standalone ack
+            // を返す — reply_reliable はこれで完了するはず。
+            let (n2, from2) = device.recv_from(&mut buf).await.unwrap();
+            let (h2, p2, body2) = open_from_controller(&buf[..n2]);
+            assert_eq!(p2.exchange_id, REQ_EXCHANGE);
+            assert_eq!(
+                body2, body1,
+                "retransmission must resend the same datagram content"
+            );
+            let ack_header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 101,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let ack_proto = ProtocolHeader {
+                initiator: true, // デバイスがこの exchange の initiator
+                needs_ack: false,
+                acked_counter: Some(h2.message_counter),
+                opcode: OPCODE_MRP_STANDALONE_ACK,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                vendor_id: None,
+            };
+            let ack_dg = seal_message(&R2I, &ack_header, &ack_proto, &[], DEV_NODE).unwrap();
+            device.send_to(&ack_dg, from2).await.unwrap();
+        });
+
+        let req = s
+            .recv_request(Duration::from_secs(5))
+            .await
+            .expect("recv_request over UDP");
+        assert_eq!(req.proto.exchange_id, REQ_EXCHANGE);
+        assert_eq!(req.proto.opcode, im::OPCODE_INVOKE_REQUEST);
+
+        let t0 = std::time::Instant::now();
+        let out = s
+            .reply_reliable(
+                &req,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_RESPONSE,
+                &resp_payload,
+                &fast_cfg(),
+            )
+            .await
+            .expect("reply_reliable completes once acked");
+        assert!(out.is_none(), "standalone ack must yield Ok(None)");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "took {:?}; retransmit interval not honored?",
+            t0.elapsed()
+        );
+        dev_task.await.unwrap();
+    }
+
+    /// レビュー対応: `reply_reliable` の UDP 分岐には、ack の代わりに同一
+    /// exchange へ実メッセージが届いたらそれを `Ok(Some(msg))` として返す枝
+    /// (`send_reliable` と対称的な契約) もある。これを ack 到達完了のケースと
+    /// 分けて別枠で検証する。
+    #[tokio::test]
+    async fn reply_reliable_udp_returns_real_message_instead_of_ack() {
+        use crate::im;
+        let device = bind_local().await;
+        let dev_addr = device.local_addr().unwrap();
+        let s_transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let s_addr = s_transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&s_transport),
+            dev_addr,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        const REQ_EXCHANGE: u16 = 0xBEEF;
+
+        let dev_task = tokio::spawn(async move {
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 200,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_INVOKE_REQUEST,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            device.send_to(&req_dg, s_addr).await.unwrap();
+
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (_, p, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p.exchange_id, REQ_EXCHANGE);
+            assert_eq!(p.opcode, im::OPCODE_INVOKE_RESPONSE);
+
+            // ack ではなく、同一 exchange へ実メッセージ（StatusResponse）を返す。
+            let real_header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 201,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let real_proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_STATUS_RESPONSE,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let real_dg = seal_message(
+                &R2I,
+                &real_header,
+                &real_proto,
+                &im::encode_status_response(0),
+                DEV_NODE,
+            )
+            .unwrap();
+            device.send_to(&real_dg, from).await.unwrap();
+        });
+
+        let req = s
+            .recv_request(Duration::from_secs(5))
+            .await
+            .expect("recv_request over UDP");
+        let out = s
+            .reply_reliable(
+                &req,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_RESPONSE,
+                &invoke_response_status_ok(),
+                &fast_cfg(),
+            )
+            .await
+            .expect("reply_reliable returns the real message");
+        let msg = out.expect("a real (non-ack) message must be returned, not None");
+        assert_eq!(msg.proto.opcode, im::OPCODE_STATUS_RESPONSE);
+        assert_eq!(msg.proto.exchange_id, REQ_EXCHANGE);
+        assert_eq!(im::decode_status_response(&msg.payload).unwrap(), 0);
+        dev_task.await.unwrap();
+    }
 }
