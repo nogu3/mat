@@ -570,7 +570,7 @@ pub async fn responder_task(
 /// `responder_task`).
 pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> SocketAddr {
     use crate::pase::{
-        OPCODE_PASE_PAKE1, OPCODE_PASE_PAKE2, OPCODE_PASE_PAKE3, OPCODE_PBKDF_PARAM_REQUEST,
+        self, OPCODE_PASE_PAKE1, OPCODE_PASE_PAKE2, OPCODE_PASE_PAKE3, OPCODE_PBKDF_PARAM_REQUEST,
         OPCODE_PBKDF_PARAM_RESPONSE,
     };
     use crate::spake2p;
@@ -588,23 +588,12 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
             continue;
         }
         let (h, _) = MessageHeader::decode(&buf).unwrap();
-        // initiatorSessionId は struct の tag 2
-        let mut r = Reader::new(&payload);
-        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
-        let mut sid: Option<u16> = None;
-        loop {
-            let el = r.next().unwrap().expect("pbkdf request truncated");
-            match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => break,
-                (Tag::Context(2), Value::Uint(v)) => sid = Some(v as u16),
-                _ => {}
-            }
-        }
+        let req = pase::decode_pbkdf_param_request(&payload).expect("pbkdf request malformed");
         break (
             payload,
             p.exchange_id,
             h.message_counter,
-            sid.expect("pbkdf request missing initiator session id"),
+            req.initiator_session_id,
             from,
         );
     };
@@ -615,19 +604,13 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     let resp_session_id: u16 = 0xB0B1;
 
     // --- PBKDFParamResponse ---
-    let resp_payload = {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_bytes(Tag::Context(1), &[0u8; 32]); // initiatorRandom echo（initiator は無視）
-        w.put_bytes(Tag::Context(2), &[1u8; 32]); // responderRandom（同上）
-        w.put_uint(Tag::Context(3), u64::from(resp_session_id));
-        w.start_struct(Tag::Context(4));
-        w.put_uint(Tag::Context(1), u64::from(ITERATIONS));
-        w.put_bytes(Tag::Context(2), SALT);
-        w.end_container();
-        w.end_container();
-        w.finish()
-    };
+    let resp_payload = pase::encode_pbkdf_param_response(
+        &[0u8; 32], // initiatorRandom echo（initiator は無視）
+        &[1u8; 32], // responderRandom（同上）
+        resp_session_id,
+        ITERATIONS,
+        SALT,
+    );
     let resp_dg = build_unsecured(
         200,
         OPCODE_PBKDF_PARAM_RESPONSE,
@@ -642,11 +625,7 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         .expect("send pbkdf param response");
 
     // --- PAKE context（spec §4.13.1.2、pase.rs と同じ構成）---
-    let mut hasher = Sha256::new();
-    hasher.update(b"CHIP PAKE V1 Commissioning");
-    hasher.update(&req_payload);
-    hasher.update(&resp_payload);
-    let context: [u8; 32] = hasher.finalize().into();
+    let context = pase::pake_context(&req_payload, &resp_payload);
 
     // --- Pake1 ---
     let (p_a, pake1_exchange, pake1_counter) = loop {
@@ -658,24 +637,8 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
             continue; // PBKDFParamRequest の MRP 再送などは無視
         }
         let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let mut r = Reader::new(&payload);
-        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
-        let mut pa: Option<[u8; 65]> = None;
-        loop {
-            let el = r.next().unwrap().expect("pake1 truncated");
-            match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => break,
-                (Tag::Context(1), Value::Bytes(b)) => {
-                    pa = Some(b.try_into().expect("pA is 65 bytes"))
-                }
-                _ => {}
-            }
-        }
-        break (
-            pa.expect("pake1 missing pA"),
-            p.exchange_id,
-            h.message_counter,
-        );
+        let pa = pase::decode_pake1(&payload).expect("pake1 malformed");
+        break (pa, p.exchange_id, h.message_counter);
     };
 
     // --- SPAKE2+ verifier 計算 ---
@@ -689,14 +652,7 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     let expected_c_a = shared.expected_c_a;
 
     // --- Pake2 ---
-    let pake2_payload = {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_bytes(Tag::Context(1), &p_b);
-        w.put_bytes(Tag::Context(2), &c_b);
-        w.end_container();
-        w.finish()
-    };
+    let pake2_payload = pase::encode_pake2(&p_b, &c_b);
     let pake2_dg = build_unsecured(
         201,
         OPCODE_PASE_PAKE2,
@@ -720,24 +676,8 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
             continue;
         }
         let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let mut r = Reader::new(&payload);
-        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
-        let mut ca: Option<[u8; 32]> = None;
-        loop {
-            let el = r.next().unwrap().expect("pake3 truncated");
-            match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => break,
-                (Tag::Context(1), Value::Bytes(b)) => {
-                    ca = Some(b.try_into().expect("cA is 32 bytes"))
-                }
-                _ => {}
-            }
-        }
-        break (
-            ca.expect("pake3 missing cA"),
-            p.exchange_id,
-            h.message_counter,
-        );
+        let ca = pase::decode_pake3(&payload).expect("pake3 malformed");
+        break (ca, p.exchange_id, h.message_counter);
     };
     assert_eq!(c_a, expected_c_a, "initiator cA mismatch (transcript bug?)");
 

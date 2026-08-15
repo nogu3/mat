@@ -22,14 +22,19 @@ use crate::spake2p::{self, SpakeError};
 use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
 use crate::transport::Transport;
 
-/// PBKDFParamRequest/Response opcodes (spec §4.13.1.2). `pub` (not
-/// `pub(crate)`) — reused by `tests/btp_pase_plumbing.rs` (a separate crate)
-/// so it doesn't have to duplicate these as magic numbers (M6b Task6).
+/// PASE opcodes (spec §4.13.1.2): PBKDFParamRequest/Response and
+/// Pake1/2/3. `pub` (not `pub(crate)`) — `OPCODE_PBKDF_PARAM_REQUEST`/
+/// `_RESPONSE` are reused by `tests/btp_pase_plumbing.rs` (a separate
+/// crate) so it doesn't have to duplicate these as magic numbers (M6b
+/// Task6); `OPCODE_PASE_PAKE1`/`2`/`3` are widened alongside them for the
+/// same reason a future out-of-crate responder (e.g. `mat-device`) would
+/// want them — matching the rest of this module's now-`pub` responder-
+/// direction codec surface (Task 3).
 pub const OPCODE_PBKDF_PARAM_REQUEST: u8 = 0x20;
 pub const OPCODE_PBKDF_PARAM_RESPONSE: u8 = 0x21;
-pub(crate) const OPCODE_PASE_PAKE1: u8 = 0x22;
-pub(crate) const OPCODE_PASE_PAKE2: u8 = 0x23;
-pub(crate) const OPCODE_PASE_PAKE3: u8 = 0x24;
+pub const OPCODE_PASE_PAKE1: u8 = 0x22;
+pub const OPCODE_PASE_PAKE2: u8 = 0x23;
+pub const OPCODE_PASE_PAKE3: u8 = 0x24;
 
 /// Matter PAKE context string prefix for commissioning (spec §4.13.1.2):
 /// `Context = Crypto_Hash("CHIP PAKE V1 Commissioning" || PBKDFParamRequest
@@ -142,17 +147,106 @@ pub(crate) fn encode_pbkdf_param_request(initiator_random: &[u8; 32], session_id
     w.finish()
 }
 
+/// Decoded PBKDFParamRequest fields (responder direction; mirrors
+/// `PbkdfParamResponse` below). `passcodeId` (tag 3) isn't kept — spec
+/// §4.13.1.2 fixes it at 0, so there's nothing for a caller to branch on.
+pub struct PbkdfParamRequest {
+    pub initiator_random: [u8; 32],
+    pub initiator_session_id: u16,
+    pub has_pbkdf_parameters: bool,
+}
+
+/// Parses PBKDFParamRequest: `struct{1: initiatorRandom[32],
+/// 2: initiatorSessionId, 3: passcodeId (ignored), 4: hasPBKDFParameters,
+/// [5: SessionParams (skipped)]}` — the responder-direction counterpart of
+/// `encode_pbkdf_param_request`.
+pub fn decode_pbkdf_param_request(payload: &[u8]) -> Result<PbkdfParamRequest, PaseError> {
+    let mut r = Reader::new(payload);
+    match r
+        .next()
+        .map_err(|_| PaseError::Malformed("tlv"))?
+        .map(|e| e.value)
+    {
+        Some(Value::StructStart) => {}
+        _ => return Err(PaseError::Malformed("top-level struct")),
+    }
+
+    let mut initiator_random: Option<[u8; 32]> = None;
+    let mut initiator_session_id: Option<u16> = None;
+    let mut has_pbkdf_parameters: Option<bool> = None;
+
+    loop {
+        let el = r
+            .next()
+            .map_err(|_| PaseError::Malformed("tlv"))?
+            .ok_or(PaseError::Malformed("truncated"))?;
+        match el.value {
+            Value::ContainerEnd => break,
+            Value::Bytes(b) if el.tag == Tag::Context(1) => {
+                initiator_random = Some(
+                    b.try_into()
+                        .map_err(|_| PaseError::Malformed("initiator random length"))?,
+                );
+            }
+            Value::Uint(v) if el.tag == Tag::Context(2) => {
+                initiator_session_id =
+                    Some(u16::try_from(v).map_err(|_| PaseError::Malformed("session id"))?);
+            }
+            Value::Bool(v) if el.tag == Tag::Context(4) => {
+                has_pbkdf_parameters = Some(v);
+            }
+            Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
+            }
+            _ => {} // e.g. tag 3 (passcodeId): ignored
+        }
+    }
+
+    Ok(PbkdfParamRequest {
+        initiator_random: initiator_random.ok_or(PaseError::Malformed("initiator random"))?,
+        initiator_session_id: initiator_session_id
+            .ok_or(PaseError::Malformed("initiator session id"))?,
+        has_pbkdf_parameters: has_pbkdf_parameters
+            .ok_or(PaseError::Malformed("has pbkdf parameters"))?,
+    })
+}
+
 /// Decoded PBKDFParamResponse fields we actually need.
-pub(crate) struct PbkdfParamResponse {
+pub struct PbkdfParamResponse {
     pub responder_session_id: u16,
     pub iterations: u32,
     pub salt: Vec<u8>,
 }
 
+/// Encodes PBKDFParamResponse: `struct{1: initiatorRandom (echoed back),
+/// 2: responderRandom, 3: responderSessionId,
+/// 4: struct{1: iterations, 2: salt}}`. The optional SessionParams (tag 5)
+/// is never sent — responder-direction counterpart of
+/// `decode_pbkdf_param_response`.
+pub fn encode_pbkdf_param_response(
+    initiator_random: &[u8; 32],
+    responder_random: &[u8; 32],
+    responder_session_id: u16,
+    iterations: u32,
+    salt: &[u8],
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(1), initiator_random);
+    w.put_bytes(Tag::Context(2), responder_random);
+    w.put_uint(Tag::Context(3), u64::from(responder_session_id));
+    w.start_struct(Tag::Context(4));
+    w.put_uint(Tag::Context(1), u64::from(iterations));
+    w.put_bytes(Tag::Context(2), salt);
+    w.end_container();
+    w.end_container();
+    w.finish()
+}
+
 /// Parses PBKDFParamResponse: `struct{1: initiatorRandom (ignored),
 /// 2: responderRandom[32] (ignored), 3: responderSessionId,
 /// 4: struct{1: iterations, 2: salt}, [5: SessionParams (skipped)]}`.
-pub(crate) fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse, PaseError> {
+pub fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse, PaseError> {
     let mut r = Reader::new(payload);
     match r
         .next()
@@ -230,6 +324,55 @@ pub(crate) fn encode_pake1(p_a: &[u8; 65]) -> Vec<u8> {
     w.finish()
 }
 
+/// Parses Pake1: `struct{1: pA[65]}` — responder-direction counterpart of
+/// `encode_pake1`.
+pub fn decode_pake1(payload: &[u8]) -> Result<[u8; 65], PaseError> {
+    let mut r = Reader::new(payload);
+    match r
+        .next()
+        .map_err(|_| PaseError::Malformed("tlv"))?
+        .map(|e| e.value)
+    {
+        Some(Value::StructStart) => {}
+        _ => return Err(PaseError::Malformed("top-level struct")),
+    }
+
+    let mut p_a: Option<[u8; 65]> = None;
+
+    loop {
+        let el = r
+            .next()
+            .map_err(|_| PaseError::Malformed("tlv"))?
+            .ok_or(PaseError::Malformed("truncated"))?;
+        match el.value {
+            Value::ContainerEnd => break,
+            Value::Bytes(b) if el.tag == Tag::Context(1) => {
+                p_a = Some(
+                    b.try_into()
+                        .map_err(|_| PaseError::Malformed("pA length"))?,
+                );
+            }
+            Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
+            }
+            _ => {}
+        }
+    }
+
+    p_a.ok_or(PaseError::Malformed("pA"))
+}
+
+/// Encodes Pake2: `struct{1: pB[65], 2: cB[32]}` — responder-direction
+/// counterpart of `decode_pake2`.
+pub fn encode_pake2(p_b: &[u8; 65], c_b: &[u8; 32]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(1), p_b);
+    w.put_bytes(Tag::Context(2), c_b);
+    w.end_container();
+    w.finish()
+}
+
 /// Parses Pake2: `struct{1: pB[65], 2: cB[32]}`.
 pub(crate) fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
     let mut r = Reader::new(payload);
@@ -284,6 +427,58 @@ pub(crate) fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
     w.put_bytes(Tag::Context(1), c_a);
     w.end_container();
     w.finish()
+}
+
+/// Parses Pake3: `struct{1: cA[32]}` — responder-direction counterpart of
+/// `encode_pake3`.
+pub fn decode_pake3(payload: &[u8]) -> Result<[u8; 32], PaseError> {
+    let mut r = Reader::new(payload);
+    match r
+        .next()
+        .map_err(|_| PaseError::Malformed("tlv"))?
+        .map(|e| e.value)
+    {
+        Some(Value::StructStart) => {}
+        _ => return Err(PaseError::Malformed("top-level struct")),
+    }
+
+    let mut c_a: Option<[u8; 32]> = None;
+
+    loop {
+        let el = r
+            .next()
+            .map_err(|_| PaseError::Malformed("tlv"))?
+            .ok_or(PaseError::Malformed("truncated"))?;
+        match el.value {
+            Value::ContainerEnd => break,
+            Value::Bytes(b) if el.tag == Tag::Context(1) => {
+                c_a = Some(
+                    b.try_into()
+                        .map_err(|_| PaseError::Malformed("cA length"))?,
+                );
+            }
+            Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
+            }
+            _ => {}
+        }
+    }
+
+    c_a.ok_or(PaseError::Malformed("cA"))
+}
+
+/// Computes the PAKE context hash (spec §4.13.1.2):
+/// `Context = SHA256("CHIP PAKE V1 Commissioning" || PBKDFParamRequest ||
+/// PBKDFParamResponse)`. Both sides derive the same value from the raw
+/// wire bytes they sent/received (not re-encoded), so `establish` and
+/// `test_support::pase_responder_task` both call this on the exact request
+/// and response byte strings that crossed the wire.
+pub fn pake_context(request_bytes: &[u8], response_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PAKE_CONTEXT_PREFIX);
+    hasher.update(request_bytes);
+    hasher.update(response_bytes);
+    hasher.finalize().into()
 }
 
 /// Runs the PASE initiator handshake against `peer` and returns the
@@ -360,11 +555,7 @@ pub async fn establish(
     }
 
     // 3. PAKE context (spec §4.13.1.2).
-    let mut hasher = Sha256::new();
-    hasher.update(PAKE_CONTEXT_PREFIX);
-    hasher.update(&req);
-    hasher.update(&resp_payload);
-    let context: [u8; 32] = hasher.finalize().into();
+    let context = pake_context(&req, &resp_payload);
 
     // 4. Pake1 / Pake2.
     let (w0, w1) = spake2p::derive_w0_w1(passcode, &resp.salt, resp.iterations);
@@ -747,6 +938,47 @@ mod tests {
                 "responder session id must be non-zero"
             ))
         ));
+    }
+
+    // --- Task 3: responder-direction codec halves + pake_context (RED) ---
+
+    #[test]
+    fn pbkdf_request_roundtrip() {
+        let bytes = encode_pbkdf_param_request(&[7u8; 32], 0x1234);
+        let req = decode_pbkdf_param_request(&bytes).unwrap();
+        assert_eq!(req.initiator_random, [7u8; 32]);
+        assert_eq!(req.initiator_session_id, 0x1234);
+        assert!(!req.has_pbkdf_parameters);
+    }
+
+    #[test]
+    fn pbkdf_response_roundtrip() {
+        let bytes =
+            encode_pbkdf_param_response(&[1u8; 32], &[2u8; 32], 0xB0B1, 1000, b"SPAKE2P Key Salt");
+        let resp = decode_pbkdf_param_response(&bytes).unwrap(); // 既存 decoder
+        assert_eq!(resp.responder_session_id, 0xB0B1);
+        assert_eq!(resp.iterations, 1000);
+    }
+
+    #[test]
+    fn pake_message_roundtrips() {
+        assert_eq!(decode_pake1(&encode_pake1(&[3u8; 65])).unwrap(), [3u8; 65]);
+        let p2 = encode_pake2(&[4u8; 65], &[5u8; 32]);
+        assert_eq!(decode_pake2(&p2).unwrap(), ([4u8; 65], [5u8; 32]));
+        assert_eq!(decode_pake3(&encode_pake3(&[6u8; 32])).unwrap(), [6u8; 32]);
+    }
+
+    #[test]
+    fn pake_context_matches_manual_hash() {
+        let req = encode_pbkdf_param_request(&[7u8; 32], 0x1234);
+        let resp =
+            encode_pbkdf_param_response(&[1u8; 32], &[2u8; 32], 0xB0B1, 1000, b"SPAKE2P Key Salt");
+        let mut hasher = Sha256::new();
+        hasher.update(PAKE_CONTEXT_PREFIX);
+        hasher.update(&req);
+        hasher.update(&resp);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(pake_context(&req, &resp), expected);
     }
 
     #[test]
