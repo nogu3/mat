@@ -41,6 +41,9 @@
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::compressed_fabric_id;
@@ -243,11 +246,69 @@ async fn bring_up_mdns(
     })
 }
 
+/// `bring_up_mdns` retry backoff state, kept only while mDNS hasn't come up
+/// yet (review fix round 1, item 1): a boot-time failure — e.g. IPv6
+/// Duplicate Address Detection not finished yet on real hardware — must not
+/// leave the device permanently invisible to discovery while it otherwise
+/// looks up and would happily answer a PASE it never gets to see. Policy is
+/// deliberately simple (not adaptive/jittered): retry every
+/// `MDNS_RETRY_INTERVAL_INITIAL` for the first `MDNS_RETRY_BACKOFF_THRESHOLD`
+/// of failures, then every `MDNS_RETRY_INTERVAL_LONG` — enough to recover
+/// quickly from a transient startup race without hammering a genuinely bad
+/// interface name forever.
+struct MdnsRetry {
+    first_failure_at: Instant,
+    next_attempt_at: Instant,
+}
+
+/// Every 5s while mDNS has been down for less than a minute...
+const MDNS_RETRY_INTERVAL_INITIAL: Duration = Duration::from_secs(5);
+/// ...then every 60s after that.
+const MDNS_RETRY_INTERVAL_LONG: Duration = Duration::from_secs(60);
+const MDNS_RETRY_BACKOFF_THRESHOLD: Duration = Duration::from_secs(60);
+
+impl MdnsRetry {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            first_failure_at: now,
+            next_attempt_at: now + MDNS_RETRY_INTERVAL_INITIAL,
+        }
+    }
+
+    /// Schedules the next attempt after another failure.
+    fn schedule_next(&mut self) {
+        let interval = if self.first_failure_at.elapsed() < MDNS_RETRY_BACKOFF_THRESHOLD {
+            MDNS_RETRY_INTERVAL_INITIAL
+        } else {
+            MDNS_RETRY_INTERVAL_LONG
+        };
+        self.next_attempt_at = Instant::now() + interval;
+    }
+}
+
+/// Resolves once at `retry.next_attempt_at`, or never (`std::future::pending`)
+/// when there's no retry pending (mDNS already up, or never attempted).
+/// Used as a `tokio::select!` branch alongside `recv_from` so the retry
+/// timer can't block datagram serving — a `None` retry state simply makes
+/// this branch inert instead of needing `select!`'s `if` precondition
+/// syntax (simpler to reason about with a value that's re-borrowed fresh
+/// every loop iteration).
+async fn mdns_retry_deadline(retry: &Option<MdnsRetry>) {
+    match retry {
+        Some(r) => tokio::time::sleep_until(r.next_attempt_at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Runs the device: binds nothing itself (the caller already bound
 /// `transport`/`local_addr` — `Device::new` does that synchronously, see
 /// its doc comment for why); brings up mDNS best-effort (see
-/// `bring_up_mdns`'s doc comment — a failure there is logged, not fatal);
-/// then serves datagrams forever.
+/// `bring_up_mdns`'s doc comment — a failure there is logged and retried in
+/// the background per `MdnsRetry`, never fatal); then serves datagrams
+/// forever — this only returns early if a caller-supplied future it's
+/// raced against elsewhere completes first (it never returns on its own;
+/// see `Device::run`'s doc comment for the exact contract).
 pub(crate) async fn run(
     transport: Arc<Transport>,
     local_addr: SocketAddr,
@@ -256,113 +317,138 @@ pub(crate) async fn run(
     comm_server: CommissioningServer,
 ) -> Result<(), DeviceError> {
     let port = local_addr.port();
-    let mdns_ctx = match bring_up_mdns(&config, port, &comm_server).await {
-        Ok(ctx) => Some(ctx),
+    let mut mdns_ctx: Option<MdnsCtx> = None;
+    let mut mdns_retry: Option<MdnsRetry> = None;
+    match bring_up_mdns(&config, port, &comm_server).await {
+        Ok(ctx) => mdns_ctx = Some(ctx),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 iface = %config.iface,
-                "mDNS advertiser did not come up — device still serves PASE/CASE/IM to peers that already have its address"
+                "mDNS advertiser did not come up — device still serves PASE/CASE/IM to peers that already have its address; retrying in the background"
             );
-            None
+            mdns_retry = Some(MdnsRetry::new());
         }
-    };
+    }
 
     let mut current_session: Option<(u16, SecureSession)> = None;
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
-        let (n, peer) = match transport.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
-        };
-        let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-            continue;
-        };
-        if header.session_id == 0 && header.security_flags == 0 {
-            let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-                continue;
-            };
-            if !proto.initiator {
-                continue;
-            }
-            if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            let first = mat_controller::exchange::IncomingMessage {
-                header,
-                proto,
-                payload: buf[off + body_off..n].to_vec(),
-            };
-            match classify_unsecured(proto.protocol_id, proto.opcode) {
-                UnsecuredFlow::Pase => {
-                    let local_session_id = random_session_id();
-                    let outcome = crate::net::pase::drive_established(
-                        &transport,
-                        peer,
-                        first,
-                        PaseVerifierConfig {
-                            passcode: config.passcode,
-                            salt: SALT.to_vec(),
-                            iterations: ITERATIONS,
-                            responder_session_id: local_session_id,
-                        },
-                    )
-                    .await;
-                    if let Ok((keys, peer_session_id)) = outcome {
-                        let session = SecureSession::new_device_role(
-                            Arc::clone(&transport),
-                            peer,
-                            local_session_id,
-                            peer_session_id,
-                            keys,
-                            0, // PASE: both sides are node id 0 (spec §4.13)
-                            0,
-                        );
-                        current_session = Some((local_session_id, session));
+        tokio::select! {
+            recv = transport.recv_from(&mut buf) => {
+                let (n, peer) = match recv {
+                    Ok(v) => v,
+                    Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
+                };
+                let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
+                    continue;
+                };
+                if header.session_id == 0 && header.security_flags == 0 {
+                    let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
+                        continue;
+                    };
+                    if !proto.initiator {
+                        continue;
                     }
-                    // Established failure: best-effort responder, nothing
-                    // more to do — the initiator's own retry/StatusReport
-                    // handling covers it.
-                }
-                UnsecuredFlow::Case => {
-                    let local_session_id = random_session_id();
-                    let fabrics = comm_server.fabrics();
-                    let outcome = crate::net::case::drive_established(
-                        Arc::clone(&transport),
-                        peer,
-                        first,
-                        fabrics,
-                        local_session_id,
-                    )
-                    .await;
-                    if let Ok((session, _fabric_index)) = outcome {
-                        current_session = Some((local_session_id, session));
+                    if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                        && proto.opcode == OPCODE_MRP_STANDALONE_ACK
+                    {
+                        continue;
                     }
+                    let first = mat_controller::exchange::IncomingMessage {
+                        header,
+                        proto,
+                        payload: buf[off + body_off..n].to_vec(),
+                    };
+                    match classify_unsecured(proto.protocol_id, proto.opcode) {
+                        UnsecuredFlow::Pase => {
+                            let local_session_id = random_session_id();
+                            let outcome = crate::net::pase::drive_established(
+                                &transport,
+                                peer,
+                                first,
+                                PaseVerifierConfig {
+                                    passcode: config.passcode,
+                                    salt: SALT.to_vec(),
+                                    iterations: ITERATIONS,
+                                    responder_session_id: local_session_id,
+                                },
+                            )
+                            .await;
+                            if let Ok((keys, peer_session_id)) = outcome {
+                                let session = SecureSession::new_device_role(
+                                    Arc::clone(&transport),
+                                    peer,
+                                    local_session_id,
+                                    peer_session_id,
+                                    keys,
+                                    0, // PASE: both sides are node id 0 (spec §4.13)
+                                    0,
+                                );
+                                current_session = Some((local_session_id, session));
+                            }
+                            // Established failure: best-effort responder, nothing
+                            // more to do — the initiator's own retry/StatusReport
+                            // handling covers it.
+                        }
+                        UnsecuredFlow::Case => {
+                            let local_session_id = random_session_id();
+                            let fabrics = comm_server.fabrics();
+                            let outcome = crate::net::case::drive_established(
+                                Arc::clone(&transport),
+                                peer,
+                                first,
+                                fabrics,
+                                local_session_id,
+                            )
+                            .await;
+                            if let Ok((session, _fabric_index)) = outcome {
+                                current_session = Some((local_session_id, session));
+                            }
+                        }
+                        UnsecuredFlow::Ignore => {}
+                    }
+                    continue;
                 }
-                UnsecuredFlow::Ignore => {}
-            }
-            continue;
-        }
 
-        // Secured traffic: only ever the current session (sequential,
-        // one-at-a-time — see module doc).
-        let Some((sid, session)) = current_session.as_mut() else {
-            continue;
-        };
-        if header.session_id != *sid {
-            continue;
+                // Secured traffic: only ever the current session (sequential,
+                // one-at-a-time — see module doc).
+                let Some((sid, session)) = current_session.as_mut() else {
+                    continue;
+                };
+                if header.session_id != *sid {
+                    continue;
+                }
+                serve_secured(
+                    &buf[..n],
+                    peer,
+                    session,
+                    &mut node,
+                    &comm_server,
+                    mdns_ctx.as_ref(),
+                )
+                .await;
+            }
+            () = mdns_retry_deadline(&mdns_retry) => {
+                match bring_up_mdns(&config, port, &comm_server).await {
+                    Ok(ctx) => {
+                        tracing::info!("mDNS advertiser came up on retry");
+                        mdns_ctx = Some(ctx);
+                        mdns_retry = None;
+                    }
+                    Err(e) => {
+                        // Warned once already (either at startup, above, or
+                        // on the very first retry — from here on this is
+                        // expected/repetitive noise for a device on a
+                        // genuinely bad interface, hence debug not warn.
+                        tracing::debug!(error = %e, "mDNS retry attempt failed, will retry again");
+                        if let Some(state) = mdns_retry.as_mut() {
+                            state.schedule_next();
+                        }
+                    }
+                }
+            }
         }
-        serve_secured(
-            &buf[..n],
-            peer,
-            session,
-            &mut node,
-            &comm_server,
-            mdns_ctx.as_ref(),
-        )
-        .await;
     }
 }
 
@@ -512,6 +598,53 @@ mod tests {
     fn random_session_id_is_never_zero() {
         for _ in 0..1000 {
             assert_ne!(random_session_id(), 0);
+        }
+    }
+
+    // ── mDNS retry backoff (review fix round 1, item 1) ────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn mdns_retry_schedules_the_initial_interval_first() {
+        let retry = MdnsRetry::new();
+        assert_eq!(
+            retry.next_attempt_at - retry.first_failure_at,
+            MDNS_RETRY_INTERVAL_INITIAL
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mdns_retry_keeps_the_short_interval_before_the_threshold() {
+        let mut retry = MdnsRetry::new();
+        // Advance to just before the backoff threshold and fail again —
+        // still short-interval territory.
+        tokio::time::advance(MDNS_RETRY_BACKOFF_THRESHOLD - Duration::from_secs(1)).await;
+        retry.schedule_next();
+        assert_eq!(
+            retry.next_attempt_at - Instant::now(),
+            MDNS_RETRY_INTERVAL_INITIAL
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mdns_retry_switches_to_the_long_interval_past_the_threshold() {
+        let mut retry = MdnsRetry::new();
+        tokio::time::advance(MDNS_RETRY_BACKOFF_THRESHOLD + Duration::from_secs(1)).await;
+        retry.schedule_next();
+        assert_eq!(
+            retry.next_attempt_at - Instant::now(),
+            MDNS_RETRY_INTERVAL_LONG
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mdns_retry_deadline_never_resolves_when_no_retry_pending() {
+        let none: Option<MdnsRetry> = None;
+        // If this ever resolved, the test would hang until its own harness
+        // timeout — so this is really "doesn't hang" plus a bounded race
+        // against a short sleep to make that assertion concrete.
+        tokio::select! {
+            () = mdns_retry_deadline(&none) => panic!("deadline resolved with no retry pending"),
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
     }
 }

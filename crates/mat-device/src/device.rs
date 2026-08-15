@@ -173,9 +173,15 @@ impl Device {
 
     /// Serves the device forever: PASE commissioning, CASE, and secured
     /// Interaction Model traffic, sequentially (see `net::runtime`'s module
-    /// doc for the full wire-classification contract). Only returns on a
-    /// fatal setup error (mDNS bind, interface resolution) — normal
-    /// operation runs until the caller cancels the future (e.g. Ctrl-C).
+    /// doc for the full wire-classification contract). **Never returns on
+    /// its own** during normal operation — the caller cancels/aborts the
+    /// future (e.g. on Ctrl-C) to stop the device. mDNS bring-up is
+    /// best-effort: if it fails (bad interface name, no link-local address
+    /// yet, socket bind failure), the device still serves PASE/CASE/IM to
+    /// any peer that already has its address, and the runtime retries
+    /// bringing mDNS up in the background on a bounded backoff (see
+    /// `net::runtime`'s `MdnsRetry`) rather than giving up or returning an
+    /// error.
     pub async fn run(self) -> Result<(), DeviceError> {
         crate::net::runtime::run(
             self.transport,

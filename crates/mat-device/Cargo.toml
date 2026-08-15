@@ -38,3 +38,9 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 mat-controller = { workspace = true, features = ["test-responder"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `tokio::time::{pause,advance}` for deterministic tests of
+# `net::runtime`'s mDNS retry backoff — the crate's own (non-dev) `tokio`
+# dependency above doesn't enable `test-util` (no reason to ship it), so
+# this pulls it in for test builds only, same pattern mat-controller uses
+# for its own dev-dependency on the same feature.
+tokio = { version = "1", features = ["test-util"] }
