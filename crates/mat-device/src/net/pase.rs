@@ -176,21 +176,46 @@ pub async fn run_pase_once(
     passcode: u32,
 ) -> Result<SessionKeys, NetPaseError> {
     let transport = Transport::Udp(Arc::new(transport));
-    let cfg = retry_cfg();
 
     // First message: no exchange/peer known yet.
     let (first, peer) = recv_first(&transport).await?;
 
-    let mut core = PaseResponderCore::new(PaseVerifierConfig {
-        passcode,
-        salt: SALT.to_vec(),
-        iterations: ITERATIONS,
-        responder_session_id: RESPONDER_SESSION_ID,
-    });
+    let (keys, _peer_session_id) = drive_established(
+        &transport,
+        peer,
+        first,
+        PaseVerifierConfig {
+            passcode,
+            salt: SALT.to_vec(),
+            iterations: ITERATIONS,
+            responder_session_id: RESPONDER_SESSION_ID,
+        },
+    )
+    .await?;
+    Ok(keys)
+}
+
+/// Drives one PASE responder handshake to completion given an
+/// **already-received** first message — the runtime (`net::runtime`) reads
+/// every datagram itself to classify it (unsecured PASE/CASE opcode vs.
+/// secured session traffic) before dispatching, so by the time it knows
+/// this is a fresh PASE attempt the first datagram is already off the
+/// socket and can't be handed to a fresh `recv_first`. Otherwise identical
+/// to [`run_pase_once`]'s inner loop, except it returns the peer's
+/// (initiator's) session id alongside the derived keys — needed to build
+/// `SecureSession::new_device_role(..)` — instead of discarding it.
+pub(crate) async fn drive_established(
+    transport: &Transport,
+    peer: SocketAddr,
+    first: IncomingMessage,
+    config: PaseVerifierConfig,
+) -> Result<(SessionKeys, u16), NetPaseError> {
+    let cfg = retry_cfg();
+    let mut core = PaseResponderCore::new(config);
 
     // One `ResponderExchange` for the whole handshake — see the module doc
     // comment on why re-adopting per message is unsafe.
-    let mut ex = ResponderExchange::adopt(&transport, peer, &first);
+    let mut ex = ResponderExchange::adopt(transport, peer, &first);
     let mut incoming = first;
 
     loop {
@@ -226,11 +251,11 @@ pub async fn run_pase_once(
                 reply,
                 opcode,
                 keys,
-                peer_session_id: _,
+                peer_session_id,
             } => {
                 ex.reply_final(PROTOCOL_ID_SECURE_CHANNEL, opcode, &reply, &cfg)
                     .await?;
-                return Ok(keys);
+                return Ok((keys, peer_session_id));
             }
         }
     }

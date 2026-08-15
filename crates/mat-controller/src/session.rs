@@ -1089,6 +1089,37 @@ impl SecureSession {
     /// フィルタ落ちで `peer_initiated` に待避したメッセージがあれば先にそれを
     /// 返す（待避条件は今のところ ReportData のみだが、将来の待避種別が増えても
     /// 取りこぼさないよう同じ規律に倣う）。
+    /// Feeds one already-received raw datagram (`buf`, from `from`) through
+    /// the same decrypt/screen/ack pipeline `recv_request`'s internal loop
+    /// uses, without this call itself reading from the transport. A
+    /// device-role runtime that owns a single shared socket must classify
+    /// each datagram (unsecured PASE/CASE opcode vs. secured session
+    /// traffic) *before* deciding which flow handles it — by the time that
+    /// classification has happened, the datagram has already been read off
+    /// the socket, so `recv_request`'s own internal `recv_from` can't be the
+    /// one to see it. Returns `Ok(None)` for standalone acks / screened-out
+    /// (foreign, duplicate, delivery-filter-mismatch) traffic — the caller
+    /// should just move on to the next datagram, exactly as `recv_request`'s
+    /// loop does internally.
+    pub async fn deliver_request(
+        &mut self,
+        buf: &[u8],
+        from: SocketAddr,
+    ) -> Result<Option<IncomingMessage>, SessionError> {
+        let Some(msg) = self
+            .screen_with(buf, from, ScreenFilter::AnyPeerInitiated)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+            && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
+        {
+            return Ok(None);
+        }
+        Ok(Some(msg))
+    }
+
     pub async fn recv_request(
         &mut self,
         timeout: Duration,

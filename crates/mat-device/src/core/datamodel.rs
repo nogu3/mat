@@ -62,7 +62,15 @@ pub enum InvokeReply {
 /// One cluster's server-side implementation on an endpoint. `read`/`invoke`
 /// work in already-decoded terms (attribute/command ids, TLV element
 /// bytes) — `Node` owns all IM wire framing.
-pub trait ClusterHandler {
+///
+/// `: Send` so `Node` (which owns `Box<dyn ClusterHandler>`s) can itself be
+/// moved into a `tokio::spawn`ed task — the device runtime
+/// (`net::runtime::run`) does exactly that. Every real implementation
+/// already satisfies it: `DescriptorHandler`/`BasicInformationHandler` are
+/// zero-sized, and `core::commissioning`'s two handlers only hold an
+/// `Arc<Mutex<..>>` (already `Send` for the same reason, see that module's
+/// doc comment).
+pub trait ClusterHandler: Send {
     fn cluster_id(&self) -> u32;
     /// Reads one attribute. `Some` is one complete, well-formed TLV element
     /// tagged `Tag::Anonymous` (the attribute's `Data`); `None` means the
@@ -135,6 +143,26 @@ impl Node {
 
     pub fn add_endpoint(&mut self, endpoint: u16, clusters: Vec<Box<dyn ClusterHandler>>) {
         self.endpoints.push((endpoint, clusters));
+    }
+
+    /// Appends `handler` to `endpoint`'s cluster list, creating the
+    /// endpoint entry if it doesn't exist yet. Unlike [`add_endpoint`]
+    /// (which always pushes a *new* `(endpoint, clusters)` entry, even if
+    /// `endpoint` already has one — `resolve_read`/`handle_invoke` only
+    /// ever look at the *first* matching entry via `Vec::iter().find`, so a
+    /// second `add_endpoint(0, ..)` call would silently shadow the first),
+    /// this lets more than one cluster be registered onto the same endpoint
+    /// incrementally — e.g. `with_root_endpoint()`'s Descriptor/
+    /// BasicInformation plus a device runtime's commissioning clusters, all
+    /// on endpoint 0.
+    ///
+    /// [`add_endpoint`]: Self::add_endpoint
+    pub fn add_cluster(&mut self, endpoint: u16, handler: Box<dyn ClusterHandler>) {
+        if let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint) {
+            clusters.push(handler);
+        } else {
+            self.endpoints.push((endpoint, vec![handler]));
+        }
     }
 
     /// Dispatches one incoming IM message. Returns the response opcode and

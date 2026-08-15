@@ -171,13 +171,18 @@ impl CommissioningServer {
             && inner.pending.trusted_root_tlv.is_none()
     }
 
-    /// Splits into the two `ClusterHandler` adapters `Node::add_endpoint`
+    /// Splits into the two `ClusterHandler` adapters `Node::add_cluster`
     /// registers on endpoint 0 (General Commissioning 0x0030, Node
-    /// Operational Credentials 0x003E) — see the module doc.
-    pub fn into_cluster_handlers(self) -> (Box<dyn ClusterHandler>, Box<dyn ClusterHandler>) {
+    /// Operational Credentials 0x003E) — see the module doc. Takes `&self`
+    /// (not `self`) so a runtime can keep the original `CommissioningServer`
+    /// around afterwards to poll `fabrics()` (e.g. to notice a fresh AddNOC
+    /// and publish an operational mDNS advert) — both handlers just clone
+    /// the shared `Arc<Mutex<Inner>>`, same as the two clones already did
+    /// when this took `self` by value.
+    pub fn into_cluster_handlers(&self) -> (Box<dyn ClusterHandler>, Box<dyn ClusterHandler>) {
         (
             Box::new(GeneralCommissioningHandler(Arc::clone(&self.inner))),
-            Box::new(OperationalCredentialsHandler(self.inner)),
+            Box::new(OperationalCredentialsHandler(Arc::clone(&self.inner))),
         )
     }
 

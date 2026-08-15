@@ -13,7 +13,7 @@ net = ["dep:tokio", "dep:mat-core", "dep:socket2"]
 [dependencies]
 mat-controller = { workspace = true }
 mat-core = { workspace = true, optional = true }
-tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"], optional = true }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync", "signal"], optional = true }
 # mDNS advertiser socket setup (`net::mdns`) — SO_REUSEADDR/join_multicast_v6
 # need the raw socket2 API before handing the fd to tokio, same as
 # mat-controller's own `dnssd::bind_mdns_socket`. Not a workspace dependency
@@ -37,3 +37,4 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 [dev-dependencies]
 mat-controller = { workspace = true, features = ["test-responder"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

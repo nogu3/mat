@@ -168,13 +168,30 @@ pub async fn run_case_once(
     fabrics: Vec<FabricEntry>,
     responder_session_id: u16,
 ) -> Result<(SecureSession, u8), NetCaseError> {
+    let transport = Arc::new(Transport::Udp(Arc::new(transport)));
+    let (first, peer) = recv_first(&transport).await?;
+    drive_established(transport, peer, first, fabrics, responder_session_id).await
+}
+
+/// Drives one CASE responder handshake to completion given an
+/// **already-received** first message — the runtime (`net::runtime`) reads
+/// every datagram itself to classify it (unsecured PASE/CASE opcode vs.
+/// secured session traffic) before dispatching, so by the time it knows
+/// this is a fresh Sigma1 the first datagram is already off the socket and
+/// can't be handed to a fresh `recv_first`. Otherwise identical to
+/// [`run_case_once`]'s inner loop (which now just calls this after its own
+/// `recv_first`).
+pub(crate) async fn drive_established(
+    transport: Arc<Transport>,
+    peer: SocketAddr,
+    first: IncomingMessage,
+    fabrics: Vec<FabricEntry>,
+    responder_session_id: u16,
+) -> Result<(SecureSession, u8), NetCaseError> {
     // Kept for the post-`Established` `local_node_id` lookup below —
     // `CaseResponderCore::new` takes ownership of `fabrics` itself.
     let fabrics_snapshot = fabrics.clone();
-    let transport = Arc::new(Transport::Udp(Arc::new(transport)));
     let cfg = retry_cfg();
-
-    let (first, peer) = recv_first(&transport).await?;
 
     let mut core = CaseResponderCore::new(fabrics, responder_session_id);
 

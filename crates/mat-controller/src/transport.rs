@@ -24,6 +24,20 @@ impl UdpTransport {
         })
     }
 
+    /// Wraps an already-bound `std::net::UdpSocket` (e.g. bound
+    /// synchronously so a non-`async fn` constructor can still end up with
+    /// a live transport — `bind`/`bind_addr` need `.await` only because
+    /// `tokio::net::UdpSocket::bind` does). Must be called from within a
+    /// running tokio runtime (same requirement as
+    /// `tokio::net::UdpSocket::from_std`, which this delegates to after
+    /// putting the socket in non-blocking mode).
+    pub fn from_std(socket: std::net::UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket: UdpSocket::from_std(socket)?,
+        })
+    }
+
     pub async fn send_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<()> {
         let n = self.socket.send_to(buf, dest).await?;
         if n != buf.len() {
