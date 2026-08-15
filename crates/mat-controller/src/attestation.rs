@@ -140,10 +140,21 @@ pub fn verify_device_attestation(
         (Some(dac_vid), Some(pai_vid)) if dac_vid == pai_vid => {}
         _ => return Err(AttestationError::Chain("dac/pai vid mismatch")),
     }
+    // DAC は PID 必須（spec §6.2.2.1: DAC subject は VID と PID を必ず持つ。
+    // VID は直前の一致検査が None を弾いている）。
+    if dac.pid.is_none() {
+        return Err(AttestationError::Chain("dac missing pid"));
+    }
     // PAI の PID は省略可（spec 上 optional）。あれば DAC と一致必須。
     if let Some(pai_pid) = pai.pid {
         if dac.pid != Some(pai_pid) {
             return Err(AttestationError::Chain("dac/pai pid mismatch"));
+        }
+    }
+    // VID スコープ PAA（spec §6.2.2.2）: PAA が VID を持つなら PAI と一致必須。
+    if let Some(paa_vid) = paa.vid {
+        if pai.vid != Some(paa_vid) {
+            return Err(AttestationError::Chain("vid-scoped paa/pai vid mismatch"));
         }
     }
 
@@ -1220,5 +1231,114 @@ mod tests {
             &challenge,
         )
         .unwrap();
+    }
+
+    // --- Task 3: VID スコープ PAA / DAC PID 必須 ---
+
+    #[test]
+    fn rejects_vid_scoped_paa_with_mismatched_pai_vid() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        // VID スコープ PAA（subject に Mvid FFF2）。PAI の issuer Name はこれと
+        // バイト一致させ、PAI 自身の subject VID は FFF1 — 不一致が検証対象。
+        let paa = make_test_cert_ext(
+            b"paa",
+            b"paa",
+            &paa_key,
+            &paa_key,
+            true,
+            Some((0xFFF2, 0x8001)),
+            Some((0xFFF2, 0x8001)),
+            Some(0x0060),
+        );
+        let pai = make_test_cert_ext(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF2, 0x8001)),
+            Some((0xFFF1, 0x8001)),
+            Some(0x0060),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::Chain("vid-scoped paa/pai vid mismatch")
+        ));
+    }
+
+    #[test]
+    fn rejects_dac_without_pid() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        // DAC の subject は CN 埋め込みの Mvid のみ（Matter PID RDN も Mpid: も
+        // 無し）— parse_vid_pid は vid=FFF1 / pid=None を返す。issuer Name は
+        // PAI subject（vid_pid 入り）にバイト一致させる。
+        let dac = make_test_cert_ext(
+            b"dac Mvid:FFF1",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+            None,
+            Some(0x0001),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AttestationError::Chain("dac missing pid")));
     }
 }
