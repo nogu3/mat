@@ -157,6 +157,20 @@ impl CommissioningServer {
             .to_vec()
     }
 
+    /// Test-only visibility into whether any CSR/AddTrustedRoot material is
+    /// currently staged — lets fail-safe-transition tests assert `pending`
+    /// was actually discarded without making the field `pub`.
+    #[cfg(test)]
+    fn pending_is_empty(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .expect("commissioning server mutex poisoned");
+        inner.pending.op_private_key.is_none()
+            && inner.pending.op_public_key.is_none()
+            && inner.pending.trusted_root_tlv.is_none()
+    }
+
     /// Splits into the two `ClusterHandler` adapters `Node::add_endpoint`
     /// registers on endpoint 0 (General Commissioning 0x0030, Node
     /// Operational Credentials 0x003E) — see the module doc.
@@ -266,11 +280,16 @@ impl Inner {
 
     /// ArmFailSafe（spec §11.10.6.2）: records the timer. An
     /// `ExpiryLengthSeconds` of 0 disarms early (spec-legal way to release
-    /// the fail-safe without waiting for it to expire).
+    /// the fail-safe without waiting for it to expire). Either way — a
+    /// fresh (re-)arm or an early disarm — the CSR/AddTrustedRoot material
+    /// staged by a previous attempt is discarded (spec §11.10.7.2.1: that
+    /// state must not survive a fail-safe transition without a completed
+    /// `AddNOC`).
     fn handle_arm_fail_safe(&mut self, fields_tlv: &[u8]) -> InvokeReply {
         let Ok((expiry_s, _breadcrumb)) = decode_arm_fail_safe(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
+        self.pending = PendingCommissioning::default();
         if expiry_s == 0 {
             self.fail_safe.disarm();
         } else {
@@ -294,9 +313,13 @@ impl Inner {
         }
     }
 
-    /// CommissioningComplete（spec §11.10.6.6）: disarms the fail-safe.
+    /// CommissioningComplete（spec §11.10.6.6）: disarms the fail-safe and
+    /// discards any staged CSR/AddTrustedRoot material — a completed
+    /// commissioning has already consumed it via `AddNOC` (which clears
+    /// `pending` itself on success), so nothing legitimate is lost.
     fn handle_commissioning_complete(&mut self) -> InvokeReply {
         self.fail_safe.disarm();
+        self.pending = PendingCommissioning::default();
         InvokeReply::Data {
             response_command: RESP_COMMISSIONING_COMPLETE,
             fields_tlv: encode_commissioning_status_response(0, ""),
@@ -306,8 +329,13 @@ impl Inner {
     /// AttestationRequest（spec §11.17.6.7）: signs `AttestationElements`
     /// with the DAC key over `elements ‖ attestation_challenge` — the same
     /// construction `mat_controller::attestation::verify_device_attestation`
-    /// checks on the commissioner side.
+    /// checks on the commissioner side. Requires the fail-safe to be armed
+    /// (spec §11.17: this and the other commissioning-flow commands below
+    /// are only meaningful inside an armed fail-safe window).
     fn handle_attestation_request(&mut self, fields_tlv: &[u8], ctx: &InvokeCtx) -> InvokeReply {
+        if !self.fail_safe.is_armed() {
+            return InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED);
+        }
         let Ok(nonce) = decode_attestation_request(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
@@ -344,8 +372,12 @@ impl Inner {
     /// signs the `NOCSRElements` the same way `AttestationResponse` is
     /// signed (`elements ‖ attestation_challenge` with the DAC key — spec
     /// §11.17.5.6, mirrored exactly from the verification code in
-    /// `mat_controller::commissioning::run_credential_steps`).
+    /// `mat_controller::commissioning::run_credential_steps`). Requires the
+    /// fail-safe to be armed.
     fn handle_csr_request(&mut self, fields_tlv: &[u8], ctx: &InvokeCtx) -> InvokeReply {
+        if !self.fail_safe.is_armed() {
+            return InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED);
+        }
         let Ok(nonce) = decode_csr_request(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
@@ -373,8 +405,11 @@ impl Inner {
     /// AddTrustedRootCertificate（spec §11.17.6.11）: stages the RCAC for
     /// `AddNOC` to verify the NOC's chain against. Response is a plain IM
     /// success status, not a `NOCResponse` (spec defines no dedicated
-    /// response command for this one).
+    /// response command for this one). Requires the fail-safe to be armed.
     fn handle_add_trusted_root(&mut self, fields_tlv: &[u8]) -> InvokeReply {
+        if !self.fail_safe.is_armed() {
+            return InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED);
+        }
         let Ok(rcac_tlv) = decode_add_trusted_root(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
@@ -620,6 +655,12 @@ mod tests {
             dev.paa_der.clone(),
         );
         let mut server = CommissioningServer::new(dev, FabricStore::new());
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
 
         let nonce = [9u8; 32];
         let (response_command, fields_tlv) = expect_data(drive_invoke(
@@ -675,36 +716,139 @@ mod tests {
 
     #[test]
     fn add_noc_rejected_without_fail_safe() {
+        // AddNOC checks `is_armed()` before decoding its fields at all, so
+        // a never-armed server rejects it outright — no valid CSR/NOC is
+        // even reachable without a fail-safe window (CSRRequest/
+        // AddTrustedRootCertificate are gated too, see
+        // `csr_request_rejected_without_fail_safe` below).
         let mut server = test_server();
-        let fabric = CommissioningFabric::generate(0x1122, 0xAA).unwrap();
-
-        // CSRRequest/AddTrustedRootCertificate don't require the fail-safe —
-        // only AddNOC's actual fabric install does.
-        let (_, csr_resp) = expect_data(drive_invoke(
-            &mut server,
-            CLUSTER_OPERATIONAL_CREDENTIALS,
-            CMD_CSR_REQUEST,
-            &encode_csr_request(&[1u8; 32]),
-        ));
-        let (elements, _) = decode_csr_response(&csr_resp).unwrap();
-        let (csr_der, _) = parse_nocsr_elements(&elements).unwrap();
-        let device_pub = parse_csr(&csr_der).unwrap();
-        let noc = fabric.issue_device_noc(&device_pub, 0x5001).unwrap();
-        drive_invoke(
-            &mut server,
-            CLUSTER_OPERATIONAL_CREDENTIALS,
-            CMD_ADD_TRUSTED_ROOT,
-            &encode_add_trusted_root(&fabric.rcac_tlv),
-        );
-
         let reply = drive_invoke(
             &mut server,
             CLUSTER_OPERATIONAL_CREDENTIALS,
             CMD_ADD_NOC,
-            &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
+            &[],
         );
         assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED));
         assert!(server.fabrics().is_empty());
+    }
+
+    #[test]
+    fn csr_request_rejected_without_fail_safe() {
+        let mut server = test_server();
+        let reply = drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[1u8; 32]),
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED));
+        assert!(server.pending_is_empty());
+    }
+
+    #[test]
+    fn attestation_request_rejected_without_fail_safe() {
+        let mut server = test_server();
+        let reply = drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ATTESTATION_REQUEST,
+            &encode_attestation_request(&[1u8; 32]),
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED));
+    }
+
+    #[test]
+    fn add_trusted_root_rejected_without_fail_safe() {
+        let mut server = test_server();
+        let reply = drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ADD_TRUSTED_ROOT,
+            &encode_add_trusted_root(b"rcac"),
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED));
+        assert!(server.pending_is_empty());
+    }
+
+    #[test]
+    fn disarm_clears_pending_commissioning_state() {
+        let mut server = test_server();
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+        drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[1u8; 32]),
+        );
+        assert!(!server.pending_is_empty());
+
+        // ArmFailSafe(expiry=0) disarms early (spec-legal, spec §11.10.7.2.1)
+        // — the CSR keypair staged above must not survive it.
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(0, 2),
+        );
+        assert!(server.pending_is_empty());
+    }
+
+    #[test]
+    fn rearm_resets_stale_pending_commissioning_state() {
+        let mut server = test_server();
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+        drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[1u8; 32]),
+        );
+        assert!(!server.pending_is_empty());
+
+        // A fresh ArmFailSafe (new commissioning attempt) must not let a
+        // stale CSR keypair from a previous attempt leak into this one.
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 2),
+        );
+        assert!(server.pending_is_empty());
+    }
+
+    #[test]
+    fn commissioning_complete_clears_pending_commissioning_state() {
+        let mut server = test_server();
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+        drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[1u8; 32]),
+        );
+        assert!(!server.pending_is_empty());
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_COMMISSIONING_COMPLETE,
+            &[],
+        );
+        assert!(server.pending_is_empty());
     }
 
     #[test]
