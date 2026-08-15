@@ -31,13 +31,19 @@ const RECV_BUF: usize = 9000;
 /// Binds the advertiser's mDNS socket: `[::]:5353` with address reuse,
 /// joined to `ff02::fb` on `scope_id`.
 ///
-/// Mirrors `mat_controller::dnssd::bind_mdns_socket` (see that function's
-/// doc comment for the SO_REUSEADDR-not-SO_REUSEPORT rationale — sharing
-/// port 5353 with a system mDNS daemon like avahi must still deliver
-/// multicast to us). One addition here: `SO_REUSEPORT` is also attempted
-/// (best-effort, brief allows "if available") purely so multiple advertiser
-/// instances (e.g. tests run concurrently) don't fail to bind outright —
-/// production only ever runs one `MdnsAdvertiser` per device process.
+/// Mirrors `mat_controller::dnssd::bind_mdns_socket` exactly on the
+/// reuse-flag choice: `SO_REUSEADDR` only, deliberately **not**
+/// `SO_REUSEPORT`. `dnssd.rs`'s doc comment (lines 135-148) records the
+/// reason, and it applies here just as much as to the querier: on Linux,
+/// `SO_REUSEPORT` puts same-port sockets into a load-balancing group that
+/// hashes *each* incoming datagram — multicast included — to a single
+/// member. A responder sharing port 5353 with a system mDNS daemon (avahi,
+/// the default on the deployment target) would then have queries land on
+/// only one of the two sockets at random, so this advertiser would
+/// silently miss a fraction of the queries it's supposed to answer.
+/// `SO_REUSEADDR` alone already delivers multicast to *every* socket bound
+/// to the port that joined the group, which is what coexistence with avahi
+/// (and, incidentally, multiple test-run instances) actually needs.
 ///
 /// `set_multicast_loop_v6(true)` is set — off by the OS default — so a
 /// query this socket itself sends (there are none from this struct today,
@@ -48,7 +54,6 @@ fn bind_advertiser_socket(scope_id: u32) -> io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
-    let _ = sock.set_reuse_port(true); // best-effort; see doc comment above
     sock.set_only_v6(true)?;
     sock.set_nonblocking(true)?;
     let bind = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
