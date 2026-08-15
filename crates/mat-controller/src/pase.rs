@@ -59,7 +59,12 @@ const PBKDF_SALT_LEN_MAX: usize = 32;
 /// unsecured 交換なので on-path 偽造で iterations=u32::MAX を注入されると
 /// 同期 PBKDF2 が数時間回る（current_thread ランタイムなので timeout も
 /// 効かない）—— PBKDF2 実行前に必ず呼ぶ。Err は Malformed に渡す detail。
-fn validate_pbkdf_params(iterations: u32, salt_len: usize) -> Result<(), &'static str> {
+///
+/// `pub`: `decode_pbkdf_param_response` 自体はこの範囲チェックをしない
+/// （その理由は同関数の doc コメント参照）ので、この decoder を
+/// `establish()` の外で使う呼び出し元は、受け取った `iterations`/
+/// `salt.len()` を PBKDF2 に渡す前に必ずこの関数で検証すること。
+pub fn validate_pbkdf_params(iterations: u32, salt_len: usize) -> Result<(), &'static str> {
     if !(PBKDF_ITERATIONS_MIN..=PBKDF_ITERATIONS_MAX).contains(&iterations) {
         return Err("pbkdf iterations out of range");
     }
@@ -246,6 +251,14 @@ pub fn encode_pbkdf_param_response(
 /// Parses PBKDFParamResponse: `struct{1: initiatorRandom (ignored),
 /// 2: responderRandom[32] (ignored), 3: responderSessionId,
 /// 4: struct{1: iterations, 2: salt}, [5: SessionParams (skipped)]}`.
+///
+/// **Does not bounds-check `iterations`/`salt`.** This decoder only parses
+/// the wire shape — it does not enforce spec §3.9's PBKDF range. Callers
+/// MUST run `validate_pbkdf_params(resp.iterations, resp.salt.len())`
+/// before feeding these values into PBKDF2 (an unvalidated, on-path-
+/// forgeable `iterations` can make PBKDF2 run for hours — see
+/// `validate_pbkdf_params`'s doc comment). `establish()` does this itself
+/// right after calling this function.
 pub fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse, PaseError> {
     let mut r = Reader::new(payload);
     match r
