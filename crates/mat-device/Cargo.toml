@@ -8,12 +8,18 @@ repository.workspace = true
 
 [features]
 default = ["net"]
-net = ["dep:tokio", "dep:mat-core"]
+net = ["dep:tokio", "dep:mat-core", "dep:socket2"]
 
 [dependencies]
 mat-controller = { workspace = true }
 mat-core = { workspace = true, optional = true }
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"], optional = true }
+# mDNS advertiser socket setup (`net::mdns`) — SO_REUSEADDR/join_multicast_v6
+# need the raw socket2 API before handing the fd to tokio, same as
+# mat-controller's own `dnssd::bind_mdns_socket`. Not a workspace dependency
+# (only mat-controller and now mat-device use it) — version pinned to match
+# mat-controller's `socket2 = "0.6"` so both resolve to one crate version.
+socket2 = { version = "0.6", optional = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

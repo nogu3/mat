@@ -7,4 +7,5 @@ pub mod case;
 pub mod commissioning;
 pub mod datamodel;
 pub mod fabric_store;
+pub mod mdns_records;
 pub mod pase;
