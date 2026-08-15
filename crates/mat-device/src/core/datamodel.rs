@@ -31,12 +31,21 @@ const TEST_PRODUCT_ID: u64 = 0x8000;
 const DATA_MODEL_REVISION: u64 = 17;
 
 /// Per-invoke scratch context threaded through `ClusterHandler::invoke`.
-/// Empty today — Task 9 will add fields such as the session's attestation
-/// challenge for commands that must bind to it (e.g. CSR generation). Kept
-/// as a struct (not `()`) so `invoke`'s signature stays stable across that
-/// addition.
-#[derive(Debug, Default)]
-pub struct InvokeCtx {}
+/// Kept as a struct (not `()`) so `invoke`'s signature stays stable as more
+/// fields get added.
+///
+/// `attestation_challenge` (Task 9): the current secure session's
+/// attestation challenge (spec §4.13.2.3, `SessionKeys::
+/// attestation_challenge`) — `CommissioningServer` binds it into
+/// `AttestationResponse`/`CSRResponse` signatures
+/// (`mat_controller::attestation::attestation_tbs`). Defaults to all-zero,
+/// which is never a real session's challenge (derived by HKDF) but is fine
+/// for the existing `datamodel` tests, which never invoke commissioning
+/// commands.
+#[derive(Debug, Clone, Default)]
+pub struct InvokeCtx {
+    pub attestation_challenge: [u8; 16],
+}
 
 /// A cluster's outcome for one invoked command: either a bare status (the
 /// common case — most commands have no response payload) or response data

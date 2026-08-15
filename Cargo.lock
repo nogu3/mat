@@ -956,6 +956,7 @@ dependencies = [
  "hkdf",
  "mat-controller",
  "mat-core",
+ "p256",
  "serde",
  "serde_json",
  "sha2",

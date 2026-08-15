@@ -9,6 +9,13 @@
 //! *same* keys the controller derives (PASE is unauthenticated — both
 //! sides end up at node id 0, so key agreement is the only thing this test
 //! can observe end-to-end).
+//!
+//! Gated on the `net` feature: this test drives `mat_device::net::pase`
+//! (tokio + real UDP sockets), which doesn't exist under
+//! `--no-default-features` — without this gate `cargo test -p mat-device
+//! --no-default-features` fails to compile the test binary (Task 9
+//! carry-over fix).
+#![cfg(feature = "net")]
 
 use std::sync::Arc;
 use std::time::Duration;

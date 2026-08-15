@@ -2,3 +2,4 @@
 //! `core`. Gated behind the `net` feature (default on).
 
 pub mod pase;
+pub mod store;

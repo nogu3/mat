@@ -340,6 +340,34 @@ fn take_utf8(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<String> {
     }
 }
 
+/// [`take_u8`] の u16 版（Task 9 のデバイス側 decoder が使う——
+/// ExpiryLengthSeconds / AdminVendorId は u16 幅）。
+fn take_u16(
+    map: &mut BTreeMap<u8, FieldValue>,
+    tag: u8,
+    step: &'static str,
+    range_detail: &'static str,
+) -> Result<Option<u16>, CommissionError> {
+    match map.remove(&tag) {
+        Some(FieldValue::Uint(v)) => Ok(Some(u16::try_from(v).map_err(|_| {
+            CommissionError::Malformed {
+                step,
+                detail: range_detail,
+            }
+        })?)),
+        _ => Ok(None),
+    }
+}
+
+/// `map` からタグ `tag` を `u64` として取り出す（型不一致は「無かった」
+/// 扱い、[`take_u8`] と同じ方針。u64 はそのままなので範囲チェック不要）。
+fn take_u64(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<u64> {
+    match map.remove(&tag) {
+        Some(FieldValue::Uint(v)) => Some(v),
+        _ => None,
+    }
+}
+
 /// ArmFailSafeResponse / SetRegulatoryConfigResponse / CommissioningComplete
 /// Response（spec §11.10.6.3 / .5 / .7）共通の `{0: ErrorCode, 1: DebugText}`
 /// 形。`DebugText` は spec 上 optional なので欠落時は空文字列にする。戻り値
@@ -507,6 +535,217 @@ pub fn thread_ext_pan_id(dataset: &[u8]) -> Option<[u8; 8]> {
         i = end;
     }
     None
+}
+
+// --- device-side（Task 9）: リクエスト decoder / レスポンス encoder ---
+//
+// 上のブロックの逆方向: mat-device のコミッショニングサーバ
+// (`mat_device::core::commissioning::CommissioningServer`) が、受け取った
+// `*Request` の CommandFields をここで decode し、`*Response` をここで
+// encode してコミッショナー側へ返す。TLV タグ割り当ては対応する上の
+// encoder/decoder と完全に同じ形（同じコマンドの表と裏）。
+
+/// `fields` から struct 直下の 32 バイト nonce（タグ `tag`）を取り出す。
+/// AttestationRequest/CSRRequest はどちらも `{0: nonce(32)}` という同じ形
+/// なので実装を共有する。
+fn decode_nonce32(fields: &[u8], tag: u8, step: &'static str) -> Result<[u8; 32], CommissionError> {
+    let mut map = scan_struct_fields(fields, step)?;
+    let bytes = take_bytes(&mut map, tag).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing nonce",
+    })?;
+    bytes.try_into().map_err(|_| CommissionError::Malformed {
+        step,
+        detail: "nonce length",
+    })
+}
+
+/// ArmFailSafeRequest（spec §11.10.6.2）: `{0: ExpiryLengthSeconds, 1:
+/// Breadcrumb}`。デバイス側 decoder（逆方向は [`encode_arm_fail_safe`]）。
+/// 戻り値は `(expiry_seconds, breadcrumb)`——`Breadcrumb` は spec上 optional
+/// なので欠落時は 0。
+pub fn decode_arm_fail_safe(fields: &[u8]) -> Result<(u16, u64), CommissionError> {
+    let step = "arm_fail_safe_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    let expiry =
+        take_u16(&mut map, 0, step, "expiry out of range")?.ok_or(CommissionError::Malformed {
+            step,
+            detail: "missing expiry",
+        })?;
+    let breadcrumb = take_u64(&mut map, 1).unwrap_or(0);
+    Ok((expiry, breadcrumb))
+}
+
+/// SetRegulatoryConfigRequest（spec §11.10.6.4）: `{0: NewRegulatoryConfig,
+/// 1: CountryCode, 2: Breadcrumb}`。デバイス側 decoder（逆方向は
+/// [`encode_set_regulatory_config`]）。戻り値は `(config, country,
+/// breadcrumb)`。
+pub fn decode_set_regulatory_config(fields: &[u8]) -> Result<(u8, String, u64), CommissionError> {
+    let step = "set_regulatory_config_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    let config =
+        take_u8(&mut map, 0, step, "config out of range")?.ok_or(CommissionError::Malformed {
+            step,
+            detail: "missing config",
+        })?;
+    let country = take_utf8(&mut map, 1).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing country",
+    })?;
+    let breadcrumb = take_u64(&mut map, 2).unwrap_or(0);
+    Ok((config, country, breadcrumb))
+}
+
+/// AttestationRequest（spec §11.17.6.7）: `{0: AttestationNonce}`。デバイス
+/// 側 decoder（逆方向は [`encode_attestation_request`]）。
+pub fn decode_attestation_request(fields: &[u8]) -> Result<[u8; 32], CommissionError> {
+    decode_nonce32(fields, 0, "attestation_request")
+}
+
+/// CertificateChainRequest（spec §11.17.6.4）: `{0: CertificateType}`
+/// （`CERT_TYPE_DAC`/`CERT_TYPE_PAI`）。デバイス側 decoder（逆方向は
+/// [`encode_cert_chain_request`]）。
+pub fn decode_cert_chain_request(fields: &[u8]) -> Result<u8, CommissionError> {
+    let step = "cert_chain_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    take_u8(&mut map, 0, step, "cert type out of range")?.ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing cert type",
+    })
+}
+
+/// CSRRequest（spec §11.17.6.9）: `{0: CSRNonce}`。デバイス側 decoder（逆
+/// 方向は [`encode_csr_request`]）。
+pub fn decode_csr_request(fields: &[u8]) -> Result<[u8; 32], CommissionError> {
+    decode_nonce32(fields, 0, "csr_request")
+}
+
+/// AddTrustedRootCertificate（spec §11.17.6.11）: `{0: RootCACertificate}`。
+/// デバイス側 decoder（逆方向は [`encode_add_trusted_root`]）。
+pub fn decode_add_trusted_root(fields: &[u8]) -> Result<Vec<u8>, CommissionError> {
+    let step = "add_trusted_root_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing rcac",
+    })
+}
+
+/// [`decode_add_noc`]'s decoded fields: `(noc_tlv, icac_tlv, ipk_epoch,
+/// case_admin_subject, admin_vendor_id)`.
+pub type AddNocFields = (Vec<u8>, Option<Vec<u8>>, [u8; 16], u64, u16);
+
+/// AddNOC（spec §11.17.6.13）: `{0: NOCValue, 1: ICACValue(optional), 2:
+/// IPKValue, 3: CaseAdminSubject, 4: AdminVendorId}`。デバイス側 decoder
+/// （逆方向は [`encode_add_noc`] — あちらは tag1（ICACValue）を意図的に
+/// 省略するが、この decoder は spec どおり optional として受理する）。戻り
+/// 値は [`AddNocFields`]。
+pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
+    let step = "add_noc_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    let noc = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing noc",
+    })?;
+    let icac = take_bytes(&mut map, 1);
+    let ipk_bytes = take_bytes(&mut map, 2).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing ipk",
+    })?;
+    let ipk: [u8; 16] = ipk_bytes
+        .try_into()
+        .map_err(|_| CommissionError::Malformed {
+            step,
+            detail: "ipk length",
+        })?;
+    let case_admin_subject = take_u64(&mut map, 3).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing case admin subject",
+    })?;
+    let admin_vendor_id = take_u16(&mut map, 4, step, "admin vendor id out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing admin vendor id",
+        },
+    )?;
+    Ok((noc, icac, ipk, case_admin_subject, admin_vendor_id))
+}
+
+/// `*CommissioningResponse`（ArmFailSafeResponse / SetRegulatoryConfig
+/// Response / CommissioningCompleteResponse 共通、spec §11.10.6.3 / .5 /
+/// .7）: `{0: ErrorCode, 1: DebugText(optional)}`。デバイス側 encoder（逆
+/// 方向は [`decode_commissioning_status_response`]）。`debug_text` が空文字
+/// 列ならタグ 1 自体を省略する。
+pub fn encode_commissioning_status_response(error_code: u8, debug_text: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(error_code));
+    if !debug_text.is_empty() {
+        w.put_str(Tag::Context(1), debug_text);
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// AttestationResponse（spec §11.17.6.8）: `{0: AttestationElements, 1:
+/// AttestationSignature}`。デバイス側 encoder（逆方向は
+/// [`decode_attestation_response`]）。
+pub fn encode_attestation_response(elements: &[u8], signature: &[u8; 64]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(0), elements);
+    w.put_bytes(Tag::Context(1), signature);
+    w.end_container();
+    w.finish()
+}
+
+/// CertificateChainResponse（spec §11.17.6.5）: `{0: Certificate}`。デバイ
+/// ス側 encoder（逆方向は [`decode_cert_chain_response`]）。
+pub fn encode_cert_chain_response(cert_der: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(0), cert_der);
+    w.end_container();
+    w.finish()
+}
+
+/// NOCSRElements（spec §11.17.6.10.1）: `{1: csr, 2: CSRNonce}`。デバイス側
+/// encoder（逆方向は [`parse_nocsr_elements`]）——vendor reserved フィール
+/// ド（tag3/4）は出さない。
+pub fn encode_nocsr_elements(csr_der: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(1), csr_der);
+    w.put_bytes(Tag::Context(2), nonce);
+    w.end_container();
+    w.finish()
+}
+
+/// CSRResponse（spec §11.17.6.10）: `{0: NOCSRElements, 1:
+/// AttestationSignature}`。デバイス側 encoder（逆方向は
+/// [`decode_csr_response`]）。`nocsr_elements` は [`encode_nocsr_elements`]
+/// の出力（生 TLV バイト列）をそのまま渡す。
+pub fn encode_csr_response(nocsr_elements: &[u8], signature: &[u8; 64]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_bytes(Tag::Context(0), nocsr_elements);
+    w.put_bytes(Tag::Context(1), signature);
+    w.end_container();
+    w.finish()
+}
+
+/// NOCResponse（spec §11.17.6.14, AddNOC / RemoveFabric 共通の応答）:
+/// `{0: StatusCode, 1: FabricIndex(optional), 2: DebugText(optional)}`。
+/// デバイス側 encoder（逆方向は [`decode_noc_response`]）。
+pub fn encode_noc_response(status: u8, fabric_index: Option<u8>) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(status));
+    if let Some(idx) = fabric_index {
+        w.put_uint(Tag::Context(1), u64::from(idx));
+    }
+    w.end_container();
+    w.finish()
 }
 
 // --- ステップマシン（Task 10） ---
@@ -1966,5 +2205,124 @@ mod tests {
             validate_window_params(0, 100_001),
             Err(CommissionError::InvalidArgument { .. })
         ));
+    }
+
+    // --- Task 9: デバイス側 decoder / encoder ↔ 既存の逆方向のラウンドトリップ ---
+
+    #[test]
+    fn decode_arm_fail_safe_roundtrips_with_encoder() {
+        let (expiry, breadcrumb) = decode_arm_fail_safe(&encode_arm_fail_safe(120, 1)).unwrap();
+        assert_eq!((expiry, breadcrumb), (120, 1));
+    }
+
+    #[test]
+    fn decode_set_regulatory_config_roundtrips_with_encoder() {
+        let (config, country, breadcrumb) =
+            decode_set_regulatory_config(&encode_set_regulatory_config(2, "XX", 2)).unwrap();
+        assert_eq!((config, country.as_str(), breadcrumb), (2, "XX", 2));
+    }
+
+    #[test]
+    fn decode_attestation_request_roundtrips_with_encoder() {
+        let nonce = [5u8; 32];
+        assert_eq!(
+            decode_attestation_request(&encode_attestation_request(&nonce)).unwrap(),
+            nonce
+        );
+    }
+
+    #[test]
+    fn decode_cert_chain_request_roundtrips_with_encoder() {
+        assert_eq!(
+            decode_cert_chain_request(&encode_cert_chain_request(CERT_TYPE_DAC)).unwrap(),
+            CERT_TYPE_DAC
+        );
+        assert_eq!(
+            decode_cert_chain_request(&encode_cert_chain_request(CERT_TYPE_PAI)).unwrap(),
+            CERT_TYPE_PAI
+        );
+    }
+
+    #[test]
+    fn decode_csr_request_roundtrips_with_encoder() {
+        let nonce = [6u8; 32];
+        assert_eq!(
+            decode_csr_request(&encode_csr_request(&nonce)).unwrap(),
+            nonce
+        );
+    }
+
+    #[test]
+    fn decode_add_trusted_root_roundtrips_with_encoder() {
+        assert_eq!(
+            decode_add_trusted_root(&encode_add_trusted_root(b"rcac-tlv")).unwrap(),
+            b"rcac-tlv"
+        );
+    }
+
+    #[test]
+    fn decode_add_noc_roundtrips_with_encoder() {
+        let (noc, icac, ipk, subj, vendor) =
+            decode_add_noc(&encode_add_noc(b"noc-tlv", &[9u8; 16], 0x1_0001, 0xFFF1)).unwrap();
+        assert_eq!(noc, b"noc-tlv");
+        assert_eq!(icac, None); // encode_add_noc は tag1 を意図的に省略する
+        assert_eq!(ipk, [9u8; 16]);
+        assert_eq!(subj, 0x1_0001);
+        assert_eq!(vendor, 0xFFF1);
+    }
+
+    #[test]
+    fn encode_commissioning_status_response_roundtrips_with_decoder() {
+        let (code, text) =
+            decode_commissioning_status_response(&encode_commissioning_status_response(0, "ok"))
+                .unwrap();
+        assert_eq!((code, text.as_str()), (0, "ok"));
+        // 空文字列は tag1 自体を省略しても decode 側は空文字列で埋める
+        let (code2, text2) =
+            decode_commissioning_status_response(&encode_commissioning_status_response(3, ""))
+                .unwrap();
+        assert_eq!((code2, text2.as_str()), (3, ""));
+    }
+
+    #[test]
+    fn encode_attestation_response_roundtrips_with_decoder() {
+        let (el, sig) =
+            decode_attestation_response(&encode_attestation_response(b"elements", &[0xAB; 64]))
+                .unwrap();
+        assert_eq!(el, b"elements");
+        assert_eq!(sig, [0xAB; 64]);
+    }
+
+    #[test]
+    fn encode_cert_chain_response_roundtrips_with_decoder() {
+        assert_eq!(
+            decode_cert_chain_response(&encode_cert_chain_response(b"der-bytes")).unwrap(),
+            b"der-bytes"
+        );
+    }
+
+    #[test]
+    fn encode_nocsr_elements_roundtrips_with_parser() {
+        let nonce = [7u8; 32];
+        let (csr, parsed_nonce) =
+            parse_nocsr_elements(&encode_nocsr_elements(b"csr-der", &nonce)).unwrap();
+        assert_eq!(csr, b"csr-der");
+        assert_eq!(parsed_nonce, nonce.to_vec());
+    }
+
+    #[test]
+    fn encode_csr_response_roundtrips_with_decoder() {
+        let elements = encode_nocsr_elements(b"csr-der", &[7u8; 32]);
+        let (el, sig) = decode_csr_response(&encode_csr_response(&elements, &[0xCD; 64])).unwrap();
+        assert_eq!(el, elements);
+        assert_eq!(sig, [0xCD; 64]);
+    }
+
+    #[test]
+    fn encode_noc_response_roundtrips_with_decoder() {
+        let (status, idx) = decode_noc_response(&encode_noc_response(0, Some(1))).unwrap();
+        assert_eq!((status, idx), (0, Some(1)));
+        let (status2, idx2) = decode_noc_response(&encode_noc_response(3, None)).unwrap();
+        assert_eq!((status2, idx2), (3, None));
     }
 }

@@ -23,6 +23,10 @@ getrandom = { workspace = true }
 # crypto primitive. Versions match mat-controller's own hkdf/sha2 deps.
 hkdf = "0.12"
 sha2 = "0.10"
+# Operational keypair generation for CSRRequest (`core::commissioning`) —
+# unconditional for the same reason as hkdf/sha2 above (pure crypto, not
+# I/O). Version/features match mat-controller's own p256 dependency.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 
 [dev-dependencies]
 mat-controller = { workspace = true, features = ["test-responder"] }

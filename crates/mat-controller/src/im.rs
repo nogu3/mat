@@ -86,6 +86,19 @@ pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
 pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
 pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
 pub const STATUS_UNSUPPORTED_CLUSTER: u8 = 0xC3;
+/// "The receiver requires a fail-safe timer to be armed to accept this
+/// action" (spec §8.10.1 Table 8-19). `mat-device`'s commissioning server
+/// (Task 9) returns this for `AddNOC` when no `ArmFailSafe` is currently in
+/// effect — the command has no fabric context to build a `NOCResponse`
+/// against, so it fails at the IM status level rather than inside a
+/// `NOCResponse.statusCode`.
+pub const STATUS_FAILSAFE_REQUIRED: u8 = 0xCA;
+/// "The action is malformed and does not meet the specification and as
+/// such produces some error not covered by other status codes in this
+/// table" (spec §8.10.1 Table 8-19). `mat-device`'s commissioning server
+/// (Task 9) returns this when a command's `CommandFields` TLV fails to
+/// decode.
+pub const STATUS_INVALID_COMMAND: u8 = 0x85;
 
 /// A decoded scalar attribute/data value. Containers are not supported (M2
 /// scope is single scalar attributes such as onoff's `OnOff` bool).
