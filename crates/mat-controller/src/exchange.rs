@@ -364,6 +364,305 @@ impl<'t> UnsecuredExchange<'t> {
     }
 }
 
+/// peer が開始した unsecured exchange の応答側。PASE/CASE の全フローを 1
+/// exchange で捌く（spec §4.6, §4.12）。`UnsecuredExchange` の鏡像 —
+/// あちらは自分から exchange を開く初期側、こちらは peer から届いた最初の
+/// メッセージ（`adopt`）から採番を引き継いで応答する側。
+pub struct ResponderExchange<'t> {
+    transport: &'t Transport,
+    peer: SocketAddr,
+    exchange_id: u16,
+    counter: TxCounter,
+    rx_window: RxWindow,
+    /// 直近に受理した peer メッセージの counter。応答の ack piggyback に使う。
+    last_peer_counter: u32,
+    /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
+    last_rx: Option<Instant>,
+    /// adopt 時点の最初のメッセージが needs_ack を立てていれば、その counter。
+    first_needs_ack: Option<u32>,
+}
+
+impl<'t> ResponderExchange<'t> {
+    /// 受信済みの最初の peer-initiated メッセージから採番を引き継いで作る。
+    /// `first` の counter は即座に rx_window へコミットする — 再送されて
+    /// きた同一メッセージは `screen` の重複判定に落ちて standalone-ack のみ
+    /// 返す。
+    pub fn adopt(transport: &'t Transport, peer: SocketAddr, first: &IncomingMessage) -> Self {
+        let mut rx_window = RxWindow::new();
+        rx_window.check_and_commit(first.header.message_counter);
+        let first_needs_ack = first
+            .proto
+            .needs_ack
+            .then_some(first.header.message_counter);
+        Self {
+            transport,
+            peer,
+            exchange_id: first.proto.exchange_id,
+            counter: TxCounter::new_random(),
+            rx_window,
+            last_peer_counter: first.header.message_counter,
+            last_rx: Some(Instant::now()),
+            first_needs_ack,
+        }
+    }
+
+    /// adopt 時点のメッセージが ack を要求していた場合、その counter。
+    /// 最初の応答（`reply_reliable`/`reply_final`）自体が ack を piggyback
+    /// するので通常は不要だが、応答までに時間がかかる呼び出し側が先に
+    /// standalone ack を出す判断材料として公開する。
+    pub fn first_needs_ack(&self) -> Option<u32> {
+        self.first_needs_ack
+    }
+
+    fn build(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        needs_ack: bool,
+        acked_counter: Option<u32>,
+        payload: &[u8],
+    ) -> (Vec<u8>, u32) {
+        let needs_ack = needs_ack && !self.transport.is_reliable();
+        let message_counter = self.counter.next();
+        let header = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: false,
+            needs_ack,
+            acked_counter,
+            opcode,
+            exchange_id: self.exchange_id,
+            protocol_id,
+            vendor_id: None,
+        };
+        let mut buf = header.encoded();
+        proto.encode(&mut buf);
+        buf.extend_from_slice(payload);
+        (buf, message_counter)
+    }
+
+    async fn send_standalone_ack(&mut self, acked: u32) -> Result<(), ExchangeError> {
+        let (buf, _) = self.build(
+            PROTOCOL_ID_SECURE_CHANNEL,
+            OPCODE_MRP_STANDALONE_ACK,
+            false,
+            Some(acked),
+            &[],
+        );
+        self.transport.send_to(&buf, self.peer).await?;
+        Ok(())
+    }
+
+    /// `UnsecuredExchange::screen` の鏡像: `proto.initiator == false`
+    /// （応答側どうしの迷子/偽装トラフィック）と exchange_id 不一致を捨て、
+    /// 重複 counter は standalone-ack のみ返して `None`。
+    async fn screen(
+        &mut self,
+        buf: &[u8],
+        from: SocketAddr,
+    ) -> Result<Option<IncomingMessage>, ExchangeError> {
+        if from != self.peer {
+            return Ok(None);
+        }
+        let (header, off) = match MessageHeader::decode(buf) {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // 不正データグラムは無視（DoS 耐性）
+        };
+        if header.session_id != 0 || header.security_flags != 0 {
+            return Ok(None);
+        }
+        let (proto, body_off) = match ProtocolHeader::decode(&buf[off..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if proto.exchange_id != self.exchange_id || !proto.initiator {
+            return Ok(None);
+        }
+        self.last_rx = Some(Instant::now());
+        if !self.rx_window.check_and_commit(header.message_counter) {
+            if proto.needs_ack && !self.transport.is_reliable() {
+                self.send_standalone_ack(header.message_counter).await?;
+            }
+            return Ok(None);
+        }
+        self.last_peer_counter = header.message_counter;
+        if proto.needs_ack && !self.transport.is_reliable() {
+            self.send_standalone_ack(header.message_counter).await?;
+        }
+        Ok(Some(IncomingMessage {
+            header,
+            proto,
+            payload: buf[off + body_off..].to_vec(),
+        }))
+    }
+
+    /// Waits for the next real (non-ack) peer message on this exchange.
+    async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ExchangeError::Timeout);
+            }
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let Ok(recv) =
+                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
+            else {
+                return Err(ExchangeError::Timeout);
+            };
+            let (n, from) = recv?;
+            let Some(msg) = self.screen(&buf[..n], from).await? else {
+                continue;
+            };
+            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
+            {
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
+
+    /// initiator:false で応答し、同一 exchange の次の peer メッセージを待つ。
+    /// 応答には直前に受理した peer counter を ack piggyback する。ピアの
+    /// 実応答（または直後の任意の実メッセージ — 受信できたこと自体が我々の
+    /// 送信が処理された証拠、という `send_reliable` と同じ簡略化）が届くまで
+    /// MRP 再送する。standalone ack のみで確定した場合は `None`。
+    /// `UnsecuredExchange::send_reliable` の鏡像。
+    pub async fn reply_reliable(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<Option<IncomingMessage>, ExchangeError> {
+        if self.transport.is_reliable() {
+            let (datagram, _) = self.build(
+                protocol_id,
+                opcode,
+                false,
+                Some(self.last_peer_counter),
+                payload,
+            );
+            self.transport.send_to(&datagram, self.peer).await?;
+            let budget = total_budget(cfg);
+            return match self.recv(budget).await {
+                Ok(msg) => Ok(Some(msg)),
+                Err(e) => Err(e),
+            };
+        }
+        let (datagram, our_counter) = self.build(
+            protocol_id,
+            opcode,
+            true,
+            Some(self.last_peer_counter),
+            payload,
+        );
+        let mut interval = retrans_base(self.last_rx, cfg);
+        let mut attempts = 0u32;
+        loop {
+            self.transport.send_to(&datagram, self.peer).await?;
+            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let Ok(recv) =
+                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
+                else {
+                    break; // interval 経過 → 再送
+                };
+                let (n, from) = recv?;
+                let Some(msg) = self.screen(&buf[..n], from).await? else {
+                    continue;
+                };
+                let acks_us = msg.proto.acked_counter == Some(our_counter);
+                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
+                if is_standalone_ack {
+                    if acks_us {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                return Ok(Some(msg));
+            }
+            attempts += 1;
+            if attempts > cfg.max_retries {
+                return Err(ExchangeError::Timeout);
+            }
+            interval = interval.mul_f64(cfg.backoff);
+        }
+    }
+
+    /// 応答して待たない（StatusReport 終端用）。needs_ack を立て、ack
+    /// （standalone または piggyback、どちらも `acked_counter` が我々の
+    /// counter と一致していること）を受け取るまで MRP 再送する。
+    pub async fn reply_final(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<(), ExchangeError> {
+        if self.transport.is_reliable() {
+            let (datagram, _) = self.build(
+                protocol_id,
+                opcode,
+                false,
+                Some(self.last_peer_counter),
+                payload,
+            );
+            self.transport.send_to(&datagram, self.peer).await?;
+            return Ok(());
+        }
+        let (datagram, our_counter) = self.build(
+            protocol_id,
+            opcode,
+            true,
+            Some(self.last_peer_counter),
+            payload,
+        );
+        let mut interval = retrans_base(self.last_rx, cfg);
+        let mut attempts = 0u32;
+        loop {
+            self.transport.send_to(&datagram, self.peer).await?;
+            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let Ok(recv) =
+                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
+                else {
+                    break; // interval 経過 → 再送
+                };
+                let (n, from) = recv?;
+                let Some(msg) = self.screen(&buf[..n], from).await? else {
+                    continue;
+                };
+                if msg.proto.acked_counter == Some(our_counter) {
+                    return Ok(());
+                }
+            }
+            attempts += 1;
+            if attempts > cfg.max_retries {
+                return Err(ExchangeError::Timeout);
+            }
+            interval = interval.mul_f64(cfg.backoff);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +1056,295 @@ mod tests {
             total_budget(&cfg).as_millis(),
             base.mul_f64(1.0 + MRP_BACKOFF_JITTER).as_millis()
         );
+    }
+
+    // ---- ResponderExchange ----
+
+    /// テスト用: peer（initiator）視点の生データグラムを組み立てる。
+    fn initiator_datagram(
+        exchange_id: u16,
+        opcode: u8,
+        msg_counter: u32,
+        needs_ack: bool,
+        acked: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let h = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter: msg_counter,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let p = ProtocolHeader {
+            initiator: true,
+            needs_ack,
+            acked_counter: acked,
+            opcode,
+            exchange_id,
+            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        };
+        let mut buf = h.encoded();
+        p.encode(&mut buf);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// `ResponderExchange::adopt` に渡す最初のメッセージのフィクスチャ。
+    fn adopted_first(exchange_id: u16, counter: u32, needs_ack: bool) -> IncomingMessage {
+        IncomingMessage {
+            header: MessageHeader {
+                session_id: 0,
+                security_flags: 0,
+                message_counter: counter,
+                source_node_id: None,
+                destination: Destination::None,
+            },
+            proto: ProtocolHeader {
+                initiator: true,
+                needs_ack,
+                acked_counter: None,
+                opcode: 0x20,
+                exchange_id,
+                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                vendor_id: None,
+            },
+            payload: b"req".to_vec(),
+        }
+    }
+
+    /// テスト内ヘルパ（brief 記載）: 生 recv から `MessageHeader::decode` +
+    /// `ProtocolHeader::decode` で最初の unsecured メッセージを取り出す。
+    async fn recv_first_unsecured(t: &Transport) -> IncomingMessage {
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for first message")
+            .expect("recv_from io error");
+        let (header, off) = MessageHeader::decode(&buf[..n]).unwrap();
+        let (proto, body_off) = ProtocolHeader::decode(&buf[off..n]).unwrap();
+        IncomingMessage {
+            header,
+            proto,
+            payload: buf[off + body_off..n].to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn responder_exchange_round_trips() {
+        use crate::transport::{ReliableChannel, RELIABLE_PEER};
+        let (a, b) = ReliableChannel::pair();
+        let cfg = MrpConfig::default();
+        let responder_cfg = cfg.clone();
+        let init = tokio::spawn(async move {
+            let mut ex = UnsecuredExchange::new(&a, RELIABLE_PEER);
+            let reply = ex
+                .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x20, b"req1", &cfg)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.proto.opcode, 0x21);
+            let fin = ex
+                .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x22, b"req2", &cfg)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fin.proto.opcode, OPCODE_STATUS_REPORT);
+        });
+        // responder 側: 最初のメッセージを recv → adopt → reply_reliable → reply_final
+        let first = recv_first_unsecured(&b).await;
+        let mut re = ResponderExchange::adopt(&b, RELIABLE_PEER, &first);
+        let next = re
+            .reply_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x21, b"resp1", &responder_cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.payload, b"req2");
+        re.reply_final(
+            PROTOCOL_ID_SECURE_CHANNEL,
+            OPCODE_STATUS_REPORT,
+            &[0u8; 8],
+            &responder_cfg,
+        )
+        .await
+        .unwrap();
+        init.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_reliable_dedupes_replay_then_retransmits_until_real_message() {
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let local = transport.local_addr().unwrap();
+        let exchange_id = 0xABCD;
+
+        let first = adopted_first(exchange_id, 500, true);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+        assert_eq!(re.first_needs_ack(), Some(500));
+
+        let peer_task = tokio::spawn(async move {
+            // resp1（ack piggyback 済み）の初回送出を受ける
+            let (h1, p1, from) = read_msg(&peer_sock).await;
+            assert!(!p1.initiator);
+            assert!(p1.needs_ack);
+            assert_eq!(p1.acked_counter, Some(500));
+
+            // 元の req1 の重複を投げる → screen は standalone-ack のみ返すはず
+            let dup = initiator_datagram(exchange_id, 0x20, 500, true, None, b"req1");
+            peer_sock.send_to(&dup, local).await.unwrap();
+            let (_, ack_p, _) = read_msg(&peer_sock).await;
+            assert_eq!(ack_p.opcode, OPCODE_MRP_STANDALONE_ACK);
+            assert_eq!(ack_p.acked_counter, Some(500));
+
+            // resp1 の再送（同一 counter）を待ってから本物の req2 を返す
+            let (h2, p2, _) = read_msg(&peer_sock).await;
+            assert_eq!(h1.message_counter, h2.message_counter);
+            assert_eq!(p2.opcode, 0x21);
+            let req2 = initiator_datagram(
+                exchange_id,
+                0x22,
+                501,
+                false,
+                Some(h2.message_counter),
+                b"req2",
+            );
+            peer_sock.send_to(&req2, from).await.unwrap();
+        });
+
+        let next = re
+            .reply_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x21, b"resp1", &fast_cfg())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.payload, b"req2");
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_reliable_completes_on_standalone_ack() {
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let exchange_id = 0x9999;
+        let first = adopted_first(exchange_id, 10, true);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+
+        let peer_task = tokio::spawn(async move {
+            let (h, p, from) = read_msg(&peer_sock).await;
+            assert!(p.needs_ack);
+            assert_eq!(p.acked_counter, Some(10));
+            let ack = initiator_datagram(
+                exchange_id,
+                OPCODE_MRP_STANDALONE_ACK,
+                11,
+                false,
+                Some(h.message_counter),
+                &[],
+            );
+            peer_sock.send_to(&ack, from).await.unwrap();
+        });
+
+        let res = re
+            .reply_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x21, b"resp1", &fast_cfg())
+            .await
+            .unwrap();
+        assert!(res.is_none());
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_final_retransmits_same_counter_until_acked() {
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let exchange_id = 0x1234;
+        let first = adopted_first(exchange_id, 700, true);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+
+        let peer_task = tokio::spawn(async move {
+            let (h1, _, _) = read_msg(&peer_sock).await; // 1通目は握りつぶす
+            let (h2, p2, from) = read_msg(&peer_sock).await; // 再送
+            assert_eq!(h1.message_counter, h2.message_counter);
+            assert_eq!(p2.acked_counter, Some(700));
+            let ack = initiator_datagram(
+                exchange_id,
+                OPCODE_MRP_STANDALONE_ACK,
+                701,
+                false,
+                Some(h2.message_counter),
+                &[],
+            );
+            peer_sock.send_to(&ack, from).await.unwrap();
+        });
+
+        re.reply_final(
+            PROTOCOL_ID_SECURE_CHANNEL,
+            OPCODE_STATUS_REPORT,
+            &[0u8; 8],
+            &fast_cfg(),
+        )
+        .await
+        .unwrap();
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_final_times_out_without_ack() {
+        let peer_sock = bind_local().await; // 何も返さない
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let first = adopted_first(0x1234, 700, true);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+        let err = re
+            .reply_final(
+                PROTOCOL_ID_SECURE_CHANNEL,
+                OPCODE_STATUS_REPORT,
+                &[0u8; 8],
+                &fast_cfg(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExchangeError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn screen_drops_non_initiator_and_foreign_exchange_id() {
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let exchange_id = 0x55;
+        let first = adopted_first(exchange_id, 1, true);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+
+        // initiator == false（応答側どうしの迷子トラフィック）は捨てる
+        let mut not_initiator = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter: 2,
+            source_node_id: None,
+            destination: Destination::None,
+        }
+        .encoded();
+        ProtocolHeader {
+            initiator: false,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: 0x20,
+            exchange_id,
+            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        }
+        .encode(&mut not_initiator);
+        assert!(re
+            .screen(&not_initiator, peer_addr)
+            .await
+            .unwrap()
+            .is_none());
+
+        // exchange_id 不一致は捨てる
+        let foreign = initiator_datagram(exchange_id.wrapping_add(1), 0x20, 3, true, None, b"x");
+        assert!(re.screen(&foreign, peer_addr).await.unwrap().is_none());
     }
 }
