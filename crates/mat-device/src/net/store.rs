@@ -23,7 +23,13 @@ impl FileFabricStore {
 impl FabricPersist for FileFabricStore {
     fn save(&self, entries: &[FabricEntry]) -> Result<(), String> {
         let bytes = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
-        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())?;
+        // fabrics.json holds op_private_key/ipk_operational in plaintext —
+        // restrict it to the owner (Linux-only workspace, matches the
+        // rustix-based permission handling used elsewhere in `net`).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())
     }
 
     fn load(&self) -> Result<Vec<FabricEntry>, String> {
@@ -69,6 +75,21 @@ mod tests {
         store.save(std::slice::from_ref(&entry(1))).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded, vec![entry(1)]);
+    }
+
+    /// fabrics.json holds op_private_key/ipk_operational plaintext — must
+    /// not be group/world readable.
+    #[test]
+    fn save_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in_dir(dir.path());
+        store.save(std::slice::from_ref(&entry(1))).unwrap();
+        let mode = std::fs::metadata(dir.path().join("fabrics.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
