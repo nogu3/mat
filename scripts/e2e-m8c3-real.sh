@@ -203,7 +203,7 @@ assert_marker_absent() {
 cleanup_disposable_group() {
   local n
   for n in "${GROUP_NODE_ARR[@]}"; do
-    run_native_default "${STORE_ARG[@]}" invoke -n "$n" -e "$ENDPOINT" -c groups --command remove-group "$GROUP" >/dev/null 2>&1 \
+    NO_RETRY=1 run_native_default "${STORE_ARG[@]}" invoke -n "$n" -e "$ENDPOINT" -c groups --command remove-group "$GROUP" >/dev/null 2>&1 \
       && echo "device-side remove-group OK (node=$n)" \
       || echo "WARN: device-side groups remove-group が失敗 (node=$n, best-effort)" >&2
   done
@@ -224,6 +224,8 @@ cleanup_disposable_group() {
 # ★注意: 戻り値は必ずこの関数自身の最終 rc（呼び出し元の `cmd; cat ...` の
 # ような書き方で戻り値が別コマンドにすり替わるバグを避けるため、
 # ここに一元化した）。
+# NO_RETRY=1 を付けて呼ぶとリトライしない（toggle/write/commission/RemoveFabric
+# 等の状態変更 op の二重実行防止 — 監査 Tier5）。
 _run_ssh_capture() {
   local rc=0
   local attempt=1
@@ -231,7 +233,7 @@ _run_ssh_capture() {
     rc=0
     "$@" 2>"$LAST_STDERR_FILE" || rc=$?
     cat "$LAST_STDERR_FILE" >> "$COMBINED_LOG"
-    if [ "$rc" != 0 ] && [ "$attempt" = "1" ]; then
+    if [ "$rc" != 0 ] && [ "$attempt" = "1" ] && [ "${NO_RETRY:-0}" != "1" ]; then
       case "$rc" in
         5|141|255)
           echo "WARN: transient rc=$rc, retrying once in 3s: $*" >&2
@@ -387,7 +389,7 @@ op_sweep() {
 
   echo "-- [$label] write (levelcontrol on-level=77 → read back → revert to null)"
   local WRITE_OUT
-  WRITE_OUT=$(run_native_default "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value 77)
+  WRITE_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value 77)
   echo "$WRITE_OUT"
   assert_no_fallback "write on-level=77 (native default)"
   assert_native_marker "iface auto-selected (native default)" "write on-level=77 (native default)"
@@ -399,7 +401,7 @@ op_sweep() {
   assert_no_fallback "read on-level after write (native default)"
   assert_grep '"value":77' "$READ_OUT" "write 直後の read on-level が value:77 を返さない"
 
-  WRITE_OUT=$(run_native_default "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value null)
+  WRITE_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value null)
   echo "$WRITE_OUT"
   assert_no_fallback "write on-level=null revert (native default)"
   assert_grep '"status":"success"' "$WRITE_OUT" "write on-level=null（後始末）が status:success を返さない"
@@ -407,14 +409,14 @@ op_sweep() {
 
   echo "-- [$label] invoke (onoff toggle → 逆toggle)"
   local INVOKE_OUT
-  INVOKE_OUT=$(run_native_default "${STORE_ARG[@]}" invoke -n "$NODE" -e "$ENDPOINT" -c onoff --command toggle)
+  INVOKE_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" invoke -n "$NODE" -e "$ENDPOINT" -c onoff --command toggle)
   echo "$INVOKE_OUT"
   assert_no_fallback "invoke toggle (native default)"
   assert_native_marker "iface auto-selected (native default)" "invoke toggle (native default)"
   assert_native_marker "invoke executed (native direct)" "invoke toggle (native default)"
   assert_grep '"status":"success"' "$INVOKE_OUT" "invoke toggle が status:success を返さない"
 
-  INVOKE_OUT=$(run_native_default "${STORE_ARG[@]}" invoke -n "$NODE" -e "$ENDPOINT" -c onoff --command toggle)
+  INVOKE_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" invoke -n "$NODE" -e "$ENDPOINT" -c onoff --command toggle)
   echo "$INVOKE_OUT"
   assert_no_fallback "invoke toggle revert (native default)"
   assert_grep '"status":"success"' "$INVOKE_OUT" "invoke toggle（復元）が status:success を返さない"
@@ -449,7 +451,7 @@ op_sweep() {
 
   echo "-- [$label] open-window"
   local OW_OUT
-  OW_OUT=$(run_native_default "${STORE_ARG[@]}" open-window -n "$NODE")
+  OW_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" open-window -n "$NODE")
   echo "$OW_OUT"
   assert_no_fallback "open-window (native default)"
   assert_native_marker "iface auto-selected (native default)" "open-window (native default)"
@@ -463,7 +465,7 @@ op_sweep() {
   local GP_OUT GP_RC
   GP_RC=0
   # shellcheck disable=SC2086 # GROUP_NODES は意図的に空白展開する（--nodes にそのまま渡す）
-  GP_OUT=$(run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
+  GP_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
     --keyset-id "$KEYSET" --name "$GROUP_NAME") || GP_RC=$?
   if [ "$GP_RC" != 0 ]; then
     echo "FAIL: [$label] group provision (native default) が exit $GP_RC で失敗した（pre-clean 後でもこれが起きる場合は再実行耐性の問題ではなく実際の provision 失敗）:" >&2
@@ -481,7 +483,7 @@ op_sweep() {
   echo "-- [$label] group provision --rebind（再実行、Duplicate にならないこと）"
   GP_RC=0
   # shellcheck disable=SC2086
-  GP_OUT=$(run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
+  GP_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" group provision -g "$GROUP" --nodes $GROUP_NODES \
     --keyset-id "$KEYSET" --name "$GROUP_NAME" --rebind) || GP_RC=$?
   if [ "$GP_RC" != 0 ]; then
     echo "FAIL: [$label] group provision --rebind (native default) が exit $GP_RC で失敗した:" >&2
@@ -497,14 +499,14 @@ op_sweep() {
 
   echo "-- [$label] group invoke（toggle → 逆toggle）"
   local GI_OUT
-  GI_OUT=$(run_native_default "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
+  GI_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
   echo "$GI_OUT"
   assert_no_fallback "group invoke toggle (native default)"
   assert_native_marker "iface auto-selected (native default)" "group invoke toggle (native default)"
   assert_native_marker "groupcast sent (native)" "group invoke toggle (native default)"
   assert_grep '"status":"sent"' "$GI_OUT" "group invoke toggle が status:sent を返さない"
 
-  GI_OUT=$(run_native_default "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
+  GI_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
   echo "$GI_OUT"
   assert_no_fallback "group invoke toggle revert (native default)"
   assert_grep '"status":"sent"' "$GI_OUT" "group invoke toggle（復元）が status:sent を返さない"
@@ -518,20 +520,20 @@ op_sweep() {
   echo "$READ_OUT"
   assert_grep '"value"' "$READ_OUT" "matd 経由 read が value を含まない"
 
-  WRITE_OUT=$(run_matd "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value 77)
+  WRITE_OUT=$(NO_RETRY=1 run_matd "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value 77)
   echo "$WRITE_OUT"
   assert_grep '"status":"success"' "$WRITE_OUT" "matd 経由 write on-level=77 が status:success を返さない"
   READ_OUT=$(run_matd "${STORE_ARG[@]}" read -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level)
   echo "$READ_OUT"
   assert_grep '"value":77' "$READ_OUT" "matd 経由 write 直後の read on-level が value:77 を返さない"
-  WRITE_OUT=$(run_matd "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value null)
+  WRITE_OUT=$(NO_RETRY=1 run_matd "${STORE_ARG[@]}" write -n "$NODE" -e "$ENDPOINT" -c levelcontrol -a on-level --value null)
   echo "$WRITE_OUT"
   assert_grep '"status":"success"' "$WRITE_OUT" "matd 経由 write on-level=null（後始末）が status:success を返さない"
 
-  GI_OUT=$(run_matd "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
+  GI_OUT=$(NO_RETRY=1 run_matd "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
   echo "$GI_OUT"
   assert_grep '"status":"sent"' "$GI_OUT" "matd 経由 group invoke toggle が status:sent を返さない"
-  GI_OUT=$(run_matd "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
+  GI_OUT=$(NO_RETRY=1 run_matd "${STORE_ARG[@]}" group invoke -g "$GROUP" -c onoff --command toggle -e "$ENDPOINT")
   echo "$GI_OUT"
   assert_grep '"status":"sent"' "$GI_OUT" "matd 経由 group invoke toggle（復元）が status:sent を返さない"
 
@@ -713,7 +715,7 @@ stage2_main() {
   echo "fresh store = $FRESH_STORE"
 
   local FI_JSON
-  FI_JSON=$(run_native_fresh fabric init) || { echo "FAIL: fabric init (fresh store) が失敗した" >&2; exit 1; }
+  FI_JSON=$(NO_RETRY=1 run_native_fresh fabric init) || { echo "FAIL: fabric init (fresh store) が失敗した" >&2; exit 1; }
   echo "$FI_JSON"
   assert_no_fallback "fabric init (fresh store)"
   assert_native_marker "fabric bootstrap written (native kvs)" "fabric init (fresh store)"
@@ -734,7 +736,7 @@ stage2_main() {
 
   echo "-- 再 init 拒否（exit 1, kind:other を期待 — 以下の 'FAIL: remote command failed' 行は想定内、拒否そのものの実証）"
   local REINIT_RC=0
-  run_native_fresh fabric init >/dev/null || REINIT_RC=$?
+  NO_RETRY=1 run_native_fresh fabric init >/dev/null || REINIT_RC=$?
   if [ "$REINIT_RC" != 1 ]; then
     echo "FAIL: 再 init が exit 1 でない (rc=$REINIT_RC) — AlreadyExists の分類が変わった可能性" >&2
     cat "$LAST_STDERR_FILE" >&2
@@ -759,7 +761,7 @@ stage2_main() {
     # 初回 open の window 失効まで最大 45s×5 回リトライで対応する。
     local ow_attempt ow_ok=0
     for ow_attempt in 1 2 3 4 5; do
-      if OW_OUT=$(run_native_default "${STORE_ARG[@]}" open-window -n "$NODE"); then
+      if OW_OUT=$(NO_RETRY=1 run_native_default "${STORE_ARG[@]}" open-window -n "$NODE"); then
         ow_ok=1
         break
       fi
@@ -784,7 +786,7 @@ stage2_main() {
     local NEW_NODE_JSON ok attempt
     ok=0
     for attempt in 1 2 3; do
-      if NEW_NODE_JSON=$(run_native_fresh commission --target "m8c3-cross-fabric-probe" --setup-code "$OW_QR"); then
+      if NEW_NODE_JSON=$(NO_RETRY=1 run_native_fresh commission --target "m8c3-cross-fabric-probe" --setup-code "$OW_QR"); then
         ok=1
         break
       fi
@@ -825,7 +827,7 @@ stage2_main() {
       echo "FAIL: 新 fabric の current-fabric-index が取得できない — node $NODE に第2 fabric が残留している可能性、手動確認してください" >&2
       exit 1
     fi
-    run_native_fresh invoke -n "$NEW_NODE_ID" -e 0 -c operationalcredentials --command remove-fabric "$NEW_DEV_FI" >/dev/null \
+    NO_RETRY=1 run_native_fresh invoke -n "$NEW_NODE_ID" -e 0 -c operationalcredentials --command remove-fabric "$NEW_DEV_FI" >/dev/null \
       || { echo "FAIL: 新 fabric の RemoveFabric が失敗した — node $NODE に第2 fabric が残留している可能性。手動で groupsettings/操作をご確認ください" >&2; exit 1; }
     echo "PASS: 新 fabric を RemoveFabric（元 fabric は無傷のはず）" >&2
 
@@ -1047,13 +1049,13 @@ stage1_main() {
       fi
 
       echo "-- [$label] RemoveFabric（native invoke, fabric-index=$DEV_FI）"
-      run_native_default "${STORE_ARG[@]}" invoke -n "$EPOCH_NODE" -e 0 -c operationalcredentials --command remove-fabric "$DEV_FI" >/dev/null
+      NO_RETRY=1 run_native_default "${STORE_ARG[@]}" invoke -n "$EPOCH_NODE" -e 0 -c operationalcredentials --command remove-fabric "$DEV_FI" >/dev/null
       assert_no_fallback "[$label] invoke remove-fabric"
 
       echo "-- [$label] 同一 setup code で on-network 再commission（commissioning window 再オープン待ちのため最大3回リトライ）"
       local ok=0 attempt
       for attempt in 1 2 3; do
-        if run_native_default "${STORE_ARG[@]}" commission --target "on-network-epoch-probe" \
+        if NO_RETRY=1 run_native_default "${STORE_ARG[@]}" commission --target "on-network-epoch-probe" \
           --setup-code "$EPOCH_SETUP_CODE" --node "$EPOCH_NODE" >/dev/null; then
           ok=1
           break
@@ -1088,7 +1090,7 @@ stage1_main() {
     if FI_OUT2=$(run_native_default "${STORE_ARG[@]}" read -n "$EPOCH_NODE" -e 0 -c operationalcredentials -a current-fabric-index 2>/dev/null); then
       DEV_FI2=$(printf '%s' "$FI_OUT2" | jq -r '.value' 2>/dev/null) || DEV_FI2=""
       if [ -n "$DEV_FI2" ] && [ "$DEV_FI2" != "null" ]; then
-        run_native_default "${STORE_ARG[@]}" invoke -n "$EPOCH_NODE" -e 0 -c operationalcredentials --command remove-fabric "$DEV_FI2" >/dev/null 2>&1 \
+        NO_RETRY=1 run_native_default "${STORE_ARG[@]}" invoke -n "$EPOCH_NODE" -e 0 -c operationalcredentials --command remove-fabric "$DEV_FI2" >/dev/null 2>&1 \
           && echo "node $EPOCH_NODE を RemoveFabric しました（fabric-less で終了 — 元の運用に戻すには手動で再commissionしてください）" \
           || echo "WARN: 後始末の RemoveFabric が失敗（best-effort、node $EPOCH_NODE の状態を手動確認してください）" >&2
       fi

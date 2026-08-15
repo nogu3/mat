@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# [M8c-3] chip-tool 撤去済みのため 0.22.0 以降では動かない（歴史的アーカイブ。
-# 動かすなら git tag の 0.21.0 時点を checkout）。現行ハーネスは e2e-m8c3-real.sh。
-# Phase 5 M6a 受け入れ: native commissioning ローカル E2E。
-# 前提: ./chip-all-clusters-app (task chip:extract:app)。chip-tool は不要。
+# Phase 5 M6a 受け入れ: native commissioning ローカル E2E。chip-tool 非依存で
+# 現行コードでも動く、唯一の device-free commissioning ハーネス（実機ハーネスは
+# e2e-m8c3-real.sh）。
+# 前提: ./chip-all-clusters-app（または MAT_E2E_APP=<path>）。入手方法:
+#   - 旧 Docker ステージを使う: `git show c415bda~1:Dockerfile` の
+#     all-clusters-builder ステージ（chip-tool 退役コミットで撤去済み）
+#   - または upstream connectedhomeip の examples/all-clusters-app/linux をビルド
 set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=${MAT_E2E_APP:-./chip-all-clusters-app}
 PASSCODE=20202021
-[[ -x "$APP" ]] || { echo "error: $APP なし (task chip:extract:app)"; exit 1; }
+[[ -x "$APP" ]] || { echo "error: $APP なし（入手方法はこのファイル先頭のコメント参照）"; exit 1; }
 
 WORK=$(mktemp -d)
 APP_PID=""
