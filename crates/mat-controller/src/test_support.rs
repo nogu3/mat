@@ -535,3 +535,259 @@ pub async fn responder_task(
         .expect("send report data");
     initiator_addr
 }
+
+// ============================================================================
+// PASE responder（SPAKE2+ verifier 役）— audit Tier 5
+// ============================================================================
+
+/// The test-only PASE responder: the mirror of `pase::establish` with the
+/// roles swapped, using real SPAKE2+ *verifier* math (Y = y·P + w0·N,
+/// Z = y·(X − w0·M), V = y·L with L = w1·P). Serves PBKDFParamRequest →
+/// PBKDFParamResponse → Pake1/2/3 → StatusReport(success), then answers one
+/// secured IM ReadRequest with ReportData(on-off=false). PASE sessions are
+/// unauthenticated: both nonce node ids are 0 (spec §4.13).
+///
+/// Returns the initiator's observed source `SocketAddr` (same contract as
+/// `responder_task`).
+pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> SocketAddr {
+    use crate::pase::{
+        OPCODE_PASE_PAKE1, OPCODE_PASE_PAKE2, OPCODE_PASE_PAKE3, OPCODE_PBKDF_PARAM_REQUEST,
+        OPCODE_PBKDF_PARAM_RESPONSE,
+    };
+    use crate::spake2p;
+    use p256::ProjectivePoint;
+
+    const ITERATIONS: u32 = 1000;
+    const SALT: &[u8; 16] = b"SPAKE2P Key Salt";
+
+    // --- PBKDFParamRequest ---
+    let (req_payload, req_exchange, req_counter, initiator_session_id, initiator_addr) = loop {
+        let (buf, from) = recv_dg(&transport).await;
+        let Some((p, payload)) = decode_unsecured(&buf) else {
+            continue;
+        };
+        if p.opcode != OPCODE_PBKDF_PARAM_REQUEST || !p.initiator {
+            continue;
+        }
+        let (h, _) = MessageHeader::decode(&buf).unwrap();
+        // initiatorSessionId は struct の tag 2
+        let mut r = Reader::new(&payload);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut sid: Option<u16> = None;
+        loop {
+            let el = r.next().unwrap().expect("pbkdf request truncated");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(2), Value::Uint(v)) => sid = Some(v as u16),
+                _ => {}
+            }
+        }
+        break (
+            payload,
+            p.exchange_id,
+            h.message_counter,
+            sid.expect("pbkdf request missing initiator session id"),
+            from,
+        );
+    };
+
+    let resp_session_id: u16 = 0xB0B1;
+
+    // --- PBKDFParamResponse ---
+    let resp_payload = {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &[0u8; 32]); // initiatorRandom echo（initiator は無視）
+        w.put_bytes(Tag::Context(2), &[1u8; 32]); // responderRandom（同上）
+        w.put_uint(Tag::Context(3), u64::from(resp_session_id));
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), u64::from(ITERATIONS));
+        w.put_bytes(Tag::Context(2), SALT);
+        w.end_container();
+        w.end_container();
+        w.finish()
+    };
+    let resp_dg = build_unsecured(
+        200,
+        OPCODE_PBKDF_PARAM_RESPONSE,
+        req_exchange,
+        Some(req_counter),
+        false,
+        &resp_payload,
+    );
+    transport
+        .send_to(&resp_dg, initiator_addr)
+        .await
+        .expect("send pbkdf param response");
+
+    // --- PAKE context（spec §4.13.1.2、pase.rs と同じ構成）---
+    let mut hasher = Sha256::new();
+    hasher.update(b"CHIP PAKE V1 Commissioning");
+    hasher.update(&req_payload);
+    hasher.update(&resp_payload);
+    let context: [u8; 32] = hasher.finalize().into();
+
+    // --- Pake1 ---
+    let (p_a, pake1_exchange, pake1_counter) = loop {
+        let (buf, _from) = recv_dg(&transport).await;
+        let Some((p, payload)) = decode_unsecured(&buf) else {
+            continue;
+        };
+        if p.opcode != OPCODE_PASE_PAKE1 {
+            continue; // PBKDFParamRequest の MRP 再送などは無視
+        }
+        let (h, _) = MessageHeader::decode(&buf).unwrap();
+        let mut r = Reader::new(&payload);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut pa: Option<[u8; 65]> = None;
+        loop {
+            let el = r.next().unwrap().expect("pake1 truncated");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(1), Value::Bytes(b)) => {
+                    pa = Some(b.try_into().expect("pA is 65 bytes"))
+                }
+                _ => {}
+            }
+        }
+        break (
+            pa.expect("pake1 missing pA"),
+            p.exchange_id,
+            h.message_counter,
+        );
+    };
+
+    // --- SPAKE2+ verifier 計算 ---
+    let (w0, w1) = spake2p::derive_w0_w1(passcode, SALT, ITERATIONS);
+    let y = spake2p::random_scalar();
+    let m = spake2p::decode_point(&spake2p::SPAKE_M).expect("SPAKE_M constant");
+    let n = spake2p::decode_point(&spake2p::SPAKE_N).expect("SPAKE_N constant");
+    let p_b_point = ProjectivePoint::GENERATOR * y + n * w0;
+    let p_b = spake2p::encode_point(&p_b_point);
+    let p_a_point = spake2p::decode_point(&p_a).expect("pA on curve");
+    let z = (p_a_point - m * w0) * y;
+    let l = ProjectivePoint::GENERATOR * w1;
+    let v = l * y;
+    let tt = spake2p::build_transcript(&context, b"", b"", &p_a, &p_b, &z, &v, &w0);
+    let (k_a, k_e) = spake2p::split_hash(&tt);
+    let (kc_a, kc_b) = spake2p::confirmation_keys(&k_a);
+    let c_b = spake2p::hmac32(&kc_b, &p_a);
+    let expected_c_a = spake2p::hmac32(&kc_a, &p_b);
+
+    // --- Pake2 ---
+    let pake2_payload = {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &p_b);
+        w.put_bytes(Tag::Context(2), &c_b);
+        w.end_container();
+        w.finish()
+    };
+    let pake2_dg = build_unsecured(
+        201,
+        OPCODE_PASE_PAKE2,
+        pake1_exchange,
+        Some(pake1_counter),
+        false,
+        &pake2_payload,
+    );
+    transport
+        .send_to(&pake2_dg, initiator_addr)
+        .await
+        .expect("send pake2");
+
+    // --- Pake3（cA 検証）---
+    let (c_a, pake3_exchange, pake3_counter) = loop {
+        let (buf, _from) = recv_dg(&transport).await;
+        let Some((p, payload)) = decode_unsecured(&buf) else {
+            continue;
+        };
+        if p.opcode != OPCODE_PASE_PAKE3 {
+            continue;
+        }
+        let (h, _) = MessageHeader::decode(&buf).unwrap();
+        let mut r = Reader::new(&payload);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut ca: Option<[u8; 32]> = None;
+        loop {
+            let el = r.next().unwrap().expect("pake3 truncated");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(1), Value::Bytes(b)) => {
+                    ca = Some(b.try_into().expect("cA is 32 bytes"))
+                }
+                _ => {}
+            }
+        }
+        break (
+            ca.expect("pake3 missing cA"),
+            p.exchange_id,
+            h.message_counter,
+        );
+    };
+    assert_eq!(c_a, expected_c_a, "initiator cA mismatch (transcript bug?)");
+
+    // --- StatusReport(success) ---
+    let status = [0u8; 8]; // general=0, protocol id=0, code=0
+    let status_dg = build_unsecured(
+        202,
+        OPCODE_STATUS_REPORT,
+        pake3_exchange,
+        Some(pake3_counter),
+        false,
+        &status,
+    );
+    transport
+        .send_to(&status_dg, initiator_addr)
+        .await
+        .expect("send pase status report");
+
+    // --- SessionKeys（spec §4.13.2.3: HKDF(salt=[], ikm=Ke, "SessionKeys")）---
+    let okm = hkdf48(&k_e, &[], INFO_SESSION_KEYS);
+    let i2r: [u8; 16] = okm[..16].try_into().unwrap();
+    let r2i: [u8; 16] = okm[16..32].try_into().unwrap();
+
+    // --- Serve one secured IM ReadRequest（PASE は両側 node id 0）---
+    let (read_exchange, read_counter) = loop {
+        let (buf, _from) = recv_dg(&transport).await;
+        let (mh, _) = match MessageHeader::decode(&buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if mh.session_id != resp_session_id {
+            continue;
+        }
+        let (h, p, _payload) = match open_message(&i2r, &buf, 0) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if p.protocol_id != im::PROTOCOL_ID_IM || p.opcode != im::OPCODE_READ_REQUEST {
+            continue;
+        }
+        break (p.exchange_id, h.message_counter);
+    };
+
+    let report = report_data_false_suppressed();
+    let header = MessageHeader {
+        session_id: initiator_session_id,
+        security_flags: 0,
+        message_counter: 2000,
+        source_node_id: None,
+        destination: Destination::None,
+    };
+    let proto = ProtocolHeader {
+        initiator: false,
+        needs_ack: true,
+        acked_counter: Some(read_counter),
+        opcode: im::OPCODE_REPORT_DATA,
+        exchange_id: read_exchange,
+        protocol_id: im::PROTOCOL_ID_IM,
+        vendor_id: None,
+    };
+    let report_dg = seal_message(&r2i, &header, &proto, &report, 0).expect("seal report data");
+    transport
+        .send_to(&report_dg, initiator_addr)
+        .await
+        .expect("send report data");
+    initiator_addr
+}

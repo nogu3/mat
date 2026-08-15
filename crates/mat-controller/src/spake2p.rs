@@ -84,7 +84,9 @@ pub fn compute_verifier(passcode: u32, salt: &[u8], iterations: u32) -> [u8; 97]
     out
 }
 
-fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to decode pA / the SPAKE_M/SPAKE_N constants.
+pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
     let ep = EncodedPoint::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
     let ap = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
         .ok_or(SpakeError::BadPoint)?;
@@ -95,7 +97,9 @@ fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
     Ok(p)
 }
 
-fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to encode pB.
+pub(crate) fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
     p.to_affine()
         .to_encoded_point(false)
         .as_bytes()
@@ -113,8 +117,10 @@ fn tt_elem(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Context, idProver, idVerifier, M, N, pA, pB, Z, V, w0。
 /// prover / verifier どちらの役でも Z・V さえ計算できれば同じ TT になる —
 /// 自己整合性テスト (verifier 役) から直接呼べるようフリー関数にしてある。
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to build TT with the verifier-side Z/V.
 #[allow(clippy::too_many_arguments)]
-fn build_transcript(
+pub(crate) fn build_transcript(
     context: &[u8],
     id_p: &[u8],
     id_v: &[u8],
@@ -142,7 +148,9 @@ fn build_transcript(
 
 /// SHA256(TT) を Ka(前半16B) / Ke(後半16B) に分割する。Matter 固有の分割
 /// (spec §3.10.3) — RFC 9383 本体の K_main/K_confirmP/K_confirmV とは異なる。
-fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to split TT's hash into Ka/Ke.
+pub(crate) fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
     let hash = Sha256::digest(tt);
     let mut k_a = [0u8; 16];
     let mut k_e = [0u8; 16];
@@ -153,7 +161,9 @@ fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
 
 /// HKDF-SHA256(salt=[], ikm=Ka, info="ConfirmationKeys") 32B
 /// → KcA(前半16B) / KcB(後半16B)（spec §3.10.3）。
-fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to derive KcA/KcB.
+pub(crate) fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     let hk = Hkdf::<Sha256>::new(Some(&[]), k_a);
     let mut kc = [0u8; 32];
     hk.expand(b"ConfirmationKeys", &mut kc)
@@ -165,7 +175,9 @@ fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     (kc_a, kc_b)
 }
 
-fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) to compute cB / verify cA.
+pub(crate) fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(msg);
     mac.finalize().into_bytes().into()
@@ -173,7 +185,9 @@ fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
 
 /// `case::random_p256_secret` と同じ乱数源から Scalar を得る（0 は
 /// `random_p256_secret` 側で引き直し済み、ここでは Deref するだけ）。
-fn random_scalar() -> Scalar {
+/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
+/// (audit Tier 5) for its own ephemeral `y`.
+pub(crate) fn random_scalar() -> Scalar {
     *random_p256_secret().to_nonzero_scalar()
 }
 
