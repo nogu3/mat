@@ -48,3 +48,20 @@
 - Subscribe のサーバ側（M2 で Echo が要求した時点で実装）
 - BLE peripheral / BTP サーバ役 / Thread
 - 並行セッション処理・no_std 化
+
+## M1 完了時の申し送り（2026-08-15 最終レビューより）
+
+M1 は受け入れ条件を満たして完了（実 `mat commission` が実 mDNS 発見込みで success、`task e2e:device:m1` で再現可能）。最終ブランチレビューが M2 計画の入力として残した既知リスク・繰延事項:
+
+**M2（Echo 相互運用）で必ず拾う**（発火しやすい順）:
+
+1. ~~piggyback ack 同載リクエストの取り扱い~~（M1 終盤で修正済み: screen が全 peer-initiated 非 ack を退避し runtime がドレイン）
+2. **Sigma2 TBE の resumptionID 欠落** — 仕様上 TBEData2 の必須フィールドで chip のパーサが期待する。Echo との CASE が硬く落ちる可能性が高い。Sigma1 の resumption 要求への応答挙動（現状: full Sigma1 として扱う）も併せて確認
+3. **fail-safe 期限切れの導入済み fabric ロールバック** — 現状、CommissioningComplete 前にコミッショナーが死ぬとゾンビ fabric が永続し、リトライごとに増える（`next_fabric_index` の再利用問題と併せて修正）
+4. **wildcard read / 複数 path read の AttributeStatusIB** — chip 系コントローラは常用する
+5. **Subscribe のサーバ側** — Echo は購読失敗をデバイスオフラインとみなす
+6. **mDNS の unsolicited announcement / goodbye** — 現状は query 応答のみ。Echo は窓オープン時・operational 出現時の announce を期待する
+7. **コミッショニング窓のライフサイクル** — 現状 PASE は常時応答（広告だけ止まる）。窓 open/close 実装時に常設パスコード窓も閉じる
+8. **PASE salt の乱数化**（現状固定 salt・iterations 1000）と逐次ループの head-of-line blocking（Echo の並列 exchange 挙動で顕在化しうる）
+
+**クリーンアップ（急がない）**: MRP 送信ループの 3 重複（send_reliable/respond_status/reply_reliable）の共有ヘルパ化 / HKDF48 セッション鍵導出の共有化 / UnsecuredExchange↔ResponderExchange の鏡像重複 / controller 役 send_reliable の cross-exchange piggyback ack 早期完了（reply_reliable にのみ実装済み）/ next_subscription_report が非 ReportData の退避メッセージで UnexpectedOpcode になり得る潜在点
