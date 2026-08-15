@@ -451,3 +451,56 @@ mod tests {
         );
     }
 }
+
+/// Pins the hand-written cluster/attribute id constants in
+/// `mat_controller::im` (this module's only consumer of them) against
+/// `mat_core::ids`'s generated CHIP data model table
+/// (`crates/mat-core/src/ids_gen.rs`, regenerated from connectedhomeip by
+/// `scripts/gen-ids.py`) — `mat-controller` doesn't depend on `mat-core`
+/// (and `mat-device/core` can't, without breaking the `--no-default-
+/// features` purity check), so `im.rs`'s own consts can't be *sourced from*
+/// the generated table; this test only *checks* them against it. Gated on
+/// the `net` feature (not just `test`) because `mat-core` is an optional
+/// dependency enabled by `net` — `cargo test -p mat-device
+/// --no-default-features` compiles this module without it. A future
+/// `ids_gen.rs` regen that moves one of these ids fails a test here instead
+/// of drifting silently.
+#[cfg(all(test, feature = "net"))]
+mod drift_guard {
+    use mat_controller::im;
+    use mat_core::ids::resolve_attribute;
+    use mat_core::ids::resolve_cluster;
+
+    #[test]
+    fn descriptor_cluster_and_attrs_match_mat_core_ids() {
+        assert_eq!(resolve_cluster("descriptor"), Some(im::CLUSTER_DESCRIPTOR));
+        let attr = |name: &str| resolve_attribute(im::CLUSTER_DESCRIPTOR, name).unwrap().id;
+        assert_eq!(attr("device-type-list"), im::ATTR_DEVICE_TYPE_LIST);
+        assert_eq!(attr("server-list"), im::ATTR_SERVER_LIST);
+        assert_eq!(attr("parts-list"), im::ATTR_PARTS_LIST);
+    }
+
+    #[test]
+    fn basic_information_cluster_and_attrs_match_mat_core_ids() {
+        assert_eq!(
+            resolve_cluster("basicinformation"),
+            Some(im::CLUSTER_BASIC_INFORMATION)
+        );
+        let attr = |name: &str| {
+            resolve_attribute(im::CLUSTER_BASIC_INFORMATION, name)
+                .unwrap()
+                .id
+        };
+        assert_eq!(attr("data-model-revision"), im::ATTR_DATA_MODEL_REVISION);
+        assert_eq!(attr("vendor-name"), im::ATTR_VENDOR_NAME);
+        assert_eq!(attr("vendor-id"), im::ATTR_VENDOR_ID);
+        assert_eq!(attr("product-name"), im::ATTR_PRODUCT_NAME);
+        assert_eq!(attr("product-id"), im::ATTR_PRODUCT_ID);
+    }
+
+    // `im::DEVICE_TYPE_ROOT_NODE` (RootNode device type, spec §9.2.2) is
+    // intentionally not pinned here: `mat_core::ids`'s generated table
+    // covers clusters/attributes/commands only, not device types — there is
+    // no `mat_core` lookup to check it against. See the doc comment on the
+    // constant itself.
+}

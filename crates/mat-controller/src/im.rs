@@ -52,13 +52,28 @@ pub const ATTR_ACL: u32 = 0x0000;
 /// Descriptor cluster (spec §9.5). Every endpoint's mandatory
 /// "what am I / what's under me" cluster — `mat-device`'s `datamodel`
 /// serves it on endpoint 0.
+///
+/// Hand-written, not sourced from `mat_core::ids`'s generated CHIP table:
+/// `mat-controller` has never depended on `mat-core` (and `mat-device` only
+/// gets it behind its `net` feature, which `mat-device/core` — this
+/// constant's main consumer — must not depend on). Pinned against
+/// `mat_core::ids` by `mat-device`'s
+/// `core::datamodel::drift_guard::descriptor_cluster_and_attrs_match_mat_core_ids`
+/// test (runs under the `net` feature, where both crates are reachable) —
+/// a future `ids_gen.rs` regen that moves one of these ids fails that test
+/// instead of drifting silently.
 pub const CLUSTER_DESCRIPTOR: u32 = 0x001D;
 pub const ATTR_DEVICE_TYPE_LIST: u32 = 0x0000;
 pub const ATTR_SERVER_LIST: u32 = 0x0001;
 pub const ATTR_PARTS_LIST: u32 = 0x0003;
 /// RootNode device type (spec §9.2.2), the `DeviceTypeList` entry for
-/// endpoint 0.
+/// endpoint 0. Not pinned by the drift-guard test above: `mat_core::ids`'s
+/// generated table only covers clusters/attributes/commands, not device
+/// types, so there is no generated source of truth to check this against.
 pub const DEVICE_TYPE_ROOT_NODE: u32 = 0x0016;
+/// BasicInformation cluster attributes (spec §11.1). Same drift-guard
+/// coverage as `CLUSTER_DESCRIPTOR` above, via
+/// `core::datamodel::drift_guard::basic_information_attrs_match_mat_core_ids`.
 pub const ATTR_VENDOR_NAME: u32 = 0x0001;
 pub const ATTR_VENDOR_ID: u32 = 0x0002;
 pub const ATTR_PRODUCT_NAME: u32 = 0x0003;
