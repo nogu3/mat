@@ -18,6 +18,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 getrandom = { workspace = true }
+# Session-key HKDF (spec §4.13.2.3), used by `core::pase` — unconditional
+# (not gated behind `net`): `core` must stay I/O-free but still needs this
+# crypto primitive. Versions match mat-controller's own hkdf/sha2 deps.
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 mat-controller = { workspace = true, features = ["test-responder"] }

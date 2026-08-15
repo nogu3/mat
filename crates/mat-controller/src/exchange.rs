@@ -502,7 +502,26 @@ impl<'t> ResponderExchange<'t> {
     }
 
     /// Waits for the next real (non-ack) peer message on this exchange.
-    async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
+    ///
+    /// `pub` (not private): mirrors `UnsecuredExchange::recv`, which
+    /// `pase::establish()` calls whenever its own `send_reliable` returns
+    /// `None` (peer's eager standalone ack observed, real reply still
+    /// pending) — see that function's `None => ex.recv(RECV_TIMEOUT)...`
+    /// branches. `reply_reliable`/`reply_final` hit the exact same "only
+    /// got a standalone ack" case (their doc comments call it out
+    /// explicitly), so a `ResponderExchange`-side caller needs the same
+    /// fallback. Re-`adopt`ing a fresh `ResponderExchange` per message is
+    /// *not* a substitute: `adopt` reseeds `counter` with a brand new
+    /// `TxCounter::new_random()`, and a fresh random value has roughly even
+    /// odds of landing below the peer's already-established high-water
+    /// mark — `RxWindow::check_and_commit` then silently rejects it as
+    /// "too old" (while still, misleadingly, acking it), and the peer's own
+    /// MRP retransmits instead of ever seeing the reply as answered
+    /// (`mat-device`'s Task 6 PASE responder hit this: ~50% handshake
+    /// failure rate until switched to this `recv`, keeping one
+    /// `ResponderExchange` — and its single incrementing `TxCounter` —
+    /// alive for the whole exchange).
+    pub async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());

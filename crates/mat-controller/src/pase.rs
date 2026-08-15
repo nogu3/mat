@@ -141,7 +141,15 @@ fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
 /// Encodes PBKDFParamRequest: `struct{1: initiatorRandom[32],
 /// 2: initiatorSessionId, 3: passcodeId=0, 4: hasPBKDFParameters=false}`.
 /// The optional SessionParams (tag 5) is never sent.
-pub(crate) fn encode_pbkdf_param_request(initiator_random: &[u8; 32], session_id: u16) -> Vec<u8> {
+///
+/// `pub` (not `pub(crate)`): alongside `encode_pake1`/`decode_pake2`/
+/// `encode_pake3` below, this is the initiator-direction half of the PASE
+/// codec surface. It's only used internally by `establish()`, but an
+/// out-of-crate responder's tests (`mat-device`'s `core::pase` unit test,
+/// Task 6) need to drive a simulated initiator by hand through these same
+/// encoders — matching the responder-direction codecs already widened for
+/// the same reason (Task 3, see the opcode constants' doc comment above).
+pub fn encode_pbkdf_param_request(initiator_random: &[u8; 32], session_id: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_bytes(Tag::Context(1), initiator_random);
@@ -329,7 +337,10 @@ pub fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse,
 }
 
 /// Encodes Pake1: `struct{1: pA[65]}`.
-pub(crate) fn encode_pake1(p_a: &[u8; 65]) -> Vec<u8> {
+///
+/// `pub`: see `encode_pbkdf_param_request`'s doc comment — initiator-
+/// direction codec, widened for out-of-crate test scaffolding.
+pub fn encode_pake1(p_a: &[u8; 65]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_bytes(Tag::Context(1), p_a);
@@ -387,7 +398,10 @@ pub fn encode_pake2(p_b: &[u8; 65], c_b: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Parses Pake2: `struct{1: pB[65], 2: cB[32]}`.
-pub(crate) fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
+///
+/// `pub`: see `encode_pbkdf_param_request`'s doc comment — initiator-
+/// direction codec, widened for out-of-crate test scaffolding.
+pub fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
     let mut r = Reader::new(payload);
     match r
         .next()
@@ -434,7 +448,10 @@ pub(crate) fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseE
 }
 
 /// Encodes Pake3: `struct{1: cA[32]}`.
-pub(crate) fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
+///
+/// `pub`: see `encode_pbkdf_param_request`'s doc comment — initiator-
+/// direction codec, widened for out-of-crate test scaffolding.
+pub fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_bytes(Tag::Context(1), c_a);
