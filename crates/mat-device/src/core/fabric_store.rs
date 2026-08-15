@@ -56,6 +56,13 @@ pub struct FabricEntry {
     #[serde(with = "fixed_bytes")]
     pub root_public_key: [u8; 65],
     pub admin_subject: u64,
+    /// `AdminVendorID` from the `AddNOC` command that installed this fabric
+    /// (spec §11.17.6.13.1) — the vendor id of the administrator (app/hub)
+    /// that commissioned this device onto the fabric. `#[serde(default)]`
+    /// so `fabrics.json` files persisted before this field existed still
+    /// load (as `0`, an unassigned vendor id — spec §2.5.2).
+    #[serde(default)]
+    pub admin_vendor_id: u16,
 }
 
 /// Persistence boundary `core` calls through instead of touching a
@@ -153,7 +160,16 @@ mod tests {
             fabric_id: 0xABCD,
             root_public_key: [9u8; 65],
             admin_subject: 0xAA,
+            admin_vendor_id: 0xFFF1,
         }
+    }
+
+    #[test]
+    fn old_fabrics_json_without_admin_vendor_id_still_loads() {
+        let mut v = serde_json::to_value(entry(1)).unwrap();
+        v.as_object_mut().unwrap().remove("admin_vendor_id");
+        let e: FabricEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(e.admin_vendor_id, 0);
     }
 
     #[test]

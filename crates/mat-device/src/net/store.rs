@@ -65,6 +65,7 @@ mod tests {
             fabric_id: 0xABCD,
             root_public_key: [11u8; 65],
             admin_subject: 0xAA,
+            admin_vendor_id: 0xFFF1,
         }
     }
 

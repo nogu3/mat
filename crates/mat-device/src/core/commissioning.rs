@@ -41,6 +41,7 @@ use mat_controller::commissioning::{
 use mat_controller::crypto::sign_ecdsa_p256;
 use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
 use mat_controller::im;
+use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::{generate_csr, DevAttestation};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply};
@@ -74,6 +75,24 @@ const NOC_STATUS_MISSING_CSR: u8 = 4;
 /// meaning ("could not add this fabric").
 const NOC_STATUS_TABLE_FULL: u8 = 5;
 
+/// General Commissioning (0x0030) attribute ids this server serves (spec
+/// §11.10.5). `CurrentFabricIndex(5)` is deliberately absent — it needs the
+/// session's fabric index, which the `read` signature doesn't carry yet;
+/// Task 5's `ReadCtx` adds it.
+const ATTR_GC_BREADCRUMB: u32 = 0;
+const ATTR_GC_BASIC_COMMISSIONING_INFO: u32 = 1;
+const ATTR_GC_REGULATORY_CONFIG: u32 = 2;
+const ATTR_GC_LOCATION_CAPABILITY: u32 = 3;
+const ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION: u32 = 4;
+
+/// Node Operational Credentials (0x003E) attribute ids this server serves
+/// (spec §11.17.5).
+const ATTR_OC_NOCS: u32 = 0;
+const ATTR_OC_FABRICS: u32 = 1;
+const ATTR_OC_SUPPORTED_FABRICS: u32 = 2;
+const ATTR_OC_COMMISSIONED_FABRICS: u32 = 3;
+const ATTR_OC_TRUSTED_ROOT_CERTIFICATES: u32 = 4;
+
 /// Placeholder Certification Declaration bytes signed into
 /// `AttestationResponse`'s `AttestationElements`. `mat-device` has no real
 /// CD (no CSA-issued declaration to embed) — `attestation::verify_cd_warn`
@@ -82,6 +101,16 @@ const NOC_STATUS_TABLE_FULL: u8 = 5;
 /// attestation exchange (mirrors `DevAttestation`'s own "dev-only, not a
 /// real identity" scope).
 const DUMMY_CERTIFICATION_DECLARATION: &[u8] = b"mat-dev-cd";
+
+/// `BasicCommissioningInfo` (spec §11.10.5.2) fields: the single-attempt
+/// fail-safe expiry and the cumulative budget across an entire commissioning
+/// session (mat-device doesn't vary either — one fixed pair for all
+/// attempts). Named consts rather than inlined at the one `read_general_
+/// commissioning` call site because Task 7's `ArmFailSafe` rollback timing
+/// references the same values and must not drift from what
+/// `BasicCommissioningInfo` advertises.
+const FAIL_SAFE_EXPIRY_LENGTH_SECONDS: u16 = 60;
+const FAIL_SAFE_MAX_CUMULATIVE_SECONDS: u16 = 900;
 
 /// Fail-safe timer (spec §11.10.1). `Instant`-based — armed until a wall
 /// point in the future; `is_armed` is `false` once that point passes or the
@@ -223,10 +252,11 @@ impl ClusterHandler for GeneralCommissioningHandler {
         CLUSTER_GENERAL_COMMISSIONING
     }
 
-    fn read(&self, _attribute: u32) -> Option<Vec<u8>> {
-        // General Commissioning declares attributes (Breadcrumb, RegulatoryConfig,
-        // ...) mat-device doesn't serve yet — out of Task 9's scope.
-        None
+    fn read(&self, attribute: u32) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .read_general_commissioning(attribute)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], _ctx: &mut InvokeCtx) -> InvokeReply {
@@ -245,8 +275,11 @@ impl ClusterHandler for OperationalCredentialsHandler {
         CLUSTER_OPERATIONAL_CREDENTIALS
     }
 
-    fn read(&self, _attribute: u32) -> Option<Vec<u8>> {
-        None
+    fn read(&self, attribute: u32) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .read_operational_credentials(attribute)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
@@ -281,6 +314,92 @@ impl Inner {
             CMD_ADD_NOC => self.handle_add_noc(fields_tlv),
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
         }
+    }
+
+    /// General Commissioning attribute reads (spec §11.10.5). Answers the
+    /// fixed set chip-tool/Echo read during and right after commissioning;
+    /// `CurrentFabricIndex(5)` is out of scope here (see the `ATTR_GC_*`
+    /// consts' doc comment) — Task 5's `ReadCtx` adds it.
+    fn read_general_commissioning(&self, attribute: u32) -> Option<Vec<u8>> {
+        match attribute {
+            ATTR_GC_BREADCRUMB => Some(uint_value(0)),
+            ATTR_GC_BASIC_COMMISSIONING_INFO => {
+                let mut w = Writer::new();
+                w.start_struct(Tag::Anonymous);
+                w.put_uint(Tag::Context(0), u64::from(FAIL_SAFE_EXPIRY_LENGTH_SECONDS));
+                w.put_uint(Tag::Context(1), u64::from(FAIL_SAFE_MAX_CUMULATIVE_SECONDS));
+                w.end_container();
+                Some(w.finish())
+            }
+            ATTR_GC_REGULATORY_CONFIG => Some(uint_value(0)),
+            ATTR_GC_LOCATION_CAPABILITY => Some(uint_value(2)),
+            ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION => Some(bool_value(true)),
+            _ => None,
+        }
+    }
+
+    /// Node Operational Credentials attribute reads (spec §11.17.5),
+    /// reflecting whatever `AddNOC` has installed into `self.store` so far.
+    fn read_operational_credentials(&self, attribute: u32) -> Option<Vec<u8>> {
+        match attribute {
+            ATTR_OC_NOCS => Some(self.encode_nocs()),
+            ATTR_OC_FABRICS => Some(self.encode_fabrics()),
+            ATTR_OC_SUPPORTED_FABRICS => Some(uint_value(5)),
+            ATTR_OC_COMMISSIONED_FABRICS => Some(uint_value(self.store.entries().len() as u64)),
+            ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates()),
+            _ => None,
+        }
+    }
+
+    /// NOCs(0): `array[ struct{1: NOCValue, 2: ICACValue?, 254:
+    /// FabricIndex} ]` (spec §11.17.5.3, `NOCStruct`).
+    fn encode_nocs(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        for entry in self.store.entries() {
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(1), &entry.noc_tlv);
+            if let Some(icac) = &entry.icac_tlv {
+                w.put_bytes(Tag::Context(2), icac);
+            }
+            w.put_uint(Tag::Context(254), u64::from(entry.fabric_index));
+            w.end_container();
+        }
+        w.end_container();
+        w.finish()
+    }
+
+    /// Fabrics(1): `array[ struct{1: RootPublicKey, 2: VendorID, 3:
+    /// FabricID, 4: NodeID, 5: Label, 254: FabricIndex} ]` (spec
+    /// §11.17.5.3, `FabricDescriptorStruct`). `Label` is always empty —
+    /// mat-device has no `UpdateFabricLabel` support to populate it.
+    fn encode_fabrics(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        for entry in self.store.entries() {
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(1), &entry.root_public_key);
+            w.put_uint(Tag::Context(2), u64::from(entry.admin_vendor_id));
+            w.put_uint(Tag::Context(3), entry.fabric_id);
+            w.put_uint(Tag::Context(4), entry.node_id);
+            w.put_str(Tag::Context(5), "");
+            w.put_uint(Tag::Context(254), u64::from(entry.fabric_index));
+            w.end_container();
+        }
+        w.end_container();
+        w.finish()
+    }
+
+    /// TrustedRootCertificates(4): `array[ bytes(RootCACertificate TLV) ]`
+    /// (spec §11.17.5.3) — one entry per installed fabric's RCAC.
+    fn encode_trusted_root_certificates(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        for entry in self.store.entries() {
+            w.put_bytes(Tag::Anonymous, &entry.root_tlv);
+        }
+        w.end_container();
+        w.finish()
     }
 
     /// ArmFailSafe（spec §11.10.6.2）: records the timer. An
@@ -433,7 +552,7 @@ impl Inner {
         if !self.fail_safe.is_armed() {
             return InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED);
         }
-        let Ok((noc_tlv, icac_tlv, ipk_epoch, case_admin_subject, _admin_vendor_id)) =
+        let Ok((noc_tlv, icac_tlv, ipk_epoch, case_admin_subject, admin_vendor_id)) =
             decode_add_noc(fields_tlv)
         else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
@@ -487,6 +606,7 @@ impl Inner {
             fabric_id,
             root_public_key: rcac.pub_key,
             admin_subject: case_admin_subject,
+            admin_vendor_id,
         };
         if self.store.insert(entry).is_err() {
             return noc_status(NOC_STATUS_TABLE_FULL);
@@ -501,6 +621,22 @@ impl Inner {
             fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
         }
     }
+}
+
+/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
+/// (the `ClusterHandler::read` contract) — same convention as
+/// `datamodel::uint_value`, duplicated here since that one is private to its
+/// own module.
+fn uint_value(v: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_uint(Tag::Anonymous, v);
+    w.finish()
+}
+
+fn bool_value(v: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_bool(Tag::Anonymous, v);
+    w.finish()
 }
 
 /// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
@@ -539,6 +675,7 @@ mod tests {
         encode_attestation_request, encode_cert_chain_request, encode_csr_request,
         parse_nocsr_elements, CommissioningFabric,
     };
+    use mat_controller::tlv::{Reader, Value};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
 
     /// Fixed per-test "session" attestation challenge — in the real
@@ -560,6 +697,67 @@ mod tests {
     fn test_server() -> CommissioningServer {
         let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         CommissioningServer::new(dev, FabricStore::new())
+    }
+
+    /// Drives ArmFailSafe → CSRRequest → AddTrustedRootCertificate → AddNOC
+    /// against `server`, installing one fabric (`fabric_id`/`node_id` from
+    /// the caller; admin subject `0xAA` and admin vendor id `0xFFF1` fixed —
+    /// no test here needs to vary those). Returns the `AddNOC` reply so
+    /// callers that care about the command's own response (like
+    /// `add_noc_installs_fabric`) can assert on it directly.
+    fn install_fabric(
+        server: &mut CommissioningServer,
+        fabric_id: u64,
+        node_id: u64,
+    ) -> InvokeReply {
+        let fabric = CommissioningFabric::generate(fabric_id, 0xAA).unwrap();
+
+        drive_invoke(
+            server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+
+        let (_, csr_resp) = expect_data(drive_invoke(
+            server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[3u8; 32]),
+        ));
+        let (elements, _sig) = decode_csr_response(&csr_resp).unwrap();
+        let (csr_der, _nonce) = parse_nocsr_elements(&elements).unwrap();
+        let device_pub = parse_csr(&csr_der).unwrap();
+        let noc = fabric.issue_device_noc(&device_pub, node_id).unwrap();
+
+        assert_eq!(
+            drive_invoke(
+                server,
+                CLUSTER_OPERATIONAL_CREDENTIALS,
+                CMD_ADD_TRUSTED_ROOT,
+                &encode_add_trusted_root(&fabric.rcac_tlv),
+            ),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+
+        drive_invoke(
+            server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ADD_NOC,
+            &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
+        )
+    }
+
+    /// A `CommissioningServer` with one fabric already installed
+    /// (fabric_id=0x1122, node_id=0x5001, admin_vendor_id=0xFFF1) — shared
+    /// setup for the GC/OC attribute-read tests below, which only care
+    /// about the resulting fabric state, not the `AddNOC` command's own
+    /// reply (`add_noc_installs_fabric` covers that separately via
+    /// `install_fabric` directly).
+    fn commissioned_server() -> CommissioningServer {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        server
     }
 
     /// Drives one command directly against `server`'s shared state
@@ -593,48 +791,143 @@ mod tests {
     #[test]
     fn add_noc_installs_fabric() {
         let mut server = test_server();
-        let fabric = CommissioningFabric::generate(0x1122, 0xAA).unwrap();
-
-        drive_invoke(
-            &mut server,
-            CLUSTER_GENERAL_COMMISSIONING,
-            CMD_ARM_FAIL_SAFE,
-            &encode_arm_fail_safe(120, 1),
-        );
-
-        let (_, csr_resp) = expect_data(drive_invoke(
-            &mut server,
-            CLUSTER_OPERATIONAL_CREDENTIALS,
-            CMD_CSR_REQUEST,
-            &encode_csr_request(&[3u8; 32]),
-        ));
-        let (elements, _sig) = decode_csr_response(&csr_resp).unwrap();
-        let (csr_der, _nonce) = parse_nocsr_elements(&elements).unwrap();
-        let device_pub = parse_csr(&csr_der).unwrap();
-        let noc = fabric.issue_device_noc(&device_pub, 0x5001).unwrap();
-
-        assert_eq!(
-            drive_invoke(
-                &mut server,
-                CLUSTER_OPERATIONAL_CREDENTIALS,
-                CMD_ADD_TRUSTED_ROOT,
-                &encode_add_trusted_root(&fabric.rcac_tlv),
-            ),
-            InvokeReply::Status(im::STATUS_SUCCESS)
-        );
-
-        let (_, resp) = expect_data(drive_invoke(
-            &mut server,
-            CLUSTER_OPERATIONAL_CREDENTIALS,
-            CMD_ADD_NOC,
-            &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
-        ));
+        let (_, resp) = expect_data(install_fabric(&mut server, 0x1122, 0x5001));
         let (status, fabric_index) = decode_noc_response(&resp).unwrap();
         assert_eq!(status, 0);
         assert_eq!(fabric_index, Some(1));
         assert_eq!(server.fabrics().len(), 1);
         assert_eq!(server.fabrics()[0].node_id, 0x5001);
         assert_eq!(server.fabrics()[0].fabric_id, 0x1122);
+        assert_eq!(server.fabrics()[0].admin_vendor_id, 0xFFF1);
+    }
+
+    #[test]
+    fn gc_serves_basic_commissioning_info() {
+        let server = test_server();
+        let (gc, _) = server.into_cluster_handlers();
+        let tlv = gc
+            .read(ATTR_GC_BASIC_COMMISSIONING_INFO)
+            .expect("BasicCommissioningInfo");
+
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut expiry = None;
+        let mut max_cumulative = None;
+        loop {
+            let el = r.next().unwrap().expect("truncated BasicCommissioningInfo");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(0), Value::Uint(v)) => expiry = Some(v),
+                (Tag::Context(1), Value::Uint(v)) => max_cumulative = Some(v),
+                _ => {}
+            }
+        }
+        assert_eq!(expiry, Some(60));
+        assert_eq!(max_cumulative, Some(900));
+    }
+
+    #[test]
+    fn gc_serves_other_scalar_attributes() {
+        let server = test_server();
+        let (gc, _) = server.into_cluster_handlers();
+
+        let breadcrumb = gc.read(ATTR_GC_BREADCRUMB).expect("Breadcrumb");
+        let mut r = Reader::new(&breadcrumb);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0));
+
+        let regulatory = gc
+            .read(ATTR_GC_REGULATORY_CONFIG)
+            .expect("RegulatoryConfig");
+        let mut r = Reader::new(&regulatory);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0));
+
+        let location = gc
+            .read(ATTR_GC_LOCATION_CAPABILITY)
+            .expect("LocationCapability");
+        let mut r = Reader::new(&location);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(2));
+
+        let concurrent = gc
+            .read(ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION)
+            .expect("SupportsConcurrentConnection");
+        let mut r = Reader::new(&concurrent);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Bool(true));
+    }
+
+    #[test]
+    fn oc_fabrics_and_nocs_reflect_installed_fabric() {
+        let server = commissioned_server(); // fabric_id=0x1122, node=0x5001, admin_vendor_id=0xFFF1
+        let (_, oc) = server.into_cluster_handlers();
+
+        // NOCs(0): array[ struct{1: noc_tlv, 2: icac_tlv?, 254: fabric_index} ]
+        let nocs_tlv = oc.read(ATTR_OC_NOCS).expect("NOCs");
+        let mut r = Reader::new(&nocs_tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut noc_tlv = None;
+        let mut fabric_index = None;
+        loop {
+            let el = r.next().unwrap().expect("truncated NOC struct");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(1), Value::Bytes(b)) => noc_tlv = Some(b.to_vec()),
+                (Tag::Context(254), Value::Uint(v)) => fabric_index = Some(v),
+                _ => {}
+            }
+        }
+        assert!(noc_tlv.is_some());
+        assert_eq!(fabric_index, Some(1));
+
+        // Fabrics(1): array[ struct{1: root_public_key, 2: admin_vendor_id,
+        // 3: fabric_id, 4: node_id, 5: label, 254: fabric_index} ]
+        let fabrics_tlv = oc.read(ATTR_OC_FABRICS).expect("Fabrics");
+        let mut r = Reader::new(&fabrics_tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut admin_vendor_id = None;
+        let mut fabric_id = None;
+        let mut node_id = None;
+        let mut fidx = None;
+        loop {
+            let el = r
+                .next()
+                .unwrap()
+                .expect("truncated FabricDescriptor struct");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(2), Value::Uint(v)) => admin_vendor_id = Some(v),
+                (Tag::Context(3), Value::Uint(v)) => fabric_id = Some(v),
+                (Tag::Context(4), Value::Uint(v)) => node_id = Some(v),
+                (Tag::Context(254), Value::Uint(v)) => fidx = Some(v),
+                _ => {}
+            }
+        }
+        assert_eq!(admin_vendor_id, Some(0xFFF1));
+        assert_eq!(fabric_id, Some(0x1122));
+        assert_eq!(node_id, Some(0x5001));
+        assert_eq!(fidx, Some(1));
+
+        // SupportedFabrics / CommissionedFabrics are plain scalars.
+        let supported = oc
+            .read(ATTR_OC_SUPPORTED_FABRICS)
+            .expect("SupportedFabrics");
+        let mut r = Reader::new(&supported);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(5));
+
+        let commissioned = oc
+            .read(ATTR_OC_COMMISSIONED_FABRICS)
+            .expect("CommissionedFabrics");
+        let mut r = Reader::new(&commissioned);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
+
+        // TrustedRootCertificates(4): array[ bytes(root_tlv) ]
+        let roots_tlv = oc
+            .read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES)
+            .expect("TrustedRootCertificates");
+        let mut r = Reader::new(&roots_tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let el = r.next().unwrap().expect("one root cert");
+        assert!(matches!(el.value, Value::Bytes(_)));
     }
 
     #[test]

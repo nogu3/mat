@@ -97,6 +97,7 @@ mod tests {
             fabric_id: noc_cert.fabric_id().expect("fabric id"),
             root_public_key: root_cert.pub_key,
             admin_subject: 0,
+            admin_vendor_id: 0xFFF1,
         }
     }
 
