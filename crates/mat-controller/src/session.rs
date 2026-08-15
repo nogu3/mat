@@ -146,6 +146,17 @@ pub struct SecureSession {
     /// （spec 4.12.5.2.2 / Issue #21: standalone ack の RF 喪失時、これが
     /// 無いとピアの MRP が未充足のまま残り、FP300 は購読を silent 破棄する）。
     pending_peer_ack: Option<(u16, u32)>,
+    /// ピアから最後に見た acked_counter（メッセージカウンタはセッション
+    /// スコープなので exchange をまたいでも意味を持つ — spec 4.12.5.2.2）。
+    /// chip/Echo 系コミッショナーは standalone ack を単独で送らず、次の
+    /// リクエストの ack フィールドに piggyback することがあり、それが別
+    /// exchange に乗ることも珍しくない（レビュー指摘: cross-exchange
+    /// secured request の ack-then-drop）。`screen_with` は配送フィルタに
+    /// 関わらず認証済みメッセージなら常にこれを更新するので、
+    /// `reply_reliable`/`send_reliable` の ack 待ちは自分の exchange 宛の
+    /// メッセージが来なくても、この値と自分の送信 counter が一致した時点で
+    /// 完了とみなせる。
+    last_peer_ack: Option<u32>,
 }
 
 impl SecureSession {
@@ -172,6 +183,7 @@ impl SecureSession {
             last_rx: None,
             deferred_sub_err: None,
             pending_peer_ack: None,
+            last_peer_ack: None,
         }
     }
 
@@ -357,9 +369,13 @@ impl SecureSession {
     /// filter (duplicates are re-acked here). Ack/dedup happen unconditionally
     /// before the filter is applied — an authenticated needs_ack message is
     /// acked as soon as it's decoded, regardless of whether it will be
-    /// delivered. A device-initiated ReportData that fails the filter is
-    /// therefore *buffered* (`peer_initiated`) rather than dropped: it has
-    /// already been acked, so dropping it here would be a permanent loss.
+    /// delivered. Any peer-initiated message (standalone acks excepted —
+    /// they carry nothing to serve) that fails the filter is therefore
+    /// *buffered* (`peer_initiated`) rather than dropped: it has already
+    /// been acked, so dropping it here would be a permanent loss (a
+    /// cross-exchange request piggybacked on our reply's ack, a
+    /// subscription's ReportData chunk arriving during an unrelated
+    /// ack-wait, etc.).
     async fn screen_with(
         &mut self,
         buf: &[u8],
@@ -401,6 +417,14 @@ impl SecureSession {
         // 認証済み受信 = ピアは active。MRP 再送間隔の active/idle 判定に使う
         // （重複再送でも「ピアが生きている」証拠として記録してよい）。
         self.last_rx = Some(Instant::now());
+        // ピアの ack フィールドは配送フィルタの可否に関わらず常に記録する
+        // （メッセージカウンタはセッションスコープなので、この ack が乗って
+        // いた exchange が呼び出し元の待ち exchange と違っても、カウンタが
+        // 一致すれば「その送信は確かに届いた」という事実は変わらない —
+        // レビュー指摘のcross-exchange piggyback ack 対応）。
+        if let Some(acked) = proto.acked_counter {
+            self.last_peer_ack = Some(acked);
+        }
         // RxWindow の重複検知はセッション単位（exchange 単位ではない）なので、
         // exchange フィルタより前にコミットする（コメント: この順序は意図的）。
         if !self.rx_window.check_and_commit(header.message_counter) {
@@ -442,11 +466,17 @@ impl SecureSession {
                 opcode = proto.opcode,
                 "screen: delivery filter miss"
             );
-            // フィルタ落ちでも device 発 ReportData は ack 済みなので待避する。
-            if proto.initiator
-                && proto.protocol_id == crate::im::PROTOCOL_ID_IM
-                && proto.opcode == crate::im::OPCODE_REPORT_DATA
-            {
+            // フィルタ落ちでも peer-initiated メッセージは ack 済みなので待避する
+            // (standalone ack 自体は除く — それ自体は待避対象ではなく、ここまで
+            // 来る頃には ack/dedup 処理も済んでいる)。以前は device 発
+            // ReportData のみを待避しており、それ以外の opcode（例: 別
+            // exchange への新規リクエストの piggyback ack で ack だけ届いて
+            // 中身は別 exchange のケース）は ack 済みのまま黙って捨てられ、
+            // ピアは再送しないため永久喪失していた（レビュー指摘: cross-
+            // exchange secured request のack-then-drop）。
+            let is_standalone_ack = proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+                && proto.opcode == OPCODE_MRP_STANDALONE_ACK;
+            if proto.initiator && !is_standalone_ack {
                 if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
                     tracing::warn!("peer-initiated report buffer full; dropping oldest");
                     self.peer_initiated.pop_front();
@@ -1155,6 +1185,17 @@ impl SecureSession {
         }
     }
 
+    /// デバイス役: ソケットに触れずに `peer_initiated` から 1 件だけ取り出す
+    /// （`recv_request` の非ブロッキング版）。`reply_reliable` がある応答の ack
+    /// 待ちをしている間に別 exchange 宛の新規リクエストが届き、`screen_with`
+    /// のフィルタ落ちで待避された場合、その応答を送り終えた直後にこれで
+    /// drain してから次のソケット読みに戻る、という使い方を想定している
+    /// （device-role ランタイムの `serve_secured` が呼ぶ）。バッファが空なら
+    /// `None`（ソケットは読まない — `recv_request` と違いここでブロックしない）。
+    pub fn take_buffered_request(&mut self) -> Option<IncomingMessage> {
+        self.peer_initiated.pop_front()
+    }
+
     /// デバイス役: `request` が乗っていた exchange（`request.proto.exchange_id`）
     /// へ `initiator:false` で応答する。`respond_status`（IM StatusResponse 専用）
     /// の一般形 — 任意の `protocol_id`/`opcode`/`payload` を送れる。UDP では
@@ -1213,6 +1254,16 @@ impl SecureSession {
                     .screen_with(&buf[..n], from, ScreenFilter::PeerExchange(exchange_id))
                     .await?
                 else {
+                    // フィルタ落ち（別 exchange 宛など）でも、その datagram の
+                    // ack フィールドは screen_with が exchange 不問で
+                    // `last_peer_ack` に記録済み。real controller/commissioner
+                    // が standalone ack を送らず次のリクエストに我々への ack
+                    // を piggyback しただけ、というケースをここで拾う
+                    // （そのリクエスト自体は `peer_initiated` に待避済み —
+                    // 呼び出し元が drain する）。
+                    if self.last_peer_ack == Some(our_counter) {
+                        return Ok(None);
+                    }
                     continue;
                 };
                 let acked = msg.proto.acked_counter == Some(our_counter);
@@ -3998,6 +4049,128 @@ mod tests {
         assert_eq!(msg.proto.opcode, im::OPCODE_STATUS_RESPONSE);
         assert_eq!(msg.proto.exchange_id, REQ_EXCHANGE);
         assert_eq!(im::decode_status_response(&msg.payload).unwrap(), 0);
+        dev_task.await.unwrap();
+    }
+
+    /// レビュー対応（Important）: cross-exchange secured request の
+    /// ack-then-drop。real chip/Echo 系コミッショナーは standalone ack を
+    /// 単独で送らず、次のリクエストの ack フィールドに我々への ack を
+    /// piggyback することがあり、それが（この応答とは別の）新しい exchange
+    /// に乗ることも珍しくない。メッセージカウンタはセッションスコープ
+    /// （`screen_with`, `last_peer_ack`）なので、`reply_reliable` の ack 待ちは
+    /// その別 exchange のメッセージだけでも完了しなければならない。かつ、
+    /// その新規リクエスト自体は screen_with が認証・ack 済みである以上
+    /// （ピアはもう再送しない）破棄されてはならず、`recv_request` で
+    /// 取り出せる必要がある。
+    #[tokio::test]
+    async fn reply_reliable_completes_via_cross_exchange_piggyback_ack() {
+        use crate::im;
+        let device = bind_local().await;
+        let dev_addr = device.local_addr().unwrap();
+        let s_transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+        let s_addr = s_transport.local_addr().unwrap();
+        let mut s = SecureSession::new(
+            Arc::clone(&s_transport),
+            dev_addr,
+            LOCAL_SID,
+            PEER_SID,
+            keys(),
+            OUR_NODE,
+            DEV_NODE,
+        );
+        const REQ_EXCHANGE: u16 = 0x1111;
+        const NEW_EXCHANGE: u16 = 0x2222;
+        let resp_payload = invoke_response_status_ok();
+
+        let dev_task = tokio::spawn(async move {
+            // デバイスが reply_reliable で応答することになる、最初のリクエスト。
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 400,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_INVOKE_REQUEST,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            device.send_to(&req_dg, s_addr).await.unwrap();
+
+            // reply_reliable の応答を受け、その message_counter を控える。
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p.exchange_id, REQ_EXCHANGE);
+            assert!(!p.initiator, "reply must be initiator:false");
+            assert!(p.needs_ack, "UDP reply must request an ack");
+
+            // standalone ack は送らない。代わりに別 exchange への新規リクエス
+            // トの ack フィールドに、この応答への ack を piggyback する。
+            let header2 = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 401,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto2 = ProtocolHeader {
+                initiator: true,
+                needs_ack: true,
+                acked_counter: Some(h.message_counter),
+                opcode: im::OPCODE_INVOKE_REQUEST,
+                exchange_id: NEW_EXCHANGE,
+                protocol_id: im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            };
+            let req2_dg = seal_message(&R2I, &header2, &proto2, &[], DEV_NODE).unwrap();
+            device.send_to(&req2_dg, from).await.unwrap();
+
+            // 新規リクエスト自体は needs_ack なので、我々からの standalone ack
+            // が来ることを確認する（"ACKed" 側 — dropped であってはならない）。
+            let (n2, _) = device.recv_from(&mut buf).await.unwrap();
+            let (_, p2, _) = open_from_controller(&buf[..n2]);
+            assert_eq!(p2.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
+            assert_eq!(p2.opcode, OPCODE_MRP_STANDALONE_ACK);
+            assert_eq!(p2.exchange_id, NEW_EXCHANGE);
+        });
+
+        let req = s
+            .recv_request(Duration::from_secs(5))
+            .await
+            .expect("recv_request over UDP");
+        assert_eq!(req.proto.exchange_id, REQ_EXCHANGE);
+
+        let out = s
+            .reply_reliable(
+                &req,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_RESPONSE,
+                &resp_payload,
+                &fast_cfg(),
+            )
+            .await
+            .expect("reply_reliable must complete via the cross-exchange piggyback ack");
+        assert!(
+            out.is_none(),
+            "a cross-exchange piggyback ack must complete as Ok(None), not be mistaken for a real reply"
+        );
+
+        // 新規リクエストは破棄されず、recv_request で取り出せる（peer_initiated
+        // 待避経由 — ソケットを新たに読まなくても即座に返るはず）。
+        let new_req = s
+            .recv_request(Duration::from_millis(500))
+            .await
+            .expect("the piggybacking request must not be lost");
+        assert_eq!(new_req.proto.exchange_id, NEW_EXCHANGE);
+        assert_eq!(new_req.proto.opcode, im::OPCODE_INVOKE_REQUEST);
+
         dev_task.await.unwrap();
     }
 }

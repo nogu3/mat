@@ -476,6 +476,40 @@ async fn serve_secured(
         Ok(None) => return,
         Err(_) => return, // decrypt/screen failure — drop, don't kill the session on noise
     };
+    serve_secured_message(msg, session, node, comm_server, mdns).await;
+
+    // While `reply_reliable` (inside `serve_secured_message`) was waiting
+    // for the ack of *that* reply, a new peer-initiated request on a
+    // *different* exchange may have arrived — real controllers/commissioners
+    // commonly piggyback their ack on the very next request rather than
+    // sending a standalone one. `screen_with` still acks and buffers it
+    // (`peer_initiated`) even though it failed that wait's `PeerExchange`
+    // filter, so it must be served here rather than silently lost (review
+    // fix: "ack-then-drop of cross-exchange secured requests"). Draining in
+    // a loop (not just once) covers the same thing happening again while
+    // *this* reply's own ack-wait is in flight.
+    while let Some(buffered) = session.take_buffered_request() {
+        if buffered.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
+            continue;
+        }
+        serve_secured_message(buffered, session, node, comm_server, mdns).await;
+    }
+}
+
+/// Dispatches one already-classified Interaction Model request (`msg`) to
+/// `node`, replies, and reacts to the two commissioning milestones (see
+/// `serve_secured`'s original doc comment for why: AddNOC success detected
+/// by fabric count growth, CommissioningComplete by decoding the request).
+/// Split out from `serve_secured` so both the datagram just read off the
+/// socket and any buffered peer-initiated request drained afterward go
+/// through the identical path.
+async fn serve_secured_message(
+    msg: mat_controller::exchange::IncomingMessage,
+    session: &mut SecureSession,
+    node: &mut Node,
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+) {
     if msg.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
         // Secure-channel traffic on an established session (e.g. a
         // device-initiated-exchange StatusReport) — out of M1 scope.
@@ -646,5 +680,172 @@ mod tests {
             () = mdns_retry_deadline(&none) => panic!("deadline resolved with no retry pending"),
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
+    }
+
+    // ── review fix: cross-exchange piggyback ack must not lose a request ──
+
+    /// Runtime-level companion to `mat_controller::session`'s
+    /// `reply_reliable_completes_via_cross_exchange_piggyback_ack`: proves
+    /// `serve_secured`'s drain loop doesn't just retain a request buffered
+    /// while the first reply's `reply_reliable` was waiting on its
+    /// (piggybacked, cross-exchange) ack — it actually dispatches it through
+    /// `Node::handle_im` and replies, exactly like a datagram read fresh off
+    /// the socket. No mDNS, no commissioning — a bare `Node`/
+    /// `CommissioningServer` pair driven directly, `serve_secured` called by
+    /// hand the same way `run`'s loop calls it.
+    #[tokio::test]
+    async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() {
+        use mat_controller::crypto::{open_message, seal_message};
+        use mat_controller::message::Destination;
+        use mat_controller::session::SessionKeys;
+        use mat_controller::transport::UdpTransport;
+
+        use crate::core::fabric_store::FabricStore;
+
+        const LOCAL_SID: u16 = 0xAAAA; // device's own session id
+        const PEER_SID: u16 = 0xBBBB; // controller's session id
+        const CTRL_NODE: u64 = 1;
+        const DEV_NODE: u64 = 2;
+        const I2R: [u8; 16] = [0x11; 16];
+        const R2I: [u8; 16] = [0x22; 16];
+        const REQ_EXCHANGE: u16 = 0x10;
+        const NEW_EXCHANGE: u16 = 0x20;
+
+        let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let ctrl_addr = controller.local_addr().unwrap();
+        let dev_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let dev_addr = dev_transport.local_addr().unwrap();
+
+        let mut session = SecureSession::new_device_role(
+            Arc::clone(&dev_transport),
+            ctrl_addr,
+            LOCAL_SID,
+            PEER_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            DEV_NODE,
+            CTRL_NODE,
+        );
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let comm_server = CommissioningServer::new(dev, FabricStore::new());
+
+        // Controller side, run concurrently with `serve_secured` below: send
+        // the first ReadRequest, wait for its reply, then — instead of a
+        // standalone ack — send a second ReadRequest on a *different*
+        // exchange that piggybacks the first reply's ack, and finally wait
+        // for its own reply too.
+        let ctrl_task = tokio::spawn(async move {
+            let req1 = im::encode_read_request(
+                0,
+                mat_controller::im::CLUSTER_BASIC_INFORMATION,
+                mat_controller::im::ATTR_DATA_MODEL_REVISION,
+            );
+            let header1 = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 10,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto1 = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_READ_REQUEST,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+                vendor_id: None,
+            };
+            let dg1 = seal_message(&I2R, &header1, &proto1, &req1, CTRL_NODE).unwrap();
+            controller.send_to(&dg1, dev_addr).await.unwrap();
+
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n1, from) = controller.recv_from(&mut buf).await.unwrap();
+            let (h1, p1, _) = open_message(&R2I, &buf[..n1], DEV_NODE).unwrap();
+            assert_eq!(p1.exchange_id, REQ_EXCHANGE);
+            assert_eq!(p1.opcode, im::OPCODE_REPORT_DATA);
+            assert!(p1.needs_ack);
+
+            let req2 = im::encode_read_request(
+                0,
+                mat_controller::im::CLUSTER_BASIC_INFORMATION,
+                mat_controller::im::ATTR_VENDOR_ID,
+            );
+            let header2 = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 11,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto2 = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: Some(h1.message_counter), // piggyback: acks dg1's reply
+                opcode: im::OPCODE_READ_REQUEST,
+                exchange_id: NEW_EXCHANGE,
+                protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+                vendor_id: None,
+            };
+            let dg2 = seal_message(&I2R, &header2, &proto2, &req2, CTRL_NODE).unwrap();
+            controller.send_to(&dg2, from).await.unwrap();
+
+            // Proof the drain loop actually served dg2 (not just buffered
+            // it): a real ReportData for VendorID must arrive on
+            // NEW_EXCHANGE.
+            let (n2, from2) = controller.recv_from(&mut buf).await.unwrap();
+            let (h2, p2, payload2) = open_message(&R2I, &buf[..n2], DEV_NODE).unwrap();
+            assert_eq!(p2.exchange_id, NEW_EXCHANGE);
+            assert_eq!(p2.opcode, im::OPCODE_REPORT_DATA);
+            let rd = im::decode_report_data_message(&payload2).unwrap();
+            assert_eq!(
+                rd.reports[0].attribute,
+                Some(mat_controller::im::ATTR_VENDOR_ID)
+            );
+            assert_eq!(rd.reports[0].data, Some(serde_json::json!(0xFFF1)));
+
+            // Ack this second reply too, so `serve_secured`'s own
+            // `reply_reliable` for it completes promptly instead of
+            // exhausting `MrpConfig::default()`'s retry budget.
+            let ack_header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 12,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let ack_proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: Some(h2.message_counter),
+                opcode: OPCODE_MRP_STANDALONE_ACK,
+                exchange_id: NEW_EXCHANGE,
+                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                vendor_id: None,
+            };
+            let ack_dg = seal_message(&I2R, &ack_header, &ack_proto, &[], CTRL_NODE).unwrap();
+            controller.send_to(&ack_dg, from2).await.unwrap();
+        });
+
+        // Device side: read dg1 off the (real) socket exactly like `run`'s
+        // loop does, then hand it to `serve_secured` — whose internal
+        // `reply_reliable` ack-wait is what actually reads dg2 off the
+        // socket and resolves it via the cross-exchange piggyback ack,
+        // which is what makes the drain loop kick in afterward.
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+        serve_secured(&buf[..n], from, &mut session, &mut node, &comm_server, None).await;
+
+        ctrl_task.await.unwrap();
     }
 }
