@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use crate::cert::{KEY_USAGE_CRL_SIGN, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_KEY_CERT_SIGN};
 use crate::tlv::{Reader, Tag, Value};
 use crate::x509::{parse_x509, DerReader, X509Cert, X509Error};
 
@@ -157,6 +158,31 @@ pub fn verify_device_attestation(
     }
     if dac.is_ca == Some(true) {
         return Err(AttestationError::Chain("dac must not be a ca certificate"));
+    }
+
+    // --- チェーン（厳格）: KeyUsage（spec §6.2.2.1 / RFC 5280 §4.2.1.3）---
+    // CA（PAI/PAA）は keyCertSign を持つ keyUsage 拡張が必須。DAC は拡張が
+    // あるなら digitalSignature 必須かつ証明書署名ビット禁止（拡張なしは
+    // is_ca の DAC 側と同じく許容 — leaf の欠落で commissioning を割らない）。
+    match pai.key_usage {
+        Some(bits) if bits & KEY_USAGE_KEY_CERT_SIGN != 0 => {}
+        _ => return Err(AttestationError::Chain("pai keyusage missing keycertsign")),
+    }
+    match paa.key_usage {
+        Some(bits) if bits & KEY_USAGE_KEY_CERT_SIGN != 0 => {}
+        _ => return Err(AttestationError::Chain("paa keyusage missing keycertsign")),
+    }
+    if let Some(bits) = dac.key_usage {
+        if bits & KEY_USAGE_DIGITAL_SIGNATURE == 0 {
+            return Err(AttestationError::Chain(
+                "dac keyusage missing digitalsignature",
+            ));
+        }
+        if bits & (KEY_USAGE_KEY_CERT_SIGN | KEY_USAGE_CRL_SIGN) != 0 {
+            return Err(AttestationError::Chain(
+                "dac keyusage must not sign certificates",
+            ));
+        }
     }
 
     // --- 有効期間（warn のみ）: 時計ずれ・特殊 notAfter 運用で
@@ -993,5 +1019,206 @@ mod tests {
         assert_eq!(parse_cert_time("not-a-time"), None);
         assert_eq!(parse_cert_time("2020101514234"), None); // Z 無し
         assert_eq!(parse_cert_time("209915142343Z"), None); // 月 99
+    }
+
+    // --- Task 2: KeyUsage 検査 ---
+
+    #[test]
+    fn rejects_pai_without_keycertsign() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        // PAI: cA=true だが keyUsage は digitalSignature のみ（keyCertSign なし）
+        let pai = make_test_cert_ext(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            None,
+            Some((0xFFF1, 0x8001)),
+            Some(0x0001),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::Chain("pai keyusage missing keycertsign")
+        ));
+    }
+
+    #[test]
+    fn rejects_paa_without_keycertsign() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        // PAA: cA=true だが keyUsage は digitalSignature のみ（keyCertSign なし）
+        let paa = make_test_cert_ext(
+            b"paa",
+            b"paa",
+            &paa_key,
+            &paa_key,
+            true,
+            None,
+            None,
+            Some(0x0001),
+        );
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        let dac = make_test_cert(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::Chain("paa keyusage missing keycertsign")
+        ));
+    }
+
+    #[test]
+    fn rejects_dac_with_certsign_keyusage() {
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        // DAC: cA なしだが keyUsage に keyCertSign — 証明書に署名できる leaf は拒否
+        let dac = make_test_cert_ext(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+            Some((0xFFF1, 0x8001)),
+            Some(0x0021), // digitalSignature|keyCertSign
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        let err = verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::Chain("dac keyusage must not sign certificates")
+        ));
+    }
+
+    #[test]
+    fn accepts_dac_without_keyusage_extension() {
+        // leaf の keyUsage 欠落は許容（is_ca の DAC 側の寛容と同じ精神）
+        let paa_key = random_p256_secret();
+        let pai_key = random_p256_secret();
+        let dac_key = random_p256_secret();
+        let paa = make_test_cert(b"paa", b"paa", &paa_key, &paa_key, true, None);
+        let pai = make_test_cert(
+            b"pai",
+            b"paa",
+            &pai_key,
+            &paa_key,
+            true,
+            Some((0xFFF1, 0x8001)),
+        );
+        let dac = make_test_cert_ext(
+            b"dac",
+            b"pai",
+            &dac_key,
+            &pai_key,
+            false,
+            Some((0xFFF1, 0x8001)),
+            Some((0xFFF1, 0x8001)),
+            None, // keyUsage 拡張なし
+        );
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
+        let mut msg = el.clone();
+        msg.extend_from_slice(&challenge);
+        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
+        verify_device_attestation(
+            &dac,
+            &pai,
+            std::slice::from_ref(&paa),
+            &[],
+            &el,
+            &sig,
+            &nonce,
+            &challenge,
+        )
+        .unwrap();
     }
 }
