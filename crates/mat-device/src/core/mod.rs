@@ -8,4 +8,5 @@ pub mod commissioning;
 pub mod datamodel;
 pub mod fabric_store;
 pub mod mdns_records;
+pub mod onoff;
 pub mod pase;

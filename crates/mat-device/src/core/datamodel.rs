@@ -133,7 +133,8 @@ impl Node {
         node.add_endpoint(
             0,
             vec![
-                Box::new(DescriptorHandler) as Box<dyn ClusterHandler>,
+                Box::new(DescriptorHandler::for_device(im::DEVICE_TYPE_ROOT_NODE))
+                    as Box<dyn ClusterHandler>,
                 Box::new(BasicInformationHandler {
                     vendor_id,
                     product_id,
@@ -242,9 +243,21 @@ impl Node {
         // `with_root_endpoint` (e.g. a device runtime's commissioning
         // clusters via `add_cluster`), so it's derived here from the
         // registry rather than left to `DescriptorHandler`'s own `read`
-        // (which has no visibility into its siblings).
+        // (which has no visibility into its siblings). Endpoint 0's
+        // PartsList (spec §9.5, "the endpoint composition tree") is the
+        // same story one level up: it must list every *other* endpoint
+        // registered on this `Node`, which `DescriptorHandler` — scoped to
+        // a single endpoint's own cluster list — has no way to see either.
+        // Non-0 endpoints (M2: only endpoint 1) have no children of their
+        // own, so their PartsList stays `DescriptorHandler`'s own
+        // always-empty answer.
         let value_tlv = if cluster == im::CLUSTER_DESCRIPTOR && attribute == im::ATTR_SERVER_LIST {
             Some(encode_server_list(clusters))
+        } else if cluster == im::CLUSTER_DESCRIPTOR
+            && attribute == im::ATTR_PARTS_LIST
+            && endpoint == 0
+        {
+            Some(encode_parts_list(&self.endpoints))
         } else {
             handler.read(attribute)
         };
@@ -350,10 +363,41 @@ fn encode_server_list(clusters: &[Box<dyn ClusterHandler>]) -> Vec<u8> {
     w.finish()
 }
 
-/// Descriptor cluster (spec §9.5), mandatory on every endpoint. `mat-device`
-/// serves it only on endpoint 0 for now (a flat, single-endpoint node —
-/// `PartsList` is always empty).
-struct DescriptorHandler;
+/// Encodes the Descriptor cluster's `PartsList` (spec §9.5) for endpoint 0:
+/// every *other* endpoint id registered on the `Node`, in registration
+/// order — see `Node::resolve_read`'s override for why this lives here
+/// rather than in `DescriptorHandler` (which only knows its own endpoint).
+fn encode_parts_list(endpoints: &[(u16, Vec<Box<dyn ClusterHandler>>)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (id, _) in endpoints {
+        if *id != 0 {
+            w.put_uint(Tag::Anonymous, u64::from(*id));
+        }
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// Descriptor cluster (spec §9.5), mandatory on every endpoint. Carries the
+/// endpoint's `DeviceTypeList` entry (`device_type` — `DEVICE_TYPE_ROOT_NODE`
+/// on endpoint 0, `DEVICE_TYPE_ON_OFF_LIGHT` on endpoint 1) since that's the
+/// one piece of per-endpoint Descriptor state this flat, non-composed data
+/// model needs; `ServerList`/endpoint-0 `PartsList` are derived from the
+/// registry by `Node::resolve_read` instead (see its doc comment) because
+/// they depend on sibling/other-endpoint state this handler can't see.
+pub struct DescriptorHandler {
+    device_type: u32,
+}
+
+impl DescriptorHandler {
+    /// A Descriptor handler for an endpoint whose `DeviceTypeList` is the
+    /// single entry `device_type` (revision 1 — M2 scope has no device type
+    /// revisions beyond the first).
+    pub fn for_device(device_type: u32) -> Self {
+        Self { device_type }
+    }
+}
 
 impl ClusterHandler for DescriptorHandler {
     fn cluster_id(&self) -> u32 {
@@ -366,15 +410,18 @@ impl ClusterHandler for DescriptorHandler {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
                 w.start_struct(Tag::Anonymous); // DeviceTypeStruct
-                w.put_uint(Tag::Context(0), u64::from(im::DEVICE_TYPE_ROOT_NODE));
+                w.put_uint(Tag::Context(0), u64::from(self.device_type));
                 w.put_uint(Tag::Context(1), 1); // Revision
                 w.end_container();
                 w.end_container();
                 Some(w.finish())
             }
-            // ATTR_SERVER_LIST is intercepted and derived from the endpoint's
-            // actual cluster registry by `Node::resolve_read` — never
-            // reaches here (see that override's doc comment).
+            // ATTR_SERVER_LIST, and ATTR_PARTS_LIST on endpoint 0, are
+            // intercepted and derived from the `Node`'s registry by
+            // `Node::resolve_read` — never reach here (see that override's
+            // doc comment). This is endpoint != 0's PartsList (always
+            // empty: M2 endpoints have no children) and endpoint 0's own
+            // fallback, which `resolve_read` never takes.
             im::ATTR_PARTS_LIST => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
@@ -587,6 +634,47 @@ mod tests {
                 u64::from(CLUSTER_GENERAL_COMMISSIONING),
                 u64::from(CLUSTER_OPERATIONAL_CREDENTIALS),
             ]
+        );
+    }
+
+    #[test]
+    fn root_parts_list_reflects_registered_endpoints() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let (onoff, _state) = crate::core::onoff::OnOffHandler::new();
+        node.add_endpoint(
+            1,
+            vec![
+                Box::new(DescriptorHandler::for_device(im::DEVICE_TYPE_ON_OFF_LIGHT)),
+                Box::new(onoff),
+            ],
+        );
+        let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST);
+        let (_, payload) = node
+            .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
+            .unwrap();
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!([1])));
+    }
+
+    #[test]
+    fn endpoint1_device_type_is_on_off_light() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let (onoff, _state) = crate::core::onoff::OnOffHandler::new();
+        node.add_endpoint(
+            1,
+            vec![
+                Box::new(DescriptorHandler::for_device(im::DEVICE_TYPE_ON_OFF_LIGHT)),
+                Box::new(onoff),
+            ],
+        );
+        let req = im::encode_read_request(1, im::CLUSTER_DESCRIPTOR, im::ATTR_DEVICE_TYPE_LIST);
+        let (_, payload) = node
+            .handle_im(im::OPCODE_READ_REQUEST, &req, &mut InvokeCtx::default())
+            .unwrap();
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(
+            msg.reports[0].data,
+            Some(serde_json::json!([{"0": im::DEVICE_TYPE_ON_OFF_LIGHT, "1": 1}]))
         );
     }
 }

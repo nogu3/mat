@@ -15,8 +15,10 @@ use mat_controller::setup_code::{self, SetupPayload};
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509::{self, X509Error};
 
+use std::sync::atomic::AtomicBool;
+
 use crate::core::commissioning::CommissioningServer;
-use crate::core::datamodel::Node;
+use crate::core::datamodel::{DescriptorHandler, Node};
 use crate::core::fabric_store::FabricStore;
 use crate::net::store::store_in_dir;
 
@@ -95,6 +97,12 @@ pub struct Device {
     local_addr: SocketAddr,
     node: Node,
     comm_server: CommissioningServer,
+    /// Shared handle to endpoint 1's OnOff state — not yet consumed here
+    /// (Task 12 wires it into the runtime's subscription/dirty-report
+    /// path, and `matv` reads it for status logging), so it's currently
+    /// dead weight from `Device`'s own perspective.
+    #[allow(dead_code)]
+    onoff_state: Arc<AtomicBool>,
 }
 
 impl Device {
@@ -128,6 +136,18 @@ impl Device {
         node.add_cluster(0, general_commissioning);
         node.add_cluster(0, operational_credentials);
 
+        // Endpoint 1: M2's single virtual OnOff Light device.
+        let (onoff, onoff_state) = crate::core::onoff::OnOffHandler::new();
+        node.add_endpoint(
+            1,
+            vec![
+                Box::new(DescriptorHandler::for_device(
+                    mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
+                )),
+                Box::new(onoff),
+            ],
+        );
+
         let bind_addr: SocketAddr = format!("[::]:{}", config.port)
             .parse()
             .expect("well-formed IPv6 wildcard address");
@@ -142,6 +162,7 @@ impl Device {
             local_addr,
             node,
             comm_server,
+            onoff_state,
         })
     }
 

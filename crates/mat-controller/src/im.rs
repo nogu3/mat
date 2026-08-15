@@ -71,6 +71,12 @@ pub const ATTR_PARTS_LIST: u32 = 0x0003;
 /// generated table only covers clusters/attributes/commands, not device
 /// types, so there is no generated source of truth to check this against.
 pub const DEVICE_TYPE_ROOT_NODE: u32 = 0x0016;
+/// On/Off Light device type (spec §Device Library 4.1), the `DeviceTypeList`
+/// entry `mat-device` puts on endpoint 1 (M2's single virtual OnOff
+/// device). Same drift-guard exemption as `DEVICE_TYPE_ROOT_NODE` above:
+/// `mat_core::ids`'s generated table has no device-type entries to check
+/// this against.
+pub const DEVICE_TYPE_ON_OFF_LIGHT: u32 = 0x0100;
 /// BasicInformation cluster attributes (spec §11.1). Same drift-guard
 /// coverage as `CLUSTER_DESCRIPTOR` above, via
 /// `core::datamodel::drift_guard::basic_information_attrs_match_mat_core_ids`.
