@@ -14,6 +14,15 @@ Task 9（フィックスラウンド）の入力。
 
 確定イメージ: **`atios/chip-tool:latest`**（Docker Hub, x86_64/amd64）。
 
+**digest ピン止め（fix round 1）**: レビュー指摘によりラッパーの既定イメージはタグ (`:latest`) ではなく本 spike で観測した digest に固定した。
+
+```
+$ docker inspect --format='{{index .RepoDigests 0}}' atios/chip-tool:latest
+atios/chip-tool@sha256:b0f75334f7264af16c19ea0f4880a20ed86b821cd12c6a553c8e012aa0344277
+```
+
+`scripts/chip-tool.sh` の `IMAGE` 既定値はこの digest（`atios/chip-tool@sha256:b0f75334f7264af16c19ea0f4880a20ed86b821cd12c6a553c8e012aa0344277`）。`CHIP_TOOL_IMAGE` 環境変数での差し替えは引き続き可能。
+
 ### 検証コマンドの結果
 
 - `docker run --rm --network host atios/chip-tool chip-tool --version` — **不可**。このイメージの `ENTRYPOINT` は既に `chip-tool` なので、引数に `chip-tool` を重ねると `Unknown cluster or command set: chip-tool` になる。正しい起動形は `docker run --rm --network host atios/chip-tool <args>`（`chip-tool` を省く）。
