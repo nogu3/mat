@@ -3,6 +3,7 @@
 //! file I/O — see `net` for the platform layer. This discipline is checked
 //! mechanically by `cargo check -p mat-device --no-default-features` in CI.
 
+pub mod case;
 pub mod commissioning;
 pub mod datamodel;
 pub mod fabric_store;

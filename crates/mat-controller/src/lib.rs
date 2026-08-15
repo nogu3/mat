@@ -10,6 +10,7 @@ pub mod attestation;
 pub mod ble;
 pub mod btp;
 pub mod case;
+pub mod case_responder;
 pub mod cert;
 pub mod commissioning;
 pub mod counter;

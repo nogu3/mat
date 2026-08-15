@@ -141,8 +141,10 @@ pub(crate) struct Tbe2 {
 }
 
 /// Encodes Sigma1: `struct{1: random, 2: session_id, 3: dest_id, 4: eph_pub}`.
-/// No optional fields (resumption, session params) are sent.
-pub(crate) fn encode_sigma1(
+/// No optional fields (resumption, session params) are sent. `pub` (Task 10):
+/// `mat-device`'s CASE responder unit test builds Sigma1 with this same
+/// initiator-authoritative encoder rather than hand-rolling a second copy.
+pub fn encode_sigma1(
     random: &[u8; 32],
     session_id: u16,
     dest_id: &[u8; 32],
@@ -299,8 +301,10 @@ pub(crate) fn decrypt_tbe2(s2k: &[u8; 16], encrypted2: &[u8]) -> Result<Tbe2, Ca
 }
 
 /// Parses a StatusReport payload: 8 bytes LE `{general_code: u16,
-/// protocol_id: u32, protocol_code: u16}` (spec §4.11.3).
-pub(crate) fn parse_status_report(payload: &[u8]) -> Result<(u16, u32, u16), CaseError> {
+/// protocol_id: u32, protocol_code: u16}` (spec §4.11.3). `pub` (Task 10):
+/// `mat-device`'s net CASE driver decodes/encodes StatusReport with this
+/// pair rather than a third hand-rolled copy.
+pub fn parse_status_report(payload: &[u8]) -> Result<(u16, u32, u16), CaseError> {
     if payload.len() < 8 {
         return Err(CaseError::Sigma2Malformed("status report truncated"));
     }
@@ -315,11 +319,9 @@ pub(crate) fn parse_status_report(payload: &[u8]) -> Result<(u16, u32, u16), Cas
 /// を明示的に中断する（例: PASE 確認不一致）ときに使う — 送らずに黙って
 /// exchange を破棄すると、responder は Pake3/Sigma3 待ちのタイムアウトまで
 /// セッション確立スロットを保持し続けてしまう（spec §4.11.3 / §4.13.1.4）。
-pub(crate) fn encode_status_report(
-    general_code: u16,
-    protocol_id: u32,
-    protocol_code: u16,
-) -> Vec<u8> {
+/// `pub`（Task 10）: mat-device の CASE responder（net driver）が
+/// success/failure の StatusReport をこの関数で組む。
+pub fn encode_status_report(general_code: u16, protocol_id: u32, protocol_code: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8);
     buf.extend_from_slice(&general_code.to_le_bytes());
     buf.extend_from_slice(&protocol_id.to_le_bytes());
@@ -327,18 +329,18 @@ pub(crate) fn encode_status_report(
     buf
 }
 
-pub(crate) fn derive_sigma_key(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 16] {
+/// `pub`（Task 10）: mat-device の CASE responder core が S2K/S3K をこの関数で
+/// 導出する（HKDF salt/info の取り違えを防ぐため initiator 側と同一実装を共有）。
+pub fn derive_sigma_key(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 16] {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), shared);
     let mut out = [0u8; 16];
     hk.expand(info, &mut out).expect("valid length");
     out
 }
 
-pub(crate) fn derive_session_keys(
-    shared: &[u8],
-    ipk: &[u8; 16],
-    transcript: &[u8; 32],
-) -> SessionKeys {
+/// `pub`（Task 10）: mat-device の CASE responder core がセッション鍵をこの
+/// 関数で導出する（initiator 側と同一実装を共有）。
+pub fn derive_session_keys(shared: &[u8], ipk: &[u8; 16], transcript: &[u8; 32]) -> SessionKeys {
     let mut salt = Vec::with_capacity(48);
     salt.extend_from_slice(ipk);
     salt.extend_from_slice(transcript);
@@ -354,8 +356,10 @@ pub(crate) fn derive_session_keys(
 }
 
 /// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
-/// out-of-range case and retries with fresh randomness).
-pub(crate) fn random_p256_secret() -> p256::SecretKey {
+/// out-of-range case and retries with fresh randomness). `pub`（Task 10）:
+/// shared with mat-device's CASE responder core (ephemeral keypair) and its
+/// integration test (device operational keypair).
+pub fn random_p256_secret() -> p256::SecretKey {
     loop {
         let mut b = [0u8; 32];
         getrandom::getrandom(&mut b).expect("os rng");
@@ -366,7 +370,11 @@ pub(crate) fn random_p256_secret() -> p256::SecretKey {
 }
 
 /// Generates a non-zero random u16 (session ids must not be zero, spec §4.5.2).
-pub(crate) fn random_nonzero_u16() -> u16 {
+/// `pub`（Task 10）: shared with mat-device's CASE responder net driver
+/// (though its `responder_session_id` today comes from a fixed config value —
+/// kept here for future randomized-session-id use, same rationale as
+/// `random_p256_secret`).
+pub fn random_nonzero_u16() -> u16 {
     loop {
         let mut b = [0u8; 2];
         getrandom::getrandom(&mut b).expect("os rng");
@@ -380,8 +388,9 @@ pub(crate) fn random_nonzero_u16() -> u16 {
 /// `secret` の SEC1 uncompressed 公開鍵（65 バイト）。CASE の一時鍵専用に
 /// 見えるが実質「p256 secret → uncompressed pubkey」の唯一の変換なので、
 /// `commissioning::write_kvs_bootstrap`（M8c-3）の使い捨て admin op 鍵にも
-/// 再利用する（`pub(crate)`）。
-pub(crate) fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
+/// 再利用する。`pub`（Task 10）: mat-device の CASE responder core（ephemeral
+/// 鍵）とその統合テスト（device operational 鍵）でも再利用する。
+pub fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
     let point = secret.public_key().to_encoded_point(false);
     point
         .as_bytes()
