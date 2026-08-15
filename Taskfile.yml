@@ -12,15 +12,16 @@ tasks:
     silent: true
 
   build:
-    desc: リリースビルド → target/release/{mat,matd}
+    desc: リリースビルド → target/release/{mat,matd,matv}
     cmds:
       - cargo build --release
 
   install:
-    desc: ~/.cargo/bin にインストール（mat / matd 両方）
+    desc: ~/.cargo/bin にインストール（mat / matd / matv）
     cmds:
       - cargo install --path crates/mat --force
       - cargo install --path crates/matd --force
+      - cargo install --path crates/matv --force
 
   run:
     desc: "実行（native バックエンド。例: task run -- discover）"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mat-core", "crates/mat", "crates/matd", "crates/mat-controller", "crates/mat-native", "crates/mat-device"]
+members = ["crates/mat-core", "crates/mat", "crates/matd", "crates/mat-controller", "crates/mat-native", "crates/mat-device", "crates/matv"]
 
 [workspace.package]
 version = "1.28.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/nogu3/mat"
 mat-core = { path = "crates/mat-core" }
 mat-controller = { path = "crates/mat-controller" }
 mat-native = { path = "crates/mat-native" }
+mat-device = { path = "crates/mat-device" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
