@@ -73,6 +73,11 @@ tasks:
     cmds:
       - bash scripts/e2e-device-m1.sh
 
+  chip-tool:
+    desc: "chip-tool (Docker, host network)。例: task chip-tool -- pairing --help"
+    cmds:
+      - bash scripts/chip-tool.sh {{.CLI_ARGS}}
+
   docker:build:
     desc: x86_64 Linux 向けイメージビルド（native、mat/matd のみ）
     cmds:
