@@ -355,21 +355,28 @@ fn parse_elements(elements: &[u8]) -> Result<(Vec<u8>, [u8; 32]), AttestationErr
 
     let mut cd: Option<Vec<u8>> = None;
     let mut nonce: Option<[u8; 32]> = None;
+    let mut depth = 0usize; // 深さ 0 = AttestationElements 直下
     loop {
         let el = r
             .next()
             .map_err(|_| AttestationError::Elements("tlv parse error"))?
             .ok_or(AttestationError::Elements("truncated elements"))?;
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => cd = Some(b.to_vec()),
-            (Tag::Context(2), Value::Bytes(b)) => {
+            (_, Value::ContainerEnd) => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => depth += 1,
+            (Tag::Context(1), Value::Bytes(b)) if depth == 0 => cd = Some(b.to_vec()),
+            (Tag::Context(2), Value::Bytes(b)) if depth == 0 => {
                 nonce = Some(
                     b.try_into()
                         .map_err(|_| AttestationError::Elements("nonce wrong length"))?,
                 );
             }
-            _ => {} // timestamp / firmware_information 等は素通り
+            _ => {} // timestamp / firmware_information / ネスト内要素は素通り
         }
     }
 
@@ -1340,5 +1347,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AttestationError::Chain("dac missing pid")));
+    }
+
+    // --- Task 4: parse_elements がネストコンテナで外側ループを打ち切るのを修正 ---
+
+    #[test]
+    fn parse_elements_skips_nested_containers() {
+        // vendor-reserved フィールドにコンテナが来ても外側ループを打ち切らず、
+        // 深さ 0 の cd/nonce だけを拾う。ネスト内の Context(2) は nonce と
+        // 誤認しない。
+        let nonce = [5u8; 32];
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(5)); // vendor フィールド（コンテナ）
+        w.put_bytes(Tag::Context(2), &[0xAA; 32]); // 罠: ネスト内の tag 2
+        w.end_container();
+        w.put_bytes(Tag::Context(1), b"real-cd");
+        w.put_bytes(Tag::Context(2), &nonce);
+        w.end_container();
+        let (cd, parsed_nonce) = parse_elements(&w.finish()).unwrap();
+        assert_eq!(cd, b"real-cd");
+        assert_eq!(parsed_nonce, nonce);
     }
 }
