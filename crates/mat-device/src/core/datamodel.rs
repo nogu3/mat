@@ -282,14 +282,15 @@ impl Node {
     }
 
     /// Splits `read_entries(paths, read_ctx)`'s report into one or more
-    /// encoded `ReportData` payloads, each at most `budget` bytes. Greedy:
-    /// entries are appended to the current chunk one at a time; the first
-    /// one that would push the encoded length over `budget` starts a new
-    /// chunk instead of splitting mid-report — simplicity over packing
-    /// efficiency, since this runs once per read/priming, not in a hot
-    /// loop. A single entry that alone exceeds `budget` is never split —
-    /// there is no sub-report structure to split at this layer, so it goes
-    /// out alone in its own (over-budget) chunk.
+    /// encoded `ReportData` payloads, each at most `budget` bytes — except
+    /// a single entry that alone exceeds `budget`, which is never split
+    /// (no sub-report structure to split at this layer) and goes out alone
+    /// in its own over-budget chunk. Greedy: entries are appended to the
+    /// current chunk one at a time; the first one that would push the
+    /// *non-final-shape* encoded length (`more_chunks=true` — see the
+    /// probe comment inline) over `budget` starts a new chunk instead of
+    /// splitting mid-report — simplicity over packing efficiency, since
+    /// this runs once per read/priming, not in a hot loop.
     ///
     /// Every chunk but the last is encoded `more_chunks=true,
     /// suppress_response=false` — the receiver must answer
@@ -316,7 +317,17 @@ impl Node {
         for entry in entries {
             let mut candidate = current.clone();
             candidate.push(entry.clone());
-            let candidate_len = im::encode_report_data_entries(&candidate, true, None, false).len();
+            // Probe with `more_chunks=true` (the shape every non-final
+            // batch is actually encoded with below — `MoreChunkedMessages`
+            // adds a 2-byte TLV element that `more_chunks=false` doesn't
+            // have) rather than the smaller final-chunk shape. Probing
+            // with the smaller shape could let a batch through whose real
+            // non-final encoding then lands 1-2 bytes over `budget` (fix
+            // round 1, code review). Only the *last* batch ends up encoded
+            // smaller (`more_chunks=false`) than what it was probed at —
+            // strictly safe, since a batch that already fit the larger
+            // probed shape still fits the smaller final one.
+            let candidate_len = im::encode_report_data_entries(&candidate, false, None, true).len();
             if candidate_len > budget && !current.is_empty() {
                 batches.push(std::mem::take(&mut current));
                 current.push(entry);
@@ -1388,7 +1399,114 @@ mod tests {
             let last = i == chunks.len() - 1;
             assert_eq!(msg.more_chunks, !last);
             assert_eq!(msg.suppress_response, last);
-            assert!(c.len() <= 900 + 64); // 単一レポートが budget 超過の場合のみ超えうる
+            // budget 超過が許されるのは「1 レポート単体が budget 超過で、
+            // 分割せず単独チャンクに出た」場合のみ（read_chunks の docstring）
+            // — 2 レポート以上を含むチャンクは厳密に budget 以内でなければ
+            // ならない（fix round 1: greedy probe が非最終チャンクの実
+            // エンコード形状〈more_chunks=true〉と不一致で最大 2 バイト超過
+            // しうるバグがあった。900+64 の緩い許容がそれを隠していた）。
+            if msg.reports.len() > 1 {
+                assert!(
+                    c.len() <= 900,
+                    "chunk {i} ({} reports) exceeded budget: {} bytes",
+                    msg.reports.len(),
+                    c.len()
+                );
+            }
+            // このフィクスチャの fat 属性（600B）はどれも単体では 900B を
+            // 超えないため、単一レポートのチャンク（fat 属性それぞれ）も
+            // 実際には budget 以内に収まる — 上の緩和は一般則としての
+            // 記録であり、このテストで例外を意図的に踏んでいるわけではない。
+            else {
+                assert!(
+                    c.len() <= 900,
+                    "solo-report chunk {i} unexpectedly exceeded budget: {} bytes",
+                    c.len()
+                );
+            }
+        }
+    }
+
+    /// Fix round 1 (code review): pins the exact boundary the bug lived
+    /// in. `read_chunks`' greedy probe used to check candidates against
+    /// the *final*-chunk wire shape (`more_chunks=false`), 2 bytes smaller
+    /// than the shape a non-final chunk is actually encoded with
+    /// (`more_chunks=true` adds a `MoreChunkedMessages` TLV element). A
+    /// batch whose final-shape length was `<= budget` but whose
+    /// non-final-shape length was `budget+1..=budget+2` used to be let
+    /// through un-split, then get encoded non-final (because a later fat
+    /// entry forced a split after it) 1-2 bytes over `budget` — silently
+    /// violating the `REPORT_CHUNK_BUDGET` contract.
+    ///
+    /// Builds the adversarial case directly: takes the fixture's small
+    /// (non-fat) entries as one candidate batch, computes its final-shape
+    /// length exactly (`im::encode_report_data_entries(..., more_chunks:
+    /// false)`), and sets `budget` to exactly that value — the tightest
+    /// possible budget that still lets the *old* code accept this batch
+    /// without splitting. Every fat entry after it then forces this batch
+    /// to end up non-final, so its real encoded length must not exceed
+    /// `budget` — which only holds if the probe already accounted for the
+    /// non-final shape.
+    #[test]
+    fn read_chunks_probe_accounts_for_non_final_more_chunks_overhead_at_the_boundary() {
+        let node = node_with_onoff_and_fat_attribute();
+        let paths = [AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        }];
+        let read_ctx = ReadCtx::default();
+        let entries = node.read_entries(&paths, &read_ctx);
+
+        // The fixture's fat clusters all use ids `0x9999_0000..=0x9999_0002`
+        // (see `node_with_onoff_and_fat_attribute`'s doc) — everything else
+        // is the small root-endpoint/OnOff data this boundary test packs
+        // into one candidate batch.
+        let small_batch: Vec<ReportEntryOut> = entries
+            .iter()
+            .filter(|e| match e {
+                ReportEntryOut::Data(r) => !(0x9999_0000..=0x9999_0002).contains(&r.cluster),
+                ReportEntryOut::Status { cluster, .. } => {
+                    !(0x9999_0000..=0x9999_0002).contains(cluster)
+                }
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !small_batch.is_empty(),
+            "fixture must have at least one non-fat entry to build the boundary batch"
+        );
+
+        let final_shape_len = im::encode_report_data_entries(&small_batch, true, None, false).len();
+        let non_final_shape_len =
+            im::encode_report_data_entries(&small_batch, false, None, true).len();
+        assert!(
+            non_final_shape_len > final_shape_len,
+            "MoreChunkedMessages must cost extra bytes for this boundary to be meaningful"
+        );
+
+        // Exactly the boundary: old (buggy) code's probe — final shape —
+        // sees `final_shape_len <= budget` and never splits this batch;
+        // fixed code's probe — non-final shape — sees
+        // `non_final_shape_len > budget` and splits it off before adding
+        // any fat entry.
+        let budget = final_shape_len;
+        let chunks = node.read_chunks(&paths, &read_ctx, budget);
+        assert!(
+            chunks.len() >= 2,
+            "fat entries after the small batch must still force a split"
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            let msg = decode_report_data_message(c).unwrap();
+            if msg.reports.len() > 1 {
+                assert!(
+                    c.len() <= budget,
+                    "chunk {i} ({} reports) exceeded budget {budget}: {} bytes \
+                     (this is exactly the fix-round-1 off-by-up-to-2-bytes bug)",
+                    msg.reports.len(),
+                    c.len()
+                );
+            }
         }
     }
 
