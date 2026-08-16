@@ -414,7 +414,17 @@ pub(crate) async fn run(
                         proto,
                         payload: buf[off + body_off..n].to_vec(),
                     };
-                    match classify_unsecured(proto.protocol_id, proto.opcode) {
+                    let flow = classify_unsecured(proto.protocol_id, proto.opcode);
+                    tracing::debug!(
+                        opcode = format_args!("0x{:02X}", proto.opcode),
+                        protocol_id = format_args!("0x{:04X}", proto.protocol_id),
+                        exchange_id = proto.exchange_id,
+                        peer = %peer,
+                        peer_node_id = ?header.source_node_id,
+                        ?flow,
+                        "unsecured datagram received"
+                    );
+                    match flow {
                         UnsecuredFlow::Pase => {
                             let local_session_id = random_session_id();
                             let outcome = crate::net::pase::drive_established(
@@ -429,21 +439,31 @@ pub(crate) async fn run(
                                 },
                             )
                             .await;
-                            if let Ok((keys, peer_session_id)) = outcome {
-                                let session = SecureSession::new_device_role(
-                                    Arc::clone(&transport),
-                                    peer,
-                                    local_session_id,
-                                    peer_session_id,
-                                    keys,
-                                    0, // PASE: both sides are node id 0 (spec §4.13)
-                                    0,
-                                );
-                                current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
+                            match outcome {
+                                Ok((keys, peer_session_id)) => {
+                                    tracing::debug!(
+                                        local_session_id,
+                                        peer_session_id,
+                                        peer = %peer,
+                                        "PASE established"
+                                    );
+                                    let session = SecureSession::new_device_role(
+                                        Arc::clone(&transport),
+                                        peer,
+                                        local_session_id,
+                                        peer_session_id,
+                                        keys,
+                                        0, // PASE: both sides are node id 0 (spec §4.13)
+                                        0,
+                                    );
+                                    current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
+                                }
+                                // Established failure: best-effort responder, nothing
+                                // more to do — the initiator's own retry/StatusReport
+                                // handling covers it (logged so a failing
+                                // interop run says *where* it stopped).
+                                Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
                             }
-                            // Established failure: best-effort responder, nothing
-                            // more to do — the initiator's own retry/StatusReport
-                            // handling covers it.
                         }
                         UnsecuredFlow::Case => {
                             let local_session_id = random_session_id();
@@ -456,8 +476,18 @@ pub(crate) async fn run(
                                 local_session_id,
                             )
                             .await;
-                            if let Ok((session, fabric_index)) = outcome {
-                                current_session = Some((local_session_id, session, fabric_index));
+                            match outcome {
+                                Ok((session, fabric_index)) => {
+                                    tracing::debug!(
+                                        local_session_id,
+                                        fabric_index,
+                                        peer = %peer,
+                                        "CASE established"
+                                    );
+                                    current_session =
+                                        Some((local_session_id, session, fabric_index));
+                                }
+                                Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
                             }
                         }
                         UnsecuredFlow::Ignore => {}
@@ -468,9 +498,20 @@ pub(crate) async fn run(
                 // Secured traffic: only ever the current session (sequential,
                 // one-at-a-time — see module doc).
                 let Some((sid, session, fabric_index)) = current_session.as_mut() else {
+                    tracing::debug!(
+                        session_id = header.session_id,
+                        peer = %peer,
+                        "secured datagram dropped: no session established"
+                    );
                     continue;
                 };
                 if header.session_id != *sid {
+                    tracing::debug!(
+                        session_id = header.session_id,
+                        current_session_id = *sid,
+                        peer = %peer,
+                        "secured datagram dropped: session id does not match the current session"
+                    );
                     continue;
                 }
                 serve_secured(
@@ -610,6 +651,15 @@ async fn serve_secured_message(
         return;
     }
 
+    tracing::debug!(
+        im_opcode = format_args!("0x{:02X}", msg.proto.opcode),
+        exchange_id = msg.proto.exchange_id,
+        request = ?im::decode_invoke_request(&msg.payload)
+            .ok()
+            .map(|r| (r.endpoint, r.cluster, r.command)),
+        "IM request"
+    );
+
     // Only meaningful for CommissioningComplete detection below; a decode
     // failure here just means we won't recognize that milestone (the
     // dispatch to `node.handle_im` below still runs against the raw bytes
@@ -702,11 +752,21 @@ async fn serve_read_request_chunked(
     node: &mut Node,
 ) {
     let Ok(paths) = im::decode_read_request(&msg.payload) else {
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            "ReadRequest dropped: undecodable"
+        );
         return;
     };
     let read_ctx = ReadCtx { fabric_index };
     let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET);
     let last_index = chunks.len().saturating_sub(1);
+    tracing::debug!(
+        exchange_id = msg.proto.exchange_id,
+        ?paths,
+        chunks = chunks.len(),
+        "ReadRequest"
+    );
 
     for (i, chunk) in chunks.into_iter().enumerate() {
         let is_last = i == last_index;
