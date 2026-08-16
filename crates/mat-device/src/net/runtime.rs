@@ -84,6 +84,19 @@ fn reply_cfg() -> MrpConfig {
     MrpConfig::default()
 }
 
+/// The payload budget for one `ReportData` chunk (Task 6:
+/// `Node::read_chunks`'s `budget` argument for real reads). `MAX_DATAGRAM`
+/// (1280B, `mat_controller::transport`) is the hard ceiling on one UDP
+/// datagram; `REPORT_CHUNK_BUDGET` leaves headroom below it for everything
+/// `read_chunks` itself doesn't account for — the Matter message header,
+/// the IM protocol header, and the AES-CCM 16B MIC/tag that
+/// `SecureSession::seal` adds after encoding — so an encoded chunk at or
+/// under this budget still fits in one real datagram once sealed. Echo/
+/// chip full-wildcard reads pull in Operational Credentials' NOCs/
+/// TrustedRootCertificates (certificates, ~500B class each) — well past
+/// this budget on their own, which is exactly why chunking exists.
+const REPORT_CHUNK_BUDGET: usize = 900;
+
 /// One classified unsecured datagram's destination flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsecuredFlow {
@@ -526,6 +539,16 @@ async fn serve_secured_message(
         return;
     }
 
+    // ReadRequest gets its own chunk-aware flow (Task 6) instead of going
+    // through `Node::handle_im` (whose `handle_read` always answers with a
+    // single message) — see `serve_read_request_chunked`'s doc comment.
+    // Reads never trigger the AddNOC/CommissioningComplete milestones
+    // below (those are Invoke-only), so returning here is safe.
+    if msg.proto.opcode == im::OPCODE_READ_REQUEST {
+        serve_read_request_chunked(&msg, session, fabric_index, node).await;
+        return;
+    }
+
     // Only meaningful for CommissioningComplete detection below; a decode
     // failure here just means we won't recognize that milestone (the
     // dispatch to `node.handle_im` below still runs against the raw bytes
@@ -582,6 +605,81 @@ async fn serve_secured_message(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Serves one `ReadRequest` with `Node::read_chunks`'s chunked reply flow
+/// (Task 6), bypassing `Node::handle_im`/`handle_read` (which only ever
+/// return a single message) entirely. Mirrors `SecureSession::
+/// subscribe_wildcard`'s priming-report chunk loop on the *initiator* side
+/// (`crates/mat-controller/src/session.rs`, around line 1329): every chunk
+/// but the last is sent `more_chunks=true, suppress_response=false` and
+/// this side then waits for the peer's `StatusResponse(0)` on the same
+/// exchange before sending the next one; the last chunk is sent
+/// `more_chunks=false, suppress_response=true` and nothing further is
+/// awaited — exactly what `handle_read`'s old single-message reply always
+/// sent, so a read whose data fits in one chunk (`Node::read_chunks`
+/// returns exactly one chunk) behaves identically to before Task 6.
+///
+/// `reply_reliable`'s `Some(msg)`/`None` return mirrors `send_reliable`'s:
+/// if the peer piggybacks its real `StatusResponse` on the MRP ack instead
+/// of sending a standalone one, `reply_reliable` already has it in hand;
+/// otherwise a separate `session.recv` on the same exchange (bounded to 5s
+/// — this is a LAN round-trip to a controller/hub, not a WAN call) waits
+/// for it. Any failure along the way — the reply itself failing to send,
+/// a wrong opcode, a non-zero status, a malformed StatusResponse, or a
+/// timeout — aborts the remaining chunks rather than retrying or looping:
+/// the exchange is effectively dead at that point, and the initiator sees
+/// an incomplete read it can retry from scratch.
+async fn serve_read_request_chunked(
+    msg: &mat_controller::exchange::IncomingMessage,
+    session: &mut SecureSession,
+    fabric_index: u8,
+    node: &mut Node,
+) {
+    let Ok(paths) = im::decode_read_request(&msg.payload) else {
+        return;
+    };
+    let read_ctx = ReadCtx { fabric_index };
+    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET);
+    let last_index = chunks.len().saturating_sub(1);
+
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let is_last = i == last_index;
+        let Ok(piggybacked) = session
+            .reply_reliable(
+                msg,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                im::OPCODE_REPORT_DATA,
+                &chunk,
+                &reply_cfg(),
+            )
+            .await
+        else {
+            return; // ack never came — exchange is dead, give up
+        };
+
+        if is_last {
+            return; // final chunk: no StatusResponse expected, done
+        }
+
+        let status_msg = match piggybacked {
+            Some(m) => m,
+            None => match session
+                .recv(msg.proto.exchange_id, Duration::from_secs(5))
+                .await
+            {
+                Ok(m) => m,
+                Err(_) => return, // timed out waiting for StatusResponse(0)
+            },
+        };
+        if status_msg.proto.opcode != im::OPCODE_STATUS_RESPONSE {
+            return;
+        }
+        match im::decode_status_response(&status_msg.payload) {
+            Ok(0) => continue, // ack for this chunk — send the next one
+            _ => return,       // non-zero status or malformed reply
         }
     }
 }
@@ -868,5 +966,242 @@ mod tests {
         .await;
 
         ctrl_task.await.unwrap();
+    }
+
+    // ── Task 6: chunked ReadRequest reply flow ──────────────────────────
+
+    /// A device-role closed-loop drive of `serve_read_request_chunked`
+    /// (Task 6): a full-wildcard read against a `Node` carrying two ~600B
+    /// attributes (each alone under `REPORT_CHUNK_BUDGET`, but the two
+    /// together well past it) must come back as 2+ `ReportData` chunks,
+    /// each non-final one answered with `StatusResponse(0)` on the same
+    /// exchange before the next is sent — `mat` (`read_attribute`) has no
+    /// chunk support to drive this against (brief's Step 4), so this test
+    /// plays the controller role by hand at the raw-datagram level, the
+    /// same technique `serve_secured_drains_and_serves_a_cross_exchange_
+    /// piggybacked_request` above uses. `read_chunks`'s own split/flag
+    /// correctness is covered by `datamodel.rs`'s unit tests; this test's
+    /// job is only proving the runtime's send-chunk/await-StatusResponse
+    /// loop actually round-trips over real sockets — the initiator-side
+    /// counterpart to what `SecureSession::subscribe_wildcard`'s priming
+    /// loop already exercises from the other end (`session.rs`, around
+    /// line 1329).
+    #[tokio::test]
+    async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
+        use mat_controller::crypto::{open_message, seal_message};
+        use mat_controller::message::Destination;
+        use mat_controller::session::SessionKeys;
+        use mat_controller::tlv::{Tag, Writer};
+        use mat_controller::transport::UdpTransport;
+
+        use crate::core::datamodel::{ClusterHandler, InvokeReply};
+        use crate::core::fabric_store::FabricStore;
+
+        const LOCAL_SID: u16 = 0xAAAA;
+        const PEER_SID: u16 = 0xBBBB;
+        const CTRL_NODE: u64 = 1;
+        const DEV_NODE: u64 = 2;
+        const I2R: [u8; 16] = [0x11; 16];
+        const R2I: [u8; 16] = [0x22; 16];
+        const REQ_EXCHANGE: u16 = 0x30;
+
+        /// Test-only cluster exposing one ~600B attribute — two of these
+        /// registered on the node force `read_chunks` to split (two
+        /// together exceed `REPORT_CHUNK_BUDGET`, though neither alone
+        /// does). Cluster id is far outside any real cluster id range.
+        struct FatHandler {
+            cluster: u32,
+        }
+        impl ClusterHandler for FatHandler {
+            fn cluster_id(&self) -> u32 {
+                self.cluster
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![1]
+            }
+            fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+                if attribute != 1 {
+                    return None;
+                }
+                let mut w = Writer::new();
+                w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
+                Some(w.finish())
+            }
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields_tlv: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+        }
+
+        /// Full-wildcard ReadRequest (every field of the one
+        /// AttributePathIB omitted) — `mat_controller::im` has no public
+        /// encoder for this shape (its `encode_read_request*` helpers all
+        /// pin at least endpoint+cluster), so built by hand the same way
+        /// `datamodel.rs`'s test-only `encode_read_request_paths` does.
+        fn encode_full_wildcard_read_request() -> Vec<u8> {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(0)); // AttributeRequests
+            w.start_list(Tag::Anonymous); // AttributePathIB, all wildcard
+            w.end_container();
+            w.end_container(); // AttributeRequests
+            w.put_bool(Tag::Context(3), true); // IsFabricFiltered
+            w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
+            w.end_container();
+            w.finish()
+        }
+
+        let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let dev_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let dev_addr = dev_transport.local_addr().unwrap();
+
+        let mut session = SecureSession::new_device_role(
+            Arc::clone(&dev_transport),
+            controller.local_addr().unwrap(),
+            LOCAL_SID,
+            PEER_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            DEV_NODE,
+            CTRL_NODE,
+        );
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(
+            0,
+            Box::new(FatHandler {
+                cluster: 0x9999_0001,
+            }),
+        );
+        node.add_cluster(
+            0,
+            Box::new(FatHandler {
+                cluster: 0x9999_0002,
+            }),
+        );
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let comm_server = CommissioningServer::new(dev, FabricStore::new());
+
+        let ctrl_task = tokio::spawn(async move {
+            let req = encode_full_wildcard_read_request();
+            let header = MessageHeader {
+                session_id: LOCAL_SID,
+                security_flags: 0,
+                message_counter: 10,
+                source_node_id: None,
+                destination: Destination::None,
+            };
+            let proto = ProtocolHeader {
+                initiator: true,
+                needs_ack: false,
+                acked_counter: None,
+                opcode: im::OPCODE_READ_REQUEST,
+                exchange_id: REQ_EXCHANGE,
+                protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+                vendor_id: None,
+            };
+            let dg = seal_message(&I2R, &header, &proto, &req, CTRL_NODE).unwrap();
+            controller.send_to(&dg, dev_addr).await.unwrap();
+
+            let mut counter = 11u32;
+            let mut chunk_count = 0usize;
+            let mut buf = [0u8; MAX_DATAGRAM];
+            loop {
+                let (n, from) = controller.recv_from(&mut buf).await.unwrap();
+                let peer = from;
+                let (h, p, payload) = open_message(&R2I, &buf[..n], DEV_NODE).unwrap();
+                assert_eq!(p.exchange_id, REQ_EXCHANGE);
+                assert_eq!(p.opcode, im::OPCODE_REPORT_DATA);
+                let rd = im::decode_report_data_message(&payload).unwrap();
+                chunk_count += 1;
+
+                if rd.more_chunks {
+                    assert!(!rd.suppress_response);
+                    // Reply with StatusResponse(0) on the same exchange —
+                    // `serve_read_request_chunked`'s `reply_reliable` for
+                    // this chunk resolves on any non-standalone-ack
+                    // message on the exchange (same idiom
+                    // `send_reliable`/`SecureSession::subscribe_wildcard`
+                    // use), so this single reply both acks the chunk and
+                    // is what the runtime's `session.recv` StatusResponse
+                    // wait is looking for.
+                    let ok = im::encode_status_response(0);
+                    let resp_header = MessageHeader {
+                        session_id: LOCAL_SID,
+                        security_flags: 0,
+                        message_counter: counter,
+                        source_node_id: None,
+                        destination: Destination::None,
+                    };
+                    let resp_proto = ProtocolHeader {
+                        initiator: true,
+                        needs_ack: false,
+                        acked_counter: Some(h.message_counter),
+                        opcode: im::OPCODE_STATUS_RESPONSE,
+                        exchange_id: REQ_EXCHANGE,
+                        protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+                        vendor_id: None,
+                    };
+                    let dg = seal_message(&I2R, &resp_header, &resp_proto, &ok, CTRL_NODE).unwrap();
+                    controller.send_to(&dg, peer).await.unwrap();
+                    counter += 1;
+                } else {
+                    assert!(rd.suppress_response);
+                    // Final chunk: no StatusResponse expected from us, but
+                    // still ack it (standalone) so the runtime's own
+                    // `reply_reliable` for this last send completes
+                    // promptly instead of exhausting its retry budget.
+                    let ack_header = MessageHeader {
+                        session_id: LOCAL_SID,
+                        security_flags: 0,
+                        message_counter: counter,
+                        source_node_id: None,
+                        destination: Destination::None,
+                    };
+                    let ack_proto = ProtocolHeader {
+                        initiator: true,
+                        needs_ack: false,
+                        acked_counter: Some(h.message_counter),
+                        opcode: OPCODE_MRP_STANDALONE_ACK,
+                        exchange_id: REQ_EXCHANGE,
+                        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+                        vendor_id: None,
+                    };
+                    let ack_dg =
+                        seal_message(&I2R, &ack_header, &ack_proto, &[], CTRL_NODE).unwrap();
+                    controller.send_to(&ack_dg, peer).await.unwrap();
+                    break;
+                }
+            }
+            chunk_count
+        });
+
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+        serve_secured(
+            &buf[..n],
+            from,
+            &mut session,
+            0,
+            &mut node,
+            &comm_server,
+            None,
+        )
+        .await;
+
+        let chunk_count = ctrl_task.await.unwrap();
+        assert!(chunk_count >= 2, "expected 2+ chunks, got {chunk_count}");
     }
 }

@@ -105,6 +105,16 @@ pub trait ClusterHandler: Send {
 pub enum ImServerError {
     Decode(ImError),
     UnsupportedOpcode(u8),
+    /// An inbound message that must *not* be answered at all — not a
+    /// decode failure and not "can't handle this action", just "there is
+    /// no reply to send back for this one". `handle_im`'s success shape is
+    /// always "here is the (opcode, payload) to reply with", so "silently
+    /// drop" has to come back as an error variant instead; callers that
+    /// already treat any `Err` as "send nothing" (`net::runtime::
+    /// serve_secured_message`) get the right behavior for free. Currently
+    /// only produced by `handle_im`'s `OPCODE_STATUS_RESPONSE` arm — see
+    /// its doc comment for why.
+    NoReply,
 }
 
 impl std::fmt::Display for ImServerError {
@@ -114,6 +124,7 @@ impl std::fmt::Display for ImServerError {
             ImServerError::UnsupportedOpcode(op) => {
                 write!(f, "im: unsupported opcode 0x{op:02X}")
             }
+            ImServerError::NoReply => write!(f, "im: no reply required"),
         }
     }
 }
@@ -216,6 +227,20 @@ impl Node {
         match opcode {
             im::OPCODE_READ_REQUEST => self.handle_read(payload, read_ctx),
             im::OPCODE_INVOKE_REQUEST => self.handle_invoke(payload, ctx),
+            // Inbound StatusResponse reaching the generic dispatch is not
+            // an unhandled action to reject — it's the initiator's ack of
+            // a ReportData chunk we just sent (Task 6's chunked-read flow,
+            // `net::runtime::serve_read_request_chunked`), which normally
+            // consumes it directly via the chunk-wait `session.recv` and
+            // never routes it through `handle_im` at all. But if one slips
+            // through anyway — e.g. `serve_secured`'s buffered-request
+            // drain replaying something left in `peer_initiated` through
+            // this same dispatch — answering it with
+            // `StatusResponse(INVALID_ACTION)` would be a protocol
+            // violation mid-chunking that makes a real controller (chip)
+            // abort the read. Drop it instead of answering (carried
+            // finding from Task 5's review).
+            im::OPCODE_STATUS_RESPONSE => Err(ImServerError::NoReply),
             // Any opcode this skeleton has no handler for (WriteRequest,
             // SubscribeRequest, TimedRequest, ...) is answered — not
             // silently dropped, and not a hard error that kills the
@@ -236,11 +261,80 @@ impl Node {
         read_ctx: &ReadCtx,
     ) -> Result<(u8, Vec<u8>), ImServerError> {
         let paths = im::decode_read_request(payload)?;
-        let entries = self.read_entries(&paths, read_ctx);
+        // `usize::MAX` never triggers a split, so this always yields
+        // exactly one chunk — the same single-message
+        // `more_chunks=false, suppress_response=true` reply `handle_read`
+        // has always returned. `handle_im` is only reached by direct unit
+        // tests and any opcode still routed through the generic dispatch;
+        // the real chunk-aware flow (`read_chunks` with `net::runtime`'s
+        // `REPORT_CHUNK_BUDGET`) is `net::runtime::serve_secured_message`'s
+        // job (Task 6) — it bypasses `handle_im` for `OPCODE_READ_REQUEST`
+        // entirely so it can drive the multi-chunk StatusResponse
+        // round-trip.
+        let chunks = self.read_chunks(&paths, read_ctx, usize::MAX);
         Ok((
             im::OPCODE_REPORT_DATA,
-            im::encode_report_data_entries(&entries, true, None, false),
+            chunks
+                .into_iter()
+                .next()
+                .expect("read_chunks always yields at least one chunk"),
         ))
+    }
+
+    /// Splits `read_entries(paths, read_ctx)`'s report into one or more
+    /// encoded `ReportData` payloads, each at most `budget` bytes. Greedy:
+    /// entries are appended to the current chunk one at a time; the first
+    /// one that would push the encoded length over `budget` starts a new
+    /// chunk instead of splitting mid-report — simplicity over packing
+    /// efficiency, since this runs once per read/priming, not in a hot
+    /// loop. A single entry that alone exceeds `budget` is never split —
+    /// there is no sub-report structure to split at this layer, so it goes
+    /// out alone in its own (over-budget) chunk.
+    ///
+    /// Every chunk but the last is encoded `more_chunks=true,
+    /// suppress_response=false` — the receiver must answer
+    /// `StatusResponse(0)` on the same exchange before the next chunk
+    /// (spec §8.9.2.3's chunk handshake; `net::runtime::
+    /// serve_read_request_chunked` drives it, mirroring `SecureSession::
+    /// subscribe_wildcard`'s priming-report loop on the initiator side).
+    /// The last chunk is `more_chunks=false, suppress_response=true` —
+    /// identical to what a single-chunk read has always encoded, so a read
+    /// that fits in one chunk is unchanged (no regression).
+    ///
+    /// Always returns at least one chunk, even for zero entries (an empty
+    /// `ReportData`, matching the pre-Task-6 always-one-chunk behavior for
+    /// a read that matches nothing).
+    pub fn read_chunks(
+        &self,
+        paths: &[AttrPathIn],
+        read_ctx: &ReadCtx,
+        budget: usize,
+    ) -> Vec<Vec<u8>> {
+        let entries = self.read_entries(paths, read_ctx);
+        let mut batches: Vec<Vec<ReportEntryOut>> = Vec::new();
+        let mut current: Vec<ReportEntryOut> = Vec::new();
+        for entry in entries {
+            let mut candidate = current.clone();
+            candidate.push(entry.clone());
+            let candidate_len = im::encode_report_data_entries(&candidate, true, None, false).len();
+            if candidate_len > budget && !current.is_empty() {
+                batches.push(std::mem::take(&mut current));
+                current.push(entry);
+            } else {
+                current = candidate;
+            }
+        }
+        batches.push(current); // always ≥1 batch, even for zero entries
+
+        let last = batches.len() - 1;
+        batches
+            .into_iter()
+            .enumerate()
+            .map(|(i, batch)| {
+                let is_last = i == last;
+                im::encode_report_data_entries(&batch, is_last, None, !is_last)
+            })
+            .collect()
     }
 
     /// Expands every `AttrPathIn` in `paths` (wildcard endpoint/cluster/
@@ -1225,6 +1319,114 @@ mod tests {
         assert_eq!(msg.reports.len(), 1);
         assert_eq!(msg.reports[0].endpoint, Some(1));
         assert_eq!(msg.reports[0].status, None);
+    }
+
+    // ── Task 6: chunked read (`Node::read_chunks`) ─────────────────────
+
+    /// `node_with_onoff()` plus endpoint 2, carrying three fake clusters
+    /// that each expose one ~600B attribute — big enough that two of them
+    /// together already blow past a 900B chunk budget, forcing
+    /// `read_chunks` to split. Cluster ids are well outside any real
+    /// (spec-assigned or manufacturer-specific) cluster id range — these
+    /// clusters exist only to be oversized, not to look like a real
+    /// device.
+    fn node_with_onoff_and_fat_attribute() -> Node {
+        struct FatHandler {
+            cluster: u32,
+            attribute: u32,
+        }
+        impl ClusterHandler for FatHandler {
+            fn cluster_id(&self) -> u32 {
+                self.cluster
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![self.attribute]
+            }
+            fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+                if attribute != self.attribute {
+                    return None;
+                }
+                let mut w = Writer::new();
+                w.put_bytes(Tag::Anonymous, &[0xAB; 600]);
+                Some(w.finish())
+            }
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields_tlv: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+        }
+
+        let mut node = node_with_onoff();
+        for i in 0..3u32 {
+            node.add_endpoint(
+                2,
+                vec![Box::new(FatHandler {
+                    cluster: 0x9999_0000 + i,
+                    attribute: 1,
+                }) as Box<dyn ClusterHandler>],
+            );
+        }
+        node
+    }
+
+    #[test]
+    fn read_chunks_splits_when_over_budget_and_marks_more_chunks() {
+        let node = node_with_onoff_and_fat_attribute();
+        let paths = [AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        }];
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900);
+        assert!(chunks.len() >= 2);
+        for (i, c) in chunks.iter().enumerate() {
+            let msg = decode_report_data_message(c).unwrap();
+            let last = i == chunks.len() - 1;
+            assert_eq!(msg.more_chunks, !last);
+            assert_eq!(msg.suppress_response, last);
+            assert!(c.len() <= 900 + 64); // 単一レポートが budget 超過の場合のみ超えうる
+        }
+    }
+
+    /// 1 チャンクで収まる読み取りは従来と同一挙動（回帰なし）: 単一チャンク、
+    /// `more_chunks=false, suppress_response=true` — `handle_read`（budget=
+    /// `usize::MAX`）が返すものと同じ形。
+    #[test]
+    fn read_chunks_single_chunk_matches_legacy_single_message_shape() {
+        let node = node_with_onoff();
+        let paths = [AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        }];
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900);
+        assert_eq!(chunks.len(), 1);
+        let msg = decode_report_data_message(&chunks[0]).unwrap();
+        assert!(!msg.more_chunks);
+        assert!(msg.suppress_response);
+    }
+
+    /// Carried finding from Task 5's review: an inbound `StatusResponse`
+    /// reaching the generic opcode dispatch (e.g. via `serve_secured`'s
+    /// buffered-request drain, instead of the chunk-wait `session.recv`
+    /// that's supposed to consume it) must be silently dropped, not
+    /// answered with `StatusResponse(INVALID_ACTION)` — see `handle_im`'s
+    /// `OPCODE_STATUS_RESPONSE` arm doc comment.
+    #[test]
+    fn handle_im_drops_inbound_status_response_without_replying() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let payload = im::encode_status_response(0);
+        let result = node.handle_im(
+            im::OPCODE_STATUS_RESPONSE,
+            &payload,
+            &mut InvokeCtx::default(),
+            &ReadCtx::default(),
+        );
+        assert!(matches!(result, Err(ImServerError::NoReply)));
     }
 }
 
