@@ -84,3 +84,15 @@ commission 試行前後にこのファイルへ結果を追記していく。
 
 - Task 16 では **この Task 10 の store をそのまま使わない**。Echo 側に古い登録が
   残っていればユーザーにアプリからの削除を依頼してから新 store で開始する。
+
+## Task 10 結果（2026-08-16）: Echo attestation 早期チェック — 不通過【Amazon 側要因で確定】
+
+- attempt 1-2（自己生成チェーン + 自作 CD）: 警告→同意→ AttestationResponse 受領後にクラウド側で停滞、fail-safe 満了で Echo が中断（GS014）
+- attempt 3（観測強化後）: 同一パターンをログで確定。AttestationResponse は MRP ack 済み、以降 80 秒間 Echo からの着信ゼロ（pcap で裏取り）→ ArmFailSafe(0) の後始末のみ
+- attempt 4（正典 chip テスト証明書チェーン PAA-FFF1→PAI→DAC）: 変化なし（GS014）
+- attempt 5（CD の certificate_id="CSA00000SWC00000-00" / device_type_id=22 を matter.js に一致）: 変化なし（GS014）
+- attempt 6【対照実験】: matter.js 公式サンプル（@matter/examples 0.15.6、Alexa ペアリング実績のある参照実装）を同一 jarvis/LAN/Echo で commission → **同一パターンで失敗**（attestationRequest 応答後 80 秒沈黙 → armFailSafe 後始末 →「Alexaをデバイスに接続できません」）
+
+**結論**: 自作スタックの問題ではない。「認定されていないデバイス」への同意はローカル続行のみを解錠し、Amazon クラウド側の attestation 検証が未認証（テスト証明書）デバイスを通していない（このアカウント/リージョン/ファーム世代で）。参照実装も同様に落ちるため、デバイス側で回避できる差分は存在しない。
+
+**申し送り**: M2 の Echo ゲート（Task 16）は Amazon 側の道（開発者コンソール登録・サポート問い合わせ・別ファーム世代の Echo での再試行等）が見つかるまで保留。残タスク（Subscribe/窓/salt）は chip-tool ゲートで完成させる方針をユーザーが承認済み。相互運用検証の代替として Apple Home / Google Home（自作証明書に寛容）が選択肢。
