@@ -116,9 +116,17 @@ impl FabricStore {
     }
 
     /// The fabric index the next `insert` will use (spec §11.17: fabric
-    /// indices are 1-based, `0` is reserved as "no fabric").
+    /// indices are 1-based, `0` is reserved as "no fabric"). `max + 1`
+    /// rather than `len + 1` — after a `remove` this table can have gaps
+    /// (a fail-safe-expiry rollback removes from the middle, not just the
+    /// end — see `remove`'s doc comment), and `len + 1` would hand out an
+    /// index a still-live fabric already occupies.
     pub fn next_fabric_index(&self) -> u8 {
-        self.entries.len() as u8 + 1
+        self.entries
+            .iter()
+            .map(|e| e.fabric_index)
+            .max()
+            .map_or(1, |m| m + 1)
     }
 
     /// Appends `entry` and, if a persist backend is configured, saves the
@@ -135,6 +143,42 @@ impl FabricStore {
             }
         }
         Ok(())
+    }
+
+    /// Removes the entry at `fabric_index`, if present, and (if a persist
+    /// backend is configured) saves the resulting table. `Ok(false)` (not
+    /// an error) if no entry has that index — callers rolling back a
+    /// fail-safe expiry call this unconditionally and treat "wasn't there"
+    /// as a no-op.
+    ///
+    /// Deliberately **asymmetric** with `insert`'s save-failure rollback.
+    /// `insert` un-appends on a save error so the in-memory table never
+    /// claims a fabric that didn't actually make it to disk. `remove` does
+    /// the opposite on a save error: the entry stays removed from memory
+    /// even though the save failed (the error is still returned, so the
+    /// caller knows persistence didn't happen). Every caller of `remove` is
+    /// a fail-safe rollback undoing an `AddNOC` that was never confirmed by
+    /// `CommissioningComplete` — putting the entry back in memory on a save
+    /// error would leave a zombie fabric a CASE session could still
+    /// authenticate against (its NOC and keys are real), potentially while
+    /// `next_fabric_index` has already handed its index to a new attempt.
+    /// That's worse than the alternative failure mode (the removed fabric
+    /// reappearing after a restart if the save is never retried) — a
+    /// zombie that's live *right now* beats one that only might come back
+    /// later.
+    pub fn remove(&mut self, fabric_index: u8) -> Result<bool, String> {
+        let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.fabric_index == fabric_index)
+        else {
+            return Ok(false);
+        };
+        self.entries.remove(pos);
+        if let Some(persist) = &self.persist {
+            persist.save(&self.entries)?;
+        }
+        Ok(true)
     }
 }
 
@@ -202,6 +246,71 @@ mod tests {
         let mut store = FabricStore::with_persist(Box::new(FailingPersist));
         let err = store.insert(entry(1)).unwrap_err();
         assert_eq!(err, "disk full");
+        assert!(store.entries().is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_matching_entry() {
+        let mut store = FabricStore::new();
+        store.insert(entry(1)).unwrap();
+        store.insert(entry(2)).unwrap();
+        assert!(store.remove(1).unwrap());
+        assert_eq!(store.entries(), &[entry(2)]);
+    }
+
+    #[test]
+    fn remove_returns_false_when_not_found() {
+        let mut store = FabricStore::new();
+        store.insert(entry(1)).unwrap();
+        assert!(!store.remove(2).unwrap());
+        assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn next_fabric_index_skips_removed_indices() {
+        let mut store = FabricStore::new();
+        store.insert(entry(1)).unwrap();
+        store.insert(entry(2)).unwrap();
+        assert!(store.remove(1).unwrap());
+        assert_eq!(store.next_fabric_index(), 3); // len+1 だと 2 で衝突していた
+    }
+
+    /// A `FabricPersist` whose `save` can be toggled to fail after
+    /// construction (unlike `FailingPersist`, which always fails and so
+    /// can't be used to get an entry into a persisted store's memory in
+    /// the first place via `insert`). `Arc<AtomicBool>` rather than `Cell`
+    /// so the flag stays reachable from the test after the persist is
+    /// moved into `Box<dyn FabricPersist>` — `AtomicBool` is `Sync`, unlike
+    /// `Cell`, which the shared `Arc` requires.
+    struct FlakySavePersist {
+        fail_save: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FabricPersist for FlakySavePersist {
+        fn save(&self, _entries: &[FabricEntry]) -> Result<(), String> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("disk full".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn load(&self) -> Result<Vec<FabricEntry>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn remove_drops_from_memory_even_when_persist_save_fails() {
+        let fail_save = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut store = FabricStore::with_persist(Box::new(FlakySavePersist {
+            fail_save: std::sync::Arc::clone(&fail_save),
+        }));
+        store.insert(entry(1)).unwrap();
+
+        fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = store.remove(1).unwrap_err();
+        assert_eq!(err, "disk full");
+        // Asymmetric with `insert`'s rollback (see `remove`'s doc comment):
+        // the entry is gone from memory regardless of the save failure.
         assert!(store.entries().is_empty());
     }
 }

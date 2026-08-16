@@ -132,8 +132,37 @@ impl FailSafeState {
         self.armed_until = None;
     }
 
+    /// The instant this window closes, if it's still open right now —
+    /// `None` both when never armed and once the window has already
+    /// passed. `CommissioningServer::fail_safe_deadline` hands this
+    /// straight to the runtime's `select`, which only ever wants a live
+    /// deadline to wait on.
+    fn deadline(&self) -> Option<Instant> {
+        self.armed_until.filter(|&t| Instant::now() < t)
+    }
+
     fn is_armed(&self) -> bool {
-        self.armed_until.is_some_and(|t| Instant::now() < t)
+        self.deadline().is_some()
+    }
+
+    /// `true` if this was armed and the window has now passed. Distinct
+    /// from `!is_armed()`, which is also true when never armed at all —
+    /// `expire_fail_safe` needs to tell "nothing to expire" from "there was
+    /// something, and it's due" apart. Fires exactly once per window: the
+    /// `disarm()` that follows a `true` result clears `armed_until`, so a
+    /// repeat call reads back as "never armed" and returns `false`.
+    fn is_expired(&self) -> bool {
+        self.armed_until.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Test-only: pushes the window into the past without waiting on a
+    /// real clock, so fail-safe-expiry tests don't need a wall-clock sleep.
+    /// A no-op if never armed.
+    #[cfg(test)]
+    fn force_expire(&mut self) {
+        if let Some(t) = self.armed_until.as_mut() {
+            *t = Instant::now() - Duration::from_millis(1);
+        }
     }
 }
 
@@ -157,6 +186,14 @@ struct Inner {
     fail_safe: FailSafeState,
     pending: PendingCommissioning,
     store: FabricStore,
+    /// The fabric index `handle_add_noc` most recently installed within the
+    /// current fail-safe attempt, if `CommissioningComplete` hasn't
+    /// confirmed it yet (spec §11.10.7.2: a fail-safe transition without a
+    /// completed commissioning must roll back the fabric change). Cleared
+    /// (without removing anything) by `handle_commissioning_complete` on
+    /// success; consumed by `rollback_uncommitted_fabric` (removing the
+    /// fabric) on expiry or on a fresh/early `ArmFailSafe`.
+    uncommitted_fabric_index: Option<u8>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -174,6 +211,7 @@ impl CommissioningServer {
                 fail_safe: FailSafeState::default(),
                 pending: PendingCommissioning::default(),
                 store,
+                uncommitted_fabric_index: None,
             })),
         }
     }
@@ -201,6 +239,50 @@ impl CommissioningServer {
         inner.pending.op_private_key.is_none()
             && inner.pending.op_public_key.is_none()
             && inner.pending.trusted_root_tlv.is_none()
+    }
+
+    /// The current fail-safe window's deadline, if one is open right now —
+    /// `None` both when never armed and once the window has already
+    /// passed. Meant for a runtime `select` (Task 8) to wait on, so it can
+    /// call `expire_fail_safe` right when the window closes instead of
+    /// only noticing on the next incoming command.
+    pub fn fail_safe_deadline(&self) -> Option<Instant> {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .fail_safe
+            .deadline()
+    }
+
+    /// spec §11.10.7.2: if the fail-safe's deadline has passed, rolls back
+    /// whatever `AddNOC` installed within that window without a following
+    /// `CommissioningComplete`, and returns the removed `FabricEntry` —
+    /// the runtime (Task 8) needs its `fabric_id`/`node_id` to compute the
+    /// `compressed_fabric_id` for the mDNS goodbye it sends once the
+    /// operational advert for that fabric is no longer valid.
+    ///
+    /// `None` if the deadline hasn't passed yet, or if it has but there was
+    /// nothing uncommitted to roll back — including a second call right
+    /// after the first: `disarm()` already ran, so the fail-safe reads back
+    /// as "never armed" and this short-circuits before touching the store.
+    /// Callable either lazily (the next command handler could call this
+    /// before doing anything else — not yet wired up; core only exposes
+    /// the primitive) or from the runtime's own deadline timer.
+    pub fn expire_fail_safe(&self) -> Option<FabricEntry> {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .expire_fail_safe()
+    }
+
+    /// Test-only: see `FailSafeState::force_expire`.
+    #[cfg(test)]
+    fn force_expire_fail_safe(&self) {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .fail_safe
+            .force_expire();
     }
 
     /// Splits into the two `ClusterHandler` adapters `Node::add_cluster`
@@ -439,6 +521,12 @@ impl Inner {
         let Ok((expiry_s, _breadcrumb)) = decode_arm_fail_safe(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
+        // A previous attempt's AddNOC that was never confirmed by
+        // CommissioningComplete must not survive into this one, whether
+        // this is a fresh re-arm mid-window or an early disarm (spec
+        // §11.10.7.2.1) — same "don't carry a zombie fabric forward" rule
+        // `expire_fail_safe` enforces on an actual timeout.
+        self.rollback_uncommitted_fabric();
         self.pending = PendingCommissioning::default();
         if expiry_s == 0 {
             self.fail_safe.disarm();
@@ -470,10 +558,55 @@ impl Inner {
     fn handle_commissioning_complete(&mut self) -> InvokeReply {
         self.fail_safe.disarm();
         self.pending = PendingCommissioning::default();
+        // The AddNOC (if any) that installed a fabric within this window is
+        // now confirmed — clear the marker without removing anything.
+        // Contrast `rollback_uncommitted_fabric`, which `expire_fail_safe`
+        // and `handle_arm_fail_safe` use to discard an *unconfirmed* one.
+        self.uncommitted_fabric_index = None;
         InvokeReply::Data {
             response_command: RESP_COMMISSIONING_COMPLETE,
             fields_tlv: encode_commissioning_status_response(0, ""),
         }
+    }
+
+    /// Removes whatever fabric `uncommitted_fabric_index` marks (if any) —
+    /// a fabric `AddNOC` installed within the current/most-recent fail-safe
+    /// window that hasn't yet been confirmed by `CommissioningComplete`.
+    /// Shared by `expire_fail_safe` (the window's deadline passed) and
+    /// `handle_arm_fail_safe` (a fresh attempt must not inherit the
+    /// previous attempt's zombie fabric). Returns the removed entry, if
+    /// any — only `expire_fail_safe`'s caller needs it (Task 8's runtime
+    /// needs `fabric_id`/`node_id` off it for the mDNS goodbye before it's
+    /// gone from the store).
+    fn rollback_uncommitted_fabric(&mut self) -> Option<FabricEntry> {
+        let fabric_index = self.uncommitted_fabric_index.take()?;
+        let removed = self
+            .store
+            .entries()
+            .iter()
+            .find(|e| e.fabric_index == fabric_index)
+            .cloned();
+        // See `FabricStore::remove`'s doc comment for why a save failure
+        // here is swallowed rather than propagated: the removal from
+        // memory already happened either way, and there's no `InvokeReply`
+        // to report it through at this call site (both callers are
+        // fire-and-forget housekeeping, not itself the response to a
+        // command).
+        let _ = self.store.remove(fabric_index);
+        removed
+    }
+
+    /// spec §11.10.7.2: if the fail-safe's deadline has passed, rolls back
+    /// whatever `AddNOC` installed during that window without a following
+    /// `CommissioningComplete`. See `CommissioningServer::expire_fail_safe`
+    /// (the public entry point this backs) for the full contract.
+    fn expire_fail_safe(&mut self) -> Option<FabricEntry> {
+        if !self.fail_safe.is_expired() {
+            return None;
+        }
+        self.fail_safe.disarm();
+        self.pending = PendingCommissioning::default();
+        self.rollback_uncommitted_fabric()
     }
 
     /// AttestationRequest（spec §11.17.6.7）: signs `AttestationElements`
@@ -641,6 +774,10 @@ impl Inner {
         // Prerequisite steps are one-shot: a second AddNOC on this session
         // must re-CSR / re-AddTrustedRoot, not silently reuse stale material.
         self.pending = PendingCommissioning::default();
+        // Installed, but not yet confirmed — `handle_commissioning_complete`
+        // clears this marker on success; a fail-safe expiry or a fresh/early
+        // `ArmFailSafe` before that rolls the fabric back (spec §11.10.7.2).
+        self.uncommitted_fabric_index = Some(fabric_index);
 
         InvokeReply::Data {
             response_command: RESP_NOC,
@@ -1240,6 +1377,87 @@ mod tests {
             &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
         );
         assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILSAFE_REQUIRED));
+    }
+
+    #[test]
+    fn fail_safe_deadline_reflects_armed_state() {
+        let mut server = test_server();
+        assert!(server.fail_safe_deadline().is_none());
+
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+        assert!(server.fail_safe_deadline().is_some());
+
+        // ExpiryLengthSeconds=0 disarms early (spec §11.10.7.2.1).
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(0, 2),
+        );
+        assert!(server.fail_safe_deadline().is_none());
+    }
+
+    #[test]
+    fn fail_safe_expiry_rolls_back_uncommitted_fabric() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        assert_eq!(server.fabrics().len(), 1);
+
+        server.force_expire_fail_safe();
+
+        let removed = server.expire_fail_safe();
+        assert_eq!(removed.map(|e| e.fabric_index), Some(1));
+        assert!(server.fabrics().is_empty());
+        assert!(server.fail_safe_deadline().is_none());
+
+        // Idempotent: the marker and the timer are both already cleared.
+        assert!(server.expire_fail_safe().is_none());
+    }
+
+    #[test]
+    fn commissioning_complete_commits_the_fabric() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_COMMISSIONING_COMPLETE,
+            &[],
+        );
+
+        // CommissioningComplete already disarmed, so there's no deadline to
+        // expire — but even if there were, the fabric is confirmed, not
+        // rolled back.
+        assert!(server.expire_fail_safe().is_none());
+        assert_eq!(server.fabrics().len(), 1);
+    }
+
+    #[test]
+    fn rearm_rolls_back_previous_attempts_uncommitted_fabric() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        assert_eq!(server.fabrics().len(), 1);
+
+        // Re-arm without a CommissioningComplete in between: the previous
+        // attempt's AddNOC must be rolled back, not left as a zombie fabric.
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 2),
+        );
+        assert!(server.fabrics().is_empty());
+
+        // The freed index (1) must be reusable, not skipped.
+        let (_, resp) = expect_data(install_fabric(&mut server, 0x3344, 0x6002));
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(fabric_index, Some(1));
     }
 
     #[test]
