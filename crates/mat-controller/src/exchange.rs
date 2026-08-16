@@ -1326,7 +1326,6 @@ mod tests {
         let peer_sock = bind_local().await;
         let peer_addr = peer_sock.local_addr().unwrap();
         let transport = bind_local_transport().await;
-        let local = transport.local_addr().unwrap();
         let exchange_id = 0x4243;
 
         let mut first = adopted_first(exchange_id, 200, true);
@@ -1365,7 +1364,6 @@ mod tests {
         assert_eq!(p.opcode, OPCODE_MRP_STANDALONE_ACK);
         assert_eq!(h.destination, Destination::Node(EPHEMERAL));
         assert_eq!(h.source_node_id, None);
-        let _ = local;
     }
 
     #[tokio::test]

@@ -73,6 +73,11 @@ tasks:
     cmds:
       - bash scripts/e2e-device-m1.sh
 
+  e2e:device:m2-chip:
+    desc: "M2 ゲート1 相互運用 E2E: 本家 chip-tool が matv を commission → onoff 操作 → matv 再起動後に再接続（要: Docker、実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
+    cmds:
+      - bash scripts/e2e-device-m2-chip.sh
+
   chip-tool:
     desc: "chip-tool (Docker, host network)。例: task chip-tool -- pairing --help"
     cmds:
