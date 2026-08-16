@@ -90,6 +90,29 @@ pub fn context_primitive(n: u8, content: &[u8]) -> Vec<u8> {
     tlv(0x80 | n, content)
 }
 
+/// 符号無し big-endian バイト列を最小長 DER INTEGER にする（先頭ゼロを削り、
+/// 最上位ビットが立っていれば 0x00 を付け直す）。
+pub fn uint_integer(bytes: &[u8]) -> Vec<u8> {
+    let mut b = bytes;
+    while b.len() > 1 && b[0] == 0 {
+        b = &b[1..];
+    }
+    if b.first().is_some_and(|f| f & 0x80 != 0) {
+        let mut v = Vec::with_capacity(b.len() + 1);
+        v.push(0);
+        v.extend_from_slice(b);
+        integer(&v)
+    } else {
+        integer(b)
+    }
+}
+
+/// raw `r ‖ s`（64B）の ECDSA-P256 署名を DER `SEQUENCE { INTEGER r,
+/// INTEGER s }` にする（X.509 証明書・CMS SignerInfo の署名フィールド用）。
+pub fn ecdsa_signature(sig: &[u8; 64]) -> Vec<u8> {
+    seq(&[&uint_integer(&sig[..32]), &uint_integer(&sig[32..])])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1500,7 +1500,7 @@ mod tests {
     fn dev_generated_chain_passes_verify_device_attestation() {
         use crate::x509::generate_dev_attestation;
 
-        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let da = generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let nonce = [7u8; 32];
         let challenge = [8u8; 16];
         let el = encode_attestation_elements(b"dummy-cd", &nonce, 12345);

@@ -122,8 +122,18 @@ impl Device {
     pub fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
         std::fs::create_dir_all(&config.store_dir).map_err(DeviceError::Io)?;
 
-        let dev = x509::generate_dev_attestation(config.vendor_id, config.product_id)
-            .map_err(DeviceError::Attestation)?;
+        // CD（Certification Declaration）に載せる device type は、この
+        // デバイスがアプリ endpoint 1 に載せている型と一致させる（コミッ
+        // ショナは CD の vendor_id/product_id を Basic Information と突き
+        // 合わせる。device_type は突き合わせ対象ではないが、揃えない理由も
+        // ない）。`Node::with_root_endpoint` +
+        // `add_on_off_endpoint` が作る構成に対応する値。
+        let dev = x509::generate_dev_attestation(
+            config.vendor_id,
+            config.product_id,
+            mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
+        )
+        .map_err(DeviceError::Attestation)?;
         let paa_dir = config.store_dir.join("paa");
         std::fs::create_dir_all(&paa_dir).map_err(DeviceError::Io)?;
         std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;

@@ -494,6 +494,11 @@ pub struct DevAttestation {
     pub dac_der: Vec<u8>,
     /// `dac_der` に対応する P-256 秘密鍵（raw 32B）。
     pub dac_private_key: [u8; 32],
+    /// Certification Declaration（CMS 署名済み、spec §6.3）。
+    /// AttestationResponse の `AttestationElements` にそのまま同梱する。
+    /// 公開されている Matter テスト CD 署名鍵で署名した開発用の CD で、
+    /// CSA 認証済みの CD ではない — `crate::cd` のモジュール doc 参照。
+    pub certification_declaration: Vec<u8>,
 }
 
 /// 開発/テスト用の PAA→PAI→DAC 証明書チェーンをその場生成する
@@ -504,7 +509,11 @@ pub struct DevAttestation {
 /// は M2 以降もスコープ外 — ここで作るのはローカルプロセス内の使い捨て鍵
 /// だけで署名された、`attestation::verify_device_attestation`（cA・keyUsage・
 /// VID/PID・AKID/SKID 制約）を通すためだけのチェーン。
-pub fn generate_dev_attestation(vid: u16, pid: u16) -> Result<DevAttestation, X509Error> {
+pub fn generate_dev_attestation(
+    vid: u16,
+    pid: u16,
+    device_type: u32,
+) -> Result<DevAttestation, X509Error> {
     let paa_key = crate::case::random_p256_secret();
     let pai_key = crate::case::random_p256_secret();
     let dac_key = crate::case::random_p256_secret();
@@ -548,12 +557,22 @@ pub fn generate_dev_attestation(vid: u16, pid: u16) -> Result<DevAttestation, X5
     );
 
     let dac_private_key: [u8; 32] = dac_key.to_bytes().into();
+    // CD の署名は自前の DAC 鍵ではなく公開テスト鍵で行う（`crate::cd` の
+    // モジュール doc 参照）。失敗しうるのは鍵定数が壊れた場合だけなので、
+    // X509Error に混ぜず `Rng` 系と同じ「起こらない」扱いにする。
+    let certification_declaration = crate::cd::generate_dev_certification_declaration(
+        vid,
+        pid,
+        device_type,
+    )
+    .map_err(|_| X509Error::Der("well-known test CD signing key is not a valid p256 key (bug)"))?;
 
     Ok(DevAttestation {
         paa_der,
         pai_der,
         dac_der,
         dac_private_key,
+        certification_declaration,
     })
 }
 
@@ -803,26 +822,10 @@ pub(crate) mod test_support {
     }
 
     /// raw r||s（64B）を DER `SEQ { INTEGER r, INTEGER s }` に変換する
-    /// （make_test_cert/make_test_csr が署名を埋め込む際に使う）。
+    /// （make_test_cert/make_test_csr が署名を埋め込む際に使う）。CMS の
+    /// SignerInfo も同じ変換を使うため実体は `asn1` にある。
     fn raw_sig_to_der(sig: &[u8; 64]) -> Vec<u8> {
-        asn1::seq(&[&der_uint(&sig[..32]), &der_uint(&sig[32..])])
-    }
-
-    /// 符号無し big-endian バイト列 -> 最小長 DER INTEGER 中身
-    /// （先頭ゼロを削り、最上位ビットが立っていれば 0x00 を再度付与）。
-    fn der_uint(bytes: &[u8]) -> Vec<u8> {
-        let mut b = bytes;
-        while b.len() > 1 && b[0] == 0 {
-            b = &b[1..];
-        }
-        if b[0] & 0x80 != 0 {
-            let mut v = Vec::with_capacity(b.len() + 1);
-            v.push(0);
-            v.extend_from_slice(b);
-            asn1::integer(&v)
-        } else {
-            asn1::integer(b)
-        }
+        asn1::ecdsa_signature(sig)
     }
 }
 
@@ -931,7 +934,7 @@ mod tests {
 
     #[test]
     fn dev_attestation_chain_verifies() {
-        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let da = generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let dac = parse_x509(&da.dac_der).unwrap();
         let pai = parse_x509(&da.pai_der).unwrap();
         let paa = parse_x509(&da.paa_der).unwrap();
@@ -996,7 +999,7 @@ mod tests {
             None
         }
 
-        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let da = generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         // PAA: SEQUENCE { BOOLEAN TRUE }
         assert_eq!(
             basic_constraints_value(&da.paa_der).as_deref(),

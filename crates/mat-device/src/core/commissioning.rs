@@ -96,14 +96,6 @@ const ATTR_OC_COMMISSIONED_FABRICS: u32 = 3;
 const ATTR_OC_TRUSTED_ROOT_CERTIFICATES: u32 = 4;
 const ATTR_OC_CURRENT_FABRIC_INDEX: u32 = 5;
 
-/// Placeholder Certification Declaration bytes signed into
-/// `AttestationResponse`'s `AttestationElements`. `mat-device` has no real
-/// CD (no CSA-issued declaration to embed) — `attestation::verify_cd_warn`
-/// on the commissioner side only ever warns on a CD it can't validate,
-/// never hard-fails, so a placeholder is sufficient to complete the
-/// attestation exchange (mirrors `DevAttestation`'s own "dev-only, not a
-/// real identity" scope).
-const DUMMY_CERTIFICATION_DECLARATION: &[u8] = b"mat-dev-cd";
 
 /// `BasicCommissioningInfo` (spec §11.10.5.2) fields: the single-attempt
 /// fail-safe expiry and the cumulative budget across an entire commissioning
@@ -622,7 +614,17 @@ impl Inner {
         let Ok(nonce) = decode_attestation_request(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
-        let elements = encode_attestation_elements(DUMMY_CERTIFICATION_DECLARATION, &nonce, 0);
+        // Real CMS-signed Certification Declaration (`mat_controller::cd`),
+        // not a placeholder: chip-derived commissioners (chip-tool, Alexa,
+        // Google) extract the CMS signer key id, look the verifying key up
+        // in their own CD trust store, check the signature, and match the
+        // CD's vendor_id/product_id against Basic Information — a device
+        // whose CD they can't parse fails commissioning outright
+        // (`kCertificationDeclarationNoKeyId`). `mat`'s own commissioner is
+        // the lenient one (`attestation::verify_cd_warn` only warns), which
+        // is why M1 got away with a placeholder here.
+        let elements =
+            encode_attestation_elements(&self.dev.certification_declaration, &nonce, 0);
         let tbs = attestation_tbs(&elements, &ctx.attestation_challenge);
         let signature = sign_ecdsa_p256(&self.dev.dac_private_key, &tbs)
             .expect("dac private key from generate_dev_attestation is always a valid p256 key");
@@ -858,7 +860,7 @@ mod tests {
     /// persistence is `net`-only and tested in `net::store` instead (this
     /// module must stay `cargo check --no-default-features`-clean).
     fn test_server() -> CommissioningServer {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         CommissioningServer::new(dev, FabricStore::new())
     }
 
@@ -1131,7 +1133,7 @@ mod tests {
 
     #[test]
     fn attestation_response_passes_verify_device_attestation() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let (dac_der, pai_der, paa_der) = (
             dev.dac_der.clone(),
             dev.pai_der.clone(),
@@ -1170,7 +1172,7 @@ mod tests {
 
     #[test]
     fn cert_chain_request_returns_dac_and_pai_der() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let (dac_der, pai_der) = (dev.dac_der.clone(), dev.pai_der.clone());
         let mut server = CommissioningServer::new(dev, FabricStore::new());
 
@@ -1478,7 +1480,7 @@ mod tests {
     /// just the direct `invoke_command` shortcut the tests above use).
     #[test]
     fn wired_into_node_dispatches_both_clusters() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let server = CommissioningServer::new(dev, FabricStore::new());
         let (gc, oc) = server.into_cluster_handlers();
         let mut node = crate::core::datamodel::Node::new();
