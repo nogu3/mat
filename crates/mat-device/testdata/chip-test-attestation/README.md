@@ -72,23 +72,46 @@ default via `gTestCdPubkeyKid`/`gTestCdPubkeyBytes`). Generation command
 use):
 
 ```rust
-mat_controller::cd::generate_dev_certification_declaration(
-    0xFFF1, 0x8000, mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT, // 0x0100
-)
+mat_controller::cd::generate_dev_certification_declaration(0xFFF1, 0x8000)
 ```
-
-sha256 of the result: `89854838450139e50cc1bb72d61b0eb14354b551236ee8680ec9cf8fcd0320e7`.
 
 This makes the CD *cryptographically* canonical (signed by the same
 well-known test authority key any chip-based verifier already trusts,
-with the correct VID/PID/device_type), but it is **not byte-identical to
-anything upstream ships** — that's the one place this "chip-test" mode
+with the correct VID/PID), but it is **not byte-identical to anything
+upstream ships as a file** — that's the one place this "chip-test" mode
 still generates rather than replays a vendored blob, because there is
-nothing to replay. If Echo's validation is sensitive to this CD's exact
-bytes (as opposed to just "signed by the known test authority, VID/PID
-match"), this is a residual difference from a real Home Assistant/matter.js
-pairing and worth re-checking first if the chip-test experiment still
-fails against Echo.
+nothing to replay.
+
+**v1 → v2 (2026-08-16, Task 10 addendum)**: attempt 4 (this vendored
+PAA/PAI/DAC chain, CD generated with the fields below unchanged from
+`self` mode's original defaults) still failed against Echo with the same
+"AttestationResponse received, 80s silence, then gives up" pattern.
+Diffing `encode_certification_elements`'s output against `matter.js`'s
+own CD generator (`packages/protocol/src/certificate/kinds/
+CertificationDeclaration.ts`, `CertificationDeclaration.generate()`,
+commit `793e431d932552f63273ed1a0684fdc065ba066d` — matter.js has real
+Alexa pairing track record via Home Assistant's Matter Hub) found the
+CD content itself differed in exactly two fields the residual-risk note
+below had flagged as worth checking:
+
+| field | v1 (before) | v2 (now) | matter.js |
+| --- | --- | --- | --- |
+| `certificate_id` | `MATDEV0000000000-00` (invented) | `CSA00000SWC00000-00` | `CSA00000SWC00000-00` |
+| `device_type_id` | `0x0100` (256, the actual OnOff Light device type) | `22` (fixed) | `22` (fixed, regardless of VID/PID) |
+
+`cd.rs`'s `CERTIFICATE_ID`/`DEVICE_TYPE_ID_IN_CD` constants were updated
+to the matter.js values (see that file for the full reasoning — CD's
+`device_type_id` is not part of any commissioner cross-check, so there
+was no correctness reason for it to track the app endpoint's actual
+device type). **This CD blob was regenerated** with the same command
+above against the fixed `cd.rs` — old sha256
+`89854838450139e50cc1bb72d61b0eb14354b551236ee8680ec9cf8fcd0320e7`,
+new (current) sha256
+`ca32d7eae1d29c3076f2d4a7721575bfd554581a006a0aac10d47a86586e02a7`.
+Everything else in the CD (`format_version=1`, `vendor_id`,
+`product_id_array`, `security_level=0`, `security_information=0`,
+`version_number=1`, `certification_type=0`/Test) already matched
+matter.js and chip.
 
 ## Source: DAC private key (embedded as a Rust const)
 
