@@ -58,8 +58,14 @@ impl ClusterHandler for OnOffHandler {
             im::CMD_ON_OFF_TOGGLE => !self.state.load(Ordering::SeqCst),
             _ => return InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
         };
-        self.state.store(new, Ordering::SeqCst);
-        let _ = ctx; // Task 12 でここに変更通知が入る
+        // `swap` (not `store`) so "did the value actually change" is decided
+        // atomically with the write — On on an already-on light must not be
+        // reported as a change (spec §8.10 reporting is value-change driven;
+        // otherwise every redundant command wakes every subscriber).
+        let previous = self.state.swap(new, Ordering::SeqCst);
+        if previous != new {
+            ctx.changed.push(im::ATTR_ON_OFF);
+        }
         InvokeReply::Status(im::STATUS_SUCCESS)
     }
 }
@@ -88,6 +94,31 @@ mod tests {
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::Bool(false)
         );
+    }
+
+    /// Task 12: the handler is what tells `Node` (and through it the
+    /// subscription machinery) that OnOff's value moved — and only when it
+    /// really moved.
+    #[test]
+    fn invoke_reports_changed_only_on_an_actual_flip() {
+        let (mut h, _state) = OnOffHandler::new();
+        let mut ctx = InvokeCtx::default();
+        h.invoke(im::CMD_ON_OFF_ON, &[], &mut ctx);
+        assert_eq!(ctx.changed, vec![im::ATTR_ON_OFF]);
+
+        // On again on an already-on light: no change to report.
+        ctx.changed.clear();
+        h.invoke(im::CMD_ON_OFF_ON, &[], &mut ctx);
+        assert!(ctx.changed.is_empty());
+
+        // Toggle always flips, so it always changes.
+        h.invoke(im::CMD_ON_OFF_TOGGLE, &[], &mut ctx);
+        assert_eq!(ctx.changed, vec![im::ATTR_ON_OFF]);
+
+        // A command the cluster doesn't implement touches nothing.
+        ctx.changed.clear();
+        h.invoke(0x7F, &[], &mut ctx);
+        assert!(ctx.changed.is_empty());
     }
 
     #[test]

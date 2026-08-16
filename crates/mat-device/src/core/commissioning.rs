@@ -859,6 +859,7 @@ mod tests {
     fn test_ctx() -> InvokeCtx {
         InvokeCtx {
             attestation_challenge: TEST_CHALLENGE,
+            ..InvokeCtx::default()
         }
     }
 
@@ -1500,7 +1501,7 @@ mod tests {
             CMD_ARM_FAIL_SAFE,
             Some(&encode_arm_fail_safe(120, 1)),
         );
-        let (opcode, payload) = node
+        let outcome = node
             .handle_im(
                 im::OPCODE_INVOKE_REQUEST,
                 &req,
@@ -1508,6 +1509,7 @@ mod tests {
                 &crate::core::datamodel::ReadCtx::default(),
             )
             .unwrap();
+        let (opcode, payload) = (outcome.opcode, outcome.payload);
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = im::decode_invoke_response_data(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_SUCCESS);
@@ -1521,7 +1523,7 @@ mod tests {
             CMD_CERT_CHAIN_REQUEST,
             Some(&encode_cert_chain_request(CERT_TYPE_DAC)),
         );
-        let (opcode, payload) = node
+        let outcome = node
             .handle_im(
                 im::OPCODE_INVOKE_REQUEST,
                 &req,
@@ -1529,6 +1531,7 @@ mod tests {
                 &crate::core::datamodel::ReadCtx::default(),
             )
             .unwrap();
+        let (opcode, payload) = (outcome.opcode, outcome.payload);
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = im::decode_invoke_response_data(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_SUCCESS);

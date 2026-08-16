@@ -12,14 +12,19 @@
 //! gets `StatusResponse(STATUS_INVALID_ACTION)` (spec §8.10.1) rather than
 //! being silently dropped or failing the whole exchange.
 
+use std::collections::HashMap;
+
 use mat_controller::im::{self, AttrPathIn, AttrReportOut, ImError, ReportEntryOut};
 use mat_controller::tlv::{Tag, Writer};
 
-/// Placeholder DataVersion for every attribute report — `mat-device` does
-/// not yet track per-cluster data versions (bumped on write). A future task
-/// wires real versioning once writes exist; until then every read reports
-/// version 1.
-const UNVERSIONED: u32 = 1;
+/// The DataVersion (spec §7.10.3) every `(endpoint, cluster)` starts at,
+/// and what `Node::data_version` reports for a cluster whose values have
+/// never changed. `Node::handle_invoke` bumps it for every `(endpoint,
+/// cluster)` a command actually changed a value on (see `InvokeCtx::
+/// changed`) — a subscribing controller (chip included) keys its own dirty
+/// tracking off this field, so a permanently static version would tell it
+/// nothing on this node ever changes.
+const INITIAL_DATA_VERSION: u32 = 1;
 
 /// Data model schema revision `mat-device` claims to implement (spec
 /// §7.13, DataModelRevision). Not spec-load-bearing for M1 — just needs to
@@ -38,9 +43,48 @@ const DATA_MODEL_REVISION: u64 = 17;
 /// which is never a real session's challenge (derived by HKDF) but is fine
 /// for the existing `datamodel` tests, which never invoke commissioning
 /// commands.
+/// `changed` (Task 12): every attribute id *within the invoked cluster*
+/// whose value actually changed as a result of this command — pushed by the
+/// `ClusterHandler::invoke` implementation itself (e.g. `OnOffHandler`
+/// pushes `im::ATTR_ON_OFF` when On/Off/Toggle flips the state, and pushes
+/// nothing for an On command on an already-on light). `Node::handle_invoke`
+/// is the one place that knows the `(endpoint, cluster)` these ids belong
+/// to, so it pairs them up into full paths on the way out (`ImOutcome::
+/// changed`) and bumps the cluster's DataVersion. The device runtime
+/// (`net::runtime`) matches those paths against the active subscription to
+/// decide what to report.
 #[derive(Debug, Clone, Default)]
 pub struct InvokeCtx {
     pub attestation_challenge: [u8; 16],
+    pub changed: Vec<u32>,
+}
+
+/// What `Node::handle_im` produced for one incoming IM message: the reply
+/// to send back (`opcode`/`payload`, already IM-wire-encoded via
+/// `mat_controller::im`) plus the full `(endpoint, cluster, attribute)`
+/// paths whose values changed while serving it (`changed` — always empty
+/// except for an `InvokeRequest` that actually mutated state). Replaces the
+/// bare `(u8, Vec<u8>)` tuple this used to return: subscriptions need the
+/// change set, and threading it back through a side channel (a `take_
+/// changed` accessor on `Node`) would make "did *this* request change
+/// anything" order-dependent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImOutcome {
+    pub opcode: u8,
+    pub payload: Vec<u8>,
+    pub changed: Vec<(u16, u32, u32)>,
+}
+
+impl ImOutcome {
+    /// The common case: a reply that changed nothing (every read, every
+    /// rejected/unsupported request).
+    fn unchanged(opcode: u8, payload: Vec<u8>) -> Self {
+        Self {
+            opcode,
+            payload,
+            changed: Vec::new(),
+        }
+    }
 }
 
 /// Per-read scratch context threaded through `ClusterHandler::read` and
@@ -141,6 +185,13 @@ impl From<ImError> for ImServerError {
 /// requests (`handle_im`) to the matching `ClusterHandler`.
 pub struct Node {
     endpoints: Vec<(u16, Vec<Box<dyn ClusterHandler>>)>,
+    /// Per-`(endpoint, cluster)` DataVersion (spec §7.10.3). Absent = never
+    /// changed = `INITIAL_DATA_VERSION`; `handle_invoke` inserts/bumps an
+    /// entry the first time a command changes one of the cluster's values.
+    /// A map (rather than a counter per `ClusterHandler`) keeps versioning
+    /// entirely `Node`'s business — `ClusterHandler` implementations only
+    /// ever say *what* changed (`InvokeCtx::changed`).
+    versions: HashMap<(u16, u32), u32>,
 }
 
 /// Bundles the (endpoint id, its clusters, the reading session's fabric
@@ -161,6 +212,7 @@ impl Node {
     pub fn new() -> Self {
         Self {
             endpoints: Vec::new(),
+            versions: HashMap::new(),
         }
     }
 
@@ -212,18 +264,27 @@ impl Node {
         }
     }
 
-    /// Dispatches one incoming IM message. Returns the response opcode and
-    /// payload to send back (already IM-wire-encoded via `mat_controller::im`).
-    /// `read_ctx` carries the requesting session's fabric index (see
-    /// `ReadCtx`'s doc) — irrelevant to `InvokeRequest`, but threaded
-    /// through every `ReadRequest`.
+    /// The current DataVersion (spec §7.10.3) of one `(endpoint, cluster)`
+    /// — `INITIAL_DATA_VERSION` until a command changes one of its values.
+    pub fn data_version(&self, endpoint: u16, cluster: u32) -> u32 {
+        self.versions
+            .get(&(endpoint, cluster))
+            .copied()
+            .unwrap_or(INITIAL_DATA_VERSION)
+    }
+
+    /// Dispatches one incoming IM message. Returns the reply to send back
+    /// plus whatever changed while serving it (`ImOutcome`). `read_ctx`
+    /// carries the requesting session's fabric index (see `ReadCtx`'s doc)
+    /// — irrelevant to `InvokeRequest`, but threaded through every
+    /// `ReadRequest`.
     pub fn handle_im(
         &mut self,
         opcode: u8,
         payload: &[u8],
         ctx: &mut InvokeCtx,
         read_ctx: &ReadCtx,
-    ) -> Result<(u8, Vec<u8>), ImServerError> {
+    ) -> Result<ImOutcome, ImServerError> {
         match opcode {
             im::OPCODE_READ_REQUEST => self.handle_read(payload, read_ctx),
             im::OPCODE_INVOKE_REQUEST => self.handle_invoke(payload, ctx),
@@ -248,18 +309,14 @@ impl Node {
             // (spec §8.10.1). `ImServerError::UnsupportedOpcode` is no
             // longer produced here; it stays reserved for a payload that
             // can't even be decoded into a response we know how to send.
-            _other => Ok((
+            _other => Ok(ImOutcome::unchanged(
                 im::OPCODE_STATUS_RESPONSE,
                 im::encode_status_response(im::STATUS_INVALID_ACTION),
             )),
         }
     }
 
-    fn handle_read(
-        &self,
-        payload: &[u8],
-        read_ctx: &ReadCtx,
-    ) -> Result<(u8, Vec<u8>), ImServerError> {
+    fn handle_read(&self, payload: &[u8], read_ctx: &ReadCtx) -> Result<ImOutcome, ImServerError> {
         let paths = im::decode_read_request(payload)?;
         // `usize::MAX` never triggers a split, so this always yields
         // exactly one chunk — the same single-message
@@ -271,8 +328,8 @@ impl Node {
         // job (Task 6) — it bypasses `handle_im` for `OPCODE_READ_REQUEST`
         // entirely so it can drive the multi-chunk StatusResponse
         // round-trip.
-        let chunks = self.read_chunks(&paths, read_ctx, usize::MAX);
-        Ok((
+        let chunks = self.read_chunks(&paths, read_ctx, usize::MAX, None);
+        Ok(ImOutcome::unchanged(
             im::OPCODE_REPORT_DATA,
             chunks
                 .into_iter()
@@ -298,9 +355,20 @@ impl Node {
     /// (spec §8.9.2.3's chunk handshake; `net::runtime::
     /// serve_read_request_chunked` drives it, mirroring `SecureSession::
     /// subscribe_wildcard`'s priming-report loop on the initiator side).
-    /// The last chunk is `more_chunks=false, suppress_response=true` —
-    /// identical to what a single-chunk read has always encoded, so a read
-    /// that fits in one chunk is unchanged (no regression).
+    ///
+    /// `subscription_id` says which of the two callers this is, and changes
+    /// the *last* chunk's shape accordingly:
+    /// - `None` (a plain `ReadRequest`): the last chunk is `more_chunks=
+    ///   false, suppress_response=true` — identical to what a single-chunk
+    ///   read has always encoded, so a read that fits in one chunk is
+    ///   unchanged (no regression). The read interaction ends there.
+    /// - `Some(id)` (a subscription's priming report, Task 12): every chunk
+    ///   including the last carries the SubscriptionId and
+    ///   `suppress_response=false`, because the priming report is *not* the
+    ///   end of the interaction — a `SubscribeResponse` follows on the same
+    ///   exchange (spec §8.10), and the initiator answers every priming
+    ///   chunk with `StatusResponse(0)` first (`SecureSession::
+    ///   subscribe_wildcard`'s loop does exactly that).
     ///
     /// Always returns at least one chunk, even for zero entries (an empty
     /// `ReportData`, matching the pre-Task-6 always-one-chunk behavior for
@@ -310,6 +378,7 @@ impl Node {
         paths: &[AttrPathIn],
         read_ctx: &ReadCtx,
         budget: usize,
+        subscription_id: Option<u32>,
     ) -> Vec<Vec<u8>> {
         let entries = self.read_entries(paths, read_ctx);
         let mut batches: Vec<Vec<ReportEntryOut>> = Vec::new();
@@ -327,7 +396,8 @@ impl Node {
             // smaller (`more_chunks=false`) than what it was probed at —
             // strictly safe, since a batch that already fit the larger
             // probed shape still fits the smaller final one.
-            let candidate_len = im::encode_report_data_entries(&candidate, false, None, true).len();
+            let candidate_len =
+                im::encode_report_data_entries(&candidate, false, subscription_id, true).len();
             if candidate_len > budget && !current.is_empty() {
                 batches.push(std::mem::take(&mut current));
                 current.push(entry);
@@ -343,7 +413,12 @@ impl Node {
             .enumerate()
             .map(|(i, batch)| {
                 let is_last = i == last;
-                im::encode_report_data_entries(&batch, is_last, None, !is_last)
+                // Priming (`subscription_id.is_some()`): never suppress —
+                // the SubscribeResponse still has to follow on this
+                // exchange, so the initiator must answer even the last
+                // chunk with `StatusResponse(0)`.
+                let suppress = is_last && subscription_id.is_none();
+                im::encode_report_data_entries(&batch, suppress, subscription_id, !is_last)
             })
             .collect()
     }
@@ -468,7 +543,7 @@ impl Node {
                     endpoint: ectx.endpoint,
                     cluster,
                     attribute,
-                    data_version: UNVERSIONED,
+                    data_version: self.data_version(ectx.endpoint, cluster),
                     value_tlv,
                 })),
                 None if concrete_so_far => out.push(ReportEntryOut::Status {
@@ -494,7 +569,7 @@ impl Node {
                             endpoint: ectx.endpoint,
                             cluster,
                             attribute,
-                            data_version: UNVERSIONED,
+                            data_version: self.data_version(ectx.endpoint, cluster),
                             value_tlv,
                         }));
                     }
@@ -556,14 +631,14 @@ impl Node {
         &mut self,
         payload: &[u8],
         ctx: &mut InvokeCtx,
-    ) -> Result<(u8, Vec<u8>), ImServerError> {
+    ) -> Result<ImOutcome, ImServerError> {
         let req = im::decode_invoke_request(payload)?;
         let Some((_, clusters)) = self
             .endpoints
             .iter_mut()
             .find(|(id, _)| *id == req.endpoint)
         else {
-            return Ok((
+            return Ok(ImOutcome::unchanged(
                 im::OPCODE_INVOKE_RESPONSE,
                 im::encode_invoke_response_status(
                     req.endpoint,
@@ -575,7 +650,7 @@ impl Node {
             ));
         };
         let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == req.cluster) else {
-            return Ok((
+            return Ok(ImOutcome::unchanged(
                 im::OPCODE_INVOKE_RESPONSE,
                 im::encode_invoke_response_status(
                     req.endpoint,
@@ -586,7 +661,27 @@ impl Node {
                 ),
             ));
         };
+        // Each `invoke` gets a fresh change list: `ctx` is per-session
+        // scratch (`attestation_challenge` outlives one command), so a
+        // leftover `changed` from an earlier command in the same session
+        // must not be re-reported as this one's.
+        ctx.changed.clear();
         let reply = handler.invoke(req.command, &req.fields_tlv, ctx);
+        // The handler reports bare attribute ids (it only knows its own
+        // cluster); pair them with the endpoint/cluster it was dispatched
+        // to, and bump this cluster's DataVersion once if anything changed.
+        let changed: Vec<(u16, u32, u32)> = ctx
+            .changed
+            .drain(..)
+            .map(|attribute| (req.endpoint, req.cluster, attribute))
+            .collect();
+        if !changed.is_empty() {
+            let version = self
+                .versions
+                .entry((req.endpoint, req.cluster))
+                .or_insert(INITIAL_DATA_VERSION);
+            *version = version.wrapping_add(1);
+        }
         let resp_payload = match reply {
             InvokeReply::Status(status) => im::encode_invoke_response_status(
                 req.endpoint,
@@ -605,7 +700,11 @@ impl Node {
                 &fields_tlv,
             ),
         };
-        Ok((im::OPCODE_INVOKE_RESPONSE, resp_payload))
+        Ok(ImOutcome {
+            opcode: im::OPCODE_INVOKE_RESPONSE,
+            payload: resp_payload,
+            changed,
+        })
     }
 }
 
@@ -811,6 +910,24 @@ mod tests {
     use super::*;
     use mat_controller::im::{decode_invoke_response, decode_report_data_message};
 
+    /// `handle_im` with the default contexts, unwrapped down to the
+    /// `(opcode, payload)` pair almost every test here asserts on — these
+    /// tests predate `ImOutcome`'s `changed` field (Task 12) and none of
+    /// them are about it, so they keep reading as the two-value assertions
+    /// they always were. The change-set-aware tests below call `handle_im`
+    /// directly instead.
+    fn handle_im_ok(node: &mut Node, opcode: u8, payload: &[u8]) -> (u8, Vec<u8>) {
+        let out = node
+            .handle_im(
+                opcode,
+                payload,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        (out.opcode, out.payload)
+    }
+
     #[test]
     fn read_basic_information_data_model_revision() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
@@ -819,14 +936,7 @@ mod tests {
             im::CLUSTER_BASIC_INFORMATION,
             im::ATTR_DATA_MODEL_REVISION,
         );
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -843,14 +953,7 @@ mod tests {
     fn read_descriptor_device_type_list_is_root_node() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_DEVICE_TYPE_LIST);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -868,14 +971,7 @@ mod tests {
     fn read_unknown_attribute_yields_per_path_status_ib() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, 0xFFFF);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -890,14 +986,7 @@ mod tests {
     fn invoke_unknown_cluster_returns_unsupported_cluster() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_invoke_request(0, 0x9999, 0, None);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_INVOKE_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_INVOKE_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = decode_invoke_response(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_UNSUPPORTED_CLUSTER);
@@ -907,14 +996,7 @@ mod tests {
     fn invoke_known_cluster_unknown_command_returns_unsupported_command() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
         let req = im::encode_invoke_request(0, im::CLUSTER_BASIC_INFORMATION, 0x7F, None);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_INVOKE_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_INVOKE_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = decode_invoke_response(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_UNSUPPORTED_COMMAND);
@@ -928,14 +1010,7 @@ mod tests {
     #[test]
     fn unsupported_opcode_returns_invalid_action_status() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_WRITE_REQUEST,
-                &[],
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &[]);
         assert_eq!(opcode, im::OPCODE_STATUS_RESPONSE);
         let status = im::decode_status_response(&payload).unwrap();
         assert_eq!(status, im::STATUS_INVALID_ACTION);
@@ -945,26 +1020,12 @@ mod tests {
     fn read_basic_information_vendor_and_product_id() {
         let mut node = Node::with_root_endpoint(0x1234, 0x5678);
         let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_VENDOR_ID);
-        let (_, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports[0].data, Some(serde_json::json!(0x1234)));
 
         let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_PRODUCT_ID);
-        let (_, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports[0].data, Some(serde_json::json!(0x5678)));
     }
@@ -1006,14 +1067,7 @@ mod tests {
         node.add_cluster(0, Box::new(DummyHandler(CLUSTER_OPERATIONAL_CREDENTIALS)));
 
         let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_SERVER_LIST);
-        let (opcode, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         assert_eq!(opcode, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -1049,14 +1103,7 @@ mod tests {
             ],
         );
         let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST);
-        let (_, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(msg.reports[0].data, Some(serde_json::json!([1])));
     }
@@ -1073,14 +1120,7 @@ mod tests {
             ],
         );
         let req = im::encode_read_request(1, im::CLUSTER_DESCRIPTOR, im::ATTR_DEVICE_TYPE_LIST);
-        let (_, payload) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &req,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
         let msg = decode_report_data_message(&payload).unwrap();
         assert_eq!(
             msg.reports[0].data,
@@ -1150,14 +1190,7 @@ mod tests {
             Some(im::CLUSTER_DESCRIPTOR),
             Some(im::ATTR_DEVICE_TYPE_LIST),
         );
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 2); // endpoint 0 と 1
@@ -1169,14 +1202,7 @@ mod tests {
     fn full_wildcard_read_reports_every_attribute_without_error() {
         let mut node = node_with_onoff();
         let payload = encode_read_request_path(None, None, None);
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert!(msg.reports.len() >= 10); // descriptor×2 + basicinfo×5 + onoff×1 + ...
@@ -1191,14 +1217,7 @@ mod tests {
     fn full_wildcard_read_excludes_global_attributes() {
         let mut node = node_with_onoff();
         let payload = encode_read_request_path(None, None, None);
-        let (_, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         let msg = decode_report_data_message(&resp).unwrap();
         assert!(!msg
             .reports
@@ -1217,14 +1236,7 @@ mod tests {
             Some(im::CLUSTER_ON_OFF),
             Some(im::ATTR_CLUSTER_REVISION),
         );
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -1243,14 +1255,7 @@ mod tests {
             ),
             (Some(0), Some(im::CLUSTER_BASIC_INFORMATION), Some(0x7777)),
         ]);
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA); // StatusResponse ではない
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 2);
@@ -1274,14 +1279,7 @@ mod tests {
     fn concrete_unknown_endpoint_reports_status_ib() {
         let mut node = node_with_onoff();
         let payload = encode_read_request_path(Some(9), None, None);
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -1293,14 +1291,7 @@ mod tests {
     fn concrete_unknown_cluster_on_concrete_endpoint_reports_status_ib() {
         let mut node = node_with_onoff();
         let payload = encode_read_request_path(Some(0), Some(0x9999), None);
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -1317,14 +1308,7 @@ mod tests {
         let mut node = node_with_onoff();
         let payload =
             encode_read_request_path(None, Some(im::CLUSTER_ON_OFF), Some(im::ATTR_ON_OFF));
-        let (op, resp) = node
-            .handle_im(
-                im::OPCODE_READ_REQUEST,
-                &payload,
-                &mut InvokeCtx::default(),
-                &ReadCtx::default(),
-            )
-            .unwrap();
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
@@ -1392,7 +1376,7 @@ mod tests {
             cluster: None,
             attribute: None,
         }];
-        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900);
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None);
         assert!(chunks.len() >= 2);
         for (i, c) in chunks.iter().enumerate() {
             let msg = decode_report_data_message(c).unwrap();
@@ -1491,7 +1475,7 @@ mod tests {
         // `non_final_shape_len > budget` and splits it off before adding
         // any fat entry.
         let budget = final_shape_len;
-        let chunks = node.read_chunks(&paths, &read_ctx, budget);
+        let chunks = node.read_chunks(&paths, &read_ctx, budget, None);
         assert!(
             chunks.len() >= 2,
             "fat entries after the small batch must still force a split"
@@ -1521,11 +1505,145 @@ mod tests {
             cluster: None,
             attribute: None,
         }];
-        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900);
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None);
         assert_eq!(chunks.len(), 1);
         let msg = decode_report_data_message(&chunks[0]).unwrap();
         assert!(!msg.more_chunks);
         assert!(msg.suppress_response);
+    }
+
+    // ── Task 12: change reporting + DataVersion ─────────────────────────
+
+    /// An invoke that actually changes a value reports the full path
+    /// (`ImOutcome::changed`) and bumps *that* `(endpoint, cluster)`'s
+    /// DataVersion — which subsequent reads of the cluster then carry
+    /// (`AttrReportOut::data_version`), because a subscribing controller
+    /// keys its own dirty tracking off that field.
+    #[test]
+    fn invoke_on_off_reports_changed_path_and_bumps_data_version() {
+        let mut node = node_with_onoff();
+        assert_eq!(node.data_version(1, im::CLUSTER_ON_OFF), 1);
+
+        let req = im::encode_invoke_request(1, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None);
+        let outcome = node
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.opcode, im::OPCODE_INVOKE_RESPONSE);
+        assert_eq!(
+            outcome.changed,
+            vec![(1u16, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF)]
+        );
+        assert_eq!(node.data_version(1, im::CLUSTER_ON_OFF), 2);
+        // The bump is per-(endpoint, cluster): endpoint 1's Descriptor is
+        // untouched.
+        assert_eq!(node.data_version(1, im::CLUSTER_DESCRIPTOR), 1);
+
+        // ...and it shows up in what a read of the cluster reports.
+        let entries = node.read_entries(
+            &[AttrPathIn {
+                endpoint: Some(1),
+                cluster: Some(im::CLUSTER_ON_OFF),
+                attribute: Some(im::ATTR_ON_OFF),
+            }],
+            &ReadCtx::default(),
+        );
+        match &entries[0] {
+            ReportEntryOut::Data(r) => assert_eq!(r.data_version, 2),
+            other => panic!("expected an OnOff data report, got {other:?}"),
+        }
+    }
+
+    /// An invoke that leaves the value where it already was (On on an
+    /// already-on light) is *not* a change: nothing to report, no version
+    /// bump — otherwise every redundant command would wake every subscriber
+    /// (spec §8.10's reporting is value-change driven). Also pins that
+    /// `changed` doesn't accumulate across commands sharing one `InvokeCtx`
+    /// (the runtime builds one per request, but `core`'s contract shouldn't
+    /// depend on that).
+    #[test]
+    fn invoke_without_a_value_change_reports_nothing_and_keeps_the_version() {
+        let mut node = node_with_onoff();
+        let req = im::encode_invoke_request(1, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None);
+        let mut ctx = InvokeCtx::default();
+        node.handle_im(
+            im::OPCODE_INVOKE_REQUEST,
+            &req,
+            &mut ctx,
+            &ReadCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(node.data_version(1, im::CLUSTER_ON_OFF), 2);
+
+        // Second On on an already-on light.
+        let outcome = node
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut ctx,
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        assert!(outcome.changed.is_empty(), "no value changed");
+        assert_eq!(node.data_version(1, im::CLUSTER_ON_OFF), 2);
+    }
+
+    /// A read never reports changes, and neither does a rejected command.
+    #[test]
+    fn read_and_rejected_invoke_report_no_changes() {
+        let mut node = node_with_onoff();
+        let read = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_VENDOR_ID);
+        let outcome = node
+            .handle_im(
+                im::OPCODE_READ_REQUEST,
+                &read,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        assert!(outcome.changed.is_empty());
+
+        let bad = im::encode_invoke_request(1, im::CLUSTER_ON_OFF, 0x7F, None);
+        let outcome = node
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &bad,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        assert!(outcome.changed.is_empty());
+        assert_eq!(node.data_version(1, im::CLUSTER_ON_OFF), 1);
+    }
+
+    /// Priming (`subscription_id = Some`) differs from a plain read in two
+    /// ways on the wire: every chunk carries the SubscriptionId, and even
+    /// the *last* one keeps `suppress_response=false`, because a
+    /// SubscribeResponse still has to follow on the same exchange (spec
+    /// §8.10) and the initiator answers every chunk with StatusResponse(0).
+    #[test]
+    fn read_chunks_for_priming_carries_the_subscription_id_and_never_suppresses() {
+        let node = node_with_onoff_and_fat_attribute();
+        let paths = [AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        }];
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, Some(0xABCD));
+        assert!(chunks.len() >= 2, "fixture must force a split");
+        for (i, c) in chunks.iter().enumerate() {
+            let msg = decode_report_data_message(c).unwrap();
+            assert_eq!(msg.subscription_id, Some(0xABCD));
+            assert!(
+                !msg.suppress_response,
+                "priming chunk {i} must not suppress"
+            );
+            assert_eq!(msg.more_chunks, i != chunks.len() - 1);
+        }
     }
 
     /// Carried finding from Task 5's review: an inbound `StatusResponse`

@@ -6,3 +6,4 @@ pub mod mdns;
 pub mod pase;
 pub(crate) mod runtime;
 pub mod store;
+pub mod subscription;

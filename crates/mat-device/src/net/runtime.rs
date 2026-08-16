@@ -60,12 +60,13 @@ use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, MAX_DATAGRAM};
 
 use crate::core::commissioning::CommissioningServer;
-use crate::core::datamodel::{InvokeCtx, Node, ReadCtx};
+use crate::core::datamodel::{ImOutcome, InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
 use crate::core::pase::PaseVerifierConfig;
 use crate::device::{DeviceConfig, DeviceError};
 use crate::net::mdns::MdnsAdvertiser;
+use crate::net::subscription::ActiveSubscription;
 
 /// PBKDF parameters this runtime advertises — same fixture values
 /// `net::pase::run_pase_once` and `mat_controller::test_support`'s own
@@ -96,6 +97,35 @@ fn reply_cfg() -> MrpConfig {
 /// TrustedRootCertificates (certificates, ~500B class each) — well past
 /// this budget on their own, which is exactly why chunking exists.
 const REPORT_CHUNK_BUDGET: usize = 900;
+
+/// How long this device is willing to stay silent on a subscription before
+/// it must send *something* (spec §8.10: the MaxInterval the device
+/// answers with may be anywhere at or below the subscriber's requested
+/// ceiling). The requested ceiling is clamped into this range: below the
+/// floor a chatty controller would have this device sending keep-alives
+/// faster than a battery-less-but-still-sequential runtime wants to; above
+/// the ceiling a subscription would take too long to notice a dead peer.
+const MIN_MAX_INTERVAL_S: u16 = 3;
+const MAX_MAX_INTERVAL_S: u16 = 60;
+
+/// How long to wait for the peer's `StatusResponse` to a ReportData we
+/// sent, when it didn't come piggybacked on the MRP ack — a LAN round-trip
+/// to a controller/hub, same budget `serve_read_request_chunked` uses.
+const REPORT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A random non-zero `SubscriptionId` (spec §8.10.3). Not collision-checked
+/// for the same reason `random_session_id` isn't: this runtime holds at most
+/// one subscription at a time, so there is nothing to collide with.
+fn random_subscription_id() -> u32 {
+    loop {
+        let mut b = [0u8; 4];
+        getrandom::getrandom(&mut b).expect("os rng");
+        let v = u32::from_le_bytes(b);
+        if v != 0 {
+            return v;
+        }
+    }
+}
 
 /// One classified unsecured datagram's destination flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +416,11 @@ pub(crate) async fn run(
     // Credentials' `CurrentFabricIndex` reflects the reading session, not a
     // hardcoded value.
     let mut current_session: Option<(u16, SecureSession, u8)> = None;
+    // The node's single active subscription (spec §8.10, Task 12). Tied to
+    // the session that created it: a new PASE/CASE session below drops it,
+    // since its reports could only ever go out over the session it was
+    // subscribed on.
+    let mut subscription: Option<ActiveSubscription> = None;
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
@@ -470,6 +505,7 @@ pub(crate) async fn run(
                                         0,
                                     );
                                     current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
+                                    subscription = None; // belonged to the replaced session
                                 }
                                 // Established failure: best-effort responder, nothing
                                 // more to do — the initiator's own retry/StatusReport
@@ -499,6 +535,7 @@ pub(crate) async fn run(
                                     );
                                     current_session =
                                         Some((local_session_id, session, fabric_index));
+                                    subscription = None; // belonged to the replaced session
                                 }
                                 Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
                             }
@@ -532,9 +569,12 @@ pub(crate) async fn run(
                     peer,
                     session,
                     *fabric_index,
-                    &mut node,
-                    &comm_server,
-                    mdns_ctx.as_ref(),
+                    &mut ServeState {
+                        node: &mut node,
+                        comm_server: &comm_server,
+                        mdns: mdns_ctx.as_ref(),
+                        subscription: &mut subscription,
+                    },
                 )
                 .await;
             }
@@ -555,6 +595,49 @@ pub(crate) async fn run(
                             state.schedule_next();
                         }
                     }
+                }
+            }
+            () = subscription_deadline(&subscription) => {
+                // The active subscription is due for a report: the dirty
+                // attributes' current values, or an empty keep-alive. Both
+                // go out on a fresh device-initiated exchange and both must
+                // be acknowledged — anything else drops the subscription
+                // (`send_subscription_report`'s doc comment).
+                //
+                // No reentrancy hazard against the datagram branch above:
+                // `select!` runs exactly one branch to completion per
+                // iteration, so while this one awaits its StatusResponse it
+                // is `SecureSession`'s own socket read — not the loop's —
+                // that consumes datagrams. Requests arriving meanwhile are
+                // buffered by `screen_with` and served by the drain below,
+                // exactly like the ones landing during a reply's ack-wait.
+                let delivered = match (subscription.as_mut(), current_session.as_mut()) {
+                    (Some(sub), Some((_, session, fabric_index))) => {
+                        send_subscription_report(session, *fabric_index, &mut node, sub).await
+                    }
+                    // A subscription that outlived its session has nothing
+                    // to report over — drop it.
+                    _ => false,
+                };
+                if !delivered {
+                    tracing::debug!(
+                        subscription_id = subscription.as_ref().map(|s| s.id),
+                        "subscription dropped: report was not acknowledged"
+                    );
+                    subscription = None;
+                }
+                if let Some((_, session, fabric_index)) = current_session.as_mut() {
+                    drain_buffered_requests(
+                        session,
+                        *fabric_index,
+                        &mut ServeState {
+                            node: &mut node,
+                            comm_server: &comm_server,
+                            mdns: mdns_ctx.as_ref(),
+                            subscription: &mut subscription,
+                        },
+                    )
+                    .await;
                 }
             }
             () = fail_safe_expiry_deadline(&comm_server) => {
@@ -608,9 +691,7 @@ async fn serve_secured(
     from: SocketAddr,
     session: &mut SecureSession,
     fabric_index: u8,
-    node: &mut Node,
-    comm_server: &CommissioningServer,
-    mdns: Option<&MdnsCtx>,
+    state: &mut ServeState<'_>,
 ) {
     let msg = match session.deliver_request(buf, from).await {
         Ok(Some(msg)) => msg,
@@ -626,7 +707,7 @@ async fn serve_secured(
             return; // decrypt/screen failure — drop, don't kill the session on noise
         }
     };
-    serve_secured_message(msg, session, fabric_index, node, comm_server, mdns).await;
+    serve_secured_message(msg, session, fabric_index, state).await;
 
     // While `reply_reliable` (inside `serve_secured_message`) was waiting
     // for the ack of *that* reply, a new peer-initiated request on a
@@ -638,11 +719,24 @@ async fn serve_secured(
     // fix: "ack-then-drop of cross-exchange secured requests"). Draining in
     // a loop (not just once) covers the same thing happening again while
     // *this* reply's own ack-wait is in flight.
+    drain_buffered_requests(session, fabric_index, state).await;
+}
+
+/// Serves every peer-initiated request `screen_with` buffered
+/// (`peer_initiated`) while this side was busy waiting for an ack — see
+/// `serve_secured`'s comment above the original call site for why dropping
+/// them would be a permanent loss. Also run after a device-initiated
+/// subscription report, whose own ack-wait reads the socket the same way.
+async fn drain_buffered_requests(
+    session: &mut SecureSession,
+    fabric_index: u8,
+    state: &mut ServeState<'_>,
+) {
     while let Some(buffered) = session.take_buffered_request() {
         if buffered.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
             continue;
         }
-        serve_secured_message(buffered, session, fabric_index, node, comm_server, mdns).await;
+        serve_secured_message(buffered, session, fabric_index, state).await;
     }
 }
 
@@ -658,10 +752,21 @@ async fn serve_secured_message(
     msg: mat_controller::exchange::IncomingMessage,
     session: &mut SecureSession,
     fabric_index: u8,
-    node: &mut Node,
-    comm_server: &CommissioningServer,
-    mdns: Option<&MdnsCtx>,
+    state: &mut ServeState<'_>,
 ) {
+    // Destructured (rather than used through `state.*`) so the borrow
+    // checker sees the four fields as independent borrows — the
+    // subscription is updated while `node` is also borrowed.
+    let ServeState {
+        node,
+        comm_server,
+        mdns,
+        subscription,
+    } = state;
+    let node: &mut Node = node;
+    let comm_server: &CommissioningServer = comm_server;
+    let mdns: Option<&MdnsCtx> = *mdns;
+
     if msg.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
         // Secure-channel traffic on an established session (e.g. a
         // device-initiated-exchange StatusReport) — out of M1 scope.
@@ -675,6 +780,17 @@ async fn serve_secured_message(
     // below (those are Invoke-only), so returning here is safe.
     if msg.proto.opcode == im::OPCODE_READ_REQUEST {
         serve_read_request_chunked(&msg, session, fabric_index, node).await;
+        return;
+    }
+
+    // SubscribeRequest likewise owns its whole interaction (priming chunks
+    // + SubscribeResponse on this exchange, Task 12) rather than producing
+    // one reply through `Node::handle_im`. Success installs the node's one
+    // active subscription; failure anywhere in the flow leaves it with
+    // none — including tearing down whatever was subscribed before, since
+    // this same peer just asked to start over.
+    if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
+        **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
         return;
     }
 
@@ -698,14 +814,25 @@ async fn serve_secured_message(
 
     let mut ctx = InvokeCtx {
         attestation_challenge: session.attestation_challenge(),
+        ..InvokeCtx::default()
     };
     let read_ctx = ReadCtx { fabric_index };
     let fabrics_before = comm_server.fabrics().len();
-    let Ok((resp_opcode, resp_payload)) =
-        node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
-    else {
+    let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx) else {
         return;
     };
+    let ImOutcome {
+        opcode: resp_opcode,
+        payload: resp_payload,
+        changed,
+    } = outcome;
+    // Anything this request changed that the active subscription covers
+    // becomes dirty — the `select!` report branch (`run`) picks it up at
+    // the subscription's next deadline. Recorded *before* the reply is
+    // sent so a change is never lost to a failing reply.
+    if let Some(sub) = subscription.as_mut() {
+        sub.note_changed(&changed);
+    }
     let reply_result = session
         .reply_reliable(
             &msg,
@@ -757,6 +884,312 @@ async fn serve_secured_message(
     }
 }
 
+/// Everything one secured message is allowed to touch, bundled so
+/// `serve_secured`/`serve_secured_message` keep a readable arity as the
+/// runtime grows state (Task 12 added the subscription). Borrowed as a
+/// whole from `run`'s loop locals; the fields are destructured inside
+/// `serve_secured_message` so they stay independent borrows.
+struct ServeState<'a> {
+    node: &'a mut Node,
+    comm_server: &'a CommissioningServer,
+    /// `None` when `bring_up_mdns` hasn't succeeded (see `run`'s doc).
+    mdns: Option<&'a MdnsCtx>,
+    /// The node's single active subscription, if any (see
+    /// `net::subscription`'s module doc for why there's only one).
+    subscription: &'a mut Option<ActiveSubscription>,
+}
+
+/// Resolves once at the active subscription's next report deadline, or
+/// never (`std::future::pending`) when nothing is subscribed — same
+/// `select!`-branch shape as `mdns_retry_deadline`/
+/// `fail_safe_expiry_deadline`, so a subscription's timer can't block
+/// datagram serving and its absence simply makes the branch inert.
+async fn subscription_deadline(subscription: &Option<ActiveSubscription>) {
+    match subscription {
+        Some(sub) => tokio::time::sleep_until(sub.next_report_deadline()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Serves one `SubscribeRequest` end to end (spec §8.10): priming
+/// ReportData (chunked, each chunk acknowledged with `StatusResponse(0)`
+/// by the initiator) followed by a `SubscribeResponse`, all on the
+/// requesting exchange, and returns the resulting `ActiveSubscription` —
+/// or `None` if any step failed, in which case this device simply has no
+/// subscription and the initiator is free to retry from scratch (same
+/// abort-and-let-the-initiator-retry policy `serve_read_request_chunked`
+/// uses for chunked reads).
+///
+/// Two ways this differs from a chunked read (both are why priming needs
+/// its own flow rather than reusing `serve_read_request_chunked`): every
+/// chunk carries the SubscriptionId and none of them suppress the
+/// response — not even the last, because the interaction isn't over until
+/// the `SubscribeResponse` goes out on the same exchange.
+///
+/// The subscription is registered by the caller only *after* all of that
+/// completes, so a half-finished subscribe never leaves a live
+/// subscription behind reporting to a controller that never got its
+/// SubscribeResponse.
+async fn serve_subscribe_request(
+    msg: &mat_controller::exchange::IncomingMessage,
+    session: &mut SecureSession,
+    fabric_index: u8,
+    node: &mut Node,
+) -> Option<ActiveSubscription> {
+    let Ok(req) = im::decode_subscribe_request(&msg.payload) else {
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            "SubscribeRequest dropped: undecodable"
+        );
+        return None;
+    };
+    let subscription_id = random_subscription_id();
+    // The device picks the MaxInterval it can actually honor, at or below
+    // the requested ceiling (spec §8.10) — `SubscribeResponse` tells the
+    // subscriber what it settled on.
+    let max_interval_s = req
+        .max_interval_ceiling_s
+        .clamp(MIN_MAX_INTERVAL_S, MAX_MAX_INTERVAL_S);
+    let max_interval = Duration::from_secs(u64::from(max_interval_s));
+    // A floor above the interval we just settled on would starve the
+    // subscription of its own keep-alives; clamp it down rather than
+    // reject the (otherwise legal) request.
+    let min_interval = Duration::from_secs(u64::from(req.min_interval_floor_s)).min(max_interval);
+
+    let read_ctx = ReadCtx { fabric_index };
+    let chunks = node.read_chunks(
+        &req.paths,
+        &read_ctx,
+        REPORT_CHUNK_BUDGET,
+        Some(subscription_id),
+    );
+    tracing::debug!(
+        exchange_id = msg.proto.exchange_id,
+        subscription_id,
+        paths = ?req.paths,
+        min_interval_floor_s = req.min_interval_floor_s,
+        max_interval_ceiling_s = req.max_interval_ceiling_s,
+        max_interval_s,
+        chunks = chunks.len(),
+        "SubscribeRequest"
+    );
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let reply_result = session
+            .reply_reliable(
+                msg,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                im::OPCODE_REPORT_DATA,
+                chunk,
+                &reply_cfg(),
+            )
+            .await;
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            subscription_id,
+            chunk_index = i,
+            payload_len = chunk.len(),
+            ok = reply_result.is_ok(),
+            error = reply_result.as_ref().err().map(|e| e.to_string()),
+            "priming ReportData chunk sent"
+        );
+        let Ok(piggybacked) = reply_result else {
+            return None; // ack never came — exchange is dead, give up
+        };
+        if !await_peer_status_ok(session, piggybacked, msg.proto.exchange_id).await {
+            return None;
+        }
+    }
+
+    let resp = im::encode_subscribe_response(subscription_id, max_interval_s);
+    let reply_result = session
+        .reply_reliable(
+            msg,
+            PROTOCOL_ID_INTERACTION_MODEL,
+            im::OPCODE_SUBSCRIBE_RESPONSE,
+            &resp,
+            &reply_cfg(),
+        )
+        .await;
+    tracing::debug!(
+        exchange_id = msg.proto.exchange_id,
+        subscription_id,
+        ok = reply_result.is_ok(),
+        error = reply_result.as_ref().err().map(|e| e.to_string()),
+        "SubscribeResponse sent"
+    );
+    if reply_result.is_err() {
+        return None;
+    }
+
+    Some(ActiveSubscription {
+        id: subscription_id,
+        paths: req.paths,
+        min_interval,
+        max_interval,
+        // The priming report counts as this subscription's first report:
+        // the keep-alive clock starts at the end of the subscribe
+        // interaction, not before it.
+        last_report_at: Instant::now(),
+        dirty: Vec::new(),
+    })
+}
+
+/// Sends one subscription ReportData on a **new**, device-initiated
+/// exchange (spec §8.10.3) and waits for the subscriber's
+/// `StatusResponse(0)`. Carries the dirty attributes' current values, or
+/// no reports at all when nothing changed — an empty ReportData is the
+/// keep-alive that tells the subscriber the subscription is still alive
+/// (`SecureSession::next_subscription_report` delivers it as such).
+///
+/// Returns `false` if the report couldn't be delivered or the subscriber
+/// answered anything other than SUCCESS; the caller then drops the
+/// subscription, which is the only sane response — MRP already retried the
+/// send, so a failure here means the peer is gone or has forgotten this
+/// subscription, and a real controller re-subscribes on its own.
+///
+/// Takes `&mut Node` even though it only reads: this future is held across
+/// `await` points inside `run`'s `select!`, and `Device::run`'s task is
+/// `tokio::spawn`ed — a shared `&Node` living across an await would make
+/// the whole runtime future require `Node: Sync`, which `Box<dyn
+/// ClusterHandler>` (declared `: Send`, not `: Sync`) is not.
+async fn send_subscription_report(
+    session: &mut SecureSession,
+    fabric_index: u8,
+    node: &mut Node,
+    sub: &mut ActiveSubscription,
+) -> bool {
+    let paths: Vec<mat_controller::im::AttrPathIn> = sub
+        .dirty
+        .iter()
+        .map(
+            |(endpoint, cluster, attribute)| mat_controller::im::AttrPathIn {
+                endpoint: Some(*endpoint),
+                cluster: Some(*cluster),
+                attribute: Some(*attribute),
+            },
+        )
+        .collect();
+    let read_ctx = ReadCtx { fabric_index };
+    // Values are read *now*, not captured when the change happened: the
+    // report carries the attribute's current value (spec §8.10.2), so two
+    // changes between reports collapse into one entry with the latest
+    // value — which is also why `dirty` holds paths, not values.
+    let entries = if paths.is_empty() {
+        Vec::new()
+    } else {
+        node.read_entries(&paths, &read_ctx)
+    };
+    // `more_chunks=false`, one message: a dirty set is a handful of
+    // scalar attributes, orders of magnitude below `REPORT_CHUNK_BUDGET`
+    // (unlike priming, which can pull in whole certificate attributes).
+    let payload = im::encode_report_data_entries(&entries, false, Some(sub.id), false);
+    let exchange_id = SecureSession::new_exchange_id();
+    let send_result = session
+        .send_reliable(
+            exchange_id,
+            PROTOCOL_ID_INTERACTION_MODEL,
+            im::OPCODE_REPORT_DATA,
+            &payload,
+            &reply_cfg(),
+        )
+        .await;
+    tracing::debug!(
+        exchange_id,
+        subscription_id = sub.id,
+        reports = entries.len(),
+        keep_alive = entries.is_empty(),
+        payload_len = payload.len(),
+        ok = send_result.is_ok(),
+        error = send_result.as_ref().err().map(|e| e.to_string()),
+        "subscription ReportData sent"
+    );
+    let Ok(piggybacked) = send_result else {
+        return false;
+    };
+    // Our own exchange this time (we're the initiator), so the plain
+    // `recv` filter is the right one — unlike priming, which answers on
+    // the *peer's* exchange (see `await_peer_status_ok`).
+    let status_msg = match piggybacked {
+        Some(m) => m,
+        None => match session.recv(exchange_id, REPORT_STATUS_TIMEOUT).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(exchange_id, error = %e, "subscription report: no StatusResponse");
+                return false;
+            }
+        },
+    };
+    if !is_status_response_ok(&status_msg) {
+        return false;
+    }
+
+    sub.last_report_at = Instant::now();
+    sub.dirty.clear();
+    true
+}
+
+/// Waits for the peer's `StatusResponse(0)` to a ReportData we just sent on
+/// an exchange **the peer initiated** (a priming chunk). `piggybacked` is
+/// whatever `reply_reliable` already had in hand — real controllers
+/// (`SecureSession::subscribe_wildcard`, chip-tool) answer with the
+/// StatusResponse itself rather than a standalone ack, so that's the
+/// normal path; the fallback reads one more peer-initiated message off the
+/// socket (`recv_request`, whose `AnyPeerInitiated` filter is the only one
+/// that can deliver a message on an exchange we didn't initiate — plain
+/// `recv` filters those out) and requires it to be on the same exchange.
+async fn await_peer_status_ok(
+    session: &mut SecureSession,
+    piggybacked: Option<mat_controller::exchange::IncomingMessage>,
+    exchange_id: u16,
+) -> bool {
+    let status_msg = match piggybacked {
+        Some(m) => m,
+        None => match session.recv_request(REPORT_STATUS_TIMEOUT).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(exchange_id, error = %e, "priming chunk: no StatusResponse");
+                return false;
+            }
+        },
+    };
+    if status_msg.proto.exchange_id != exchange_id {
+        tracing::debug!(
+            exchange_id,
+            got_exchange_id = status_msg.proto.exchange_id,
+            "priming chunk: StatusResponse arrived on another exchange"
+        );
+        return false;
+    }
+    is_status_response_ok(&status_msg)
+}
+
+/// Whether `msg` is a `StatusResponse(SUCCESS)` — the acknowledgement
+/// every non-suppressed ReportData expects (spec §8.9.2.3). Anything else
+/// (wrong opcode, non-zero status, malformed payload) means the peer isn't
+/// following the interaction and the caller gives up on it.
+fn is_status_response_ok(msg: &mat_controller::exchange::IncomingMessage) -> bool {
+    if msg.proto.opcode != im::OPCODE_STATUS_RESPONSE {
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            opcode = format_args!("0x{:02X}", msg.proto.opcode),
+            "expected StatusResponse, got another opcode"
+        );
+        return false;
+    }
+    match im::decode_status_response(&msg.payload) {
+        Ok(0) => true,
+        other => {
+            tracing::debug!(
+                exchange_id = msg.proto.exchange_id,
+                status = ?other,
+                "StatusResponse was not SUCCESS"
+            );
+            false
+        }
+    }
+}
+
 /// Serves one `ReadRequest` with `Node::read_chunks`'s chunked reply flow
 /// (Task 6), bypassing `Node::handle_im`/`handle_read` (which only ever
 /// return a single message) entirely. Mirrors `SecureSession::
@@ -794,7 +1227,7 @@ async fn serve_read_request_chunked(
         return;
     };
     let read_ctx = ReadCtx { fabric_index };
-    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET);
+    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
     let last_index = chunks.len().saturating_sub(1);
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
@@ -832,22 +1265,14 @@ async fn serve_read_request_chunked(
             return; // final chunk: no StatusResponse expected, done
         }
 
-        let status_msg = match piggybacked {
-            Some(m) => m,
-            None => match session
-                .recv(msg.proto.exchange_id, Duration::from_secs(5))
-                .await
-            {
-                Ok(m) => m,
-                Err(_) => return, // timed out waiting for StatusResponse(0)
-            },
-        };
-        if status_msg.proto.opcode != im::OPCODE_STATUS_RESPONSE {
+        // Same wait the subscription's priming loop does — this is the
+        // peer's exchange, so `await_peer_status_ok`'s `recv_request`
+        // fallback is what can actually deliver a StatusResponse that
+        // didn't come piggybacked on the ack (plain `session.recv` filters
+        // out messages on exchanges we didn't initiate and would sit here
+        // until it timed out).
+        if !await_peer_status_ok(session, piggybacked, msg.proto.exchange_id).await {
             return;
-        }
-        match im::decode_status_response(&status_msg.payload) {
-            Ok(0) => continue, // ack for this chunk — send the next one
-            _ => return,       // non-zero status or malformed reply
         }
     }
 }
@@ -1001,9 +1426,7 @@ mod tests {
 
         let comm_server = fail_safe_test_server();
         let (mut gc, _oc) = comm_server.into_cluster_handlers();
-        let mut ctx = InvokeCtx {
-            attestation_challenge: [0u8; 16],
-        };
+        let mut ctx = InvokeCtx::default();
         gc.invoke(CMD_ARM_FAIL_SAFE, &encode_arm_fail_safe(1, 1), &mut ctx);
         assert!(
             comm_server.fail_safe_deadline().is_some(),
@@ -1191,9 +1614,12 @@ mod tests {
             from,
             &mut session,
             0,
-            &mut node,
-            &comm_server,
-            None,
+            &mut ServeState {
+                node: &mut node,
+                comm_server: &comm_server,
+                mdns: None,
+                subscription: &mut None,
+            },
         )
         .await;
 
@@ -1427,13 +1853,191 @@ mod tests {
             from,
             &mut session,
             0,
-            &mut node,
-            &comm_server,
-            None,
+            &mut ServeState {
+                node: &mut node,
+                comm_server: &comm_server,
+                mdns: None,
+                subscription: &mut None,
+            },
         )
         .await;
 
         let chunk_count = ctrl_task.await.unwrap();
         assert!(chunk_count >= 2, "expected 2+ chunks, got {chunk_count}");
+    }
+    // ── Task 12: chunked subscription priming ───────────────────────────
+
+    /// Task 6's homework, settled here: priming a subscription against a
+    /// `Node` fat enough to blow past `REPORT_CHUNK_BUDGET` must come back
+    /// as several `ReportData` chunks and still complete with a
+    /// `SubscribeResponse`.
+    ///
+    /// Unlike `read_request_chunked_flow_round_trips_two_or_more_chunks`
+    /// above (which hand-rolls the controller at the datagram level,
+    /// because `mat` has no chunk-aware read), the controller here is the
+    /// real `SecureSession::subscribe_wildcard` — the same code path a
+    /// commissioned `mat`/`matd` uses against real devices. It is
+    /// therefore the authority on the wire contract: it acknowledges each
+    /// priming chunk with `StatusResponse(0)` on the subscribe exchange and
+    /// insists the `SubscribeResponse` follow on that same exchange, so a
+    /// device that suppressed the final chunk's response, forgot the
+    /// SubscriptionId, or answered on a fresh exchange would fail here.
+    ///
+    /// Only the device's *session* is built by hand (no PASE/CASE — that's
+    /// `subscribe_loop.rs`'s job); everything above the session is real.
+    #[tokio::test]
+    async fn subscription_priming_round_trips_multiple_chunks() {
+        use mat_controller::session::SessionKeys;
+        use mat_controller::tlv::{Tag, Writer};
+        use mat_controller::transport::UdpTransport;
+
+        use crate::core::datamodel::{ClusterHandler, InvokeReply};
+        use crate::core::fabric_store::FabricStore;
+
+        const DEV_SID: u16 = 0xAAAA; // device's own session id
+        const CTRL_SID: u16 = 0xBBBB; // controller's session id
+        const CTRL_NODE: u64 = 1;
+        const DEV_NODE: u64 = 2;
+        const I2R: [u8; 16] = [0x11; 16];
+        const R2I: [u8; 16] = [0x22; 16];
+
+        /// One ~600B attribute per instance — three of them force priming
+        /// past `REPORT_CHUNK_BUDGET`. Cluster ids are far outside any real
+        /// range (same fixture idea as `datamodel`'s own chunking tests).
+        struct FatHandler {
+            cluster: u32,
+        }
+        impl ClusterHandler for FatHandler {
+            fn cluster_id(&self) -> u32 {
+                self.cluster
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![1]
+            }
+            fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+                if attribute != 1 {
+                    return None;
+                }
+                let mut w = Writer::new();
+                w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
+                Some(w.finish())
+            }
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields_tlv: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+        }
+
+        let ctrl_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let ctrl_addr = ctrl_transport.local_addr().unwrap();
+        let dev_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let dev_addr = dev_transport.local_addr().unwrap();
+
+        let mut session = SecureSession::new_device_role(
+            Arc::clone(&dev_transport),
+            ctrl_addr,
+            DEV_SID,
+            CTRL_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            DEV_NODE,
+            CTRL_NODE,
+        );
+        // Controller role: mirror image of the device's ids (see
+        // `SecureSession::new_device_role`'s doc for the key swap).
+        let mut ctrl = SecureSession::new(
+            Arc::clone(&ctrl_transport),
+            dev_addr,
+            CTRL_SID,
+            DEV_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            CTRL_NODE,
+            DEV_NODE,
+        );
+
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        for i in 0..3u32 {
+            node.add_cluster(
+                0,
+                Box::new(FatHandler {
+                    cluster: 0x9999_0000 + i,
+                }),
+            );
+        }
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let comm_server = CommissioningServer::new(dev, FabricStore::new());
+
+        let ctrl_task = tokio::spawn(async move {
+            let cfg = MrpConfig {
+                initial_interval: Duration::from_millis(50),
+                active_interval: Duration::from_millis(50),
+                max_retries: 4,
+                backoff: 1.2,
+                jitter: 0.0,
+            };
+            // Full wildcard (`clusters` empty) so every fat attribute is
+            // primed.
+            ctrl.subscribe_wildcard(0, 30, false, &[], &cfg).await
+        });
+
+        // One datagram in: `serve_secured` drives the entire subscribe
+        // interaction (every chunk plus the SubscribeResponse) from here,
+        // reading the controller's StatusResponses off the socket itself.
+        let mut subscription: Option<ActiveSubscription> = None;
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+        serve_secured(
+            &buf[..n],
+            from,
+            &mut session,
+            0,
+            &mut ServeState {
+                node: &mut node,
+                comm_server: &comm_server,
+                mdns: None,
+                subscription: &mut subscription,
+            },
+        )
+        .await;
+
+        let (sr, priming) = ctrl_task.await.unwrap().expect("subscribe should complete");
+        assert!(
+            priming.len() >= 2,
+            "expected priming to arrive in 2+ chunks, got {}",
+            priming.len()
+        );
+        for (i, chunk) in priming.iter().enumerate() {
+            assert_eq!(
+                chunk.subscription_id,
+                Some(sr.subscription_id),
+                "priming chunk {i} must carry the SubscriptionId"
+            );
+            assert!(
+                !chunk.suppress_response,
+                "priming chunk {i} must not suppress the response"
+            );
+        }
+        let sub = subscription.expect("a completed subscribe must register the subscription");
+        assert_eq!(sub.id, sr.subscription_id);
+        assert_eq!(sub.max_interval, Duration::from_secs(30));
     }
 }
