@@ -560,12 +560,10 @@ pub fn generate_dev_attestation(
     // CD の署名は自前の DAC 鍵ではなく公開テスト鍵で行う（`crate::cd` の
     // モジュール doc 参照）。失敗しうるのは鍵定数が壊れた場合だけなので、
     // X509Error に混ぜず `Rng` 系と同じ「起こらない」扱いにする。
-    let certification_declaration = crate::cd::generate_dev_certification_declaration(
-        vid,
-        pid,
-        device_type,
-    )
-    .map_err(|_| X509Error::Der("well-known test CD signing key is not a valid p256 key (bug)"))?;
+    let certification_declaration =
+        crate::cd::generate_dev_certification_declaration(vid, pid, device_type).map_err(|_| {
+            X509Error::Der("well-known test CD signing key is not a valid p256 key (bug)")
+        })?;
 
     Ok(DevAttestation {
         paa_der,
@@ -934,7 +932,8 @@ mod tests {
 
     #[test]
     fn dev_attestation_chain_verifies() {
-        let da = generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let da =
+            generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         let dac = parse_x509(&da.dac_der).unwrap();
         let pai = parse_x509(&da.pai_der).unwrap();
         let paa = parse_x509(&da.paa_der).unwrap();
@@ -999,7 +998,8 @@ mod tests {
             None
         }
 
-        let da = generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let da =
+            generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
         // PAA: SEQUENCE { BOOLEAN TRUE }
         assert_eq!(
             basic_constraints_value(&da.paa_der).as_deref(),

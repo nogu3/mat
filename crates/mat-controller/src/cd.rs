@@ -35,8 +35,22 @@ use crate::asn1;
 use crate::crypto::{sign_ecdsa_p256, CryptoError};
 use crate::tlv::{Tag, Writer};
 
-/// 「Matter Test CD Signing Authority」の P-256 秘密鍵（raw 32B）。
-/// モジュール doc のとおり公開されているテスト鍵。
+/// 「Matter Test CD Signing Authority」の P-256 **秘密**鍵（raw 32B）。
+///
+/// **これは秘密情報ではなく、秘密情報として扱ってもいけない。**
+/// connectedhomeip リポジトリに平文でコミットされている公開のテスト鍵
+/// （`credentials/test/certification-declaration/Chip-Test-CD-Signing-Key.pem`）
+/// で、世界中の誰でも同じ鍵で CD を署名できる。したがってこの鍵で署名された
+/// CD は「CSA が認証した」ことを一切証明しない — 「chip 系コントローラが
+/// 既定で受け入れる、未認証デバイスの標準的な形」でしかない。
+///
+/// 本番のデバイス identity には**絶対に使わないこと**。実機を CSA 認証に
+/// 通すときは、CSA から発行された CD（と実 PAA/PAI/DAC）に差し替える。
+///
+/// `#[doc(hidden)]`: 公開 API として案内する類のものではなく、
+/// [`generate_dev_certification_declaration`] の実装詳細として `pub` に
+/// なっているだけ（テストと、将来 CD を自前で組みたい呼び出し側のため）。
+#[doc(hidden)]
 pub const TEST_CD_SIGNING_KEY: [u8; 32] = [
     0xAE, 0xF3, 0x48, 0x41, 0x16, 0xE9, 0x48, 0x1E, 0xC5, 0x7B, 0xE0, 0x47, 0x2D, 0xF4, 0x1B, 0xF4,
     0x99, 0x06, 0x4E, 0x50, 0x24, 0xAD, 0x86, 0x9E, 0xCA, 0x5E, 0x88, 0x98, 0x02, 0xD4, 0x80, 0x75,
@@ -201,7 +215,10 @@ mod tests {
     fn certification_elements_are_in_ascending_tag_order() {
         let el = encode_certification_elements(0xFFF1, 0x8000, 0x0100);
         let mut r = Reader::new(&el);
-        assert!(matches!(r.next().unwrap().unwrap().value, Value::StructStart));
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            Value::StructStart
+        ));
         let mut seen: Vec<u8> = Vec::new();
         let mut depth = 0usize;
         while let Some(el) = r.next().unwrap() {

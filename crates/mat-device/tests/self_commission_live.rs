@@ -174,7 +174,12 @@ async fn fail_safe_expiry_gates_add_noc() {
     use mat_device::core::datamodel::{InvokeCtx, InvokeReply};
     use mat_device::core::fabric_store::FabricStore;
 
-    let dev = x509::generate_dev_attestation(VENDOR_ID, PRODUCT_ID, mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT).expect("dev attestation");
+    let dev = x509::generate_dev_attestation(
+        VENDOR_ID,
+        PRODUCT_ID,
+        mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
+    )
+    .expect("dev attestation");
     let server = CommissioningServer::new(dev, FabricStore::new());
     let (mut gc, mut oc) = {
         let (a, b) = server.into_cluster_handlers();

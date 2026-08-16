@@ -137,12 +137,19 @@ read_onoff() {
 # changed. This is the real "the controller can both command and observe
 # this device" check: a toggle that silently no-ops, or a read served from
 # a stale/unrelated path, fails here rather than looking green.
+#
+# The `|| exit 1` on each `$(read_onoff)` is load-bearing, not belt-and-
+# braces: `fail` runs inside the command substitution's *subshell*, so its
+# `exit 1` only kills that subshell. Without an explicit propagation the
+# script would carry on with an empty `before`/`after` — and relying on
+# `set -e` alone here is exactly the kind of thing that quietly stops
+# working the moment this call moves into a condition or a pipeline.
 assert_toggle_flips() {
     local phase="$1" before after
-    before="$(read_onoff)"
+    before="$(read_onoff)" || exit 1
     chip onoff toggle "$NODE_ID" "$ENDPOINT" >/dev/null \
         || fail "$phase: chip-tool onoff toggle failed"
-    after="$(read_onoff)"
+    after="$(read_onoff)" || exit 1
     [[ "$before" != "$after" ]] \
         || fail "$phase: OnOff did not change across toggle (stayed $before)"
     echo "==> $phase: OnOff $before -> $after" >&2

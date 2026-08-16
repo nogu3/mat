@@ -279,6 +279,17 @@ CSR → NOC → CASE → `Device commissioning completed with success`。**commi
 
 3 回連続グリーン。`task e2e:device:m1` も引き続きグリーン。
 
+> **fix round 1 での訂正**: 上のフィックスラウンド中、`task check` の成否を
+> 「出力を `grep -icE "test result: FAILED|^error(\[|:)"` して 0 なら green」
+> という方法で判定していた。この正規表現は `cargo fmt --check` の出力
+> （`Diff in <path> at line N:`）にも clippy の warning にも一致しないため、
+> **fmt 違反 11 hunks を全サイクルで見逃したまま「green」と報告していた**。
+> レビューで指摘され `cargo fmt` をかけて修正済み。
+>
+> 教訓: `task check` のようなラッパーの成否は**終了コードで見る**こと。
+> 出力の grep は、こちらが想定していない出し方をするサブコマンドの失敗を
+> 静かに取りこぼす — しかも「green を確認した」という報告つきで。
+
 ## 副次的な観測（Echo ゲート＝Task 13 以降への申し送り）
 
 - **CASE resumption は毎回 full fallback している**。chip-tool は 1 コマンド 1
