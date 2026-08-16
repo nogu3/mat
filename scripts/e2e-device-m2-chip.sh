@@ -13,7 +13,13 @@
 #      store + Certification Declaration), CSR/NOC, operational CASE
 #   3. `chip-tool onoff read on-off 1 1` (baseline) -> `onoff toggle 1 1`
 #      -> read again, asserting the value actually flipped
-#   4. SIGTERM `matv`, restart it against the *same* store (fabrics persist;
+#   4. `chip-tool interactive start` fed `onoff subscribe on-off <min> <max>
+#      1 1` — verifies the Subscribe path (Task 12) end-to-end from the
+#      *official* SDK controller: priming report + SubscribeResponse land,
+#      and at least one keep-alive report arrives within max_interval. See
+#      `verify_subscribe()` below for why this doesn't also drive a
+#      change-report through chip-tool.
+#   5. SIGTERM `matv`, restart it against the *same* store (fabrics persist;
 #      the UDP port is re-picked, so chip-tool must re-resolve it over the
 #      operational mDNS advert) -> read/toggle/read again, proving the
 #      re-CASE path works against a restarted device
@@ -25,23 +31,40 @@
 # `docs/superpowers/plans/m2-chip-tool-probe.md` ("つまずき" section).
 #
 # Env:
-#   MAT_E2E_IFACE      interface `matv`'s mDNS advertiser binds (default:
-#                      `eth1` — plain `lo` has no IPv6 link-local address;
-#                      same default and rationale as e2e-device-m1.sh).
-#   MAT_E2E_TIMEOUT_S  per-chip-tool-command timeout (default: 120; the
-#                      whole `pairing` handshake plus Docker start fits well
-#                      inside this on a laptop, but the image pull on a cold
-#                      host does not, hence the generous budget).
+#   MAT_E2E_IFACE            interface `matv`'s mDNS advertiser binds
+#                            (default: `eth1` — plain `lo` has no IPv6
+#                            link-local address; same default and rationale
+#                            as e2e-device-m1.sh).
+#   MAT_E2E_TIMEOUT_S        per-chip-tool-command timeout (default: 120;
+#                            the whole `pairing` handshake plus Docker start
+#                            fits well inside this on a laptop, but the
+#                            image pull on a cold host does not, hence the
+#                            generous budget). Also used as the hard backstop
+#                            for the interactive subscribe container — see
+#                            `verify_subscribe()`.
+#   MAT_E2E_SUBSCRIBE_WAIT_S how long to watch the interactive subscribe
+#                            session for a priming report + keep-alive
+#                            before giving up (default: 12).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IFACE="${MAT_E2E_IFACE:-eth1}"
 TIMEOUT_S="${MAT_E2E_TIMEOUT_S:-120}"
+SUBSCRIBE_WAIT_S="${MAT_E2E_SUBSCRIBE_WAIT_S:-12}"
+
+# Same default as scripts/chip-tool.sh (kept in sync manually — there's no
+# clean way to source just its IMAGE assignment without also running the
+# `exec docker run` at the bottom of that script). Sharing the env var name
+# means a caller override applies to both the `chip()` helper below (via the
+# wrapper) and the interactive-mode `docker run` in `verify_subscribe()`.
+CHIP_TOOL_IMAGE="${CHIP_TOOL_IMAGE:-atios/chip-tool@sha256:b0f75334f7264af16c19ea0f4880a20ed86b821cd12c6a553c8e012aa0344277}"
 
 PASSCODE=20202021
 DISCRIMINATOR=3840
 NODE_ID=1
 ENDPOINT=1
+SUB_MIN_INTERVAL_S=0
+SUB_MAX_INTERVAL_S=5
 
 WORKDIR=".e2e-cache/e2e-device-m2-chip.$$"
 DEVICE_STORE="$WORKDIR/device-store"
@@ -50,11 +73,18 @@ MATV_CONFIG="$WORKDIR/matv.toml"
 DEVICE_STDOUT="$WORKDIR/device.stdout.log"
 DEVICE_STDERR="$WORKDIR/device.stderr.log"
 CHIP_LOG="$WORKDIR/chip.log"
+SUBSCRIBE_LOG="$WORKDIR/chip-subscribe.log"
 mkdir -p "$DEVICE_STORE" "$CHIP_STORE"
 
 DEVICE_PID=""
 cleanup() {
     stop_device
+    # Belt-and-braces: `verify_subscribe` already kills its own container
+    # before returning (success or `fail`), but this covers an external
+    # interrupt (Ctrl-C, an outer timeout) landing mid-poll. The name is
+    # deterministic (`mat-e2e-sub-$$`), so this is a no-op double-kill on the
+    # normal path.
+    docker kill "mat-e2e-sub-$$" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -155,6 +185,87 @@ assert_toggle_flips() {
     echo "==> $phase: OnOff $before -> $after" >&2
 }
 
+# Verifies chip-tool's Subscribe path end-to-end from the *official* SDK
+# controller: feeds `onoff subscribe on-off <min> <max> <node> <endpoint>`
+# into `chip-tool interactive start`'s stdin, then polls the session's log
+# for (a) a priming report + SubscribeResponse and (b) at least one
+# keep-alive report arriving within max_interval.
+#
+# Why `interactive start` and not the plain `chip-tool onoff subscribe on-off
+# ...` subcommand: tried the plain form first (it exists — `chip-tool onoff
+# subscribe on-off --help` documents it) and confirmed empirically that it
+# exits the instant SubscribeResponse lands ("Shutting down the
+# commissioner"), before any keep-alive can arrive. `interactive start` is a
+# long-lived REPL; the fed command's ReadClient keeps running afterwards,
+# which is what a keep-alive check needs.
+#
+# Why this only checks priming + keep-alive, not a change report: the device
+# is sequential (one CASE session at a time — see
+# `docs/superpowers/plans/m2-chip-tool-probe.md`), so a second chip-tool
+# process toggling on-off would open a second CASE session and evict this
+# one, killing the subscription before any change report could arrive.
+# `crates/mat-device/tests/subscribe_loop.rs` (Task 12) already covers
+# subscribe -> invoke -> change-report by driving both sides itself from a
+# single process, so that path doesn't need re-proving here.
+#
+# Why the container is torn down with an explicit `docker kill --name`
+# rather than relying on the fed stdin closing or a `timeout` wrapper alone:
+# verified empirically that chip-tool's interactive shell does *not* exit
+# when its stdin pipe hits EOF — it just stops accepting new commands while
+# the ReadClient event loop keeps running (observed it stay up for minutes
+# until force-killed). A `timeout N docker run ...` around it only kills the
+# `docker` client process at N seconds, not the container — the container
+# itself doesn't receive a signal, and docker was seen to leave it running.
+# So cleanup here is unconditional (`|| true`) and independent of the
+# `timeout` backstop, which exists only so a stuck/hanging `docker run`
+# client can't wedge this function indefinitely.
+verify_subscribe() {
+    local name="mat-e2e-sub-$$"
+    : >"$SUBSCRIBE_LOG"
+
+    (
+        printf 'onoff subscribe on-off %s %s %s %s\n' \
+            "$SUB_MIN_INTERVAL_S" "$SUB_MAX_INTERVAL_S" "$NODE_ID" "$ENDPOINT"
+        sleep "$SUBSCRIBE_WAIT_S"
+    ) | timeout "${TIMEOUT_S}s" docker run --rm -i --network host --name "$name" \
+        -v "$CHIP_STORE":/root/.chip-tool-store \
+        -v "$PWD":/workdir -w /workdir \
+        "$CHIP_TOOL_IMAGE" interactive start \
+        --storage-directory /root/.chip-tool-store \
+        >"$SUBSCRIBE_LOG" 2>&1 &
+    local bg_pid=$!
+
+    # Polls in 0.5s steps for up to $SUBSCRIBE_WAIT_S. `Refresh
+    # LivenessCheckTime for` is logged once when the subscription is
+    # established (right after SubscribeResponse) and again after every
+    # report chip-tool receives thereafter — dirty or keep-alive alike — so
+    # a count >= 2 with no dirty report in between (nothing else writes
+    # on-off during this window) means a keep-alive round-tripped.
+    local primed="" keepalive_count=0 waited=0
+    while ((waited < SUBSCRIBE_WAIT_S * 2)); do
+        if [[ -z "$primed" ]] && grep -q "SubscribeResponse is received" "$SUBSCRIBE_LOG" 2>/dev/null \
+            && grep -q "OnOff: \(TRUE\|FALSE\)" "$SUBSCRIBE_LOG" 2>/dev/null; then
+            primed=1
+        fi
+        keepalive_count="$(grep -c "Refresh LivenessCheckTime for" "$SUBSCRIBE_LOG" 2>/dev/null || true)"
+        if [[ -n "$primed" && "${keepalive_count:-0}" -ge 2 ]]; then
+            break
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+
+    docker kill "$name" >/dev/null 2>&1 || true
+    wait "$bg_pid" 2>/dev/null || true
+    cat "$SUBSCRIBE_LOG" >>"$CHIP_LOG"
+
+    [[ -n "$primed" ]] \
+        || fail "chip-tool interactive subscribe: no priming report / SubscribeResponse observed within ${SUBSCRIBE_WAIT_S}s"
+    [[ "${keepalive_count:-0}" -ge 2 ]] \
+        || fail "chip-tool interactive subscribe: no keep-alive report observed within ${SUBSCRIBE_WAIT_S}s (LivenessCheckTime refresh count=${keepalive_count:-0}, want >=2)"
+    echo "==> subscribe: priming report + keep-alive observed (LivenessCheckTime refreshed x${keepalive_count})" >&2
+}
+
 echo "==> building (release)" >&2
 cargo build --release -p matv
 
@@ -174,6 +285,9 @@ echo "==> commissioned" >&2
 
 assert_toggle_flips "before restart"
 
+echo "==> chip-tool interactive subscribe (min=${SUB_MIN_INTERVAL_S}s max=${SUB_MAX_INTERVAL_S}s, watching up to ${SUBSCRIBE_WAIT_S}s)" >&2
+verify_subscribe
+
 echo "==> restarting matv (SIGTERM, same store)" >&2
 stop_device
 start_device
@@ -183,4 +297,4 @@ echo "==> device back up: $(cat "$DEVICE_STDOUT")" >&2
 # re-establish CASE against the restarted device on its new port.
 assert_toggle_flips "after restart"
 
-echo "==> PASS: chip-tool commissioned, controlled, and re-attached to matv" >&2
+echo "==> PASS: chip-tool commissioned, controlled, subscribed, and re-attached to matv" >&2
