@@ -131,3 +131,27 @@ Task 10 記録後の再試行（matv.stderr.log 08:38Z / 09:13Z）は**より手
 
 - matv の PASE 状態機械は StatusReport を「unexpected opcode」として扱う。エラー StatusReport のコード（GeneralCode/ProtocolCode）をログに出すと今後の切り分けが速くなる（小改善候補）。
 - jarvis 稼働中の matv は Task 10 時点のビルド（5ab8014、窓 close の PASE 無応答 drop・salt 乱数化を含まない）。**次回 Echo 検証前に最新 main のビルドを再配布すること**。
+
+## 追加調査（2026-08-17）: 世代相関説を棄却 → クラウド側ロールアウト説へ更新
+
+ユーザーの Echo は **Echo Show 11（最新モデル・2026 年版ファーム）**と判明。「古い世代で失敗・新しい世代で成功」という前日の世代相関説は棄却。時期相関を再調査した結果:
+
+### タイムライン（未認証 matter.js 系ブリッジ × Alexa）
+
+- **〜2026-07-13: attestation は通っていた**。RiDDiX/HAMH #401（07-04, 失敗するが addNoc 後 = attestation 通過）、#414（07-13, Echo Dot 4th/5th gen で commissioningComplete 完走）、Luligu/matterbridge #575（07-10 頃, 稼働中）
+- **2026-08-13〜: 「attestation 交換直後に沈黙 → fail-safe 失効 → GS014」の新シグネチャが独立 3 系統で出現**:
+  - RiDDiX/HAMH **#449**（08-13, Echo Dot 2nd gen fw 13121734531）<https://github.com/RiDDiX/home-assistant-matter-hub/issues/449>
+  - Luligu/matterbridge **#605**（08-16, Echo Dot with Clock fw 13121734532 + Echo Show 5 3rd gen fw 5601010007320, **regulatory JP**。attestationRequest 応答直後に停止 → 80 秒で fail-safe 失効 → GS014。Google Home は成功）<https://github.com/Luligu/matterbridge/issues/605>
+  - 本プロジェクト実測（08-16, Echo Show 11 2026FW, matv + matter.js 公式サンプル）
+- 8 月以降の「未認証ブリッジ × Alexa 成功」報告はゼロ（消極的証拠）
+
+### 判定
+
+**「2026-07-13〜08-13 の間に Amazon がクラウド側で attestation 検証を厳格化（test 証明書チェーンを拒否）」説が最有力**。スタック非依存（HAMH / matterbridge / matter.js / matv）・Echo 世代非依存（2nd gen〜Show 11）で同一シグネチャ、クラウド側変更なら FW 世代を問わず一斉に効く点と整合。ただし Amazon の公式告知・changelog は皆無で、意図的強制かリグレッションかは不明（inconclusive, leaning supported）。
+
+### 帰結（前節「次の一手」の修正）
+
+1. ~~別世代 Echo で再試行~~ → **棄却**（最新 Show 11 で失敗済み。クラウド側なら世代交換は無意味）
+2. デバイス側でできることは無い。**Echo ゲートは Amazon 側の解消（修正 or 公式声明）待ちで凍結**が妥当
+3. ウォッチ先: **#605**（help wanted・JP 環境で本件と同一）と **#449**。pcap 所見（AttestationResponse MRP-ack 後 80 秒沈黙）を追記して事例を束ねる価値は引き続き有り
+4. 相互運用の実機検証は **Apple Home / Google Home へ切替**（8 月時点でも成功報告が継続。M3 Aggregator の interview 型コントローラ対応とも方向が一致）
