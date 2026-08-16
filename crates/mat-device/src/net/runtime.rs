@@ -68,11 +68,12 @@ use crate::device::{DeviceConfig, DeviceError};
 use crate::net::mdns::MdnsAdvertiser;
 use crate::net::subscription::ActiveSubscription;
 
-/// PBKDF parameters this runtime advertises — same fixture values
-/// `net::pase::run_pase_once` and `mat_controller::test_support`'s own
-/// responder use (spec §3.9 legal, not spec-mandated exact numbers).
-const ITERATIONS: u32 = 1000;
-const SALT: &[u8; 16] = b"SPAKE2P Key Salt";
+/// PBKDF iterations this runtime advertises for PASE (spec §3.9 legal
+/// range 1000..=100000). 10k rounds of PBKDF2-SHA256 on the Pi is
+/// millisecond-class and paid once per commissioning attempt, so raising it
+/// well above the 1000 floor costs nothing in practice while narrowing the
+/// brute-force budget an attacker gets per guess.
+const PASE_ITERATIONS: u32 = 10_000;
 
 /// Sigma1's opcode (spec §4.14) — `case_responder::OPCODE_SIGMA1` is
 /// `pub(crate)` to mat-controller (see `core::case`'s test module for the
@@ -504,6 +505,14 @@ pub(crate) async fn run(
     comm_server: CommissioningServer,
 ) -> Result<(), DeviceError> {
     let port = local_addr.port();
+    // A fresh random PASE salt each boot (spec §3.9 permits any salt; a
+    // fixed one is weak against a precomputed rainbow table across every
+    // device running this firmware). Generated once here and reused for
+    // every PASE attempt this run serves — it only needs to be consistent
+    // within one handshake (it round-trips to the peer in
+    // PBKDFParamResponse), not secret or per-attempt.
+    let mut pase_salt = [0u8; 16];
+    getrandom::getrandom(&mut pase_salt).expect("os rng");
     // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
     // doc comment): open only for a device with no fabric yet — one already
     // on disk means this device was commissioned in an earlier run, so a
@@ -612,8 +621,8 @@ pub(crate) async fn run(
                                 first,
                                 PaseVerifierConfig {
                                     passcode: config.passcode,
-                                    salt: SALT.to_vec(),
-                                    iterations: ITERATIONS,
+                                    salt: pase_salt.to_vec(),
+                                    iterations: PASE_ITERATIONS,
                                     responder_session_id: local_session_id,
                                 },
                             )
