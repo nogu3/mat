@@ -157,6 +157,91 @@ fn classify_unsecured(protocol_id: u16, opcode: u8) -> UnsecuredFlow {
     }
 }
 
+/// The commissioning window's admission decision (Task 14) for one already-
+/// classified unsecured flow: `None` means "drop it — no response, no
+/// session start", `Some` means "let `run`'s existing match handle it
+/// unchanged". Kept as a pure function separate from the `select!` loop for
+/// the same reason `classify_unsecured` is: unit-testable without a socket.
+///
+/// - `UnsecuredFlow::Pase` is gated on `window_open` — a closed window
+///   (spec §5.4.2.3's 15-minute PASE upper bound elapsed, or
+///   `CommissioningComplete` already closed it, or the device booted with a
+///   fabric already installed) must refuse *every* PASE opcode with total
+///   silence, not a `StatusReport` (申し送り 7 項: this runtime's DoS-
+///   hardening posture treats a closed window exactly like every other
+///   "nothing to route this to" drop elsewhere in this module — see the
+///   module doc's wire-classification list).
+/// - `UnsecuredFlow::Case` is never gated: CASE is how an already-
+///   commissioned controller reconnects on every subsequent boot, spec's
+///   commissioning window only bounds *PASE* (§5.4.2.3), and closing CASE
+///   too would brick every fabric already on the device.
+/// - `UnsecuredFlow::Ignore` passes through unchanged — it was never a flow
+///   this runtime starts in the first place (see its variant doc), so the
+///   window has nothing to say about it.
+fn admit_unsecured(flow: UnsecuredFlow, window_open: bool) -> Option<UnsecuredFlow> {
+    match flow {
+        UnsecuredFlow::Pase if !window_open => None,
+        other => Some(other),
+    }
+}
+
+/// The commissioning window's upper bound (spec §5.4.2.3: the PASE window a
+/// commissioner may use to complete commissioning must not exceed 15
+/// minutes). This runtime has no way to *extend* an already-open window
+/// (no Administrator Commissioning cluster — out of scope for M2, see
+/// `CommissioningWindow`'s doc), so this is simply the one duration a
+/// freshly opened window ever runs for.
+const COMMISSIONING_WINDOW_DURATION: Duration = Duration::from_secs(15 * 60);
+
+/// Whether new PASE attempts are currently admitted (Task 14). Boot-time
+/// policy (decided once in `run`, before the loop starts): `Open` if
+/// `comm_server.fabrics()` is empty (a never-commissioned, or freshly wiped,
+/// device — closing the window here would brick it, since M2 has no way to
+/// reopen one), `Closed` if any fabric is already installed (this device
+/// was commissioned in a previous run; a fresh commissioner has no business
+/// PASE-ing into it again). Beyond that starting point, the window only
+/// ever moves `Open -> Closed`, on either of two events: the 15-minute
+/// deadline lapsing (`commissioning_window_deadline`) or
+/// `CommissioningComplete` succeeding (`serve_secured_message`) — both also
+/// send the mDNS commissionable goodbye (`set_commissionable(None)`, wired
+/// since Task 8).
+///
+/// **Reopening is out of scope for M2.** The spec's real reopen mechanism
+/// is the Administrator Commissioning cluster's `OpenCommissioningWindow`
+/// command, which this runtime does not implement; the only way this
+/// process re-admits PASE is a full restart (which re-runs the boot-time
+/// policy above against whatever's on disk at that point).
+#[derive(Debug, Clone, Copy)]
+enum CommissioningWindow {
+    Open { until: Instant },
+    Closed,
+}
+
+impl CommissioningWindow {
+    /// Whether `admit_unsecured` should currently let a `Pase` flow
+    /// through. Doesn't re-check `until` against `Instant::now()` — the
+    /// `select!` loop's `commissioning_window_deadline` branch is what
+    /// transitions `Open -> Closed` exactly at that instant (same
+    /// single-threaded-loop invariant `fail_safe_expiry_deadline`'s doc
+    /// comment relies on), so by construction this is never read past its
+    /// own deadline while still reporting `Open`.
+    fn is_open(&self) -> bool {
+        matches!(self, CommissioningWindow::Open { .. })
+    }
+}
+
+/// Same shape as `mdns_retry_deadline`/`fail_safe_expiry_deadline`: resolves
+/// once at the open window's deadline, or never (`std::future::pending`)
+/// once it's `Closed`. This `select!` branch is the mechanism that actually
+/// enforces spec §5.4.2.3's 15-minute PASE upper bound — nothing else polls
+/// `until` against the clock.
+async fn commissioning_window_deadline(window: &CommissioningWindow) {
+    match window {
+        CommissioningWindow::Open { until } => tokio::time::sleep_until(*until).await,
+        CommissioningWindow::Closed => std::future::pending().await,
+    }
+}
+
 /// A random non-zero u16 — local (responder) session id for a fresh PASE or
 /// CASE attempt. Not collision-checked against a previous session: this
 /// runtime keeps at most one "current session" alive at a time (see module
@@ -421,6 +506,17 @@ pub(crate) async fn run(
     // since its reports could only ever go out over the session it was
     // subscribed on.
     let mut subscription: Option<ActiveSubscription> = None;
+    // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
+    // doc comment): open only for a device with no fabric yet — one already
+    // on disk means this device was commissioned in an earlier run, so a
+    // fresh PASE attempt now has no business succeeding.
+    let mut window = if comm_server.fabrics().is_empty() {
+        CommissioningWindow::Open {
+            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+        }
+    } else {
+        CommissioningWindow::Closed
+    };
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
@@ -472,6 +568,14 @@ pub(crate) async fn run(
                         ?flow,
                         "unsecured datagram received"
                     );
+                    let Some(flow) = admit_unsecured(flow, window.is_open()) else {
+                        tracing::debug!(
+                            peer = %peer,
+                            exchange_id = proto.exchange_id,
+                            "PASE datagram dropped: commissioning window closed"
+                        );
+                        continue;
+                    };
                     match flow {
                         UnsecuredFlow::Pase => {
                             let local_session_id = random_session_id();
@@ -574,6 +678,7 @@ pub(crate) async fn run(
                         comm_server: &comm_server,
                         mdns: mdns_ctx.as_ref(),
                         subscription: &mut subscription,
+                        window: &mut window,
                     },
                 )
                 .await;
@@ -635,9 +740,29 @@ pub(crate) async fn run(
                             comm_server: &comm_server,
                             mdns: mdns_ctx.as_ref(),
                             subscription: &mut subscription,
+                            window: &mut window,
                         },
                     )
                     .await;
+                }
+            }
+            () = commissioning_window_deadline(&window) => {
+                // Spec §5.4.2.3's 15-minute PASE window upper bound has
+                // elapsed: close the window (no more PASE admitted — see
+                // `admit_unsecured`) and send the same commissionable-advert
+                // goodbye `CommissioningComplete` sends on success
+                // (`set_commissionable(None)`, goodbye wired since Task 8).
+                // No fabric rollback here — unlike fail-safe expiry, an
+                // already-*established* PASE session (if one happened to be
+                // mid-flight right at the deadline) is left alone; this
+                // branch only stops *new* PASE attempts from being admitted
+                // going forward.
+                tracing::info!(
+                    "commissioning window expired (15-minute PASE upper bound) — closing"
+                );
+                window = CommissioningWindow::Closed;
+                if let Some(ctx) = mdns_ctx.as_ref() {
+                    ctx.mdns.set_commissionable(None).await;
                 }
             }
             () = fail_safe_expiry_deadline(&comm_server) => {
@@ -762,6 +887,7 @@ async fn serve_secured_message(
         comm_server,
         mdns,
         subscription,
+        window,
     } = state;
     let node: &mut Node = node;
     let comm_server: &CommissioningServer = comm_server;
@@ -877,6 +1003,14 @@ async fn serve_secured_message(
                         if let Some(ctx) = mdns {
                             ctx.mdns.set_commissionable(None).await;
                         }
+                        // Task 14: CommissioningComplete is the other event
+                        // (besides the 15-minute deadline in `run`'s
+                        // `select!`) that closes the commissioning window —
+                        // a controller that just finished commissioning has
+                        // no reason to PASE in again, and refusing it stops
+                        // a second commissioner from racing in during
+                        // whatever's left of the original 15 minutes.
+                        **window = CommissioningWindow::Closed;
                     }
                 }
             }
@@ -897,6 +1031,12 @@ struct ServeState<'a> {
     /// The node's single active subscription, if any (see
     /// `net::subscription`'s module doc for why there's only one).
     subscription: &'a mut Option<ActiveSubscription>,
+    /// The commissioning window (Task 14) — mutated here only by
+    /// `CommissioningComplete` succeeding (`serve_secured_message` closes
+    /// it, same milestone that already tears down the mDNS commissionable
+    /// advert); the 15-minute-elapsed close happens in `run`'s own
+    /// `select!` branch, outside any `ServeState`.
+    window: &'a mut CommissioningWindow,
 }
 
 /// Resolves once at the active subscription's next report deadline, or
@@ -1416,6 +1556,45 @@ mod tests {
         }
     }
 
+    // ── commissioning window admission (Task 14) ────────────────────────
+
+    #[test]
+    fn admit_unsecured_drops_pase_when_window_closed() {
+        assert_eq!(admit_unsecured(UnsecuredFlow::Pase, false), None);
+    }
+
+    #[test]
+    fn admit_unsecured_allows_pase_when_window_open() {
+        assert_eq!(
+            admit_unsecured(UnsecuredFlow::Pase, true),
+            Some(UnsecuredFlow::Pase)
+        );
+    }
+
+    #[test]
+    fn admit_unsecured_allows_case_regardless_of_window() {
+        assert_eq!(
+            admit_unsecured(UnsecuredFlow::Case, true),
+            Some(UnsecuredFlow::Case)
+        );
+        assert_eq!(
+            admit_unsecured(UnsecuredFlow::Case, false),
+            Some(UnsecuredFlow::Case)
+        );
+    }
+
+    #[test]
+    fn admit_unsecured_allows_ignore_regardless_of_window() {
+        assert_eq!(
+            admit_unsecured(UnsecuredFlow::Ignore, true),
+            Some(UnsecuredFlow::Ignore)
+        );
+        assert_eq!(
+            admit_unsecured(UnsecuredFlow::Ignore, false),
+            Some(UnsecuredFlow::Ignore)
+        );
+    }
+
     // ── mDNS retry backoff (review fix round 1, item 1) ────────────────
 
     #[tokio::test(start_paused = true)]
@@ -1461,6 +1640,44 @@ mod tests {
             () = mdns_retry_deadline(&none) => panic!("deadline resolved with no retry pending"),
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
+    }
+
+    // ── commissioning window deadline (Task 14) ─────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn commissioning_window_deadline_never_resolves_when_closed() {
+        // Same "doesn't hang" technique as the mDNS retry/fail-safe tests
+        // above: if this ever resolved, the closed-window branch would
+        // spuriously fire and start dropping PASE that should have been
+        // fine.
+        tokio::select! {
+            () = commissioning_window_deadline(&CommissioningWindow::Closed) => {
+                panic!("deadline resolved for a closed window")
+            }
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commissioning_window_deadline_resolves_once_the_open_window_lapses() {
+        let window = CommissioningWindow::Open {
+            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+        };
+        tokio::select! {
+            () = commissioning_window_deadline(&window) => {}
+            () = tokio::time::sleep(COMMISSIONING_WINDOW_DURATION + Duration::from_secs(1)) => {
+                panic!("commissioning_window_deadline never resolved for an open window")
+            }
+        }
+    }
+
+    #[test]
+    fn commissioning_window_is_open_reports_correctly() {
+        assert!(CommissioningWindow::Open {
+            until: Instant::now() + COMMISSIONING_WINDOW_DURATION
+        }
+        .is_open());
+        assert!(!CommissioningWindow::Closed.is_open());
     }
 
     // ── fail-safe expiry deadline (Task 8) ──────────────────────────────
@@ -1697,6 +1914,7 @@ mod tests {
                 comm_server: &comm_server,
                 mdns: None,
                 subscription: &mut None,
+                window: &mut CommissioningWindow::Closed,
             },
         )
         .await;
@@ -1936,6 +2154,7 @@ mod tests {
                 comm_server: &comm_server,
                 mdns: None,
                 subscription: &mut None,
+                window: &mut CommissioningWindow::Closed,
             },
         )
         .await;
@@ -2093,6 +2312,7 @@ mod tests {
                 comm_server: &comm_server,
                 mdns: None,
                 subscription: &mut subscription,
+                window: &mut CommissioningWindow::Closed,
             },
         )
         .await;
@@ -2391,6 +2611,7 @@ mod tests {
                 comm_server: &comm_server,
                 mdns: None,
                 subscription: &mut None,
+                window: &mut CommissioningWindow::Closed,
             },
         )
         .await;

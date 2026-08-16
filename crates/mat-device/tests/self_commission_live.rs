@@ -201,6 +201,51 @@ async fn fail_safe_expiry_gates_add_noc() {
     );
 }
 
+/// Task 14, brief Step 3: proves the commissioning window actually closes
+/// on `CommissioningComplete` — a fresh PASE attempt against a device that
+/// just finished commissioning must get **silence**, not a `StatusReport`
+/// (申し送り 7 項's DoS-hardening posture — see `admit_unsecured`'s doc
+/// comment in `net::runtime`). `mat_controller::pase::establish`'s own
+/// `MrpConfig` retry budget (`support::fast_cfg`) is what bounds this
+/// test's wait: with nothing answering, `establish` exhausts its retries
+/// and returns `Err` in well under a second — the "timeout with no
+/// response" the brief calls for, expressed through the initiator's own
+/// give-up rather than a raw manual timeout race.
+#[tokio::test]
+async fn pase_after_commissioning_complete_is_silently_dropped() {
+    let store_dir = tempfile::tempdir().expect("tempdir");
+    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
+    let addr = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        device.local_addr().port(),
+    );
+    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
+        .expect("device should have written its PAA DER at Device::new");
+
+    let device_task = tokio::spawn(async move {
+        let _ = device.run().await;
+    });
+
+    let fabric =
+        CommissioningFabric::generate(0x3344_5566, ADMIN_NODE_ID).expect("fabric generate");
+    // Reaches CommissioningComplete — the window should close right there,
+    // well before this device's 15-minute boot-time window would have
+    // elapsed on its own.
+    let _session = commission_directly(addr, &paa_der, &fabric).await;
+
+    let pase_transport = Arc::new(Transport::Udp(Arc::new(
+        UdpTransport::bind().await.unwrap(),
+    )));
+    let result = mat_controller::pase::establish(pase_transport, addr, PASSCODE, &fast_cfg()).await;
+    assert!(
+        result.is_err(),
+        "PASE against an already-commissioned device (window closed) must not succeed"
+    );
+
+    device_task.abort();
+    let _ = device_task.await;
+}
+
 /// Live full-mDNS variant (mirrors `scripts/e2e-device-m1.sh`, which drives
 /// the real `mat` binary instead of `mat_controller::commissioning`
 /// directly). `#[ignore]`d for the same reason as `discover_live.rs`:

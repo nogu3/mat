@@ -253,6 +253,25 @@ impl Device {
     /// bringing mDNS up in the background on a bounded backoff (see
     /// `net::runtime`'s `MdnsRetry`) rather than giving up or returning an
     /// error.
+    ///
+    /// **Commissioning window policy** (Task 14, spec §5.4.2.3): PASE is
+    /// only admitted while the window is open. The window's *starting*
+    /// state is decided once, right here, from `self.comm_server.fabrics()`
+    /// as it stands at the moment `run` is called — empty (never
+    /// commissioned, or a wiped `store_dir`) opens it for 15 minutes;
+    /// non-empty (this device already has a fabric from an earlier run)
+    /// starts it closed, since a fresh commissioner has no legitimate
+    /// reason to PASE into an already-commissioned device. From there the
+    /// window only ever closes — on the 15-minute deadline or on
+    /// `CommissioningComplete` succeeding — and never reopens within this
+    /// process: **M2 has no Administrator Commissioning cluster**
+    /// (`OpenCommissioningWindow`/`RevokeCommissioning` are out of scope),
+    /// so the only way to admit PASE again is a full restart, which
+    /// re-evaluates this same policy against whatever's on disk at that
+    /// point. The window's live state (open-until-deadline vs. closed) is
+    /// tracked entirely inside `net::runtime::run`'s loop
+    /// (`CommissioningWindow`) — this doc only describes the policy, not
+    /// where the state lives.
     pub async fn run(self) -> Result<(), DeviceError> {
         crate::net::runtime::run(
             self.transport,
