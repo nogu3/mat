@@ -509,23 +509,42 @@ pub fn generate_dev_attestation(vid: u16, pid: u16) -> Result<DevAttestation, X5
     let pai_key = crate::case::random_p256_secret();
     let dac_key = crate::case::random_p256_secret();
 
-    let paa_der =
-        test_support::make_test_cert(b"dev paa", b"dev paa", &paa_key, &paa_key, true, None);
-    let pai_der = test_support::make_test_cert(
+    // basicConstraints は役割ごとに形が違う（`BasicConstraints` の doc
+    // 参照）。`make_test_cert` の bool 版では PAI の pathLenConstraint=0 と
+    // DAC の空 basicConstraints を表現できないので、ここは `_ext` を直接
+    // 呼ぶ — `make_test_cert` が組み立てる issuer/subject Name と keyUsage
+    // の割り当てはそのまま引き写している。
+    const KEY_USAGE_CA: u16 = 0x0060; // keyCertSign | cRLSign
+    const KEY_USAGE_LEAF: u16 = 0x0001; // digitalSignature
+    let paa_der = test_support::make_test_cert_ext(
+        b"dev paa",
+        b"dev paa",
+        &paa_key,
+        &paa_key,
+        test_support::BasicConstraints::Ca { path_len: None },
+        None,
+        None,
+        Some(KEY_USAGE_CA),
+    );
+    let pai_der = test_support::make_test_cert_ext(
         b"dev pai",
         b"dev paa",
         &pai_key,
         &paa_key,
-        true,
+        test_support::BasicConstraints::Ca { path_len: Some(0) },
+        None,
         Some((vid, pid)),
+        Some(KEY_USAGE_CA),
     );
-    let dac_der = test_support::make_test_cert(
+    let dac_der = test_support::make_test_cert_ext(
         b"dev dac",
         b"dev pai",
         &dac_key,
         &pai_key,
-        false,
+        test_support::BasicConstraints::EndEntity,
         Some((vid, pid)),
+        Some((vid, pid)),
+        Some(KEY_USAGE_LEAF),
     );
 
     let dac_private_key: [u8; 32] = dac_key.to_bytes().into();
@@ -557,6 +576,20 @@ pub(crate) mod test_support {
         OID_KEY_USAGE, OID_MATTER_PID, OID_MATTER_VID, OID_PRIME256V1, OID_SKID,
     };
 
+    /// 合成する証明書の basicConstraints 拡張の出し方。Matter spec §6.2.2
+    /// は attestation チェーンの役割ごとに違う形を要求し、chip の
+    /// `VerifyAttestationCertificateFormat` はそれを厳密に検査する:
+    /// PAA = `Ca { path_len: None }`（1 も可）、PAI = `Ca { path_len:
+    /// Some(0) }`、DAC = `EndEntity`（拡張自体は必須で、cA は DEFAULT
+    /// FALSE なので値は空 SEQUENCE）。`Absent` は「拡張を一切付けない」
+    /// フィクスチャ用で、実運用のチェーンでは使わない。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum BasicConstraints {
+        Absent,
+        EndEntity,
+        Ca { path_len: Option<u8> },
+    }
+
     /// 最小の自己/他者署名 X.509 証明書を合成する（DER バイト列）。
     /// `subject`/`issuer` は CN 文字列のバイト列。CA 証明書には
     /// BasicConstraints(CA=true) を、全証明書に SKID（subject 鍵の）と
@@ -583,7 +616,16 @@ pub(crate) mod test_support {
             issuer,
             subject_key,
             signer_key,
-            is_ca,
+            // 歴史的な意味づけを維持: `is_ca=false` は「basicConstraints を
+            // 付けない」フィクスチャ（`is_ca_is_none_when_extension_absent`
+            // / `rejects_paa_without_ca_flag` が依存している）。実運用の
+            // attestation チェーンは `generate_dev_attestation` が
+            // `make_test_cert_ext` を直接呼んで役割別の形を指定する。
+            if is_ca {
+                BasicConstraints::Ca { path_len: None }
+            } else {
+                BasicConstraints::Absent
+            },
             if is_ca { None } else { vid_pid },
             vid_pid,
             if is_ca { Some(0x0060) } else { Some(0x0001) },
@@ -602,7 +644,7 @@ pub(crate) mod test_support {
         issuer: &[u8],
         subject_key: &p256::SecretKey,
         signer_key: &p256::SecretKey,
-        emit_ca_basic_constraints: bool,
+        basic_constraints: BasicConstraints,
         issuer_vid_pid: Option<(u16, u16)>,
         subject_vid_pid: Option<(u16, u16)>,
         key_usage: Option<u16>,
@@ -639,8 +681,8 @@ pub(crate) mod test_support {
         ]);
 
         let mut ext_items: Vec<Vec<u8>> = Vec::new();
-        if emit_ca_basic_constraints {
-            ext_items.push(basic_constraints_ext());
+        if basic_constraints != BasicConstraints::Absent {
+            ext_items.push(basic_constraints_ext(basic_constraints));
         }
         ext_items.push(skid_ext(&subject_skid));
         ext_items.push(akid_ext(&signer_skid));
@@ -718,11 +760,21 @@ pub(crate) mod test_support {
         asn1::seq(&refs)
     }
 
-    fn basic_constraints_ext() -> Vec<u8> {
-        let value = asn1::seq(&[&asn1::boolean(true)]);
+    fn basic_constraints_ext(bc: BasicConstraints) -> Vec<u8> {
+        // cA は DEFAULT FALSE — DER では既定値を符号化しないので、end-entity
+        // 証明書の拡張値は空の SEQUENCE になる（実 DAC と同じ形）。
+        let mut items: Vec<Vec<u8>> = Vec::new();
+        if let BasicConstraints::Ca { path_len } = bc {
+            items.push(asn1::boolean(true));
+            if let Some(n) = path_len {
+                items.push(asn1::integer(&[n]));
+            }
+        }
+        let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
+        let value = asn1::seq(&refs);
         asn1::seq(&[
             &asn1::oid(OID_BASIC_CONSTRAINTS),
-            &asn1::boolean(true),
+            &asn1::boolean(true), // critical
             &asn1::octet_string(&value),
         ])
     }
@@ -886,6 +938,87 @@ mod tests {
         dac.verify_signed_by(&pai).unwrap();
         pai.verify_signed_by(&paa).unwrap();
         assert_eq!(dac.vid, Some(0xFFF1));
+    }
+
+    /// `generate_dev_attestation` のチェーンは chip の
+    /// `VerifyAttestationCertificateFormat`（`src/crypto/
+    /// CHIPCryptoPALOpenSSL.cpp`）を通らなければならない。そこでの
+    /// basicConstraints 規定（Matter spec §6.2.2）は役割ごとに違う:
+    ///
+    /// | 役割 | cA | pathLenConstraint |
+    /// | --- | --- | --- |
+    /// | PAA | TRUE | 省略 または 1 |
+    /// | PAI | TRUE | **0（必須）** |
+    /// | DAC | FALSE | 省略（ただし拡張自体は**必須**） |
+    ///
+    /// 我々の `parse_x509` は pathLen を読まず、拡張の欠落も
+    /// `is_ca: None` として許すため往復テストでは差が出ない。実際に
+    /// chip-tool は PAI の pathLen 欠落を `AttestationVerificationResult`
+    /// 203 (`kPaiFormatInvalid`) で弾いた（M2 ゲート 1 の実測 —
+    /// `docs/superpowers/plans/m2-chip-tool-probe.md`）ので、拡張の DER
+    /// バイト列を直接検査する。
+    #[test]
+    fn dev_attestation_chain_has_role_correct_basic_constraints() {
+        /// `der` の basicConstraints 拡張値（OCTET STRING の中身）を返す。
+        fn basic_constraints_value(der: &[u8]) -> Option<Vec<u8>> {
+            let mut r = DerReader::new(der);
+            let cert = r.expect(0x30).ok()?;
+            let mut c = DerReader::new(cert);
+            let tbs = c.expect(0x30).ok()?;
+            let mut t = DerReader::new(tbs);
+            // version[0], serial, sigalg, issuer, validity, subject, spki
+            t.expect(0xA0).ok()?;
+            t.expect(0x02).ok()?;
+            t.expect(0x30).ok()?;
+            t.expect(0x30).ok()?;
+            t.expect(0x30).ok()?;
+            t.expect(0x30).ok()?;
+            t.expect(0x30).ok()?;
+            let ext_wrap = t.expect(0xA3).ok()?;
+            let mut ew = DerReader::new(ext_wrap);
+            let exts = ew.expect(0x30).ok()?;
+            let mut list = DerReader::new(exts);
+            while !list.is_empty() {
+                let ext_seq = list.expect(0x30).ok()?;
+                let mut er = DerReader::new(ext_seq);
+                let oid = er.expect(0x06).ok()?;
+                let critical = if er.peek_tag() == Some(0x01) {
+                    er.expect(0x01).ok()?.first().copied().unwrap_or(0) != 0
+                } else {
+                    false
+                };
+                let value = er.expect(0x04).ok()?;
+                if oid == OID_BASIC_CONSTRAINTS {
+                    assert!(critical, "basicConstraints must be critical");
+                    return Some(value.to_vec());
+                }
+            }
+            None
+        }
+
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        // PAA: SEQUENCE { BOOLEAN TRUE }
+        assert_eq!(
+            basic_constraints_value(&da.paa_der).as_deref(),
+            Some(&[0x30, 0x03, 0x01, 0x01, 0xFF][..]),
+            "PAA basicConstraints"
+        );
+        // PAI: SEQUENCE { BOOLEAN TRUE, INTEGER 0 }
+        assert_eq!(
+            basic_constraints_value(&da.pai_der).as_deref(),
+            Some(&[0x30, 0x06, 0x01, 0x01, 0xFF, 0x02, 0x01, 0x00][..]),
+            "PAI basicConstraints must carry pathLenConstraint=0"
+        );
+        // DAC: SEQUENCE {}（cA は DEFAULT FALSE なので省略）— 拡張自体は必須
+        assert_eq!(
+            basic_constraints_value(&da.dac_der).as_deref(),
+            Some(&[0x30, 0x00][..]),
+            "DAC must carry an (empty) basicConstraints extension"
+        );
+        // 既存の意味づけ（is_ca パース）も壊さない。
+        assert_eq!(parse_x509(&da.paa_der).unwrap().is_ca, Some(true));
+        assert_eq!(parse_x509(&da.pai_der).unwrap().is_ca, Some(true));
+        assert_eq!(parse_x509(&da.dac_der).unwrap().is_ca, Some(false));
     }
 
     #[test]

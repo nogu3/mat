@@ -711,7 +711,15 @@ mod tests {
     use crate::case::random_p256_secret;
     use crate::crypto::sign_ecdsa_p256;
     use crate::tlv::{Tag, Writer};
-    use crate::x509::test_support::{make_test_cert, make_test_cert_ext};
+    use crate::x509::test_support::{make_test_cert, make_test_cert_ext, BasicConstraints};
+
+    /// これらのフィクスチャが使う basicConstraints は 2 種類だけ — CA 証明書
+    /// （pathLen 無し）か、拡張そのものを付けない leaf。役割別の厳密な形
+    /// （PAI の pathLenConstraint=0 等）は `generate_dev_attestation` の
+    /// 責務で、`x509::tests::
+    /// dev_attestation_chain_has_role_correct_basic_constraints` が検査する。
+    const CA_BC: BasicConstraints = BasicConstraints::Ca { path_len: None };
+    const NO_BC: BasicConstraints = BasicConstraints::Absent;
 
     struct Fixture {
         dac: Vec<u8>,
@@ -873,7 +881,7 @@ mod tests {
             b"pai",
             &dac_key,
             &pai_key,
-            false,
+            NO_BC,
             Some((0xFFF2, 0x8001)),
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
@@ -921,7 +929,7 @@ mod tests {
             b"paa",
             &fake_pai_key,
             &paa_key,
-            false,
+            NO_BC,
             None,
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
@@ -986,7 +994,7 @@ mod tests {
             b"pai",
             &dac_key,
             &pai_key,
-            true,
+            CA_BC,
             Some((0xFFF1, 0x8001)),
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
@@ -1115,7 +1123,7 @@ mod tests {
             b"paa",
             &pai_key,
             &paa_key,
-            true,
+            CA_BC,
             None,
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
@@ -1163,7 +1171,7 @@ mod tests {
             b"paa",
             &paa_key,
             &paa_key,
-            true,
+            CA_BC,
             None,
             None,
             Some(0x0001),
@@ -1228,7 +1236,7 @@ mod tests {
             b"pai",
             &dac_key,
             &pai_key,
-            false,
+            NO_BC,
             Some((0xFFF1, 0x8001)),
             Some((0xFFF1, 0x8001)),
             Some(0x0021), // digitalSignature|keyCertSign
@@ -1277,7 +1285,7 @@ mod tests {
             b"pai",
             &dac_key,
             &pai_key,
-            false,
+            NO_BC,
             Some((0xFFF1, 0x8001)),
             Some((0xFFF1, 0x8001)),
             None, // keyUsage 拡張なし
@@ -1316,7 +1324,7 @@ mod tests {
             b"paa",
             &paa_key,
             &paa_key,
-            true,
+            CA_BC,
             Some((0xFFF2, 0x8001)),
             Some((0xFFF2, 0x8001)),
             Some(0x0060),
@@ -1326,7 +1334,7 @@ mod tests {
             b"paa",
             &pai_key,
             &paa_key,
-            true,
+            CA_BC,
             Some((0xFFF2, 0x8001)),
             Some((0xFFF1, 0x8001)),
             Some(0x0060),
@@ -1385,7 +1393,7 @@ mod tests {
             b"pai",
             &dac_key,
             &pai_key,
-            false,
+            NO_BC,
             Some((0xFFF1, 0x8001)),
             None,
             Some(0x0001),
