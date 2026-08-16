@@ -1699,6 +1699,14 @@ pub fn decode_invoke_response_data(payload: &[u8]) -> Result<InvokeResponseData,
 /// `decode_invoke_response`/`decode_invoke_response_data`. Echoes the
 /// CommandPath (spec §8.9.4.2) so a well-behaved controller can correlate
 /// the status against the command it invoked.
+///
+/// `SuppressResponse`（タグ 0, bool）は spec §8.9.4 で **mandatory**。
+/// 自前の decoder は未知タグを読み飛ばすので欠けても往復は通るが、chip の
+/// `CommandSender::ProcessInvokeResponse` は `GetSuppressResponse` を必ず
+/// 引き、無ければ `CHIP Error 0x00000021: End of TLV` で invoke を失敗に
+/// する（M2 ゲート 1 の実測 —
+/// `docs/superpowers/plans/m2-chip-tool-probe.md`）。デバイス側の応答は
+/// 常に `false`（応答を出している時点で抑制していない）。
 pub fn encode_invoke_response_status(
     endpoint: u16,
     cluster: u32,
@@ -1708,6 +1716,7 @@ pub fn encode_invoke_response_status(
 ) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), false); // SuppressResponse — mandatory, see below
     w.start_array(Tag::Context(1)); // InvokeResponses
     w.start_struct(Tag::Anonymous); // InvokeResponseIB
     w.start_struct(Tag::Context(1)); // CommandStatusIB
@@ -1738,7 +1747,9 @@ pub fn encode_invoke_response_status(
 /// fields. `response_command` goes in the echoed CommandPath's CommandId,
 /// same field `decode_command_data_ib`'s caller ignores today (it only
 /// needs the fields) but that a spec-faithful controller would use to
-/// distinguish response commands from the invoked one.
+/// distinguish response commands from the invoked one. `SuppressResponse`
+/// は `encode_invoke_response_status` と同じ理由で常に書き出す（その doc
+/// コメント参照）。
 pub fn encode_invoke_response_data(
     endpoint: u16,
     cluster: u32,
@@ -1747,6 +1758,7 @@ pub fn encode_invoke_response_data(
 ) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
+    w.put_bool(Tag::Context(0), false); // SuppressResponse — mandatory, see below
     w.start_array(Tag::Context(1)); // InvokeResponses
     w.start_struct(Tag::Anonymous); // InvokeResponseIB
     w.start_struct(Tag::Context(0)); // CommandDataIB
@@ -2945,6 +2957,31 @@ mod tests {
         let payload = encode_invoke_response_status(1, 0x0006, 1, 0, None);
         let out = decode_invoke_response(&payload).unwrap();
         assert_eq!(out.status, 0);
+    }
+
+    /// `SuppressResponse`（タグ 0, bool）は InvokeResponseMessage の
+    /// **mandatory** フィールド（spec §8.9.4）。自前の decoder は未知タグを
+    /// 読み飛ばすので欠けていても往復テストは通るが、chip の
+    /// `CommandSender::ProcessInvokeResponse` は `GetSuppressResponse` で
+    /// タグを引きに行き、無ければ `CHIP Error 0x00000021: End of TLV` を
+    /// 返して invoke ごと失敗にする（M2 ゲート 1 の実測 —
+    /// `docs/superpowers/plans/m2-chip-tool-probe.md`）。ワイヤ形状を直接
+    /// 検査する。
+    #[test]
+    fn invoke_responses_always_carry_suppress_response() {
+        for payload in [
+            encode_invoke_response_status(1, 0x0006, 1, 0, None),
+            encode_invoke_response_data(1, CLUSTER_ON_OFF, 0x00, &[]),
+        ] {
+            let mut r = Reader::new(&payload);
+            expect_struct_start(&mut r).unwrap();
+            let first = r.next().unwrap().unwrap();
+            assert_eq!(
+                (first.tag, first.value),
+                (Tag::Context(0), Value::Bool(false)),
+                "InvokeResponseMessage must open with SuppressResponse=false: {payload:02X?}"
+            );
+        }
     }
 
     #[test]
