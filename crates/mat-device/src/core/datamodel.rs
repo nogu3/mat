@@ -290,9 +290,10 @@ impl Node {
             im::OPCODE_INVOKE_REQUEST => self.handle_invoke(payload, ctx),
             // Inbound StatusResponse reaching the generic dispatch is not
             // an unhandled action to reject — it's the initiator's ack of
-            // a ReportData chunk we just sent (Task 6's chunked-read flow,
-            // `net::runtime::serve_read_request_chunked`), which normally
-            // consumes it directly via the chunk-wait `session.recv` and
+            // a ReportData chunk we just sent (`net::runtime`'s chunked
+            // read and subscription priming flows), which normally
+            // consumes it directly in `await_peer_status_ok` (whose
+            // `recv_request` wait is what pulls it off the socket) and
             // never routes it through `handle_im` at all. But if one slips
             // through anyway — e.g. `serve_secured`'s buffered-request
             // drain replaying something left in `peer_initiated` through

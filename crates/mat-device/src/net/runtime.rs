@@ -1084,6 +1084,19 @@ async fn send_subscription_report(
     // scalar attributes, orders of magnitude below `REPORT_CHUNK_BUDGET`
     // (unlike priming, which can pull in whole certificate attributes).
     let payload = im::encode_report_data_entries(&entries, false, Some(sub.id), false);
+    if payload.len() > REPORT_CHUNK_BUDGET {
+        // Not a hard failure (MRP/`seal` will just fail to send it, and the
+        // subscription gets dropped below) — but a silent oversized report
+        // is exactly the failure mode a future non-scalar subscribed
+        // attribute would hit, so say so loudly enough to find in a log.
+        tracing::debug!(
+            subscription_id = sub.id,
+            payload_len = payload.len(),
+            budget = REPORT_CHUNK_BUDGET,
+            reports = entries.len(),
+            "subscription report exceeds the chunk budget — dirty reports are not chunked (see send_subscription_report)"
+        );
+    }
     let exchange_id = SecureSession::new_exchange_id();
     let send_result = session
         .send_reliable(
@@ -1129,39 +1142,104 @@ async fn send_subscription_report(
     true
 }
 
+/// How many mis-addressed peer-initiated messages `await_peer_status_ok`
+/// will set aside while waiting for its StatusResponse. Matches
+/// `SecureSession`'s own `peer_initiated` capacity: a peer that sends more
+/// unrelated requests than that inside one chunk's status wait is flooding,
+/// and the wait gives up rather than growing without bound.
+const MAX_DEFERRED_REQUESTS: usize = 32;
+
 /// Waits for the peer's `StatusResponse(0)` to a ReportData we just sent on
-/// an exchange **the peer initiated** (a priming chunk). `piggybacked` is
-/// whatever `reply_reliable` already had in hand — real controllers
-/// (`SecureSession::subscribe_wildcard`, chip-tool) answer with the
-/// StatusResponse itself rather than a standalone ack, so that's the
-/// normal path; the fallback reads one more peer-initiated message off the
-/// socket (`recv_request`, whose `AnyPeerInitiated` filter is the only one
-/// that can deliver a message on an exchange we didn't initiate — plain
-/// `recv` filters those out) and requires it to be on the same exchange.
+/// an exchange **the peer initiated** (a priming chunk, or a non-final read
+/// chunk). `piggybacked` is whatever `reply_reliable` already had in hand —
+/// real controllers (`SecureSession::subscribe_wildcard`, chip-tool) answer
+/// with the StatusResponse itself rather than a standalone ack, so that's
+/// the normal path; the fallback pulls messages with `recv_request`, whose
+/// `AnyPeerInitiated` filter is the only one that can deliver on an
+/// exchange we didn't initiate (plain `recv` requires `!initiator` and so
+/// would sit here until it timed out).
+///
+/// **Nothing pulled here is ever discarded.** A message on another exchange
+/// is a request the peer expects an answer to, and `screen_with` has
+/// already MRP-acked it — dropping it would make the peer wait forever with
+/// no retransmit to save it (the "ack-then-drop of cross-exchange secured
+/// requests" class of bug). Such messages are set aside and handed back to
+/// `SecureSession`'s buffer in their original order on the way out
+/// (`requeue_buffered_request`), where `serve_secured`'s drain picks them
+/// up once the chunked interaction finishes.
+///
+/// ## Why this loop terminates
+///
+/// Every iteration does exactly one of: return on a match, return on the
+/// deadline, or move one message from `SecureSession`'s buffer/socket into
+/// the local `deferred` vec — which is *not* fed back until the loop is
+/// over, so a set-aside message can never be re-pulled within this call.
+/// That leaves two bounded sources of iterations: the buffer, which is
+/// finite (`MAX_PEER_INITIATED_BUFFER`) and strictly shrinks as it is
+/// drained, and the socket, whose reads are bounded by `REPORT_STATUS_
+/// TIMEOUT` (`recv_request` gets the *remaining* time, so buffered
+/// messages — which return instantly — can't extend the total wait).
+/// `MAX_DEFERRED_REQUESTS` is a third, redundant bound covering a peer that
+/// floods new requests faster than they can be set aside.
 async fn await_peer_status_ok(
     session: &mut SecureSession,
     piggybacked: Option<mat_controller::exchange::IncomingMessage>,
     exchange_id: u16,
 ) -> bool {
-    let status_msg = match piggybacked {
-        Some(m) => m,
-        None => match session.recv_request(REPORT_STATUS_TIMEOUT).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(exchange_id, error = %e, "priming chunk: no StatusResponse");
-                return false;
+    let deadline = Instant::now() + REPORT_STATUS_TIMEOUT;
+    let mut candidate = piggybacked;
+    let mut deferred: Vec<mat_controller::exchange::IncomingMessage> = Vec::new();
+    let mut ok = false;
+
+    loop {
+        let msg = match candidate.take() {
+            Some(m) => m,
+            None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    tracing::debug!(
+                        exchange_id,
+                        "chunk ack: timed out waiting for StatusResponse"
+                    );
+                    break;
+                }
+                match session.recv_request(remaining).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(exchange_id, error = %e, "chunk ack: no StatusResponse");
+                        break;
+                    }
+                }
             }
-        },
-    };
-    if status_msg.proto.exchange_id != exchange_id {
+        };
+        if msg.proto.exchange_id == exchange_id {
+            ok = is_status_response_ok(&msg);
+            break;
+        }
+        // Someone else's exchange: not ours to answer here, not ours to
+        // throw away either.
         tracing::debug!(
             exchange_id,
-            got_exchange_id = status_msg.proto.exchange_id,
-            "priming chunk: StatusResponse arrived on another exchange"
+            other_exchange_id = msg.proto.exchange_id,
+            opcode = format_args!("0x{:02X}", msg.proto.opcode),
+            "chunk ack: setting aside a request on another exchange"
         );
-        return false;
+        deferred.push(msg);
+        if deferred.len() >= MAX_DEFERRED_REQUESTS {
+            tracing::debug!(
+                exchange_id,
+                "chunk ack: too many unrelated requests while waiting; giving up"
+            );
+            break;
+        }
     }
-    is_status_response_ok(&status_msg)
+
+    // Back to the front of the buffer, oldest first (push each to the
+    // front in reverse, so the head ends up being the one pulled first).
+    for msg in deferred.into_iter().rev() {
+        session.requeue_buffered_request(msg);
+    }
+    ok
 }
 
 /// Whether `msg` is a `StatusResponse(SUCCESS)` — the acknowledgement
@@ -2039,5 +2117,293 @@ mod tests {
         let sub = subscription.expect("a completed subscribe must register the subscription");
         assert_eq!(sub.id, sr.subscription_id);
         assert_eq!(sub.max_interval, Duration::from_secs(30));
+    }
+    /// Fix round 1 (code review): a request that lands on *another*
+    /// exchange while the device is waiting for a chunk's
+    /// `StatusResponse(0)` must survive that wait and still be served.
+    ///
+    /// `screen_with` MRP-acks every authenticated request the moment it
+    /// decodes it, delivery filter or not — so a request pulled out of the
+    /// buffer by the status wait and then thrown away is gone for good: the
+    /// peer has its ack and will never retransmit ("ack-then-drop of
+    /// cross-exchange secured requests"). `await_peer_status_ok` therefore
+    /// sets such messages aside and hands them back
+    /// (`SecureSession::requeue_buffered_request`) for `serve_secured`'s
+    /// drain.
+    ///
+    /// Drives the exact interleaving by hand: the controller answers the
+    /// first chunk with a *standalone* ack (forcing the fallback wait
+    /// instead of the piggybacked fast path), then squeezes a ReadRequest
+    /// on a second exchange in before the chunk's StatusResponse. The read
+    /// must still complete, and the second exchange must still get its
+    /// ReportData.
+    ///
+    /// This also exercises the wait loop's termination: every *subsequent*
+    /// chunk's status wait pulls that same requeued request out of the
+    /// buffer again, sets it aside again, and has to fall through to the
+    /// socket for the real StatusResponse. A loop that re-consumed its own
+    /// set-aside messages would spin here, and one that gave up on them
+    /// would stall the read — both show up as the controller's 20s
+    /// "device went silent" timeout rather than a passing test.
+    #[tokio::test]
+    async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
+        use mat_controller::crypto::{open_message, seal_message};
+        use mat_controller::message::Destination;
+        use mat_controller::session::SessionKeys;
+        use mat_controller::tlv::{Tag, Writer};
+        use mat_controller::transport::UdpTransport;
+
+        use crate::core::datamodel::{ClusterHandler, InvokeReply};
+        use crate::core::fabric_store::FabricStore;
+
+        const LOCAL_SID: u16 = 0xAAAA;
+        const PEER_SID: u16 = 0xBBBB;
+        const CTRL_NODE: u64 = 1;
+        const DEV_NODE: u64 = 2;
+        const I2R: [u8; 16] = [0x11; 16];
+        const R2I: [u8; 16] = [0x22; 16];
+        const EX_READ: u16 = 0x40;
+        const EX_OTHER: u16 = 0x41;
+
+        struct FatHandler {
+            cluster: u32,
+        }
+        impl ClusterHandler for FatHandler {
+            fn cluster_id(&self) -> u32 {
+                self.cluster
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![1]
+            }
+            fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+                if attribute != 1 {
+                    return None;
+                }
+                let mut w = Writer::new();
+                w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
+                Some(w.finish())
+            }
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields_tlv: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+        }
+
+        fn encode_full_wildcard_read_request() -> Vec<u8> {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(0));
+            w.start_list(Tag::Anonymous);
+            w.end_container();
+            w.end_container();
+            w.put_bool(Tag::Context(3), true);
+            w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
+            w.end_container();
+            w.finish()
+        }
+
+        let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let dev_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let dev_addr = dev_transport.local_addr().unwrap();
+
+        let mut session = SecureSession::new_device_role(
+            Arc::clone(&dev_transport),
+            controller.local_addr().unwrap(),
+            LOCAL_SID,
+            PEER_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            DEV_NODE,
+            CTRL_NODE,
+        );
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(
+            0,
+            Box::new(FatHandler {
+                cluster: 0x9999_0001,
+            }),
+        );
+        node.add_cluster(
+            0,
+            Box::new(FatHandler {
+                cluster: 0x9999_0002,
+            }),
+        );
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let comm_server = CommissioningServer::new(dev, FabricStore::new());
+
+        let ctrl_task = tokio::spawn(async move {
+            let mut counter = 10u32;
+            let mut send = |opcode: u8,
+                            protocol_id: u16,
+                            exchange_id: u16,
+                            needs_ack: bool,
+                            acked: Option<u32>,
+                            payload: &[u8]| {
+                let header = MessageHeader {
+                    session_id: LOCAL_SID,
+                    security_flags: 0,
+                    message_counter: counter,
+                    source_node_id: None,
+                    destination: Destination::None,
+                };
+                let proto = ProtocolHeader {
+                    initiator: true,
+                    needs_ack,
+                    acked_counter: acked,
+                    opcode,
+                    exchange_id,
+                    protocol_id,
+                    vendor_id: None,
+                };
+                counter += 1;
+                seal_message(&I2R, &header, &proto, payload, CTRL_NODE).unwrap()
+            };
+
+            let dg = send(
+                im::OPCODE_READ_REQUEST,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                EX_READ,
+                false,
+                None,
+                &encode_full_wildcard_read_request(),
+            );
+            controller.send_to(&dg, dev_addr).await.unwrap();
+
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let mut chunks = 0usize;
+            let mut interleaved_sent = false;
+            let mut interleaved_answered = false;
+            let mut read_done = false;
+
+            // One loop for both exchanges: the device's answer to the
+            // interleaved read can only arrive after the chunked read
+            // finishes (the drain runs last), but the loop doesn't assume
+            // that ordering.
+            while !(read_done && interleaved_answered) {
+                let (n, from) =
+                    tokio::time::timeout(Duration::from_secs(20), controller.recv_from(&mut buf))
+                        .await
+                        .expect("device went silent")
+                        .unwrap();
+                let (h, p, payload) = open_message(&R2I, &buf[..n], DEV_NODE).unwrap();
+                if p.protocol_id == PROTOCOL_ID_SECURE_CHANNEL {
+                    continue; // the device's own standalone acks
+                }
+                assert_eq!(p.opcode, im::OPCODE_REPORT_DATA);
+
+                if p.exchange_id == EX_OTHER {
+                    let rd = im::decode_report_data_message(&payload).unwrap();
+                    assert_eq!(
+                        rd.reports[0].attribute,
+                        Some(mat_controller::im::ATTR_VENDOR_ID),
+                        "the interleaved read must be answered, not dropped"
+                    );
+                    interleaved_answered = true;
+                    let ack = send(
+                        OPCODE_MRP_STANDALONE_ACK,
+                        PROTOCOL_ID_SECURE_CHANNEL,
+                        EX_OTHER,
+                        false,
+                        Some(h.message_counter),
+                        &[],
+                    );
+                    controller.send_to(&ack, from).await.unwrap();
+                    continue;
+                }
+
+                assert_eq!(p.exchange_id, EX_READ);
+                let rd = im::decode_report_data_message(&payload).unwrap();
+                chunks += 1;
+
+                // Always a *standalone* ack first — never a piggybacked
+                // StatusResponse — so the device has to take
+                // `await_peer_status_ok`'s fallback wait.
+                let ack = send(
+                    OPCODE_MRP_STANDALONE_ACK,
+                    PROTOCOL_ID_SECURE_CHANNEL,
+                    EX_READ,
+                    false,
+                    Some(h.message_counter),
+                    &[],
+                );
+                controller.send_to(&ack, from).await.unwrap();
+
+                if !rd.more_chunks {
+                    read_done = true;
+                    continue;
+                }
+
+                // ...and, exactly once, a request on another exchange
+                // squeezed in while the device is inside that wait.
+                if !interleaved_sent {
+                    interleaved_sent = true;
+                    let other = send(
+                        im::OPCODE_READ_REQUEST,
+                        PROTOCOL_ID_INTERACTION_MODEL,
+                        EX_OTHER,
+                        true, // needs_ack: this is the message screen_with acks then buffers
+                        None,
+                        &im::encode_read_request(
+                            0,
+                            mat_controller::im::CLUSTER_BASIC_INFORMATION,
+                            mat_controller::im::ATTR_VENDOR_ID,
+                        ),
+                    );
+                    controller.send_to(&other, from).await.unwrap();
+                }
+
+                let ok = send(
+                    im::OPCODE_STATUS_RESPONSE,
+                    PROTOCOL_ID_INTERACTION_MODEL,
+                    EX_READ,
+                    false,
+                    None,
+                    &im::encode_status_response(0),
+                );
+                controller.send_to(&ok, from).await.unwrap();
+            }
+            (chunks, interleaved_answered)
+        });
+
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+        serve_secured(
+            &buf[..n],
+            from,
+            &mut session,
+            0,
+            &mut ServeState {
+                node: &mut node,
+                comm_server: &comm_server,
+                mdns: None,
+                subscription: &mut None,
+            },
+        )
+        .await;
+
+        let (chunks, interleaved_answered) =
+            tokio::time::timeout(Duration::from_secs(30), ctrl_task)
+                .await
+                .expect("controller task hung — an interleaved request was probably dropped")
+                .unwrap();
+        assert!(
+            chunks >= 2,
+            "expected a chunked read, got {chunks} chunk(s)"
+        );
+        assert!(interleaved_answered);
     }
 }

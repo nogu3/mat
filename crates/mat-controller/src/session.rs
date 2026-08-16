@@ -1196,6 +1196,30 @@ impl SecureSession {
         self.peer_initiated.pop_front()
     }
 
+    /// `take_buffered_request`/`recv_request` の鏡像: 取り出したものの今は
+    /// 処理できないピア発リクエストを待避バッファの**先頭**へ戻す
+    /// （`pop_front` の逆なので、戻した直後の `take_buffered_request` は
+    /// それを返す = 取り出す前と同じ順序が保たれる）。
+    ///
+    /// 用途は「特定の exchange の応答だけを待っている最中に、別 exchange の
+    /// リクエストを引いてしまった」ケース（device-role ランタイムのチャンク
+    /// StatusResponse 待ち `await_peer_status_ok`）。`screen_with` は配送
+    /// フィルタに関わらず認証済み needs_ack メッセージを ack 済みなので、
+    /// ここで捨てるとピアは再送せず永久に失われる（「cross-exchange secured
+    /// request の ack-then-drop」と同じ事故）。捨てずに戻し、呼び出し元の
+    /// drain（`serve_secured`）に拾わせる。
+    ///
+    /// バッファ上限に達しているときは**最新**（`push_back` 側）を落として
+    /// でも戻す — 戻そうとしている方が古く、ピアから見て先に送ったリクエスト
+    /// だから。
+    pub fn requeue_buffered_request(&mut self, msg: IncomingMessage) {
+        if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
+            tracing::warn!("peer-initiated request buffer full on requeue; dropping newest");
+            self.peer_initiated.pop_back();
+        }
+        self.peer_initiated.push_front(msg);
+    }
+
     /// デバイス役: `request` が乗っていた exchange（`request.proto.exchange_id`）
     /// へ `initiator:false` で応答する。`respond_status`（IM StatusResponse 専用）
     /// の一般形 — 任意の `protocol_id`/`opcode`/`payload` を送れる。UDP では
