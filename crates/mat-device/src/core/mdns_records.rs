@@ -349,39 +349,69 @@ pub fn encode_unsolicited_announcement(
     commissionable: Option<&CommissionableAdvert>,
     operational: &[OperationalAdvert],
 ) -> Vec<u8> {
+    encode_announcement_or_goodbye(commissionable, operational, None)
+}
+
+/// Builds one "goodbye" packet (RFC 6762 §8.3/§10.1: a departing responder
+/// announces its records one last time with TTL=0, telling peers to purge
+/// them from cache immediately rather than waiting out the normal TTL).
+/// Same record set, same order, as [`encode_unsolicited_announcement`] for
+/// the same adverts — every TTL is forced to 0 instead of each record
+/// type's normal value. The caller (`net::mdns`) sends this *before*
+/// removing an advert (clearing commissionable, or `remove_operational`),
+/// per the same "send twice, ~1s apart" §8.3 cadence as a normal
+/// announcement.
+pub fn encode_goodbye(
+    commissionable: Option<&CommissionableAdvert>,
+    operational: &[OperationalAdvert],
+) -> Vec<u8> {
+    encode_announcement_or_goodbye(commissionable, operational, Some(0))
+}
+
+/// Shared record-set builder for [`encode_unsolicited_announcement`] and
+/// [`encode_goodbye`] — identical shape either way, differing only in
+/// whether every record's TTL is forced to `ttl_override` (goodbye,
+/// always `Some(0)`) or left at its normal per-record-type value
+/// (announcement, `None`).
+fn encode_announcement_or_goodbye(
+    commissionable: Option<&CommissionableAdvert>,
+    operational: &[OperationalAdvert],
+    ttl_override: Option<u32>,
+) -> Vec<u8> {
+    let ttl = |normal: u32| ttl_override.unwrap_or(normal);
     let mut answers = Vec::new();
     if let Some(ad) = commissionable {
         let names = commissionable_names(ad);
         answers.push(Rr::Ptr {
             owner: names.service.clone(),
             target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Ptr {
             owner: names.long_subtype.clone(),
             target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Ptr {
             owner: names.short_subtype.clone(),
             target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Srv {
             owner: names.instance_full.clone(),
             target: names.host_full.clone(),
             port: ad.port,
-            ttl: HOST_TTL,
+            ttl: ttl(HOST_TTL),
         });
         answers.push(Rr::Txt {
             owner: names.instance_full.clone(),
             strings: commissionable_txt(ad),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Aaaa {
             owner: names.host_full.clone(),
             addr: ad.addr_v6,
-            ttl: HOST_TTL,
+            ttl: ttl(HOST_TTL),
         });
     }
     for ad in operational {
@@ -389,23 +419,23 @@ pub fn encode_unsolicited_announcement(
         answers.push(Rr::Ptr {
             owner: names.service.clone(),
             target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Srv {
             owner: names.instance_full.clone(),
             target: names.host_full.clone(),
             port: ad.port,
-            ttl: HOST_TTL,
+            ttl: ttl(HOST_TTL),
         });
         answers.push(Rr::Txt {
             owner: names.instance_full.clone(),
             strings: operational_txt(),
-            ttl: PTR_TXT_TTL,
+            ttl: ttl(PTR_TXT_TTL),
         });
         answers.push(Rr::Aaaa {
             owner: names.host_full.clone(),
             addr: ad.addr_v6,
-            ttl: HOST_TTL,
+            ttl: ttl(HOST_TTL),
         });
     }
     encode_message(&answers, &[], false)
@@ -828,6 +858,43 @@ mod tests {
         let (answers, _) = parse_response(&bytes);
         assert_eq!(answers.len(), 4);
         assert_eq!(answers[0].name, "_matter._tcp.local");
+    }
+
+    // ── goodbye (RFC 6762 §8.3: departure, TTL=0) ───────────────────────
+
+    #[test]
+    fn goodbye_bundles_the_same_records_as_announcement_but_all_ttl_zero() {
+        let c = commissionable();
+        let o = operational();
+        let announce = encode_unsolicited_announcement(Some(&c), std::slice::from_ref(&o));
+        let goodbye = encode_goodbye(Some(&c), std::slice::from_ref(&o));
+
+        let (announce_answers, _) = parse_response(&announce);
+        let (goodbye_answers, goodbye_additionals) = parse_response(&goodbye);
+
+        assert!(goodbye_additionals.is_empty());
+        // Same record set/order/types/names as the announcement — only TTL
+        // (and, incidentally, cache-flush bit shape) differs.
+        assert_eq!(goodbye_answers.len(), announce_answers.len());
+        for (a, g) in announce_answers.iter().zip(goodbye_answers.iter()) {
+            assert_eq!(a.rtype, g.rtype);
+            assert_eq!(a.name, g.name);
+            assert_eq!(a.rdata, g.rdata);
+            assert_eq!(g.ttl, 0, "goodbye record must have TTL=0");
+        }
+        // Sanity: the announcement itself did *not* already use TTL=0
+        // everywhere (otherwise this test wouldn't distinguish anything).
+        assert!(announce_answers.iter().any(|r| r.ttl != 0));
+    }
+
+    #[test]
+    fn goodbye_with_no_commissionable_only_advertises_operational_at_ttl_zero() {
+        let o = operational();
+        let bytes = encode_goodbye(None, std::slice::from_ref(&o));
+        let (answers, _) = parse_response(&bytes);
+        assert_eq!(answers.len(), 4);
+        assert_eq!(answers[0].name, "_matter._tcp.local");
+        assert!(answers.iter().all(|r| r.ttl == 0));
     }
 
     // ── question parsing ────────────────────────────────────────────────

@@ -1,26 +1,34 @@
 //! mDNS advertiser socket loop (spec §4.3; RFC 6762). Owns the `ff02::fb`
 //! multicast socket, holds the current commissionable/operational adverts
-//! behind a lock, and answers incoming queries with
-//! `core::mdns_records::encode_{commissionable,operational}_response`.
+//! behind a lock, answers incoming queries with
+//! `core::mdns_records::encode_{commissionable,operational}_response`, and
+//! proactively announces (RFC 6762 §8.3) or says goodbye (§10.1, TTL=0) on
+//! its own initiative whenever the advert set changes — see `announce`,
+//! `set_commissionable`, `add_operational`, `remove_operational` below.
 //!
 //! Thin by design: all RR framing lives in `core::mdns_records` (pure,
 //! tested independently — see that module's `tests`); this file is just the
 //! socket plumbing plus the "which advert(s) does this query name match"
-//! dispatch.
+//! dispatch, and, for the advert-mutating methods, the "which advert(s)
+//! changed" send.
 
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
 use crate::core::mdns_records::{
-    encode_commissionable_response, encode_operational_response, parse_questions,
-    CommissionableAdvert, OperationalAdvert,
+    encode_commissionable_response, encode_goodbye, encode_operational_response,
+    encode_unsolicited_announcement, parse_questions, CommissionableAdvert, OperationalAdvert,
 };
 
 const MDNS_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
+/// RFC 6762 §8.3/§10.1: an unsolicited announcement or a goodbye SHOULD be
+/// sent twice, about a second apart, to guard against a single lost packet.
+const ANNOUNCE_REPEAT_DELAY: Duration = Duration::from_secs(1);
 /// mDNS messages are conventionally bounded to the classic UDP-safe
 /// payload; our own responses are small (a handful of records), but an
 /// incoming query could in principle be larger (e.g. many known-answer PTR
@@ -93,28 +101,128 @@ impl MdnsAdvertiser {
         Ok(this)
     }
 
-    /// Sets (or clears, with `None`) the commissionable advert. Takes
-    /// effect for the next query the background loop receives — no
-    /// unsolicited announcement is sent on change (see module doc: this
-    /// driver is query-answering only, matching the brief's minimal scope;
-    /// `core::mdns_records::encode_unsolicited_announcement` exists and is
-    /// tested but this loop doesn't call it proactively yet).
-    pub fn set_commissionable(&self, ad: Option<CommissionableAdvert>) {
+    /// Cloned-out snapshot of the current advert set — taken out from
+    /// under both locks so a caller can build/send a message without
+    /// holding either lock across an `.await` (a `RwLockReadGuard` isn't
+    /// `Send`, and every send here happens on a socket, i.e. async).
+    fn snapshot(&self) -> (Option<CommissionableAdvert>, Vec<OperationalAdvert>) {
+        let commissionable = self
+            .commissionable
+            .read()
+            .expect("mdns commissionable lock poisoned")
+            .clone();
+        let operational = self
+            .operational
+            .read()
+            .expect("mdns operational lock poisoned")
+            .clone();
+        (commissionable, operational)
+    }
+
+    /// Multicast destination for announcements/goodbyes — the same group
+    /// and port `serve`'s non-QU replies already target.
+    fn multicast_dest(&self) -> SocketAddr {
+        SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, self.scope_id))
+    }
+
+    /// Sends `msg` to the multicast group once now, then again after
+    /// `ANNOUNCE_REPEAT_DELAY` via `tokio::spawn` (RFC 6762 §8.3/§10.1's
+    /// "send twice, ~1s apart" cadence — see that const's doc). The second
+    /// send is fire-and-forget: callers (an advert-mutating method
+    /// returning to `serve_secured_message`, ultimately) must not block an
+    /// extra second on every advert change, and losing the repeat to a
+    /// send error is no worse than losing the first send to packet loss —
+    /// either way the advertiser is still correct, just less redundant.
+    async fn send_doubled(self: &Arc<Self>, msg: Vec<u8>) {
+        let dest = self.multicast_dest();
+        let _ = self.sock.send_to(&msg, dest).await;
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(ANNOUNCE_REPEAT_DELAY).await;
+            let dest = this.multicast_dest();
+            let _ = this.sock.send_to(&msg, dest).await;
+        });
+    }
+
+    /// Sends an unsolicited multicast announcement (RFC 6762 §8.3) of the
+    /// current advert set — every record for whichever commissionable/
+    /// operational adverts are set right now, doubled per
+    /// `send_doubled`. Called after every advert-mutating method below,
+    /// and once more right after `bring_up_mdns` finishes its initial
+    /// setup (`net::runtime`) — so a device joining the network
+    /// proactively tells the LAN about itself instead of waiting to be
+    /// asked.
+    pub async fn announce(self: &Arc<Self>) {
+        let (commissionable, operational) = self.snapshot();
+        let msg = encode_unsolicited_announcement(commissionable.as_ref(), &operational);
+        self.send_doubled(msg).await;
+    }
+
+    /// Sets (or clears, with `None`) the commissionable advert, then
+    /// announces the resulting advert set. Clearing first sends a goodbye
+    /// (TTL=0, RFC 6762 §10.1) for the *outgoing* commissionable advert
+    /// alone (the operational adverts aren't changing here, so they're
+    /// left out of this particular goodbye) — so peers purge it from
+    /// cache immediately instead of waiting out its TTL — before the
+    /// state actually changes.
+    pub async fn set_commissionable(self: &Arc<Self>, ad: Option<CommissionableAdvert>) {
+        if ad.is_none() {
+            let old = self
+                .commissionable
+                .read()
+                .expect("mdns commissionable lock poisoned")
+                .clone();
+            if let Some(old) = old {
+                let goodbye = encode_goodbye(Some(&old), &[]);
+                self.send_doubled(goodbye).await;
+            }
+        }
         *self
             .commissionable
             .write()
             .expect("mdns commissionable lock poisoned") = ad;
+        self.announce().await;
     }
 
-    /// Adds one operational advert (e.g. one per commissioned fabric).
-    /// There is no corresponding remove — fabrics are removed by process
-    /// restart in this M1 scope (matches the brief's interface, which only
-    /// lists `add_operational`).
-    pub fn add_operational(&self, ad: OperationalAdvert) {
+    /// Adds one operational advert (e.g. one per commissioned fabric),
+    /// then announces the resulting advert set.
+    pub async fn add_operational(self: &Arc<Self>, ad: OperationalAdvert) {
         self.operational
             .write()
             .expect("mdns operational lock poisoned")
             .push(ad);
+        self.announce().await;
+    }
+
+    /// Removes the operational advert matching `(compressed_fabric_id,
+    /// node_id)` — e.g. a fail-safe expiry (`net::runtime`'s deadline
+    /// timer, Task 8) rolling back an uncommitted `AddNOC`'s fabric.
+    /// Sends a goodbye for *that* advert alone first (same
+    /// goodbye-before-state-change ordering as `set_commissionable(None)`
+    /// above), then removes it. A no-op if no advert currently matches —
+    /// defensive; not expected to happen given the only caller computes
+    /// the identity from the very entry it just removed from the fabric
+    /// store.
+    pub async fn remove_operational(self: &Arc<Self>, compressed_fabric_id: u64, node_id: u64) {
+        let cfid = compressed_fabric_id.to_be_bytes();
+        let matches =
+            |ad: &&OperationalAdvert| ad.compressed_fabric_id == cfid && ad.node_id == node_id;
+        let target = self
+            .operational
+            .read()
+            .expect("mdns operational lock poisoned")
+            .iter()
+            .find(matches)
+            .cloned();
+        let Some(target) = target else {
+            return;
+        };
+        let goodbye = encode_goodbye(None, std::slice::from_ref(&target));
+        self.send_doubled(goodbye).await;
+        self.operational
+            .write()
+            .expect("mdns operational lock poisoned")
+            .retain(|ad| !(ad.compressed_fabric_id == cfid && ad.node_id == node_id));
     }
 
     /// Receive loop: reads queries, matches each distinct question name

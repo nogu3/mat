@@ -246,10 +246,22 @@ async fn bring_up_mdns(
         product_id: config.product_id,
         port,
         addr_v6,
-    }));
+    }))
+    .await;
     for entry in comm_server.fabrics() {
-        mdns.add_operational(operational_advert(&entry, &hostname, port, addr_v6));
+        mdns.add_operational(operational_advert(&entry, &hostname, port, addr_v6))
+            .await;
     }
+    // Every `set_commissionable`/`add_operational` call above already
+    // announces the advert set as it stood at that point (see
+    // `MdnsAdvertiser`'s doc comment), so restoring N fabrics on a restart
+    // already sends N+1 announcements. One more explicit announce here
+    // covers the case that matters most for a *fresh* boot with zero
+    // restored fabrics — a bare commissionable-only advert still gets
+    // proactively broadcast the moment mDNS is up, not just answered on
+    // demand — and is otherwise harmless (RFC 6762 puts no limit on how
+    // often a responder may announce its own records).
+    mdns.announce().await;
 
     Ok(MdnsCtx {
         mdns,
@@ -310,6 +322,29 @@ impl MdnsRetry {
 async fn mdns_retry_deadline(retry: &Option<MdnsRetry>) {
     match retry {
         Some(r) => tokio::time::sleep_until(r.next_attempt_at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Same shape as `mdns_retry_deadline`, for the fail-safe window's expiry
+/// (spec §11.10.7.2): resolves once at `comm_server.fail_safe_deadline()`,
+/// or never (`std::future::pending`) when no window is currently open. This
+/// `select!` branch *is* the mechanism that bounds how long an uncommitted
+/// `AddNOC` fabric — and its operational mDNS advert — can stay visible
+/// after the fail-safe lapses without a following `CommissioningComplete`;
+/// no other code path (e.g. a lazy check on the next incoming command) also
+/// tears it down, so a device that never receives another datagram after
+/// the deadline still gets its goodbye sent, because this branch fires on
+/// its own regardless.
+///
+/// `CommissioningServer::fail_safe_deadline` returns a `std::time::Instant`
+/// (`core` stays free of any async-runtime dependency); `tokio::time::
+/// sleep_until` needs `tokio::time::Instant`, hence the `from_std`
+/// conversion — both wrap the same monotonic clock, so this is a lossless
+/// reinterpretation, not a resampling of "now".
+async fn fail_safe_expiry_deadline(comm_server: &CommissioningServer) {
+    match comm_server.fail_safe_deadline() {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending().await,
     }
 }
@@ -468,6 +503,32 @@ pub(crate) async fn run(
                     }
                 }
             }
+            () = fail_safe_expiry_deadline(&comm_server) => {
+                // `expire_fail_safe` is the one primitive that both decides
+                // "was there actually something to roll back" and does the
+                // rollback — `Some(entry)` only for the fabric an
+                // uncommitted `AddNOC` installed within this now-lapsed
+                // window (see its doc comment). Nothing to do here beyond
+                // that if it returns `None` (e.g. a plain `ArmFailSafe`
+                // that never called `AddNOC`, or this branch racing another
+                // caller that already consumed the same expiry) — the
+                // `select!` loop simply comes back around, and
+                // `fail_safe_expiry_deadline` reads as "no window open"
+                // (`std::future::pending`) on the next iteration.
+                if let Some(entry) = comm_server.expire_fail_safe() {
+                    tracing::info!(
+                        fabric_id = entry.fabric_id,
+                        node_id = entry.node_id,
+                        "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
+                    );
+                    if let Some(ctx) = mdns_ctx.as_ref() {
+                        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+                        ctx.mdns
+                            .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                            .await;
+                    }
+                }
+            }
         }
     }
 }
@@ -582,12 +643,14 @@ async fn serve_secured_message(
     let fabrics_after = comm_server.fabrics();
     if fabrics_after.len() > fabrics_before {
         if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
-            ctx.mdns.add_operational(operational_advert(
-                entry,
-                &ctx.hostname,
-                ctx.port,
-                ctx.addr_v6,
-            ));
+            ctx.mdns
+                .add_operational(operational_advert(
+                    entry,
+                    &ctx.hostname,
+                    ctx.port,
+                    ctx.addr_v6,
+                ))
+                .await;
         }
     }
 
@@ -600,7 +663,7 @@ async fn serve_secured_message(
                 if let Ok(outcome) = im::decode_invoke_response(&resp_payload) {
                     if outcome.status == im::STATUS_SUCCESS {
                         if let Some(ctx) = mdns {
-                            ctx.mdns.set_commissionable(None);
+                            ctx.mdns.set_commissionable(None).await;
                         }
                     }
                 }
@@ -790,6 +853,70 @@ mod tests {
             () = mdns_retry_deadline(&none) => panic!("deadline resolved with no retry pending"),
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
+    }
+
+    // ── fail-safe expiry deadline (Task 8) ──────────────────────────────
+    //
+    // Brief-scoped: only the `fail_safe_deadline()` Some/None → resolves/
+    // never-resolves mapping. Whether `expire_fail_safe()` then actually
+    // rolls back the right fabric is `core::commissioning`'s own test
+    // territory (Task 7); whether the runtime's `select!` branch drives the
+    // real mDNS goodbye end-to-end is Task 9's real-hardware gate.
+
+    fn fail_safe_test_server() -> CommissioningServer {
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        CommissioningServer::new(dev, crate::core::fabric_store::FabricStore::new())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fail_safe_expiry_deadline_never_resolves_when_not_armed() {
+        let comm_server = fail_safe_test_server();
+        assert!(comm_server.fail_safe_deadline().is_none());
+        // Same "doesn't hang" technique as
+        // `mdns_retry_deadline_never_resolves_when_no_retry_pending`.
+        tokio::select! {
+            () = fail_safe_expiry_deadline(&comm_server) => {
+                panic!("deadline resolved with no fail-safe armed")
+            }
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+    }
+
+    // Not `start_paused`, unlike the mDNS retry tests above: those poll a
+    // `tokio::time::Instant` deadline, which a paused runtime's virtual
+    // clock auto-advances through freely. `fail_safe_deadline()` returns a
+    // `std::time::Instant` (`core::commissioning` stays runtime-agnostic on
+    // purpose) — real wall-clock time, which a paused *tokio* clock does
+    // not advance. `ArmFailSafe`'s `ExpiryLengthSeconds` also bottoms out
+    // at whole seconds, so this test just eats one real second rather than
+    // fighting the two clocks.
+    #[tokio::test]
+    async fn fail_safe_expiry_deadline_resolves_once_the_armed_window_passes() {
+        use mat_controller::commissioning::{encode_arm_fail_safe, CMD_ARM_FAIL_SAFE};
+
+        let comm_server = fail_safe_test_server();
+        let (mut gc, _oc) = comm_server.into_cluster_handlers();
+        let mut ctx = InvokeCtx {
+            attestation_challenge: [0u8; 16],
+        };
+        gc.invoke(CMD_ARM_FAIL_SAFE, &encode_arm_fail_safe(1, 1), &mut ctx);
+        assert!(
+            comm_server.fail_safe_deadline().is_some(),
+            "ArmFailSafe should have opened a window"
+        );
+
+        // Bounded by a much longer sleep so a regression (never resolving)
+        // fails the test instead of hanging — mirrors the mDNS retry tests'
+        // technique of racing an unambiguous outcome.
+        tokio::select! {
+            () = fail_safe_expiry_deadline(&comm_server) => {}
+            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                panic!("fail_safe_expiry_deadline never resolved for an armed window")
+            }
+        }
+        // The window has now lapsed — `fail_safe_deadline` reads back
+        // `None` (`FailSafeState::deadline`'s doc: `None` once passed).
+        assert!(comm_server.fail_safe_deadline().is_none());
     }
 
     // ── review fix: cross-exchange piggyback ack must not lose a request ──

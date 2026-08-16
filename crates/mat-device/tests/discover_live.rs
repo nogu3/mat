@@ -29,15 +29,17 @@ async fn advertiser_is_discoverable_via_browse_commissionable() {
     let advertiser = MdnsAdvertiser::spawn(scope_id)
         .await
         .expect("advertiser socket should bind");
-    advertiser.set_commissionable(Some(CommissionableAdvert {
-        instance: "AA11BB22CC33DD44".to_string(),
-        hostname: "MATDEV01".to_string(),
-        discriminator: 3840,
-        vendor_id: 65521,
-        product_id: 32768,
-        port: 5540,
-        addr_v6: "fe80::1234".parse().unwrap(),
-    }));
+    advertiser
+        .set_commissionable(Some(CommissionableAdvert {
+            instance: "AA11BB22CC33DD44".to_string(),
+            hostname: "MATDEV01".to_string(),
+            discriminator: 3840,
+            vendor_id: 65521,
+            product_id: 32768,
+            port: 5540,
+            addr_v6: "fe80::1234".parse().unwrap(),
+        }))
+        .await;
 
     let found = browse_commissionable(scope_id, Duration::from_secs(3))
         .await
