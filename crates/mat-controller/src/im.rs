@@ -909,6 +909,37 @@ pub struct AttrPathIn {
     pub attribute: Option<u32>,
 }
 
+/// `AttributeRequests`（array[AttributePathIB]）の中身を読む共通処理。
+/// 呼び出し側は array を開く `ArrayStart` を既に読んでいる前提で、この
+/// 関数は対応する `ContainerEnd` まで読み切る。`decode_read_request` と
+/// `decode_subscribe_request` の両方から使う。
+fn decode_attribute_requests(r: &mut Reader) -> Result<Vec<AttrPathIn>, ImError> {
+    let mut paths = Vec::new();
+    loop {
+        let e2 = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated attribute requests"))?;
+        match e2.value {
+            Value::ContainerEnd => break,
+            Value::ListStart => {
+                let (endpoint, cluster, attribute, _) = decode_attribute_path_ib(r)?;
+                paths.push(AttrPathIn {
+                    endpoint,
+                    cluster,
+                    attribute,
+                });
+            }
+            Value::StructStart | Value::ArrayStart => skip_container(r)?,
+            _ => {
+                return Err(ImError::Malformed(
+                    "unexpected element in attribute requests",
+                ))
+            }
+        }
+    }
+    Ok(paths)
+}
+
 /// ReadRequestMessage (spec §8.9.2): server-side decode of
 /// `encode_read_request`/`encode_read_request_cluster`'s payload. Returns
 /// every AttributePathIB in `AttributeRequests` (tag 0) — unlike the
@@ -926,29 +957,7 @@ pub fn decode_read_request(payload: &[u8]) -> Result<Vec<AttrPathIn>, ImError> {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ArrayStart) => {
                 // AttributeRequests
-                loop {
-                    let e2 = r
-                        .next()?
-                        .ok_or(ImError::Malformed("truncated attribute requests"))?;
-                    match e2.value {
-                        Value::ContainerEnd => break,
-                        Value::ListStart => {
-                            let (endpoint, cluster, attribute, _) =
-                                decode_attribute_path_ib(&mut r)?;
-                            paths.push(AttrPathIn {
-                                endpoint,
-                                cluster,
-                                attribute,
-                            });
-                        }
-                        Value::StructStart | Value::ArrayStart => skip_container(&mut r)?,
-                        _ => {
-                            return Err(ImError::Malformed(
-                                "unexpected element in attribute requests",
-                            ))
-                        }
-                    }
-                }
+                paths = decode_attribute_requests(&mut r)?;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
@@ -995,6 +1004,72 @@ pub fn encode_subscribe_request(
     w.finish()
 }
 
+/// Decoded SubscribeRequestMessage (spec §8.10): server-side counterpart of
+/// `encode_subscribe_request`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscribeRequestIn {
+    pub keep_subscriptions: bool,
+    pub min_interval_floor_s: u16,
+    pub max_interval_ceiling_s: u16,
+    pub paths: Vec<AttrPathIn>,
+}
+
+/// SubscribeRequestMessage (spec §8.10): server-side decode of
+/// `encode_subscribe_request`'s payload. Shape: `{0: KeepSubscriptions,
+/// 1: MinIntervalFloor, 2: MaxIntervalCeiling, 3: AttributeRequests
+/// (array[AttributePathIB]), 7: IsFabricFiltered(無視), 255: rev(無視)}`.
+/// AttributeRequests の読みは `decode_read_request` と共通の
+/// `decode_attribute_requests` を使う。
+pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, ImError> {
+    let mut r = Reader::new(payload);
+    expect_struct_start(&mut r)?;
+    let mut keep_subscriptions = None;
+    let mut min_interval_floor_s = None;
+    let mut max_interval_ceiling_s = None;
+    let mut paths = Vec::new();
+    loop {
+        let el = r
+            .next()?
+            .ok_or(ImError::Malformed("truncated subscribe request"))?;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Bool(b)) => keep_subscriptions = Some(b),
+            (Tag::Context(1), Value::Uint(v)) => {
+                min_interval_floor_s = Some(
+                    u16::try_from(v)
+                        .map_err(|_| ImError::Malformed("min interval floor out of range"))?,
+                );
+            }
+            (Tag::Context(2), Value::Uint(v)) => {
+                max_interval_ceiling_s = Some(
+                    u16::try_from(v)
+                        .map_err(|_| ImError::Malformed("max interval ceiling out of range"))?,
+                );
+            }
+            (Tag::Context(3), Value::ArrayStart) => {
+                // AttributeRequests
+                paths = decode_attribute_requests(&mut r)?;
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(SubscribeRequestIn {
+        keep_subscriptions: keep_subscriptions.ok_or(ImError::Malformed(
+            "subscribe request without keep_subscriptions",
+        ))?,
+        min_interval_floor_s: min_interval_floor_s.ok_or(ImError::Malformed(
+            "subscribe request without min interval floor",
+        ))?,
+        max_interval_ceiling_s: max_interval_ceiling_s.ok_or(ImError::Malformed(
+            "subscribe request without max interval ceiling",
+        ))?,
+        paths,
+    })
+}
+
 /// SubscribeResponseMessage (spec §8.10): {0: SubscriptionId, 2: MaxInterval}.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscribeResponse {
@@ -1037,6 +1112,19 @@ pub fn decode_subscribe_response(payload: &[u8]) -> Result<SubscribeResponse, Im
             "subscribe response without max interval",
         ))?,
     })
+}
+
+/// SubscribeResponseMessage (spec §8.10): server-side encode, mirroring
+/// `decode_subscribe_response`'s shape. `{0: SubscriptionId, 2: MaxInterval,
+/// 255: IM_REVISION}`.
+pub fn encode_subscribe_response(subscription_id: u32, max_interval_s: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(subscription_id));
+    w.put_uint(Tag::Context(2), u64::from(max_interval_s));
+    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+    w.end_container();
+    w.finish()
 }
 
 /// 複数 ReportDataMessage・リスト追記を統合し attribute id → JSON 値へ。
@@ -2950,6 +3038,45 @@ mod tests {
         assert_eq!(paths[0].endpoint, Some(0));
         assert_eq!(paths[0].cluster, Some(CLUSTER_DESCRIPTOR));
         assert_eq!(paths[0].attribute, None);
+    }
+
+    #[test]
+    fn subscribe_request_roundtrips_through_server_decode() {
+        let payload = encode_subscribe_request(2, 60, false, &[CLUSTER_ON_OFF]);
+        let req = decode_subscribe_request(&payload).unwrap();
+        assert!(!req.keep_subscriptions);
+        assert_eq!(req.min_interval_floor_s, 2);
+        assert_eq!(req.max_interval_ceiling_s, 60);
+        assert_eq!(
+            req.paths,
+            vec![AttrPathIn {
+                endpoint: None,
+                cluster: Some(CLUSTER_ON_OFF),
+                attribute: None
+            }]
+        );
+    }
+
+    #[test]
+    fn subscribe_response_roundtrips_through_client_decode() {
+        let payload = encode_subscribe_response(0xDEADBEEF, 60);
+        let sr = decode_subscribe_response(&payload).unwrap();
+        assert_eq!(sr.subscription_id, 0xDEADBEEF);
+        assert_eq!(sr.max_interval_s, 60);
+    }
+
+    #[test]
+    fn full_wildcard_subscribe_request_decodes_to_one_empty_path() {
+        let payload = encode_subscribe_request(0, 30, true, &[]);
+        let req = decode_subscribe_request(&payload).unwrap();
+        assert_eq!(
+            req.paths,
+            vec![AttrPathIn {
+                endpoint: None,
+                cluster: None,
+                attribute: None
+            }]
+        );
     }
 
     #[test]
