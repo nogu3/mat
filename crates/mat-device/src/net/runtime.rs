@@ -330,20 +330,42 @@ struct MdnsCtx {
 }
 
 /// Brings up the mDNS advertiser: resolves `config.iface`, spawns the
-/// advertiser, sets the commissionable advert, and republishes every
-/// fabric already on disk (the restart path: a second `Device::new` over
-/// the same `store_dir` reloads `comm_server.fabrics()` from disk, and this
-/// makes sure those fabrics are still discoverable operationally after the
-/// restart). Failure (bad interface name, no link-local address, socket
-/// bind failure) is reported via `Err` so `run` can log it — but `run`
-/// itself treats that as *non-fatal*: mDNS is how a real controller finds
-/// this device, but a device unreachable by discovery still MUST answer a
-/// peer that already has its address (exactly `direct_drive_*`'s test
-/// setup, and not unrealistic — e.g. a controller with a cached address).
+/// advertiser, sets the commissionable advert (only while `window_open` —
+/// see below), and republishes every fabric already on disk (the restart
+/// path: a second `Device::new` over the same `store_dir` reloads
+/// `comm_server.fabrics()` from disk, and this makes sure those fabrics are
+/// still discoverable operationally after the restart). Failure (bad
+/// interface name, no link-local address, socket bind failure) is reported
+/// via `Err` so `run` can log it — but `run` itself treats that as
+/// *non-fatal*: mDNS is how a real controller finds this device, but a
+/// device unreachable by discovery still MUST answer a peer that already
+/// has its address (exactly `direct_drive_*`'s test setup, and not
+/// unrealistic — e.g. a controller with a cached address).
+///
+/// `window_open` (Task 14 fix round 1, review item 1): a fresh
+/// `MdnsAdvertiser::spawn` starts with no commissionable advert set (its
+/// `commissionable` field is `RwLock::new(None)`), so simply *not* calling
+/// `set_commissionable(Some(..))` when the window is closed is sufficient —
+/// no explicit `None` call needed to reach the right end state. This one
+/// bool, threaded from both of `run`'s call sites (initial bring-up and
+/// every retry), closes two related holes at once:
+/// - **Retry-after-close**: without this, a `CommissioningComplete`- or
+///   15-minute-expiry close that lands *while* mDNS is still down (mid
+///   `MdnsRetry` backoff) would be silently undone the moment the retry
+///   later succeeds — `bring_up_mdns` used to always publish commissionable
+///   unconditionally, reviving an advert for a window that had already
+///   sent its goodbye. `run` now re-reads the *current* `window.is_open()`
+///   at the moment each retry actually runs, not the state from when the
+///   retry was scheduled.
+/// - **Boot-with-fabric**: a device restarting with a fabric already on
+///   disk starts with `window = Closed` (Task 14's boot policy) — this
+///   parameter means such a restart no longer publishes a commissionable
+///   advert it would just silently refuse PASE against.
 async fn bring_up_mdns(
     config: &DeviceConfig,
     port: u16,
     comm_server: &CommissioningServer,
+    window_open: bool,
 ) -> Result<MdnsCtx, DeviceError> {
     let scope_id =
         mat_controller::dnssd::iface_index(&config.iface).map_err(DeviceError::IfaceIndex)?;
@@ -353,16 +375,18 @@ async fn bring_up_mdns(
     let mdns = MdnsAdvertiser::spawn(scope_id)
         .await
         .map_err(DeviceError::Io)?;
-    mdns.set_commissionable(Some(CommissionableAdvert {
-        instance: random_hex_name(),
-        hostname: hostname.clone(),
-        discriminator: config.discriminator,
-        vendor_id: config.vendor_id,
-        product_id: config.product_id,
-        port,
-        addr_v6,
-    }))
-    .await;
+    if window_open {
+        mdns.set_commissionable(Some(CommissionableAdvert {
+            instance: random_hex_name(),
+            hostname: hostname.clone(),
+            discriminator: config.discriminator,
+            vendor_id: config.vendor_id,
+            product_id: config.product_id,
+            port,
+            addr_v6,
+        }))
+        .await;
+    }
     for entry in comm_server.fabrics() {
         mdns.add_operational(operational_advert(&entry, &hostname, port, addr_v6))
             .await;
@@ -480,9 +504,23 @@ pub(crate) async fn run(
     comm_server: CommissioningServer,
 ) -> Result<(), DeviceError> {
     let port = local_addr.port();
+    // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
+    // doc comment): open only for a device with no fabric yet — one already
+    // on disk means this device was commissioned in an earlier run, so a
+    // fresh PASE attempt now has no business succeeding. Decided *before*
+    // the first `bring_up_mdns` call (fix round 1, review item 1) — that
+    // call needs `window.is_open()` to know whether to publish a
+    // commissionable advert at all.
+    let mut window = if comm_server.fabrics().is_empty() {
+        CommissioningWindow::Open {
+            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+        }
+    } else {
+        CommissioningWindow::Closed
+    };
     let mut mdns_ctx: Option<MdnsCtx> = None;
     let mut mdns_retry: Option<MdnsRetry> = None;
-    match bring_up_mdns(&config, port, &comm_server).await {
+    match bring_up_mdns(&config, port, &comm_server, window.is_open()).await {
         Ok(ctx) => mdns_ctx = Some(ctx),
         Err(e) => {
             tracing::warn!(
@@ -506,17 +544,6 @@ pub(crate) async fn run(
     // since its reports could only ever go out over the session it was
     // subscribed on.
     let mut subscription: Option<ActiveSubscription> = None;
-    // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
-    // doc comment): open only for a device with no fabric yet — one already
-    // on disk means this device was commissioned in an earlier run, so a
-    // fresh PASE attempt now has no business succeeding.
-    let mut window = if comm_server.fabrics().is_empty() {
-        CommissioningWindow::Open {
-            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
-        }
-    } else {
-        CommissioningWindow::Closed
-    };
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
@@ -684,7 +711,14 @@ pub(crate) async fn run(
                 .await;
             }
             () = mdns_retry_deadline(&mdns_retry) => {
-                match bring_up_mdns(&config, port, &comm_server).await {
+                // `window.is_open()` read *now*, not whatever it was when
+                // this retry was scheduled (fix round 1, review item 1):
+                // the window may have closed (15-minute expiry or
+                // `CommissioningComplete`) while mDNS was still down, and a
+                // stale "was open when scheduled" read would let this retry
+                // revive a commissionable advert for a window that already
+                // sent its goodbye.
+                match bring_up_mdns(&config, port, &comm_server, window.is_open()).await {
                     Ok(ctx) => {
                         tracing::info!("mDNS advertiser came up on retry");
                         mdns_ctx = Some(ctx);

@@ -205,12 +205,24 @@ async fn fail_safe_expiry_gates_add_noc() {
 /// on `CommissioningComplete` — a fresh PASE attempt against a device that
 /// just finished commissioning must get **silence**, not a `StatusReport`
 /// (申し送り 7 項's DoS-hardening posture — see `admit_unsecured`'s doc
-/// comment in `net::runtime`). `mat_controller::pase::establish`'s own
-/// `MrpConfig` retry budget (`support::fast_cfg`) is what bounds this
-/// test's wait: with nothing answering, `establish` exhausts its retries
-/// and returns `Err` in well under a second — the "timeout with no
-/// response" the brief calls for, expressed through the initiator's own
-/// give-up rather than a raw manual timeout race.
+/// comment in `net::runtime`).
+///
+/// Two independent proofs (fix round 1, review item 2: a bare `Err` from
+/// `establish` isn't proof of *silence* — a future regression to answering
+/// with an explicit `StatusReport` refusal would also return `Err` and slip
+/// through unnoticed):
+/// - `mat_controller::pase::establish` must fail with exactly
+///   `PaseError::Exchange(ExchangeError::Timeout)` — the "nothing answered
+///   within the MRP retry budget" variant specifically, not e.g.
+///   `PaseError::StatusReport` (which would mean the device *did* answer,
+///   just with a refusal) or a decode error.
+/// - A single, unretried `PBKDFParamRequest` sent raw (bypassing
+///   `send_reliable`'s own retry loop entirely) followed by a bounded
+///   `recv_from` on that same socket, asserted to itself time out — proving
+///   literally zero bytes come back, not even a bare MRP ack, within a
+///   fixed short window. This is independent of whatever `establish`'s
+///   retry/backoff internals do, and is the most direct statement of
+///   "silently dropped" the brief asks for.
 #[tokio::test]
 async fn pase_after_commissioning_complete_is_silently_dropped() {
     let store_dir = tempfile::tempdir().expect("tempdir");
@@ -233,14 +245,69 @@ async fn pase_after_commissioning_complete_is_silently_dropped() {
     // elapsed on its own.
     let _session = commission_directly(addr, &paa_der, &fabric).await;
 
-    let pase_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind().await.unwrap(),
-    )));
-    let result = mat_controller::pase::establish(pase_transport, addr, PASSCODE, &fast_cfg()).await;
-    assert!(
-        result.is_err(),
-        "PASE against an already-commissioned device (window closed) must not succeed"
-    );
+    // Proof 1: `establish` fails with exactly the "nothing answered" variant.
+    {
+        use mat_controller::exchange::ExchangeError;
+        use mat_controller::pase::PaseError;
+
+        let pase_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind().await.unwrap(),
+        )));
+        let result =
+            mat_controller::pase::establish(pase_transport, addr, PASSCODE, &fast_cfg()).await;
+        // Matched by hand (not `SecureSession: Debug`-derived `{result:?}`,
+        // which doesn't exist) so a regression still prints something
+        // actionable: `Ok` means the window failed to stay closed at all;
+        // any other `Err` variant means the device *did* answer, just not
+        // with silence.
+        match result {
+            Err(PaseError::Exchange(ExchangeError::Timeout)) => {}
+            Ok(_) => panic!("PASE against a closed-window device unexpectedly succeeded"),
+            Err(e) => {
+                panic!("expected a bare MRP-retry-budget timeout (no response at all), got: {e}")
+            }
+        }
+    }
+
+    // Proof 2: a single, unretried PBKDFParamRequest sent raw gets nothing
+    // back at all within a bounded wait — not an ack, not a StatusReport.
+    {
+        use mat_controller::message::{Destination, MessageHeader, ProtocolHeader};
+        use mat_controller::pase::{encode_pbkdf_param_request, OPCODE_PBKDF_PARAM_REQUEST};
+        use mat_controller::transport::MAX_DATAGRAM;
+
+        let raw = UdpTransport::bind().await.unwrap();
+        let mut initiator_random = [0u8; 32];
+        getrandom::getrandom(&mut initiator_random).expect("os rng");
+        let header = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter: 1,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: OPCODE_PBKDF_PARAM_REQUEST,
+            exchange_id: 0x77,
+            protocol_id: mat_controller::message::PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        };
+        let mut datagram = Vec::new();
+        header.encode(&mut datagram);
+        proto.encode(&mut datagram);
+        datagram.extend_from_slice(&encode_pbkdf_param_request(&initiator_random, 0xBEEF));
+
+        raw.send_to(&datagram, addr).await.unwrap();
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let recv = tokio::time::timeout(Duration::from_millis(300), raw.recv_from(&mut buf)).await;
+        assert!(
+            recv.is_err(),
+            "expected total silence (bounded recv timeout) for a raw PASE datagram against a closed window, got {recv:?}"
+        );
+    }
 
     device_task.abort();
     let _ = device_task.await;
