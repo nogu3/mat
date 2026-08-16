@@ -517,13 +517,22 @@ impl Inner {
         // this is a fresh re-arm mid-window or an early disarm (spec
         // §11.10.7.2.1) — same "don't carry a zombie fabric forward" rule
         // `expire_fail_safe` enforces on an actual timeout.
-        self.rollback_uncommitted_fabric();
+        let rolled_back = self.rollback_uncommitted_fabric();
         self.pending = PendingCommissioning::default();
         if expiry_s == 0 {
             self.fail_safe.disarm();
         } else {
             self.fail_safe.arm(expiry_s);
         }
+        // Debug-only, no behavior change (Echo interop observability): says
+        // which of arm/disarm/re-arm this call took and whether it rolled
+        // back a zombie fabric from a previous attempt.
+        tracing::debug!(
+            expiry_s,
+            disarm = expiry_s == 0,
+            rolled_back_fabric_index = ?rolled_back.as_ref().map(|e| e.fabric_index),
+            "ArmFailSafe"
+        );
         InvokeReply::Data {
             response_command: RESP_ARM_FAIL_SAFE,
             fields_tlv: encode_commissioning_status_response(0, ""),

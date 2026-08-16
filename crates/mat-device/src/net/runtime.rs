@@ -395,18 +395,31 @@ pub(crate) async fn run(
                     Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
                 };
                 let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
+                    tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
                     continue;
                 };
                 if header.session_id == 0 && header.security_flags == 0 {
                     let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
+                        tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
                         continue;
                     };
                     if !proto.initiator {
+                        tracing::debug!(
+                            peer = %peer,
+                            exchange_id = proto.exchange_id,
+                            opcode = format_args!("0x{:02X}", proto.opcode),
+                            "unsecured datagram dropped: not an initiator message"
+                        );
                         continue;
                     }
                     if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
                         && proto.opcode == OPCODE_MRP_STANDALONE_ACK
                     {
+                        tracing::debug!(
+                            peer = %peer,
+                            exchange_id = proto.exchange_id,
+                            "unsecured datagram dropped: standalone MRP ack (no session to route it to)"
+                        );
                         continue;
                     }
                     let first = mat_controller::exchange::IncomingMessage {
@@ -556,7 +569,12 @@ pub(crate) async fn run(
                 // `select!` loop simply comes back around, and
                 // `fail_safe_expiry_deadline` reads as "no window open"
                 // (`std::future::pending`) on the next iteration.
-                if let Some(entry) = comm_server.expire_fail_safe() {
+                let expired = comm_server.expire_fail_safe();
+                tracing::debug!(
+                    rolled_back_fabric_index = ?expired.as_ref().map(|e| e.fabric_index),
+                    "fail-safe expiry deadline fired"
+                );
+                if let Some(entry) = expired {
                     tracing::info!(
                         fabric_id = entry.fabric_id,
                         node_id = entry.node_id,
@@ -596,8 +614,17 @@ async fn serve_secured(
 ) {
     let msg = match session.deliver_request(buf, from).await {
         Ok(Some(msg)) => msg,
-        Ok(None) => return,
-        Err(_) => return, // decrypt/screen failure — drop, don't kill the session on noise
+        Ok(None) => {
+            tracing::debug!(
+                peer = %from,
+                "secured datagram dropped: deliver_request returned no message (standalone ack or screened-out)"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, peer = %from, "secured datagram dropped: decrypt/screen failure");
+            return; // decrypt/screen failure — drop, don't kill the session on noise
+        }
     };
     serve_secured_message(msg, session, fabric_index, node, comm_server, mdns).await;
 
@@ -679,7 +706,7 @@ async fn serve_secured_message(
     else {
         return;
     };
-    let _ = session
+    let reply_result = session
         .reply_reliable(
             &msg,
             PROTOCOL_ID_INTERACTION_MODEL,
@@ -688,6 +715,14 @@ async fn serve_secured_message(
             &reply_cfg(),
         )
         .await;
+    tracing::debug!(
+        resp_opcode = format_args!("0x{:02X}", resp_opcode),
+        exchange_id = msg.proto.exchange_id,
+        payload_len = resp_payload.len(),
+        ok = reply_result.is_ok(),
+        error = reply_result.as_ref().err().map(|e| e.to_string()),
+        "IM reply sent"
+    );
 
     // AddNOC success: a fabric appeared that wasn't there before this call.
     let fabrics_after = comm_server.fabrics();
@@ -770,7 +805,7 @@ async fn serve_read_request_chunked(
 
     for (i, chunk) in chunks.into_iter().enumerate() {
         let is_last = i == last_index;
-        let Ok(piggybacked) = session
+        let reply_result = session
             .reply_reliable(
                 msg,
                 PROTOCOL_ID_INTERACTION_MODEL,
@@ -778,8 +813,18 @@ async fn serve_read_request_chunked(
                 &chunk,
                 &reply_cfg(),
             )
-            .await
-        else {
+            .await;
+        tracing::debug!(
+            resp_opcode = format_args!("0x{:02X}", im::OPCODE_REPORT_DATA),
+            exchange_id = msg.proto.exchange_id,
+            payload_len = chunk.len(),
+            chunk_index = i,
+            is_last,
+            ok = reply_result.is_ok(),
+            error = reply_result.as_ref().err().map(|e| e.to_string()),
+            "IM reply sent (ReportData chunk)"
+        );
+        let Ok(piggybacked) = reply_result else {
             return; // ack never came — exchange is dead, give up
         };
 
