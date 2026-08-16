@@ -969,12 +969,7 @@ mod tests {
     // real mDNS goodbye end-to-end is Task 9's real-hardware gate.
 
     fn fail_safe_test_server() -> CommissioningServer {
-        let dev = mat_controller::x509::generate_dev_attestation(
-            0xFFF1,
-            0x8000,
-            im::DEVICE_TYPE_ON_OFF_LIGHT,
-        )
-        .unwrap();
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         CommissioningServer::new(dev, crate::core::fabric_store::FabricStore::new())
     }
 
@@ -1083,12 +1078,7 @@ mod tests {
             CTRL_NODE,
         );
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-        let dev = mat_controller::x509::generate_dev_attestation(
-            0xFFF1,
-            0x8000,
-            im::DEVICE_TYPE_ON_OFF_LIGHT,
-        )
-        .unwrap();
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let comm_server = CommissioningServer::new(dev, FabricStore::new());
 
         // Controller side, run concurrently with `serve_secured` below: send
@@ -1333,12 +1323,7 @@ mod tests {
                 cluster: 0x9999_0002,
             }),
         );
-        let dev = mat_controller::x509::generate_dev_attestation(
-            0xFFF1,
-            0x8000,
-            im::DEVICE_TYPE_ON_OFF_LIGHT,
-        )
-        .unwrap();
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let comm_server = CommissioningServer::new(dev, FabricStore::new());
 
         let ctrl_task = tokio::spawn(async move {

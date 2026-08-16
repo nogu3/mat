@@ -509,11 +509,13 @@ pub struct DevAttestation {
 /// は M2 以降もスコープ外 — ここで作るのはローカルプロセス内の使い捨て鍵
 /// だけで署名された、`attestation::verify_device_attestation`（cA・keyUsage・
 /// VID/PID・AKID/SKID 制約）を通すためだけのチェーン。
-pub fn generate_dev_attestation(
-    vid: u16,
-    pid: u16,
-    device_type: u32,
-) -> Result<DevAttestation, X509Error> {
+///
+/// 以前は `device_type` も引数に取り CD（Certification Declaration）に
+/// 転記していたが、CD の `device_type_id` は matter.js の正典値に固定した
+/// ため（`crate::cd::DEVICE_TYPE_ID_IN_CD` の doc 参照）不要になり削除した
+/// — device type はノードの Descriptor クラスタ側（呼び出し側が別途
+/// `im::DEVICE_TYPE_*` を渡す）でのみ意味を持つ。
+pub fn generate_dev_attestation(vid: u16, pid: u16) -> Result<DevAttestation, X509Error> {
     let paa_key = crate::case::random_p256_secret();
     let pai_key = crate::case::random_p256_secret();
     let dac_key = crate::case::random_p256_secret();
@@ -560,8 +562,8 @@ pub fn generate_dev_attestation(
     // CD の署名は自前の DAC 鍵ではなく公開テスト鍵で行う（`crate::cd` の
     // モジュール doc 参照）。失敗しうるのは鍵定数が壊れた場合だけなので、
     // X509Error に混ぜず `Rng` 系と同じ「起こらない」扱いにする。
-    let certification_declaration =
-        crate::cd::generate_dev_certification_declaration(vid, pid, device_type).map_err(|_| {
+    let certification_declaration = crate::cd::generate_dev_certification_declaration(vid, pid)
+        .map_err(|_| {
             X509Error::Der("well-known test CD signing key is not a valid p256 key (bug)")
         })?;
 
@@ -932,8 +934,7 @@ mod tests {
 
     #[test]
     fn dev_attestation_chain_verifies() {
-        let da =
-            generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let dac = parse_x509(&da.dac_der).unwrap();
         let pai = parse_x509(&da.pai_der).unwrap();
         let paa = parse_x509(&da.paa_der).unwrap();
@@ -998,8 +999,7 @@ mod tests {
             None
         }
 
-        let da =
-            generate_dev_attestation(0xFFF1, 0x8000, crate::im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         // PAA: SEQUENCE { BOOLEAN TRUE }
         assert_eq!(
             basic_constraints_value(&da.paa_der).as_deref(),

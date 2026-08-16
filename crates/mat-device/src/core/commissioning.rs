@@ -867,7 +867,7 @@ mod tests {
     /// persistence is `net`-only and tested in `net::store` instead (this
     /// module must stay `cargo check --no-default-features`-clean).
     fn test_server() -> CommissioningServer {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         CommissioningServer::new(dev, FabricStore::new())
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn attestation_response_passes_verify_device_attestation() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let (dac_der, pai_der, paa_der) = (
             dev.dac_der.clone(),
             dev.pai_der.clone(),
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[test]
     fn cert_chain_request_returns_dac_and_pai_der() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let (dac_der, pai_der) = (dev.dac_der.clone(), dev.pai_der.clone());
         let mut server = CommissioningServer::new(dev, FabricStore::new());
 
@@ -1487,7 +1487,7 @@ mod tests {
     /// just the direct `invoke_command` shortcut the tests above use).
     #[test]
     fn wired_into_node_dispatches_both_clusters() {
-        let dev = generate_dev_attestation(0xFFF1, 0x8000, im::DEVICE_TYPE_ON_OFF_LIGHT).unwrap();
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let server = CommissioningServer::new(dev, FabricStore::new());
         let (gc, oc) = server.into_cluster_handlers();
         let mut node = crate::core::datamodel::Node::new();

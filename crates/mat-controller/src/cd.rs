@@ -67,9 +67,27 @@ pub const TEST_CD_SIGNING_KEY_ID: [u8; 20] = [
 const CERTIFICATION_TYPE_DEVELOPMENT_AND_TEST: u8 = 0;
 /// `format_version`: chip は 1 以外を `kAttestationElementsMalformed` で弾く。
 const FORMAT_VERSION: u8 = 1;
-/// `certificate_id` は spec 上ちょうど 19 文字。認証を受けていない開発用
-/// デバイスなので実在の証明書 ID ではなく、その旨が読み取れる固定値を置く。
-const CERTIFICATE_ID: &str = "MATDEV0000000000-00";
+/// `certificate_id` は spec 上ちょうど 19 文字。当初は「認証を受けていない
+/// 開発用デバイス」と読み取れる自作の固定値（`MATDEV0000000000-00`）を
+/// 置いていたが、M2 Echo attestation 実験（Task 10 追加ラウンド）で
+/// Alexa ペアリング実績のある `matter.js` の CD generator
+/// （`packages/protocol/src/certificate/kinds/CertificationDeclaration.ts`
+/// `CertificationDeclaration.generate()`、commit
+/// `793e431d932552f63273ed1a0684fdc065ba066d` 時点）と突き合わせたところ
+/// **一致しない唯一のフィールドの一つ**だったため、matter.js/chip の全
+/// テスト CD が使う正典値 `"CSA00000SWC00000-00"` に差し替えた —
+/// コミッショナ（Echo 含む）側がテスト CD をこの identity で認識してい
+/// る可能性があるため合わせる。
+const CERTIFICATE_ID: &str = "CSA00000SWC00000-00";
+/// CD の `device_type_id`（タグ 3）。spec 上は任意の値を置けるが、
+/// `matter.js`（上記 `generate()`）は VID/PID に関わらず常に `22` を
+/// 固定で書いている — CD のこのフィールドはコミッショナ側の
+/// VID/PID 突き合わせには使われず（Basic Information と照合されるのは
+/// vendor_id/product_id のみ）、Echo 含む実績のあるコミッショナが見て
+/// いる値がこれなので合わせておく。以前はデバイスの実際の device type
+/// （呼び出し側の `x509::generate_dev_attestation` 経由）を渡していたが、
+/// CD の中身としては無意味だったため引数ごと削除した。
+const DEVICE_TYPE_ID_IN_CD: u32 = 22;
 
 // CMS で使う OID（tag/len を除いた中身のバイト列）。
 const OID_PKCS7_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
@@ -87,7 +105,7 @@ const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03,
 /// 出すとコミッショナ側の追加の突き合わせ（DAC/PAI の VID/PID 一致、
 /// PAA SKID の許可リスト）が有効になる。ここでは出さない — DAC と CD を
 /// 同じ VID/PID で自分が発行しているので突き合わせる相手がいない。
-pub fn encode_certification_elements(vendor_id: u16, product_id: u16, device_type: u32) -> Vec<u8> {
+pub fn encode_certification_elements(vendor_id: u16, product_id: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_uint(Tag::Context(0), u64::from(FORMAT_VERSION));
@@ -95,7 +113,7 @@ pub fn encode_certification_elements(vendor_id: u16, product_id: u16, device_typ
     w.start_array(Tag::Context(2));
     w.put_uint(Tag::Anonymous, u64::from(product_id));
     w.end_container();
-    w.put_uint(Tag::Context(3), u64::from(device_type));
+    w.put_uint(Tag::Context(3), u64::from(DEVICE_TYPE_ID_IN_CD));
     w.put_str(Tag::Context(4), CERTIFICATE_ID);
     w.put_uint(Tag::Context(5), 0); // security_level（コミッショナは解釈しない）
     w.put_uint(Tag::Context(6), 0); // security_information（同上）
@@ -165,15 +183,18 @@ pub fn cms_sign(
     ]))
 }
 
-/// 開発用デバイスの CD を 1 本作る: `vendor_id`/`product_id`/`device_type`
-/// の CD を組み、公開テスト鍵（[`TEST_CD_SIGNING_KEY`]）で CMS 署名する。
+/// 開発用デバイスの CD を 1 本作る: `vendor_id`/`product_id`の CD を組み、
+/// 公開テスト鍵（[`TEST_CD_SIGNING_KEY`]）で CMS 署名する。
 /// **CSA 認証済みの CD ではない** — モジュール doc 参照。
+///
+/// 以前は `device_type` も引数に取っていたが、CD に載る `device_type_id`
+/// は常に固定値 [`DEVICE_TYPE_ID_IN_CD`]（matter.js の正典値）になった
+/// ため削除した（`CERTIFICATE_ID`/`DEVICE_TYPE_ID_IN_CD` の doc 参照）。
 pub fn generate_dev_certification_declaration(
     vendor_id: u16,
     product_id: u16,
-    device_type: u32,
 ) -> Result<Vec<u8>, CryptoError> {
-    let content = encode_certification_elements(vendor_id, product_id, device_type);
+    let content = encode_certification_elements(vendor_id, product_id);
     cms_sign(&content, &TEST_CD_SIGNING_KEY_ID, &TEST_CD_SIGNING_KEY)
 }
 
@@ -213,7 +234,7 @@ mod tests {
 
     #[test]
     fn certification_elements_are_in_ascending_tag_order() {
-        let el = encode_certification_elements(0xFFF1, 0x8000, 0x0100);
+        let el = encode_certification_elements(0xFFF1, 0x8000);
         let mut r = Reader::new(&el);
         assert!(matches!(
             r.next().unwrap().unwrap().value,
@@ -263,8 +284,8 @@ mod tests {
     /// であること、(c) 署名がテスト鍵の公開鍵で検証できることを確かめる。
     #[test]
     fn cms_envelope_matches_what_chip_parses() {
-        let content = encode_certification_elements(0xFFF1, 0x8000, 0x0100);
-        let cms = generate_dev_certification_declaration(0xFFF1, 0x8000, 0x0100).unwrap();
+        let content = encode_certification_elements(0xFFF1, 0x8000);
+        let cms = generate_dev_certification_declaration(0xFFF1, 0x8000).unwrap();
 
         // SEQUENCE { OID signedData, [0] { SignedData } }
         let (tag, outer) = der_split(&cms);

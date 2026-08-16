@@ -154,12 +154,13 @@ impl Device {
     pub fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
         std::fs::create_dir_all(&config.store_dir).map_err(DeviceError::Io)?;
 
-        // CD（Certification Declaration）に載せる device type は、この
-        // デバイスがアプリ endpoint 1 に載せている型と一致させる（コミッ
-        // ショナは CD の vendor_id/product_id を Basic Information と突き
-        // 合わせる。device_type は突き合わせ対象ではないが、揃えない理由も
-        // ない）。`Node::with_root_endpoint` +
-        // `add_on_off_endpoint` が作る構成に対応する値。
+        // CD（Certification Declaration）の vendor_id/product_id はここの
+        // `config.vendor_id`/`config.product_id` と一致させる（コミッショナ
+        // が CD の vendor_id/product_id を Basic Information と突き合わせる
+        // ため）。`device_type_id` は CD 側では matter.js の正典値に固定
+        // されている（`mat_controller::cd::DEVICE_TYPE_ID_IN_CD` の doc
+        // 参照 — CD の突き合わせ対象ではないため、この node がアプリ
+        // endpoint 1 に載せている device type と揃える意味が無くなった）。
         //
         // Task 10: `ChipTest` mode bypasses this entirely in favor of the
         // vendored canonical chain (fixed VID FFF1/PID 8000 — matv.toml's
@@ -167,12 +168,10 @@ impl Device {
         // line up with Basic Information; see chip_test_attestation's
         // module doc).
         let dev = match config.attestation {
-            AttestationMode::Self_ => x509::generate_dev_attestation(
-                config.vendor_id,
-                config.product_id,
-                mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
-            )
-            .map_err(DeviceError::Attestation)?,
+            AttestationMode::Self_ => {
+                x509::generate_dev_attestation(config.vendor_id, config.product_id)
+                    .map_err(DeviceError::Attestation)?
+            }
             AttestationMode::ChipTest => crate::chip_test_attestation::dev_attestation(),
         };
         let paa_dir = config.store_dir.join("paa");
