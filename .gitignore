@@ -9,6 +9,11 @@
 *.der
 *.chip
 
+# 例外: Task 10 の chip-test attestation 実験用に vendor した connectedhomeip
+# の公開テスト証明書（実機の証明書ではない — testdata/chip-test-attestation/
+# README.md に出所を記載）。include_bytes! で読み込むので追跡が必要。
+!/crates/mat-device/testdata/chip-test-attestation/*.der
+
 # Docker から取り出した chip-tool バイナリ
 /chip-tool
 

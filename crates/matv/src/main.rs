@@ -16,7 +16,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use mat_controller::commissioning::INVALID_PASSCODES;
-use mat_device::device::{Device, DeviceConfig};
+use mat_device::device::{AttestationMode, Device, DeviceConfig};
 
 /// spec §5.1.3.1: valid setup passcode range is `1..=99_999_998` (0 and
 /// `0x5F5E0FF`=99_999_999 are reserved), on top of the trivial/attack-prone
@@ -55,6 +55,15 @@ struct FileConfig {
     store: PathBuf,
     /// mDNS/UDP egress interface name (e.g. `"eth0"`).
     iface: String,
+    /// Dev attestation chain to use: `"self"` (default — fresh
+    /// self-generated chain every boot, unchanged M1/M2 behavior) or
+    /// `"chip-test"` (Task 10's Echo experiment: the vendored canonical
+    /// connectedhomeip test chain — see `mat_device::device::AttestationMode`
+    /// and `mat_device::chip_test_attestation`'s module docs). Optional,
+    /// defaults to `"self"` so existing `matv.toml` files (and the
+    /// chip-tool e2e gates) are unaffected.
+    #[serde(default)]
+    attestation: AttestationMode,
 }
 
 fn main() {
@@ -135,6 +144,7 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         port: cfg.port,
         store_dir: cfg.store,
         iface: cfg.iface,
+        attestation: cfg.attestation,
     })
     .map_err(|e| format!("failed to start device: {e}"))?;
 
@@ -186,6 +196,38 @@ mod tests {
         assert_eq!(cfg.passcode, 20_202_021);
         assert_eq!(cfg.discriminator, 3840);
         assert_eq!(cfg.iface, "lo");
+    }
+
+    /// `attestation` is optional (Task 10) — an existing `matv.toml` with
+    /// no `attestation` line (like `VALID_BASE`) must still load, and must
+    /// default to `Self_` (unchanged behavior for chip-tool e2e gates).
+    #[test]
+    fn attestation_defaults_to_self_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), VALID_BASE);
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.attestation, AttestationMode::Self_);
+    }
+
+    /// `attestation = "chip-test"` parses to `AttestationMode::ChipTest`.
+    #[test]
+    fn attestation_parses_chip_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &format!("{VALID_BASE}attestation = \"chip-test\"\n"),
+        );
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.attestation, AttestationMode::ChipTest);
+    }
+
+    /// `attestation = "self"` parses explicitly too (not just via omission).
+    #[test]
+    fn attestation_parses_self() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), &format!("{VALID_BASE}attestation = \"self\"\n"));
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.attestation, AttestationMode::Self_);
     }
 
     #[test]

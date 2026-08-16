@@ -28,6 +28,34 @@ use crate::net::store::store_in_dir;
 /// the same reason.
 const DISCOVERY_CAPABILITY_ON_NETWORK: u8 = 0x04;
 
+/// Which dev attestation chain `Device::new` builds. Task 10 (M2 Echo
+/// checkpoint) addition: a from-scratch commissions fine with chip-tool but
+/// Echo aborts after AttestationRequest (cloud-side validation) — the
+/// working hypothesis is that Echo accepts the canonical connectedhomeip
+/// test chain (the one HA Matter Hub / matter.js-based devices use
+/// verbatim) but rejects our self-generated-every-boot one. `ChipTest`
+/// switches to that vendored chain (`crate::chip_test_attestation`) so the
+/// hypothesis can be tested against a real Echo without touching the
+/// default `Self_` path chip-tool e2e gates rely on.
+/// `serde::Deserialize` derived directly on this enum (rather than a
+/// separate string field in `matv`'s `FileConfig`) so `matv.toml`'s
+/// `attestation = "self" | "chip-test"` maps straight onto it — one enum,
+/// one place that knows the two spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub enum AttestationMode {
+    /// Fresh self-generated PAA/PAI/DAC chain every boot
+    /// (`x509::generate_dev_attestation`) plus a locally-built CD signed
+    /// with the public Matter test CD signing key. Default — unchanged
+    /// M1/M2 behavior, what the chip-tool e2e gates exercise.
+    #[default]
+    #[serde(rename = "self")]
+    Self_,
+    /// The vendored canonical connectedhomeip test chain (VID FFF1 / PID
+    /// 8000) — see `crate::chip_test_attestation`'s module doc.
+    #[serde(rename = "chip-test")]
+    ChipTest,
+}
+
 /// What this device advertises/answers as. Loaded once at `Device::new` and
 /// otherwise immutable for the process lifetime (M1 scope: no runtime
 /// reconfiguration).
@@ -55,6 +83,10 @@ pub struct DeviceConfig {
     /// same reason — see its doc comment). Documented deviation; see
     /// task-12-report.md.
     pub iface: String,
+    /// Which dev attestation chain to build (Task 10 addition). Defaults
+    /// to [`AttestationMode::Self_`] — existing chip-tool e2e behavior is
+    /// unchanged unless a caller opts into `ChipTest` explicitly.
+    pub attestation: AttestationMode,
 }
 
 /// `Device::new`/`Device::run` failure.
@@ -128,12 +160,21 @@ impl Device {
         // 合わせる。device_type は突き合わせ対象ではないが、揃えない理由も
         // ない）。`Node::with_root_endpoint` +
         // `add_on_off_endpoint` が作る構成に対応する値。
-        let dev = x509::generate_dev_attestation(
-            config.vendor_id,
-            config.product_id,
-            mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
-        )
-        .map_err(DeviceError::Attestation)?;
+        //
+        // Task 10: `ChipTest` mode bypasses this entirely in favor of the
+        // vendored canonical chain (fixed VID FFF1/PID 8000 — matv.toml's
+        // vendor_id/product_id must match for the CD's baked-in VID/PID to
+        // line up with Basic Information; see chip_test_attestation's
+        // module doc).
+        let dev = match config.attestation {
+            AttestationMode::Self_ => x509::generate_dev_attestation(
+                config.vendor_id,
+                config.product_id,
+                mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
+            )
+            .map_err(DeviceError::Attestation)?,
+            AttestationMode::ChipTest => crate::chip_test_attestation::dev_attestation(),
+        };
         let paa_dir = config.store_dir.join("paa");
         std::fs::create_dir_all(&paa_dir).map_err(DeviceError::Io)?;
         std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;

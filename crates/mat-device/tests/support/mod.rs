@@ -34,7 +34,7 @@ use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509;
 
-use mat_device::device::DeviceConfig;
+use mat_device::device::{AttestationMode, DeviceConfig};
 
 pub const PASSCODE: u32 = 20202021;
 pub const DISCRIMINATOR: u16 = 840;
@@ -69,6 +69,7 @@ pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
         port: 0,
         store_dir,
         iface: "lo".to_string(),
+        attestation: AttestationMode::default(),
     }
 }
 
