@@ -68,3 +68,15 @@ matv を**単一 OnOff 仮想デバイス**として Echo と相互運用させ�
 - Sigma2Resume による resumption 受理（fallback 拒否が観測された場合のみ）
 - 申し送りの「クリーンアップ（急がない）」群（MRP 送信ループ 3 重複の共有化等）。触るファイルで自然に拾える分だけ拾う
 - Alexa 以外のコントローラ（Apple Home / Google Home）の検証
+
+## M2 完了時の申し送り（2026-08-16 最終レビューより）
+
+M2 は chip-tool ゲート（commission → OnOff 操作 → 再起動 re-CASE → Subscribe、`task e2e:device:m2-chip` 3 連続 green）を通過して完了。**Echo ゲートのみ Amazon 側要因で保留**（未認証デバイスはユーザー同意後もクラウド attestation 検証で拒否される。対照実験で matter.js 参照実装も同一失敗 — 詳細は `plans/m2-echo-checklist.md`）。受け入れ条件のうち「Alexa アプリ commission / 音声操作 / アプリ反映」は Amazon 側の道（開発者登録・別ファーム世代等）が開けるまで未達。代替の実機検証先は Apple Home / Google Home（自作証明書に寛容）。
+
+**M3（Aggregator）冒頭で拾うべき事項**（最終ブランチレビューの Important 2 件 + 関連 deferred）:
+
+1. **データモデルの自己記述がプレースホルダ級**: wildcard 展開がグローバル属性を含まない / ClusterRevision 全クラスタ 1 固定（実値: Descriptor 2, BasicInfo 3, OnOff 6）/ AcceptedCommandList・GeneratedCommandList が常に空。interview 型コントローラ（Apple/Google、M3 の aggregator 親）で顕在化しうる。`ClusterHandler` に revision()/コマンド列挙を足して一括解決（status path の request echo 化も同時に）
+2. **OC 属性の fabric scoping 無視**: NOCs/Fabrics/TrustedRootCertificates が全 fabric 分を任意の認証済みセッションに返す（IsFabricFiltered 未実装）。マルチ fabric が常態になる M3 で cross-fabric 情報漏えい + 適合性違反。SupportedFabrics=5 の容量 enforcement も同時に
+3. その他 M3 チェックリスト: DataVersion のブート時乱数初期化（spec §7.10.3）/ dirty レポートのチャンク化（リスト値属性が購読対象になったら）/ ChipTest モードの VID/PID 検証ガード / 逐次ハンドシェイクの head-of-line blocking（無認証 Sigma1 スプレーで keep-alive が飢餓しうる — 同時ハンドシェイク制限 or タイムボックス）/ dirty 期限が floor=ceiling で keep-alive 期限と同時刻になる件
+
+**プロセス教訓**: ラッパーコマンドの成否は出力 grep でなく exit code で判定する（Task 9 で「green と誤報告」が実発生）。lenient な自前 decoder 同士の roundtrip テストはエンコーダの必須フィールド欠落に盲目 — 相互運用フィックスは必ずワイヤバイトを直接 assert する。
