@@ -374,6 +374,11 @@ pub struct ResponderExchange<'t> {
     exchange_id: u16,
     counter: TxCounter,
     rx_window: RxWindow,
+    /// initiator が名乗った ephemeral node id（unsecured セッションの
+    /// 最初のメッセージの source node id）。応答では **destination** に
+    /// 載せ替える（spec §4.4.1.2 / §4.6.1.5）。`build` の doc 参照。
+    /// `None` は相手が source を載せていない場合 — 従来どおり両方省略する。
+    peer_ephemeral_node_id: Option<u64>,
     /// 直近に受理した peer メッセージの counter。応答の ack piggyback に使う。
     last_peer_counter: u32,
     /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
@@ -400,6 +405,7 @@ impl<'t> ResponderExchange<'t> {
             exchange_id: first.proto.exchange_id,
             counter: TxCounter::new_random(),
             rx_window,
+            peer_ephemeral_node_id: first.header.source_node_id,
             last_peer_counter: first.header.message_counter,
             last_rx: Some(Instant::now()),
             first_needs_ack,
@@ -414,6 +420,17 @@ impl<'t> ResponderExchange<'t> {
         self.first_needs_ack
     }
 
+    /// unsecured セッションの応答メッセージを組む。
+    ///
+    /// **ヘッダのアドレス指定**: unsecured セッションでは initiator の
+    /// ephemeral node id をメッセージ 1 通につきちょうど 1 箇所に載せる
+    /// （spec §4.4.1.2 / §4.6.1.5）。initiator は source に、responder は
+    /// destination に載せる。両方載せる／両方省くのはプロトコル違反で、
+    /// 参照実装（chip の `SessionManager::UnauthenticatedMessageDispatch`）
+    /// はその場でデータグラムを捨てる — 応答が「届いているのに無かったこと
+    /// にされる」ので、症状は上位プロトコルのエラーではなく無言のタイムアウト
+    /// になる。M2 ゲート 1 で実際にこれを踏んだ（`docs/superpowers/plans/
+    /// m2-chip-tool-probe.md`）。
     fn build(
         &mut self,
         protocol_id: u16,
@@ -429,7 +446,10 @@ impl<'t> ResponderExchange<'t> {
             security_flags: 0,
             message_counter,
             source_node_id: None,
-            destination: Destination::None,
+            destination: match self.peer_ephemeral_node_id {
+                Some(id) => Destination::Node(id),
+                None => Destination::None,
+            },
         };
         let proto = ProtocolHeader {
             initiator: false,
@@ -1239,6 +1259,113 @@ mod tests {
             .unwrap();
         assert_eq!(next.payload, b"req2");
         peer_task.await.unwrap();
+    }
+
+    /// spec §4.4.1.2 / §4.6.1.5: an *unsecured* session message carries the
+    /// initiator's ephemeral node id exactly once — as the **source** node
+    /// id when the initiator sends, and as the **destination** node id when
+    /// the responder replies. The reference implementation enforces this as
+    /// a hard drop, not a lenient warning: chip's
+    /// `SessionManager::UnauthenticatedMessageDispatch` rejects any
+    /// unsecured datagram where source and destination are both present or
+    /// both absent with `Received malformed unsecure packet`.
+    ///
+    /// This is the nail for a real interop failure: every `matv` PASE reply
+    /// (and standalone ack) went out with neither field set, so chip-tool
+    /// dropped all of them at the transport layer and `pairing
+    /// onnetwork-long` timed out in PBKDFParamRequest retries without ever
+    /// logging a protocol-level complaint (M2 gate 1, see
+    /// `docs/superpowers/plans/m2-chip-tool-probe.md`).
+    #[tokio::test]
+    async fn responder_replies_address_the_initiators_ephemeral_node_id() {
+        const EPHEMERAL: u64 = 0x0011_2233_4455_6677;
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let exchange_id = 0x4242;
+
+        let mut first = adopted_first(exchange_id, 100, true);
+        first.header.source_node_id = Some(EPHEMERAL);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+
+        let peer_task = tokio::spawn(async move {
+            let (h, p, from) = read_msg(&peer_sock).await;
+            assert_eq!(
+                h.destination,
+                Destination::Node(EPHEMERAL),
+                "reply must be addressed to the initiator's ephemeral node id"
+            );
+            assert_eq!(
+                h.source_node_id, None,
+                "reply must not also carry a source node id"
+            );
+            let ack = initiator_datagram(
+                exchange_id,
+                OPCODE_MRP_STANDALONE_ACK,
+                101,
+                false,
+                Some(h.message_counter),
+                &[],
+            );
+            peer_sock.send_to(&ack, from).await.unwrap();
+            p.opcode
+        });
+
+        re.reply_reliable(PROTOCOL_ID_SECURE_CHANNEL, 0x21, b"resp1", &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(peer_task.await.unwrap(), 0x21);
+    }
+
+    /// The standalone ack `screen` fires for a duplicate goes through the
+    /// same `build` — it must be addressed the same way, or chip drops the
+    /// ack too (and its MRP keeps retransmitting forever).
+    #[tokio::test]
+    async fn responder_standalone_acks_address_the_initiators_ephemeral_node_id() {
+        const EPHEMERAL: u64 = 0x00AA_BBCC_DDEE_FF00;
+        let peer_sock = bind_local().await;
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let local = transport.local_addr().unwrap();
+        let exchange_id = 0x4243;
+
+        let mut first = adopted_first(exchange_id, 200, true);
+        first.header.source_node_id = Some(EPHEMERAL);
+        let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
+
+        // A *new* peer message (not the adopted one) that demands an ack:
+        // `screen` emits the standalone ack for it inline.
+        let mut dg = MessageHeader {
+            session_id: 0,
+            security_flags: 0,
+            message_counter: 201,
+            source_node_id: Some(EPHEMERAL),
+            destination: Destination::None,
+        }
+        .encoded();
+        ProtocolHeader {
+            initiator: true,
+            needs_ack: true,
+            acked_counter: None,
+            opcode: 0x22,
+            exchange_id,
+            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
+            vendor_id: None,
+        }
+        .encode(&mut dg);
+        assert!(re.screen(&dg, peer_addr).await.unwrap().is_some());
+
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), peer_sock.recv_from(&mut buf))
+            .await
+            .expect("no standalone ack arrived")
+            .unwrap();
+        let (h, off) = MessageHeader::decode(&buf[..n]).unwrap();
+        let (p, _) = ProtocolHeader::decode(&buf[off..n]).unwrap();
+        assert_eq!(p.opcode, OPCODE_MRP_STANDALONE_ACK);
+        assert_eq!(h.destination, Destination::Node(EPHEMERAL));
+        assert_eq!(h.source_node_id, None);
+        let _ = local;
     }
 
     #[tokio::test]
