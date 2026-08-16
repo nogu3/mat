@@ -59,9 +59,10 @@ tasks:
     desc: "aarch64 gnu + BLE の deploy 成果物を ./dist/arm64/ に作る（jarvis 用標準ビルド）"
     cmds:
       - cross build --release --target aarch64-unknown-linux-gnu --features ble
+      - cross build --release --target aarch64-unknown-linux-gnu --package matv
       - mkdir -p dist/arm64
-      - cp target/aarch64-unknown-linux-gnu/release/mat target/aarch64-unknown-linux-gnu/release/matd dist/arm64/
-      - 'echo "実機ランタイム依存: libdbus-1-3（BLE 用）。scp dist/arm64/{mat,matd} <host>:~/"'
+      - cp target/aarch64-unknown-linux-gnu/release/mat target/aarch64-unknown-linux-gnu/release/matd target/aarch64-unknown-linux-gnu/release/matv dist/arm64/
+      - 'echo "実機ランタイム依存: libdbus-1-3（BLE 用。mat/matd のみ、matv は不要）。scp dist/arm64/{mat,matd,matv} <host>:~/"'
 
   e2e:m8c3:real:
     desc: "M8c-3 実機 E2E（jarvis）。STAGE=1 既定 / STAGE=2 は撤去後の最終受け入れ"
