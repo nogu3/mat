@@ -673,16 +673,20 @@ pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
 
 /// `*CommissioningResponse`（ArmFailSafeResponse / SetRegulatoryConfig
 /// Response / CommissioningCompleteResponse 共通、spec §11.10.6.3 / .5 /
-/// .7）: `{0: ErrorCode, 1: DebugText(optional)}`。デバイス側 encoder（逆
-/// 方向は [`decode_commissioning_status_response`]）。`debug_text` が空文字
-/// 列ならタグ 1 自体を省略する。
+/// .7）: `{0: ErrorCode, 1: DebugText}`。デバイス側 encoder（逆方向は
+/// [`decode_commissioning_status_response`]）。
+///
+/// `DebugText` は spec 上 **mandatory**（空でもタグを省略できない）。
+/// 我々の decoder は欠落を空文字列で埋める寛容な実装なので自己往復では
+/// 差が出ないが、chip は ArmFailSafeResponse を読む時点で次の必須フィールド
+/// を探しに行き `CHIP Error 0x00000021: End of TLV` で commissioning ごと
+/// 落とす（M2 ゲート 1 の実測 —
+/// `docs/superpowers/plans/m2-chip-tool-probe.md`）。空文字列でも必ず書く。
 pub fn encode_commissioning_status_response(error_code: u8, debug_text: &str) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.put_uint(Tag::Context(0), u64::from(error_code));
-    if !debug_text.is_empty() {
-        w.put_str(Tag::Context(1), debug_text);
-    }
+    w.put_str(Tag::Context(1), debug_text);
     w.end_container();
     w.finish()
 }
@@ -2277,11 +2281,26 @@ mod tests {
             decode_commissioning_status_response(&encode_commissioning_status_response(0, "ok"))
                 .unwrap();
         assert_eq!((code, text.as_str()), (0, "ok"));
-        // 空文字列は tag1 自体を省略しても decode 側は空文字列で埋める
         let (code2, text2) =
             decode_commissioning_status_response(&encode_commissioning_status_response(3, ""))
                 .unwrap();
         assert_eq!((code2, text2.as_str()), (3, ""));
+    }
+
+    /// DebugText は spec §11.10.6.3/.5/.7 で **mandatory** — 空文字列でも
+    /// タグ 1 を省略してはいけない。我々の decoder は欠落を許すので
+    /// roundtrip テストだけでは検出できず、chip 側だけが
+    /// `CHIP Error 0x00000021: End of TLV` で落ちた（M2 ゲート 1 の実測。
+    /// `docs/superpowers/plans/m2-chip-tool-probe.md`）ため、ワイヤ形状を
+    /// 直接検査する。
+    #[test]
+    fn commissioning_status_response_always_writes_debug_text() {
+        let fields = encode_commissioning_status_response(0, "");
+        let map = scan_struct_fields(&fields, "test").expect("struct");
+        assert!(
+            map.contains_key(&1),
+            "DebugText (tag 1) must be present even when empty: {fields:02X?}"
+        );
     }
 
     #[test]
