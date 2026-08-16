@@ -3,7 +3,12 @@
 # ペアリング状態は $CHIP_TOOL_STORE に永続化される（コンテナ間で共有）。
 # $CHIP_TOOL_IMAGE で既定イメージ（spike で確定した digest 固定版）を差し替え可能。
 set -euo pipefail
-IMAGE="${CHIP_TOOL_IMAGE:-atios/chip-tool@sha256:b0f75334f7264af16c19ea0f4880a20ed86b821cd12c6a553c8e012aa0344277}"
+# Resolve relative to this script's own location, not $PWD: $PWD is the
+# caller's cwd, which this script deliberately leaves untouched (it's
+# mounted below as the container's /workdir).
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$SCRIPT_DIR/chip-tool-image.env"
+IMAGE="${CHIP_TOOL_IMAGE:-$CHIP_TOOL_IMAGE_DEFAULT}"
 STORE="${CHIP_TOOL_STORE:-$HOME/.chip-tool-store}"
 mkdir -p "$STORE"
 exec docker run --rm --network host \

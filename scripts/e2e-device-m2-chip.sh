@@ -52,12 +52,21 @@ IFACE="${MAT_E2E_IFACE:-eth1}"
 TIMEOUT_S="${MAT_E2E_TIMEOUT_S:-120}"
 SUBSCRIBE_WAIT_S="${MAT_E2E_SUBSCRIBE_WAIT_S:-12}"
 
-# Same default as scripts/chip-tool.sh (kept in sync manually — there's no
-# clean way to source just its IMAGE assignment without also running the
-# `exec docker run` at the bottom of that script). Sharing the env var name
-# means a caller override applies to both the `chip()` helper below (via the
-# wrapper) and the interactive-mode `docker run` in `verify_subscribe()`.
-CHIP_TOOL_IMAGE="${CHIP_TOOL_IMAGE:-atios/chip-tool@sha256:b0f75334f7264af16c19ea0f4880a20ed86b821cd12c6a553c8e012aa0344277}"
+# Single source of truth for the digest-pinned image, shared with
+# scripts/chip-tool.sh via scripts/chip-tool-image.env (see that file for
+# provenance — a spike documented in the m2-chip-tool-probe plan). Sharing
+# the env var name means a caller override applies to both the `chip()`
+# helper below (via the wrapper) and the interactive-mode `docker run` in
+# `verify_subscribe()`.
+#
+# `verify_subscribe()` calls `docker run` directly instead of going through
+# scripts/chip-tool.sh for that one invocation: the wrapper doesn't pass
+# `-i` (needed to feed stdin into `interactive start`'s REPL), and it always
+# appends `--storage-directory` as the *last* argument — which would land
+# after (and so clobber/conflict with) `interactive start`'s own trailing
+# arguments rather than sitting among chip-tool's global flags.
+. scripts/chip-tool-image.env
+CHIP_TOOL_IMAGE="${CHIP_TOOL_IMAGE:-$CHIP_TOOL_IMAGE_DEFAULT}"
 
 PASSCODE=20202021
 DISCRIMINATOR=3840
@@ -223,6 +232,13 @@ verify_subscribe() {
     local name="mat-e2e-sub-$$"
     : >"$SUBSCRIBE_LOG"
 
+    # `$!` below only captures the reader end (the `timeout ... docker run`
+    # job); the writer subshell (`( printf ...; sleep ... )`) isn't waited on
+    # separately. That's fine, not a leak: it does its one write immediately
+    # and then just sleeps for at most $SUBSCRIBE_WAIT_S before exiting on
+    # its own — bounded by the same constant we already poll against below —
+    # and once the container is killed, its `sleep` finishing just hits a
+    # closed pipe (SIGPIPE-safe here since there's nothing left to write).
     (
         printf 'onoff subscribe on-off %s %s %s %s\n' \
             "$SUB_MIN_INTERVAL_S" "$SUB_MAX_INTERVAL_S" "$NODE_ID" "$ENDPOINT"
