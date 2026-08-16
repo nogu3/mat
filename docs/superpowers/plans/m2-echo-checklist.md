@@ -96,3 +96,38 @@ commission 試行前後にこのファイルへ結果を追記していく。
 **結論**: 自作スタックの問題ではない。「認定されていないデバイス」への同意はローカル続行のみを解錠し、Amazon クラウド側の attestation 検証が未認証（テスト証明書）デバイスを通していない（このアカウント/リージョン/ファーム世代で）。参照実装も同様に落ちるため、デバイス側で回避できる差分は存在しない。
 
 **申し送り**: M2 の Echo ゲート（Task 16）は Amazon 側の道（開発者コンソール登録・サポート問い合わせ・別ファーム世代の Echo での再試行等）が見つかるまで保留。残タスク（Subscribe/窓/salt）は chip-tool ゲートで完成させる方針をユーザーが承認済み。相互運用検証の代替として Apple Home / Google Home（自作証明書に寛容）が選択肢。
+
+## Amazon 側の道 調査結果（2026-08-16 夜・Web 調査）
+
+Task 10 の結論「Amazon クラウドが未認証を一律拒否」を Web 調査 2 系統（Amazon 公式経路 / コミュニティ事例）で検証した。**結論は修正が必要: 一律拒否ではなく Echo 個体/世代/ファーム依存の可能性が高い。**
+
+### 公式経路（存在しないことの確認）
+
+- Amazon に Google Home Developer Console 相当の「テスト VID を自アカウントに登録して attestation を通す」機構は**存在しない**。公式経路は CSA 認証 → DCL 登録（→ 任意で WWA）のみ。
+  - Matter support: <https://developer.amazon.com/en-US/docs/alexa/smarthome/matter-support.html>
+  - WWA 要件（CSA 認証 + DCL 登録が前提）: <https://developer.amazon.com/en-US/docs/alexa/smarthome/wwa-connection-requirements.html>
+- 一方 Amazon 公式の ACK ドキュメントは「プロトタイプは VID 0xFFF1 + テスト証明書チェーンで Echo テストせよ」という立場で、**建前上テスト証明書での commissioning はサポートされている**: <https://developer.amazon.com/en-US/docs/alexa/ack/matter-provision-device.html>
+- 未認証ブロックを認めた Amazon 公式声明・changelog 記載は皆無。
+
+### コミュニティ証拠（一律拒否説への反証）
+
+- **同一シグネチャの失敗報告**: RiDDiX/home-assistant-matter-hub **#449**（2026-08-13 起票・オープン）— matter.js 製未認証ブリッジが certificateChainRequest 後に Echo 沈黙 → fail-safe 失効 → GS014。同一ブリッジは Apple Home で完走。環境は **Echo Dot 2nd gen**。<https://github.com/RiDDiX/home-assistant-matter-hub/issues/449>
+- **成功報告（反証）**: 同じ HAMH（未認証・テスト証明書）が **2026-07-12 に Echo Dot 4th/5th gen で commissioning 完走**（#414。addNOC → commissioningComplete 確認）。2026-01 にも成功報告あり。<https://github.com/RiDDiX/home-assistant-matter-hub/issues/414>
+- → **失敗＝2nd gen、成功＝4th/5th gen** という世代相関。GS014 は認証済みデバイス（Nuki Gen4）でも出る汎用失敗コードで、attestation 拒否専用ではない。
+- matter.js の Alexa 固有要件（ECOSYSTEMS.md）: **ポート 5540 固定**（それ以外は発見されない / AddNOC 後 ~20 秒でロールバック）・**Endpoint 1 必須**・仕様外クラスタ禁止。matv は 5540 + Endpoint 1 OnOff で充足済み。<https://github.com/matter-js/matter.js/blob/main/docs/ECOSYSTEMS.md>
+- マルチアドミン共有（他エコシステムから Alexa へ共有）は attestation を再実行するため理論上回避にならず、成功報告も無し。
+- ブリッジ経由が実績最多: 未認証 matter.js ブリッジ（HAMH）が通った環境では配下エンドポイントは個別 attestation を受けない — **M3 Aggregator 構成そのものが Echo 通過後の正攻法**。
+
+### 次の一手（優先順）
+
+1. **別世代の Echo（Dot 4th/5th gen 等）で再試行**。複数 Echo がある場合はどれがコミッショナーに選ばれるか制御できないため、他の Echo を一時電源オフして対象個体を固定する（コミュニティで唯一挙がっている切り分け策）。
+2. RiDDiX #449 に pcap 所見（AttestationResponse MRP-ack 後 80 秒沈黙 → ArmFailSafe(0)）を追記して事例を束ねる。
+3. project-chip/connectedhomeip に再現手順つき issue（Amazon の chrisdecenzo がトリアージ実績あり）。<https://github.com/project-chip/connectedhomeip/issues/34174>
+4. developer.amazon.com/support へ照会。
+
+### 追加観測（2026-08-16 17:38 / 18:13 JST の再試行）
+
+Task 10 記録後の再試行（matv.stderr.log 08:38Z / 09:13Z）は**より手前の PASE 段階で失敗**: Echo が PBKDFParamRequest 送信 → matv 応答直後に StatusReport (0x40) で中断。同一バイナリで 16:35 JST は PASE 成立していたため、Echo 側の状態変化（失敗デバイスの記憶・早期中断）が疑われる。該当時間帯の pcap は無く StatusReport の中身は未取得。副産物 2 件:
+
+- matv の PASE 状態機械は StatusReport を「unexpected opcode」として扱う。エラー StatusReport のコード（GeneralCode/ProtocolCode）をログに出すと今後の切り分けが速くなる（小改善候補）。
+- jarvis 稼働中の matv は Task 10 時点のビルド（5ab8014、窓 close の PASE 無応答 drop・salt 乱数化を含まない）。**次回 Echo 検証前に最新 main のビルドを再配布すること**。
