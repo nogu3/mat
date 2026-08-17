@@ -303,6 +303,17 @@ impl Node {
             // abort the read. Drop it instead of answering (carried
             // finding from Task 5's review).
             im::OPCODE_STATUS_RESPONSE => Err(ImServerError::NoReply),
+            // Timed Request Action（spec §8.9.4）: `StatusResponse(SUCCESS)`
+            // を返すと initiator が同一 exchange で後続の timed
+            // Invoke/Write を送ってくる。後続はステートレスに通常経路で
+            // 処理される（この skeleton は timed access 必須のコマンドを
+            // 持たないため、期限とフラグ整合の enforcement は M3 送り —
+            // INVALID_ACTION で拒むと Google Play Services スタックの
+            // commissioning がここで中断する）。
+            im::OPCODE_TIMED_REQUEST => Ok(ImOutcome::unchanged(
+                im::OPCODE_STATUS_RESPONSE,
+                im::encode_status_response(im::STATUS_SUCCESS),
+            )),
             // Any opcode this skeleton has no handler for (WriteRequest,
             // SubscribeRequest, TimedRequest, ...) is answered — not
             // silently dropped, and not a hard error that kills the
@@ -1015,6 +1026,27 @@ mod tests {
         assert_eq!(opcode, im::OPCODE_STATUS_RESPONSE);
         let status = im::decode_status_response(&payload).unwrap();
         assert_eq!(status, im::STATUS_INVALID_ACTION);
+    }
+
+    /// Timed Request Action（spec §8.9.4）: TimedRequest には
+    /// `StatusResponse(SUCCESS)` を返し、initiator は同一 exchange で
+    /// 後続の timed Invoke/Write を送ってくる（後続はステートレスに通常
+    /// 経路で処理される）。INVALID_ACTION で返すと Google Play Services
+    /// スタック（Android の HA アプリ / Google Home 経由の commissioning）
+    /// がそこで中断する（2026-08-18 実測）。期限とフラグ整合の enforcement
+    /// は M3 送り。
+    #[test]
+    fn timed_request_is_acknowledged_with_success_status() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        // TimedRequest: struct{0: timeout-ms}
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 300);
+        w.end_container();
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_TIMED_REQUEST, &w.finish());
+        assert_eq!(opcode, im::OPCODE_STATUS_RESPONSE);
+        let status = im::decode_status_response(&payload).unwrap();
+        assert_eq!(status, im::STATUS_SUCCESS);
     }
 
     #[test]
