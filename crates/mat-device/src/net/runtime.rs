@@ -936,127 +936,147 @@ async fn serve_secured_message(
     let comm_server: &CommissioningServer = comm_server;
     let mdns: Option<&MdnsCtx> = *mdns;
 
-    if msg.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
-        // Secure-channel traffic on an established session (e.g. a
-        // device-initiated-exchange StatusReport) — out of M1 scope.
-        return;
-    }
-
-    // ReadRequest gets its own chunk-aware flow (Task 6) instead of going
-    // through `Node::handle_im` (whose `handle_read` always answers with a
-    // single message) — see `serve_read_request_chunked`'s doc comment.
-    // Reads never trigger the AddNOC/CommissioningComplete milestones
-    // below (those are Invoke-only), so returning here is safe.
-    if msg.proto.opcode == im::OPCODE_READ_REQUEST {
-        serve_read_request_chunked(&msg, session, fabric_index, node).await;
-        return;
-    }
-
-    // SubscribeRequest likewise owns its whole interaction (priming chunks
-    // + SubscribeResponse on this exchange, Task 12) rather than producing
-    // one reply through `Node::handle_im`. Success installs the node's one
-    // active subscription; failure anywhere in the flow leaves it with
-    // none — including tearing down whatever was subscribed before, since
-    // this same peer just asked to start over.
-    if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
-        **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
-        return;
-    }
-
-    tracing::debug!(
-        im_opcode = format_args!("0x{:02X}", msg.proto.opcode),
-        exchange_id = msg.proto.exchange_id,
-        request = ?im::decode_invoke_request(&msg.payload)
-            .ok()
-            .map(|r| (r.endpoint, r.cluster, r.command)),
-        "IM request"
-    );
-
-    // Only meaningful for CommissioningComplete detection below; a decode
-    // failure here just means we won't recognize that milestone (the
-    // dispatch to `node.handle_im` below still runs against the raw bytes
-    // regardless, so a malformed request is still answered/rejected
-    // normally).
-    let req_cluster_command = im::decode_invoke_request(&msg.payload)
-        .ok()
-        .map(|r| (r.cluster, r.command));
-
-    let mut ctx = InvokeCtx {
-        attestation_challenge: session.attestation_challenge(),
-        ..InvokeCtx::default()
-    };
-    let read_ctx = ReadCtx { fabric_index };
-    let fabrics_before = comm_server.fabrics().len();
-    let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx) else {
-        return;
-    };
-    let ImOutcome {
-        opcode: resp_opcode,
-        payload: resp_payload,
-        changed,
-    } = outcome;
-    // Anything this request changed that the active subscription covers
-    // becomes dirty — the `select!` report branch (`run`) picks it up at
-    // the subscription's next deadline. Recorded *before* the reply is
-    // sent so a change is never lost to a failing reply.
-    if let Some(sub) = subscription.as_mut() {
-        sub.note_changed(&changed);
-    }
-    let reply_result = session
-        .reply_reliable(
-            &msg,
-            PROTOCOL_ID_INTERACTION_MODEL,
-            resp_opcode,
-            &resp_payload,
-            &reply_cfg(),
-        )
-        .await;
-    tracing::debug!(
-        resp_opcode = format_args!("0x{:02X}", resp_opcode),
-        exchange_id = msg.proto.exchange_id,
-        payload_len = resp_payload.len(),
-        ok = reply_result.is_ok(),
-        error = reply_result.as_ref().err().map(|e| e.to_string()),
-        "IM reply sent"
-    );
-
-    // AddNOC success: a fabric appeared that wasn't there before this call.
-    let fabrics_after = comm_server.fabrics();
-    if fabrics_after.len() > fabrics_before {
-        if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
-            ctx.mdns
-                .add_operational(operational_advert(
-                    entry,
-                    &ctx.hostname,
-                    ctx.port,
-                    ctx.addr_v6,
-                ))
-                .await;
+    // 同一 exchange の後続リクエストを処理し切るまで回るループ。Timed
+    // Interaction（spec §8.9.4）では initiator が StatusResponse(SUCCESS) の
+    // 受領後、**同じ exchange** で timed Invoke/Write を送ってくる（ack は
+    // そこに piggyback）。`reply_reliable` はそれを `Ok(Some(msg))` として
+    // 返すので、捨てずにここで続けて処理する（捨てると invoke は MRP ack
+    // 済みのまま永遠に応答されず、Google Play Services スタックの
+    // commissioning が中断する — 2026-08-18 実測）。
+    let mut msg = msg;
+    loop {
+        if msg.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
+            // Secure-channel traffic on an established session (e.g. a
+            // device-initiated-exchange StatusReport) — out of M1 scope.
+            return;
         }
-    }
 
-    // CommissioningComplete success: stop advertising commissionable.
-    if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
-        if let Some((cluster, command)) = req_cluster_command {
-            if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
-                && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
-            {
-                if let Ok(outcome) = im::decode_invoke_response(&resp_payload) {
-                    if outcome.status == im::STATUS_SUCCESS {
-                        if let Some(ctx) = mdns {
-                            ctx.mdns.set_commissionable(None).await;
+        // ReadRequest gets its own chunk-aware flow (Task 6) instead of going
+        // through `Node::handle_im` (whose `handle_read` always answers with a
+        // single message) — see `serve_read_request_chunked`'s doc comment.
+        // Reads never trigger the AddNOC/CommissioningComplete milestones
+        // below (those are Invoke-only), so returning here is safe.
+        if msg.proto.opcode == im::OPCODE_READ_REQUEST {
+            serve_read_request_chunked(&msg, session, fabric_index, node).await;
+            return;
+        }
+
+        // SubscribeRequest likewise owns its whole interaction (priming chunks
+        // + SubscribeResponse on this exchange, Task 12) rather than producing
+        // one reply through `Node::handle_im`. Success installs the node's one
+        // active subscription; failure anywhere in the flow leaves it with
+        // none — including tearing down whatever was subscribed before, since
+        // this same peer just asked to start over.
+        if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
+            **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
+            return;
+        }
+
+        tracing::debug!(
+            im_opcode = format_args!("0x{:02X}", msg.proto.opcode),
+            exchange_id = msg.proto.exchange_id,
+            request = ?im::decode_invoke_request(&msg.payload)
+                .ok()
+                .map(|r| (r.endpoint, r.cluster, r.command)),
+            "IM request"
+        );
+
+        // Only meaningful for CommissioningComplete detection below; a decode
+        // failure here just means we won't recognize that milestone (the
+        // dispatch to `node.handle_im` below still runs against the raw bytes
+        // regardless, so a malformed request is still answered/rejected
+        // normally).
+        let req_cluster_command = im::decode_invoke_request(&msg.payload)
+            .ok()
+            .map(|r| (r.cluster, r.command));
+
+        let mut ctx = InvokeCtx {
+            attestation_challenge: session.attestation_challenge(),
+            ..InvokeCtx::default()
+        };
+        let read_ctx = ReadCtx { fabric_index };
+        let fabrics_before = comm_server.fabrics().len();
+        let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
+        else {
+            return;
+        };
+        let ImOutcome {
+            opcode: resp_opcode,
+            payload: resp_payload,
+            changed,
+        } = outcome;
+        // Anything this request changed that the active subscription covers
+        // becomes dirty — the `select!` report branch (`run`) picks it up at
+        // the subscription's next deadline. Recorded *before* the reply is
+        // sent so a change is never lost to a failing reply.
+        if let Some(sub) = subscription.as_mut() {
+            sub.note_changed(&changed);
+        }
+        let reply_result = session
+            .reply_reliable(
+                &msg,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                resp_opcode,
+                &resp_payload,
+                &reply_cfg(),
+            )
+            .await;
+        tracing::debug!(
+            resp_opcode = format_args!("0x{:02X}", resp_opcode),
+            exchange_id = msg.proto.exchange_id,
+            payload_len = resp_payload.len(),
+            ok = reply_result.is_ok(),
+            error = reply_result.as_ref().err().map(|e| e.to_string()),
+            "IM reply sent"
+        );
+
+        // AddNOC success: a fabric appeared that wasn't there before this call.
+        let fabrics_after = comm_server.fabrics();
+        if fabrics_after.len() > fabrics_before {
+            if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
+                ctx.mdns
+                    .add_operational(operational_advert(
+                        entry,
+                        &ctx.hostname,
+                        ctx.port,
+                        ctx.addr_v6,
+                    ))
+                    .await;
+            }
+        }
+
+        // CommissioningComplete success: stop advertising commissionable.
+        if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
+            if let Some((cluster, command)) = req_cluster_command {
+                if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
+                    && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
+                {
+                    if let Ok(outcome) = im::decode_invoke_response(&resp_payload) {
+                        if outcome.status == im::STATUS_SUCCESS {
+                            if let Some(ctx) = mdns {
+                                ctx.mdns.set_commissionable(None).await;
+                            }
+                            // Task 14: CommissioningComplete is the other event
+                            // (besides the 15-minute deadline in `run`'s
+                            // `select!`) that closes the commissioning window —
+                            // a controller that just finished commissioning has
+                            // no reason to PASE in again, and refusing it stops
+                            // a second commissioner from racing in during
+                            // whatever's left of the original 15 minutes.
+                            **window = CommissioningWindow::Closed;
                         }
-                        // Task 14: CommissioningComplete is the other event
-                        // (besides the 15-minute deadline in `run`'s
-                        // `select!`) that closes the commissioning window —
-                        // a controller that just finished commissioning has
-                        // no reason to PASE in again, and refusing it stops
-                        // a second commissioner from racing in during
-                        // whatever's left of the original 15 minutes.
-                        **window = CommissioningWindow::Closed;
                     }
                 }
             }
+        }
+
+        // `reply_reliable` が実メッセージ（同一 exchange の後続リクエスト —
+        // 典型は Timed Interaction の timed Invoke）を返したら、この iteration
+        // と同じ経路で続けて処理する。ack 完了 (`Ok(None)`) と送信失敗 (`Err`)
+        // はどちらもこのメッセージ列の終端。
+        match reply_result {
+            Ok(Some(next)) => msg = next,
+            _ => return,
         }
     }
 }
@@ -2669,5 +2689,177 @@ mod tests {
             "expected a chunked read, got {chunks} chunk(s)"
         );
         assert!(interleaved_answered);
+    }
+
+    /// Timed Interaction（spec §8.9.4）の後続リクエスト: initiator は
+    /// TimedRequest → StatusResponse(SUCCESS) 受領後、**同一 exchange** で
+    /// timed Invoke を送る（StatusResponse への ack はそこに piggyback）。
+    /// `reply_reliable` はこの後続リクエストを `Ok(Some(msg))` として返すが、
+    /// 旧 `serve_secured_message` は戻り値を捨てていたため invoke は MRP ack
+    /// だけされて永遠に応答されず、Google Play Services スタック（Android HA
+    /// アプリ経由の commissioning）が 45 秒タイムアウトで中断していた
+    /// （2026-08-18 実測）。
+    #[tokio::test]
+    async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
+        use mat_controller::crypto::{open_message, seal_message};
+        use mat_controller::message::Destination;
+        use mat_controller::session::SessionKeys;
+        use mat_controller::tlv::{Tag, Writer};
+        use mat_controller::transport::UdpTransport;
+
+        use crate::core::fabric_store::FabricStore;
+
+        const LOCAL_SID: u16 = 0xAAAA;
+        const PEER_SID: u16 = 0xBBBB;
+        const CTRL_NODE: u64 = 1;
+        const DEV_NODE: u64 = 2;
+        const I2R: [u8; 16] = [0x11; 16];
+        const R2I: [u8; 16] = [0x22; 16];
+        const EX: u16 = 0x50;
+
+        let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+            .await
+            .unwrap();
+        let dev_transport = Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )));
+        let dev_addr = dev_transport.local_addr().unwrap();
+
+        let mut session = SecureSession::new_device_role(
+            Arc::clone(&dev_transport),
+            controller.local_addr().unwrap(),
+            LOCAL_SID,
+            PEER_SID,
+            SessionKeys {
+                i2r: I2R,
+                r2i: R2I,
+                attestation_challenge: [0; 16],
+            },
+            DEV_NODE,
+            CTRL_NODE,
+        );
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let comm_server = CommissioningServer::new(dev, FabricStore::new());
+
+        let ctrl_task = tokio::spawn(async move {
+            let mut counter = 10u32;
+            let mut send = |opcode: u8,
+                            protocol_id: u16,
+                            needs_ack: bool,
+                            acked: Option<u32>,
+                            payload: &[u8]| {
+                let header = MessageHeader {
+                    session_id: LOCAL_SID,
+                    security_flags: 0,
+                    message_counter: counter,
+                    source_node_id: None,
+                    destination: Destination::None,
+                };
+                let proto = ProtocolHeader {
+                    initiator: true,
+                    needs_ack,
+                    acked_counter: acked,
+                    opcode,
+                    exchange_id: EX,
+                    protocol_id,
+                    vendor_id: None,
+                };
+                counter += 1;
+                seal_message(&I2R, &header, &proto, payload, CTRL_NODE).unwrap()
+            };
+
+            // TimedRequest: struct{0: timeout-ms, 255: revision}
+            let timed_payload = {
+                let mut w = Writer::new();
+                w.start_struct(Tag::Anonymous);
+                w.put_uint(Tag::Context(0), 300);
+                w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
+                w.end_container();
+                w.finish()
+            };
+            let dg = send(
+                im::OPCODE_TIMED_REQUEST,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                true,
+                None,
+                &timed_payload,
+            );
+            controller.send_to(&dg, dev_addr).await.unwrap();
+
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let mut invoke_sent = false;
+            loop {
+                let (n, from) =
+                    tokio::time::timeout(Duration::from_secs(20), controller.recv_from(&mut buf))
+                        .await
+                        .expect("device went silent — the timed invoke was probably dropped")
+                        .unwrap();
+                let (h, p, payload) = open_message(&R2I, &buf[..n], DEV_NODE).unwrap();
+                if p.protocol_id == PROTOCOL_ID_SECURE_CHANNEL {
+                    continue; // the device's own standalone acks
+                }
+                if p.opcode == im::OPCODE_STATUS_RESPONSE {
+                    assert_eq!(
+                        im::decode_status_response(&payload).unwrap(),
+                        im::STATUS_SUCCESS
+                    );
+                    assert!(!invoke_sent, "one StatusResponse expected");
+                    invoke_sent = true;
+                    // 後続の timed invoke: 同一 exchange、StatusResponse への
+                    // ack を piggyback（standalone ack は送らない — 実機の
+                    // chip スタックの挙動に合わせる）。
+                    let invoke = send(
+                        im::OPCODE_INVOKE_REQUEST,
+                        PROTOCOL_ID_INTERACTION_MODEL,
+                        true,
+                        Some(h.message_counter),
+                        &im::encode_invoke_request(0, im::CLUSTER_BASIC_INFORMATION, 0x7F, None),
+                    );
+                    controller.send_to(&invoke, from).await.unwrap();
+                    continue;
+                }
+                assert_eq!(
+                    p.opcode,
+                    im::OPCODE_INVOKE_RESPONSE,
+                    "the timed invoke must be answered with an InvokeResponse"
+                );
+                let out = im::decode_invoke_response(&payload).unwrap();
+                assert_eq!(out.status, im::STATUS_UNSUPPORTED_COMMAND);
+                let ack = send(
+                    OPCODE_MRP_STANDALONE_ACK,
+                    PROTOCOL_ID_SECURE_CHANNEL,
+                    false,
+                    Some(h.message_counter),
+                    &[],
+                );
+                controller.send_to(&ack, from).await.unwrap();
+                return;
+            }
+        });
+
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+        serve_secured(
+            &buf[..n],
+            from,
+            &mut session,
+            0,
+            &mut ServeState {
+                node: &mut node,
+                comm_server: &comm_server,
+                mdns: None,
+                subscription: &mut None,
+                window: &mut CommissioningWindow::Closed,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(30), ctrl_task)
+            .await
+            .expect("controller task hung — the same-exchange timed invoke was dropped")
+            .unwrap();
     }
 }

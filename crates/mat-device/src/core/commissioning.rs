@@ -782,7 +782,10 @@ impl Inner {
             return noc_status(NOC_STATUS_INVALID_NOC);
         }
         if noc.pub_key != op_public_key {
-            tracing::debug!(reason = "public key mismatch", "AddNOC rejected: InvalidPublicKey");
+            tracing::debug!(
+                reason = "public key mismatch",
+                "AddNOC rejected: InvalidPublicKey"
+            );
             return noc_status(NOC_STATUS_INVALID_PUBLIC_KEY);
         }
         let (Some(node_id), Some(fabric_id)) = (noc.node_id(), noc.fabric_id()) else {
