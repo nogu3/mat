@@ -63,7 +63,7 @@ use crate::core::commissioning::CommissioningServer;
 use crate::core::datamodel::{ImOutcome, InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
-use crate::core::pase::PaseVerifierConfig;
+use crate::core::pase::{PaseSecret, PaseVerifierConfig};
 use crate::device::{DeviceConfig, DeviceError};
 use crate::net::mdns::MdnsAdvertiser;
 use crate::net::subscription::ActiveSubscription;
@@ -620,7 +620,7 @@ pub(crate) async fn run(
                                 peer,
                                 first,
                                 PaseVerifierConfig {
-                                    passcode: config.passcode,
+                                    secret: PaseSecret::Passcode(config.passcode),
                                     salt: pase_salt.to_vec(),
                                     iterations: PASE_ITERATIONS,
                                     responder_session_id: local_session_id,

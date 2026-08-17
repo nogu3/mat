@@ -31,12 +31,21 @@ use mat_controller::spake2p::{Spake2pVerifier, SpakeError};
 /// same name.
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
-/// Verifier-side configuration: the setup passcode plus the PBKDF salt/
-/// iterations this responder advertises in PBKDFParamResponse, and the
-/// local (responder) session id it assigns itself (spec §4.13.1.2's
-/// `responderSessionId`).
+/// PASE の secret 供給源。`Passcode` は起動時窓（QR の passcode から
+/// w0/w1 を導出）、`VerifierMaterial` は ECM 窓（OpenCommissioningWindow が
+/// 渡す w0‖L をそのまま使う — こちらは w1 を知らない）。
+#[derive(Clone)]
+pub enum PaseSecret {
+    Passcode(u32),
+    VerifierMaterial([u8; 97]),
+}
+
+/// Verifier-side configuration: the PASE secret (passcode or verifier
+/// material) plus the PBKDF salt/iterations this responder advertises in
+/// PBKDFParamResponse, and the local (responder) session id it assigns
+/// itself (spec §4.13.1.2's `responderSessionId`).
 pub struct PaseVerifierConfig {
-    pub passcode: u32,
+    pub secret: PaseSecret,
     pub salt: Vec<u8>,
     pub iterations: u32,
     pub responder_session_id: u16,
@@ -201,11 +210,14 @@ impl PaseResponderCore {
         peer_session_id: u16,
     ) -> Result<PaseOutput, PaseCoreError> {
         let p_a = pase::decode_pake1(payload)?;
-        let verifier = Spake2pVerifier::from_passcode(
-            self.config.passcode,
-            &self.config.salt,
-            self.config.iterations,
-        );
+        let verifier = match &self.config.secret {
+            PaseSecret::Passcode(passcode) => {
+                Spake2pVerifier::from_passcode(*passcode, &self.config.salt, self.config.iterations)
+            }
+            PaseSecret::VerifierMaterial(material) => {
+                Spake2pVerifier::from_verifier_material(material).map_err(PaseCoreError::Spake)?
+            }
+        };
         let p_b = verifier.p_b();
         let shared = verifier.finish(&p_a, &context, b"", b"")?;
         let reply = pase::encode_pake2(&p_b, &shared.c_b);
@@ -264,20 +276,28 @@ mod tests {
 
     fn cfg() -> PaseVerifierConfig {
         PaseVerifierConfig {
-            passcode: 20202021,
+            secret: PaseSecret::Passcode(20202021),
             salt: b"SPAKE2P Key Salt".to_vec(),
             iterations: 1000,
             responder_session_id: 0xB0B1,
         }
     }
 
-    /// Full handshake driven purely through `mat_controller::pase`'s public
-    /// codecs and a `Spake2pProver` — no I/O, no `ResponderExchange`. Also
-    /// asserts the derived session keys agree with an independent
-    /// prover-side HKDF computation (key-derivation direction check).
-    #[test]
-    fn pase_core_full_handshake() {
-        let mut core = PaseResponderCore::new(cfg());
+    /// Drives a full handshake (PBKDFParamRequest -> Pake1 -> Pake3) against
+    /// a responder built from `config`, using a `Spake2pProver` initiator
+    /// that knows `passcode` — no I/O, no `ResponderExchange`. Works for a
+    /// `PaseSecret::Passcode(passcode)` responder as well as a
+    /// `PaseSecret::VerifierMaterial` responder built from
+    /// `compute_verifier(passcode, ..)` with the same salt/iterations,
+    /// since both land on the same w0. Also asserts the derived session
+    /// keys agree with an independent prover-side HKDF computation
+    /// (key-derivation direction check). Returns the terminal
+    /// `PaseOutput::Established` so callers can assert on its fields.
+    fn drive_full_handshake(config: PaseVerifierConfig, passcode: u32) -> PaseOutput {
+        let expected_responder_session_id = config.responder_session_id;
+        let expected_salt = config.salt.clone();
+        let expected_iterations = config.iterations;
+        let mut core = PaseResponderCore::new(config);
 
         // --- PBKDFParamRequest -> PBKDFParamResponse ---
         let req = pase::encode_pbkdf_param_request(&[9u8; 32], 0x0011);
@@ -289,14 +309,14 @@ mod tests {
         assert_eq!(op, OPCODE_PBKDF_PARAM_RESPONSE);
 
         let resp = pase::decode_pbkdf_param_response(&resp_bytes).unwrap();
-        assert_eq!(resp.responder_session_id, 0xB0B1);
-        assert_eq!(resp.iterations, 1000);
-        assert_eq!(resp.salt, b"SPAKE2P Key Salt");
+        assert_eq!(resp.responder_session_id, expected_responder_session_id);
+        assert_eq!(resp.iterations, expected_iterations);
+        assert_eq!(resp.salt, expected_salt);
 
         // --- prover side (drives the handshake exactly as a real
         // initiator would, using the same public codecs/crypto) ---
         let context = pase::pake_context(&req, &resp_bytes);
-        let (w0, w1) = spake2p::derive_w0_w1(20202021, &resp.salt, resp.iterations);
+        let (w0, w1) = spake2p::derive_w0_w1(passcode, &resp.salt, resp.iterations);
         let prover = Spake2pProver::new(w0, w1);
 
         // --- Pake1 -> Pake2 ---
@@ -317,17 +337,18 @@ mod tests {
 
         // --- Pake3 -> Established ---
         let pake3 = pase::encode_pake3(&shared.c_a);
+        let output = core.on_message(OPCODE_PASE_PAKE3, &pake3).unwrap();
         let PaseOutput::Established {
-            reply,
+            ref reply,
             opcode,
-            keys,
+            ref keys,
             peer_session_id,
-        } = core.on_message(OPCODE_PASE_PAKE3, &pake3).unwrap()
+        } = output
         else {
             panic!("expected Established")
         };
         assert_eq!(opcode, OPCODE_STATUS_REPORT);
-        assert_eq!(reply, [0u8; 8]);
+        assert_eq!(reply, &[0u8; 8]);
         assert_eq!(peer_session_id, 0x0011);
 
         // --- session keys must match an independent prover-side derivation ---
@@ -337,6 +358,34 @@ mod tests {
         assert_eq!(keys.i2r, okm[..16]);
         assert_eq!(keys.r2i, okm[16..32]);
         assert_eq!(keys.attestation_challenge, okm[32..]);
+
+        output
+    }
+
+    /// Full handshake with a `PaseSecret::Passcode` responder (startup
+    /// commissioning window).
+    #[test]
+    fn pase_core_full_handshake() {
+        drive_full_handshake(cfg(), 20202021);
+    }
+
+    /// ECM（OpenCommissioningWindow）: passcode ではなく verifier 素材
+    /// （w0‖L, 97B）で responder を構成してもハンドシェイクが成立する。
+    /// verifier は initiator と同じ passcode/salt/iterations から
+    /// `compute_verifier` で作る（実運用では OCW が 97B を直接渡してくる）。
+    #[test]
+    fn ecm_verifier_material_handshake_succeeds() {
+        use mat_controller::spake2p::compute_verifier;
+        let salt = [0x5A; 16];
+        let iterations = 1000;
+        let material = compute_verifier(31415926, &salt, iterations);
+        let config = PaseVerifierConfig {
+            secret: PaseSecret::VerifierMaterial(material),
+            salt: salt.to_vec(),
+            iterations,
+            responder_session_id: 0xB0B2,
+        };
+        drive_full_handshake(config, 31415926);
     }
 
     #[test]

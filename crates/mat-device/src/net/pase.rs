@@ -32,7 +32,7 @@ use mat_controller::message::{
 use mat_controller::session::SessionKeys;
 use mat_controller::transport::{Transport, UdpTransport, MAX_DATAGRAM};
 
-use crate::core::pase::{PaseCoreError, PaseOutput, PaseResponderCore, PaseVerifierConfig};
+use crate::core::pase::{PaseCoreError, PaseOutput, PaseResponderCore, PaseSecret, PaseVerifierConfig};
 
 /// PBKDF parameters this minimal driver advertises. Matches
 /// `mat_controller::test_support::pase_responder_task`'s fixture values.
@@ -185,7 +185,7 @@ pub async fn run_pase_once(
         peer,
         first,
         PaseVerifierConfig {
-            passcode,
+            secret: PaseSecret::Passcode(passcode),
             salt: SALT.to_vec(),
             iterations: ITERATIONS,
             responder_session_id: RESPONDER_SESSION_ID,
