@@ -991,6 +991,14 @@ mod tests {
             InvokeReply::Status(status) => {
                 panic!("expected data reply, got status 0x{status:02X}")
             }
+            InvokeReply::ClusterStatus {
+                status,
+                cluster_status,
+            } => {
+                panic!(
+                    "expected data reply, got cluster status 0x{status:02X} (cluster-specific: 0x{cluster_status:02X})"
+                )
+            }
         }
     }
 

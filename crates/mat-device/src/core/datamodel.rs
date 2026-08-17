@@ -104,6 +104,10 @@ pub struct ReadCtx {
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvokeReply {
     Status(u8),
+    /// spec §8.10.1: IM status + クラスタ固有ステータス（例:
+    /// AdministratorCommissioning の Busy(2)/PAKEParameterError(3)/
+    /// WindowNotOpen(4)）。status は通常 STATUS_FAILURE。
+    ClusterStatus { status: u8, cluster_status: u8 },
     Data {
         response_command: u32,
         fields_tlv: Vec<u8>,
@@ -702,6 +706,16 @@ impl Node {
                 status,
                 None,
             ),
+            InvokeReply::ClusterStatus {
+                status,
+                cluster_status,
+            } => im::encode_invoke_response_status(
+                req.endpoint,
+                req.cluster,
+                req.command,
+                status,
+                Some(cluster_status),
+            ),
             InvokeReply::Data {
                 response_command,
                 fields_tlv,
@@ -1012,6 +1026,38 @@ mod tests {
         assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
         let out = decode_invoke_response(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_UNSUPPORTED_COMMAND);
+    }
+
+    /// クラスタ固有ステータス（spec §8.10.1 の cluster-status フィールド）を
+    /// 返せること。AdministratorCommissioning の Busy(2) 等が使う。
+    #[test]
+    fn invoke_reply_cluster_status_encodes_cluster_specific_code() {
+        struct Failing;
+        impl ClusterHandler for Failing {
+            fn cluster_id(&self) -> u32 {
+                0x9999_0003
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![]
+            }
+            fn read(&self, _attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+                None
+            }
+            fn invoke(&mut self, _command: u32, _fields: &[u8], _ctx: &mut InvokeCtx) -> InvokeReply {
+                InvokeReply::ClusterStatus {
+                    status: im::STATUS_FAILURE,
+                    cluster_status: 2, // Busy
+                }
+            }
+        }
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(0, Box::new(Failing));
+        let req = im::encode_invoke_request(0, 0x9999_0003, 0, None);
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_INVOKE_REQUEST, &req);
+        assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
+        let out = decode_invoke_response(&payload).unwrap();
+        assert_eq!(out.status, im::STATUS_FAILURE);
+        assert_eq!(out.cluster_status, Some(2));
     }
 
     /// M2 behavior (unlike M1): an opcode this skeleton doesn't implement

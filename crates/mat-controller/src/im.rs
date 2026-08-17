@@ -88,6 +88,7 @@ pub const ATTR_PRODUCT_ID: u32 = 0x0004;
 /// IM status codes (spec §8.10.1, Table "Status Code Table"). Only the
 /// values `mat-device`'s data model dispatch actually returns today.
 pub const STATUS_SUCCESS: u8 = 0x00;
+pub const STATUS_FAILURE: u8 = 0x01;
 pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
 pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
 pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
