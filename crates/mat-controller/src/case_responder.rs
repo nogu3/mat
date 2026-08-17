@@ -63,7 +63,7 @@ use crate::crypto::{decrypt_payload, encrypt_payload, sign_ecdsa_p256, verify_ec
 use crate::fabric::case_destination_id;
 use crate::message::OPCODE_STATUS_REPORT;
 use crate::session::SessionKeys;
-use crate::tlv::{Reader, Tag, Value, Writer};
+use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
 
 // Wire opcodes (spec §4.14) — mirror of the ones in `case.rs`.
 pub(crate) const OPCODE_SIGMA1: u8 = 0x30;
@@ -406,6 +406,24 @@ struct Sigma1Fields {
 /// ignored; `case::encode_sigma1` never sends them). Resumption fields (tag
 /// 6/7) are deliberately tolerated and ignored — full-handshake fallback per
 /// spec §4.14.2; Sigma2Resume is out of M2 scope.
+/// Consumes a just-opened container up to and including its matching
+/// `ContainerEnd`. Local copy of `pase::skip_container`（あちらは module
+/// private — 同じ理由でここにも複製）。フラットな field ループが
+/// ネストした struct（例: Sigma1 の initiatorSessionParams）の中身を
+/// 同じレベルの context tag として誤読しないための必須処理。
+fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
+    let mut depth = 1usize;
+    while depth > 0 {
+        let el = r.next()?.ok_or(TlvError::Truncated)?;
+        match el.value {
+            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
+            Value::ContainerEnd => depth -= 1,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_sigma1(payload: &[u8]) -> Result<Sigma1Fields, CaseCoreError> {
     let mut r = Reader::new(payload);
     match r
@@ -436,6 +454,12 @@ fn parse_sigma1(payload: &[u8]) -> Result<Sigma1Fields, CaseCoreError> {
             (Tag::Context(2), Value::Uint(v)) => {
                 session_id =
                     Some(u16::try_from(v).map_err(|_| CaseCoreError::Decode("sigma1 session id"))?);
+            }
+            // initiatorSessionParams（tag 5 の struct）等のネストは丸ごと
+            // 読み飛ばす — 中身の context tag をこのレベルの field と
+            // 誤読しない（matter.js は必ず sessionParams を含める）。
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("sigma1 tlv"))?;
             }
             (Tag::Context(3), Value::Bytes(b)) => {
                 dest = Some(
@@ -494,6 +518,9 @@ fn parse_sigma3(payload: &[u8]) -> Result<Vec<u8>, CaseCoreError> {
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::Bytes(b)) => enc = Some(b.to_vec()),
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("sigma3 tlv"))?;
+            }
             _ => {}
         }
     }
@@ -532,6 +559,9 @@ fn parse_tbe(payload: &[u8]) -> Result<ParsedTbe, CaseCoreError> {
                     b.try_into()
                         .map_err(|_| CaseCoreError::Decode("tbe signature length"))?,
                 );
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("tbe tlv"))?;
             }
             _ => {}
         }
@@ -663,6 +693,34 @@ mod tests {
             }
         }
         (session_id.expect("session id"), eph.expect("eph"))
+    }
+
+    /// matter.js は Sigma1 に initiatorSessionParams（tag 5 の struct）を
+    /// 含める。その中の tag 2 は SESSION_ACTIVE_INTERVAL（matter.js 既定
+    /// 300ms）で、ネストを平坦に舐める旧実装は initiatorSessionId を 300 に
+    /// 上書きしていた。実測: HA matter-server 1.1.7 からの commissioning で
+    /// CASE 後の matv 発パケットが全て「Ignoring message for unknown
+    /// session 0x012c(=300)」で捨てられ完了不能（2026-08-18）。
+    #[test]
+    fn parse_sigma1_ignores_nested_session_params() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(1), &[0x42; 32]);
+        w.put_uint(Tag::Context(2), 0x1234);
+        w.put_bytes(Tag::Context(3), &[0x24; 32]);
+        w.put_bytes(Tag::Context(4), &[0x04; 65]);
+        w.start_struct(Tag::Context(5)); // initiatorSessionParams
+        w.put_uint(Tag::Context(1), 5000); // SESSION_IDLE_INTERVAL
+        w.put_uint(Tag::Context(2), 300); // SESSION_ACTIVE_INTERVAL
+        w.put_uint(Tag::Context(3), 4000); // SESSION_ACTIVE_THRESHOLD
+        w.end_container();
+        w.end_container();
+
+        let parsed = parse_sigma1(&w.finish()).expect("sigma1 with session params parses");
+        assert_eq!(
+            parsed.initiator_session_id, 0x1234,
+            "nested session params must not overwrite the session id"
+        );
     }
 
     fn build_sigma1(fabric: &CaseFabric) -> Vec<u8> {
