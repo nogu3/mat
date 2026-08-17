@@ -9,20 +9,21 @@
 //! `core::fabric_store::FabricStore`'s `FabricPersist` trait boundary; the
 //! only concrete (file-backed) implementation lives under `net::store`.
 //!
-//! ## Structure: one state, two `ClusterHandler`s
+//! ## Structure: one state, three `ClusterHandler`s
 //!
 //! `Node::add_endpoint` takes `Vec<Box<dyn ClusterHandler>>` — each boxed
 //! handler is singly owned and answers exactly one `cluster_id()`. But
-//! General Commissioning and Node Operational Credentials commands share
-//! state (the fail-safe timer, the CSR/AddTrustedRoot staged between
-//! commands, the fabric table), so `CommissioningServer` itself is *not* a
+//! General Commissioning, Node Operational Credentials, and Administrator
+//! Commissioning commands share state (the fail-safe timer, the
+//! CSR/AddTrustedRoot staged between commands, the fabric table, the open
+//! commissioning window), so `CommissioningServer` itself is *not* a
 //! `ClusterHandler` — it holds an `Arc<Mutex<Inner>>` and
-//! `into_cluster_handlers` splits it into two thin adapters
-//! (`GeneralCommissioningHandler`/`OperationalCredentialsHandler`) that
-//! both lock the same `Inner` and delegate. `Arc<Mutex<..>>` rather than
-//! `Rc<RefCell<..>>` so the handlers stay `Send` for a future async IM
-//! driver (mirrors `Node`'s eventual home behind `tokio::sync::Mutex` or
-//! similar) even though nothing here awaits.
+//! `into_cluster_handlers` splits it into three thin adapters
+//! (`GeneralCommissioningHandler`/`OperationalCredentialsHandler`/
+//! `AdminCommissioningHandler`) that all lock the same `Inner` and
+//! delegate. `Arc<Mutex<..>>` rather than `Rc<RefCell<..>>` so the handlers
+//! stay `Send` for a future async IM driver (mirrors `Node`'s eventual home
+//! behind `tokio::sync::Mutex` or similar) even though nothing here awaits.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,12 +32,14 @@ use mat_controller::attestation::{attestation_tbs, encode_attestation_elements};
 use mat_controller::cert::{verify_noc_chain, MatterCert};
 use mat_controller::commissioning::{
     decode_add_noc, decode_add_trusted_root, decode_arm_fail_safe, decode_attestation_request,
-    decode_cert_chain_request, decode_csr_request, decode_set_regulatory_config,
-    encode_attestation_response, encode_cert_chain_response, encode_commissioning_status_response,
-    encode_csr_response, encode_noc_response, encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI,
+    decode_cert_chain_request, decode_csr_request, decode_open_commissioning_window,
+    decode_set_regulatory_config, encode_attestation_response, encode_cert_chain_response,
+    encode_commissioning_status_response, encode_csr_response, encode_noc_response,
+    encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI, CLUSTER_ADMIN_COMMISSIONING,
     CLUSTER_GENERAL_COMMISSIONING, CLUSTER_OPERATIONAL_CREDENTIALS, CMD_ADD_NOC,
     CMD_ADD_TRUSTED_ROOT, CMD_ARM_FAIL_SAFE, CMD_ATTESTATION_REQUEST, CMD_CERT_CHAIN_REQUEST,
-    CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST, CMD_SET_REGULATORY_CONFIG,
+    CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST, CMD_OPEN_COMMISSIONING_WINDOW,
+    CMD_REVOKE_COMMISSIONING, CMD_SET_REGULATORY_CONFIG,
 };
 use mat_controller::crypto::sign_ecdsa_p256;
 use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
@@ -95,6 +98,22 @@ const ATTR_OC_SUPPORTED_FABRICS: u32 = 2;
 const ATTR_OC_COMMISSIONED_FABRICS: u32 = 3;
 const ATTR_OC_TRUSTED_ROOT_CERTIFICATES: u32 = 4;
 const ATTR_OC_CURRENT_FABRIC_INDEX: u32 = 5;
+
+/// Administrator Commissioning (0x003C) attribute ids this server serves
+/// (spec §11.19.5). `WindowStatus` is 0 (closed) or 1 (`EnhancedWindowOpen`
+/// — this server only ever opens an ECM window, never the legacy basic-
+/// commissioning-method window 2); `AdminFabricIndex`/`AdminVendorID` are
+/// `null` while closed.
+const ATTR_AC_WINDOW_STATUS: u32 = 0;
+const ATTR_AC_ADMIN_FABRIC_INDEX: u32 = 1;
+const ATTR_AC_ADMIN_VENDOR_ID: u32 = 2;
+
+/// AdministratorCommissioning `StatusCode` (spec §11.19.6) values this
+/// server returns via `InvokeReply::ClusterStatus`. `Success`(0) isn't
+/// listed — that's the plain `InvokeReply::Status(im::STATUS_SUCCESS)` path.
+const AC_STATUS_BUSY: u8 = 2;
+const AC_STATUS_PAKE_PARAMETER_ERROR: u8 = 3;
+const AC_STATUS_WINDOW_NOT_OPEN: u8 = 4;
 
 /// `BasicCommissioningInfo` (spec §11.10.5.2) fields: the single-attempt
 /// fail-safe expiry and the cumulative budget across an entire commissioning
@@ -170,6 +189,32 @@ struct PendingCommissioning {
     trusted_root_tlv: Option<Vec<u8>>,
 }
 
+/// Administrator Commissioning window state (spec §11.19.5) backing the
+/// `WindowStatus`/`AdminFabricIndex`/`AdminVendorID` attributes — `Some`
+/// while `OpenCommissioningWindow` has been accepted and the window hasn't
+/// since been revoked or closed (by `close_admin_window`, Task 4's
+/// timeout/`CommissioningComplete` handling).
+#[derive(Debug, Clone, Copy)]
+struct AdminWindow {
+    fabric_index: u8,
+    vendor_id: u16,
+}
+
+/// Staged by a successful `OpenCommissioningWindow` (spec §11.19.8.1) for
+/// the net runtime (Task 4) to pick up via
+/// `CommissioningServer::take_pending_window_request` and turn into an
+/// actual PASE listener bound to `verifier`/`discriminator`. Core stays
+/// timer/socket free (module doc), so `timeout_s` is handed over as a plain
+/// duration — the runtime is the one that turns it into a deadline.
+#[derive(Debug, Clone)]
+pub struct WindowRequest {
+    pub verifier: [u8; 97],
+    pub discriminator: u16,
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub timeout_s: u16,
+}
+
 /// Shared state behind `CommissioningServer`'s `Arc<Mutex<..>>` — see the
 /// module doc for why this isn't `CommissioningServer` itself.
 struct Inner {
@@ -185,6 +230,14 @@ struct Inner {
     /// success; consumed by `rollback_uncommitted_fabric` (removing the
     /// fabric) on expiry or on a fresh/early `ArmFailSafe`.
     uncommitted_fabric_index: Option<u8>,
+    /// The currently open Administrator Commissioning window, if any —
+    /// backs the AC cluster's attribute reads. `None` both before the first
+    /// `OpenCommissioningWindow` and after a `RevokeCommissioning` /
+    /// `close_admin_window`.
+    admin_window: Option<AdminWindow>,
+    /// The most recent `OpenCommissioningWindow` request, staged for the
+    /// runtime to collect (and clear) via `take_pending_window_request`.
+    pending_window_request: Option<WindowRequest>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -203,6 +256,8 @@ impl CommissioningServer {
                 pending: PendingCommissioning::default(),
                 store,
                 uncommitted_fabric_index: None,
+                admin_window: None,
+                pending_window_request: None,
             })),
         }
     }
@@ -266,6 +321,42 @@ impl CommissioningServer {
             .expire_fail_safe()
     }
 
+    /// Takes (clearing) the `WindowRequest` staged by the most recent
+    /// successful `OpenCommissioningWindow`, if any — the net runtime
+    /// (Task 4) collects this right after dispatch and turns it into an
+    /// actual PASE listener. `None` if no `OpenCommissioningWindow` has
+    /// succeeded since the last time this was called.
+    pub fn take_pending_window_request(&self) -> Option<WindowRequest> {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .pending_window_request
+            .take()
+    }
+
+    /// Whether an Administrator Commissioning window is currently open —
+    /// the net runtime (Task 4) polls this to decide whether its own PASE
+    /// listener should still be accepting connections.
+    pub fn admin_window_is_open(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .admin_window
+            .is_some()
+    }
+
+    /// Closes the Administrator Commissioning window without going through
+    /// `RevokeCommissioning` — for the net runtime (Task 4) to call on
+    /// timeout expiry or `CommissioningComplete`, mirroring
+    /// `handle_revoke_commissioning`'s effect on the AC attributes. A no-op
+    /// if already closed.
+    pub fn close_admin_window(&self) {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .admin_window = None;
+    }
+
     /// Test-only: see `FailSafeState::force_expire`.
     #[cfg(test)]
     fn force_expire_fail_safe(&self) {
@@ -276,18 +367,26 @@ impl CommissioningServer {
             .force_expire();
     }
 
-    /// Splits into the two `ClusterHandler` adapters `Node::add_cluster`
+    /// Splits into the three `ClusterHandler` adapters `Node::add_cluster`
     /// registers on endpoint 0 (General Commissioning 0x0030, Node
-    /// Operational Credentials 0x003E) — see the module doc. Takes `&self`
-    /// (not `self`) so a runtime can keep the original `CommissioningServer`
-    /// around afterwards to poll `fabrics()` (e.g. to notice a fresh AddNOC
-    /// and publish an operational mDNS advert) — both handlers just clone
-    /// the shared `Arc<Mutex<Inner>>`, same as the two clones already did
-    /// when this took `self` by value.
-    pub fn into_cluster_handlers(&self) -> (Box<dyn ClusterHandler>, Box<dyn ClusterHandler>) {
+    /// Operational Credentials 0x003E, Administrator Commissioning 0x003C)
+    /// — see the module doc. Takes `&self` (not `self`) so a runtime can
+    /// keep the original `CommissioningServer` around afterwards to poll
+    /// `fabrics()` (e.g. to notice a fresh AddNOC and publish an
+    /// operational mDNS advert) or `take_pending_window_request()` — all
+    /// three handlers just clone the shared `Arc<Mutex<Inner>>`, same as the
+    /// two clones already did when this took `self` by value.
+    pub fn into_cluster_handlers(
+        &self,
+    ) -> (
+        Box<dyn ClusterHandler>,
+        Box<dyn ClusterHandler>,
+        Box<dyn ClusterHandler>,
+    ) {
         (
             Box::new(GeneralCommissioningHandler(Arc::clone(&self.inner))),
             Box::new(OperationalCredentialsHandler(Arc::clone(&self.inner))),
+            Box::new(AdminCommissioningHandler(Arc::clone(&self.inner))),
         )
     }
 
@@ -314,6 +413,9 @@ impl CommissioningServer {
             }
             CLUSTER_OPERATIONAL_CREDENTIALS => {
                 inner.handle_operational_credentials(command, fields_tlv, ctx)
+            }
+            CLUSTER_ADMIN_COMMISSIONING => {
+                inner.handle_admin_commissioning(command, fields_tlv, ctx)
             }
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_CLUSTER),
         }
@@ -387,6 +489,37 @@ impl ClusterHandler for OperationalCredentialsHandler {
     }
 }
 
+/// Thin `ClusterHandler` adapter for Administrator Commissioning (0x003C).
+struct AdminCommissioningHandler(Arc<Mutex<Inner>>);
+
+impl ClusterHandler for AdminCommissioningHandler {
+    fn cluster_id(&self) -> u32 {
+        CLUSTER_ADMIN_COMMISSIONING
+    }
+
+    fn attributes(&self) -> Vec<u32> {
+        vec![
+            ATTR_AC_WINDOW_STATUS,
+            ATTR_AC_ADMIN_FABRIC_INDEX,
+            ATTR_AC_ADMIN_VENDOR_ID,
+        ]
+    }
+
+    fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .read_admin_commissioning(attribute)
+    }
+
+    fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
+        self.0
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .handle_admin_commissioning(command, fields_tlv, ctx)
+    }
+}
+
 impl Inner {
     fn handle_general_commissioning(&mut self, command: u32, fields_tlv: &[u8]) -> InvokeReply {
         match command {
@@ -409,6 +542,19 @@ impl Inner {
             CMD_CSR_REQUEST => self.handle_csr_request(fields_tlv, ctx),
             CMD_ADD_TRUSTED_ROOT => self.handle_add_trusted_root(fields_tlv),
             CMD_ADD_NOC => self.handle_add_noc(fields_tlv),
+            _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
+        }
+    }
+
+    fn handle_admin_commissioning(
+        &mut self,
+        command: u32,
+        fields_tlv: &[u8],
+        ctx: &InvokeCtx,
+    ) -> InvokeReply {
+        match command {
+            CMD_OPEN_COMMISSIONING_WINDOW => self.handle_open_commissioning_window(fields_tlv, ctx),
+            CMD_REVOKE_COMMISSIONING => self.handle_revoke_commissioning(),
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
         }
     }
@@ -446,6 +592,28 @@ impl Inner {
             ATTR_OC_COMMISSIONED_FABRICS => Some(uint_value(self.store.entries().len() as u64)),
             ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates()),
             ATTR_OC_CURRENT_FABRIC_INDEX => Some(uint_value(u64::from(ctx.fabric_index))),
+            _ => None,
+        }
+    }
+
+    /// Administrator Commissioning attribute reads (spec §11.19.5), backed
+    /// by `admin_window`. `AdminFabricIndex`/`AdminVendorID` are `null`
+    /// while the window is closed (spec §11.19.5.1/.2) rather than 0 —
+    /// `Writer::put_null` distinguishes "no admin" from fabric index 0
+    /// (never a real fabric index) or vendor id 0 (unassigned but legal).
+    fn read_admin_commissioning(&self, attribute: u32) -> Option<Vec<u8>> {
+        match attribute {
+            ATTR_AC_WINDOW_STATUS => {
+                Some(uint_value(if self.admin_window.is_some() { 1 } else { 0 }))
+            }
+            ATTR_AC_ADMIN_FABRIC_INDEX => Some(match self.admin_window {
+                Some(w) => uint_value(u64::from(w.fabric_index)),
+                None => null_value(),
+            }),
+            ATTR_AC_ADMIN_VENDOR_ID => Some(match self.admin_window {
+                Some(w) => uint_value(u64::from(w.vendor_id)),
+                None => null_value(),
+            }),
             _ => None,
         }
     }
@@ -826,6 +994,88 @@ impl Inner {
             fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
         }
     }
+
+    /// OpenCommissioningWindow（spec §11.19.8.1, ECM — this server never
+    /// serves the legacy basic-commissioning-method window）: validates the
+    /// PAKE parameters, rejects if a window is already open, then records
+    /// `admin_window` (for the AC attributes) and stages a `WindowRequest`
+    /// for the runtime to turn into an actual PASE listener. Requires a
+    /// timed invoke in the real protocol (spec §11.19.8.1) — enforced by
+    /// the IM layer upstream of this handler, not re-checked here.
+    fn handle_open_commissioning_window(
+        &mut self,
+        fields_tlv: &[u8],
+        ctx: &InvokeCtx,
+    ) -> InvokeReply {
+        let Ok((timeout_s, verifier, discriminator, iterations, salt)) =
+            decode_open_commissioning_window(fields_tlv)
+        else {
+            return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+        };
+        if !(180..=900).contains(&timeout_s) {
+            return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+        }
+        if verifier.len() != 97
+            || !(1000..=100_000).contains(&iterations)
+            || !(16..=32).contains(&salt.len())
+        {
+            return InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: AC_STATUS_PAKE_PARAMETER_ERROR,
+            };
+        }
+        if self.admin_window.is_some() {
+            return InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: AC_STATUS_BUSY,
+            };
+        }
+
+        // AdminVendorID (spec §11.19.5.3) reflects the vendor id of the
+        // fabric that opened this window — the vendor id the *invoking*
+        // admin's own AddNOC recorded (`FabricEntry::admin_vendor_id`), not
+        // anything from this command's own fields (OpenCommissioningWindow
+        // carries no vendor id). Unassigned (0) if the invoking session's
+        // fabric index isn't in the table — shouldn't happen for a CASE
+        // session past AddNOC, but this handler doesn't assume it.
+        let vendor_id = self
+            .store
+            .entries()
+            .iter()
+            .find(|e| e.fabric_index == ctx.fabric_index)
+            .map_or(0, |e| e.admin_vendor_id);
+        self.admin_window = Some(AdminWindow {
+            fabric_index: ctx.fabric_index,
+            vendor_id,
+        });
+        let verifier: [u8; 97] = verifier
+            .try_into()
+            .expect("verifier length already checked == 97 above");
+        self.pending_window_request = Some(WindowRequest {
+            verifier,
+            discriminator,
+            iterations,
+            salt,
+            timeout_s,
+        });
+        InvokeReply::Status(im::STATUS_SUCCESS)
+    }
+
+    /// RevokeCommissioning（spec §11.19.8.2）: closes the window if one is
+    /// open, or `WindowNotOpen` if not. The actual PASE listener teardown
+    /// happens in the net runtime (Task 4), which reads
+    /// `admin_window_is_open()` after this dispatches to notice the
+    /// closure — this handler only owns the AC attribute state.
+    fn handle_revoke_commissioning(&mut self) -> InvokeReply {
+        if self.admin_window.is_none() {
+            return InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: AC_STATUS_WINDOW_NOT_OPEN,
+            };
+        }
+        self.admin_window = None;
+        InvokeReply::Status(im::STATUS_SUCCESS)
+    }
 }
 
 /// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
@@ -841,6 +1091,16 @@ fn uint_value(v: u64) -> Vec<u8> {
 fn bool_value(v: bool) -> Vec<u8> {
     let mut w = Writer::new();
     w.put_bool(Tag::Anonymous, v);
+    w.finish()
+}
+
+/// A standalone, `Tag::Anonymous`-tagged TLV `null` element — for nullable
+/// attributes (e.g. `AdminFabricIndex`/`AdminVendorID` while the
+/// Administrator Commissioning window is closed) that must read back
+/// distinct from a valid `0`.
+fn null_value() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_null(Tag::Anonymous);
     w.finish()
 }
 
@@ -878,7 +1138,7 @@ mod tests {
         decode_attestation_response, decode_commissioning_status_response, decode_csr_response,
         decode_noc_response, encode_add_noc, encode_add_trusted_root, encode_arm_fail_safe,
         encode_attestation_request, encode_cert_chain_request, encode_csr_request,
-        parse_nocsr_elements, CommissioningFabric,
+        encode_open_commissioning_window, parse_nocsr_elements, CommissioningFabric,
     };
     use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
@@ -1079,7 +1339,7 @@ mod tests {
     #[test]
     fn gc_serves_basic_commissioning_info() {
         let server = test_server();
-        let (gc, _) = server.into_cluster_handlers();
+        let (gc, ..) = server.into_cluster_handlers();
         let tlv = gc
             .read(ATTR_GC_BASIC_COMMISSIONING_INFO, &ReadCtx::default())
             .expect("BasicCommissioningInfo");
@@ -1104,7 +1364,7 @@ mod tests {
     #[test]
     fn gc_serves_other_scalar_attributes() {
         let server = test_server();
-        let (gc, _) = server.into_cluster_handlers();
+        let (gc, ..) = server.into_cluster_handlers();
 
         let breadcrumb = gc
             .read(ATTR_GC_BREADCRUMB, &ReadCtx::default())
@@ -1134,7 +1394,7 @@ mod tests {
     #[test]
     fn oc_fabrics_and_nocs_reflect_installed_fabric() {
         let server = commissioned_server(); // fabric_id=0x1122, node=0x5001, admin_vendor_id=0xFFF1
-        let (_, oc) = server.into_cluster_handlers();
+        let (_, oc, _) = server.into_cluster_handlers();
 
         // NOCs(0): array[ struct{1: noc_tlv, 2: icac_tlv?, 254: fabric_index} ]
         let nocs_tlv = oc.read(ATTR_OC_NOCS, &ReadCtx::default()).expect("NOCs");
@@ -1218,7 +1478,7 @@ mod tests {
     #[test]
     fn oc_current_fabric_index_reflects_read_ctx() {
         let server = commissioned_server();
-        let (_, oc) = server.into_cluster_handlers();
+        let (_, oc, _) = server.into_cluster_handlers();
 
         let tlv = oc
             .read(ATTR_OC_CURRENT_FABRIC_INDEX, &ReadCtx { fabric_index: 1 })
@@ -1642,16 +1902,188 @@ mod tests {
         );
     }
 
-    /// End-to-end proof that `into_cluster_handlers` wires both clusters
-    /// into the same shared state through real `Node`/IM wire framing (not
-    /// just the direct `invoke_command` shortcut the tests above use).
+    /// OCW 成功: WindowStatus=1、Admin 属性が呼び出し元 fabric を反映、
+    /// WindowRequest が stage される。
+    #[test]
+    fn open_commissioning_window_stages_request_and_updates_attrs() {
+        let server = commissioned_server(); // fabric_index=1 が入っている既存ヘルパ
+        let material = [0x42u8; 97];
+        let fields = encode_open_commissioning_window(300, &material, 0x0ABC, 1000, &[0x5A; 16]);
+        let reply = server.invoke_command(
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            &fields,
+            &InvokeCtx {
+                fabric_index: 1,
+                ..test_ctx()
+            },
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_SUCCESS));
+        let req = server.take_pending_window_request().expect("staged");
+        assert_eq!(req.discriminator, 0x0ABC);
+        assert_eq!(req.timeout_s, 300);
+        assert_eq!(req.verifier, material);
+        // 属性: WindowStatus=1(EnhancedWindowOpen), AdminFabricIndex=1,
+        // AdminVendorId=登録済み fabric の admin_vendor_id(0xFFF1)
+        let (_, _, ac) = server.into_cluster_handlers();
+        let tlv = ac.read(ATTR_AC_WINDOW_STATUS, &ReadCtx::default()).unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
+        let tlv = ac
+            .read(ATTR_AC_ADMIN_FABRIC_INDEX, &ReadCtx::default())
+            .unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
+        let tlv = ac
+            .read(ATTR_AC_ADMIN_VENDOR_ID, &ReadCtx::default())
+            .unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0xFFF1));
+    }
+
+    /// 窓が既に開いていれば Busy(2)。
+    #[test]
+    fn open_commissioning_window_while_open_returns_busy() {
+        let server = commissioned_server();
+        let fields = encode_open_commissioning_window(300, &[0x42; 97], 0x0ABC, 1000, &[0x5A; 16]);
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        server.invoke_command(
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            &fields,
+            &ctx,
+        );
+        let reply = server.invoke_command(
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            &fields,
+            &ctx,
+        );
+        assert_eq!(
+            reply,
+            InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: 2
+            }
+        );
+    }
+
+    /// パラメータ検証: verifier 長 ≠97 / iterations 範囲外(1000..=100000) /
+    /// salt 長範囲外(16..=32) は PAKEParameterError(3)。timeout 範囲外
+    /// (180..=900) は INVALID_COMMAND。
+    #[test]
+    fn open_commissioning_window_rejects_bad_parameters() {
+        let server = commissioned_server();
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let bad_iter = encode_open_commissioning_window(300, &[0x42; 97], 0x0ABC, 999, &[0x5A; 16]);
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_OPEN_COMMISSIONING_WINDOW,
+                &bad_iter,
+                &ctx
+            ),
+            InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: 3
+            }
+        );
+        let bad_salt = encode_open_commissioning_window(300, &[0x42; 97], 0x0ABC, 1000, &[0x5A; 8]);
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_OPEN_COMMISSIONING_WINDOW,
+                &bad_salt,
+                &ctx
+            ),
+            InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: 3
+            }
+        );
+        let bad_timeout =
+            encode_open_commissioning_window(60, &[0x42; 97], 0x0ABC, 1000, &[0x5A; 16]);
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_OPEN_COMMISSIONING_WINDOW,
+                &bad_timeout,
+                &ctx
+            ),
+            InvokeReply::Status(im::STATUS_INVALID_COMMAND)
+        );
+    }
+
+    /// Revoke: 開いていれば閉じ、閉じていれば WindowNotOpen(4)。
+    #[test]
+    fn revoke_commissioning_closes_or_rejects() {
+        let server = commissioned_server();
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_REVOKE_COMMISSIONING,
+                &[],
+                &ctx
+            ),
+            InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: 4
+            }
+        );
+        let fields = encode_open_commissioning_window(300, &[0x42; 97], 0x0ABC, 1000, &[0x5A; 16]);
+        server.invoke_command(
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            &fields,
+            &ctx,
+        );
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_REVOKE_COMMISSIONING,
+                &[],
+                &ctx
+            ),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+        // 閉じた後の属性は WindowStatus=0 / Admin* は null
+        let (_, _, ac) = server.into_cluster_handlers();
+        let tlv = ac.read(ATTR_AC_WINDOW_STATUS, &ReadCtx::default()).unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(0));
+        let tlv = ac
+            .read(ATTR_AC_ADMIN_FABRIC_INDEX, &ReadCtx::default())
+            .unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Null);
+        let tlv = ac
+            .read(ATTR_AC_ADMIN_VENDOR_ID, &ReadCtx::default())
+            .unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::Null);
+    }
+
+    /// End-to-end proof that `into_cluster_handlers` wires all three
+    /// clusters into the same shared state through real `Node`/IM wire
+    /// framing (not just the direct `invoke_command` shortcut the tests
+    /// above use).
     #[test]
     fn wired_into_node_dispatches_both_clusters() {
         let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
         let server = CommissioningServer::new(dev, FabricStore::new());
-        let (gc, oc) = server.into_cluster_handlers();
+        let (gc, oc, ac) = server.into_cluster_handlers();
         let mut node = crate::core::datamodel::Node::new();
-        node.add_endpoint(0, vec![gc, oc]);
+        node.add_endpoint(0, vec![gc, oc, ac]);
         let mut ctx = test_ctx();
 
         let req = im::encode_invoke_request(
@@ -1695,5 +2127,30 @@ mod tests {
         let out = im::decode_invoke_response_data(&payload).unwrap();
         assert_eq!(out.status, im::STATUS_SUCCESS);
         assert!(out.fields_tlv.is_some());
+
+        let req = im::encode_invoke_request(
+            0,
+            CLUSTER_ADMIN_COMMISSIONING,
+            CMD_OPEN_COMMISSIONING_WINDOW,
+            Some(&encode_open_commissioning_window(
+                300,
+                &[0x42; 97],
+                0x0ABC,
+                1000,
+                &[0x5A; 16],
+            )),
+        );
+        let outcome = node
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut ctx,
+                &crate::core::datamodel::ReadCtx::default(),
+            )
+            .unwrap();
+        let (opcode, payload) = (outcome.opcode, outcome.payload);
+        assert_eq!(opcode, im::OPCODE_INVOKE_RESPONSE);
+        let out = im::decode_invoke_response_data(&payload).unwrap();
+        assert_eq!(out.status, im::STATUS_SUCCESS);
     }
 }

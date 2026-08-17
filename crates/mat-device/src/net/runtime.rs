@@ -992,6 +992,7 @@ async fn serve_secured_message(
 
         let mut ctx = InvokeCtx {
             attestation_challenge: session.attestation_challenge(),
+            fabric_index,
             ..InvokeCtx::default()
         };
         let read_ctx = ReadCtx { fabric_index };
@@ -1783,7 +1784,7 @@ mod tests {
         use mat_controller::commissioning::{encode_arm_fail_safe, CMD_ARM_FAIL_SAFE};
 
         let comm_server = fail_safe_test_server();
-        let (mut gc, _oc) = comm_server.into_cluster_handlers();
+        let (mut gc, _oc, _ac) = comm_server.into_cluster_handlers();
         let mut ctx = InvokeCtx::default();
         gc.invoke(CMD_ARM_FAIL_SAFE, &encode_arm_fail_safe(1, 1), &mut ctx);
         assert!(

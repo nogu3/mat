@@ -55,6 +55,7 @@ pub const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B; // 応答は NOCResponse ではな�
 
 pub const CLUSTER_ADMIN_COMMISSIONING: u32 = 0x003C;
 pub const CMD_OPEN_COMMISSIONING_WINDOW: u32 = 0x00; // timed 必須
+pub const CMD_REVOKE_COMMISSIONING: u32 = 0x02; // timed 必須、フィールド無し
 
 /// CertificateChainRequest の CertificateType（spec §11.17.6.4）: DAC。
 pub const CERT_TYPE_DAC: u8 = 1;
@@ -350,6 +351,25 @@ fn take_u16(
 ) -> Result<Option<u16>, CommissionError> {
     match map.remove(&tag) {
         Some(FieldValue::Uint(v)) => Ok(Some(u16::try_from(v).map_err(|_| {
+            CommissionError::Malformed {
+                step,
+                detail: range_detail,
+            }
+        })?)),
+        _ => Ok(None),
+    }
+}
+
+/// [`take_u8`] の u32 版（`OpenCommissioningWindow` の Iterations は u32
+/// 幅）。
+fn take_u32(
+    map: &mut BTreeMap<u8, FieldValue>,
+    tag: u8,
+    step: &'static str,
+    range_detail: &'static str,
+) -> Result<Option<u32>, CommissionError> {
+    match map.remove(&tag) {
+        Some(FieldValue::Uint(v)) => Ok(Some(u32::try_from(v).map_err(|_| {
             CommissionError::Malformed {
                 step,
                 detail: range_detail,
@@ -669,6 +689,50 @@ pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
         },
     )?;
     Ok((noc, icac, ipk, case_admin_subject, admin_vendor_id))
+}
+
+/// [`decode_open_commissioning_window`]'s decoded fields: `(timeout_s,
+/// verifier, discriminator, iterations, salt)`.
+pub type OpenCommissioningWindowFields = (u16, Vec<u8>, u16, u32, Vec<u8>);
+
+/// OpenCommissioningWindow（spec §11.19.8.1）: `{0: CommissioningTimeout, 1:
+/// PAKEPasscodeVerifier, 2: Discriminator, 3: Iterations, 4: Salt}`。デバイ
+/// ス側 decoder（逆方向は [`encode_open_commissioning_window`]）。戻り値は
+/// [`OpenCommissioningWindowFields`] — 範囲検証（verifier 長 97 /
+/// iterations 1000..=100000 / salt 長 16..=32 / timeout 180..=900）はここ
+/// では行わない（デバイス側ハンドラが Busy/PAKEParameterError/
+/// INVALID_COMMAND を出し分けるため）。
+pub fn decode_open_commissioning_window(
+    fields: &[u8],
+) -> Result<OpenCommissioningWindowFields, CommissionError> {
+    let step = "open_commissioning_window_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    let timeout_s =
+        take_u16(&mut map, 0, step, "timeout out of range")?.ok_or(CommissionError::Malformed {
+            step,
+            detail: "missing timeout",
+        })?;
+    let verifier = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing verifier",
+    })?;
+    let discriminator = take_u16(&mut map, 2, step, "discriminator out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing discriminator",
+        },
+    )?;
+    let iterations = take_u32(&mut map, 3, step, "iterations out of range")?.ok_or(
+        CommissionError::Malformed {
+            step,
+            detail: "missing iterations",
+        },
+    )?;
+    let salt = take_bytes(&mut map, 4).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing salt",
+    })?;
+    Ok((timeout_s, verifier, discriminator, iterations, salt))
 }
 
 /// `*CommissioningResponse`（ArmFailSafeResponse / SetRegulatoryConfig

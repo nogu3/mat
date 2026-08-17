@@ -57,6 +57,11 @@ const DATA_MODEL_REVISION: u64 = 17;
 pub struct InvokeCtx {
     pub attestation_challenge: [u8; 16],
     pub changed: Vec<u32>,
+    /// The invoking session's fabric index (0 for a PASE/non-CASE session,
+    /// where no fabric applies yet). `AdministratorCommissioning`'s
+    /// `OpenCommissioningWindow` records this as `AdminFabricIndex` (spec
+    /// §11.19.7.2.1) — the only current consumer.
+    pub fabric_index: u8,
 }
 
 /// What `Node::handle_im` produced for one incoming IM message: the reply

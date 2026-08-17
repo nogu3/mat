@@ -182,9 +182,11 @@ impl Device {
         let comm_server = CommissioningServer::new(dev, fabric_store);
 
         let mut node = Node::with_root_endpoint(config.vendor_id, config.product_id);
-        let (general_commissioning, operational_credentials) = comm_server.into_cluster_handlers();
+        let (general_commissioning, operational_credentials, admin_commissioning) =
+            comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);
         node.add_cluster(0, operational_credentials);
+        node.add_cluster(0, admin_commissioning);
 
         // Endpoint 1: M2's single virtual OnOff Light device.
         let (onoff, onoff_state) = crate::core::onoff::OnOffHandler::new();

@@ -177,7 +177,7 @@ async fn fail_safe_expiry_gates_add_noc() {
     let dev = x509::generate_dev_attestation(VENDOR_ID, PRODUCT_ID).expect("dev attestation");
     let server = CommissioningServer::new(dev, FabricStore::new());
     let (mut gc, mut oc) = {
-        let (a, b) = server.into_cluster_handlers();
+        let (a, b, _c) = server.into_cluster_handlers();
         (a, b)
     };
     let mut ctx = InvokeCtx::default();
