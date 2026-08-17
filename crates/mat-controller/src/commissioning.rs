@@ -159,7 +159,7 @@ pub fn encode_add_noc(
     w.finish()
 }
 
-/// UpdateFabricLabel（spec §11.17.6.10）: `{0: Label}`。fabric-scoped —
+/// UpdateFabricLabel（spec §11.17.6.11）: `{0: Label}`。fabric-scoped —
 /// operates on the invoking session's own fabric (no `FabricIndex` field;
 /// unlike `RemoveFabric` this command can't target a different fabric). No
 /// production caller in this workspace yet (an admin app, not
@@ -707,7 +707,7 @@ pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
     Ok((noc, icac, ipk, case_admin_subject, admin_vendor_id))
 }
 
-/// UpdateFabricLabel（spec §11.17.6.10）: `{0: Label}`。デバイス側 decoder
+/// UpdateFabricLabel（spec §11.17.6.11）: `{0: Label}`。デバイス側 decoder
 /// （逆方向は [`encode_update_fabric_label`]）。`Label` は spec 上最大 32
 /// 文字（§11.17.5.20 `FabricDescriptorStruct` の `Label` フィールドと同じ
 /// 制約）——超過は `CommissionError::Malformed` にする。呼び出し元

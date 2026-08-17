@@ -1005,7 +1005,7 @@ impl Inner {
         }
     }
 
-    /// UpdateFabricLabel（spec §11.17.6.10）: fabric-scoped — always targets
+    /// UpdateFabricLabel（spec §11.17.6.11）: fabric-scoped — always targets
     /// the *invoking session's own* fabric (`ctx.fabric_index`), never a
     /// fabric index named in the command fields (the command has none; only
     /// `RemoveFabric` takes an explicit `FabricIndex`). No fail-safe
@@ -1016,35 +1016,33 @@ impl Inner {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
 
-        let noc_status = |status: u8| InvokeReply::Data {
-            response_command: RESP_NOC,
-            fields_tlv: encode_noc_response(status, None),
-        };
-
         let fabric_index = ctx.fabric_index;
-        if !self
-            .store
-            .entries()
-            .iter()
-            .any(|e| e.fabric_index == fabric_index)
-        {
-            return noc_status(NOC_STATUS_INVALID_FABRIC_INDEX);
-        }
-
-        // Best-effort persist: the label change already applies to the
-        // in-memory table (and so to the next `Fabrics` attribute read)
-        // regardless of whether the write-through to disk succeeds — same
-        // "no dedicated status for a storage error" gap `AddNOC` papers
-        // over with `NOC_STATUS_TABLE_FULL` (see that const's doc comment),
-        // except here there isn't even an approximate status to reuse
-        // without misleading the caller about which fabric failed.
-        if let Err(e) = self.store.update_label(fabric_index, label) {
-            tracing::debug!(error = %e, fabric_index, "UpdateFabricLabel: persist failed (label change still applied in memory)");
-        }
-
-        InvokeReply::Data {
-            response_command: RESP_NOC,
-            fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
+        // `update_label` itself distinguishes "no such fabric" (`Ok(false)`)
+        // from "found it, but the write-through to disk failed" (`Err`) —
+        // branch on that directly instead of a separate existence pre-scan
+        // (the pre-scan and `update_label`'s own lookup would otherwise walk
+        // `self.store.entries()` twice to answer the same question).
+        match self.store.update_label(fabric_index, label) {
+            Ok(true) => InvokeReply::Data {
+                response_command: RESP_NOC,
+                fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
+            },
+            Ok(false) => InvokeReply::Data {
+                response_command: RESP_NOC,
+                fields_tlv: encode_noc_response(NOC_STATUS_INVALID_FABRIC_INDEX, None),
+            },
+            // No `NodeOperationalCertStatusEnum` member means "storage
+            // write error" (`AddNOC` fakes one with `NOC_STATUS_TABLE_FULL`
+            // — that borrowed meaning doesn't fit here without misleading
+            // the caller about *which* fabric failed). The global `FAILURE`
+            // status is the honest signal instead: the label already applies
+            // to the in-memory table (so the next `Fabrics` read reflects it
+            // regardless of this branch), but the caller must not be told
+            // `OK` when the change may not survive a restart.
+            Err(e) => {
+                tracing::debug!(error = %e, fabric_index, "UpdateFabricLabel: persist failed");
+                InvokeReply::Status(im::STATUS_FAILURE)
+            }
         }
     }
 
@@ -1186,6 +1184,7 @@ fn public_key_bytes(secret: &p256::SecretKey) -> [u8; 65] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::fabric_store::FabricPersist;
     use mat_controller::attestation::verify_device_attestation;
     use mat_controller::commissioning::{
         decode_attestation_response, decode_commissioning_status_response, decode_csr_response,
@@ -1472,6 +1471,64 @@ mod tests {
             &ctx,
         );
         assert_eq!(reply, InvokeReply::Status(im::STATUS_INVALID_COMMAND));
+    }
+
+    /// A `FabricPersist` whose `save` can be toggled to fail after
+    /// construction — same shape as `fabric_store`'s own `FlakySavePersist`
+    /// (that one is private to `fabric_store`'s test module, so this is a
+    /// separate copy). `load` always returns empty; tests using this get
+    /// their one fabric in via `install_fabric` (which needs `save` to
+    /// succeed) before flipping `fail_save` on.
+    struct FlakySavePersist {
+        fail_save: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FabricPersist for FlakySavePersist {
+        fn save(&self, _entries: &[FabricEntry]) -> Result<(), String> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("disk full".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn load(&self) -> Result<Vec<FabricEntry>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// UpdateFabricLabel: a persist failure must not be reported as
+    /// `NOCResponse(OK)` — the caller has no other signal that the label
+    /// change won't survive a restart. `update_label`'s in-memory write
+    /// (`FabricStore::update_label` sets the field before attempting the
+    /// save) still applies regardless — same asymmetry `FabricStore::remove`
+    /// already documents for the fail-safe-rollback path — but the *reply*
+    /// must be honest, so this asserts the global `STATUS_FAILURE`, not a
+    /// success `NOCResponse`.
+    #[test]
+    fn update_fabric_label_persist_failure_returns_status_failure() {
+        let fail_save = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = FabricStore::with_persist(Box::new(FlakySavePersist {
+            fail_save: std::sync::Arc::clone(&fail_save),
+        }));
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let mut server = CommissioningServer::new(dev, store);
+        install_fabric(&mut server, 0x1122, 0x5001);
+
+        fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let fields = encode_update_fabric_label("Alexa-1");
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let reply = server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_UPDATE_FABRIC_LABEL,
+            &fields,
+            &ctx,
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILURE));
+        // In-memory table still got the label — the reply is what must not
+        // lie, not the (already-established) in-memory-vs-disk asymmetry.
+        assert_eq!(server.fabrics()[0].label, "Alexa-1");
     }
 
     #[test]
