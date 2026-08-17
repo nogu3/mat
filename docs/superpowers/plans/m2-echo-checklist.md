@@ -149,6 +149,22 @@ Task 10 記録後の再試行（matv.stderr.log 08:38Z / 09:13Z）は**より手
 
 **「2026-07-13〜08-13 の間に Amazon がクラウド側で attestation 検証を厳格化（test 証明書チェーンを拒否）」説が最有力**。スタック非依存（HAMH / matterbridge / matter.js / matv）・Echo 世代非依存（2nd gen〜Show 11）で同一シグネチャ、クラウド側変更なら FW 世代を問わず一斉に効く点と整合。ただし Amazon の公式告知・changelog は皆無で、意図的強制かリグレッションかは不明（inconclusive, leaning supported）。
 
+### 再検証（2026-08-18 早朝・Echo Show 11 / 最新 main ビルド）: 同一シグネチャで失敗を追認
+
+「念のため」の実機再検証。条件を全て更新して実施:
+
+- matv: 最新 main（282d635）のビルド（M2 完了版: 窓 close・salt 乱数化入り）を再配布
+- 新 identity（discriminator 1478 / passcode 51869473、`~/matv-r2/`）+ まっさらな store
+- Echo Show 11（最新 2026FW）、pcap 取得あり（`~/matv-r2/echo-r2.pcap`）
+
+結果（matv ログ + pcap 両方で確認、時刻 JST）:
+
+- 04:39:17 PASE 成立 → ArmFailSafe(80) → SetRegulatoryConfig → CertificateChainRequest×2 → AttestationRequest
+- 04:39:17.947 matv が AttestationResponse 送信 → **04:39:17.960 Echo が MRP ack** → **以降ちょうど 80 秒間、Echo からの着信ゼロ（StatusReport もセッション close も無し）**
+- 04:40:37 Echo が ArmFailSafe(0) の後始末だけ送って終了 → アプリは GS014
+
+**追認事項**: (1) 最新ビルド・新 identity・新 store でも変化なし = クラウド側 attestation 拒否の結論は堅い。(2) 新 identity にしたことで前回の「PASE 早期中断（StatusReport 0x40）」は発生せず正常に attestation まで進んだ — あれは「Echo が失敗デバイス（同一 discriminator）を記憶して早期中断する」挙動で、本質と無関係と確定。(3) デバイス側で打てる手が無いことを実機で再確認。凍結判断は維持。
+
 ### 帰結（前節「次の一手」の修正）
 
 1. ~~別世代 Echo で再試行~~ → **棄却**（最新 Show 11 で失敗済み。クラウド側なら世代交換は無意味）
