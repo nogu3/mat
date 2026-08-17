@@ -512,13 +512,22 @@ impl Inner {
         let Ok((expiry_s, _breadcrumb)) = decode_arm_fail_safe(fields_tlv) else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
-        // A previous attempt's AddNOC that was never confirmed by
-        // CommissioningComplete must not survive into this one, whether
-        // this is a fresh re-arm mid-window or an early disarm (spec
-        // §11.10.7.2.1) — same "don't carry a zombie fabric forward" rule
-        // `expire_fail_safe` enforces on an actual timeout.
-        let rolled_back = self.rollback_uncommitted_fabric();
-        self.pending = PendingCommissioning::default();
+        // spec §11.10.6.2: armed 中の非ゼロ ArmFailSafe は**タイマー延長**。
+        // 進行中の試行の staged 素材（CSR/RCAC）と未確定 fabric は生かす —
+        // matter.js は AddNOC 後に再アームしてから CASE で
+        // CommissioningComplete を送るため、ここで巻き戻すと commissioning が
+        // 完了できない（2026-08-18 実測）。zombie fabric（未確定のまま残る
+        // AddNOC 結果, spec §11.10.7.2.1）の回収は fail-safe 満了
+        // （`expire_fail_safe`）と早期 disarm（expiry=0）が担保する。
+        // 未対応エッジ: 別セッションからの armed 中 ArmFailSafe は spec 上
+        // BUSY を返すべきだが、セッション同一性の追跡は未実装（M3 で拾う）。
+        let rolled_back = if expiry_s == 0 || !self.fail_safe.is_armed() {
+            let rolled_back = self.rollback_uncommitted_fabric();
+            self.pending = PendingCommissioning::default();
+            rolled_back
+        } else {
+            None
+        };
         if expiry_s == 0 {
             self.fail_safe.disarm();
         } else {
@@ -725,6 +734,10 @@ impl Inner {
         else {
             return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
         };
+        // matter.js 系コントローラ（HA matter-server 等）は「ICAC なし」を
+        // フィールド省略ではなく空バイト列の ICACValue で表現する。chip 本家の
+        // デバイス実装も空 ICAC は「無し」扱いなので、ここで正規化する。
+        let icac_tlv = icac_tlv.filter(|v| !v.is_empty());
 
         let noc_status = |status: u8| InvokeReply::Data {
             response_command: RESP_NOC,
@@ -739,24 +752,41 @@ impl Inner {
             return noc_status(NOC_STATUS_MISSING_CSR);
         };
 
-        let Ok(rcac) = MatterCert::parse(&root_tlv) else {
-            return noc_status(NOC_STATUS_INVALID_NOC);
+        // InvalidNOC は複数分岐から返る。どの検証で落ちたかは応答からは
+        // 区別できないため、拒否時は理由と素材（TLV hex）を debug ログに残す。
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let rcac = match MatterCert::parse(&root_tlv) {
+            Ok(cert) => cert,
+            Err(e) => {
+                tracing::debug!(reason = "rcac parse", error = %e, rcac_tlv = %hex(&root_tlv), "AddNOC rejected: InvalidNOC");
+                return noc_status(NOC_STATUS_INVALID_NOC);
+            }
         };
-        let Ok(noc) = MatterCert::parse(&noc_tlv) else {
-            return noc_status(NOC_STATUS_INVALID_NOC);
+        let noc = match MatterCert::parse(&noc_tlv) {
+            Ok(cert) => cert,
+            Err(e) => {
+                tracing::debug!(reason = "noc parse", error = %e, noc_tlv = %hex(&noc_tlv), "AddNOC rejected: InvalidNOC");
+                return noc_status(NOC_STATUS_INVALID_NOC);
+            }
         };
         let icac = match icac_tlv.as_deref().map(MatterCert::parse) {
             Some(Ok(cert)) => Some(cert),
-            Some(Err(_)) => return noc_status(NOC_STATUS_INVALID_NOC),
+            Some(Err(e)) => {
+                tracing::debug!(reason = "icac parse", error = %e, icac_tlv = %hex(icac_tlv.as_deref().unwrap_or_default()), "AddNOC rejected: InvalidNOC");
+                return noc_status(NOC_STATUS_INVALID_NOC);
+            }
             None => None,
         };
-        if verify_noc_chain(&noc, icac.as_ref(), &rcac).is_err() {
+        if let Err(e) = verify_noc_chain(&noc, icac.as_ref(), &rcac) {
+            tracing::debug!(reason = "chain verify", error = %e, has_icac = icac.is_some(), noc_tlv = %hex(&noc_tlv), rcac_tlv = %hex(&root_tlv), "AddNOC rejected: InvalidNOC");
             return noc_status(NOC_STATUS_INVALID_NOC);
         }
         if noc.pub_key != op_public_key {
+            tracing::debug!(reason = "public key mismatch", "AddNOC rejected: InvalidPublicKey");
             return noc_status(NOC_STATUS_INVALID_PUBLIC_KEY);
         }
         let (Some(node_id), Some(fabric_id)) = (noc.node_id(), noc.fabric_id()) else {
+            tracing::debug!(reason = "node/fabric id missing", node_id = ?noc.node_id(), fabric_id = ?noc.fabric_id(), noc_tlv = %hex(&noc_tlv), "AddNOC rejected: InvalidNOC");
             return noc_status(NOC_STATUS_INVALID_NOC);
         };
 
@@ -847,7 +877,7 @@ mod tests {
         encode_attestation_request, encode_cert_chain_request, encode_csr_request,
         parse_nocsr_elements, CommissioningFabric,
     };
-    use mat_controller::tlv::{Reader, Value};
+    use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
 
     /// Fixed per-test "session" attestation challenge — in the real
@@ -972,6 +1002,67 @@ mod tests {
         assert_eq!(server.fabrics()[0].node_id, 0x5001);
         assert_eq!(server.fabrics()[0].fabric_id, 0x1122);
         assert_eq!(server.fabrics()[0].admin_vendor_id, 0xFFF1);
+    }
+
+    /// matter.js（Home Assistant の matter-server 等）は「ICAC なし」を
+    /// フィールド省略ではなく**空バイト列の ICACValue** で送る（chip-tool は
+    /// 省略）。chip 本家のデバイス実装も空 ICAC は「無し」として扱うため、
+    /// 空 ICACValue 付きの AddNOC は省略時と同様に成功しなければならない。
+    /// 実測: HA matter-server 1.1.7 からの commissioning が本ケースで
+    /// InvalidNOC(3) になり中断していた（2026-08-18）。
+    #[test]
+    fn add_noc_accepts_empty_icac_value_as_absent() {
+        let mut server = test_server();
+        let fabric = CommissioningFabric::generate(0x1122, 0xAA).unwrap();
+
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 1),
+        );
+        let (_, csr_resp) = expect_data(drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_CSR_REQUEST,
+            &encode_csr_request(&[3u8; 32]),
+        ));
+        let (elements, _sig) = decode_csr_response(&csr_resp).unwrap();
+        let (csr_der, _nonce) = parse_nocsr_elements(&elements).unwrap();
+        let device_pub = parse_csr(&csr_der).unwrap();
+        let noc = fabric.issue_device_noc(&device_pub, 0x5001).unwrap();
+        assert_eq!(
+            drive_invoke(
+                &mut server,
+                CLUSTER_OPERATIONAL_CREDENTIALS,
+                CMD_ADD_TRUSTED_ROOT,
+                &encode_add_trusted_root(&fabric.rcac_tlv),
+            ),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+
+        // AddNOC {0: NOCValue, 1: ICACValue(空), 2: IPKValue, 3:
+        // CaseAdminSubject, 4: AdminVendorId} — encode_add_noc は ICAC を
+        // 書かないので、matter.js が送る形をここで直接組み立てる。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(0), &noc);
+        w.put_bytes(Tag::Context(1), &[]);
+        w.put_bytes(Tag::Context(2), &fabric.ipk_epoch);
+        w.put_uint(Tag::Context(3), 0xAA);
+        w.put_uint(Tag::Context(4), 0xFFF1);
+        w.end_container();
+
+        let (_, resp) = expect_data(drive_invoke(
+            &mut server,
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_ADD_NOC,
+            &w.finish(),
+        ));
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0, "empty ICACValue must be treated as absent");
+        assert_eq!(fabric_index, Some(1));
+        assert_eq!(server.fabrics().len(), 1);
     }
 
     #[test]
@@ -1291,8 +1382,12 @@ mod tests {
         assert!(server.pending_is_empty());
     }
 
+    /// 同一窓内の再アームは同じ試行の延長なので staged CSR を維持する
+    /// （matter.js の BLE フローは CSR と AddNOC の間でも定期再アームする、
+    /// spec §11.10.6.2）。窓をまたいだ fresh arm（disarm 後の新規試行）では
+    /// 前の試行の CSR keypair を持ち越してはいけない。
     #[test]
-    fn rearm_resets_stale_pending_commissioning_state() {
+    fn rearm_keeps_pending_within_window_but_fresh_arm_resets_it() {
         let mut server = test_server();
         drive_invoke(
             &mut server,
@@ -1308,13 +1403,27 @@ mod tests {
         );
         assert!(!server.pending_is_empty());
 
-        // A fresh ArmFailSafe (new commissioning attempt) must not let a
-        // stale CSR keypair from a previous attempt leak into this one.
+        // 同一窓内の再アーム: staged CSR は生きたまま
         drive_invoke(
             &mut server,
             CLUSTER_GENERAL_COMMISSIONING,
             CMD_ARM_FAIL_SAFE,
             &encode_arm_fail_safe(120, 2),
+        );
+        assert!(!server.pending_is_empty());
+
+        // disarm → fresh arm: 新規試行に前の CSR を持ち越さない
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(0, 3),
+        );
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(120, 4),
         );
         assert!(server.pending_is_empty());
     }
@@ -1447,19 +1556,58 @@ mod tests {
         assert_eq!(server.fabrics().len(), 1);
     }
 
+    /// spec §11.10.6.2: armed 中の非ゼロ ArmFailSafe は**タイマー延長**で
+    /// あって新規試行の開始ではない。未確定 fabric を巻き戻してはいけない。
+    /// 実測: matter.js（HA matter-server 1.1.7）は AddNOC 成功後に
+    /// fail-safe を再アームしてから CASE を張り直し、その上で
+    /// CommissioningComplete を送る。旧実装は再アームで fabric を
+    /// 巻き戻してしまい、直後の Sigma1 が「destination id matched no
+    /// fabric」で永遠に失敗していた（2026-08-18）。zombie fabric 対策は
+    /// 満了時（`fail_safe_expiry_rolls_back_uncommitted_fabric`）と
+    /// disarm 時の rollback が引き続き担保する。
     #[test]
-    fn rearm_rolls_back_previous_attempts_uncommitted_fabric() {
+    fn rearm_keeps_uncommitted_fabric_and_complete_commits_it() {
         let mut server = test_server();
         install_fabric(&mut server, 0x1122, 0x5001);
         assert_eq!(server.fabrics().len(), 1);
 
-        // Re-arm without a CommissioningComplete in between: the previous
-        // attempt's AddNOC must be rolled back, not left as a zombie fabric.
+        // AddNOC 後の再アーム（matter.js の Reconnect ステップ相当）
         drive_invoke(
             &mut server,
             CLUSTER_GENERAL_COMMISSIONING,
             CMD_ARM_FAIL_SAFE,
-            &encode_arm_fail_safe(120, 2),
+            &encode_arm_fail_safe(313, 2),
+        );
+        assert_eq!(
+            server.fabrics().len(),
+            1,
+            "re-arm while armed must not roll back the pending fabric"
+        );
+
+        // CASE 再接続後の CommissioningComplete で確定する
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_COMMISSIONING_COMPLETE,
+            &[],
+        );
+        assert!(server.expire_fail_safe().is_none());
+        assert_eq!(server.fabrics().len(), 1);
+    }
+
+    /// 早期 disarm（expiry=0）は従来どおり未確定 fabric を巻き戻し、
+    /// 解放された index は次の試行で再利用される。
+    #[test]
+    fn early_disarm_rolls_back_uncommitted_fabric() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        assert_eq!(server.fabrics().len(), 1);
+
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(0, 2),
         );
         assert!(server.fabrics().is_empty());
 
