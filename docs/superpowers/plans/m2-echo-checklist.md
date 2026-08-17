@@ -171,3 +171,25 @@ Task 10 記録後の再試行（matv.stderr.log 08:38Z / 09:13Z）は**より手
 2. デバイス側でできることは無い。**Echo ゲートは Amazon 側の解消（修正 or 公式声明）待ちで凍結**が妥当
 3. ウォッチ先: **#605**（help wanted・JP 環境で本件と同一）と **#449**。pcap 所見（AttestationResponse MRP-ack 後 80 秒沈黙）を追記して事例を束ねる価値は引き続き有り
 4. 相互運用の実機検証は **Apple Home / Google Home へ切替**（8 月時点でも成功報告が継続。M3 Aggregator の interview 型コントローラ対応とも方向が一致）
+
+## 2026-08-18 追記: matter.js（HA Matter Server）実機ゲート通過
+
+代替検証先の第一弾として HA の Matter Server（matter-server 1.1.7 =
+matter.js 0.17.4 ベース）で実機検証を実施。**3 つの interop バグを特定・修正し、
+commission 完走 + interview（32 属性）+ OnOff トグル往復まで green**
+（検証リグ: jarvis 上に同一版 matter-server を立て WS API から commission）。
+
+修正 3 件（コミット 8d67b35, 4f58be6）:
+1. AddNOC: matter.js の空 ICACValue（省略でなく空バイト列）を None に正規化
+2. ArmFailSafe: armed 中の非ゼロ再アームで未確定 fabric を巻き戻していた
+   （spec §11.10.6.2 違反。matter.js は AddNOC 後に再アーム→CASE→Complete）
+3. parse_sigma1: ネストした initiatorSessionParams の中の
+   SESSION_ACTIVE_INTERVAL(300) を initiatorSessionId と誤読（sigma3/TBE の
+   フラットループにも同修正）
+
+**残タスク**: Timed Interaction（opcode 0x0A）未実装。スマホの HA アプリ経由の
+追加は **Android の Google Play Services スタックが commissioner になり**、
+TimedRequest → INVALID_ACTION で中断する（8/18 実測で送信元 MAC がスマホと確定）。
+本番 HA へのペアリングは **PC ブラウザの HA Web UI から**行えば matter-server
+経由になるため現状の修正だけで通る見込み。要: アドオン設定で
+Test Net DCL 有効化。
