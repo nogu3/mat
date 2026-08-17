@@ -68,6 +68,11 @@ pub struct CommissionableAdvert {
     pub product_id: u16,
     pub port: u16,
     pub addr_v6: Ipv6Addr,
+    /// Commissioning Mode TXT value (spec §4.3.1's `CM` key): `1` for the
+    /// boot/basic window, `2` for a window opened by the Administrator
+    /// Commissioning cluster's `OpenCommissioningWindow` (spec §11.19.8.1,
+    /// ECM — ties into `net::runtime`'s `advert_params_for_window`).
+    pub cm: u8,
 }
 
 /// One operational-service advert (spec §4.3.1, `_matter._tcp.local`).
@@ -216,7 +221,7 @@ fn commissionable_txt(ad: &CommissionableAdvert) -> Vec<String> {
     vec![
         format!("D={}", ad.discriminator),
         format!("VP={}+{}", ad.vendor_id, ad.product_id),
-        "CM=1".to_string(),
+        format!("CM={}", ad.cm),
         "SII=300".to_string(),
         "SAI=300".to_string(),
     ]
@@ -524,6 +529,7 @@ mod tests {
             product_id: 32768,
             port: 5540,
             addr_v6: "fe80::1".parse().unwrap(),
+            cm: 1,
         }
     }
 

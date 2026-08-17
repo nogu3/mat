@@ -59,7 +59,7 @@ use mat_controller::pase::{
 use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, MAX_DATAGRAM};
 
-use crate::core::commissioning::CommissioningServer;
+use crate::core::commissioning::{CommissioningServer, WindowRequest};
 use crate::core::datamodel::{ImOutcome, InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
@@ -186,35 +186,53 @@ fn admit_unsecured(flow: UnsecuredFlow, window_open: bool) -> Option<UnsecuredFl
     }
 }
 
-/// The commissioning window's upper bound (spec §5.4.2.3: the PASE window a
-/// commissioner may use to complete commissioning must not exceed 15
-/// minutes). This runtime has no way to *extend* an already-open window
-/// (no Administrator Commissioning cluster — out of scope for M2, see
-/// `CommissioningWindow`'s doc), so this is simply the one duration a
-/// freshly opened window ever runs for.
+/// The *boot* commissioning window's upper bound (spec §5.4.2.3: the PASE
+/// window a commissioner may use to complete commissioning must not exceed
+/// 15 minutes) — the duration a freshly booted, never-commissioned device's
+/// window runs for. A window opened later by the Administrator
+/// Commissioning cluster's `OpenCommissioningWindow` (spec §11.19.8.1, Task
+/// 4's `CommissioningWindow::EnhancedOpen`) uses its own `CommissioningTimeout`
+/// instead (`apply_window_request`), not this constant.
 const COMMISSIONING_WINDOW_DURATION: Duration = Duration::from_secs(15 * 60);
 
-/// Whether new PASE attempts are currently admitted (Task 14). Boot-time
-/// policy (decided once in `run`, before the loop starts): `Open` if
-/// `comm_server.fabrics()` is empty (a never-commissioned, or freshly wiped,
-/// device — closing the window here would brick it, since M2 has no way to
-/// reopen one), `Closed` if any fabric is already installed (this device
-/// was commissioned in a previous run; a fresh commissioner has no business
-/// PASE-ing into it again). Beyond that starting point, the window only
-/// ever moves `Open -> Closed`, on either of two events: the 15-minute
-/// deadline lapsing (`commissioning_window_deadline`) or
-/// `CommissioningComplete` succeeding (`serve_secured_message`) — both also
-/// send the mDNS commissionable goodbye (`set_commissionable(None)`, wired
-/// since Task 8).
+/// Whether new PASE attempts are currently admitted (Task 14), and — once
+/// opened by the Administrator Commissioning cluster (Task 4) — what
+/// verifier material/discriminator that admission should use instead of the
+/// boot passcode. Boot-time policy (decided once in `run`, before the loop
+/// starts): `Open` if `comm_server.fabrics()` is empty (a never-
+/// commissioned, or freshly wiped, device), `Closed` if any fabric is
+/// already installed (this device was commissioned in a previous run; a
+/// fresh commissioner has no business PASE-ing into it again *until* an
+/// already-commissioned controller — over an established CASE session —
+/// explicitly reopens ECM access via `OpenCommissioningWindow`).
 ///
-/// **Reopening is out of scope for M2.** The spec's real reopen mechanism
-/// is the Administrator Commissioning cluster's `OpenCommissioningWindow`
-/// command, which this runtime does not implement; the only way this
-/// process re-admits PASE is a full restart (which re-runs the boot-time
-/// policy above against whatever's on disk at that point).
-#[derive(Debug, Clone, Copy)]
+/// From that starting point:
+/// - `Open -> EnhancedOpen`: a successful `OpenCommissioningWindow` stages a
+///   `WindowRequest` (`core::commissioning`) the runtime picks up per
+///   dispatch iteration (`serve_secured_message`) and turns into
+///   `EnhancedOpen` via `apply_window_request`.
+/// - `{Open,EnhancedOpen} -> Closed`: the 15-minute (boot) or
+///   `CommissioningTimeout` (ECM) deadline lapsing
+///   (`commissioning_window_deadline`), `CommissioningComplete` succeeding,
+///   or `RevokeCommissioning` clearing the core's admin window out from
+///   under an `EnhancedOpen` runtime window (detected the same
+///   per-iteration place `EnhancedOpen` is entered) — all three also send
+///   the mDNS commissionable goodbye (`set_commissionable(None)`).
+#[derive(Debug, Clone)]
 enum CommissioningWindow {
-    Open { until: Instant },
+    /// The boot-time window: PASE against the QR/manual-pairing passcode
+    /// and boot discriminator.
+    Open {
+        until: Instant,
+    },
+    /// A window opened at runtime by `OpenCommissioningWindow`: PASE against
+    /// the commissioner-supplied verifier material and discriminator
+    /// (`request`) instead of the boot passcode (`pase_config_for_window`),
+    /// advertised with `CM=2` instead of `CM=1` (`advert_params_for_window`).
+    EnhancedOpen {
+        until: Instant,
+        request: WindowRequest,
+    },
     Closed,
 }
 
@@ -222,24 +240,84 @@ impl CommissioningWindow {
     /// Whether `admit_unsecured` should currently let a `Pase` flow
     /// through. Doesn't re-check `until` against `Instant::now()` — the
     /// `select!` loop's `commissioning_window_deadline` branch is what
-    /// transitions `Open -> Closed` exactly at that instant (same
-    /// single-threaded-loop invariant `fail_safe_expiry_deadline`'s doc
-    /// comment relies on), so by construction this is never read past its
-    /// own deadline while still reporting `Open`.
+    /// transitions `{Open,EnhancedOpen} -> Closed` exactly at that instant
+    /// (same single-threaded-loop invariant `fail_safe_expiry_deadline`'s
+    /// doc comment relies on), so by construction this is never read past
+    /// its own deadline while still reporting open.
     fn is_open(&self) -> bool {
-        matches!(self, CommissioningWindow::Open { .. })
+        !matches!(self, CommissioningWindow::Closed)
     }
 }
 
 /// Same shape as `mdns_retry_deadline`/`fail_safe_expiry_deadline`: resolves
-/// once at the open window's deadline, or never (`std::future::pending`)
-/// once it's `Closed`. This `select!` branch is the mechanism that actually
-/// enforces spec §5.4.2.3's 15-minute PASE upper bound — nothing else polls
-/// `until` against the clock.
+/// once at the open window's deadline (boot or ECM — both variants carry
+/// `until`), or never (`std::future::pending`) once it's `Closed`. This
+/// `select!` branch is the mechanism that actually enforces spec §5.4.2.3's
+/// 15-minute PASE upper bound (boot) / the requested `CommissioningTimeout`
+/// (ECM) — nothing else polls `until` against the clock.
 async fn commissioning_window_deadline(window: &CommissioningWindow) {
     match window {
-        CommissioningWindow::Open { until } => tokio::time::sleep_until(*until).await,
+        CommissioningWindow::Open { until } | CommissioningWindow::EnhancedOpen { until, .. } => {
+            tokio::time::sleep_until(*until).await
+        }
         CommissioningWindow::Closed => std::future::pending().await,
+    }
+}
+
+/// Stages a `WindowRequest` (a successful `OpenCommissioningWindow`, staged
+/// by `core::commissioning` and collected by the runtime per dispatch
+/// iteration) into an ECM window state — spec §11.19.8.1's
+/// `CommissioningTimeout` becomes the window's deadline directly, the same
+/// way the boot window uses `COMMISSIONING_WINDOW_DURATION`.
+fn apply_window_request(request: WindowRequest) -> CommissioningWindow {
+    let until = Instant::now() + Duration::from_secs(u64::from(request.timeout_s));
+    CommissioningWindow::EnhancedOpen { until, request }
+}
+
+/// The PASE verifier configuration the current window should be served
+/// with: the boot passcode for `Open`/`Closed` (a closed window never
+/// actually reaches PASE — `admit_unsecured` already refused it — so this
+/// arm is only reached, in practice, for the still-open boot window), or the
+/// commissioner-supplied verifier material for `EnhancedOpen`.
+/// `responder_session_id` is per-attempt (`random_session_id`) and always
+/// passed through regardless of which window is active.
+fn pase_config_for_window(
+    window: &CommissioningWindow,
+    boot_passcode: u32,
+    boot_salt: &[u8],
+    responder_session_id: u16,
+) -> PaseVerifierConfig {
+    match window {
+        CommissioningWindow::EnhancedOpen { request, .. } => PaseVerifierConfig {
+            secret: PaseSecret::VerifierMaterial(request.verifier),
+            salt: request.salt.clone(),
+            iterations: request.iterations,
+            responder_session_id,
+        },
+        CommissioningWindow::Open { .. } | CommissioningWindow::Closed => PaseVerifierConfig {
+            secret: PaseSecret::Passcode(boot_passcode),
+            salt: boot_salt.to_vec(),
+            iterations: PASE_ITERATIONS,
+            responder_session_id,
+        },
+    }
+}
+
+/// The commissionable mDNS advert's `(discriminator, CM)` for the current
+/// window — `None` for `Closed` (no advert to publish at all). `Open` keeps
+/// the boot discriminator and `CM=1`; `EnhancedOpen` switches to the
+/// `WindowRequest`'s discriminator and `CM=2` (spec §5.1.4.2/§4.3.1: a
+/// commissioner distinguishes an ECM window from the boot window by `CM`,
+/// and the discriminator an ECM window advertises is the one the
+/// `OpenCommissioningWindow` caller chose, not necessarily the boot one).
+fn advert_params_for_window(
+    window: &CommissioningWindow,
+    boot_discriminator: u16,
+) -> Option<(u16, u8)> {
+    match window {
+        CommissioningWindow::Open { .. } => Some((boot_discriminator, 1)),
+        CommissioningWindow::EnhancedOpen { request, .. } => Some((request.discriminator, 2)),
+        CommissioningWindow::Closed => None,
     }
 }
 
@@ -331,7 +409,7 @@ struct MdnsCtx {
 }
 
 /// Brings up the mDNS advertiser: resolves `config.iface`, spawns the
-/// advertiser, sets the commissionable advert (only while `window_open` —
+/// advertiser, sets the commissionable advert (only while `window` is open —
 /// see below), and republishes every fabric already on disk (the restart
 /// path: a second `Device::new` over the same `store_dir` reloads
 /// `comm_server.fabrics()` from disk, and this makes sure those fabrics are
@@ -343,21 +421,25 @@ struct MdnsCtx {
 /// has its address (exactly `direct_drive_*`'s test setup, and not
 /// unrealistic — e.g. a controller with a cached address).
 ///
-/// `window_open` (Task 14 fix round 1, review item 1): a fresh
-/// `MdnsAdvertiser::spawn` starts with no commissionable advert set (its
-/// `commissionable` field is `RwLock::new(None)`), so simply *not* calling
-/// `set_commissionable(Some(..))` when the window is closed is sufficient —
-/// no explicit `None` call needed to reach the right end state. This one
-/// bool, threaded from both of `run`'s call sites (initial bring-up and
-/// every retry), closes two related holes at once:
+/// `window` (Task 14 fix round 1, review item 1; widened from a plain
+/// `window_open: bool` to `&CommissioningWindow` by Task 4 so a retry
+/// republishes the *right* advert — boot `CM=1`/discriminator or ECM
+/// `CM=2`/`WindowRequest` discriminator, via `advert_params_for_window` —
+/// not just whether one should exist at all): a fresh `MdnsAdvertiser::spawn`
+/// starts with no commissionable advert set (its `commissionable` field is
+/// `RwLock::new(None)`), so simply *not* calling `set_commissionable(Some(..))`
+/// when the window is closed is sufficient — no explicit `None` call needed
+/// to reach the right end state. Threaded from both of `run`'s call sites
+/// (initial bring-up and every retry), this closes two related holes at
+/// once:
 /// - **Retry-after-close**: without this, a `CommissioningComplete`- or
-///   15-minute-expiry close that lands *while* mDNS is still down (mid
+///   deadline-expiry close that lands *while* mDNS is still down (mid
 ///   `MdnsRetry` backoff) would be silently undone the moment the retry
 ///   later succeeds — `bring_up_mdns` used to always publish commissionable
 ///   unconditionally, reviving an advert for a window that had already
-///   sent its goodbye. `run` now re-reads the *current* `window.is_open()`
-///   at the moment each retry actually runs, not the state from when the
-///   retry was scheduled.
+///   sent its goodbye. `run` now re-reads the *current* window at the
+///   moment each retry actually runs, not the state from when the retry was
+///   scheduled.
 /// - **Boot-with-fabric**: a device restarting with a fabric already on
 ///   disk starts with `window = Closed` (Task 14's boot policy) — this
 ///   parameter means such a restart no longer publishes a commissionable
@@ -366,7 +448,7 @@ async fn bring_up_mdns(
     config: &DeviceConfig,
     port: u16,
     comm_server: &CommissioningServer,
-    window_open: bool,
+    window: &CommissioningWindow,
 ) -> Result<MdnsCtx, DeviceError> {
     let scope_id =
         mat_controller::dnssd::iface_index(&config.iface).map_err(DeviceError::IfaceIndex)?;
@@ -376,15 +458,16 @@ async fn bring_up_mdns(
     let mdns = MdnsAdvertiser::spawn(scope_id)
         .await
         .map_err(DeviceError::Io)?;
-    if window_open {
+    if let Some((discriminator, cm)) = advert_params_for_window(window, config.discriminator) {
         mdns.set_commissionable(Some(CommissionableAdvert {
             instance: random_hex_name(),
             hostname: hostname.clone(),
-            discriminator: config.discriminator,
+            discriminator,
             vendor_id: config.vendor_id,
             product_id: config.product_id,
             port,
             addr_v6,
+            cm,
         }))
         .await;
     }
@@ -529,7 +612,7 @@ pub(crate) async fn run(
     };
     let mut mdns_ctx: Option<MdnsCtx> = None;
     let mut mdns_retry: Option<MdnsRetry> = None;
-    match bring_up_mdns(&config, port, &comm_server, window.is_open()).await {
+    match bring_up_mdns(&config, port, &comm_server, &window).await {
         Ok(ctx) => mdns_ctx = Some(ctx),
         Err(e) => {
             tracing::warn!(
@@ -619,12 +702,12 @@ pub(crate) async fn run(
                                 &transport,
                                 peer,
                                 first,
-                                PaseVerifierConfig {
-                                    secret: PaseSecret::Passcode(config.passcode),
-                                    salt: pase_salt.to_vec(),
-                                    iterations: PASE_ITERATIONS,
-                                    responder_session_id: local_session_id,
-                                },
+                                pase_config_for_window(
+                                    &window,
+                                    config.passcode,
+                                    &pase_salt,
+                                    local_session_id,
+                                ),
                             )
                             .await;
                             match outcome {
@@ -715,6 +798,7 @@ pub(crate) async fn run(
                         mdns: mdns_ctx.as_ref(),
                         subscription: &mut subscription,
                         window: &mut window,
+                        config: &config,
                     },
                 )
                 .await;
@@ -727,7 +811,7 @@ pub(crate) async fn run(
                 // stale "was open when scheduled" read would let this retry
                 // revive a commissionable advert for a window that already
                 // sent its goodbye.
-                match bring_up_mdns(&config, port, &comm_server, window.is_open()).await {
+                match bring_up_mdns(&config, port, &comm_server, &window).await {
                     Ok(ctx) => {
                         tracing::info!("mDNS advertiser came up on retry");
                         mdns_ctx = Some(ctx);
@@ -784,29 +868,38 @@ pub(crate) async fn run(
                             mdns: mdns_ctx.as_ref(),
                             subscription: &mut subscription,
                             window: &mut window,
+                            config: &config,
                         },
                     )
                     .await;
                 }
             }
             () = commissioning_window_deadline(&window) => {
-                // Spec §5.4.2.3's 15-minute PASE window upper bound has
-                // elapsed: close the window (no more PASE admitted — see
-                // `admit_unsecured`) and send the same commissionable-advert
-                // goodbye `CommissioningComplete` sends on success
-                // (`set_commissionable(None)`, goodbye wired since Task 8).
-                // No fabric rollback here — unlike fail-safe expiry, an
-                // already-*established* PASE session (if one happened to be
-                // mid-flight right at the deadline) is left alone; this
-                // branch only stops *new* PASE attempts from being admitted
-                // going forward.
-                tracing::info!(
-                    "commissioning window expired (15-minute PASE upper bound) — closing"
-                );
+                // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
+                // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
+                // window, Task 4) has elapsed: close the window (no more
+                // PASE admitted — see `admit_unsecured`) and send the same
+                // commissionable-advert goodbye `CommissioningComplete`
+                // sends on success (`set_commissionable(None)`, goodbye
+                // wired since Task 8). No fabric rollback here — unlike
+                // fail-safe expiry, an already-*established* PASE session
+                // (if one happened to be mid-flight right at the deadline)
+                // is left alone; this branch only stops *new* PASE attempts
+                // from being admitted going forward.
+                tracing::info!("commissioning window expired — closing");
                 window = CommissioningWindow::Closed;
                 if let Some(ctx) = mdns_ctx.as_ref() {
                     ctx.mdns.set_commissionable(None).await;
                 }
+                // Task 4: this timer-driven close is the runtime noticing
+                // on its own — unlike `CommissioningComplete`/`Revoke`
+                // (dispatched IM commands the core cluster handler already
+                // reacts to), nothing on the core side knows the deadline
+                // just passed, so the runtime must tell it explicitly to
+                // keep the AC cluster's `WindowStatus` attribute honest. A
+                // no-op if this was the boot window (never opened an admin
+                // window in the first place).
+                comm_server.close_admin_window();
             }
             () = fail_safe_expiry_deadline(&comm_server) => {
                 // `expire_fail_safe` is the one primitive that both decides
@@ -931,10 +1024,12 @@ async fn serve_secured_message(
         mdns,
         subscription,
         window,
+        config,
     } = state;
     let node: &mut Node = node;
     let comm_server: &CommissioningServer = comm_server;
     let mdns: Option<&MdnsCtx> = *mdns;
+    let config: &DeviceConfig = config;
 
     // 同一 exchange の後続リクエストを処理し切るまで回るループ。Timed
     // Interaction（spec §8.9.4）では initiator が StatusResponse(SUCCESS) の
@@ -1046,6 +1141,63 @@ async fn serve_secured_message(
             }
         }
 
+        // ECM window reconciliation (Task 4), per dispatch iteration — same
+        // spot the AddNOC fabric-diff check above lives, so a timed
+        // `OpenCommissioningWindow`/`RevokeCommissioning` invoke (piggybacked
+        // on this same exchange, per the timed-invoke loop this function
+        // runs) is handled without waiting for the next datagram.
+        //
+        // Order matters (Task 3 review carry-over): take the pending
+        // `WindowRequest` *first*, then check whether the admin window is
+        // (still) open, so a `RevokeCommissioning` arriving in the same
+        // dispatch as an earlier-staged `OpenCommissioningWindow` — both
+        // invoked back-to-back on one timed exchange — drops the stale
+        // request and leaves the window closed, rather than reopening a
+        // window the very same dispatch was just told to close. Applying the
+        // request only when the admin window is (still) open is what makes
+        // this safe: `close_admin_window`/`RevokeCommissioning` clear the
+        // core's `admin_window` immediately, so a Revoke that already ran
+        // this iteration is visible to this check regardless of ordering
+        // within the timed exchange.
+        let pending_request = comm_server.take_pending_window_request();
+        let admin_open = comm_server.admin_window_is_open();
+        if let Some(request) = pending_request {
+            if admin_open {
+                **window = apply_window_request(request);
+                if let (Some(ctx), Some((discriminator, cm))) =
+                    (mdns, advert_params_for_window(window, config.discriminator))
+                {
+                    ctx.mdns
+                        .set_commissionable(Some(CommissionableAdvert {
+                            instance: random_hex_name(),
+                            hostname: ctx.hostname.clone(),
+                            discriminator,
+                            vendor_id: config.vendor_id,
+                            product_id: config.product_id,
+                            port: ctx.port,
+                            addr_v6: ctx.addr_v6,
+                            cm,
+                        }))
+                        .await;
+                }
+            }
+            // else: staged by an `OpenCommissioningWindow` that a
+            // same-dispatch `RevokeCommissioning` already invalidated —
+            // drop it; the window stays whatever it already was (not
+            // reopened), and if it was `EnhancedOpen` from an *earlier*
+            // dispatch, the branch below closes it.
+        }
+        // `RevokeCommissioning` (this dispatch or an earlier one) cleared
+        // the core's admin window while the runtime's own window is still
+        // `EnhancedOpen` — bring the two back in sync.
+        if matches!(**window, CommissioningWindow::EnhancedOpen { .. }) && !admin_open {
+            tracing::info!("administrator commissioning window revoked — closing");
+            **window = CommissioningWindow::Closed;
+            if let Some(ctx) = mdns {
+                ctx.mdns.set_commissionable(None).await;
+            }
+        }
+
         // CommissioningComplete success: stop advertising commissionable.
         if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
             if let Some((cluster, command)) = req_cluster_command {
@@ -1058,13 +1210,22 @@ async fn serve_secured_message(
                                 ctx.mdns.set_commissionable(None).await;
                             }
                             // Task 14: CommissioningComplete is the other event
-                            // (besides the 15-minute deadline in `run`'s
-                            // `select!`) that closes the commissioning window —
-                            // a controller that just finished commissioning has
-                            // no reason to PASE in again, and refusing it stops
-                            // a second commissioner from racing in during
-                            // whatever's left of the original 15 minutes.
+                            // (besides the 15-minute/`CommissioningTimeout`
+                            // deadline in `run`'s `select!`) that closes the
+                            // commissioning window — a controller that just
+                            // finished commissioning has no reason to PASE in
+                            // again, and refusing it stops a second
+                            // commissioner from racing in during whatever's
+                            // left of the window.
                             **window = CommissioningWindow::Closed;
+                            // Task 4: this close is runtime-initiated (General
+                            // Commissioning's CommissioningComplete doesn't
+                            // touch the AC cluster's admin_window itself), so
+                            // tell core explicitly — keeps `WindowStatus`
+                            // honest for an ECM window that just got
+                            // committed by completion rather than expiry/
+                            // revoke. A no-op for the boot window.
+                            comm_server.close_admin_window();
                         }
                     }
                 }
@@ -1095,12 +1256,23 @@ struct ServeState<'a> {
     /// The node's single active subscription, if any (see
     /// `net::subscription`'s module doc for why there's only one).
     subscription: &'a mut Option<ActiveSubscription>,
-    /// The commissioning window (Task 14) — mutated here only by
-    /// `CommissioningComplete` succeeding (`serve_secured_message` closes
-    /// it, same milestone that already tears down the mDNS commissionable
-    /// advert); the 15-minute-elapsed close happens in `run`'s own
+    /// The commissioning window (Task 14, widened by Task 4). Mutated here
+    /// by: a staged `WindowRequest` opening it (`Open -> EnhancedOpen`,
+    /// `apply_window_request`); `CommissioningComplete` succeeding; and
+    /// `RevokeCommissioning` having cleared the core's admin window out from
+    /// under an `EnhancedOpen` runtime window — all three detected per
+    /// dispatch iteration, same place as the AddNOC fabric-diff check. The
+    /// 15-minute/`CommissioningTimeout`-elapsed close happens in `run`'s own
     /// `select!` branch, outside any `ServeState`.
     window: &'a mut CommissioningWindow,
+    /// Boot-time identity (passcode/discriminator/vendor+product id) — Task
+    /// 4 needs `config.discriminator`/`vendor_id`/`product_id` to rebuild
+    /// the commissionable advert when a `WindowRequest` reopens the window,
+    /// and `config.passcode` was already reachable via `run`'s closure but
+    /// not through `ServeState` until now (`pase_config_for_window` is
+    /// called directly in `run`, not from here — this is only for the
+    /// mDNS-side advert rebuild).
+    config: &'a DeviceConfig,
 }
 
 /// Resolves once at the active subscription's next report deadline, or
@@ -1563,6 +1735,24 @@ async fn serve_read_request_chunked(
 mod tests {
     use super::*;
 
+    /// Minimal `DeviceConfig` fixture for tests that need a `ServeState`
+    /// (`config` is only read when a `WindowRequest` reopens the window
+    /// with `mdns: Some(..)`, neither of which any `serve_secured`-driving
+    /// test below exercises — `store_dir`/`iface` are never touched by
+    /// those paths, so their placeholder values are never resolved).
+    fn test_config() -> DeviceConfig {
+        DeviceConfig {
+            passcode: 20202021,
+            discriminator: 3840,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            port: 5540,
+            store_dir: std::path::PathBuf::new(),
+            iface: String::new(),
+            attestation: Default::default(),
+        }
+    }
+
     #[test]
     fn classifies_pase_opcodes() {
         for op in [
@@ -1742,6 +1932,63 @@ mod tests {
         }
         .is_open());
         assert!(!CommissioningWindow::Closed.is_open());
+    }
+
+    // ── ECM window (Task 4) ──────────────────────────────────────────────
+
+    /// dispatch 後に WindowRequest が stage されていれば、runtime の窓が
+    /// EnhancedOpen になり ECM 用 PASE 設定が得られる（純粋ロジック部分の
+    /// 単体テスト — apply_window_request を関数に切り出してテストする）。
+    #[test]
+    fn apply_window_request_transitions_to_enhanced_open() {
+        let req = WindowRequest {
+            verifier: [0x42; 97],
+            discriminator: 0x0ABC,
+            iterations: 1000,
+            salt: vec![0x5A; 16],
+            timeout_s: 300,
+        };
+        let window = apply_window_request(req.clone());
+        // Destructured from a clone, not `window` itself, so `window` stays
+        // usable below (`CommissioningWindow` can't be `Copy` — it carries
+        // `WindowRequest`'s `Vec<u8>` salt).
+        let CommissioningWindow::EnhancedOpen { until, request } = window.clone() else {
+            panic!("expected EnhancedOpen");
+        };
+        assert_eq!(request.discriminator, 0x0ABC);
+        assert!(until > Instant::now());
+        // ECM 中の PASE 設定が verifier 素材になること
+        let config = pase_config_for_window(
+            &window, /*boot passcode*/ 20202021, /*boot salt*/ &[0u8; 32], 0x1234,
+        );
+        assert!(matches!(config.secret, PaseSecret::VerifierMaterial(m) if m == [0x42; 97]));
+        assert_eq!(config.iterations, 1000);
+        assert_eq!(config.salt, vec![0x5A; 16]);
+    }
+
+    /// 窓 variant ごとの mDNS 広告パラメータ（CM 値と discriminator）。
+    #[test]
+    fn commissionable_advert_params_reflect_window_kind() {
+        let boot = CommissioningWindow::Open {
+            until: Instant::now() + Duration::from_secs(60),
+        };
+        assert_eq!(advert_params_for_window(&boot, 3210), Some((3210, 1)));
+        let req = WindowRequest {
+            verifier: [0x42; 97],
+            discriminator: 0x0ABC,
+            iterations: 1000,
+            salt: vec![0x5A; 16],
+            timeout_s: 300,
+        };
+        let ecm = CommissioningWindow::EnhancedOpen {
+            until: Instant::now() + Duration::from_secs(300),
+            request: req,
+        };
+        assert_eq!(advert_params_for_window(&ecm, 3210), Some((0x0ABC, 2)));
+        assert_eq!(
+            advert_params_for_window(&CommissioningWindow::Closed, 3210),
+            None
+        );
     }
 
     // ── fail-safe expiry deadline (Task 8) ──────────────────────────────
@@ -1979,6 +2226,7 @@ mod tests {
                 mdns: None,
                 subscription: &mut None,
                 window: &mut CommissioningWindow::Closed,
+                config: &test_config(),
             },
         )
         .await;
@@ -2219,6 +2467,7 @@ mod tests {
                 mdns: None,
                 subscription: &mut None,
                 window: &mut CommissioningWindow::Closed,
+                config: &test_config(),
             },
         )
         .await;
@@ -2377,6 +2626,7 @@ mod tests {
                 mdns: None,
                 subscription: &mut subscription,
                 window: &mut CommissioningWindow::Closed,
+                config: &test_config(),
             },
         )
         .await;
@@ -2676,6 +2926,7 @@ mod tests {
                 mdns: None,
                 subscription: &mut None,
                 window: &mut CommissioningWindow::Closed,
+                config: &test_config(),
             },
         )
         .await;
@@ -2854,6 +3105,7 @@ mod tests {
                 mdns: None,
                 subscription: &mut None,
                 window: &mut CommissioningWindow::Closed,
+                config: &test_config(),
             },
         )
         .await;

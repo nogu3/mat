@@ -38,6 +38,7 @@ async fn advertiser_is_discoverable_via_browse_commissionable() {
             product_id: 32768,
             port: 5540,
             addr_v6: "fe80::1234".parse().unwrap(),
+            cm: 1,
         }))
         .await;
 
