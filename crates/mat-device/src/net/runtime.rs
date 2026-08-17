@@ -321,6 +321,72 @@ fn advert_params_for_window(
     }
 }
 
+/// What `serve_secured_message`'s per-dispatch-iteration ECM reconciliation
+/// should do, decided as a pure function so the ordering invariant it
+/// encodes (review fix, Task 4 follow-up) can be unit-tested without a
+/// socket harness — the `serve_secured_message` block that calls this only
+/// performs the side effects (`**window` assignment, mDNS
+/// publish/goodbye), it makes no decisions of its own.
+#[derive(Debug)]
+enum AdminWindowAction {
+    /// Nothing to do this iteration — either nothing was staged and the
+    /// window (if any) already agrees with `admin_open`, or a stale staged
+    /// request was silently dropped and the window was already `Closed` (so
+    /// there's nothing left to reconcile).
+    None,
+    /// Apply this staged `WindowRequest`: `Open`/`Closed -> EnhancedOpen`.
+    Apply(WindowRequest),
+    /// The admin window closed (timeout, `CommissioningComplete`, or
+    /// `RevokeCommissioning`) while the runtime's own window is still
+    /// `EnhancedOpen` — bring the two back in sync.
+    Close,
+}
+
+/// Decides `AdminWindowAction` from the three inputs
+/// `serve_secured_message` reads every dispatch iteration:
+/// `comm_server.take_pending_window_request()` (`staged`),
+/// `comm_server.admin_window_is_open()` (`admin_open`), and the runtime's
+/// own `window`.
+///
+/// Order matters (Task 3 review carry-over, restated here since this is now
+/// the one place the invariant lives): the caller must call
+/// `take_pending_window_request()` *before* `admin_window_is_open()`, so a
+/// `RevokeCommissioning` arriving in the same dispatch as an earlier-staged
+/// `OpenCommissioningWindow` — both invoked back-to-back on one timed
+/// exchange — is already visible in `admin_open` by the time this function
+/// runs, regardless of which of the two ran first within that exchange.
+/// Given that ordering, this function is a pure decision table:
+/// - `staged: Some(_)`, `admin_open: true` → `Apply` (the common case: a
+///   fresh `OpenCommissioningWindow` that wasn't immediately revoked).
+/// - `staged: Some(_)`, `admin_open: false` → the request is stale (a
+///   same-dispatch Revoke beat it) and must **not** be applied; falls
+///   through to the same `Close`-or-`None` decision as `staged: None` below,
+///   since dropping the stale request doesn't by itself tell us whether the
+///   *window* (which may have been `EnhancedOpen` from an earlier dispatch)
+///   still needs closing.
+/// - `staged: None`, `window` is `EnhancedOpen`, `admin_open: false` →
+///   `Close` (a Revoke — this dispatch or an earlier one — closed the admin
+///   window out from under an already-open ECM window).
+/// - Anything else (steady state: nothing staged and `admin_open` already
+///   agrees with whether `window` is `EnhancedOpen`) → `None`.
+fn admin_window_action(
+    staged: Option<WindowRequest>,
+    admin_open: bool,
+    window: &CommissioningWindow,
+) -> AdminWindowAction {
+    if let Some(request) = staged {
+        if admin_open {
+            return AdminWindowAction::Apply(request);
+        }
+        // else: stale — drop it, fall through to the Close-or-None check.
+    }
+    if !admin_open && matches!(window, CommissioningWindow::EnhancedOpen { .. }) {
+        AdminWindowAction::Close
+    } else {
+        AdminWindowAction::None
+    }
+}
+
 /// A random non-zero u16 — local (responder) session id for a fresh PASE or
 /// CASE attempt. Not collision-checked against a previous session: this
 /// runtime keeps at most one "current session" alive at a time (see module
@@ -1145,24 +1211,15 @@ async fn serve_secured_message(
         // spot the AddNOC fabric-diff check above lives, so a timed
         // `OpenCommissioningWindow`/`RevokeCommissioning` invoke (piggybacked
         // on this same exchange, per the timed-invoke loop this function
-        // runs) is handled without waiting for the next datagram.
-        //
-        // Order matters (Task 3 review carry-over): take the pending
-        // `WindowRequest` *first*, then check whether the admin window is
-        // (still) open, so a `RevokeCommissioning` arriving in the same
-        // dispatch as an earlier-staged `OpenCommissioningWindow` — both
-        // invoked back-to-back on one timed exchange — drops the stale
-        // request and leaves the window closed, rather than reopening a
-        // window the very same dispatch was just told to close. Applying the
-        // request only when the admin window is (still) open is what makes
-        // this safe: `close_admin_window`/`RevokeCommissioning` clear the
-        // core's `admin_window` immediately, so a Revoke that already ran
-        // this iteration is visible to this check regardless of ordering
-        // within the timed exchange.
+        // runs) is handled without waiting for the next datagram. The
+        // ordering invariant this depends on (take the staged request
+        // *before* reading `admin_open`) and the resulting decision table
+        // are `admin_window_action`'s doc comment/unit tests, not repeated
+        // here — this block only performs the side effects.
         let pending_request = comm_server.take_pending_window_request();
         let admin_open = comm_server.admin_window_is_open();
-        if let Some(request) = pending_request {
-            if admin_open {
+        match admin_window_action(pending_request, admin_open, window) {
+            AdminWindowAction::Apply(request) => {
                 **window = apply_window_request(request);
                 if let (Some(ctx), Some((discriminator, cm))) =
                     (mdns, advert_params_for_window(window, config.discriminator))
@@ -1181,21 +1238,14 @@ async fn serve_secured_message(
                         .await;
                 }
             }
-            // else: staged by an `OpenCommissioningWindow` that a
-            // same-dispatch `RevokeCommissioning` already invalidated —
-            // drop it; the window stays whatever it already was (not
-            // reopened), and if it was `EnhancedOpen` from an *earlier*
-            // dispatch, the branch below closes it.
-        }
-        // `RevokeCommissioning` (this dispatch or an earlier one) cleared
-        // the core's admin window while the runtime's own window is still
-        // `EnhancedOpen` — bring the two back in sync.
-        if matches!(**window, CommissioningWindow::EnhancedOpen { .. }) && !admin_open {
-            tracing::info!("administrator commissioning window revoked — closing");
-            **window = CommissioningWindow::Closed;
-            if let Some(ctx) = mdns {
-                ctx.mdns.set_commissionable(None).await;
+            AdminWindowAction::Close => {
+                tracing::info!("administrator commissioning window revoked — closing");
+                **window = CommissioningWindow::Closed;
+                if let Some(ctx) = mdns {
+                    ctx.mdns.set_commissionable(None).await;
+                }
             }
+            AdminWindowAction::None => {}
         }
 
         // CommissioningComplete success: stop advertising commissionable.
@@ -1931,6 +1981,17 @@ mod tests {
             until: Instant::now() + COMMISSIONING_WINDOW_DURATION
         }
         .is_open());
+        assert!(CommissioningWindow::EnhancedOpen {
+            until: Instant::now() + Duration::from_secs(60),
+            request: WindowRequest {
+                verifier: [0x11; 97],
+                discriminator: 100,
+                iterations: 1000,
+                salt: vec![1, 2, 3],
+                timeout_s: 60,
+            },
+        }
+        .is_open());
         assert!(!CommissioningWindow::Closed.is_open());
     }
 
@@ -1988,6 +2049,80 @@ mod tests {
         assert_eq!(
             advert_params_for_window(&CommissioningWindow::Closed, 3210),
             None
+        );
+    }
+
+    fn test_window_request() -> WindowRequest {
+        WindowRequest {
+            verifier: [0x11; 97],
+            discriminator: 100,
+            iterations: 1000,
+            salt: vec![1, 2, 3],
+            timeout_s: 60,
+        }
+    }
+
+    /// staged Some + admin_open true → Apply(request) — the common case: a
+    /// fresh `OpenCommissioningWindow` that wasn't immediately revoked.
+    #[test]
+    fn admin_window_action_applies_staged_request_when_admin_open() {
+        let req = test_window_request();
+        let window = CommissioningWindow::Open {
+            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+        };
+        match admin_window_action(Some(req.clone()), true, &window) {
+            AdminWindowAction::Apply(applied) => {
+                assert_eq!(applied.discriminator, req.discriminator);
+                assert_eq!(applied.timeout_s, req.timeout_s);
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    /// staged Some + admin_open false (a same-dispatch Revoke raced ahead of
+    /// the Open) → the stale request must not be applied. With `window`
+    /// already `Closed` (never `EnhancedOpen`), there is also nothing left
+    /// to reconcile — `None`, not `Close`.
+    #[test]
+    fn admin_window_action_drops_stale_request_without_closing_an_already_closed_window() {
+        let req = test_window_request();
+        let action = admin_window_action(Some(req), false, &CommissioningWindow::Closed);
+        assert!(
+            matches!(action, AdminWindowAction::None),
+            "expected None, got {action:?}"
+        );
+    }
+
+    /// staged None + admin_open false + window `EnhancedOpen` → `Close`: a
+    /// `RevokeCommissioning` (this dispatch or an earlier one) closed the
+    /// admin window out from under an already-open ECM window.
+    #[test]
+    fn admin_window_action_closes_an_enhanced_open_window_once_admin_window_is_revoked() {
+        let window = CommissioningWindow::EnhancedOpen {
+            until: Instant::now() + Duration::from_secs(60),
+            request: test_window_request(),
+        };
+        let action = admin_window_action(None, false, &window);
+        assert!(
+            matches!(action, AdminWindowAction::Close),
+            "expected Close, got {action:?}"
+        );
+    }
+
+    /// staged None + admin_open true + window `EnhancedOpen` → `None`
+    /// (steady state: an ECM window that's still open and nothing new
+    /// staged this iteration — no side effect should fire every single
+    /// dispatch while a commissioner is just using the window it opened).
+    #[test]
+    fn admin_window_action_is_steady_state_none_for_a_still_open_enhanced_window() {
+        let window = CommissioningWindow::EnhancedOpen {
+            until: Instant::now() + Duration::from_secs(60),
+            request: test_window_request(),
+        };
+        let action = admin_window_action(None, true, &window);
+        assert!(
+            matches!(action, AdminWindowAction::None),
+            "expected None, got {action:?}"
         );
     }
 
