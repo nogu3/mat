@@ -104,6 +104,7 @@ async fn case_establishes_against_mat_device_core_and_reads() {
         root_public_key: admin_creds.root_public_key,
         admin_subject: ADMIN_NODE_ID,
         admin_vendor_id: 0xFFF1,
+        label: String::new(),
     };
 
     // Responder (mat-device core, over the net driver) socket first, so we

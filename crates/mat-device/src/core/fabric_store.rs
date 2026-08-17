@@ -63,6 +63,13 @@ pub struct FabricEntry {
     /// load (as `0`, an unassigned vendor id — spec §2.5.2).
     #[serde(default)]
     pub admin_vendor_id: u16,
+    /// `Label` (spec §11.17.5.20 `FabricDescriptorStruct`) — free-text name
+    /// set by `UpdateFabricLabel` (spec §11.17.6.10), empty until an
+    /// administrator sets one. `#[serde(default)]` so `fabrics.json` files
+    /// persisted before this field existed still load (as `""`, matching a
+    /// fabric that never had its label set).
+    #[serde(default)]
+    pub label: String,
 }
 
 /// Persistence boundary `core` calls through instead of touching a
@@ -180,6 +187,27 @@ impl FabricStore {
         }
         Ok(true)
     }
+
+    /// Sets `label` on the entry at `fabric_index` and, if a persist backend
+    /// is configured, saves the resulting table. `Ok(false)` (not an error)
+    /// if no entry has that index — mirrors `remove`'s contract. In
+    /// practice `UpdateFabricLabel`'s handler (`core::commissioning`)
+    /// already checks the fabric exists (to choose `InvalidFabricIndex` vs.
+    /// this call), so the `false` case is mostly a safety net here.
+    pub fn update_label(&mut self, fabric_index: u8, label: String) -> Result<bool, String> {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.fabric_index == fabric_index)
+        else {
+            return Ok(false);
+        };
+        entry.label = label;
+        if let Some(persist) = &self.persist {
+            persist.save(&self.entries)?;
+        }
+        Ok(true)
+    }
 }
 
 impl Default for FabricStore {
@@ -205,6 +233,7 @@ mod tests {
             root_public_key: [9u8; 65],
             admin_subject: 0xAA,
             admin_vendor_id: 0xFFF1,
+            label: String::new(),
         }
     }
 
@@ -214,6 +243,17 @@ mod tests {
         v.as_object_mut().unwrap().remove("admin_vendor_id");
         let e: FabricEntry = serde_json::from_value(v).unwrap();
         assert_eq!(e.admin_vendor_id, 0);
+    }
+
+    /// Backward compat for `UpdateFabricLabel`'s new `label` field: a
+    /// `fabrics.json` persisted before this field existed has no `label`
+    /// key at all, and must still load — as `""`, not a decode error.
+    #[test]
+    fn old_fabrics_json_without_label_still_loads() {
+        let mut v = serde_json::to_value(entry(1)).unwrap();
+        v.as_object_mut().unwrap().remove("label");
+        let e: FabricEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(e.label, "");
     }
 
     #[test]
@@ -264,6 +304,23 @@ mod tests {
         store.insert(entry(1)).unwrap();
         assert!(!store.remove(2).unwrap());
         assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn update_label_sets_label_on_matching_entry() {
+        let mut store = FabricStore::new();
+        store.insert(entry(1)).unwrap();
+        store.insert(entry(2)).unwrap();
+        assert!(store.update_label(1, "Alexa-1".to_string()).unwrap());
+        assert_eq!(store.entries()[0].label, "Alexa-1");
+        assert_eq!(store.entries()[1].label, "");
+    }
+
+    #[test]
+    fn update_label_returns_false_when_not_found() {
+        let mut store = FabricStore::new();
+        store.insert(entry(1)).unwrap();
+        assert!(!store.update_label(2, "x".to_string()).unwrap());
     }
 
     #[test]

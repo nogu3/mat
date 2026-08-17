@@ -98,6 +98,7 @@ mod tests {
             root_public_key: root_cert.pub_key,
             admin_subject: 0,
             admin_vendor_id: 0xFFF1,
+            label: String::new(),
         }
     }
 

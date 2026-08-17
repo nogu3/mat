@@ -48,6 +48,7 @@ pub const CMD_ATTESTATION_REQUEST: u32 = 0x00; // resp 0x01
 pub const CMD_CERT_CHAIN_REQUEST: u32 = 0x02; // resp 0x03
 pub const CMD_CSR_REQUEST: u32 = 0x04; // resp 0x05
 pub const CMD_ADD_NOC: u32 = 0x06; // resp NOCResponse 0x08
+pub const CMD_UPDATE_FABRIC_LABEL: u32 = 0x09; // resp NOCResponse 0x08
 pub const CMD_REMOVE_FABRIC: u32 = 0x0A; // resp NOCResponse 0x08
 pub const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B; // 応答は NOCResponse ではなく status
 
@@ -154,6 +155,21 @@ pub fn encode_add_noc(
     w.put_bytes(Tag::Context(2), ipk_epoch);
     w.put_uint(Tag::Context(3), case_admin_subject);
     w.put_uint(Tag::Context(4), u64::from(admin_vendor_id));
+    w.end_container();
+    w.finish()
+}
+
+/// UpdateFabricLabel（spec §11.17.6.10）: `{0: Label}`。fabric-scoped —
+/// operates on the invoking session's own fabric (no `FabricIndex` field;
+/// unlike `RemoveFabric` this command can't target a different fabric). No
+/// production caller in this workspace yet (an admin app, not
+/// `mat-controller`'s own commissioning flow, would send this) — kept `pub`
+/// rather than `#[cfg(test)]` so `mat-device`'s test module (a separate
+/// crate) can use it too, same as the other `encode_*` builders here.
+pub fn encode_update_fabric_label(label: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_str(Tag::Context(0), label);
     w.end_container();
     w.finish()
 }
@@ -689,6 +705,29 @@ pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
         },
     )?;
     Ok((noc, icac, ipk, case_admin_subject, admin_vendor_id))
+}
+
+/// UpdateFabricLabel（spec §11.17.6.10）: `{0: Label}`。デバイス側 decoder
+/// （逆方向は [`encode_update_fabric_label`]）。`Label` は spec 上最大 32
+/// 文字（§11.17.5.20 `FabricDescriptorStruct` の `Label` フィールドと同じ
+/// 制約）——超過は `CommissionError::Malformed` にする。呼び出し元
+/// （`mat_device::core::commissioning`）は他の decode エラーと同じく
+/// `let Ok(..) = decode_update_fabric_label(..) else { .. STATUS_INVALID_
+/// COMMAND }` の形で INVALID_COMMAND にマップする。
+pub fn decode_update_fabric_label(fields: &[u8]) -> Result<String, CommissionError> {
+    let step = "update_fabric_label_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    let label = take_utf8(&mut map, 0).ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing label",
+    })?;
+    if label.len() > 32 {
+        return Err(CommissionError::Malformed {
+            step,
+            detail: "label too long",
+        });
+    }
+    Ok(label)
 }
 
 /// [`decode_open_commissioning_window`]'s decoded fields: `(timeout_s,
@@ -2407,5 +2446,33 @@ mod tests {
         assert_eq!((status, idx), (0, Some(1)));
         let (status2, idx2) = decode_noc_response(&encode_noc_response(3, None)).unwrap();
         assert_eq!((status2, idx2), (3, None));
+    }
+
+    #[test]
+    fn decode_update_fabric_label_roundtrips_with_encoder() {
+        assert_eq!(
+            decode_update_fabric_label(&encode_update_fabric_label("Alexa-1")).unwrap(),
+            "Alexa-1"
+        );
+        assert_eq!(
+            decode_update_fabric_label(&encode_update_fabric_label("")).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn decode_update_fabric_label_rejects_over_32_bytes() {
+        let label = "x".repeat(33);
+        let err = decode_update_fabric_label(&encode_update_fabric_label(&label)).unwrap_err();
+        assert!(matches!(err, CommissionError::Malformed { .. }));
+    }
+
+    #[test]
+    fn decode_update_fabric_label_accepts_exactly_32_bytes() {
+        let label = "x".repeat(32);
+        assert_eq!(
+            decode_update_fabric_label(&encode_update_fabric_label(&label)).unwrap(),
+            label
+        );
     }
 }

@@ -33,13 +33,14 @@ use mat_controller::cert::{verify_noc_chain, MatterCert};
 use mat_controller::commissioning::{
     decode_add_noc, decode_add_trusted_root, decode_arm_fail_safe, decode_attestation_request,
     decode_cert_chain_request, decode_csr_request, decode_open_commissioning_window,
-    decode_set_regulatory_config, encode_attestation_response, encode_cert_chain_response,
-    encode_commissioning_status_response, encode_csr_response, encode_noc_response,
-    encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI, CLUSTER_ADMIN_COMMISSIONING,
-    CLUSTER_GENERAL_COMMISSIONING, CLUSTER_OPERATIONAL_CREDENTIALS, CMD_ADD_NOC,
-    CMD_ADD_TRUSTED_ROOT, CMD_ARM_FAIL_SAFE, CMD_ATTESTATION_REQUEST, CMD_CERT_CHAIN_REQUEST,
-    CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST, CMD_OPEN_COMMISSIONING_WINDOW,
-    CMD_REVOKE_COMMISSIONING, CMD_SET_REGULATORY_CONFIG,
+    decode_set_regulatory_config, decode_update_fabric_label, encode_attestation_response,
+    encode_cert_chain_response, encode_commissioning_status_response, encode_csr_response,
+    encode_noc_response, encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI,
+    CLUSTER_ADMIN_COMMISSIONING, CLUSTER_GENERAL_COMMISSIONING, CLUSTER_OPERATIONAL_CREDENTIALS,
+    CMD_ADD_NOC, CMD_ADD_TRUSTED_ROOT, CMD_ARM_FAIL_SAFE, CMD_ATTESTATION_REQUEST,
+    CMD_CERT_CHAIN_REQUEST, CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST,
+    CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING, CMD_SET_REGULATORY_CONFIG,
+    CMD_UPDATE_FABRIC_LABEL,
 };
 use mat_controller::crypto::sign_ecdsa_p256;
 use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
@@ -77,6 +78,12 @@ const NOC_STATUS_MISSING_CSR: u8 = 4;
 /// "storage write error" member; `TableFull` is the closest existing
 /// meaning ("could not add this fabric").
 const NOC_STATUS_TABLE_FULL: u8 = 5;
+/// `UpdateFabricLabel`/`RemoveFabric`'s "no such fabric on this device"
+/// outcome (spec §11.17.6.14.1, `InvalidFabricIndex`). Only
+/// `handle_update_fabric_label` returns this so far — `RemoveFabric` isn't
+/// implemented as a command handler yet (only as an internal fail-safe
+/// rollback via `FabricStore::remove`).
+const NOC_STATUS_INVALID_FABRIC_INDEX: u8 = 0x0A;
 
 /// General Commissioning (0x0030) attribute ids this server serves (spec
 /// §11.10.5). This cluster has no `CurrentFabricIndex` — that attribute is
@@ -542,6 +549,7 @@ impl Inner {
             CMD_CSR_REQUEST => self.handle_csr_request(fields_tlv, ctx),
             CMD_ADD_TRUSTED_ROOT => self.handle_add_trusted_root(fields_tlv),
             CMD_ADD_NOC => self.handle_add_noc(fields_tlv),
+            CMD_UPDATE_FABRIC_LABEL => self.handle_update_fabric_label(fields_tlv, ctx),
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
         }
     }
@@ -638,8 +646,9 @@ impl Inner {
 
     /// Fabrics(1): `array[ struct{1: RootPublicKey, 2: VendorID, 3:
     /// FabricID, 4: NodeID, 5: Label, 254: FabricIndex} ]` (spec
-    /// §11.17.5.3, `FabricDescriptorStruct`). `Label` is always empty —
-    /// mat-device has no `UpdateFabricLabel` support to populate it.
+    /// §11.17.5.3, `FabricDescriptorStruct`). `Label` reflects whatever
+    /// `UpdateFabricLabel` (`handle_update_fabric_label`) has set — empty
+    /// until then.
     fn encode_fabrics(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_array(Tag::Anonymous);
@@ -649,7 +658,7 @@ impl Inner {
             w.put_uint(Tag::Context(2), u64::from(entry.admin_vendor_id));
             w.put_uint(Tag::Context(3), entry.fabric_id);
             w.put_uint(Tag::Context(4), entry.node_id);
-            w.put_str(Tag::Context(5), "");
+            w.put_str(Tag::Context(5), &entry.label);
             w.put_uint(Tag::Context(254), u64::from(entry.fabric_index));
             w.end_container();
         }
@@ -976,6 +985,7 @@ impl Inner {
             root_public_key: rcac.pub_key,
             admin_subject: case_admin_subject,
             admin_vendor_id,
+            label: String::new(),
         };
         if self.store.insert(entry).is_err() {
             return noc_status(NOC_STATUS_TABLE_FULL);
@@ -988,6 +998,49 @@ impl Inner {
         // clears this marker on success; a fail-safe expiry or a fresh/early
         // `ArmFailSafe` before that rolls the fabric back (spec §11.10.7.2).
         self.uncommitted_fabric_index = Some(fabric_index);
+
+        InvokeReply::Data {
+            response_command: RESP_NOC,
+            fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
+        }
+    }
+
+    /// UpdateFabricLabel（spec §11.17.6.10）: fabric-scoped — always targets
+    /// the *invoking session's own* fabric (`ctx.fabric_index`), never a
+    /// fabric index named in the command fields (the command has none; only
+    /// `RemoveFabric` takes an explicit `FabricIndex`). No fail-safe
+    /// requirement, unlike `AddNOC` — this runs against a fabric that's
+    /// already fully commissioned.
+    fn handle_update_fabric_label(&mut self, fields_tlv: &[u8], ctx: &InvokeCtx) -> InvokeReply {
+        let Ok(label) = decode_update_fabric_label(fields_tlv) else {
+            return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+        };
+
+        let noc_status = |status: u8| InvokeReply::Data {
+            response_command: RESP_NOC,
+            fields_tlv: encode_noc_response(status, None),
+        };
+
+        let fabric_index = ctx.fabric_index;
+        if !self
+            .store
+            .entries()
+            .iter()
+            .any(|e| e.fabric_index == fabric_index)
+        {
+            return noc_status(NOC_STATUS_INVALID_FABRIC_INDEX);
+        }
+
+        // Best-effort persist: the label change already applies to the
+        // in-memory table (and so to the next `Fabrics` attribute read)
+        // regardless of whether the write-through to disk succeeds — same
+        // "no dedicated status for a storage error" gap `AddNOC` papers
+        // over with `NOC_STATUS_TABLE_FULL` (see that const's doc comment),
+        // except here there isn't even an approximate status to reuse
+        // without misleading the caller about which fabric failed.
+        if let Err(e) = self.store.update_label(fabric_index, label) {
+            tracing::debug!(error = %e, fabric_index, "UpdateFabricLabel: persist failed (label change still applied in memory)");
+        }
 
         InvokeReply::Data {
             response_command: RESP_NOC,
@@ -1138,7 +1191,8 @@ mod tests {
         decode_attestation_response, decode_commissioning_status_response, decode_csr_response,
         decode_noc_response, encode_add_noc, encode_add_trusted_root, encode_arm_fail_safe,
         encode_attestation_request, encode_cert_chain_request, encode_csr_request,
-        encode_open_commissioning_window, parse_nocsr_elements, CommissioningFabric,
+        encode_open_commissioning_window, encode_update_fabric_label, parse_nocsr_elements,
+        CommissioningFabric,
     };
     use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
@@ -1334,6 +1388,90 @@ mod tests {
         assert_eq!(status, 0, "empty ICACValue must be treated as absent");
         assert_eq!(fabric_index, Some(1));
         assert_eq!(server.fabrics().len(), 1);
+    }
+
+    /// UpdateFabricLabel: NOCResponse(Ok) を返し、store に永続化され、
+    /// Fabrics 属性の読みに Label が反映される。
+    #[test]
+    fn update_fabric_label_persists_and_reflects_in_fabrics_attr() {
+        let server = commissioned_server(); // fabric_index=1
+        let fields = encode_update_fabric_label("Alexa-1");
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let (_, resp) = expect_data(server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_UPDATE_FABRIC_LABEL,
+            &fields,
+            &ctx,
+        ));
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(fabric_index, Some(1));
+        assert_eq!(server.fabrics()[0].label, "Alexa-1");
+
+        // Fabrics 属性（ATTR_OC_FABRICS）の TLV に "Alexa-1" が Label
+        // フィールド（context tag 5, spec §11.17.5.20 FabricDescriptorStruct）
+        // として現れることを Reader で確認する。
+        let (_, oc, _) = server.into_cluster_handlers();
+        let fabrics_tlv = oc
+            .read(ATTR_OC_FABRICS, &ReadCtx::default())
+            .expect("Fabrics");
+        let mut r = Reader::new(&fabrics_tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut label = None;
+        loop {
+            let el = r
+                .next()
+                .unwrap()
+                .expect("truncated FabricDescriptor struct");
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(5), Value::Utf8(s)) => label = Some(s.to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(label.as_deref(), Some("Alexa-1"));
+    }
+
+    /// 対象は「呼び出しセッションの fabric」（spec: fabric-scoped コマンド）。
+    /// ctx.fabric_index の fabric が存在しなければ InvalidFabricIndex(0x0A)。
+    #[test]
+    fn update_fabric_label_unknown_fabric_returns_invalid_fabric_index() {
+        let server = test_server(); // fabric なし
+        let fields = encode_update_fabric_label("x");
+        let ctx = InvokeCtx {
+            fabric_index: 7,
+            ..test_ctx()
+        };
+        let (_, resp) = expect_data(server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_UPDATE_FABRIC_LABEL,
+            &fields,
+            &ctx,
+        ));
+        let (status, _) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0x0A);
+    }
+
+    /// Label 長 >32 は INVALID_COMMAND（グローバルステータス）。
+    #[test]
+    fn update_fabric_label_too_long_returns_invalid_command() {
+        let server = commissioned_server();
+        let fields = encode_update_fabric_label(&"x".repeat(33));
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let reply = server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_UPDATE_FABRIC_LABEL,
+            &fields,
+            &ctx,
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_INVALID_COMMAND));
     }
 
     #[test]
