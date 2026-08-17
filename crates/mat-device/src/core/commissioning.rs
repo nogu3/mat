@@ -2018,6 +2018,34 @@ mod tests {
             ),
             InvokeReply::Status(im::STATUS_INVALID_COMMAND)
         );
+
+        // `encode_open_commissioning_window` takes `verifier: &[u8; 97]`, so
+        // a wrong-length verifier can't be produced through it — build the
+        // fields TLV directly (same technique as
+        // `add_noc_accepts_empty_icac_value_as_absent`) with a 96-byte
+        // verifier to exercise the third PAKEParameterError disjunct
+        // (verifier.len() != 97) independently of iterations/salt.
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 300);
+        w.put_bytes(Tag::Context(1), &[0x42; 96]);
+        w.put_uint(Tag::Context(2), 0x0ABC);
+        w.put_uint(Tag::Context(3), 1000);
+        w.put_bytes(Tag::Context(4), &[0x5A; 16]);
+        w.end_container();
+        let bad_verifier = w.finish();
+        assert_eq!(
+            server.invoke_command(
+                CLUSTER_ADMIN_COMMISSIONING,
+                CMD_OPEN_COMMISSIONING_WINDOW,
+                &bad_verifier,
+                &ctx
+            ),
+            InvokeReply::ClusterStatus {
+                status: im::STATUS_FAILURE,
+                cluster_status: 3
+            }
+        );
     }
 
     /// Revoke: 開いていれば閉じ、閉じていれば WindowNotOpen(4)。
