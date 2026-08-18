@@ -33,14 +33,14 @@ use mat_controller::cert::{verify_noc_chain, MatterCert};
 use mat_controller::commissioning::{
     decode_add_noc, decode_add_trusted_root, decode_arm_fail_safe, decode_attestation_request,
     decode_cert_chain_request, decode_csr_request, decode_open_commissioning_window,
-    decode_set_regulatory_config, decode_update_fabric_label, encode_attestation_response,
-    encode_cert_chain_response, encode_commissioning_status_response, encode_csr_response,
-    encode_noc_response, encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI,
+    decode_remove_fabric, decode_set_regulatory_config, decode_update_fabric_label,
+    encode_attestation_response, encode_cert_chain_response, encode_commissioning_status_response,
+    encode_csr_response, encode_noc_response, encode_nocsr_elements, CERT_TYPE_DAC, CERT_TYPE_PAI,
     CLUSTER_ADMIN_COMMISSIONING, CLUSTER_GENERAL_COMMISSIONING, CLUSTER_OPERATIONAL_CREDENTIALS,
     CMD_ADD_NOC, CMD_ADD_TRUSTED_ROOT, CMD_ARM_FAIL_SAFE, CMD_ATTESTATION_REQUEST,
     CMD_CERT_CHAIN_REQUEST, CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST,
-    CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING, CMD_SET_REGULATORY_CONFIG,
-    CMD_UPDATE_FABRIC_LABEL,
+    CMD_OPEN_COMMISSIONING_WINDOW, CMD_REMOVE_FABRIC, CMD_REVOKE_COMMISSIONING,
+    CMD_SET_REGULATORY_CONFIG, CMD_UPDATE_FABRIC_LABEL,
 };
 use mat_controller::crypto::sign_ecdsa_p256;
 use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
@@ -79,10 +79,8 @@ const NOC_STATUS_MISSING_CSR: u8 = 4;
 /// meaning ("could not add this fabric").
 const NOC_STATUS_TABLE_FULL: u8 = 5;
 /// `UpdateFabricLabel`/`RemoveFabric`'s "no such fabric on this device"
-/// outcome (spec §11.17.6.14.1, `InvalidFabricIndex`). Only
-/// `handle_update_fabric_label` returns this so far — `RemoveFabric` isn't
-/// implemented as a command handler yet (only as an internal fail-safe
-/// rollback via `FabricStore::remove`).
+/// outcome (spec §11.17.6.14.1, `InvalidFabricIndex`). Returned by both
+/// `handle_update_fabric_label` and `handle_remove_fabric`.
 const NOC_STATUS_INVALID_FABRIC_INDEX: u8 = 0x0A;
 
 /// General Commissioning (0x0030) attribute ids this server serves (spec
@@ -245,6 +243,17 @@ struct Inner {
     /// The most recent `OpenCommissioningWindow` request, staged for the
     /// runtime to collect (and clear) via `take_pending_window_request`.
     pending_window_request: Option<WindowRequest>,
+    /// The `FabricEntry` a successful `RemoveFabric` (spec §11.17.6.15)
+    /// most recently removed from `store`, staged for the runtime to
+    /// collect (and clear) via `take_removed_fabric`. The runtime needs the
+    /// full entry (not just the index) for two things `store` no longer has
+    /// it for once `remove` returns: the `root_public_key`/`fabric_id` to
+    /// derive the `compressed_fabric_id` for the mDNS operational-advert
+    /// goodbye, and the `fabric_index` to compare against the invoking
+    /// session's own — dropping that session if they match (an ephemeral
+    /// commissioner fabric removing itself after handing off, e.g. an
+    /// Android phone handing a device to Home Assistant).
+    removed_fabric: Option<FabricEntry>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -265,6 +274,7 @@ impl CommissioningServer {
                 uncommitted_fabric_index: None,
                 admin_window: None,
                 pending_window_request: None,
+                removed_fabric: None,
             })),
         }
     }
@@ -338,6 +348,21 @@ impl CommissioningServer {
             .lock()
             .expect("commissioning server mutex poisoned")
             .pending_window_request
+            .take()
+    }
+
+    /// Takes (clearing) the `FabricEntry` a successful `RemoveFabric`
+    /// (spec §11.17.6.15) most recently removed from the store, if any —
+    /// the net runtime (Task 6) collects this right after dispatch, same
+    /// spot as `take_pending_window_request`, and uses it to retract the
+    /// fabric's mDNS operational advert and (if it was the invoking
+    /// session's own fabric) end that session. `None` if no `RemoveFabric`
+    /// has succeeded since the last time this was called.
+    pub fn take_removed_fabric(&self) -> Option<FabricEntry> {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .removed_fabric
             .take()
     }
 
@@ -550,6 +575,7 @@ impl Inner {
             CMD_ADD_TRUSTED_ROOT => self.handle_add_trusted_root(fields_tlv),
             CMD_ADD_NOC => self.handle_add_noc(fields_tlv),
             CMD_UPDATE_FABRIC_LABEL => self.handle_update_fabric_label(fields_tlv, ctx),
+            CMD_REMOVE_FABRIC => self.handle_remove_fabric(fields_tlv),
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND),
         }
     }
@@ -1046,6 +1072,66 @@ impl Inner {
         }
     }
 
+    /// RemoveFabric（spec §11.17.6.15）: unlike `UpdateFabricLabel`, targets
+    /// the `FabricIndex` named in the command's own fields, not necessarily
+    /// the invoking session's fabric — an administrator (or, per this
+    /// branch's motivating case, a commissioner phone that just handed a
+    /// device off via `OpenCommissioningWindow`) can remove any fabric,
+    /// including its own. Looks the entry up (and clones it) *before*
+    /// calling `store.remove` — `FabricStore::remove` only reports whether
+    /// something was removed, not what it was, and the runtime needs the
+    /// full entry (root public key, fabric id, node id) to retract the
+    /// mDNS operational advert and decide whether to drop the session (see
+    /// `removed_fabric`'s doc comment). Mirrors
+    /// `rollback_uncommitted_fabric`'s find-then-remove shape.
+    fn handle_remove_fabric(&mut self, fields_tlv: &[u8]) -> InvokeReply {
+        let Ok(fabric_index) = decode_remove_fabric(fields_tlv) else {
+            return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+        };
+
+        let Some(entry) = self
+            .store
+            .entries()
+            .iter()
+            .find(|e| e.fabric_index == fabric_index)
+            .cloned()
+        else {
+            return InvokeReply::Data {
+                response_command: RESP_NOC,
+                fields_tlv: encode_noc_response(NOC_STATUS_INVALID_FABRIC_INDEX, None),
+            };
+        };
+
+        match self.store.remove(fabric_index) {
+            Ok(true) => {
+                self.removed_fabric = Some(entry);
+                InvokeReply::Data {
+                    response_command: RESP_NOC,
+                    fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
+                }
+            }
+            // `entry` was just found above under the same `&mut self`
+            // borrow — nothing can have removed it out from under us
+            // between the two calls, so `remove` reporting "wasn't there"
+            // here would mean the two lookups disagree, which can't happen.
+            Ok(false) => unreachable!(
+                "fabric_index {fabric_index} found in store.entries() moments ago, \
+                 store.remove() must still find it"
+            ),
+            // Same asymmetry as `UpdateFabricLabel`: the in-memory removal
+            // already happened (`FabricStore::remove`'s doc comment — it
+            // does *not* roll the removal back on a save failure), so the
+            // fabric is really gone from this device's perspective even
+            // though the reply below is `STATUS_FAILURE` rather than a
+            // success `NOCResponse` — the caller must not be told `OK` when
+            // the removal may not survive a restart.
+            Err(e) => {
+                tracing::debug!(error = %e, fabric_index, "RemoveFabric: persist failed");
+                InvokeReply::Status(im::STATUS_FAILURE)
+            }
+        }
+    }
+
     /// OpenCommissioningWindow（spec §11.19.8.1, ECM — this server never
     /// serves the legacy basic-commissioning-method window）: validates the
     /// PAKE parameters, rejects if a window is already open, then records
@@ -1190,8 +1276,8 @@ mod tests {
         decode_attestation_response, decode_commissioning_status_response, decode_csr_response,
         decode_noc_response, encode_add_noc, encode_add_trusted_root, encode_arm_fail_safe,
         encode_attestation_request, encode_cert_chain_request, encode_csr_request,
-        encode_open_commissioning_window, encode_update_fabric_label, parse_nocsr_elements,
-        CommissioningFabric,
+        encode_open_commissioning_window, encode_remove_fabric, encode_update_fabric_label,
+        parse_nocsr_elements, CommissioningFabric,
     };
     use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
@@ -1529,6 +1615,46 @@ mod tests {
         // In-memory table still got the label — the reply is what must not
         // lie, not the (already-established) in-memory-vs-disk asymmetry.
         assert_eq!(server.fabrics()[0].label, "Alexa-1");
+    }
+
+    /// RemoveFabric: NOCResponse(Ok) + store から消え、removed が stage される。
+    #[test]
+    fn remove_fabric_removes_and_stages_entry() {
+        let server = commissioned_server();
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let (_, resp) = expect_data(server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_REMOVE_FABRIC,
+            &encode_remove_fabric(1),
+            &ctx,
+        ));
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(fabric_index, Some(1));
+        assert!(server.fabrics().is_empty());
+        assert_eq!(server.take_removed_fabric().map(|e| e.fabric_index), Some(1));
+    }
+
+    /// 存在しない index は InvalidFabricIndex(0x0A)。
+    #[test]
+    fn remove_fabric_unknown_index_returns_invalid_fabric_index() {
+        let server = commissioned_server();
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let (_, resp) = expect_data(server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_REMOVE_FABRIC,
+            &encode_remove_fabric(9),
+            &ctx,
+        ));
+        let (status, _) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0x0A);
+        assert_eq!(server.fabrics().len(), 1);
     }
 
     #[test]

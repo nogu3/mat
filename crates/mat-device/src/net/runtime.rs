@@ -387,6 +387,40 @@ fn admin_window_action(
     }
 }
 
+/// What `serve_secured_message` should do once it's finished dispatching
+/// and replying to one request — `Continue` (the overwhelming common case)
+/// or `DropSession` (Task 6: a `RemoveFabric` this dispatch removed the
+/// invoking session's own fabric — spec §2.5.11, removing a fabric SHALL
+/// terminate any session associated with it). Propagated back up through
+/// `drain_buffered_requests`/`serve_secured` to `run`'s loop, which is the
+/// only place that actually owns `current_session` and can set it to
+/// `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeOutcome {
+    Continue,
+    DropSession,
+}
+
+/// Whether a `RemoveFabric` that just removed `removed_fabric_index` from
+/// the store should end the current secured session — true iff the
+/// removed fabric is the one `session_fabric_index` (this session's own,
+/// carried alongside `SecureSession` in `run`'s `current_session`)
+/// authenticated against. Extracted as a pure function (mirrors
+/// `admin_window_action` above) so this one-line decision has a unit test
+/// that doesn't need a socket harness — `serve_secured_message`'s
+/// `RemoveFabric` block below only calls it and acts on the result.
+///
+/// A PASE session (`session_fabric_index == 0`) can never match: `0` isn't
+/// a valid fabric index (spec §2.5.1, fabric indices are 1-based), and
+/// `RemoveFabric` itself is only reachable post-`AddNOC` in practice, but
+/// nothing here assumes that — a `0 == 0` false-positive would be wrong
+/// (there is no "fabric 0" to remove), so this only fires for handled
+/// FabricIndex bytes, which `decode_remove_fabric` already restricts to
+/// values `FabricStore` actually assigned (1+).
+fn remove_fabric_drops_session(removed_fabric_index: u8, session_fabric_index: u8) -> bool {
+    removed_fabric_index == session_fabric_index && session_fabric_index != 0
+}
+
 /// A random non-zero u16 — local (responder) session id for a fresh PASE or
 /// CASE attempt. Not collision-checked against a previous session: this
 /// runtime keeps at most one "current session" alive at a time (see module
@@ -853,7 +887,7 @@ pub(crate) async fn run(
                     );
                     continue;
                 }
-                serve_secured(
+                let outcome = serve_secured(
                     &buf[..n],
                     peer,
                     session,
@@ -868,6 +902,14 @@ pub(crate) async fn run(
                     },
                 )
                 .await;
+                // Task 6: a `RemoveFabric` that removed this session's own
+                // fabric — `session`/`fabric_index` (borrowed out of
+                // `current_session` above) are no longer used past this
+                // point in this iteration, so this is the first place the
+                // borrow checker lets `current_session` be reassigned.
+                if outcome == ServeOutcome::DropSession {
+                    current_session = None;
+                }
             }
             () = mdns_retry_deadline(&mdns_retry) => {
                 // `window.is_open()` read *now*, not whatever it was when
@@ -924,8 +966,9 @@ pub(crate) async fn run(
                     );
                     subscription = None;
                 }
+                let mut drop_session = false;
                 if let Some((_, session, fabric_index)) = current_session.as_mut() {
-                    drain_buffered_requests(
+                    drop_session = drain_buffered_requests(
                         session,
                         *fabric_index,
                         &mut ServeState {
@@ -937,7 +980,15 @@ pub(crate) async fn run(
                             config: &config,
                         },
                     )
-                    .await;
+                    .await
+                        == ServeOutcome::DropSession;
+                }
+                // Task 6: same reasoning as the datagram branch above — a
+                // buffered `RemoveFabric` piggybacked on this session's own
+                // fabric ends the session too, not just one arriving as a
+                // fresh datagram.
+                if drop_session {
+                    current_session = None;
                 }
             }
             () = commissioning_window_deadline(&window) => {
@@ -1013,13 +1064,24 @@ pub(crate) async fn run(
 /// `mdns` is `None` when `bring_up_mdns` failed at startup (`run`'s doc
 /// comment) — commissioning still completes, just without an operational
 /// advert or a commissionable-window teardown to publish.
+///
+/// Returns `ServeOutcome::DropSession` (Task 6) if this datagram's dispatch
+/// — or, when it wasn't, one of the buffered requests drained afterward —
+/// contained a `RemoveFabric` that removed the invoking session's own
+/// fabric (`remove_fabric_drops_session`); `run`'s caller then sets
+/// `current_session = None`. `DropSession` skips the buffered-request drain
+/// below entirely (rather than draining what's left first): the session is
+/// about to be torn down, so there is no longer anywhere to route replies
+/// for whatever else `screen_with` buffered — and per spec §2.5.11 removing
+/// a fabric SHALL terminate sessions associated with it, so continuing to
+/// serve *other* requests on it, even briefly, would be wrong regardless.
 async fn serve_secured(
     buf: &[u8],
     from: SocketAddr,
     session: &mut SecureSession,
     fabric_index: u8,
     state: &mut ServeState<'_>,
-) {
+) -> ServeOutcome {
     let msg = match session.deliver_request(buf, from).await {
         Ok(Some(msg)) => msg,
         Ok(None) => {
@@ -1027,14 +1089,17 @@ async fn serve_secured(
                 peer = %from,
                 "secured datagram dropped: deliver_request returned no message (standalone ack or screened-out)"
             );
-            return;
+            return ServeOutcome::Continue;
         }
         Err(e) => {
             tracing::debug!(error = %e, peer = %from, "secured datagram dropped: decrypt/screen failure");
-            return; // decrypt/screen failure — drop, don't kill the session on noise
+            return ServeOutcome::Continue; // decrypt/screen failure — drop, don't kill the session on noise
         }
     };
-    serve_secured_message(msg, session, fabric_index, state).await;
+    if serve_secured_message(msg, session, fabric_index, state).await == ServeOutcome::DropSession
+    {
+        return ServeOutcome::DropSession;
+    }
 
     // While `reply_reliable` (inside `serve_secured_message`) was waiting
     // for the ack of *that* reply, a new peer-initiated request on a
@@ -1046,7 +1111,7 @@ async fn serve_secured(
     // fix: "ack-then-drop of cross-exchange secured requests"). Draining in
     // a loop (not just once) covers the same thing happening again while
     // *this* reply's own ack-wait is in flight.
-    drain_buffered_requests(session, fabric_index, state).await;
+    drain_buffered_requests(session, fabric_index, state).await
 }
 
 /// Serves every peer-initiated request `screen_with` buffered
@@ -1054,17 +1119,25 @@ async fn serve_secured(
 /// `serve_secured`'s comment above the original call site for why dropping
 /// them would be a permanent loss. Also run after a device-initiated
 /// subscription report, whose own ack-wait reads the socket the same way.
+/// Stops (returning `ServeOutcome::DropSession`) as soon as any drained
+/// request drops the session — same reasoning as `serve_secured`'s doc
+/// comment: nothing buffered after that point should still be served.
 async fn drain_buffered_requests(
     session: &mut SecureSession,
     fabric_index: u8,
     state: &mut ServeState<'_>,
-) {
+) -> ServeOutcome {
     while let Some(buffered) = session.take_buffered_request() {
         if buffered.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
             continue;
         }
-        serve_secured_message(buffered, session, fabric_index, state).await;
+        if serve_secured_message(buffered, session, fabric_index, state).await
+            == ServeOutcome::DropSession
+        {
+            return ServeOutcome::DropSession;
+        }
     }
+    ServeOutcome::Continue
 }
 
 /// Dispatches one already-classified Interaction Model request (`msg`) to
@@ -1075,12 +1148,19 @@ async fn drain_buffered_requests(
 /// socket and any buffered peer-initiated request drained afterward go
 /// through the identical path. `fabric_index` is this session's fabric
 /// index (0 for PASE) — threaded into `ReadCtx` for every `ReadRequest`.
+///
+/// Returns `ServeOutcome` (Task 6) — `DropSession` once, per dispatch
+/// iteration, if a `RemoveFabric` handled this iteration removed the
+/// invoking session's own fabric (see the `RemoveFabric` block near the
+/// end of the loop body); every other exit path (non-IM traffic, Read/
+/// Subscribe's own flows, a `handle_im` decode failure, or the ack-wait
+/// loop simply running out of same-exchange follow-ups) is `Continue`.
 async fn serve_secured_message(
     msg: mat_controller::exchange::IncomingMessage,
     session: &mut SecureSession,
     fabric_index: u8,
     state: &mut ServeState<'_>,
-) {
+) -> ServeOutcome {
     // Destructured (rather than used through `state.*`) so the borrow
     // checker sees the four fields as independent borrows — the
     // subscription is updated while `node` is also borrowed.
@@ -1109,7 +1189,7 @@ async fn serve_secured_message(
         if msg.proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL {
             // Secure-channel traffic on an established session (e.g. a
             // device-initiated-exchange StatusReport) — out of M1 scope.
-            return;
+            return ServeOutcome::Continue;
         }
 
         // ReadRequest gets its own chunk-aware flow (Task 6) instead of going
@@ -1119,7 +1199,7 @@ async fn serve_secured_message(
         // below (those are Invoke-only), so returning here is safe.
         if msg.proto.opcode == im::OPCODE_READ_REQUEST {
             serve_read_request_chunked(&msg, session, fabric_index, node).await;
-            return;
+            return ServeOutcome::Continue;
         }
 
         // SubscribeRequest likewise owns its whole interaction (priming chunks
@@ -1130,7 +1210,7 @@ async fn serve_secured_message(
         // this same peer just asked to start over.
         if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
             **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
-            return;
+            return ServeOutcome::Continue;
         }
 
         tracing::debug!(
@@ -1160,7 +1240,7 @@ async fn serve_secured_message(
         let fabrics_before = comm_server.fabrics().len();
         let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
         else {
-            return;
+            return ServeOutcome::Continue;
         };
         let ImOutcome {
             opcode: resp_opcode,
@@ -1282,13 +1362,41 @@ async fn serve_secured_message(
             }
         }
 
+        // RemoveFabric (Task 6): the store may have shed a fabric this
+        // dispatch — either the invoking session's own (the motivating
+        // case: an Android phone removing its ephemeral fabric right after
+        // handing the device off to Home Assistant via
+        // `OpenCommissioningWindow`) or a different one named explicitly in
+        // the command fields. Either way its mDNS operational advert must
+        // go. Checked *after* `reply_reliable` above, per the brief: the
+        // `RemoveFabric` response itself has already been sent (and, along
+        // `reply_reliable`'s normal path, acked) by this point, so dropping
+        // the session below never races the response that announces the
+        // removal.
+        if let Some(entry) = comm_server.take_removed_fabric() {
+            if let Some(ctx) = mdns {
+                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+                ctx.mdns
+                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                    .await;
+            }
+            if remove_fabric_drops_session(entry.fabric_index, fabric_index) {
+                tracing::info!(
+                    fabric_index,
+                    node_id = entry.node_id,
+                    "RemoveFabric removed the invoking session's own fabric — dropping session"
+                );
+                return ServeOutcome::DropSession;
+            }
+        }
+
         // `reply_reliable` が実メッセージ（同一 exchange の後続リクエスト —
         // 典型は Timed Interaction の timed Invoke）を返したら、この iteration
         // と同じ経路で続けて処理する。ack 完了 (`Ok(None)`) と送信失敗 (`Err`)
         // はどちらもこのメッセージ列の終端。
         match reply_result {
             Ok(Some(next)) => msg = next,
-            _ => return,
+            _ => return ServeOutcome::Continue,
         }
     }
 }
@@ -2124,6 +2232,35 @@ mod tests {
             matches!(action, AdminWindowAction::None),
             "expected None, got {action:?}"
         );
+    }
+
+    // ── RemoveFabric session-drop decision (Task 6) ─────────────────────
+    //
+    // `remove_fabric_drops_session` is the one-line decision
+    // `serve_secured_message`'s RemoveFabric block acts on; a socket-
+    // harness test proving the whole PASE/CASE→AddNOC→RemoveFabric→session-
+    // torn-down flow end to end would be disproportionate here (it would
+    // mostly re-exercise `net::case`/`net::pase`, already covered
+    // elsewhere) — this unit-tests the decision itself, same rationale as
+    // the `admin_window_action` tests above.
+
+    #[test]
+    fn remove_fabric_drops_session_when_removed_index_matches_session() {
+        assert!(remove_fabric_drops_session(1, 1));
+    }
+
+    #[test]
+    fn remove_fabric_does_not_drop_session_when_removed_index_differs() {
+        assert!(!remove_fabric_drops_session(2, 1));
+    }
+
+    /// A PASE session's `fabric_index` is `0` (no fabric yet) — `0` can
+    /// never be a real `FabricIndex` (spec §2.5.1, 1-based), so it must
+    /// never match even a (hypothetically malformed) `removed_fabric_index
+    /// == 0`.
+    #[test]
+    fn remove_fabric_never_drops_a_pase_session() {
+        assert!(!remove_fabric_drops_session(0, 0));
     }
 
     // ── fail-safe expiry deadline (Task 8) ──────────────────────────────

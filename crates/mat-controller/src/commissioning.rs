@@ -730,6 +730,20 @@ pub fn decode_update_fabric_label(fields: &[u8]) -> Result<String, CommissionErr
     Ok(label)
 }
 
+/// RemoveFabric（spec §11.17.6.15）: `{0: FabricIndex}`。デバイス側 decoder
+/// （逆方向は [`encode_remove_fabric`]）。`UpdateFabricLabel` と異なり
+/// `FabricIndex` を明示するのは、削除対象が呼び出しセッション自身の
+/// fabric とは限らないから（Android がハンドオフ後に自分の一時 fabric
+/// を名指しで消すのが典型ケース）。
+pub fn decode_remove_fabric(fields: &[u8]) -> Result<u8, CommissionError> {
+    let step = "remove_fabric_request";
+    let mut map = scan_struct_fields(fields, step)?;
+    take_u8(&mut map, 0, step, "fabric index out of range")?.ok_or(CommissionError::Malformed {
+        step,
+        detail: "missing fabric index",
+    })
+}
+
 /// [`decode_open_commissioning_window`]'s decoded fields: `(timeout_s,
 /// verifier, discriminator, iterations, salt)`.
 pub type OpenCommissioningWindowFields = (u16, Vec<u8>, u16, u32, Vec<u8>);
@@ -2474,5 +2488,20 @@ mod tests {
             decode_update_fabric_label(&encode_update_fabric_label(&label)).unwrap(),
             label
         );
+    }
+
+    #[test]
+    fn decode_remove_fabric_roundtrips_with_encoder() {
+        assert_eq!(decode_remove_fabric(&encode_remove_fabric(1)).unwrap(), 1);
+        assert_eq!(decode_remove_fabric(&encode_remove_fabric(9)).unwrap(), 9);
+    }
+
+    #[test]
+    fn decode_remove_fabric_rejects_missing_fabric_index() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.end_container();
+        let err = decode_remove_fabric(&w.finish()).unwrap_err();
+        assert!(matches!(err, CommissionError::Malformed { .. }));
     }
 }
