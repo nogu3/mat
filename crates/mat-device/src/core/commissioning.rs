@@ -1124,9 +1124,18 @@ impl Inner {
             // fabric is really gone from this device's perspective even
             // though the reply below is `STATUS_FAILURE` rather than a
             // success `NOCResponse` — the caller must not be told `OK` when
-            // the removal may not survive a restart.
+            // the removal may not survive a restart. `removed_fabric` is
+            // still staged, though (unlike the reply, which must stay
+            // honest about durability): the runtime's mDNS retract and
+            // same-session drop must follow the in-memory truth, not the
+            // reply. Leaving it unstaged would strand a stale operational
+            // advert and, worse, leave a session alive against a fabric
+            // that no longer resolves — spec §2.5.11 requires removing a
+            // fabric to terminate its sessions, and that's true regardless
+            // of whether the removal also made it to disk.
             Err(e) => {
                 tracing::debug!(error = %e, fabric_index, "RemoveFabric: persist failed");
+                self.removed_fabric = Some(entry);
                 InvokeReply::Status(im::STATUS_FAILURE)
             }
         }
@@ -1655,6 +1664,39 @@ mod tests {
         let (status, _) = decode_noc_response(&resp).unwrap();
         assert_eq!(status, 0x0A);
         assert_eq!(server.fabrics().len(), 1);
+    }
+
+    /// RemoveFabric: a persist failure must still stage `removed_fabric`
+    /// for the runtime — `FabricStore::remove`'s in-memory removal already
+    /// happened (same asymmetry `update_fabric_label_persist_failure_
+    /// returns_status_failure` documents for `update_label`), so the mDNS
+    /// retract and (if it were this session's own fabric) session drop
+    /// must follow that in-memory truth, not the reply. The reply itself
+    /// still stays honest (`STATUS_FAILURE`, not a success `NOCResponse`).
+    #[test]
+    fn remove_fabric_persist_failure_still_stages_removal() {
+        let fail_save = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = FabricStore::with_persist(Box::new(FlakySavePersist {
+            fail_save: std::sync::Arc::clone(&fail_save),
+        }));
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let mut server = CommissioningServer::new(dev, store);
+        install_fabric(&mut server, 0x1122, 0x5001);
+
+        fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let reply = server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_REMOVE_FABRIC,
+            &encode_remove_fabric(1),
+            &ctx,
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILURE));
+        assert!(server.fabrics().is_empty());
+        assert_eq!(server.take_removed_fabric().map(|e| e.fabric_index), Some(1));
     }
 
     #[test]
