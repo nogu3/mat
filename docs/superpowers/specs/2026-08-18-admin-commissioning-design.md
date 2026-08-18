@@ -130,3 +130,18 @@ enum CommissioningWindow {
   commission できる」「Revoke / 期限満了で goodbye」
 - リグレッション: `cargo test --workspace` + chip-tool ゲート + matter-server WS ゲート
 - 最終受け入れ: スマホ HA アプリからの追加が端から端まで通る（人間チェックポイント）
+
+## 完了時の申し送り（2026-08-19）
+
+**実装は全タスク完了・final review Approve（コード指摘なし）**。自動ゲート: workspace 1088 テスト + clippy / chip-tool フルゲート PASS / **ECM 2 コントローラ E2E PASS**（matter-server 1.1.7 ×2、jarvis 実機: commission → OCW → 第 2 コントローラが verifier PASE で commission → 操作。UpdateFabricLabel も実機確認）。
+
+**スマホ実機 E2E は 99% 到達で保留**: 実測（2026-08-18 21:59）でスマホの commission → CASE → **OpenCommissioningWindow invoke → 本物の HA サーバが ECM 窓から PASE 接続**まで全て成功。HA サーバが attestation でテスト証明書を即拒否して中断 — 残る前提は **HA の Matter Server アドオンで Test Net DCL を有効化**することのみ（ユーザー操作待ち）。
+
+**M3 送り（final review の deferred minors）**:
+- runtime の単一セッション制約: 旧セッション経由の RemoveFabric が不達（スマホの一時 fabric が zombie 化しうる。手動 RemoveFabric で回収可能）→ multi-session 化
+- OCW の Busy 判定順序が spec §11.19.8.1 と逆（Busy より先にパラメータ検証）
+- WindowRequest が Debug/Clone 派生（verifier 素材の保護一貫性）
+- 最終 fabric 削除後に再 commissioning 不能（要 restart。spec は commissioning mode 再進入を期待）
+- DropSession 伝播・mDNS retry の seam 自動テスト無し（pure-fn テスト + 実機ゲートでカバー中）
+
+**検証リグ（再利用可）**: jarvis `~/ms-test`（matter-server 1.1.7 npm 導入済み、`--enable-test-net-dcl` で起動）、`~/matv-ha/`（matv 手動起動、discriminator 2314 / passcode 63852174）。WS 自動化スクリプトの手順は plan の Task 7 参照。
