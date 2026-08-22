@@ -64,6 +64,12 @@ pub const ATTR_GROUPS_NAME_SUPPORT: u32 = 0x0000;
 /// requests (including groupcast, which arrives with `authMode = Group`).
 pub const CLUSTER_ACCESS_CONTROL: u32 = 0x001F;
 pub const ATTR_ACL: u32 = 0x0000;
+/// Fixed capacity attributes (spec §9.10.5) — `mat-device`'s
+/// `AccessControlHandler` reports constant values, no real per-table
+/// tracking (M2/M3 scope has never come close to any of these limits).
+pub const ATTR_ACL_SUBJECTS_PER_ENTRY: u32 = 0x0002;
+pub const ATTR_ACL_TARGETS_PER_ENTRY: u32 = 0x0003;
+pub const ATTR_ACL_ENTRIES_PER_FABRIC: u32 = 0x0004;
 /// Descriptor cluster (spec §9.5). Every endpoint's mandatory
 /// "what am I / what's under me" cluster — `mat-device`'s `datamodel`
 /// serves it on endpoint 0.
