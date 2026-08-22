@@ -137,6 +137,13 @@ pub const STATUS_INVALID_COMMAND: u8 = 0x85;
 /// `WriteRequest`/`SubscribeRequest`/etc. all land here) instead of
 /// silently dropping the request.
 pub const STATUS_INVALID_ACTION: u8 = 0x80;
+/// "The specified action can't be performed" (spec §8.10.1 Table 8-19) for
+/// a `WriteRequest` targeting an attribute the cluster doesn't accept
+/// writes to — `mat-device`'s data model dispatch
+/// (`core::datamodel::ClusterHandler::write`'s default implementation)
+/// returns this for every cluster that doesn't override `write` (as of this
+/// writing, none do).
+pub const STATUS_UNSUPPORTED_WRITE: u8 = 0x88;
 
 /// Global attribute ids every cluster exposes (spec §7.13, Table
 /// "Global Attributes"). `core::datamodel::Node` synthesizes these itself
@@ -2024,6 +2031,16 @@ pub struct WriteAttrIn {
     /// `encode_write_request_tlv`'s `data_tlv` input, just decoded instead of
     /// encoded.
     pub data_tlv: Vec<u8>,
+    /// Whether the path's AttributePathIB carried a `ListIndex` (spec
+    /// §8.9.2.2) — i.e. this write targets one element of a list attribute
+    /// rather than replacing the whole attribute. chip-tool-family
+    /// controllers write a list attribute as "replace whole list" followed
+    /// by a chunk train of `ListIndex: null` appends; `mat-device`'s data
+    /// model dispatch has no list-attribute write implemented yet and so no
+    /// consumer for this, but plumbing it through from
+    /// `decode_attribute_path_ib` now means a future list-attribute
+    /// `ClusterHandler::write` doesn't need another wire-decode change.
+    pub list_append: bool,
 }
 
 /// Decoded WriteRequestMessage (spec §8.9.2.4): server-side counterpart of
@@ -2047,6 +2064,7 @@ fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError
     let mut cluster = None;
     let mut attribute = None;
     let mut data_tlv = None;
+    let mut list_append = false;
     loop {
         let el = r
             .next()?
@@ -2054,10 +2072,11 @@ fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::ListStart) => {
-                let (ep, cl, attr, _) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, la) = decode_attribute_path_ib(r)?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
+                list_append = la;
             }
             (Tag::Context(2), v) => {
                 // Data: re-tag to Anonymous, same convention as
@@ -2078,6 +2097,7 @@ fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError
         cluster,
         attribute,
         data_tlv: data_tlv.ok_or(ImError::Malformed("write attribute without Data field"))?,
+        list_append,
     })
 }
 
@@ -2945,6 +2965,7 @@ mod tests {
             (wr.endpoint, wr.cluster, wr.attribute),
             (Some(0), Some(CLUSTER_ACCESS_CONTROL), Some(ATTR_ACL))
         );
+        assert!(!wr.list_append);
         let mut r = Reader::new(&wr.data_tlv);
         let el = r.next().unwrap().unwrap();
         assert_eq!(el.tag, Tag::Anonymous);

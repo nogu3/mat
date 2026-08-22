@@ -165,6 +165,42 @@ pub trait ClusterHandler: Send {
     fn generated_commands(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// Writes one attribute. `data_tlv` is the AttributeDataIB's `Data`
+    /// element (one complete, well-formed TLV element, `Tag::Anonymous`).
+    /// `Ok(())` = accepted — the implementation must push the changed
+    /// attribute id onto `ctx.changed` itself (mirrors `invoke`'s contract
+    /// for `InvokeCtx::changed`; `Node::handle_write` pairs those ids with
+    /// this cluster's `(endpoint, cluster)` and bumps DataVersion, same as
+    /// `handle_invoke`). `Err(status)` is the IM status carried in the
+    /// reply's `AttributeStatusIB` (spec §8.9.2.2).
+    ///
+    /// `list_append` is `true` when the request's AttributePathIB carried a
+    /// `ListIndex` (spec §8.9.2.2) — the write targets one element of a
+    /// list attribute (chip-tool-family controllers send a whole-list
+    /// replace followed by a `ListIndex: null` append chunk train) rather
+    /// than replacing the attribute wholesale. No cluster implemented so
+    /// far has a list attribute's write, so the default below never
+    /// needs to branch on it — it's threaded through purely so a future
+    /// implementation doesn't need another wire-decode change to see it.
+    ///
+    /// Defaults to rejecting every write — matches every cluster
+    /// implemented so far (all read-only or command-only).
+    fn write(
+        &mut self,
+        _attribute: u32,
+        _data_tlv: &[u8],
+        _list_append: bool,
+        _ctx: &mut InvokeCtx,
+    ) -> Result<(), u8> {
+        Err(im::STATUS_UNSUPPORTED_WRITE)
+    }
+    /// FeatureMap (spec §7.13, attribute id 0xFFFC) — which optional
+    /// cluster features this endpoint's instance supports. Defaults to 0
+    /// (no optional features) — every cluster implemented so far except
+    /// NetworkCommissioning(Ethernet) (Task 4) reports no features.
+    fn feature_map(&self) -> u32 {
+        0
+    }
 }
 
 /// Interaction Model server-side dispatch errors: either a malformed
@@ -312,6 +348,7 @@ impl Node {
         match opcode {
             im::OPCODE_READ_REQUEST => self.handle_read(payload, read_ctx),
             im::OPCODE_INVOKE_REQUEST => self.handle_invoke(payload, ctx),
+            im::OPCODE_WRITE_REQUEST => self.handle_write(payload, ctx),
             // Inbound StatusResponse reaching the generic dispatch is not
             // an unhandled action to reject — it's the initiator's ack of
             // a ReportData chunk we just sent (`net::runtime`'s chunked
@@ -654,7 +691,7 @@ impl Node {
         }
         match attribute {
             im::ATTR_CLUSTER_REVISION => Some(uint_value(1)),
-            im::ATTR_FEATURE_MAP => Some(uint_value(0)),
+            im::ATTR_FEATURE_MAP => Some(uint_value(u64::from(handler.feature_map()))),
             im::ATTR_ATTRIBUTE_LIST => Some(encode_attribute_list(handler)),
             im::ATTR_ACCEPTED_COMMAND_LIST => {
                 Some(encode_command_list(&handler.accepted_commands()))
@@ -752,6 +789,82 @@ impl Node {
         Ok(ImOutcome {
             opcode: im::OPCODE_INVOKE_RESPONSE,
             payload: resp_payload,
+            changed,
+        })
+    }
+
+    /// Dispatches a `WriteRequest`'s attribute writes one at a time —
+    /// mirrors `handle_invoke`'s endpoint/cluster resolution and
+    /// DataVersion/`changed` bookkeeping, but per write entry rather than
+    /// once (a `WriteRequest` can carry more than one `AttributeDataIB`,
+    /// unlike M2-scope `InvokeRequest` which is always a single command).
+    /// Every entry gets its own `AttributeStatusIB` in the reply (spec
+    /// §8.9.2.4) — one bad path never fails the whole exchange.
+    fn handle_write(
+        &mut self,
+        payload: &[u8],
+        ctx: &mut InvokeCtx,
+    ) -> Result<ImOutcome, ImServerError> {
+        let req = im::decode_write_request(payload)?;
+        let mut results: Vec<(u16, u32, u32, u8)> = Vec::with_capacity(req.writes.len());
+        let mut changed: Vec<(u16, u32, u32)> = Vec::new();
+        for write in &req.writes {
+            // Every write must name a concrete (endpoint, cluster,
+            // attribute) — this dispatch has no wildcard-write expansion
+            // (spec §8.9.2.4 allows it, but no controller this skeleton
+            // talks to sends one). A wildcard field here means the request
+            // is malformed for this dispatch's purposes, not "not found".
+            let (Some(endpoint), Some(cluster), Some(attribute)) =
+                (write.endpoint, write.cluster, write.attribute)
+            else {
+                results.push((
+                    write.endpoint.unwrap_or(0),
+                    write.cluster.unwrap_or(0),
+                    write.attribute.unwrap_or(0),
+                    im::STATUS_INVALID_COMMAND,
+                ));
+                continue;
+            };
+            let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint)
+            else {
+                results.push((
+                    endpoint,
+                    cluster,
+                    attribute,
+                    im::STATUS_UNSUPPORTED_ENDPOINT,
+                ));
+                continue;
+            };
+            let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == cluster) else {
+                results.push((endpoint, cluster, attribute, im::STATUS_UNSUPPORTED_CLUSTER));
+                continue;
+            };
+            // Same rationale as `handle_invoke`: `ctx` is per-session
+            // scratch, so a leftover `changed` from an earlier write/invoke
+            // in the same session must not be re-reported as this one's.
+            ctx.changed.clear();
+            let status = match handler.write(attribute, &write.data_tlv, write.list_append, ctx) {
+                Ok(()) => im::STATUS_SUCCESS,
+                Err(status) => status,
+            };
+            let entry_changed: Vec<(u16, u32, u32)> = ctx
+                .changed
+                .drain(..)
+                .map(|attr| (endpoint, cluster, attr))
+                .collect();
+            if !entry_changed.is_empty() {
+                let version = self
+                    .versions
+                    .entry((endpoint, cluster))
+                    .or_insert(INITIAL_DATA_VERSION);
+                *version = version.wrapping_add(1);
+            }
+            changed.extend(entry_changed);
+            results.push((endpoint, cluster, attribute, status));
+        }
+        Ok(ImOutcome {
+            opcode: im::OPCODE_WRITE_RESPONSE,
+            payload: im::encode_write_response(&results),
             changed,
         })
     }
@@ -1091,14 +1204,15 @@ mod tests {
     }
 
     /// M2 behavior (unlike M1): an opcode this skeleton doesn't implement
-    /// (`WriteRequest` etc.) is answered with `StatusResponse
-    /// (STATUS_INVALID_ACTION)`, not a hard `Err` — chip-tool/Echo probing
-    /// an unimplemented feature shouldn't look like a dropped/malformed
-    /// exchange.
+    /// (`SubscribeRequest` etc. — `WriteRequest` got its own dispatch, see
+    /// `write_to_read_only_attribute_reports_unsupported_write`) is
+    /// answered with `StatusResponse(STATUS_INVALID_ACTION)`, not a hard
+    /// `Err` — chip-tool/Echo probing an unimplemented feature shouldn't
+    /// look like a dropped/malformed exchange.
     #[test]
     fn unsupported_opcode_returns_invalid_action_status() {
         let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &[]);
+        let (opcode, payload) = handle_im_ok(&mut node, im::OPCODE_SUBSCRIBE_REQUEST, &[]);
         assert_eq!(opcode, im::OPCODE_STATUS_RESPONSE);
         let status = im::decode_status_response(&payload).unwrap();
         assert_eq!(status, im::STATUS_INVALID_ACTION);
@@ -1253,6 +1367,67 @@ mod tests {
             ],
         );
         node
+    }
+
+    /// Write 未対応クラスタへの write は AttributeStatusIB(UNSUPPORTED_WRITE) で
+    /// 応答する（StatusResponse で会話全体を落とさない）。
+    #[test]
+    fn write_to_read_only_attribute_reports_unsupported_write() {
+        let mut node = node_with_onoff();
+        let mut data = Writer::new();
+        data.put_bool(Tag::Anonymous, true);
+        let payload =
+            im::encode_write_request_tlv(1, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF, &data.finish());
+        let (op, resp) = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &payload);
+        assert_eq!(op, im::OPCODE_WRITE_RESPONSE);
+        assert_eq!(
+            im::decode_write_response(&resp).unwrap(),
+            im::STATUS_UNSUPPORTED_WRITE
+        );
+    }
+
+    /// 未知 endpoint / 未知 cluster は per-path の status で応答する。
+    #[test]
+    fn write_to_unknown_paths_reports_path_scoped_status() {
+        let mut node = node_with_onoff();
+        let mut data = Writer::new();
+        data.put_uint(Tag::Anonymous, 1);
+        let payload =
+            im::encode_write_request_tlv(9, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF, &data.finish());
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &payload);
+        assert_eq!(
+            im::decode_write_response(&resp).unwrap(),
+            im::STATUS_UNSUPPORTED_ENDPOINT
+        );
+    }
+
+    /// FeatureMap はハンドラ申告値になる（Task 4 の NetworkCommissioning=ET 用の座金）。
+    #[test]
+    fn feature_map_global_reflects_the_handler() {
+        struct FmHandler;
+        impl ClusterHandler for FmHandler {
+            fn cluster_id(&self) -> u32 {
+                0x0031
+            }
+            fn attributes(&self) -> Vec<u32> {
+                vec![]
+            }
+            fn read(&self, _: u32, _: &ReadCtx) -> Option<Vec<u8>> {
+                None
+            }
+            fn invoke(&mut self, _: u32, _: &[u8], _: &mut InvokeCtx) -> InvokeReply {
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+            }
+            fn feature_map(&self) -> u32 {
+                0x04
+            }
+        }
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(0, Box::new(FmHandler));
+        let payload = encode_read_request_path(Some(0), Some(0x0031), Some(im::ATTR_FEATURE_MAP));
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
+        let msg = decode_report_data_message(&resp).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(4)));
     }
 
     /// Test-only ReadRequest encoder generalizing `im::encode_read_request`/
