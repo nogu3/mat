@@ -203,6 +203,29 @@ impl Device {
             )),
         );
 
+        // NetworkCommissioning / GeneralDiagnostics / GroupKeyManagement
+        // (Task 4): RootNode デバイスタイプの必須クラスタ（Device Library
+        // §9.2.2）— AccessControl と同じ「Apple Home の commissioning 直後
+        // interview 対策」。`config.iface` を唯一の "network"/interface 名
+        // としてそのまま渡す（mDNS が同じ interface で egress する実体と
+        // 一致させる）。
+        node.add_cluster(
+            0,
+            Box::new(
+                crate::core::network_commissioning::NetworkCommissioningHandler::new(&config.iface),
+            ),
+        );
+        node.add_cluster(
+            0,
+            Box::new(
+                crate::core::general_diagnostics::GeneralDiagnosticsHandler::new(&config.iface),
+            ),
+        );
+        node.add_cluster(
+            0,
+            Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new()),
+        );
+
         // Endpoint 1: M2's single virtual OnOff Light device. Identify と
         // Groups は On/Off Light デバイスタイプの必須クラスタ（Device
         // Library §4.1）— Apple Home は commissioning 後の interview で

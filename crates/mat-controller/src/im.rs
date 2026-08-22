@@ -48,6 +48,34 @@ pub const CMD_KEY_SET_WRITE: u32 = 0x00;
 /// `group-key-map` attribute (list of `GroupKeyMapStruct`): maps a `GroupId`
 /// to the `GroupKeySetID` used to decrypt its groupcast traffic.
 pub const ATTR_GROUP_KEY_MAP: u32 = 0x0000;
+/// `group-table` attribute (spec §11.2.7.5, Table 89): read-only —
+/// mat-device (Task 4) reports it always empty; no groupcast keying is
+/// actually configured yet.
+pub const ATTR_GROUP_TABLE: u32 = 0x0001;
+pub const ATTR_MAX_GROUPS_PER_FABRIC: u32 = 0x0002;
+pub const ATTR_MAX_GROUP_KEYS_PER_FABRIC: u32 = 0x0003;
+/// NetworkCommissioning cluster (spec §11.9) — root-node mandatory (Device
+/// Library §9.2.2). mat-device (Task 4) only implements the read-only
+/// Ethernet shape (`FeatureMap`=Ethernet(0x04), no commands): this is a
+/// wired virtual device, so there is nothing to scan/connect at runtime —
+/// the single "network" it ever reports is its own egress interface.
+pub const CLUSTER_NETWORK_COMMISSIONING: u32 = 0x0031;
+pub const ATTR_NC_MAX_NETWORKS: u32 = 0x0000;
+pub const ATTR_NC_NETWORKS: u32 = 0x0001;
+pub const ATTR_NC_INTERFACE_ENABLED: u32 = 0x0004;
+pub const ATTR_NC_LAST_NETWORKING_STATUS: u32 = 0x0005;
+pub const ATTR_NC_LAST_NETWORK_ID: u32 = 0x0006;
+pub const ATTR_NC_LAST_CONNECT_ERROR_VALUE: u32 = 0x0007;
+/// GeneralDiagnostics cluster (spec §11.11) — root-node mandatory (Device
+/// Library §9.2.2). mat-device (Task 4) implements the read-only status
+/// attributes plus `TestEventTrigger`, which this device always rejects
+/// (see `core::general_diagnostics`'s module doc for why).
+pub const CLUSTER_GENERAL_DIAGNOSTICS: u32 = 0x0033;
+pub const ATTR_GD_NETWORK_INTERFACES: u32 = 0x0000;
+pub const ATTR_GD_REBOOT_COUNT: u32 = 0x0001;
+pub const ATTR_GD_UP_TIME: u32 = 0x0002;
+pub const ATTR_GD_TEST_EVENT_TRIGGERS_ENABLED: u32 = 0x0008;
+pub const CMD_TEST_EVENT_TRIGGER: u32 = 0x00;
 /// Groups cluster (spec §1.3). `AddGroup` binds an endpoint into a group.
 pub const CLUSTER_GROUPS: u32 = 0x0004;
 pub const CMD_ADD_GROUP: u32 = 0x00;
