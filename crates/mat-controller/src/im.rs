@@ -23,6 +23,13 @@ pub const ATTR_ON_OFF: u32 = 0x0000;
 pub const CMD_ON_OFF_OFF: u32 = 0x00;
 pub const CMD_ON_OFF_ON: u32 = 0x01;
 pub const CMD_ON_OFF_TOGGLE: u32 = 0x02;
+/// Identify cluster (spec §1.2) — mandatory on every application device
+/// type (e.g. On/Off Light, Device Library §4.1).
+pub const CLUSTER_IDENTIFY: u32 = 0x0003;
+pub const ATTR_IDENTIFY_TIME: u32 = 0x0000;
+pub const ATTR_IDENTIFY_TYPE: u32 = 0x0001;
+pub const CMD_IDENTIFY: u32 = 0x00;
+pub const CMD_IDENTIFY_TRIGGER_EFFECT: u32 = 0x40;
 pub const CLUSTER_BASIC_INFORMATION: u32 = 0x0028;
 pub const ATTR_DATA_MODEL_REVISION: u32 = 0x0000;
 pub const CLUSTER_COLOR_CONTROL: u32 = 0x0300;
@@ -44,6 +51,14 @@ pub const ATTR_GROUP_KEY_MAP: u32 = 0x0000;
 /// Groups cluster (spec §1.3). `AddGroup` binds an endpoint into a group.
 pub const CLUSTER_GROUPS: u32 = 0x0004;
 pub const CMD_ADD_GROUP: u32 = 0x00;
+pub const CMD_VIEW_GROUP: u32 = 0x01;
+pub const CMD_GET_GROUP_MEMBERSHIP: u32 = 0x02;
+pub const CMD_REMOVE_GROUP: u32 = 0x03;
+pub const CMD_REMOVE_ALL_GROUPS: u32 = 0x04;
+pub const CMD_ADD_GROUP_IF_IDENTIFYING: u32 = 0x05;
+/// `NameSupport` (spec §1.3.6.1): bit 7 set = group names stored. mat-device
+/// reports 0 (no name storage — matches FeatureMap GN=0).
+pub const ATTR_GROUPS_NAME_SUPPORT: u32 = 0x0000;
 /// AccessControl cluster (spec §11.1). `acl` is the fabric-scoped list of
 /// `AccessControlEntryStruct` a device consults to authorize incoming
 /// requests (including groupcast, which arrives with `authMode = Group`).
@@ -92,6 +107,15 @@ pub const STATUS_FAILURE: u8 = 0x01;
 pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
 pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
 pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
+/// "A constraint was violated" (spec §8.10.1 Table 8-19) — e.g. Groups'
+/// `AddGroup` with the reserved group id 0 (carried inside
+/// `AddGroupResponse.status`, not as an IM-level status).
+pub const STATUS_CONSTRAINT_ERROR: u8 = 0x87;
+/// "Resource exhausted" — Groups' `AddGroup` when the group table is full.
+pub const STATUS_RESOURCE_EXHAUSTED: u8 = 0x89;
+/// "The indicated data field or entry could not be found" — Groups'
+/// `ViewGroup`/`RemoveGroup` for a group the endpoint is not a member of.
+pub const STATUS_NOT_FOUND: u8 = 0x8B;
 pub const STATUS_UNSUPPORTED_CLUSTER: u8 = 0xC3;
 /// "The receiver requires a fail-safe timer to be armed to accept this
 /// action" (spec §8.10.1 Table 8-19). `mat-device`'s commissioning server

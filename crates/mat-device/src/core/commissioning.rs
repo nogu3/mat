@@ -485,6 +485,22 @@ impl ClusterHandler for GeneralCommissioningHandler {
             .expect("commissioning server mutex poisoned")
             .handle_general_commissioning(command, fields_tlv)
     }
+
+    fn accepted_commands(&self) -> Vec<u32> {
+        vec![
+            CMD_ARM_FAIL_SAFE,
+            CMD_SET_REGULATORY_CONFIG,
+            CMD_COMMISSIONING_COMPLETE,
+        ]
+    }
+
+    fn generated_commands(&self) -> Vec<u32> {
+        vec![
+            RESP_ARM_FAIL_SAFE,
+            RESP_SET_REGULATORY_CONFIG,
+            RESP_COMMISSIONING_COMPLETE,
+        ]
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Node Operational Credentials (0x003E).
@@ -519,6 +535,22 @@ impl ClusterHandler for OperationalCredentialsHandler {
             .expect("commissioning server mutex poisoned")
             .handle_operational_credentials(command, fields_tlv, ctx)
     }
+
+    fn accepted_commands(&self) -> Vec<u32> {
+        vec![
+            CMD_ATTESTATION_REQUEST,
+            CMD_CERT_CHAIN_REQUEST,
+            CMD_CSR_REQUEST,
+            CMD_ADD_NOC,
+            CMD_UPDATE_FABRIC_LABEL,
+            CMD_REMOVE_FABRIC,
+            CMD_ADD_TRUSTED_ROOT,
+        ]
+    }
+
+    fn generated_commands(&self) -> Vec<u32> {
+        vec![RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR, RESP_NOC]
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Administrator Commissioning (0x003C).
@@ -549,6 +581,10 @@ impl ClusterHandler for AdminCommissioningHandler {
             .lock()
             .expect("commissioning server mutex poisoned")
             .handle_admin_commissioning(command, fields_tlv, ctx)
+    }
+
+    fn accepted_commands(&self) -> Vec<u32> {
+        vec![CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING]
     }
 }
 
@@ -1644,7 +1680,10 @@ mod tests {
         assert_eq!(status, 0);
         assert_eq!(fabric_index, Some(1));
         assert!(server.fabrics().is_empty());
-        assert_eq!(server.take_removed_fabric().map(|e| e.fabric_index), Some(1));
+        assert_eq!(
+            server.take_removed_fabric().map(|e| e.fabric_index),
+            Some(1)
+        );
     }
 
     /// 存在しない index は InvalidFabricIndex(0x0A)。
@@ -1696,7 +1735,10 @@ mod tests {
         );
         assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILURE));
         assert!(server.fabrics().is_empty());
-        assert_eq!(server.take_removed_fabric().map(|e| e.fabric_index), Some(1));
+        assert_eq!(
+            server.take_removed_fabric().map(|e| e.fabric_index),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1722,6 +1764,56 @@ mod tests {
         }
         assert_eq!(expiry, Some(60));
         assert_eq!(max_cumulative, Some(900));
+    }
+
+    /// AcceptedCommandList/GeneratedCommandList (spec §7.13) for the three
+    /// commissioning clusters must name their real command sets —
+    /// conformance-checking controllers (Apple Home) read them during the
+    /// post-commissioning interview.
+    #[test]
+    fn commissioning_handlers_declare_their_command_lists() {
+        let server = test_server();
+        let (gc, oc, ac) = server.into_cluster_handlers();
+
+        assert_eq!(
+            gc.accepted_commands(),
+            vec![
+                CMD_ARM_FAIL_SAFE,
+                CMD_SET_REGULATORY_CONFIG,
+                CMD_COMMISSIONING_COMPLETE
+            ]
+        );
+        assert_eq!(
+            gc.generated_commands(),
+            vec![
+                RESP_ARM_FAIL_SAFE,
+                RESP_SET_REGULATORY_CONFIG,
+                RESP_COMMISSIONING_COMPLETE
+            ]
+        );
+
+        assert_eq!(
+            oc.accepted_commands(),
+            vec![
+                CMD_ATTESTATION_REQUEST,
+                CMD_CERT_CHAIN_REQUEST,
+                CMD_CSR_REQUEST,
+                CMD_ADD_NOC,
+                CMD_UPDATE_FABRIC_LABEL,
+                CMD_REMOVE_FABRIC,
+                CMD_ADD_TRUSTED_ROOT
+            ]
+        );
+        assert_eq!(
+            oc.generated_commands(),
+            vec![RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR, RESP_NOC]
+        );
+
+        assert_eq!(
+            ac.accepted_commands(),
+            vec![CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING]
+        );
+        assert_eq!(ac.generated_commands(), Vec::<u32>::new());
     }
 
     #[test]

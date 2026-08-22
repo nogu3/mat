@@ -68,6 +68,10 @@ impl ClusterHandler for OnOffHandler {
         }
         InvokeReply::Status(im::STATUS_SUCCESS)
     }
+
+    fn accepted_commands(&self) -> Vec<u32> {
+        vec![im::CMD_ON_OFF_OFF, im::CMD_ON_OFF_ON, im::CMD_ON_OFF_TOGGLE]
+    }
 }
 
 #[cfg(test)]

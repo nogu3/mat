@@ -188,14 +188,20 @@ impl Device {
         node.add_cluster(0, operational_credentials);
         node.add_cluster(0, admin_commissioning);
 
-        // Endpoint 1: M2's single virtual OnOff Light device.
+        // Endpoint 1: M2's single virtual OnOff Light device. Identify と
+        // Groups は On/Off Light デバイスタイプの必須クラスタ（Device
+        // Library §4.1）— Apple Home は commissioning 後の interview で
+        // この適合性を検査し、欠けていると RemoveFabric で離脱する。
         let (onoff, onoff_state) = crate::core::onoff::OnOffHandler::new();
+        let (identify, identify_state) = crate::core::identify::IdentifyHandler::new();
         node.add_endpoint(
             1,
             vec![
                 Box::new(DescriptorHandler::for_device(
                     mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
                 )),
+                Box::new(identify),
+                Box::new(crate::core::groups::GroupsHandler::new(identify_state)),
                 Box::new(onoff),
             ],
         );

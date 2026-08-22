@@ -112,7 +112,10 @@ pub enum InvokeReply {
     /// spec §8.10.1: IM status + クラスタ固有ステータス（例:
     /// AdministratorCommissioning の Busy(2)/PAKEParameterError(3)/
     /// WindowNotOpen(4)）。status は通常 STATUS_FAILURE。
-    ClusterStatus { status: u8, cluster_status: u8 },
+    ClusterStatus {
+        status: u8,
+        cluster_status: u8,
+    },
     Data {
         response_command: u32,
         fields_tlv: Vec<u8>,
@@ -150,6 +153,18 @@ pub trait ClusterHandler: Send {
     /// Invokes one command. `fields_tlv` is the request's CommandFields (one
     /// complete TLV element, or empty if the command takes no fields).
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply;
+    /// Every request command id this cluster accepts —
+    /// `AcceptedCommandList`'s value (spec §7.13), synthesized by `Node`
+    /// the same way `AttributeList` is. Defaults to empty for
+    /// attribute-only clusters (Descriptor, Basic Information).
+    fn accepted_commands(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    /// Every response command id this cluster can generate —
+    /// `GeneratedCommandList`'s value (spec §7.13).
+    fn generated_commands(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// Interaction Model server-side dispatch errors: either a malformed
@@ -641,8 +656,11 @@ impl Node {
             im::ATTR_CLUSTER_REVISION => Some(uint_value(1)),
             im::ATTR_FEATURE_MAP => Some(uint_value(0)),
             im::ATTR_ATTRIBUTE_LIST => Some(encode_attribute_list(handler)),
-            im::ATTR_ACCEPTED_COMMAND_LIST | im::ATTR_GENERATED_COMMAND_LIST => {
-                Some(encode_empty_list())
+            im::ATTR_ACCEPTED_COMMAND_LIST => {
+                Some(encode_command_list(&handler.accepted_commands()))
+            }
+            im::ATTR_GENERATED_COMMAND_LIST => {
+                Some(encode_command_list(&handler.generated_commands()))
             }
             _ => handler.read(attribute, ectx.read_ctx),
         }
@@ -817,13 +835,15 @@ const GLOBAL_ATTRIBUTE_IDS: [u32; 5] = [
     im::ATTR_CLUSTER_REVISION,
 ];
 
-/// Encodes an empty TLV array — `AcceptedCommandList`/`GeneratedCommandList`
-/// (spec §7.13): `mat-device` has no command-enumeration API yet (M2
-/// scope), so every cluster reports "no commands" rather than omitting the
-/// attribute; chip tolerates this (see `read_attribute_value`'s caller).
-fn encode_empty_list() -> Vec<u8> {
+/// `AcceptedCommandList`/`GeneratedCommandList` (spec §7.13): the cluster's
+/// `ClusterHandler::accepted_commands`/`generated_commands` answer, as a
+/// TLV array of command ids.
+fn encode_command_list(ids: &[u32]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_array(Tag::Anonymous);
+    for id in ids {
+        w.put_uint(Tag::Anonymous, u64::from(*id));
+    }
     w.end_container();
     w.finish()
 }
@@ -1048,7 +1068,12 @@ mod tests {
             fn read(&self, _attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
                 None
             }
-            fn invoke(&mut self, _command: u32, _fields: &[u8], _ctx: &mut InvokeCtx) -> InvokeReply {
+            fn invoke(
+                &mut self,
+                _command: u32,
+                _fields: &[u8],
+                _ctx: &mut InvokeCtx,
+            ) -> InvokeReply {
                 InvokeReply::ClusterStatus {
                     status: im::STATUS_FAILURE,
                     cluster_status: 2, // Busy
@@ -1325,6 +1350,42 @@ mod tests {
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
         assert_eq!(msg.reports[0].data, Some(serde_json::json!(1)));
+    }
+
+    /// AcceptedCommandList/GeneratedCommandList (spec §7.13) must reflect
+    /// the cluster's real command set — an all-empty AcceptedCommandList
+    /// claims an OnOff light that no command can control, which a
+    /// conformance-checking controller (Apple Home's post-commissioning
+    /// interview) treats as a broken device.
+    #[test]
+    fn command_list_globals_reflect_the_handler() {
+        let mut node = node_with_onoff();
+        let payload = encode_read_request_path(
+            Some(1),
+            Some(im::CLUSTER_ON_OFF),
+            Some(im::ATTR_ACCEPTED_COMMAND_LIST),
+        );
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
+        let msg = decode_report_data_message(&resp).unwrap();
+        assert_eq!(
+            msg.reports[0].data,
+            Some(serde_json::json!([
+                im::CMD_ON_OFF_OFF,
+                im::CMD_ON_OFF_ON,
+                im::CMD_ON_OFF_TOGGLE
+            ]))
+        );
+
+        // OnOff declares no response commands, so GeneratedCommandList
+        // stays empty — but as the cluster's answer, not a Node-wide stub.
+        let payload = encode_read_request_path(
+            Some(1),
+            Some(im::CLUSTER_ON_OFF),
+            Some(im::ATTR_GENERATED_COMMAND_LIST),
+        );
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &payload);
+        let msg = decode_report_data_message(&resp).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!([])));
     }
 
     #[test]
