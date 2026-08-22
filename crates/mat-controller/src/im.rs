@@ -133,6 +133,19 @@ pub const ATTR_VENDOR_NAME: u32 = 0x0001;
 pub const ATTR_VENDOR_ID: u32 = 0x0002;
 pub const ATTR_PRODUCT_NAME: u32 = 0x0003;
 pub const ATTR_PRODUCT_ID: u32 = 0x0004;
+/// BasicInformation's remaining mandatory attributes (spec §11.1.6 —
+/// Apple Home's post-commissioning interview reads all of these; Task 5
+/// fills them in alongside the identity attributes above).
+pub const ATTR_BI_NODE_LABEL: u32 = 0x0005;
+pub const ATTR_BI_LOCATION: u32 = 0x0006;
+pub const ATTR_BI_HARDWARE_VERSION: u32 = 0x0007;
+pub const ATTR_BI_HARDWARE_VERSION_STRING: u32 = 0x0008;
+pub const ATTR_BI_SOFTWARE_VERSION: u32 = 0x0009;
+pub const ATTR_BI_SOFTWARE_VERSION_STRING: u32 = 0x000A;
+pub const ATTR_BI_UNIQUE_ID: u32 = 0x0012;
+pub const ATTR_BI_CAPABILITY_MINIMA: u32 = 0x0013;
+pub const ATTR_BI_SPECIFICATION_VERSION: u32 = 0x0015;
+pub const ATTR_BI_MAX_PATHS_PER_INVOKE: u32 = 0x0016;
 
 /// IM status codes (spec §8.10.1, Table "Status Code Table"). Only the
 /// values `mat-device`'s data model dispatch actually returns today.

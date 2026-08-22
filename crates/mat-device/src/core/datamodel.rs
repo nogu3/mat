@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use mat_controller::im::{self, AttrPathIn, AttrReportOut, ImError, ReportEntryOut};
-use mat_controller::tlv::{Tag, Writer};
+use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 /// The DataVersion (spec §7.10.3) every `(endpoint, cluster)` starts at,
 /// and what `Node::data_version` reports for a cluster whose values have
@@ -284,7 +284,24 @@ impl Node {
     /// same values advertised in mDNS TXT records and the commissioning
     /// QR/manual code) so BasicInformation doesn't drift from what the
     /// device actually announces itself as.
+    ///
+    /// Fixed UniqueID `"matv-dev"` — kept as the ~15 existing call sites'
+    /// (mostly test) behavior; a real device wants a per-install UniqueID,
+    /// which is what [`with_root_endpoint_unique`] is for.
+    ///
+    /// [`with_root_endpoint_unique`]: Self::with_root_endpoint_unique
     pub fn with_root_endpoint(vendor_id: u16, product_id: u16) -> Self {
+        Self::with_root_endpoint_unique(vendor_id, product_id, "matv-dev")
+    }
+
+    /// Same as [`with_root_endpoint`], but with an explicit UniqueID (spec
+    /// §11.1.6.9) rather than the fixed `"matv-dev"` fallback — what
+    /// `device::Device::new` uses so BasicInformation's UniqueID is the
+    /// per-install value persisted at `<store_dir>/unique_id`, stable
+    /// across restarts.
+    ///
+    /// [`with_root_endpoint`]: Self::with_root_endpoint
+    pub fn with_root_endpoint_unique(vendor_id: u16, product_id: u16, unique_id: &str) -> Self {
         let mut node = Self::new();
         node.add_endpoint(
             0,
@@ -294,6 +311,8 @@ impl Node {
                 Box::new(BasicInformationHandler {
                     vendor_id,
                     product_id,
+                    unique_id: unique_id.to_string(),
+                    node_label: String::new(),
                 }) as Box<dyn ClusterHandler>,
             ],
         );
@@ -1029,13 +1048,38 @@ impl ClusterHandler for DescriptorHandler {
     }
 }
 
-/// BasicInformation cluster (spec §11.1), mandatory on endpoint 0. M1 only
-/// serves the identity attributes a controller reads during commissioning;
-/// the rest of the cluster (writable NodeLabel, etc.) is future scope.
+/// BasicInformation cluster (spec §11.1), mandatory on endpoint 0. Task 5
+/// fills in every attribute Apple Home's post-commissioning interview reads
+/// (beyond the identity attributes M1 already served): NodeLabel is the
+/// only writable one (in-memory, resets on restart — no disk persistence
+/// asked for), everything else is either a fixed value or, for UniqueID,
+/// whatever the constructor was handed (`device::Device::new` threads
+/// through the value persisted at `<store_dir>/unique_id`).
 struct BasicInformationHandler {
     vendor_id: u16,
     product_id: u16,
+    unique_id: String,
+    /// NodeLabel (spec §11.1.6.2) — the one writable attribute this
+    /// handler carries state for. Starts empty (spec default); `write`
+    /// mutates it directly since `Node::handle_write` already gives every
+    /// `ClusterHandler::write` call `&mut self`.
+    node_label: String,
 }
+
+/// CaseSessionsPerFabric/SubscriptionsPerFabric (spec §11.1.6.9,
+/// CapabilityMinimaStruct fields, context tags 0/1) — fixed floor values
+/// `mat-device` comfortably supports; not tracked against any real
+/// resource-exhaustion path (M2/M3 scope never gets close).
+const CAPABILITY_MINIMA_CASE_SESSIONS_PER_FABRIC: u64 = 3;
+const CAPABILITY_MINIMA_SUBSCRIPTIONS_PER_FABRIC: u64 = 3;
+
+/// SpecificationVersion (spec §11.1.6.9, attribute id 0x0015): Matter 1.4,
+/// encoded per spec §7.1.9 as `(major << 24) | (minor << 16)`.
+const SPECIFICATION_VERSION: u64 = 0x0104_0000;
+
+/// NodeLabel's upper bound (spec §11.1.6.2, `string32`) — measured in UTF-8
+/// **characters**, not bytes.
+const NODE_LABEL_MAX_CHARS: usize = 32;
 
 impl ClusterHandler for BasicInformationHandler {
     fn cluster_id(&self) -> u32 {
@@ -1049,6 +1093,16 @@ impl ClusterHandler for BasicInformationHandler {
             im::ATTR_PRODUCT_ID,
             im::ATTR_VENDOR_NAME,
             im::ATTR_PRODUCT_NAME,
+            im::ATTR_BI_NODE_LABEL,
+            im::ATTR_BI_LOCATION,
+            im::ATTR_BI_HARDWARE_VERSION,
+            im::ATTR_BI_HARDWARE_VERSION_STRING,
+            im::ATTR_BI_SOFTWARE_VERSION,
+            im::ATTR_BI_SOFTWARE_VERSION_STRING,
+            im::ATTR_BI_UNIQUE_ID,
+            im::ATTR_BI_CAPABILITY_MINIMA,
+            im::ATTR_BI_SPECIFICATION_VERSION,
+            im::ATTR_BI_MAX_PATHS_PER_INVOKE,
         ]
     }
 
@@ -1059,6 +1113,16 @@ impl ClusterHandler for BasicInformationHandler {
             im::ATTR_PRODUCT_ID => Some(uint_value(u64::from(self.product_id))),
             im::ATTR_VENDOR_NAME => Some(str_value("mat")),
             im::ATTR_PRODUCT_NAME => Some(str_value("matv")),
+            im::ATTR_BI_NODE_LABEL => Some(str_value(&self.node_label)),
+            im::ATTR_BI_LOCATION => Some(str_value("XX")),
+            im::ATTR_BI_HARDWARE_VERSION => Some(uint_value(1)),
+            im::ATTR_BI_HARDWARE_VERSION_STRING => Some(str_value("matv")),
+            im::ATTR_BI_SOFTWARE_VERSION => Some(uint_value(1)),
+            im::ATTR_BI_SOFTWARE_VERSION_STRING => Some(str_value(env!("CARGO_PKG_VERSION"))),
+            im::ATTR_BI_UNIQUE_ID => Some(str_value(&self.unique_id)),
+            im::ATTR_BI_CAPABILITY_MINIMA => Some(encode_capability_minima()),
+            im::ATTR_BI_SPECIFICATION_VERSION => Some(uint_value(SPECIFICATION_VERSION)),
+            im::ATTR_BI_MAX_PATHS_PER_INVOKE => Some(uint_value(1)),
             _ => None,
         }
     }
@@ -1067,6 +1131,48 @@ impl ClusterHandler for BasicInformationHandler {
         // BasicInformation declares no commands.
         InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
     }
+
+    /// NodeLabel is the only writable attribute (spec §11.1.6.2); every
+    /// other BasicInformation attribute keeps the default `write`
+    /// (`STATUS_UNSUPPORTED_WRITE`). `list_append` is irrelevant — NodeLabel
+    /// isn't a list — so it's ignored, matching the trait doc's guidance for
+    /// clusters with no list attribute.
+    fn write(
+        &mut self,
+        attribute: u32,
+        data_tlv: &[u8],
+        _list_append: bool,
+        ctx: &mut InvokeCtx,
+    ) -> Result<(), u8> {
+        if attribute != im::ATTR_BI_NODE_LABEL {
+            return Err(im::STATUS_UNSUPPORTED_WRITE);
+        }
+        let mut r = Reader::new(data_tlv);
+        let Ok(Some(element)) = r.next() else {
+            return Err(im::STATUS_CONSTRAINT_ERROR);
+        };
+        let Value::Utf8(s) = element.value else {
+            return Err(im::STATUS_CONSTRAINT_ERROR);
+        };
+        if s.chars().count() > NODE_LABEL_MAX_CHARS {
+            return Err(im::STATUS_CONSTRAINT_ERROR);
+        }
+        self.node_label = s.to_string();
+        ctx.changed.push(im::ATTR_BI_NODE_LABEL);
+        Ok(())
+    }
+}
+
+/// CapabilityMinima (spec §11.1.6.9, attribute id 0x0013): a
+/// `CapabilityMinimaStruct{CaseSessionsPerFabric: uint16, Subscriptions
+/// PerFabric: uint16}`, context tags 0/1 in field-declaration order.
+fn encode_capability_minima() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), CAPABILITY_MINIMA_CASE_SESSIONS_PER_FABRIC);
+    w.put_uint(Tag::Context(1), CAPABILITY_MINIMA_SUBSCRIPTIONS_PER_FABRIC);
+    w.end_container();
+    w.finish()
 }
 
 #[cfg(test)]
@@ -1110,6 +1216,133 @@ mod tests {
         assert_eq!(
             msg.reports[0].data,
             Some(serde_json::json!(DATA_MODEL_REVISION))
+        );
+    }
+
+    /// Task 5: BasicInformation's remaining mandatory attributes (spec
+    /// §11.1.6) — Apple Home's post-commissioning interview reads every one
+    /// of these, not just the identity attributes the earlier test above
+    /// covers.
+    #[test]
+    fn read_basic_information_task5_attributes_have_required_values() {
+        let mut node = Node::with_root_endpoint_unique(0xFFF1, 0x8000, "unique-abc123");
+        let read = |node: &mut Node, attribute: u32| -> serde_json::Value {
+            let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, attribute);
+            let (_, payload) = handle_im_ok(node, im::OPCODE_READ_REQUEST, &req);
+            let msg = decode_report_data_message(&payload).unwrap();
+            msg.reports[0].data.clone().unwrap()
+        };
+
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_NODE_LABEL),
+            serde_json::json!("")
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_LOCATION),
+            serde_json::json!("XX")
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_HARDWARE_VERSION),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_HARDWARE_VERSION_STRING),
+            serde_json::json!("matv")
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_SOFTWARE_VERSION),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_SOFTWARE_VERSION_STRING),
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_UNIQUE_ID),
+            serde_json::json!("unique-abc123")
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_CAPABILITY_MINIMA),
+            serde_json::json!({"0": 3, "1": 3})
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_SPECIFICATION_VERSION),
+            serde_json::json!(0x0104_0000u32)
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_MAX_PATHS_PER_INVOKE),
+            serde_json::json!(1)
+        );
+    }
+
+    /// `with_root_endpoint` (existing signature, ~15 call sites) delegates
+    /// to `with_root_endpoint_unique(.., "matv-dev")` — same fixed UniqueID
+    /// as before this task, just no longer the only way to set it.
+    #[test]
+    fn with_root_endpoint_uses_fixed_fallback_unique_id() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_UNIQUE_ID);
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!("matv-dev")));
+    }
+
+    /// NodeLabel is the one BasicInformation attribute Apple Home writes
+    /// (spec §11.1.6.2) — a write must both be readable back and reported
+    /// via `ImOutcome::changed` (mirrors the OnOff `changed` contract in
+    /// the Task 12 tests above).
+    #[test]
+    fn node_label_write_then_read_reflects_change_and_reports_changed() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let mut data = Writer::new();
+        data.put_str(Tag::Anonymous, "Living Room");
+        let payload = im::encode_write_request_tlv(
+            0,
+            im::CLUSTER_BASIC_INFORMATION,
+            im::ATTR_BI_NODE_LABEL,
+            &data.finish(),
+        );
+        let outcome = node
+            .handle_im(
+                im::OPCODE_WRITE_REQUEST,
+                &payload,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            im::decode_write_response(&outcome.payload).unwrap(),
+            im::STATUS_SUCCESS
+        );
+        assert_eq!(
+            outcome.changed,
+            vec![(0u16, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_NODE_LABEL)]
+        );
+
+        let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_NODE_LABEL);
+        let (_, read_payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&read_payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!("Living Room")));
+    }
+
+    /// NodeLabel is capped at 32 UTF-8 *characters* (spec §11.1.6.2's
+    /// `string32` type) — a 33-character write is rejected wholesale
+    /// (CONSTRAINT_ERROR), not truncated.
+    #[test]
+    fn node_label_write_over_32_chars_is_constraint_error() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let mut data = Writer::new();
+        data.put_str(Tag::Anonymous, &"a".repeat(33));
+        let payload = im::encode_write_request_tlv(
+            0,
+            im::CLUSTER_BASIC_INFORMATION,
+            im::ATTR_BI_NODE_LABEL,
+            &data.finish(),
+        );
+        let (_, resp) = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &payload);
+        assert_eq!(
+            im::decode_write_response(&resp).unwrap(),
+            im::STATUS_CONSTRAINT_ERROR
         );
     }
 
@@ -2030,6 +2263,29 @@ mod drift_guard {
         assert_eq!(attr("vendor-id"), im::ATTR_VENDOR_ID);
         assert_eq!(attr("product-name"), im::ATTR_PRODUCT_NAME);
         assert_eq!(attr("product-id"), im::ATTR_PRODUCT_ID);
+        // Task 5 additions.
+        assert_eq!(attr("node-label"), im::ATTR_BI_NODE_LABEL);
+        assert_eq!(attr("location"), im::ATTR_BI_LOCATION);
+        assert_eq!(attr("hardware-version"), im::ATTR_BI_HARDWARE_VERSION);
+        assert_eq!(
+            attr("hardware-version-string"),
+            im::ATTR_BI_HARDWARE_VERSION_STRING
+        );
+        assert_eq!(attr("software-version"), im::ATTR_BI_SOFTWARE_VERSION);
+        assert_eq!(
+            attr("software-version-string"),
+            im::ATTR_BI_SOFTWARE_VERSION_STRING
+        );
+        assert_eq!(attr("unique-id"), im::ATTR_BI_UNIQUE_ID);
+        assert_eq!(attr("capability-minima"), im::ATTR_BI_CAPABILITY_MINIMA);
+        assert_eq!(
+            attr("specification-version"),
+            im::ATTR_BI_SPECIFICATION_VERSION
+        );
+        assert_eq!(
+            attr("max-paths-per-invoke"),
+            im::ATTR_BI_MAX_PATHS_PER_INVOKE
+        );
     }
 
     // `im::DEVICE_TYPE_ROOT_NODE` (RootNode device type, spec §9.2.2) is

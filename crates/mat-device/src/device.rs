@@ -119,6 +119,29 @@ impl std::fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
+/// BasicInformation's UniqueID (spec §11.1.6.9) — a per-install identifier
+/// that must survive restarts (unlike `NodeLabel`'s in-memory-only value in
+/// `core::datamodel::BasicInformationHandler` — see that struct's doc).
+/// Reads `<store_dir>/unique_id` if it already exists; otherwise generates
+/// 16 random bytes (`getrandom`, the same OS RNG every other dev-
+/// attestation/nonce generation in this crate uses) hex-encoded to 32
+/// characters, persists that to the same path, and returns it — so the
+/// value picked on first boot is the one every later boot reuses.
+fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<String> {
+    let path = store_dir.join("unique_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("os rng");
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&path, &hex)?;
+    Ok(hex)
+}
+
 /// A running (or about-to-run) device instance. Construct with `new`
 /// (synchronous — binds the socket and loads/creates all persistent state
 /// eagerly, so `local_addr`/`qr_payload`/`manual_code` are all usable
@@ -190,7 +213,9 @@ impl Device {
         let acl_store = crate::core::access_control::AclStore::new();
         comm_server.set_acl_store(acl_store.clone());
 
-        let mut node = Node::with_root_endpoint(config.vendor_id, config.product_id);
+        let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
+        let mut node =
+            Node::with_root_endpoint_unique(config.vendor_id, config.product_id, &unique_id);
         let (general_commissioning, operational_credentials, admin_commissioning) =
             comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);
@@ -327,5 +352,36 @@ impl Device {
             self.comm_server,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// First call with an empty `store_dir` generates a fresh UniqueID and
+    /// persists it — 32 lowercase hex chars (16 random bytes).
+    #[test]
+    fn load_or_create_unique_id_generates_and_persists_on_first_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = load_or_create_unique_id(dir.path()).unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("unique_id")).unwrap(),
+            id
+        );
+    }
+
+    /// Restart stability: a second call against the same `store_dir` reads
+    /// back the exact value the first call generated, rather than
+    /// generating a new one — Apple Home's UniqueID-keyed pairing state
+    /// would otherwise desync from a fresh random value on every restart.
+    #[test]
+    fn load_or_create_unique_id_is_stable_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_unique_id(dir.path()).unwrap();
+        let second = load_or_create_unique_id(dir.path()).unwrap();
+        assert_eq!(first, second);
     }
 }
