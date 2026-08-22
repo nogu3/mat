@@ -180,16 +180,18 @@ pub const STATUS_INVALID_COMMAND: u8 = 0x85;
 /// "The received request cannot be handled" (spec §8.10.1 Table 8-19) —
 /// `mat-device`'s data model dispatch (`core::datamodel::Node::handle_im`)
 /// returns this `StatusResponse` for any opcode it has no handler for
-/// (M2 scope: only `ReadRequest`/`InvokeRequest` are implemented —
-/// `WriteRequest`/`SubscribeRequest`/etc. all land here) instead of
-/// silently dropping the request.
+/// (`ReadRequest`/`InvokeRequest`/`WriteRequest` are implemented —
+/// `SubscribeRequest`/etc. still land here) instead of silently dropping
+/// the request.
 pub const STATUS_INVALID_ACTION: u8 = 0x80;
 /// "The specified action can't be performed" (spec §8.10.1 Table 8-19) for
 /// a `WriteRequest` targeting an attribute the cluster doesn't accept
 /// writes to — `mat-device`'s data model dispatch
 /// (`core::datamodel::ClusterHandler::write`'s default implementation)
-/// returns this for every cluster that doesn't override `write` (as of this
-/// writing, none do).
+/// returns this for every cluster that doesn't override `write` (as of
+/// this writing, `core::access_control::AccessControlHandler` and
+/// `core::datamodel::BasicInformationHandler` do; every other cluster still
+/// uses the default).
 pub const STATUS_UNSUPPORTED_WRITE: u8 = 0x88;
 
 /// Global attribute ids every cluster exposes (spec §7.13, Table

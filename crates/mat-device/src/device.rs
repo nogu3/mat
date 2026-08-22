@@ -119,7 +119,7 @@ impl std::fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
-/// BasicInformation's UniqueID (spec §11.1.6.9) — a per-install identifier
+/// BasicInformation's UniqueID (spec §11.1.6.15) — a per-install identifier
 /// that must survive restarts (unlike `NodeLabel`'s in-memory-only value in
 /// `core::datamodel::BasicInformationHandler` — see that struct's doc).
 /// Reads `<store_dir>/unique_id` if it already exists; otherwise generates

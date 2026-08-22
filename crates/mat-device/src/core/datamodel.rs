@@ -6,11 +6,12 @@
 //! `mat_controller::im` (this module only knows attribute/command
 //! semantics, never TLV byte layout directly).
 //!
-//! M2 scope: `ReadRequest` (with wildcard endpoint/cluster/attribute
-//! expansion — see `Node::read_entries`) and `InvokeRequest` (single
-//! command) only — still no subscriptions, no writes. Every other opcode
-//! gets `StatusResponse(STATUS_INVALID_ACTION)` (spec §8.10.1) rather than
-//! being silently dropped or failing the whole exchange.
+//! `ReadRequest` (with wildcard endpoint/cluster/attribute expansion — see
+//! `Node::read_entries`), `InvokeRequest` (single command), and
+//! `WriteRequest` (`Node::handle_write`) are all handled — still no
+//! subscriptions. Every other opcode gets
+//! `StatusResponse(STATUS_INVALID_ACTION)` (spec §8.10.1) rather than being
+//! silently dropped or failing the whole exchange.
 
 use std::collections::HashMap;
 
@@ -295,7 +296,7 @@ impl Node {
     }
 
     /// Same as [`with_root_endpoint`], but with an explicit UniqueID (spec
-    /// §11.1.6.9) rather than the fixed `"matv-dev"` fallback — what
+    /// §11.1.6.15) rather than the fixed `"matv-dev"` fallback — what
     /// `device::Device::new` uses so BasicInformation's UniqueID is the
     /// per-install value persisted at `<store_dir>/unique_id`, stable
     /// across restarts.
@@ -394,8 +395,8 @@ impl Node {
                 im::OPCODE_STATUS_RESPONSE,
                 im::encode_status_response(im::STATUS_SUCCESS),
             )),
-            // Any opcode this skeleton has no handler for (WriteRequest,
-            // SubscribeRequest, TimedRequest, ...) is answered — not
+            // Any opcode this skeleton has no handler for (SubscribeRequest,
+            // TimedRequest, ...) is answered — not
             // silently dropped, and not a hard error that kills the
             // exchange — with the IM status for "can't handle this action"
             // (spec §8.10.1). `ImServerError::UnsupportedOpcode` is no
@@ -1066,14 +1067,14 @@ struct BasicInformationHandler {
     node_label: String,
 }
 
-/// CaseSessionsPerFabric/SubscriptionsPerFabric (spec §11.1.6.9,
+/// CaseSessionsPerFabric/SubscriptionsPerFabric (spec §11.1.6.16,
 /// CapabilityMinimaStruct fields, context tags 0/1) — fixed floor values
 /// `mat-device` comfortably supports; not tracked against any real
 /// resource-exhaustion path (M2/M3 scope never gets close).
 const CAPABILITY_MINIMA_CASE_SESSIONS_PER_FABRIC: u64 = 3;
 const CAPABILITY_MINIMA_SUBSCRIPTIONS_PER_FABRIC: u64 = 3;
 
-/// SpecificationVersion (spec §11.1.6.9, attribute id 0x0015): Matter 1.4,
+/// SpecificationVersion (spec §11.1.6.18, attribute id 0x0015): Matter 1.4,
 /// encoded per spec §7.1.9 as `(major << 24) | (minor << 16)`.
 const SPECIFICATION_VERSION: u64 = 0x0104_0000;
 
@@ -1163,7 +1164,7 @@ impl ClusterHandler for BasicInformationHandler {
     }
 }
 
-/// CapabilityMinima (spec §11.1.6.9, attribute id 0x0013): a
+/// CapabilityMinima (spec §11.1.6.16, attribute id 0x0013): a
 /// `CapabilityMinimaStruct{CaseSessionsPerFabric: uint16, Subscriptions
 /// PerFabric: uint16}`, context tags 0/1 in field-declaration order.
 fn encode_capability_minima() -> Vec<u8> {
