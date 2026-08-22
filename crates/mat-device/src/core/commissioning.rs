@@ -1204,10 +1204,20 @@ impl Inner {
             // advert and, worse, leave a session alive against a fabric
             // that no longer resolves — spec §2.5.11 requires removing a
             // fabric to terminate its sessions, and that's true regardless
-            // of whether the removal also made it to disk.
+            // of whether the removal also made it to disk. Same reasoning
+            // forces the ACL purge here too (precedent: 31f4b44 did this
+            // for `removed_fabric` itself) — `next_fabric_index` reissues a
+            // removed index as `max(existing)+1`, so an unpurged entry here
+            // would apply the previous occupant's ACL to whatever
+            // unrelated fabric a later `AddNOC` installs at that index
+            // (cross-fabric ACL leak), regardless of whether this removal
+            // made it to disk.
             Err(e) => {
                 tracing::debug!(error = %e, fabric_index, "RemoveFabric: persist failed");
                 self.removed_fabric = Some(entry);
+                if let Some(store) = &self.acl_store {
+                    store.purge_fabric(fabric_index);
+                }
                 InvokeReply::Status(im::STATUS_FAILURE)
             }
         }
@@ -1821,6 +1831,59 @@ mod tests {
             server.take_removed_fabric().map(|e| e.fabric_index),
             Some(1)
         );
+    }
+
+    /// RemoveFabric: a persist failure must still purge the removed
+    /// fabric's ACL entries — `FabricStore::remove`'s in-memory removal
+    /// already happened (same asymmetry the sibling
+    /// `remove_fabric_persist_failure_still_stages_removal` test documents
+    /// for `removed_fabric`), and `next_fabric_index` reissues a removed
+    /// index as `max(existing)+1` — an unpurged entry here would let a
+    /// later `AddNOC` at that same index inherit the previous occupant's
+    /// ACL (cross-fabric leak).
+    #[test]
+    fn remove_fabric_persist_failure_still_purges_acl() {
+        use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
+
+        let fail_save = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = FabricStore::with_persist(Box::new(FlakySavePersist {
+            fail_save: std::sync::Arc::clone(&fail_save),
+        }));
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let mut server = CommissioningServer::new(dev, store);
+        let acl_store = AclStore::new();
+        server.set_acl_store(acl_store.clone());
+        install_fabric(&mut server, 0x1122, 0x5001);
+
+        let handler = AccessControlHandler::new(acl_store.clone());
+        assert_eq!(
+            decode_entries_for_test(
+                &handler
+                    .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
+                    .unwrap()
+            )
+            .len(),
+            1
+        );
+
+        fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let reply = server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_REMOVE_FABRIC,
+            &encode_remove_fabric(1),
+            &ctx,
+        );
+        assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILURE));
+        assert!(decode_entries_for_test(
+            &handler
+                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
+                .unwrap()
+        )
+        .is_empty());
     }
 
     #[test]
