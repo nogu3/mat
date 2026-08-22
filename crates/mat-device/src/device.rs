@@ -179,7 +179,16 @@ impl Device {
         std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;
 
         let fabric_store = FabricStore::with_persist(Box::new(store_in_dir(&config.store_dir)));
-        let comm_server = CommissioningServer::new(dev, fabric_store);
+        let mut comm_server = CommissioningServer::new(dev, fabric_store);
+
+        // AccessControl（spec §11.1）の共有ストア: AddNOC の自動 admin
+        // エントリ / RemoveFabric・fail-safe rollback の purge は
+        // `CommissioningServer` が書き、EP0 の `AccessControlHandler` が
+        // 読み書きする — `set_acl_store` は `into_cluster_handlers` より
+        // 前に呼ぶ必要がある（後続のコミッショニングコマンドがこのストア
+        // を触れるようにするため）。
+        let acl_store = crate::core::access_control::AclStore::new();
+        comm_server.set_acl_store(acl_store.clone());
 
         let mut node = Node::with_root_endpoint(config.vendor_id, config.product_id);
         let (general_commissioning, operational_credentials, admin_commissioning) =
@@ -187,6 +196,12 @@ impl Device {
         node.add_cluster(0, general_commissioning);
         node.add_cluster(0, operational_credentials);
         node.add_cluster(0, admin_commissioning);
+        node.add_cluster(
+            0,
+            Box::new(crate::core::access_control::AccessControlHandler::new(
+                acl_store,
+            )),
+        );
 
         // Endpoint 1: M2's single virtual OnOff Light device. Identify と
         // Groups は On/Off Light デバイスタイプの必須クラスタ（Device

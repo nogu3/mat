@@ -48,6 +48,7 @@ use mat_controller::im;
 use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::{generate_csr, DevAttestation};
 
+use crate::core::access_control::AclStore;
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::fabric_store::{FabricEntry, FabricStore};
 
@@ -254,6 +255,13 @@ struct Inner {
     /// commissioner fabric removing itself after handing off, e.g. an
     /// Android phone handing a device to Home Assistant).
     removed_fabric: Option<FabricEntry>,
+    /// The shared ACL store `AccessControlHandler` (EP0) also holds, if a
+    /// runtime has wired one in via `CommissioningServer::set_acl_store`.
+    /// `None` in the commissioning-module's own unit tests that don't call
+    /// it — `handle_add_noc`'s auto-admin-entry and `handle_remove_fabric`/
+    /// `rollback_uncommitted_fabric`'s purge become no-ops rather than
+    /// panicking, so every pre-existing test keeps passing unmodified.
+    acl_store: Option<AclStore>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -275,8 +283,22 @@ impl CommissioningServer {
                 admin_window: None,
                 pending_window_request: None,
                 removed_fabric: None,
+                acl_store: None,
             })),
         }
+    }
+
+    /// Wires a shared `AclStore` in — the same store a runtime registers
+    /// `AccessControlHandler` on EP0 with (`device.rs`), so `handle_add_noc`
+    /// installs its automatic admin entry and `handle_remove_fabric`/the
+    /// fail-safe rollback purge it into the store the cluster actually
+    /// reads back. Must be called before any commissioning command that
+    /// touches fabrics — in practice, before `into_cluster_handlers`.
+    pub fn set_acl_store(&mut self, store: AclStore) {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .acl_store = Some(store);
     }
 
     /// Fabrics installed so far (cloned out of the shared state — this
@@ -841,6 +863,9 @@ impl Inner {
         // fire-and-forget housekeeping, not itself the response to a
         // command).
         let _ = self.store.remove(fabric_index);
+        if let Some(store) = &self.acl_store {
+            store.purge_fabric(fabric_index);
+        }
         removed
     }
 
@@ -1061,6 +1086,14 @@ impl Inner {
         // `ArmFailSafe` before that rolls the fabric back (spec §11.10.7.2).
         self.uncommitted_fabric_index = Some(fabric_index);
 
+        // spec §11.17.6.8: AddNOC installs an automatic ACL entry granting
+        // Administer privilege to the CASE admin subject — without it, the
+        // commissioner that just wrote this fabric could never read/write
+        // its own ACL again (nothing on the device would authorize it to).
+        if let Some(store) = &self.acl_store {
+            store.add_case_admin(fabric_index, case_admin_subject);
+        }
+
         InvokeReply::Data {
             response_command: RESP_NOC,
             fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
@@ -1141,6 +1174,9 @@ impl Inner {
         match self.store.remove(fabric_index) {
             Ok(true) => {
                 self.removed_fabric = Some(entry);
+                if let Some(store) = &self.acl_store {
+                    store.purge_fabric(fabric_index);
+                }
                 InvokeReply::Data {
                     response_command: RESP_NOC,
                     fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
@@ -1684,6 +1720,52 @@ mod tests {
             server.take_removed_fabric().map(|e| e.fabric_index),
             Some(1)
         );
+    }
+
+    /// AddNOC が case admin subject に Administer の自動 ACL エントリを
+    /// 発行し、その後の RemoveFabric がそのエントリを purge することを
+    /// `set_acl_store` で配線した `AclStore` 越しに検証する
+    /// （Task 3 rulings）。
+    #[test]
+    fn add_noc_installs_case_admin_acl_and_remove_fabric_purges_it() {
+        use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
+
+        let dev = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let mut server = CommissioningServer::new(dev, FabricStore::new());
+        let acl_store = AclStore::new();
+        server.set_acl_store(acl_store.clone());
+
+        // install_fabric drives ArmFailSafe/CSR/AddTrustedRoot/AddNOC with
+        // admin subject fixed at 0xAA (see its doc comment).
+        install_fabric(&mut server, 0x1122, 0x5001);
+
+        let handler = AccessControlHandler::new(acl_store.clone());
+        let entries = decode_entries_for_test(
+            &handler
+                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
+                .unwrap(),
+        );
+        assert_eq!(entries, vec![(5u8, 2u8, vec![0xAAu64], 1u8)]);
+
+        let ctx = InvokeCtx {
+            fabric_index: 1,
+            ..test_ctx()
+        };
+        let (_, resp) = expect_data(server.invoke_command(
+            CLUSTER_OPERATIONAL_CREDENTIALS,
+            CMD_REMOVE_FABRIC,
+            &encode_remove_fabric(1),
+            &ctx,
+        ));
+        let (status, _) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, 0);
+
+        let entries = decode_entries_for_test(
+            &handler
+                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
+                .unwrap(),
+        );
+        assert!(entries.is_empty());
     }
 
     /// 存在しない index は InvalidFabricIndex(0x0A)。
