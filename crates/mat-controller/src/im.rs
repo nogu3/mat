@@ -3399,10 +3399,57 @@ mod tests {
     }
 
     #[test]
+    fn decode_read_request_message_extracts_fabric_filtered_false_from_wire() {
+        // Hand-built ReadRequest with IsFabricFiltered explicitly false at
+        // Context(3) — asserts the decoded value comes from the actual wire
+        // byte, not just "field present" (encode_read_request only ever
+        // emits true, so a decoder that hardcoded `Some(true)` on seeing
+        // the tag would pass every other test in this file).
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(0));
+        w.start_list(Tag::Anonymous);
+        w.put_uint(Tag::Context(2), 0); // Endpoint
+        w.put_uint(Tag::Context(3), u64::from(CLUSTER_BASIC_INFORMATION));
+        w.put_uint(Tag::Context(4), u64::from(ATTR_VENDOR_ID));
+        w.end_container();
+        w.end_container();
+        w.put_bool(Tag::Context(3), false); // IsFabricFiltered
+        w.end_container();
+        let req = decode_read_request_message(&w.finish()).unwrap();
+        assert!(
+            !req.fabric_filtered,
+            "explicit false on the wire must decode to false"
+        );
+    }
+
+    #[test]
     fn decode_subscribe_request_extracts_fabric_filtered() {
         let payload = encode_subscribe_request(1, 60, false, &[]);
         let req = decode_subscribe_request(&payload).unwrap();
         assert!(req.fabric_filtered);
+    }
+
+    #[test]
+    fn decode_subscribe_request_extracts_fabric_filtered_false_from_wire() {
+        // Hand-built SubscribeRequest with IsFabricFiltered explicitly
+        // false at Context(7) — asserts the decoded value comes from the
+        // actual wire byte, not just "field present" (encode_subscribe_
+        // request only ever emits true).
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false); // KeepSubscriptions
+        w.put_uint(Tag::Context(1), 1); // MinIntervalFloor
+        w.put_uint(Tag::Context(2), 60); // MaxIntervalCeiling
+        w.start_array(Tag::Context(3)); // AttributeRequests
+        w.end_container();
+        w.put_bool(Tag::Context(7), false); // IsFabricFiltered
+        w.end_container();
+        let req = decode_subscribe_request(&w.finish()).unwrap();
+        assert!(
+            !req.fabric_filtered,
+            "explicit false on the wire must decode to false"
+        );
     }
 
     #[test]
