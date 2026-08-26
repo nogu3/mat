@@ -38,17 +38,25 @@ pub struct EndpointLedger {
 impl EndpointLedger {
     /// 無ければ `{ next: FIRST_BRIDGED_ENDPOINT, map: {} }`。壊れた
     /// （パース不能な）ファイルは同じ初期状態として読む。パースできるが
-    /// 不整合（`next <= map` の最大値）なファイルは `next` を `max + 1` に
-    /// 修復して読む。
+    /// 不整合（`next <= map` の最大値、または `map` が空でも
+    /// `next < FIRST_BRIDGED_ENDPOINT` で EP0/EP1 の予約領域に食い込む）な
+    /// ファイルは `next` を修復して読む。
     pub fn load(store_dir: &Path) -> io::Result<Self> {
         let path = store_dir.join("endpoints.json");
         let fresh = || (FIRST_BRIDGED_ENDPOINT, BTreeMap::new());
         let (next, map) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<LedgerFile>(&bytes) {
-                Ok(file) => match file.map.values().copied().max() {
-                    Some(max) if file.next <= max => (max + 1, file.map),
-                    _ => (file.next, file.map),
-                },
+                Ok(file) => {
+                    let next = match file.map.values().copied().max() {
+                        Some(max) if file.next <= max => max + 1,
+                        _ => file.next,
+                    };
+                    // Floor even when the map is empty (and so has no max to
+                    // repair against) — a stray/hand-edited `next` of 0 or 1
+                    // would otherwise hand out the reserved root (EP0) /
+                    // Aggregator (EP1) endpoints on the next assign.
+                    (next.max(FIRST_BRIDGED_ENDPOINT), file.map)
+                }
                 // Can't recover a device-id → endpoint mapping out of bytes
                 // that don't even parse — the best available fallback is a
                 // fresh ledger rather than a hard failure.
@@ -167,5 +175,26 @@ mod tests {
         assert_eq!(ledger.assign("kitchen-light"), 4);
         // New id gets max(map)+1 = 5, not the stale next=2.
         assert_eq!(ledger.assign("hallway-light"), 5);
+    }
+
+    /// Empty `map` means there's no `max` to repair `next` against — but a
+    /// stray/hand-edited `next` below `FIRST_BRIDGED_ENDPOINT` must still be
+    /// floored, or the next assign would hand out the reserved root (EP0) /
+    /// Aggregator (EP1) endpoints.
+    #[test]
+    fn next_below_first_bridged_endpoint_with_empty_map_is_floored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("endpoints.json"), br#"{"next":0,"map":{}}"#).unwrap();
+        let mut ledger = EndpointLedger::load(dir.path()).unwrap();
+        assert_eq!(ledger.assign("living-light"), FIRST_BRIDGED_ENDPOINT);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir2.path().join("endpoints.json"),
+            br#"{"next":1,"map":{}}"#,
+        )
+        .unwrap();
+        let mut ledger2 = EndpointLedger::load(dir2.path()).unwrap();
+        assert_eq!(ledger2.assign("living-light"), FIRST_BRIDGED_ENDPOINT);
     }
 }
