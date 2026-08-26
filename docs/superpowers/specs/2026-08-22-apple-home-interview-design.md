@@ -99,3 +99,29 @@ NodeLabel は Apple が書きに来ることがあるため write 対応（32 �
 - ACL enforcement（認可判定）
 - GroupKeyManagement のコマンド群（KeySetWrite 等）
 - Timed write、chunked write、FabricFiltered=false の read
+
+## 完了時の申し送り（2026-08-26）
+
+**Apple Home ゲート通過（実機）**。iPhone ホームアプリで commission 完走 → 部屋割り当て →
+**Apple TV（ハブ、iPhone とは別ピア）が CASE 接続** → タイルから OnOff トグル 2 往復が
+matv に届き成功応答 + 購読レポート送出まで実測 green（2026-08-26 10:24 JST、
+`~/matv-apple/matv.stderr.log`）。ハブの CASE 接続は ACL write が効いた直接証拠。
+
+自動ゲート: workspace 1137 テスト + clippy / chip-tool フルゲート / mat ゲート
+（いずれも `MAT_E2E_IFACE=eth0`）全 PASS。最終ホールブランチレビュー（e8bb8ed..cdbebff）
+Critical 0・コード修正なしで完了。
+
+実装中の設計逸脱（レジャーの裁定より）:
+- `WriteAttrIn.list_append` + `ClusterHandler::write` の 4 引数化 — chip 系のチャンク
+  リスト write（空置換 + ListIndex null append）対応のため計画の署名を拡張
+- RemoveFabric の persist 失敗時も ACL purge（計画の「成功パス」文言より広い。
+  fabric index 再発行時の cross-fabric ACL 漏えい防止、31f4b44 と同構図）
+
+M3 送り（最終レビューの deferred）: NodeLabel write の値変化 dedup /
+PASE(fabric 0) からの ACL write 拒否 / `load_or_create_unique_id` の getrandom expect →
+エラー伝播 / ClusterRevision 全クラスタ 1 固定（実 revision 化）/ Location の write 対応 /
+ACL capacity enforcement。
+
+観測メモ: Apple は fabric 1 に加えて fabric_index=2 の CASE も張ってきた
+（iPhone ピアから。fabrics.json に 2 fabric 永続化）。挙動に実害は出ていないが、
+M3 の multi-session/multi-fabric 作業時に意識すること。
