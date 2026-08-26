@@ -56,6 +56,23 @@ pub enum AttestationMode {
     ChipTest,
 }
 
+/// 設定ファイル 1 `[[device]]` 分 — Aggregator (EP1) 配下にぶら下がる
+/// bridged endpoint 1 つ。`id` は endpoint 採番台帳
+/// (`net::endpoint_ledger`) のキーで、一度使ったら改名してはいけない
+/// （改名は「別デバイスの新規追加 + 旧デバイスの削除」として扱われ、
+/// コントローラ側のアクセサリ対応が切れる）。`name` は Bridged Device
+/// Basic Information の NodeLabel。
+///
+/// バリデーション（`id` の一意性・非空、`name` の 32 文字上限）は
+/// `matv::load_config` の責務 — `Device::new` は渡されたものをそのまま
+/// 組むだけで、設定ファイルの妥当性判断は持たない。
+#[derive(Debug, Clone)]
+pub struct VirtualDeviceConfig {
+    pub id: String,
+    pub kind: crate::core::bridge::DeviceKind,
+    pub name: String,
+}
+
 /// What this device advertises/answers as. Loaded once at `Device::new` and
 /// otherwise immutable for the process lifetime (M1 scope: no runtime
 /// reconfiguration).
@@ -87,6 +104,11 @@ pub struct DeviceConfig {
     /// to [`AttestationMode::Self_`] — existing chip-tool e2e behavior is
     /// unchanged unless a caller opts into `ChipTest` explicitly.
     pub attestation: AttestationMode,
+    /// M3: Aggregator (EP1) 配下に載せる bridged device 群、設定ファイルの
+    /// `[[device]]` 宣言順。空でも `Device::new` は通る（EP1 の PartsList が
+    /// 空の Aggregator になるだけ）— 「1 台以上必要」の判断は
+    /// `matv::load_config` 側。
+    pub devices: Vec<VirtualDeviceConfig>,
 }
 
 /// `Device::new`/`Device::run` failure.
@@ -152,12 +174,11 @@ pub struct Device {
     local_addr: SocketAddr,
     node: Node,
     comm_server: CommissioningServer,
-    /// Shared handle to endpoint 1's OnOff state — not yet consumed here
-    /// (Task 12 wires it into the runtime's subscription/dirty-report
-    /// path, and `matv` reads it for status logging), so it's currently
-    /// dead weight from `Device`'s own perspective.
+    /// 各 bridged device の `(設定ファイルの id, OnOff 状態ハンドル)` —
+    /// 宣言順。`Device` 自身はまだ読まない（M4 で mando への転送/状態
+    /// ログが消費する）。
     #[allow(dead_code)]
-    onoff_state: Arc<AtomicBool>,
+    onoff_states: Vec<(String, Arc<AtomicBool>)>,
 }
 
 impl Device {
@@ -260,23 +281,48 @@ impl Device {
             Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new()),
         );
 
-        // Endpoint 1: M2's single virtual OnOff Light device. Identify と
-        // Groups は On/Off Light デバイスタイプの必須クラスタ（Device
-        // Library §4.1）— Apple Home は commissioning 後の interview で
-        // この適合性を検査し、欠けていると RemoveFabric で離脱する。
-        let (onoff, onoff_state) = crate::core::onoff::OnOffHandler::new();
-        let (identify, identify_state) = crate::core::identify::IdentifyHandler::new();
+        // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
+        // 設定ファイルの `[[device]]` 1 件ずつに対応する bridged endpoint。
+        // M2 までの「EP1 に OnOff Light 直付け」は廃止 — matv は純粋な
+        // bridge になった。
+        //
+        // 採番はまず全 device 分を宣言順に台帳から引き当ててから 1 回だけ
+        // save する（device ごとに save すると途中で失敗したときに台帳と
+        // 実際に生えた endpoint が食い違う）。台帳は既知 id に同じ endpoint
+        // を返し続けるので、設定の増減を跨いで endpoint が安定する。
+        let mut ledger = crate::net::endpoint_ledger::EndpointLedger::load(&config.store_dir)
+            .map_err(DeviceError::Io)?;
+        let bridged_eps: Vec<u16> = config
+            .devices
+            .iter()
+            .map(|d| ledger.assign(&d.id))
+            .collect();
+        ledger.save().map_err(DeviceError::Io)?;
+
+        // EP1 は bridged endpoint 群より先に登録する — EP0 の PartsList は
+        // `Node` が登録順に registry から導出するので、この順序がそのまま
+        // `[1, 2, 3, ...]` という昇順の composition tree になる。
         node.add_endpoint(
             1,
-            vec![
-                Box::new(DescriptorHandler::for_device(
-                    mat_controller::im::DEVICE_TYPE_ON_OFF_LIGHT,
-                )),
-                Box::new(identify),
-                Box::new(crate::core::groups::GroupsHandler::new(identify_state)),
-                Box::new(onoff),
-            ],
+            vec![Box::new(
+                DescriptorHandler::for_device(mat_controller::im::DEVICE_TYPE_AGGREGATOR)
+                    .with_parts(bridged_eps.clone()),
+            )],
         );
+
+        let mut onoff_states = Vec::with_capacity(config.devices.len());
+        for (device, endpoint) in config.devices.iter().zip(&bridged_eps) {
+            // BDBI の UniqueID は「この node の UniqueID + 設定の device
+            // id」— node を跨いでも衝突せず、設定ファイルの id が変わらない
+            // 限り再起動を跨いで安定する。
+            let built = crate::core::bridge::build_bridged_endpoint(
+                device.kind,
+                &device.name,
+                &format!("{unique_id}-{}", device.id),
+            );
+            node.add_endpoint(*endpoint, built.clusters);
+            onoff_states.push((device.id.clone(), built.onoff_state));
+        }
 
         let bind_addr: SocketAddr = format!("[::]:{}", config.port)
             .parse()
@@ -292,7 +338,7 @@ impl Device {
             local_addr,
             node,
             comm_server,
-            onoff_state,
+            onoff_states,
         })
     }
 
@@ -367,6 +413,180 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use mat_controller::im;
+
+    use crate::core::bridge::DeviceKind;
+    use crate::core::datamodel::{InvokeCtx, ReadCtx};
+
+    /// Reads one attribute off a `Node` through the real IM dispatch and
+    /// returns its decoded JSON value — the `handle_im` +
+    /// `decode_report_data_message` idiom `core::datamodel`'s own tests use,
+    /// applied to the `Node` a live `Device` assembled.
+    fn read_attr(
+        node: &mut Node,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> serde_json::Value {
+        let req = im::encode_read_request(endpoint, cluster, attribute);
+        let out = node
+            .handle_im(
+                im::OPCODE_READ_REQUEST,
+                &req,
+                &mut InvokeCtx::default(),
+                &ReadCtx::default(),
+            )
+            .expect("read request should be answered");
+        let msg = im::decode_report_data_message(&out.payload).expect("decode report data");
+        msg.reports
+            .first()
+            .unwrap_or_else(|| panic!("no report for {endpoint}/{cluster:#x}/{attribute:#x}"))
+            .data
+            .clone()
+            .unwrap_or_else(|| panic!("no data for {endpoint}/{cluster:#x}/{attribute:#x}"))
+    }
+
+    /// M3 の bridge トポロジと採番台帳の安定性を、実際に `Device::new` が
+    /// 組んだ `Node` に対する IM read で確認する:
+    ///
+    /// - EP0 の PartsList が EP1(Aggregator) + bridged EP 群を宣言順に並べる
+    /// - EP1 が Aggregator デバイスタイプ + bridged EP 群の静的 PartsList
+    /// - bridged EP が On/Off Light + Bridged Node の 2 デバイスタイプを持ち、
+    ///   BDBI NodeLabel が設定ファイルの name
+    /// - 設定から外した id の endpoint は他の id に再利用されず（単調増加）、
+    ///   再追加すれば旧 endpoint が復元される
+    #[tokio::test]
+    async fn bridge_topology_and_ledger_stability() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |devices: Vec<VirtualDeviceConfig>| DeviceConfig {
+            passcode: 20202021,
+            discriminator: 0xF00,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            // Port 0 so several `Device`s in this one test never collide.
+            port: 0,
+            store_dir: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            attestation: AttestationMode::default(),
+            devices,
+        };
+        let dev = |id: &str, name: &str| VirtualDeviceConfig {
+            id: id.into(),
+            kind: DeviceKind::OnOffLight,
+            name: name.into(),
+        };
+
+        let mut d1 = Device::new(cfg(vec![
+            dev("a", "A Light"),
+            dev("b", "B Light"),
+            dev("c", "C Light"),
+        ]))
+        .unwrap();
+
+        // EP0 PartsList: Aggregator + the three bridged endpoints, in
+        // declaration order (EP1 is registered before the bridged ones so the
+        // registry-derived list comes out ascending).
+        assert_eq!(
+            read_attr(&mut d1.node, 0, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST),
+            serde_json::json!([1, 2, 3, 4])
+        );
+        // EP1 is the Aggregator, and its static PartsList names only the
+        // bridged children.
+        assert_eq!(
+            read_attr(
+                &mut d1.node,
+                1,
+                im::CLUSTER_DESCRIPTOR,
+                im::ATTR_DEVICE_TYPE_LIST
+            ),
+            serde_json::json!([{"0": im::DEVICE_TYPE_AGGREGATOR, "1": 1}])
+        );
+        assert_eq!(
+            read_attr(&mut d1.node, 1, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST),
+            serde_json::json!([2, 3, 4])
+        );
+        // EP2 is device "a": On/Off Light + Bridged Node, NodeLabel = name.
+        assert_eq!(
+            read_attr(
+                &mut d1.node,
+                2,
+                im::CLUSTER_DESCRIPTOR,
+                im::ATTR_DEVICE_TYPE_LIST
+            ),
+            serde_json::json!([
+                {"0": im::DEVICE_TYPE_ON_OFF_LIGHT, "1": 1},
+                {"0": im::DEVICE_TYPE_BRIDGED_NODE, "1": 1},
+            ])
+        );
+        assert_eq!(
+            read_attr(
+                &mut d1.node,
+                2,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::ATTR_BI_NODE_LABEL
+            ),
+            serde_json::json!("A Light")
+        );
+        assert_eq!(
+            read_attr(
+                &mut d1.node,
+                4,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::ATTR_BI_NODE_LABEL
+            ),
+            serde_json::json!("C Light")
+        );
+        drop(d1);
+
+        // Restart against the same store with "b" removed and "d" added:
+        // a/c keep their endpoints, d gets a brand-new one (5) rather than
+        // b's freed 3.
+        let mut d2 = Device::new(cfg(vec![
+            dev("a", "A Light"),
+            dev("c", "C Light"),
+            dev("d", "D Light"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            read_attr(&mut d2.node, 1, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST),
+            serde_json::json!([2, 4, 5])
+        );
+        assert_eq!(
+            read_attr(
+                &mut d2.node,
+                5,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::ATTR_BI_NODE_LABEL
+            ),
+            serde_json::json!("D Light")
+        );
+        drop(d2);
+
+        // Re-adding "b" restores its original endpoint 3 (tombstone), so the
+        // controller's existing pairing for that accessory keeps working.
+        let mut d3 = Device::new(cfg(vec![
+            dev("a", "A Light"),
+            dev("b", "B Light"),
+            dev("c", "C Light"),
+            dev("d", "D Light"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            read_attr(&mut d3.node, 1, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST),
+            serde_json::json!([2, 3, 4, 5])
+        );
+        assert_eq!(
+            read_attr(
+                &mut d3.node,
+                3,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::ATTR_BI_NODE_LABEL
+            ),
+            serde_json::json!("B Light")
+        );
+        drop(d3);
+    }
 
     /// First call with an empty `store_dir` generates a fresh UniqueID and
     /// persists it — 32 lowercase hex chars (16 random bytes).

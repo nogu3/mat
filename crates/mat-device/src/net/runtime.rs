@@ -1930,6 +1930,7 @@ mod tests {
             store_dir: std::path::PathBuf::new(),
             iface: String::new(),
             attestation: Default::default(),
+            devices: vec![],
         }
     }
 

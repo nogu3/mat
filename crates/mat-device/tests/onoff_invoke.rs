@@ -1,4 +1,4 @@
-//! Task M2-2, Step 8: self-closed-loop proof that endpoint 1's OnOff
+//! Task M2-2, Step 8: self-closed-loop proof that the bridged endpoint's OnOff
 //! cluster is reachable end-to-end — not just through `Node::handle_im`
 //! directly (`core::datamodel`'s own tests) or `mat-controller`'s
 //! `case_establish.rs` (which drives a hand-rolled responder, not the real
@@ -24,15 +24,15 @@ use support::{commission_directly, device_config};
 const ADMIN_NODE_ID: u64 = 445_566;
 
 /// Commissions against a running `Device` (no mDNS, same direct-drive
-/// pattern as `self_commission_live.rs`), then invokes endpoint 1 /
-/// `CLUSTER_ON_OFF` / `CMD_ON_OFF_TOGGLE` over the resulting secured
-/// session and confirms `STATUS_SUCCESS` — proof that `device.rs`'s
-/// endpoint 1 registration (`OnOffHandler` + `DescriptorHandler::
-/// for_device(DEVICE_TYPE_ON_OFF_LIGHT)`) is actually reachable through the
-/// real commissioning + CASE + secured-IM path, not just `Node::handle_im`
-/// called in isolation.
+/// pattern as `self_commission_live.rs`), then invokes
+/// [`support::BRIDGED_EP`] / `CLUSTER_ON_OFF` / `CMD_ON_OFF_TOGGLE` over the
+/// resulting secured session and confirms `STATUS_SUCCESS` — proof that
+/// `device.rs`'s bridged-endpoint assembly (the `[[device]]` entry's
+/// `build_bridged_endpoint` cluster set, under the EP1 Aggregator) is
+/// actually reachable through the real commissioning + CASE + secured-IM
+/// path, not just `Node::handle_im` called in isolation.
 #[tokio::test]
-async fn commissioned_session_can_toggle_endpoint1_onoff() {
+async fn commissioned_session_can_toggle_bridged_endpoint_onoff() {
     let store_dir = tempfile::tempdir().expect("tempdir");
     let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
     // Same `[::]` -> `[::1]` substitution as `self_commission_live.rs` (see
@@ -55,7 +55,7 @@ async fn commissioned_session_can_toggle_endpoint1_onoff() {
 
     let resp = session
         .invoke_for_data(
-            1,
+            support::BRIDGED_EP,
             im::CLUSTER_ON_OFF,
             im::CMD_ON_OFF_TOGGLE,
             None,

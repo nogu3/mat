@@ -24,7 +24,10 @@ fn prints_setup_payload_and_stays_up() {
     std::fs::write(
         &cfg,
         format!(
-            "passcode = 20202021\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"{}\"\niface = \"lo\"\n",
+            // 末尾の `[[device]]` は M3 の標準 e2e ブロック（scripts/e2e-* と
+            // mat-device の integration テストが使うものと同一）。matv は純
+            // bridge なので 1 台以上の宣言が必須。
+            "passcode = 20202021\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"{}\"\niface = \"lo\"\n\n[[device]]\nid = \"e2e-light\"\nkind = \"onoff-light\"\nname = \"E2E Light\"\n",
             dir.path().display()
         ),
     )

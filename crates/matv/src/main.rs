@@ -16,7 +16,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use mat_controller::commissioning::INVALID_PASSCODES;
-use mat_device::device::{AttestationMode, Device, DeviceConfig};
+use mat_device::core::bridge::DeviceKind;
+use mat_device::device::{AttestationMode, Device, DeviceConfig, VirtualDeviceConfig};
 
 /// spec §5.1.3.1: valid setup passcode range is `1..=99_999_998` (0 and
 /// `0x5F5E0FF`=99_999_999 are reserved), on top of the trivial/attack-prone
@@ -28,6 +29,10 @@ const MAX_PASSCODE: u32 = 99_999_998;
 /// (a panic, not a `Result`) — matv validates up front so an out-of-range
 /// value is a clean stderr error + non-zero exit instead of a panic.
 const MAX_DISCRIMINATOR: u16 = 0x0FFF;
+/// `[[device]]` の `name` 上限。Bridged Device Basic Information の
+/// NodeLabel は spec §11.1.6.2 の `string32` — バイト数ではなく**文字数**
+/// で 32 まで。
+const MAX_DEVICE_NAME_CHARS: usize = 32;
 
 /// matv — virtual Matter device host (M1: single self-contained node).
 #[derive(Parser, Debug)]
@@ -64,6 +69,26 @@ struct FileConfig {
     /// chip-tool e2e gates) are unaffected.
     #[serde(default)]
     attestation: AttestationMode,
+    /// M3: bridge がぶら下げるデバイス群（`[[device]]` の配列）。宣言順が
+    /// そのまま endpoint 採番順になる。`serde(default)` は「未宣言 = 空
+    /// ベクタ」をパースエラーではなく `load_config` のバリデーション
+    /// エラー（"config must declare at least one [[device]]"）にするため
+    /// — TOML の missing-field メッセージより設定者に伝わる。
+    #[serde(default, rename = "device")]
+    devices: Vec<FileDeviceConfig>,
+}
+
+/// `matv.toml` の `[[device]]` 1 件。
+#[derive(Debug, Deserialize)]
+struct FileDeviceConfig {
+    /// endpoint 採番台帳のキー。一度使ったら改名しない（改名すると
+    /// コントローラ側では別アクセサリの新規追加として見える）。
+    id: String,
+    /// デバイス種別。綴りは `mat_device::core::bridge::DeviceKind` の
+    /// serde rename が正本（未知の綴りは serde が弾く）。
+    kind: DeviceKind,
+    /// Bridged Device Basic Information の NodeLabel。
+    name: String,
 }
 
 fn main() {
@@ -129,6 +154,28 @@ fn load_config(path: &std::path::Path) -> Result<FileConfig, String> {
         ));
     }
 
+    // `[[device]]` 群（M3）。`Device::new` は渡されたものをそのまま組む
+    // だけなので、設定ファイルの妥当性はここで全部見る。
+    if cfg.devices.is_empty() {
+        return Err("config must declare at least one [[device]]".to_string());
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for device in &cfg.devices {
+        if device.id.is_empty() {
+            return Err("[[device]] id must not be empty".to_string());
+        }
+        if !seen.insert(device.id.as_str()) {
+            return Err(format!("duplicate [[device]] id {:?}", device.id));
+        }
+        let chars = device.name.chars().count();
+        if chars > MAX_DEVICE_NAME_CHARS {
+            return Err(format!(
+                "[[device]] {:?} name must be at most {MAX_DEVICE_NAME_CHARS} characters, got {chars}",
+                device.id
+            ));
+        }
+    }
+
     Ok(cfg)
 }
 
@@ -136,6 +183,15 @@ fn load_config(path: &std::path::Path) -> Result<FileConfig, String> {
 /// until `Device::run` errors or Ctrl-C is received.
 async fn run(cfg: FileConfig) -> Result<(), String> {
     let store = cfg.store.clone();
+    let devices = cfg
+        .devices
+        .into_iter()
+        .map(|d| VirtualDeviceConfig {
+            id: d.id,
+            kind: d.kind,
+            name: d.name,
+        })
+        .collect();
     let device = Device::new(DeviceConfig {
         passcode: cfg.passcode,
         discriminator: cfg.discriminator,
@@ -145,6 +201,7 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         store_dir: cfg.store,
         iface: cfg.iface,
         attestation: cfg.attestation,
+        devices,
     })
     .map_err(|e| format!("failed to start device: {e}"))?;
 
@@ -186,16 +243,146 @@ mod tests {
         path
     }
 
+    /// The scalar half of a valid `matv.toml` — everything that must come
+    /// *before* the `[[device]]` array-of-tables (TOML puts every following
+    /// key inside the last table header, so top-level keys go first).
     const VALID_BASE: &str = "passcode = 20202021\ndiscriminator = 3840\nvendor_id = 65521\nproduct_id = 32768\nport = 0\nstore = \"x\"\niface = \"lo\"\n";
+
+    /// The standard e2e `[[device]]` block — the same id/kind/name
+    /// `mat-device`'s integration tests and `scripts/e2e-*` use.
+    const DEVICE_BLOCK: &str =
+        "\n[[device]]\nid = \"e2e-light\"\nkind = \"onoff-light\"\nname = \"E2E Light\"\n";
+
+    /// `VALID_BASE` + any extra top-level scalar lines + one valid
+    /// `[[device]]`, in the order TOML requires.
+    fn valid_config(extra_scalars: &str) -> String {
+        format!("{VALID_BASE}{extra_scalars}{DEVICE_BLOCK}")
+    }
 
     #[test]
     fn accepts_a_valid_config() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), VALID_BASE);
+        let path = write_config(dir.path(), &valid_config(""));
         let cfg = load_config(&path).expect("valid config should load");
         assert_eq!(cfg.passcode, 20_202_021);
         assert_eq!(cfg.discriminator, 3840);
         assert_eq!(cfg.iface, "lo");
+    }
+
+    /// A pure bridge with nothing to bridge is a config mistake, not a
+    /// degenerate-but-valid device — `[[device]]` is what `matv` exists to
+    /// serve, so an empty list is rejected up front rather than booting an
+    /// Aggregator with an empty PartsList.
+    #[test]
+    fn rejects_config_with_no_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), VALID_BASE);
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("[[device]]"),
+            "error should point at the missing [[device]] section: {err}"
+        );
+    }
+
+    /// The device id is the endpoint ledger's key — two entries sharing one
+    /// id would map two accessories onto a single endpoint.
+    #[test]
+    fn rejects_duplicate_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "{VALID_BASE}{DEVICE_BLOCK}\n[[device]]\nid = \"e2e-light\"\nkind = \"onoff-light\"\nname = \"Another\"\n"
+            ),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("e2e-light"),
+            "error should name the duplicated id: {err}"
+        );
+        assert!(
+            err.contains("duplicate"),
+            "error should say what's wrong: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &format!("{VALID_BASE}\n[[device]]\nid = \"\"\nkind = \"onoff-light\"\nname = \"X\"\n"),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("id"),
+            "error should point at the empty id: {err}"
+        );
+    }
+
+    /// `name` becomes the Bridged Device Basic Information NodeLabel, a
+    /// spec `string32` (§11.1.6.2) — 33 characters is over the line.
+    #[test]
+    fn rejects_device_name_over_32_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "x".repeat(33);
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "{VALID_BASE}\n[[device]]\nid = \"a\"\nkind = \"onoff-light\"\nname = \"{name}\"\n"
+            ),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("32"),
+            "error should mention the 32-character limit: {err}"
+        );
+    }
+
+    /// Exactly 32 characters is still fine (the boundary is inclusive), and
+    /// the count is in characters, not bytes.
+    #[test]
+    fn accepts_a_32_char_multibyte_device_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "あ".repeat(32);
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "{VALID_BASE}\n[[device]]\nid = \"a\"\nkind = \"onoff-light\"\nname = \"{name}\"\n"
+            ),
+        );
+        let cfg = load_config(&path).expect("a 32-character name should be accepted");
+        assert_eq!(cfg.devices[0].name, name);
+    }
+
+    #[test]
+    fn accepts_several_devices_and_keeps_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "{VALID_BASE}\n[[device]]\nid = \"a\"\nkind = \"onoff-light\"\nname = \"A\"\n\n[[device]]\nid = \"b\"\nkind = \"onoff-light\"\nname = \"B\"\n\n[[device]]\nid = \"c\"\nkind = \"onoff-light\"\nname = \"C\"\n"
+            ),
+        );
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.devices.len(), 3);
+        let ids: Vec<&str> = cfg.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(cfg.devices[0].kind, DeviceKind::OnOffLight);
+    }
+
+    #[test]
+    fn rejects_unknown_device_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &format!("{VALID_BASE}\n[[device]]\nid = \"a\"\nkind = \"toaster\"\nname = \"A\"\n"),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("toaster"),
+            "error should name the unknown kind: {err}"
+        );
     }
 
     /// `attestation` is optional (Task 10) — an existing `matv.toml` with
@@ -204,7 +391,7 @@ mod tests {
     #[test]
     fn attestation_defaults_to_self_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), VALID_BASE);
+        let path = write_config(dir.path(), &valid_config(""));
         let cfg = load_config(&path).expect("valid config should load");
         assert_eq!(cfg.attestation, AttestationMode::Self_);
     }
@@ -213,10 +400,7 @@ mod tests {
     #[test]
     fn attestation_parses_chip_test() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            &format!("{VALID_BASE}attestation = \"chip-test\"\n"),
-        );
+        let path = write_config(dir.path(), &valid_config("attestation = \"chip-test\"\n"));
         let cfg = load_config(&path).expect("valid config should load");
         assert_eq!(cfg.attestation, AttestationMode::ChipTest);
     }
@@ -225,7 +409,7 @@ mod tests {
     #[test]
     fn attestation_parses_self() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &format!("{VALID_BASE}attestation = \"self\"\n"));
+        let path = write_config(dir.path(), &valid_config("attestation = \"self\"\n"));
         let cfg = load_config(&path).expect("valid config should load");
         assert_eq!(cfg.attestation, AttestationMode::Self_);
     }

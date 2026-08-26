@@ -34,7 +34,21 @@ use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509;
 
-use mat_device::device::{AttestationMode, DeviceConfig};
+use mat_device::core::bridge::DeviceKind;
+use mat_device::device::{AttestationMode, DeviceConfig, VirtualDeviceConfig};
+
+/// The endpoint the one bridged device in [`device_config`] lands on — EP0
+/// is the root, EP1 the Aggregator, so the first (and here only) bridged
+/// device gets EP2 (`net::endpoint_ledger::FIRST_BRIDGED_ENDPOINT`). M3
+/// turned `matv` into a pure bridge, so there is no longer any On/Off
+/// cluster on EP1 for these tests to drive.
+///
+/// `allow(dead_code)`: `support` is compiled separately into *each*
+/// integration test binary, so anything only some of them use looks unused
+/// from the others' point of view (`self_commission_live.rs` never touches
+/// an application endpoint).
+#[allow(dead_code)]
+pub const BRIDGED_EP: u16 = 2;
 
 pub const PASSCODE: u32 = 20202021;
 pub const DISCRIMINATOR: u16 = 840;
@@ -70,6 +84,14 @@ pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
         store_dir,
         iface: "lo".to_string(),
         attestation: AttestationMode::default(),
+        // The standard e2e `[[device]]` block (same id/kind/name as
+        // `matv`'s own tests and `scripts/e2e-*`), landing on
+        // [`BRIDGED_EP`].
+        devices: vec![VirtualDeviceConfig {
+            id: "e2e-light".to_string(),
+            kind: DeviceKind::OnOffLight,
+            name: "E2E Light".to_string(),
+        }],
     }
 }
 

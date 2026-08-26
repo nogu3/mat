@@ -100,7 +100,13 @@ async fn subscribed_controller_gets_priming_a_change_report_and_a_keep_alive() {
     // 2. Change the state through the same session — the device notices
     //    the change itself and pushes a report for it.
     session
-        .invoke(1, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None, &cfg)
+        .invoke(
+            support::BRIDGED_EP,
+            im::CLUSTER_ON_OFF,
+            im::CMD_ON_OFF_ON,
+            None,
+            &cfg,
+        )
         .await
         .expect("On invoke should succeed");
 
