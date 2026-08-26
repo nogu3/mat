@@ -164,6 +164,30 @@ fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<Stri
     Ok(hex)
 }
 
+/// 1 つの bridged endpoint (`[[device]]` 1 件) の Bridged Device Basic
+/// Information UniqueID。
+///
+/// 素直に `format!("{node_unique_id}-{device_id}")` と繋ぐと **spec の
+/// `string32` 上限を必ず超える** — `node_unique_id` 自体が 32 hex 文字
+/// (`load_or_create_unique_id`) なので、区切りの `-` と device id を足した
+/// 時点で 34 文字以上になる。BDBI の UniqueID は BasicInformation
+/// (spec §11.1.6.15) と同じ `string32` 制約を継ぐので、そのまま載せると
+/// 上限超過の値がワイヤに出る（Apple Home の interview で落ちうる）。
+///
+/// そこで同じ合成文字列の SHA-256 を取り、先頭 16 バイト = 32 hex 文字を
+/// UniqueID とする。node unique id と device id の両方に依存するので
+/// node を跨いでも device を跨いでも衝突せず、どちらも変わらない限り
+/// 再起動を跨いで同じ値になる（コントローラ側のアクセサリ対応が安定
+/// する）。
+fn bridged_unique_id(node_unique_id: &str, device_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("{node_unique_id}-{device_id}").as_bytes());
+    // 16 バイト = 32 hex 文字。`load_or_create_unique_id` の node 側と同じ
+    // 「16 ランダムバイトの hex」形と揃う。
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// A running (or about-to-run) device instance. Construct with `new`
 /// (synchronous — binds the socket and loads/creates all persistent state
 /// eagerly, so `local_addr`/`qr_payload`/`manual_code` are all usable
@@ -312,13 +336,10 @@ impl Device {
 
         let mut onoff_states = Vec::with_capacity(config.devices.len());
         for (device, endpoint) in config.devices.iter().zip(&bridged_eps) {
-            // BDBI の UniqueID は「この node の UniqueID + 設定の device
-            // id」— node を跨いでも衝突せず、設定ファイルの id が変わらない
-            // 限り再起動を跨いで安定する。
             let built = crate::core::bridge::build_bridged_endpoint(
                 device.kind,
                 &device.name,
-                &format!("{unique_id}-{}", device.id),
+                &bridged_unique_id(&unique_id, &device.id),
             );
             node.add_endpoint(*endpoint, built.clusters);
             onoff_states.push((device.id.clone(), built.onoff_state));
@@ -586,6 +607,81 @@ mod tests {
             serde_json::json!("B Light")
         );
         drop(d3);
+    }
+
+    /// BDBI の UniqueID (spec §9.13 / §11.1.6.15 の `string32`) を、実際に
+    /// `Device` が組んだ node から IM read で取り出して確認する:
+    ///
+    /// - ちょうど 32 文字の小文字 hex（`{node_unique_id}-{device_id}` の
+    ///   素の連結だと必ず 32 文字を超える — [`bridged_unique_id`] の doc）
+    /// - 同じ store で組み直せば同じ値（コントローラ側のアクセサリ対応が
+    ///   再起動を跨いで生きる）
+    /// - device が違えば違う値
+    #[tokio::test]
+    async fn bridged_unique_ids_are_string32_stable_and_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = || DeviceConfig {
+            passcode: 20202021,
+            discriminator: 0xF00,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            port: 0,
+            store_dir: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            attestation: AttestationMode::default(),
+            devices: vec![
+                VirtualDeviceConfig {
+                    id: "e2e-light".into(),
+                    kind: DeviceKind::OnOffLight,
+                    name: "E2E Light".into(),
+                },
+                VirtualDeviceConfig {
+                    id: "other-light".into(),
+                    kind: DeviceKind::OnOffLight,
+                    name: "Other Light".into(),
+                },
+            ],
+        };
+        let unique_id_at = |node: &mut Node, endpoint: u16| -> String {
+            read_attr(
+                node,
+                endpoint,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::ATTR_BI_UNIQUE_ID,
+            )
+            .as_str()
+            .expect("UniqueID reads as a string")
+            .to_string()
+        };
+
+        let mut d1 = Device::new(cfg()).unwrap();
+        let first = unique_id_at(&mut d1.node, 2);
+        let second = unique_id_at(&mut d1.node, 3);
+        drop(d1);
+
+        for id in [&first, &second] {
+            assert_eq!(
+                id.chars().count(),
+                32,
+                "BDBI UniqueID is a spec string32, got {id:?}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "BDBI UniqueID should be lowercase hex, got {id:?}"
+            );
+        }
+        assert_ne!(
+            first, second,
+            "two devices under the same bridge must not share a UniqueID"
+        );
+
+        // 同じ store で組み直しても同じ値（node の unique_id も device id も
+        // 変わらないので決定的）。
+        let mut d2 = Device::new(cfg()).unwrap();
+        assert_eq!(unique_id_at(&mut d2.node, 2), first);
+        assert_eq!(unique_id_at(&mut d2.node, 3), second);
+        drop(d2);
     }
 
     /// First call with an empty `store_dir` generates a fresh UniqueID and
