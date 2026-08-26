@@ -202,6 +202,13 @@ pub trait ClusterHandler: Send {
     fn feature_map(&self) -> u32 {
         0
     }
+    /// ClusterRevision (spec §7.13, id 0xFFFD). Real implementations return
+    /// the revision the current spec (Matter 1.4) assigns their cluster —
+    /// M2 hardcoded every cluster to 1, which this default preserves for
+    /// tests that mock `ClusterHandler` without caring about the value.
+    fn revision(&self) -> u16 {
+        1
+    }
 }
 
 /// Interaction Model server-side dispatch errors: either a malformed
@@ -253,6 +260,14 @@ pub struct Node {
     /// entirely `Node`'s business — `ClusterHandler` implementations only
     /// ever say *what* changed (`InvokeCtx::changed`).
     versions: HashMap<(u16, u32), u32>,
+    /// The DataVersion every `(endpoint, cluster)` not yet in `versions`
+    /// reports (see `data_version`) and the value newly-bumped entries
+    /// start from (see `handle_invoke`/`handle_write`). Defaults to
+    /// `INITIAL_DATA_VERSION`; `set_data_version_base` overrides it —
+    /// `device::Device::new` seeds it from `getrandom` at boot (spec
+    /// §7.10.3) so a restarted node's DataVersions don't coincide with
+    /// whatever a subscriber cached from the previous boot.
+    version_base: u32,
 }
 
 /// Bundles the (endpoint id, its clusters, the reading session's fabric
@@ -274,6 +289,7 @@ impl Node {
         Self {
             endpoints: Vec::new(),
             versions: HashMap::new(),
+            version_base: INITIAL_DATA_VERSION,
         }
     }
 
@@ -345,12 +361,24 @@ impl Node {
     }
 
     /// The current DataVersion (spec §7.10.3) of one `(endpoint, cluster)`
-    /// — `INITIAL_DATA_VERSION` until a command changes one of its values.
+    /// — `version_base` until a command changes one of its values.
     pub fn data_version(&self, endpoint: u16, cluster: u32) -> u32 {
         self.versions
             .get(&(endpoint, cluster))
             .copied()
-            .unwrap_or(INITIAL_DATA_VERSION)
+            .unwrap_or(self.version_base)
+    }
+
+    /// Sets the DataVersion every `(endpoint, cluster)` not yet changed
+    /// reports, and the value newly-bumped entries start counting up from
+    /// (spec §7.10.3: ブートごとに乱数初期化 — the initial value must be
+    /// unpredictable at each boot so a subscriber's cached DataVersion from
+    /// a previous boot never coincidentally matches). Call once, right
+    /// after construction — `device::Device::new` seeds it from
+    /// `getrandom`; tests that don't call this keep the fixed
+    /// `INITIAL_DATA_VERSION` default.
+    pub fn set_data_version_base(&mut self, base: u32) {
+        self.version_base = base;
     }
 
     /// Dispatches one incoming IM message. Returns the reply to send back
@@ -710,7 +738,7 @@ impl Node {
             return Some(encode_parts_list(&self.endpoints));
         }
         match attribute {
-            im::ATTR_CLUSTER_REVISION => Some(uint_value(1)),
+            im::ATTR_CLUSTER_REVISION => Some(uint_value(u64::from(handler.revision()))),
             im::ATTR_FEATURE_MAP => Some(uint_value(u64::from(handler.feature_map()))),
             im::ATTR_ATTRIBUTE_LIST => Some(encode_attribute_list(handler)),
             im::ATTR_ACCEPTED_COMMAND_LIST => {
@@ -775,7 +803,7 @@ impl Node {
             let version = self
                 .versions
                 .entry((req.endpoint, req.cluster))
-                .or_insert(INITIAL_DATA_VERSION);
+                .or_insert(self.version_base);
             *version = version.wrapping_add(1);
         }
         let resp_payload = match reply {
@@ -876,7 +904,7 @@ impl Node {
                 let version = self
                     .versions
                     .entry((endpoint, cluster))
-                    .or_insert(INITIAL_DATA_VERSION);
+                    .or_insert(self.version_base);
                 *version = version.wrapping_add(1);
             }
             changed.extend(entry_changed);
@@ -1007,6 +1035,12 @@ impl ClusterHandler for DescriptorHandler {
         im::CLUSTER_DESCRIPTOR
     }
 
+    /// ClusterRevision (spec §7.13): Descriptor cluster spec revision 2
+    /// (Matter 1.4).
+    fn revision(&self) -> u16 {
+        2
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![
             im::ATTR_DEVICE_TYPE_LIST,
@@ -1085,6 +1119,12 @@ const NODE_LABEL_MAX_CHARS: usize = 32;
 impl ClusterHandler for BasicInformationHandler {
     fn cluster_id(&self) -> u32 {
         im::CLUSTER_BASIC_INFORMATION
+    }
+
+    /// ClusterRevision (spec §7.13): Basic Information cluster spec
+    /// revision 3 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        3
     }
 
     fn attributes(&self) -> Vec<u32> {
@@ -1344,6 +1384,45 @@ mod tests {
         assert_eq!(
             im::decode_write_response(&resp).unwrap(),
             im::STATUS_CONSTRAINT_ERROR
+        );
+    }
+
+    /// ClusterRevision (spec §7.13, id 0xFFFD) must reflect the handler's
+    /// own `revision()`, not the M2-era hardcoded 1 — Descriptor's current
+    /// revision is 2.
+    #[test]
+    fn cluster_revision_reflects_handler_value() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let req = im::encode_read_request(0, im::CLUSTER_DESCRIPTOR, im::ATTR_CLUSTER_REVISION);
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(2)));
+    }
+
+    /// DataVersion (spec §7.10.3) starts at whatever base
+    /// `set_data_version_base` seeds — not the fixed `INITIAL_DATA_VERSION`
+    /// — and still bumps by 1 (wrapping) on the first change, via the
+    /// existing write→changed path.
+    #[test]
+    fn data_version_base_seeds_initial_version_and_bump() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.set_data_version_base(0xDEAD_BEEF);
+        assert_eq!(
+            node.data_version(0, im::CLUSTER_BASIC_INFORMATION),
+            0xDEAD_BEEF
+        );
+        let mut w = Writer::new();
+        w.put_str(Tag::Anonymous, "x");
+        let req = im::encode_write_request_tlv(
+            0,
+            im::CLUSTER_BASIC_INFORMATION,
+            im::ATTR_BI_NODE_LABEL,
+            &w.finish(),
+        );
+        let _ = handle_im_ok(&mut node, im::OPCODE_WRITE_REQUEST, &req);
+        assert_eq!(
+            node.data_version(0, im::CLUSTER_BASIC_INFORMATION),
+            0xDEAD_BEEF_u32.wrapping_add(1)
         );
     }
 
@@ -1758,7 +1837,8 @@ mod tests {
         assert_eq!(op, im::OPCODE_REPORT_DATA);
         let msg = decode_report_data_message(&resp).unwrap();
         assert_eq!(msg.reports.len(), 1);
-        assert_eq!(msg.reports[0].data, Some(serde_json::json!(1)));
+        // OnOff's real ClusterRevision (6) — not the M2-era hardcoded 1.
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!(6)));
     }
 
     /// AcceptedCommandList/GeneratedCommandList (spec §7.13) must reflect

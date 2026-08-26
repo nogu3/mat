@@ -40,6 +40,12 @@ impl ClusterHandler for GeneralDiagnosticsHandler {
         im::CLUSTER_GENERAL_DIAGNOSTICS
     }
 
+    /// ClusterRevision (spec §7.13): General Diagnostics cluster spec
+    /// revision 2 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        2
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![
             im::ATTR_GD_NETWORK_INTERFACES,

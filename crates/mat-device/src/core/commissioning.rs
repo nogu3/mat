@@ -484,6 +484,12 @@ impl ClusterHandler for GeneralCommissioningHandler {
         CLUSTER_GENERAL_COMMISSIONING
     }
 
+    /// ClusterRevision (spec §7.13): General Commissioning cluster spec
+    /// revision 1 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        1
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![
             ATTR_GC_BREADCRUMB,
@@ -531,6 +537,12 @@ struct OperationalCredentialsHandler(Arc<Mutex<Inner>>);
 impl ClusterHandler for OperationalCredentialsHandler {
     fn cluster_id(&self) -> u32 {
         CLUSTER_OPERATIONAL_CREDENTIALS
+    }
+
+    /// ClusterRevision (spec §7.13): Operational Credentials cluster spec
+    /// revision 1 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        1
     }
 
     fn attributes(&self) -> Vec<u32> {
@@ -581,6 +593,12 @@ struct AdminCommissioningHandler(Arc<Mutex<Inner>>);
 impl ClusterHandler for AdminCommissioningHandler {
     fn cluster_id(&self) -> u32 {
         CLUSTER_ADMIN_COMMISSIONING
+    }
+
+    /// ClusterRevision (spec §7.13): Administrator Commissioning cluster
+    /// spec revision 1 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        1
     }
 
     fn attributes(&self) -> Vec<u32> {

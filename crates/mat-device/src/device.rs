@@ -216,6 +216,15 @@ impl Device {
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
         let mut node =
             Node::with_root_endpoint_unique(config.vendor_id, config.product_id, &unique_id);
+        // DataVersion のブート時乱数初期化 (spec §7.10.3) — `core` は乱数源
+        // を持ち込まないので、`getrandom` はここ（呼び出し側）で引いて
+        // `Node` に渡す。node 単位の共通 base で十分（`set_data_version_
+        // base`のdoc参照）: 目的は前ブートのキャッシュ済み DataVersion との
+        // 偶然一致の排除であり、クラスタごとに独立させる必要はない。
+        let mut version_seed = [0u8; 4];
+        getrandom::getrandom(&mut version_seed)
+            .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
+        node.set_data_version_base(u32::from_le_bytes(version_seed));
         let (general_commissioning, operational_credentials, admin_commissioning) =
             comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);

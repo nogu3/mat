@@ -61,6 +61,12 @@ impl ClusterHandler for IdentifyHandler {
         im::CLUSTER_IDENTIFY
     }
 
+    /// ClusterRevision (spec §7.13): Identify cluster spec revision 4
+    /// (Matter 1.4).
+    fn revision(&self) -> u16 {
+        4
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![im::ATTR_IDENTIFY_TIME, im::ATTR_IDENTIFY_TYPE]
     }

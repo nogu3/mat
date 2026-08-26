@@ -77,6 +77,12 @@ impl ClusterHandler for GroupsHandler {
         im::CLUSTER_GROUPS
     }
 
+    /// ClusterRevision (spec §7.13): Groups cluster spec revision 4
+    /// (Matter 1.4).
+    fn revision(&self) -> u16 {
+        4
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![im::ATTR_GROUPS_NAME_SUPPORT]
     }

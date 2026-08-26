@@ -36,6 +36,12 @@ impl ClusterHandler for OnOffHandler {
         im::CLUSTER_ON_OFF
     }
 
+    /// ClusterRevision (spec §7.13): On/Off cluster spec revision 6
+    /// (Matter 1.4).
+    fn revision(&self) -> u16 {
+        6
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![im::ATTR_ON_OFF]
     }

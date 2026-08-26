@@ -33,6 +33,12 @@ impl ClusterHandler for GroupKeyManagementHandler {
         im::CLUSTER_GROUP_KEY_MANAGEMENT
     }
 
+    /// ClusterRevision (spec §7.13): Group Key Management cluster spec
+    /// revision 2 (Matter 1.4).
+    fn revision(&self) -> u16 {
+        2
+    }
+
     fn attributes(&self) -> Vec<u32> {
         vec![
             im::ATTR_GROUP_KEY_MAP,
