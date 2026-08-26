@@ -1018,23 +1018,51 @@ fn encode_command_list(ids: &[u32]) -> Vec<u8> {
 }
 
 /// Descriptor cluster (spec §9.5), mandatory on every endpoint. Carries the
-/// endpoint's `DeviceTypeList` entry (`device_type` — `DEVICE_TYPE_ROOT_NODE`
-/// on endpoint 0, `DEVICE_TYPE_ON_OFF_LIGHT` on endpoint 1) since that's the
-/// one piece of per-endpoint Descriptor state this flat, non-composed data
-/// model needs; `ServerList`/endpoint-0 `PartsList` are derived from the
-/// registry by `Node::read_attribute_value` instead (see its doc comment)
-/// because they depend on sibling/other-endpoint state this handler can't
-/// see.
+/// endpoint's `DeviceTypeList` entries (`device_types` — `DEVICE_TYPE_ROOT_NODE`
+/// on endpoint 0, `DEVICE_TYPE_ON_OFF_LIGHT` on endpoint 1; a bridged endpoint
+/// carries two entries — its "real" device type plus `DEVICE_TYPE_BRIDGED_NODE`,
+/// spec §9.13) since that's the one piece of per-endpoint Descriptor state
+/// this flat, non-composed data model needs; `ServerList`/endpoint-0
+/// `PartsList` are derived from the registry by `Node::read_attribute_value`
+/// instead (see its doc comment) because they depend on sibling/other-endpoint
+/// state this handler can't see.
 pub struct DescriptorHandler {
-    device_type: u32,
+    device_types: Vec<u32>,
+    /// この endpoint 自身の PartsList（EP0 以外用 — EP0 は従来どおり
+    /// `Node::read_attribute_value` が registry から導出して intercept）。
+    /// EP1 Aggregator が bridged EP 群を静的に持つ（設定反映は再起動のみ
+    /// なので動的導出は不要 — YAGNI）。
+    parts: Vec<u16>,
 }
 
 impl DescriptorHandler {
     /// A Descriptor handler for an endpoint whose `DeviceTypeList` is the
     /// single entry `device_type` (revision 1 — M2 scope has no device type
-    /// revisions beyond the first).
+    /// revisions beyond the first), with an empty `PartsList`.
     pub fn for_device(device_type: u32) -> Self {
-        Self { device_type }
+        Self {
+            device_types: vec![device_type],
+            parts: Vec::new(),
+        }
+    }
+
+    /// A Descriptor handler for an endpoint whose `DeviceTypeList` carries
+    /// multiple entries (each revision 1) — a bridged endpoint's "real"
+    /// device type plus `DEVICE_TYPE_BRIDGED_NODE`, per spec §9.13.
+    pub fn for_device_types(device_types: &[u32]) -> Self {
+        Self {
+            device_types: device_types.to_vec(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// Builder: sets a static `PartsList` — the Aggregator endpoint's
+    /// bridged children. Only meaningful on a non-zero endpoint (endpoint
+    /// 0's `PartsList` is always derived by `Node::read_attribute_value`,
+    /// which intercepts it before this handler's `read` runs).
+    pub fn with_parts(mut self, parts: Vec<u16>) -> Self {
+        self.parts = parts;
+        self
     }
 }
 
@@ -1062,10 +1090,12 @@ impl ClusterHandler for DescriptorHandler {
             im::ATTR_DEVICE_TYPE_LIST => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
-                w.start_struct(Tag::Anonymous); // DeviceTypeStruct
-                w.put_uint(Tag::Context(0), u64::from(self.device_type));
-                w.put_uint(Tag::Context(1), 1); // Revision
-                w.end_container();
+                for device_type in &self.device_types {
+                    w.start_struct(Tag::Anonymous); // DeviceTypeStruct
+                    w.put_uint(Tag::Context(0), u64::from(*device_type));
+                    w.put_uint(Tag::Context(1), 1); // Revision
+                    w.end_container();
+                }
                 w.end_container();
                 Some(w.finish())
             }
@@ -1073,11 +1103,15 @@ impl ClusterHandler for DescriptorHandler {
             // intercepted and derived from the `Node`'s registry by
             // `Node::read_attribute_value` — never reach here (see that
             // override's doc comment). This is endpoint != 0's PartsList
-            // (always empty: M2 endpoints have no children) and endpoint
-            // 0's own fallback, which `read_attribute_value` never takes.
+            // (`self.parts` — empty unless `with_parts` set it, as on the
+            // EP1 Aggregator) and endpoint 0's own fallback, which
+            // `read_attribute_value` never takes.
             im::ATTR_PARTS_LIST => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
+                for id in &self.parts {
+                    w.put_uint(Tag::Anonymous, u64::from(*id));
+                }
                 w.end_container();
                 Some(w.finish())
             }
@@ -1670,6 +1704,45 @@ mod tests {
             msg.reports[0].data,
             Some(serde_json::json!([{"0": im::DEVICE_TYPE_ON_OFF_LIGHT, "1": 1}]))
         );
+    }
+
+    /// M3 bridged topology: EP2 is a bridged On/Off Light that also carries
+    /// `DEVICE_TYPE_BRIDGED_NODE` (spec §9.13 — every bridged endpoint's
+    /// `DeviceTypeList` includes it alongside its "real" device type), and
+    /// EP1 is the Aggregator whose static `PartsList` names EP2 as its one
+    /// bridged child.
+    #[test]
+    fn descriptor_multi_device_types_and_static_parts() {
+        let mut node = Node::new();
+        node.add_endpoint(
+            2,
+            vec![Box::new(DescriptorHandler::for_device_types(&[
+                im::DEVICE_TYPE_ON_OFF_LIGHT,
+                im::DEVICE_TYPE_BRIDGED_NODE,
+            ]))],
+        );
+        node.add_endpoint(
+            1,
+            vec![Box::new(
+                DescriptorHandler::for_device(im::DEVICE_TYPE_AGGREGATOR).with_parts(vec![2]),
+            )],
+        );
+
+        let req = im::encode_read_request(2, im::CLUSTER_DESCRIPTOR, im::ATTR_DEVICE_TYPE_LIST);
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(
+            msg.reports[0].data,
+            Some(serde_json::json!([
+                {"0": im::DEVICE_TYPE_ON_OFF_LIGHT, "1": 1},
+                {"0": im::DEVICE_TYPE_BRIDGED_NODE, "1": 1},
+            ]))
+        );
+
+        let req = im::encode_read_request(1, im::CLUSTER_DESCRIPTOR, im::ATTR_PARTS_LIST);
+        let (_, payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!([2])));
     }
 
     /// A `Node` with the standard root endpoint (Descriptor + BasicInfo)
