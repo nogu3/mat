@@ -4,6 +4,7 @@
 //! mechanically by `cargo check -p mat-device --no-default-features` in CI.
 
 pub mod access_control;
+pub mod bridged_device_basic_information;
 pub mod case;
 pub mod commissioning;
 pub mod datamodel;
