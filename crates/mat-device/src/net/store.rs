@@ -7,7 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::access_control::{AclDeviceEntry, AclPersist};
+use crate::core::datamodel::BasicInfoPersist;
 use crate::core::fabric_store::{FabricEntry, FabricPersist};
 
 /// Persists the fabric table as one JSON file at a fixed path.
@@ -84,6 +87,66 @@ impl AclPersist for FileAclStore {
 /// mirrors [`store_in_dir`] above.
 pub fn acl_store_in_dir(dir: &Path) -> FileAclStore {
     FileAclStore::new(dir.join("acl.json"))
+}
+
+/// Whole-record shape persisted at `<dir>/basic_info.json` — just the two
+/// writable BasicInformation attributes (`FileAclStore`'s whole-table JSON
+/// shape scaled down to a single struct, since there's no per-fabric or
+/// per-entry list here).
+#[derive(Serialize, Deserialize)]
+struct BasicInfoRecord {
+    node_label: String,
+    location: String,
+}
+
+/// File-backed [`BasicInfoPersist`](crate::core::datamodel::BasicInfoPersist)
+/// implementation — same JSON-via-`serde_json` +
+/// `mat_core::fsatomic::write_atomic` discipline as [`FileAclStore`] above.
+/// No key material here either, so no owner-only permission restriction.
+pub struct FileBasicInfoStore {
+    path: PathBuf,
+}
+
+impl FileBasicInfoStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl BasicInfoPersist for FileBasicInfoStore {
+    fn save(&self, node_label: &str, location: &str) -> Result<(), String> {
+        let record = BasicInfoRecord {
+            node_label: node_label.to_string(),
+            location: location.to_string(),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
+    }
+}
+
+/// Convenience: builds a [`FileBasicInfoStore`] rooted at `dir`
+/// (`basic_info.json`) — mirrors [`acl_store_in_dir`] above.
+pub fn basic_info_in_dir(dir: &Path) -> FileBasicInfoStore {
+    FileBasicInfoStore::new(dir.join("basic_info.json"))
+}
+
+/// Loads `<dir>/basic_info.json`'s `(node_label, location)` pair for
+/// `Node::with_root_endpoint_persisted`'s initial values. Unlike
+/// `AclPersist`/`FabricPersist::load` (which return `Result` and let the
+/// caller decide how to treat an error), this collapses "file doesn't
+/// exist yet" (first boot) and "corrupt JSON" alike to the spec-default
+/// `("", "XX")` — `BasicInfoPersist` is save-only (module doc), so there's
+/// no trait method to route this through; the caller (`device::Device::
+/// new`) has no better fallback than the spec default either way.
+pub fn load_basic_info(dir: &Path) -> (String, String) {
+    let path = dir.join("basic_info.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<BasicInfoRecord>(&bytes) {
+            Ok(record) => (record.node_label, record.location),
+            Err(_) => (String::new(), "XX".to_string()),
+        },
+        Err(_) => (String::new(), "XX".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +271,40 @@ mod tests {
         };
         let entries = decode_entries_for_test(&h.read(im::ATTR_ACL, &ctx).unwrap());
         assert_eq!(entries, vec![(5u8, 2u8, vec![112233u64], 1u8)]);
+    }
+
+    #[test]
+    fn basic_info_save_then_load_roundtrips_node_label_and_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = basic_info_in_dir(dir.path());
+        store.save("Living Room", "JP").unwrap();
+        assert_eq!(
+            load_basic_info(dir.path()),
+            ("Living Room".to_string(), "JP".to_string())
+        );
+    }
+
+    /// No `basic_info.json` yet (first boot) falls back to the spec
+    /// defaults `("", "XX")` rather than erroring.
+    #[test]
+    fn basic_info_load_with_no_file_yet_is_spec_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_basic_info(dir.path()),
+            (String::new(), "XX".to_string())
+        );
+    }
+
+    /// Corrupt JSON falls back to the same spec default as a missing file
+    /// — `load_basic_info` never propagates a parse error to its caller
+    /// (module doc).
+    #[test]
+    fn basic_info_load_with_corrupt_file_is_spec_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("basic_info.json"), b"not json").unwrap();
+        assert_eq!(
+            load_basic_info(dir.path()),
+            (String::new(), "XX".to_string())
+        );
     }
 }

@@ -322,11 +322,65 @@ impl Node {
     /// Same as [`with_root_endpoint`], but with an explicit UniqueID (spec
     /// §11.1.6.15) rather than the fixed `"matv-dev"` fallback — what
     /// `device::Device::new` uses so BasicInformation's UniqueID is the
-    /// per-install value persisted at `<store_dir>/unique_id`, stable
-    /// across restarts.
+    /// per-install value persisted at `<store_dir>/unique_id`. Delegates to
+    /// [`with_root_endpoint_persisted_impl`] with the spec-default
+    /// NodeLabel/Location (`""`/`"XX"`) and no persist backend — the ~15
+    /// existing call sites (mostly tests) never touch disk for
+    /// NodeLabel/Location, same as before this task.
     ///
     /// [`with_root_endpoint`]: Self::with_root_endpoint
+    /// [`with_root_endpoint_persisted_impl`]: Self::with_root_endpoint_persisted_impl
     pub fn with_root_endpoint_unique(vendor_id: u16, product_id: u16, unique_id: &str) -> Self {
+        Self::with_root_endpoint_persisted_impl(
+            vendor_id,
+            product_id,
+            unique_id,
+            String::new(),
+            "XX".to_string(),
+            None,
+        )
+    }
+
+    /// Same as [`with_root_endpoint_unique`], but with NodeLabel/Location
+    /// seeded from whatever was last persisted (`device::Device::new` loads
+    /// them via `net::store::load_basic_info`) and a `persist` backend the
+    /// handler saves to on every future NodeLabel/Location write — the
+    /// `AclPersist`/`FabricPersist` injection pattern, applied to
+    /// BasicInformation's two writable attributes.
+    ///
+    /// [`with_root_endpoint_unique`]: Self::with_root_endpoint_unique
+    pub fn with_root_endpoint_persisted(
+        vendor_id: u16,
+        product_id: u16,
+        unique_id: &str,
+        node_label: String,
+        location: String,
+        persist: Box<dyn BasicInfoPersist>,
+    ) -> Self {
+        Self::with_root_endpoint_persisted_impl(
+            vendor_id,
+            product_id,
+            unique_id,
+            node_label,
+            location,
+            Some(persist),
+        )
+    }
+
+    /// Shared construction path [`with_root_endpoint_unique`] and
+    /// [`with_root_endpoint_persisted`] both funnel through — the only
+    /// difference between them is whether a persist backend is wired in.
+    ///
+    /// [`with_root_endpoint_unique`]: Self::with_root_endpoint_unique
+    /// [`with_root_endpoint_persisted`]: Self::with_root_endpoint_persisted
+    fn with_root_endpoint_persisted_impl(
+        vendor_id: u16,
+        product_id: u16,
+        unique_id: &str,
+        node_label: String,
+        location: String,
+        persist: Option<Box<dyn BasicInfoPersist>>,
+    ) -> Self {
         let mut node = Self::new();
         node.add_endpoint(
             0,
@@ -337,7 +391,9 @@ impl Node {
                     vendor_id,
                     product_id,
                     unique_id: unique_id.to_string(),
-                    node_label: String::new(),
+                    node_label,
+                    location,
+                    persist,
                 }) as Box<dyn ClusterHandler>,
             ],
         );
@@ -1125,22 +1181,58 @@ impl ClusterHandler for DescriptorHandler {
     }
 }
 
+/// Persistence boundary `core` calls through instead of touching a
+/// filesystem directly — same shape as `core::access_control::AclPersist`/
+/// `core::fabric_store::FabricPersist` (see those traits' docs for the
+/// `: Send`/object-safety rationale), but save-only: NodeLabel/Location's
+/// *initial* value is whatever the constructor is handed (loaded by the
+/// caller, e.g. `net::store::load_basic_info`), not something this trait
+/// loads itself. A save failure is logged and ignored, same disposition as
+/// `AclPersist` (see `BasicInformationHandler::persist_state`'s doc).
+pub trait BasicInfoPersist: Send {
+    fn save(&self, node_label: &str, location: &str) -> Result<(), String>;
+}
+
 /// BasicInformation cluster (spec §11.1), mandatory on endpoint 0. Task 5
-/// fills in every attribute Apple Home's post-commissioning interview reads
-/// (beyond the identity attributes M1 already served): NodeLabel is the
-/// only writable one (in-memory, resets on restart — no disk persistence
-/// asked for), everything else is either a fixed value or, for UniqueID,
-/// whatever the constructor was handed (`device::Device::new` threads
-/// through the value persisted at `<store_dir>/unique_id`).
+/// filled in every attribute Apple Home's post-commissioning interview
+/// reads (beyond the identity attributes M1 already served); Task 10 adds
+/// disk persistence for the two writable ones (NodeLabel/Location) via an
+/// injected `BasicInfoPersist` — everything else here is either a fixed
+/// value or, for UniqueID, whatever the constructor was handed
+/// (`device::Device::new` threads through the value persisted at
+/// `<store_dir>/unique_id`, a separate file predating this task).
 struct BasicInformationHandler {
     vendor_id: u16,
     product_id: u16,
     unique_id: String,
-    /// NodeLabel (spec §11.1.6.2) — the one writable attribute this
-    /// handler carries state for. Starts empty (spec default); `write`
-    /// mutates it directly since `Node::handle_write` already gives every
-    /// `ClusterHandler::write` call `&mut self`.
+    /// NodeLabel (spec §11.1.6.2) — writable, persisted via `persist` on
+    /// change. `write` mutates it directly since `Node::handle_write`
+    /// already gives every `ClusterHandler::write` call `&mut self`.
     node_label: String,
+    /// Location (spec §11.1.6.6, `CountryCode`) — writable, persisted via
+    /// `persist` on change. Spec default `"XX"` (unknown/unset).
+    location: String,
+    /// Save backend for NodeLabel/Location — `None` for the ~15 existing
+    /// `with_root_endpoint`/`with_root_endpoint_unique` call sites that
+    /// never asked for persistence.
+    persist: Option<Box<dyn BasicInfoPersist>>,
+}
+
+impl BasicInformationHandler {
+    /// Saves the current NodeLabel/Location to `persist`, if any (no-op for
+    /// the non-persisted constructors). Called only when a write actually
+    /// changes a value — dedup writes never reach here. A save failure is
+    /// `tracing::warn`ed and otherwise ignored: the write that triggered it
+    /// has already succeeded and updated in-memory state, which stays
+    /// authoritative; the next write to either attribute retries the save
+    /// (same disposition `AclStore::save` documents for `AclPersist`).
+    fn persist_state(&self) {
+        if let Some(persist) = &self.persist {
+            if let Err(e) = persist.save(&self.node_label, &self.location) {
+                tracing::warn!("basic information store save failed: {e}");
+            }
+        }
+    }
 }
 
 /// CaseSessionsPerFabric/SubscriptionsPerFabric (spec §11.1.6.16,
@@ -1157,6 +1249,28 @@ const SPECIFICATION_VERSION: u64 = 0x0104_0000;
 /// NodeLabel's upper bound (spec §11.1.6.2, `string32`) — measured in UTF-8
 /// **characters**, not bytes.
 const NODE_LABEL_MAX_CHARS: usize = 32;
+
+/// Location's fixed length (spec §11.1.6.6, `CountryCode` — ISO 3166-1
+/// alpha-2, or `"XX"` for unset/unknown) — measured in UTF-8 **characters**,
+/// not bytes. Unlike NodeLabel this isn't an upper bound: any length other
+/// than exactly 2 is rejected.
+const LOCATION_CHARS: usize = 2;
+
+/// Decodes a write payload expected to be a single anonymous UTF-8 TLV
+/// element — the shape both NodeLabel and Location writes take. Shared by
+/// `BasicInformationHandler::write`'s two branches so the
+/// malformed-TLV/wrong-type rejection (`STATUS_CONSTRAINT_ERROR`) is
+/// written once.
+fn decode_utf8_write(data_tlv: &[u8]) -> Result<String, u8> {
+    let mut r = Reader::new(data_tlv);
+    let Ok(Some(element)) = r.next() else {
+        return Err(im::STATUS_CONSTRAINT_ERROR);
+    };
+    let Value::Utf8(s) = element.value else {
+        return Err(im::STATUS_CONSTRAINT_ERROR);
+    };
+    Ok(s.to_string())
+}
 
 impl ClusterHandler for BasicInformationHandler {
     fn cluster_id(&self) -> u32 {
@@ -1197,7 +1311,7 @@ impl ClusterHandler for BasicInformationHandler {
             im::ATTR_VENDOR_NAME => Some(str_value("mat")),
             im::ATTR_PRODUCT_NAME => Some(str_value("matv")),
             im::ATTR_BI_NODE_LABEL => Some(str_value(&self.node_label)),
-            im::ATTR_BI_LOCATION => Some(str_value("XX")),
+            im::ATTR_BI_LOCATION => Some(str_value(&self.location)),
             im::ATTR_BI_HARDWARE_VERSION => Some(uint_value(1)),
             im::ATTR_BI_HARDWARE_VERSION_STRING => Some(str_value("matv")),
             im::ATTR_BI_SOFTWARE_VERSION => Some(uint_value(1)),
@@ -1215,10 +1329,17 @@ impl ClusterHandler for BasicInformationHandler {
         InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
     }
 
-    /// NodeLabel is the only writable attribute (spec §11.1.6.2); every
-    /// other BasicInformation attribute keeps the default `write`
-    /// (`STATUS_UNSUPPORTED_WRITE`). `list_append` is irrelevant — NodeLabel
-    /// isn't a list — so it's ignored, matching the trait doc's guidance for
+    /// NodeLabel and Location are the two writable attributes (spec
+    /// §11.1.6.2/§11.1.6.6); every other BasicInformation attribute keeps
+    /// the default `write` (`STATUS_UNSUPPORTED_WRITE`). Both branches
+    /// dedup (a write equal to the current value is `Ok(())` but neither
+    /// reports `ctx.changed` nor calls `persist.save` — Apple Home's
+    /// post-commissioning interview writes these unconditionally on every
+    /// connect, and a same-value write is not a change worth a dirty
+    /// report or a disk write) and, on an actual change, persist the new
+    /// `(node_label, location)` pair (`persist_state`'s doc covers save
+    /// failure handling). `list_append` is irrelevant to either — neither
+    /// is a list — so it's ignored, matching the trait doc's guidance for
     /// clusters with no list attribute.
     fn write(
         &mut self,
@@ -1227,22 +1348,35 @@ impl ClusterHandler for BasicInformationHandler {
         _list_append: bool,
         ctx: &mut InvokeCtx,
     ) -> Result<(), u8> {
-        if attribute != im::ATTR_BI_NODE_LABEL {
-            return Err(im::STATUS_UNSUPPORTED_WRITE);
+        match attribute {
+            im::ATTR_BI_NODE_LABEL => {
+                let s = decode_utf8_write(data_tlv)?;
+                if s.chars().count() > NODE_LABEL_MAX_CHARS {
+                    return Err(im::STATUS_CONSTRAINT_ERROR);
+                }
+                if s == self.node_label {
+                    return Ok(());
+                }
+                self.node_label = s;
+                ctx.changed.push(im::ATTR_BI_NODE_LABEL);
+                self.persist_state();
+                Ok(())
+            }
+            im::ATTR_BI_LOCATION => {
+                let s = decode_utf8_write(data_tlv)?;
+                if s.chars().count() != LOCATION_CHARS {
+                    return Err(im::STATUS_CONSTRAINT_ERROR);
+                }
+                if s == self.location {
+                    return Ok(());
+                }
+                self.location = s;
+                ctx.changed.push(im::ATTR_BI_LOCATION);
+                self.persist_state();
+                Ok(())
+            }
+            _ => Err(im::STATUS_UNSUPPORTED_WRITE),
         }
-        let mut r = Reader::new(data_tlv);
-        let Ok(Some(element)) = r.next() else {
-            return Err(im::STATUS_CONSTRAINT_ERROR);
-        };
-        let Value::Utf8(s) = element.value else {
-            return Err(im::STATUS_CONSTRAINT_ERROR);
-        };
-        if s.chars().count() > NODE_LABEL_MAX_CHARS {
-            return Err(im::STATUS_CONSTRAINT_ERROR);
-        }
-        self.node_label = s.to_string();
-        ctx.changed.push(im::ATTR_BI_NODE_LABEL);
-        Ok(())
     }
 }
 
@@ -1426,6 +1560,190 @@ mod tests {
         assert_eq!(
             im::decode_write_response(&resp).unwrap(),
             im::STATUS_CONSTRAINT_ERROR
+        );
+    }
+
+    /// Writes a single anonymous UTF-8 TLV element to `attribute` and
+    /// returns the resulting `ImOutcome` — shared by the Task 10
+    /// NodeLabel/Location tests below (dedup, Location constraint, persist)
+    /// so each test body is just the assertions.
+    fn write_bi_str(node: &mut Node, attribute: u32, value: &str) -> ImOutcome {
+        let mut data = Writer::new();
+        data.put_str(Tag::Anonymous, value);
+        let payload = im::encode_write_request_tlv(
+            0,
+            im::CLUSTER_BASIC_INFORMATION,
+            attribute,
+            &data.finish(),
+        );
+        node.handle_im(
+            im::OPCODE_WRITE_REQUEST,
+            &payload,
+            &mut InvokeCtx::default(),
+            &ReadCtx::default(),
+        )
+        .unwrap()
+    }
+
+    /// A write equal to the current NodeLabel is `Ok` but must not appear
+    /// in `ImOutcome::changed` — Apple Home's post-commissioning interview
+    /// writes NodeLabel unconditionally on every connect, and a same-value
+    /// write is not a change worth a dirty report (brief's "無変化 dirty
+    /// レポートの抑止").
+    #[test]
+    fn node_label_write_same_value_is_dedup_noop() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let first = write_bi_str(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room");
+        assert_eq!(
+            first.changed,
+            vec![(0u16, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_NODE_LABEL)]
+        );
+        let second = write_bi_str(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room");
+        assert_eq!(
+            im::decode_write_response(&second.payload).unwrap(),
+            im::STATUS_SUCCESS
+        );
+        assert!(second.changed.is_empty());
+    }
+
+    /// Location (spec §11.1.6.6) is writable, reflects on read, and reports
+    /// `ImOutcome::changed` on an actual change — same contract as
+    /// NodeLabel's existing test above.
+    #[test]
+    fn location_write_then_read_reflects_change_and_reports_changed() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let outcome = write_bi_str(&mut node, im::ATTR_BI_LOCATION, "JP");
+        assert_eq!(
+            im::decode_write_response(&outcome.payload).unwrap(),
+            im::STATUS_SUCCESS
+        );
+        assert_eq!(
+            outcome.changed,
+            vec![(0u16, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_LOCATION)]
+        );
+
+        let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_LOCATION);
+        let (_, read_payload) = handle_im_ok(&mut node, im::OPCODE_READ_REQUEST, &req);
+        let msg = decode_report_data_message(&read_payload).unwrap();
+        assert_eq!(msg.reports[0].data, Some(serde_json::json!("JP")));
+    }
+
+    /// Location must be exactly 2 UTF-8 characters (spec §11.1.6.6
+    /// `CountryCode`) — both a 3-character and a 1-character write are
+    /// rejected wholesale (CONSTRAINT_ERROR), not truncated/padded.
+    #[test]
+    fn location_write_wrong_length_is_constraint_error() {
+        for value in ["JPN", "J"] {
+            let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+            let outcome = write_bi_str(&mut node, im::ATTR_BI_LOCATION, value);
+            assert_eq!(
+                im::decode_write_response(&outcome.payload).unwrap(),
+                im::STATUS_CONSTRAINT_ERROR,
+                "value {value:?} should be rejected"
+            );
+        }
+    }
+
+    /// Same dedup contract as `node_label_write_same_value_is_dedup_noop`,
+    /// for Location.
+    #[test]
+    fn location_write_same_value_is_dedup_noop() {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        let first = write_bi_str(&mut node, im::ATTR_BI_LOCATION, "JP");
+        assert_eq!(
+            first.changed,
+            vec![(0u16, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_LOCATION)]
+        );
+        let second = write_bi_str(&mut node, im::ATTR_BI_LOCATION, "JP");
+        assert_eq!(
+            im::decode_write_response(&second.payload).unwrap(),
+            im::STATUS_SUCCESS
+        );
+        assert!(second.changed.is_empty());
+    }
+
+    /// Test-only `BasicInfoPersist`: records every `save` call's
+    /// `(node_label, location)` pair — lets a test assert both "a real
+    /// change delivers the new values" and "a dedup write never calls
+    /// save" against the same backing `Vec`.
+    struct MemBasicInfoPersist(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl BasicInfoPersist for MemBasicInfoPersist {
+        fn save(&self, node_label: &str, location: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((node_label.to_string(), location.to_string()));
+            Ok(())
+        }
+    }
+
+    /// `with_root_endpoint_persisted` wires NodeLabel/Location writes to
+    /// the injected `BasicInfoPersist`: a real change calls `save` with the
+    /// new values, and a same-value (dedup) write calls it zero additional
+    /// times — persist only fires on an actual change (brief).
+    #[test]
+    fn basic_info_persist_receives_changes_but_not_dedup_writes() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut node = Node::with_root_endpoint_persisted(
+            0xFFF1,
+            0x8000,
+            "unique-abc123",
+            String::new(),
+            "XX".to_string(),
+            Box::new(MemBasicInfoPersist(std::sync::Arc::clone(&calls))),
+        );
+
+        write_bi_str(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("Living Room".to_string(), "XX".to_string())]
+        );
+
+        write_bi_str(&mut node, im::ATTR_BI_LOCATION, "JP");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("Living Room".to_string(), "XX".to_string()),
+                ("Living Room".to_string(), "JP".to_string()),
+            ]
+        );
+
+        // Same-value writes to both attributes: no additional save calls.
+        write_bi_str(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room");
+        write_bi_str(&mut node, im::ATTR_BI_LOCATION, "JP");
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    /// `with_root_endpoint_persisted` seeds NodeLabel/Location from its
+    /// `node_label`/`location` arguments (what `device::Device::new` loads
+    /// via `net::store::load_basic_info`) rather than the `""`/`"XX"`
+    /// spec-default fallback `with_root_endpoint_unique` uses.
+    #[test]
+    fn with_root_endpoint_persisted_seeds_initial_node_label_and_location() {
+        let mut node = Node::with_root_endpoint_persisted(
+            0xFFF1,
+            0x8000,
+            "unique-abc123",
+            "Living Room".to_string(),
+            "JP".to_string(),
+            Box::new(MemBasicInfoPersist(std::sync::Arc::new(
+                std::sync::Mutex::new(Vec::new()),
+            ))),
+        );
+        let read = |node: &mut Node, attribute: u32| -> serde_json::Value {
+            let req = im::encode_read_request(0, im::CLUSTER_BASIC_INFORMATION, attribute);
+            let (_, payload) = handle_im_ok(node, im::OPCODE_READ_REQUEST, &req);
+            let msg = decode_report_data_message(&payload).unwrap();
+            msg.reports[0].data.clone().unwrap()
+        };
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_NODE_LABEL),
+            serde_json::json!("Living Room")
+        );
+        assert_eq!(
+            read(&mut node, im::ATTR_BI_LOCATION),
+            serde_json::json!("JP")
         );
     }
 

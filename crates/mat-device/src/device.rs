@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use crate::core::commissioning::CommissioningServer;
 use crate::core::datamodel::{DescriptorHandler, Node};
 use crate::core::fabric_store::FabricStore;
-use crate::net::store::store_in_dir;
+use crate::net::store::{basic_info_in_dir, load_basic_info, store_in_dir};
 
 /// spec §5.1.4.2 `DiscoveryCapabilitiesBitmask`: bit 2 = on-network. This
 /// device advertises no other discovery capability (no BLE/SoftAP) — same
@@ -158,7 +158,7 @@ fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<Stri
         }
     }
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("os rng");
+    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(format!("os rng: {e}")))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(&path, &hex)?;
     Ok(hex)
@@ -263,8 +263,20 @@ impl Device {
         comm_server.set_acl_store(acl_store.clone());
 
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
-        let mut node =
-            Node::with_root_endpoint_unique(config.vendor_id, config.product_id, &unique_id);
+        // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
+        // 保存値（無ければ spec default の ("", "XX")）を初期値として渡し、
+        // 以降の write は `basic_info_in_dir` へ save される
+        // （`FabricStore`/`AclStore` と同じ「ディレクトリを渡して
+        // file-backed persist を注入する」配線）。
+        let (node_label, location) = load_basic_info(&config.store_dir);
+        let mut node = Node::with_root_endpoint_persisted(
+            config.vendor_id,
+            config.product_id,
+            &unique_id,
+            node_label,
+            location,
+            Box::new(basic_info_in_dir(&config.store_dir)),
+        );
         // DataVersion のブート時乱数初期化 (spec §7.10.3) — `core` は乱数源
         // を持ち込まないので、`getrandom` はここ（呼び出し側）で引いて
         // `Node` に渡す。node 単位の共通 base で十分（`set_data_version_
