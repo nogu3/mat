@@ -2,6 +2,7 @@
 //! `core`. Gated behind the `net` feature (default on).
 
 pub mod case;
+pub mod endpoint_ledger;
 pub mod mdns;
 pub mod pase;
 pub(crate) mod runtime;
