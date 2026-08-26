@@ -428,16 +428,28 @@ pub(crate) fn decode_entries_for_test(tlv: &[u8]) -> Vec<(u8, u8, Vec<u64>, u8)>
 mod tests {
     use super::*;
 
+    /// A `ReadCtx` for a session on `fabric_index`. The ACL attribute is
+    /// fabric-scoped in `read` unconditionally (it only ever answers with
+    /// the accessing fabric's entries), so `fabric_filtered` doesn't change
+    /// what these tests see — leaving it at the default keeps each call site
+    /// about the one thing it varies.
+    fn read_ctx(fabric_index: u8) -> ReadCtx {
+        ReadCtx {
+            fabric_index,
+            ..ReadCtx::default()
+        }
+    }
+
     #[test]
     fn add_noc_style_admin_entry_reads_back_for_its_fabric_only() {
         let store = AclStore::new();
         store.add_case_admin(1, 112233);
         let h = AccessControlHandler::new(store);
-        let tlv = h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap();
+        let tlv = h.read(im::ATTR_ACL, &read_ctx(1)).unwrap();
         let entries = decode_entries_for_test(&tlv);
         assert_eq!(entries, vec![(5u8, 2u8, vec![112233u64], 1u8)]);
         // 他 fabric からは空
-        let tlv = h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 2 }).unwrap();
+        let tlv = h.read(im::ATTR_ACL, &read_ctx(2)).unwrap();
         assert!(decode_entries_for_test(&tlv).is_empty());
     }
 
@@ -455,13 +467,11 @@ mod tests {
         };
         assert_eq!(h.write(im::ATTR_ACL, &data, false, &mut ctx), Ok(()));
         assert_eq!(ctx.changed, vec![im::ATTR_ACL]);
-        let entries =
-            decode_entries_for_test(&h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap());
+        let entries = decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert_eq!(entries.len(), 2);
         // fabric2 は無傷
         assert_eq!(
-            decode_entries_for_test(&h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 2 }).unwrap())
-                .len(),
+            decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(2)).unwrap()).len(),
             1
         );
     }
@@ -473,13 +483,9 @@ mod tests {
         store.add_case_admin(2, 222);
         store.purge_fabric(1);
         let h = AccessControlHandler::new(store);
-        assert!(decode_entries_for_test(
-            &h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap()
-        )
-        .is_empty());
+        assert!(decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).is_empty());
         assert_eq!(
-            decode_entries_for_test(&h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 2 }).unwrap())
-                .len(),
+            decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(2)).unwrap()).len(),
             1
         );
     }
@@ -499,8 +505,7 @@ mod tests {
         );
         assert!(ctx.changed.is_empty());
         assert_eq!(
-            decode_entries_for_test(&h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap())
-                .len(),
+            decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             1
         );
     }
@@ -519,10 +524,7 @@ mod tests {
         let empty = encode_entries_for_test(&[]);
         assert_eq!(h.write(im::ATTR_ACL, &empty, false, &mut ctx), Ok(()));
         assert_eq!(ctx.changed, vec![im::ATTR_ACL]);
-        assert!(decode_entries_for_test(
-            &h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap()
-        )
-        .is_empty());
+        assert!(decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).is_empty());
 
         // (b) ListIndex null の append を 1 エントリずつ
         ctx.changed.clear();
@@ -535,8 +537,7 @@ mod tests {
         assert_eq!(h.write(im::ATTR_ACL, &entry2, true, &mut ctx), Ok(()));
         assert_eq!(ctx.changed, vec![im::ATTR_ACL]);
 
-        let entries =
-            decode_entries_for_test(&h.read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 }).unwrap());
+        let entries = decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert_eq!(
             entries,
             vec![(5u8, 2u8, vec![111u64], 1u8), (3u8, 2u8, vec![222u64], 1u8)]

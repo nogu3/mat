@@ -105,6 +105,13 @@ const ATTR_OC_COMMISSIONED_FABRICS: u32 = 3;
 const ATTR_OC_TRUSTED_ROOT_CERTIFICATES: u32 = 4;
 const ATTR_OC_CURRENT_FABRIC_INDEX: u32 = 5;
 
+/// How many fabrics this device can hold (spec §11.17.5.2,
+/// `SupportedFabrics`; the spec's own floor is 5). Single source of truth
+/// for both the attribute's value and `handle_add_noc`'s capacity check —
+/// an `AddNOC` that installed a sixth fabric would contradict the number
+/// the device just reported.
+const SUPPORTED_FABRICS: u8 = 5;
+
 /// Administrator Commissioning (0x003C) attribute ids this server serves
 /// (spec §11.19.5). `WindowStatus` is 0 (closed) or 1 (`EnhancedWindowOpen`
 /// — this server only ever opens an ECM window, never the legacy basic-
@@ -693,14 +700,18 @@ impl Inner {
     /// reflecting whatever `AddNOC` has installed into `self.store` so far.
     /// `CurrentFabricIndex` (spec §11.17.5.3) is the reading session's own
     /// fabric index — carried in `ctx` (`ReadCtx`), not derivable from
-    /// `self.store` alone.
+    /// `self.store` alone. `NOCs`/`Fabrics`/`TrustedRootCertificates` are
+    /// fabric-scoped lists, so `ctx.fabric_filtered` decides whether they
+    /// answer with the accessing fabric's entry alone or the whole table
+    /// (see `fabric_scoped_entries`); the two counters are plain scalars and
+    /// are never filtered.
     fn read_operational_credentials(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            ATTR_OC_NOCS => Some(self.encode_nocs()),
-            ATTR_OC_FABRICS => Some(self.encode_fabrics()),
-            ATTR_OC_SUPPORTED_FABRICS => Some(uint_value(5)),
+            ATTR_OC_NOCS => Some(self.encode_nocs(ctx)),
+            ATTR_OC_FABRICS => Some(self.encode_fabrics(ctx)),
+            ATTR_OC_SUPPORTED_FABRICS => Some(uint_value(u64::from(SUPPORTED_FABRICS))),
             ATTR_OC_COMMISSIONED_FABRICS => Some(uint_value(self.store.entries().len() as u64)),
-            ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates()),
+            ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates(ctx)),
             ATTR_OC_CURRENT_FABRIC_INDEX => Some(uint_value(u64::from(ctx.fabric_index))),
             _ => None,
         }
@@ -728,12 +739,30 @@ impl Inner {
         }
     }
 
+    /// The fabric table as one read should see it: every entry when the
+    /// request asked for the unfiltered view, otherwise only the accessing
+    /// fabric's (spec §8.9.2.4 — a fabric-filtered read of a fabric-scoped
+    /// list returns just the accessing fabric's entries). A PASE session
+    /// (`fabric_index` 0, never a valid index) therefore matches nothing and
+    /// gets an empty list, which is exactly right: it has no fabric whose
+    /// credentials it is entitled to see.
+    fn fabric_scoped_entries(&self, ctx: &ReadCtx) -> impl Iterator<Item = &FabricEntry> {
+        // Copied out of `ctx` rather than borrowed: the returned iterator
+        // must only borrow `self`, not the caller's `ReadCtx`.
+        let (filtered, accessing) = (ctx.fabric_filtered, ctx.fabric_index);
+        self.store
+            .entries()
+            .iter()
+            .filter(move |e| !filtered || e.fabric_index == accessing)
+    }
+
     /// NOCs(0): `array[ struct{1: NOCValue, 2: ICACValue?, 254:
-    /// FabricIndex} ]` (spec §11.17.5.3, `NOCStruct`).
-    fn encode_nocs(&self) -> Vec<u8> {
+    /// FabricIndex} ]` (spec §11.17.5.3, `NOCStruct`). Fabric-scoped — see
+    /// `fabric_scoped_entries`.
+    fn encode_nocs(&self, ctx: &ReadCtx) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_array(Tag::Anonymous);
-        for entry in self.store.entries() {
+        for entry in self.fabric_scoped_entries(ctx) {
             w.start_struct(Tag::Anonymous);
             w.put_bytes(Tag::Context(1), &entry.noc_tlv);
             if let Some(icac) = &entry.icac_tlv {
@@ -750,11 +779,11 @@ impl Inner {
     /// FabricID, 4: NodeID, 5: Label, 254: FabricIndex} ]` (spec
     /// §11.17.5.3, `FabricDescriptorStruct`). `Label` reflects whatever
     /// `UpdateFabricLabel` (`handle_update_fabric_label`) has set — empty
-    /// until then.
-    fn encode_fabrics(&self) -> Vec<u8> {
+    /// until then. Fabric-scoped — see `fabric_scoped_entries`.
+    fn encode_fabrics(&self, ctx: &ReadCtx) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_array(Tag::Anonymous);
-        for entry in self.store.entries() {
+        for entry in self.fabric_scoped_entries(ctx) {
             w.start_struct(Tag::Anonymous);
             w.put_bytes(Tag::Context(1), &entry.root_public_key);
             w.put_uint(Tag::Context(2), u64::from(entry.admin_vendor_id));
@@ -770,10 +799,14 @@ impl Inner {
 
     /// TrustedRootCertificates(4): `array[ bytes(RootCACertificate TLV) ]`
     /// (spec §11.17.5.3) — one entry per installed fabric's RCAC.
-    fn encode_trusted_root_certificates(&self) -> Vec<u8> {
+    /// Fabric-scoped — see `fabric_scoped_entries`. Its entries carry no
+    /// `FabricIndex` field of their own (they're bare certificate blobs),
+    /// which is precisely why filtering matters here: an unfiltered read
+    /// hands out every commissioner's root with nothing to tell them apart.
+    fn encode_trusted_root_certificates(&self, ctx: &ReadCtx) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_array(Tag::Anonymous);
-        for entry in self.store.entries() {
+        for entry in self.fabric_scoped_entries(ctx) {
             w.put_bytes(Tag::Anonymous, &entry.root_tlv);
         }
         w.end_container();
@@ -1025,6 +1058,19 @@ impl Inner {
             response_command: RESP_NOC,
             fields_tlv: encode_noc_response(status, None),
         };
+
+        // spec §11.17.6.13.1: past `SupportedFabrics` the answer is
+        // `TableFull`, and it comes before any of the certificate checks —
+        // there is no point verifying a chain for a fabric that has nowhere
+        // to go, and the capacity is the same number the `SupportedFabrics`
+        // attribute reports.
+        if self.store.entries().len() >= usize::from(SUPPORTED_FABRICS) {
+            tracing::debug!(
+                supported_fabrics = SUPPORTED_FABRICS,
+                "AddNOC rejected: TableFull"
+            );
+            return noc_status(NOC_STATUS_TABLE_FULL);
+        }
 
         let (Some(root_tlv), Some(op_private_key), Some(op_public_key)) = (
             self.pending.trusted_root_tlv.clone(),
@@ -1404,6 +1450,18 @@ mod tests {
         }
     }
 
+    /// A `ReadCtx` for a session on `fabric_index`, leaving
+    /// `fabric_filtered` at its unfiltered default — for the tests that only
+    /// care *which* fabric is reading. The fabric-filtering behavior itself
+    /// is covered by `oc_reads_are_fabric_scoped_when_fabric_filtered`,
+    /// which spells both fields out at every call site.
+    fn read_ctx(fabric_index: u8) -> ReadCtx {
+        ReadCtx {
+            fabric_index,
+            ..ReadCtx::default()
+        }
+    }
+
     /// A `CommissioningServer` over a freshly generated dev attestation
     /// chain and an in-memory (non-persisted) `FabricStore` — file-backed
     /// persistence is `net`-only and tested in `net::store` instead (this
@@ -1768,11 +1826,7 @@ mod tests {
         install_fabric(&mut server, 0x1122, 0x5001);
 
         let handler = AccessControlHandler::new(acl_store.clone());
-        let entries = decode_entries_for_test(
-            &handler
-                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
-                .unwrap(),
-        );
+        let entries = decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert_eq!(entries, vec![(5u8, 2u8, vec![0xAAu64], 1u8)]);
 
         let ctx = InvokeCtx {
@@ -1788,11 +1842,7 @@ mod tests {
         let (status, _) = decode_noc_response(&resp).unwrap();
         assert_eq!(status, 0);
 
-        let entries = decode_entries_for_test(
-            &handler
-                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
-                .unwrap(),
-        );
+        let entries = decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert!(entries.is_empty());
     }
 
@@ -1875,12 +1925,7 @@ mod tests {
 
         let handler = AccessControlHandler::new(acl_store.clone());
         assert_eq!(
-            decode_entries_for_test(
-                &handler
-                    .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
-                    .unwrap()
-            )
-            .len(),
+            decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             1
         );
 
@@ -1896,12 +1941,9 @@ mod tests {
             &ctx,
         );
         assert_eq!(reply, InvokeReply::Status(im::STATUS_FAILURE));
-        assert!(decode_entries_for_test(
-            &handler
-                .read(im::ATTR_ACL, &ReadCtx { fabric_index: 1 })
-                .unwrap()
-        )
-        .is_empty());
+        assert!(
+            decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).is_empty()
+        );
     }
 
     #[test]
@@ -2099,10 +2141,166 @@ mod tests {
         let (_, oc, _) = server.into_cluster_handlers();
 
         let tlv = oc
-            .read(ATTR_OC_CURRENT_FABRIC_INDEX, &ReadCtx { fabric_index: 1 })
+            .read(ATTR_OC_CURRENT_FABRIC_INDEX, &read_ctx(1))
             .expect("CurrentFabricIndex");
         let mut r = Reader::new(&tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(1));
+    }
+
+    /// Reads every `FabricIndex` (context tag 254) of an
+    /// `array[ struct{ …, 254: FabricIndex } ]` attribute straight off the
+    /// encoded bytes with the TLV `Reader` — no decode helper in between,
+    /// so the assertion is about what actually goes on the wire. Returns one
+    /// entry per array element (and panics if an element carries none, which
+    /// would itself be a spec violation for a fabric-scoped list).
+    fn fabric_indices_of_list(tlv: &[u8]) -> Vec<u64> {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let mut out = Vec::new();
+        loop {
+            match r.next().unwrap().expect("truncated list").value {
+                Value::ContainerEnd => break, // end of the array itself
+                Value::StructStart => {}
+                other => panic!("unexpected array element: {other:?}"),
+            }
+            let mut fabric_index = None;
+            loop {
+                let el = r.next().unwrap().expect("truncated list entry struct");
+                match (el.tag, el.value) {
+                    (_, Value::ContainerEnd) => break,
+                    (Tag::Context(254), Value::Uint(v)) => fabric_index = Some(v),
+                    _ => {}
+                }
+            }
+            out.push(fabric_index.expect("list entry without FabricIndex(254)"));
+        }
+        out
+    }
+
+    /// Number of elements in an `array[ bytes ]` attribute
+    /// (`TrustedRootCertificates`), read off the encoded bytes directly —
+    /// its entries carry no `FabricIndex`, so the count is all there is to
+    /// assert.
+    fn byte_list_len(tlv: &[u8]) -> usize {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let mut n = 0;
+        loop {
+            match r.next().unwrap().expect("truncated byte list").value {
+                Value::ContainerEnd => break,
+                Value::Bytes(_) => n += 1,
+                other => panic!("unexpected array element: {other:?}"),
+            }
+        }
+        n
+    }
+
+    /// spec §11.17.5 / §8.9.2.4: `NOCs`/`Fabrics`/`TrustedRootCertificates`
+    /// are fabric-scoped lists, so a read with `IsFabricFiltered=true` must
+    /// only see the accessing fabric's own entry — anything else leaks one
+    /// commissioner's credentials to another (Apple alone establishes two
+    /// fabrics in practice). A PASE session (fabric index 0, no fabric yet)
+    /// sees an empty list. `IsFabricFiltered=false` keeps the unfiltered
+    /// view.
+    #[test]
+    fn oc_reads_are_fabric_scoped_when_fabric_filtered() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001); // fabric_index 1
+        install_fabric(&mut server, 0x3344, 0x5002); // fabric_index 2
+        assert_eq!(server.fabrics().len(), 2);
+        let (_, oc, _) = server.into_cluster_handlers();
+
+        let read = |attribute: u32, ctx: &ReadCtx| oc.read(attribute, ctx).expect("OC attribute");
+
+        for accessing in [1u8, 2] {
+            let ctx = ReadCtx {
+                fabric_index: accessing,
+                fabric_filtered: true,
+            };
+            assert_eq!(
+                fabric_indices_of_list(&read(ATTR_OC_NOCS, &ctx)),
+                vec![u64::from(accessing)],
+                "NOCs must only carry fabric {accessing}'s entry"
+            );
+            assert_eq!(
+                fabric_indices_of_list(&read(ATTR_OC_FABRICS, &ctx)),
+                vec![u64::from(accessing)],
+                "Fabrics must only carry fabric {accessing}'s entry"
+            );
+            assert_eq!(
+                byte_list_len(&read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &ctx)),
+                1,
+                "TrustedRootCertificates must only carry fabric {accessing}'s root"
+            );
+        }
+
+        // PASE (fabric index 0 — never a valid fabric index): nothing matches.
+        let pase = ReadCtx {
+            fabric_index: 0,
+            fabric_filtered: true,
+        };
+        assert!(fabric_indices_of_list(&read(ATTR_OC_NOCS, &pase)).is_empty());
+        assert!(fabric_indices_of_list(&read(ATTR_OC_FABRICS, &pase)).is_empty());
+        assert_eq!(
+            byte_list_len(&read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &pase)),
+            0
+        );
+
+        // IsFabricFiltered=false: unfiltered, as before (regression guard).
+        let unfiltered = ReadCtx {
+            fabric_index: 1,
+            fabric_filtered: false,
+        };
+        assert_eq!(
+            fabric_indices_of_list(&read(ATTR_OC_NOCS, &unfiltered)),
+            vec![1, 2]
+        );
+        assert_eq!(
+            fabric_indices_of_list(&read(ATTR_OC_FABRICS, &unfiltered)),
+            vec![1, 2]
+        );
+        assert_eq!(
+            byte_list_len(&read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &unfiltered)),
+            2
+        );
+
+        // Scalars stay unfiltered either way (spec: not fabric-scoped).
+        for ctx in [&pase, &unfiltered] {
+            let commissioned = read(ATTR_OC_COMMISSIONED_FABRICS, ctx);
+            let mut r = Reader::new(&commissioned);
+            assert_eq!(r.next().unwrap().unwrap().value, Value::Uint(2));
+            let supported = read(ATTR_OC_SUPPORTED_FABRICS, ctx);
+            let mut r = Reader::new(&supported);
+            assert_eq!(
+                r.next().unwrap().unwrap().value,
+                Value::Uint(u64::from(SUPPORTED_FABRICS))
+            );
+        }
+    }
+
+    /// spec §11.17.5.2: `SupportedFabrics` is the device's capacity, and
+    /// `AddNOC` past it must answer `NOCResponse(TableFull=5)` rather than
+    /// installing a fabric the attribute says can't exist.
+    #[test]
+    fn add_noc_rejects_sixth_fabric_with_table_full() {
+        let mut server = test_server();
+        for i in 0..u64::from(SUPPORTED_FABRICS) {
+            let (_, resp) = expect_data(install_fabric(&mut server, 0x1122 + i, 0x5001 + i));
+            let (status, _) = decode_noc_response(&resp).unwrap();
+            assert_eq!(status, NOC_STATUS_OK, "fabric {} must install", i + 1);
+        }
+        assert_eq!(server.fabrics().len(), usize::from(SUPPORTED_FABRICS));
+
+        let (response_command, resp) = expect_data(install_fabric(&mut server, 0x9999, 0x5999));
+        assert_eq!(response_command, RESP_NOC);
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, NOC_STATUS_TABLE_FULL);
+        assert_eq!(fabric_index, None);
+        assert_eq!(
+            server.fabrics().len(),
+            usize::from(SUPPORTED_FABRICS),
+            "a rejected AddNOC must not install anything"
+        );
     }
 
     #[test]

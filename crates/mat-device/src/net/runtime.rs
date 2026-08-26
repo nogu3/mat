@@ -1236,7 +1236,13 @@ async fn serve_secured_message(
             fabric_index,
             ..InvokeCtx::default()
         };
-        let read_ctx = ReadCtx { fabric_index };
+        // Invoke/write dispatch: no `IsFabricFiltered` on the wire for those
+        // requests, so use the fabric-filtered side — the same default the
+        // read/subscribe decoders apply when the flag is absent.
+        let read_ctx = ReadCtx {
+            fabric_index,
+            fabric_filtered: true,
+        };
         let fabrics_before = comm_server.fabrics().len();
         let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
         else {
@@ -1490,7 +1496,10 @@ async fn serve_subscribe_request(
     // reject the (otherwise legal) request.
     let min_interval = Duration::from_secs(u64::from(req.min_interval_floor_s)).min(max_interval);
 
-    let read_ctx = ReadCtx { fabric_index };
+    let read_ctx = ReadCtx {
+        fabric_index,
+        fabric_filtered: req.fabric_filtered,
+    };
     let chunks = node.read_chunks(
         &req.paths,
         &read_ctx,
@@ -1501,6 +1510,7 @@ async fn serve_subscribe_request(
         exchange_id = msg.proto.exchange_id,
         subscription_id,
         paths = ?req.paths,
+        fabric_filtered = req.fabric_filtered,
         min_interval_floor_s = req.min_interval_floor_s,
         max_interval_ceiling_s = req.max_interval_ceiling_s,
         max_interval_s,
@@ -1559,6 +1569,7 @@ async fn serve_subscribe_request(
     Some(ActiveSubscription {
         id: subscription_id,
         paths: req.paths,
+        fabric_filtered: req.fabric_filtered,
         min_interval,
         max_interval,
         // The priming report counts as this subscription's first report:
@@ -1604,7 +1615,13 @@ async fn send_subscription_report(
             },
         )
         .collect();
-    let read_ctx = ReadCtx { fabric_index };
+    // Same `IsFabricFiltered` the subscribe request asked for: every report
+    // on a subscription is a continuation of that one read request, so a
+    // dirty/keep-alive report must not widen what the priming report showed.
+    let read_ctx = ReadCtx {
+        fabric_index,
+        fabric_filtered: sub.fabric_filtered,
+    };
     // Values are read *now*, not captured when the change happened: the
     // report carries the attribute's current value (spec §8.10.2), so two
     // changes between reports collapse into one entry with the latest
@@ -1831,19 +1848,24 @@ async fn serve_read_request_chunked(
     fabric_index: u8,
     node: &mut Node,
 ) {
-    let Ok(paths) = im::decode_read_request(&msg.payload) else {
+    let Ok(req) = im::decode_read_request_message(&msg.payload) else {
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             "ReadRequest dropped: undecodable"
         );
         return;
     };
-    let read_ctx = ReadCtx { fabric_index };
+    let paths = req.paths;
+    let read_ctx = ReadCtx {
+        fabric_index,
+        fabric_filtered: req.fabric_filtered,
+    };
     let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
     let last_index = chunks.len().saturating_sub(1);
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
         ?paths,
+        fabric_filtered = req.fabric_filtered,
         chunks = chunks.len(),
         "ReadRequest"
     );

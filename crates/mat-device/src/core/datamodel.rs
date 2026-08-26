@@ -99,9 +99,17 @@ impl ImOutcome {
 /// Operational Credentials' `CurrentFabricIndex`. `0` (the default) is not a
 /// valid fabric index (fabric indices start at 1) but matches what a PASE
 /// session (no fabric yet) should report.
+///
+/// `fabric_filtered` is the request's `IsFabricFiltered` (spec §8.4.1 /
+/// §8.9.2.4): when set, a fabric-scoped list attribute must only return
+/// `fabric_index`'s own entries. The `Default` is `false` — the unfiltered
+/// view — so a `ReadCtx::default()` in a test or a non-read path keeps
+/// seeing everything; the runtime always passes the decoded (wire-default
+/// `true`) value for real reads and subscriptions.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReadCtx {
     pub fabric_index: u8,
+    pub fabric_filtered: bool,
 }
 
 /// A cluster's outcome for one invoked command: either a bare status (the

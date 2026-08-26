@@ -39,6 +39,11 @@ const KEEP_ALIVE_MARGIN: Duration = Duration::from_secs(2);
 pub struct ActiveSubscription {
     pub id: u32,
     pub paths: Vec<AttrPathIn>,
+    /// The `IsFabricFiltered` of the `SubscribeRequest` that created this
+    /// subscription (spec §8.5.1). Every later report is part of that same
+    /// request, so it has to be replayed into the `ReadCtx` of each
+    /// dirty/keep-alive report — not just the priming one.
+    pub fabric_filtered: bool,
     pub min_interval: Duration,
     pub max_interval: Duration,
     pub last_report_at: Instant,
@@ -126,6 +131,7 @@ mod tests {
                 cluster: None,
                 attribute: None,
             }],
+            fabric_filtered: true,
             min_interval: Duration::from_secs(min),
             max_interval: Duration::from_secs(max),
             last_report_at: now,
