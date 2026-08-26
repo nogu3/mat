@@ -193,3 +193,26 @@ TimedRequest → INVALID_ACTION で中断する（8/18 実測で送信元 MAC �
 本番 HA へのペアリングは **PC ブラウザの HA Web UI から**行えば matter-server
 経由になるため現状の修正だけで通る見込み。要: アドオン設定で
 Test Net DCL 有効化。
+
+## 2026-08-26 再試行（Apple Home ゲート通過後・フル適合ビルド）: 同一シグネチャで失敗
+
+Write/ACL/root 適合性実装済みビルド（94c15e4 相当、Apple Home は同日タイル操作まで通過）で
+Echo Show 11 から再試行（`~/matv-alexa/`, discriminator 1859, port 5540, self チェーン）:
+
+- 10:30:28 PASE → ArmFailSafe(80) → SetRegulatoryConfig → **SetTCAcknowledgements(0x06)**
+  （新観測。matv は UNSUPPORTED_COMMAND 応答 — HAMH #449 の実験で受理しても結果不変と確認済みの項目）
+  → CertificateChainRequest×2 → AttestationRequest 応答
+- 以降 80 秒沈黙 → 10:31:48 fail-safe 失効 → ArmFailSafe(0) 後始末 → アプリは GS014
+
+**判定**: クラウド側 attestation 拒否のシグネチャ完全一致。デバイス側適合性の改善は無関係
+（そもそも interview 到達前）。
+
+**新情報（2026-08-25/26 のコミュニティ動向）**:
+- matterbridge #605: コラボレータ tammeryousef1006 が **Echo Show 8 3rd gen (fw 3607267748)
+  で未認証 matterbridge のペアリング成功**を報告（08-13 以降初の成功報告、非 JP 環境）
+- 同日、JP 環境の報告者 k9i は依然失敗（エラーコードが GS014 → RN002 に変化）
+- HAMH #449 にも 08-24 に同症状の新規報告（Apple/Google は成功、Alexa のみ失敗）
+
+→ **「リージョン/アカウント段階のロールアウト（JP 未解除）」説が最有力に更新**。
+JP + Echo Show 11 + 独立 Rust 実装で同日失敗という本試行はこの説の裏付けデータ点。
+引き続きウォッチ + JP データ点の #605 への投稿を検討。
