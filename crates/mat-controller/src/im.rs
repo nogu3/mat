@@ -126,6 +126,16 @@ pub const DEVICE_TYPE_ROOT_NODE: u32 = 0x0016;
 /// `mat_core::ids`'s generated table has no device-type entries to check
 /// this against.
 pub const DEVICE_TYPE_ON_OFF_LIGHT: u32 = 0x0100;
+/// Aggregator device type (Device Library §11.2), the `DeviceTypeList`
+/// entry for the bridge's own endpoint (M3's `mat-device` endpoint hosting
+/// the bridged devices below it in `PartsList`). Same drift-guard
+/// exemption as `DEVICE_TYPE_ROOT_NODE` above.
+pub const DEVICE_TYPE_AGGREGATOR: u32 = 0x000E;
+/// Bridged Node device type (Device Library §11.1), the `DeviceTypeList`
+/// entry every bridged (non-Aggregator) endpoint carries in addition to
+/// its own application device type. Same drift-guard exemption as
+/// `DEVICE_TYPE_ROOT_NODE` above.
+pub const DEVICE_TYPE_BRIDGED_NODE: u32 = 0x0013;
 /// BasicInformation cluster attributes (spec §11.1). Same drift-guard
 /// coverage as `CLUSTER_DESCRIPTOR` above, via
 /// `core::datamodel::drift_guard::basic_information_attrs_match_mat_core_ids`.
@@ -146,11 +156,23 @@ pub const ATTR_BI_UNIQUE_ID: u32 = 0x0012;
 pub const ATTR_BI_CAPABILITY_MINIMA: u32 = 0x0013;
 pub const ATTR_BI_SPECIFICATION_VERSION: u32 = 0x0015;
 pub const ATTR_BI_MAX_PATHS_PER_INVOKE: u32 = 0x0016;
+/// BridgedDeviceBasicInformation cluster (spec §9.13) — every bridged
+/// (non-Aggregator) endpoint's identity/status cluster, the bridged-side
+/// counterpart of BasicInformation above. NodeLabel/UniqueID are shared
+/// with BasicInformation's `ATTR_BI_NODE_LABEL`/`ATTR_BI_UNIQUE_ID` above
+/// (same attribute ids, distinct cluster).
+pub const CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION: u32 = 0x0039;
+/// `Reachable` (spec §9.13.4): whether the bridged endpoint's real device
+/// is currently reachable over its native protocol.
+pub const ATTR_BDBI_REACHABLE: u32 = 0x0011;
 
 /// IM status codes (spec §8.10.1, Table "Status Code Table"). Only the
 /// values `mat-device`'s data model dispatch actually returns today.
 pub const STATUS_SUCCESS: u8 = 0x00;
 pub const STATUS_FAILURE: u8 = 0x01;
+/// "The sender of the action does not have authorization or access
+/// privilege to carry out the operation" (spec §8.10.1 Table 8-19).
+pub const STATUS_UNSUPPORTED_ACCESS: u8 = 0x7E;
 pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
 pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
 pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
@@ -1021,15 +1043,29 @@ fn decode_attribute_requests(r: &mut Reader) -> Result<Vec<AttrPathIn>, ImError>
     Ok(paths)
 }
 
+/// Decoded ReadRequestMessage (spec §8.9.2): server-side counterpart of
+/// `encode_read_request`/`encode_read_request_cluster`, including
+/// `IsFabricFiltered` (tag 3, bool) alongside the requested paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRequestIn {
+    pub paths: Vec<AttrPathIn>,
+    pub fabric_filtered: bool,
+}
+
 /// ReadRequestMessage (spec §8.9.2): server-side decode of
 /// `encode_read_request`/`encode_read_request_cluster`'s payload. Returns
 /// every AttributePathIB in `AttributeRequests` (tag 0) — unlike the
 /// client-side `decode_report_data*` helpers, a device must answer every
-/// path a controller asks for, not just the first.
-pub fn decode_read_request(payload: &[u8]) -> Result<Vec<AttrPathIn>, ImError> {
+/// path a controller asks for, not just the first — plus `IsFabricFiltered`
+/// (tag 3). `IsFabricFiltered` defaults to `true` when absent from the
+/// wire: that's the side that discloses less (filters fabric-scoped
+/// attributes down), so an omitted flag errs toward it rather than toward
+/// leaking other fabrics' entries.
+pub fn decode_read_request_message(payload: &[u8]) -> Result<ReadRequestIn, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut paths = Vec::new();
+    let mut fabric_filtered = None;
     loop {
         let el = r
             .next()?
@@ -1040,13 +1076,25 @@ pub fn decode_read_request(payload: &[u8]) -> Result<Vec<AttrPathIn>, ImError> {
                 // AttributeRequests
                 paths = decode_attribute_requests(&mut r)?;
             }
+            (Tag::Context(3), Value::Bool(b)) => fabric_filtered = Some(b),
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
             }
             _ => {}
         }
     }
-    Ok(paths)
+    Ok(ReadRequestIn {
+        paths,
+        fabric_filtered: fabric_filtered.unwrap_or(true),
+    })
+}
+
+/// ReadRequestMessage (spec §8.9.2): server-side decode of
+/// `encode_read_request`/`encode_read_request_cluster`'s payload, paths
+/// only. Thin delegation to `decode_read_request_message` for callers that
+/// don't need `IsFabricFiltered`.
+pub fn decode_read_request(payload: &[u8]) -> Result<Vec<AttrPathIn>, ImError> {
+    Ok(decode_read_request_message(payload)?.paths)
 }
 
 /// SubscribeRequestMessage (spec §8.10)。`clusters` が空なら全フィールド省略の
@@ -1093,14 +1141,16 @@ pub struct SubscribeRequestIn {
     pub min_interval_floor_s: u16,
     pub max_interval_ceiling_s: u16,
     pub paths: Vec<AttrPathIn>,
+    pub fabric_filtered: bool,
 }
 
 /// SubscribeRequestMessage (spec §8.10): server-side decode of
 /// `encode_subscribe_request`'s payload. Shape: `{0: KeepSubscriptions,
 /// 1: MinIntervalFloor, 2: MaxIntervalCeiling, 3: AttributeRequests
-/// (array[AttributePathIB]), 7: IsFabricFiltered(無視), 255: rev(無視)}`.
+/// (array[AttributePathIB]), 7: IsFabricFiltered, 255: rev(無視)}`.
 /// AttributeRequests の読みは `decode_read_request` と共通の
-/// `decode_attribute_requests` を使う。
+/// `decode_attribute_requests` を使う。`IsFabricFiltered` が欠落している場合は
+/// `decode_read_request_message` と同じ既定（`true` — 開示が少ない側）。
 pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
@@ -1108,6 +1158,7 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
     let mut min_interval_floor_s = None;
     let mut max_interval_ceiling_s = None;
     let mut paths = Vec::new();
+    let mut fabric_filtered = None;
     loop {
         let el = r
             .next()?
@@ -1131,6 +1182,7 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
                 // AttributeRequests
                 paths = decode_attribute_requests(&mut r)?;
             }
+            (Tag::Context(7), Value::Bool(b)) => fabric_filtered = Some(b),
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
             }
@@ -1148,6 +1200,7 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
             "subscribe request without max interval ceiling",
         ))?,
         paths,
+        fabric_filtered: fabric_filtered.unwrap_or(true),
     })
 }
 
@@ -3311,6 +3364,45 @@ mod tests {
         assert_eq!(paths[0].endpoint, Some(0));
         assert_eq!(paths[0].cluster, Some(CLUSTER_DESCRIPTOR));
         assert_eq!(paths[0].attribute, None);
+    }
+
+    #[test]
+    fn decode_read_request_message_extracts_fabric_filtered() {
+        // encode_read_request は IsFabricFiltered=true を Context(3) に載せる
+        // （このファイル既存の encode_read_request_cluster_is_fabric_filtered
+        // テストが wire 位置を保証済み）。true がそのまま出ること。
+        let payload = encode_read_request(0, CLUSTER_BASIC_INFORMATION, ATTR_VENDOR_ID);
+        let req = decode_read_request_message(&payload).unwrap();
+        assert_eq!(req.paths.len(), 1);
+        assert!(req.fabric_filtered);
+    }
+
+    #[test]
+    fn decode_read_request_message_defaults_fabric_filtered_when_absent() {
+        // IsFabricFiltered を載せない ReadRequest を手組み（AttributeRequests のみ）
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(0));
+        w.start_list(Tag::Anonymous);
+        w.put_uint(Tag::Context(2), 0); // Endpoint
+        w.put_uint(Tag::Context(3), u64::from(CLUSTER_BASIC_INFORMATION));
+        w.put_uint(Tag::Context(4), u64::from(ATTR_VENDOR_ID));
+        w.end_container();
+        w.end_container();
+        w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
+        w.end_container();
+        let req = decode_read_request_message(&w.finish()).unwrap();
+        assert!(
+            req.fabric_filtered,
+            "absent IsFabricFiltered must default to true"
+        );
+    }
+
+    #[test]
+    fn decode_subscribe_request_extracts_fabric_filtered() {
+        let payload = encode_subscribe_request(1, 60, false, &[]);
+        let req = decode_subscribe_request(&payload).unwrap();
+        assert!(req.fabric_filtered);
     }
 
     #[test]
