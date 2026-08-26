@@ -254,8 +254,12 @@ impl Device {
         // `CommissioningServer` が書き、EP0 の `AccessControlHandler` が
         // 読み書きする — `set_acl_store` は `into_cluster_handlers` より
         // 前に呼ぶ必要がある（後続のコミッショニングコマンドがこのストア
-        // を触れるようにするため）。
-        let acl_store = crate::core::access_control::AclStore::new();
+        // を触れるようにするため）。永続化は `<store_dir>/acl.json`
+        // （`FabricStore`と同じ「ディレクトリを渡して file-backed persist
+        // を注入する」配線）。
+        let acl_store = crate::core::access_control::AclStore::with_persist(Box::new(
+            crate::net::store::acl_store_in_dir(&config.store_dir),
+        ));
         comm_server.set_acl_store(acl_store.clone());
 
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;

@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::access_control::{AclDeviceEntry, AclPersist};
 use crate::core::fabric_store::{FabricEntry, FabricPersist};
 
 /// Persists the fabric table as one JSON file at a fixed path.
@@ -46,6 +47,43 @@ impl FabricPersist for FileFabricStore {
 /// bootstrap) actually want, one directory in, one store out.
 pub fn store_in_dir(dir: &Path) -> FileFabricStore {
     FileFabricStore::new(dir.join("fabrics.json"))
+}
+
+/// File-backed [`AclPersist`](crate::core::access_control::AclPersist)
+/// implementation — same JSON-via-`serde_json` +
+/// `mat_core::fsatomic::write_atomic` discipline as [`FileFabricStore`]
+/// above. Unlike `fabrics.json`, `acl.json` holds no key material (just
+/// privilege/subject/target bookkeeping), so it doesn't get the
+/// owner-only permission restriction `FileFabricStore::save` applies.
+pub struct FileAclStore {
+    path: PathBuf,
+}
+
+impl FileAclStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl AclPersist for FileAclStore {
+    fn save(&self, entries: &[AclDeviceEntry]) -> Result<(), String> {
+        let bytes = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
+    }
+
+    fn load(&self) -> Result<Vec<AclDeviceEntry>, String> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Convenience: builds a [`FileAclStore`] rooted at `dir` (`acl.json`) —
+/// mirrors [`store_in_dir`] above.
+pub fn acl_store_in_dir(dir: &Path) -> FileAclStore {
+    FileAclStore::new(dir.join("acl.json"))
 }
 
 #[cfg(test)]
@@ -113,5 +151,62 @@ mod tests {
         // (proves `insert` really persists, not just holds in memory).
         let fs2 = FabricStore::with_persist(Box::new(store_in_dir(dir.path())));
         assert_eq!(fs2.entries(), &[entry(1), entry(2)]);
+    }
+
+    fn acl_entry(fabric_index: u8) -> AclDeviceEntry {
+        AclDeviceEntry {
+            privilege: 5,
+            auth_mode: 2,
+            subjects: vec![112233],
+            targets_raw: None,
+            fabric_index,
+        }
+    }
+
+    #[test]
+    fn acl_save_then_load_roundtrips_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = acl_store_in_dir(dir.path());
+        store.save(std::slice::from_ref(&acl_entry(1))).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, vec![acl_entry(1)]);
+    }
+
+    #[test]
+    fn acl_load_with_no_file_yet_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = acl_store_in_dir(dir.path());
+        assert_eq!(store.load().unwrap(), Vec::new());
+    }
+
+    /// `acl.json` を実ファイルへ save し、別インスタンスの `AclStore` が
+    /// それを load して復元できることを、`AclStore::with_persist` +
+    /// `AccessControlHandler` を通して確認する（`entries_for` は
+    /// `core::access_control` 内部 private なので、公開 API である
+    /// `read` 経由で見る）。
+    #[test]
+    fn acl_store_with_persist_reloads_across_instances() {
+        use crate::core::access_control::{
+            decode_entries_for_test, AccessControlHandler, AclStore,
+        };
+        use crate::core::datamodel::{ClusterHandler, ReadCtx};
+        use mat_controller::im;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = AclStore::with_persist(Box::new(acl_store_in_dir(dir.path())));
+            store.add_case_admin(1, 112233);
+        }
+        // Fresh `AclStore` over the same directory picks up the persisted
+        // entry (proves `add_case_admin` really persists, not just holds it
+        // in memory).
+        let store2 = AclStore::with_persist(Box::new(acl_store_in_dir(dir.path())));
+        let h = AccessControlHandler::new(store2);
+        let ctx = ReadCtx {
+            fabric_index: 1,
+            ..ReadCtx::default()
+        };
+        let entries = decode_entries_for_test(&h.read(im::ATTR_ACL, &ctx).unwrap());
+        assert_eq!(entries, vec![(5u8, 2u8, vec![112233u64], 1u8)]);
     }
 }
