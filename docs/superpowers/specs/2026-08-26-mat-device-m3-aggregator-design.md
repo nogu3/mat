@@ -113,3 +113,58 @@ floor=ceiling の keep-alive 同時刻問題 / ACL enforcement（認可判定）
 - Apple Home / Echo 実機検証（M4。Echo は Amazon 側凍結が解けた場合のみ）
 - ホットリロード / 動的 endpoint 追加（PartsList の live 更新）
 - 「送る」に列挙した deferred 群
+
+## 申し送り（M3 完了）
+
+**完了**: 2026-08-27 08:50 JST
+
+**ゲート結果**（`feature/m3-aggregator` HEAD, `.worktrees/m3-aggregator`。すべて exit code で判定）:
+
+- `cargo fmt --all -- --check`: exit 1 — 唯一の diff は `crates/mat-device/src/net/runtime.rs:1096`
+  （if 条件式の改行有無のみ）。本ブランチ以前から存在する pre-existing drift（base commit で
+  確認済み）につき、この 1 箇所を受容例外として扱い本タスクでは修正・コミットしない
+  （M4 送りに追加）
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0
+- `cargo test --workspace`: exit 0（全 test suite ok、fail 0）
+- `cargo check -p mat-device --no-default-features`: exit 0
+- `MAT_E2E_IFACE=eth0 task e2e:device:m1`: exit 0（`mat commission` → `status=success`）
+- `MAT_E2E_IFACE=eth0 task e2e:device:m2-chip`: exit 0（chip-tool commission → parts-list 検証
+  → toggle → subscribe → matv 再起動後の再接続、すべて green）
+
+**`mat describe` マトリョーシカ確認**（仮想デバイス 3 台: living-light / bedroom-light /
+goodnight、port 5541 の一時 store）:
+
+`mat fabric init` → `mat commission --setup-code ...` で `status=success`。`mat describe
+--node 1` で EP0〜4 の cluster 一覧を確認（EP1 は descriptor(29) のみ、EP2〜4 は
+descriptor + bridgeddevicebasicinformation(57) + identify(3) + groups(4) + onoff(6)）。
+`mat read` で内訳を確認:
+
+- EP1 `descriptor/device-type-list` = `[{0:14,1:1}]`（Aggregator 0x000E）、
+  `descriptor/parts-list` = `[2,3,4]`
+- EP2〜4 `descriptor/device-type-list` = `[{0:256,1:1},{0:19,1:1}]`（On/Off Light 0x0100 +
+  Bridged Node 0x0013）
+- `bridgeddevicebasicinformation/node-label`: EP2="Living Light" / EP3="Bedroom Light" /
+  EP4="Goodnight Scene"（config の `name` と一致）
+
+spec の M3 受け入れ条件（`mat describe` で parts-list のマトリョーシカ構造が正しく見える）を
+満たす。
+
+**実装中の設計逸脱**（controller のレジャー裁定。plan 未記載分の追加テスト・修正）:
+
+1. Task 1: plan の貼付テストに加え、IsFabricFiltered=false の手組み wire バイトテストを 2 本
+   追加（テスト戦略の Global Constraint「ワイヤバイト直接 assert」裁定に基づく）
+2. Task 7: 台帳 load に `next.max(FIRST_BRIDGED_ENDPOINT)` フロアを追加（手編集 JSON で
+   EP0/1 が誤って払い出されてしまう穴を塞ぐため）
+3. Task 8: BDBI UniqueID を plan の `"{unique_id}-{id}"` 連結案から変更 — string32 制約に
+   違反するため `hex(SHA-256(連結))[..32]` に変更（レビュー検出 → controller 裁定）
+
+**M4 送り**（本節「スコープ外」「送る」の既存列挙 + 実行中に積んだ deferred。優先度未整理の
+フラット列挙）:
+
+dirty レポートのチャンク化 / 逐次ハンドシェイクの head-of-line blocking / GroupKeyManagement
+のコマンド群 / Timed write・chunked write / FabricFiltered=false の厳密化（read 全般 + ACL
+read の全 fabric 返しの解消を含む）/ ChipTest モードの VID/PID 検証ガード / dirty 期限
+floor=ceiling の keep-alive 同時刻問題 / ACL enforcement（認可判定）/ Reachable の実判定・
+mando 転送・Apple Home 実機ゲート / 台帳の壊れ JSON silent-fallback に `tracing::warn` 追加を
+検討 / `str_value`・`bool_value` のクラスタファイル間重複を `pub(crate)` 昇格して DRY 化を
+検討 / `net/runtime.rs:1096` の既存 fmt drift 解消
