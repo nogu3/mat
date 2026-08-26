@@ -71,7 +71,7 @@ CHIP_TOOL_IMAGE="${CHIP_TOOL_IMAGE:-$CHIP_TOOL_IMAGE_DEFAULT}"
 PASSCODE=20202021
 DISCRIMINATOR=3840
 NODE_ID=1
-ENDPOINT=1
+ENDPOINT=2
 SUB_MIN_INTERVAL_S=0
 SUB_MAX_INTERVAL_S=5
 
@@ -129,6 +129,11 @@ product_id = 0x8000
 port = 0
 store = "$DEVICE_STORE"
 iface = "$IFACE"
+
+[[device]]
+id = "e2e-light"
+kind = "onoff-light"
+name = "E2E Light"
 EOF
     : >"$DEVICE_STDOUT"
     RUST_LOG="${RUST_LOG:-info}" \
@@ -282,6 +287,16 @@ verify_subscribe() {
     echo "==> subscribe: priming report + keep-alive observed (LivenessCheckTime refreshed x${keepalive_count})" >&2
 }
 
+# bridge topology: EP0 PartsList ⊇ {1,2} / EP1(Aggregator) PartsList = [2]
+assert_parts_list() {
+    # $1=endpoint $2=expected-member
+    local out
+    out="$(chip descriptor read parts-list "$NODE_ID" "$1")" \
+        || fail "descriptor read parts-list ep$1 failed (exit non-zero)"
+    grep -Eq "\[[0-9]+\]: $2\b" <<<"$out" \
+        || fail "ep$1 parts-list missing endpoint $2: $(grep -E 'PartsList|\[' <<<"$out" | head -5)"
+}
+
 echo "==> building (release)" >&2
 cargo build --release -p matv
 
@@ -298,6 +313,12 @@ PAIR_OUT="$(chip pairing onnetwork-long "$NODE_ID" "$PASSCODE" "$DISCRIMINATOR" 
 printf '%s\n' "$PAIR_OUT" | grep -q "Device commissioning completed with success" \
     || fail "chip-tool pairing did not report commissioning success"
 echo "==> commissioned" >&2
+
+echo "==> asserting bridge topology (EP0 PartsList {1,2}, EP1 Aggregator PartsList [2])" >&2
+assert_parts_list 0 1
+assert_parts_list 0 2
+assert_parts_list 1 2
+echo "==> topology OK" >&2
 
 assert_toggle_flips "before restart"
 

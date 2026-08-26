@@ -76,6 +76,11 @@ product_id = 0x8000
 port = 0
 store = "$DEVICE_STORE"
 iface = "$IFACE"
+
+[[device]]
+id = "e2e-light"
+kind = "onoff-light"
+name = "E2E Light"
 EOF
 
 echo "==> starting matv (iface=$IFACE, store=$DEVICE_STORE)" >&2
