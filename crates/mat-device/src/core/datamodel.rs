@@ -102,14 +102,36 @@ impl ImOutcome {
 ///
 /// `fabric_filtered` is the request's `IsFabricFiltered` (spec §8.4.1 /
 /// §8.9.2.4): when set, a fabric-scoped list attribute must only return
-/// `fabric_index`'s own entries. The `Default` is `false` — the unfiltered
-/// view — so a `ReadCtx::default()` in a test or a non-read path keeps
-/// seeing everything; the runtime always passes the decoded (wire-default
-/// `true`) value for real reads and subscriptions.
-#[derive(Debug, Clone, Copy, Default)]
+/// `fabric_index`'s own entries. `Default` matches the wire default (an
+/// absent `IsFabricFiltered` flag means `true`, spec §8.4.1) — filtered, the
+/// non-disclosing side — so a `ReadCtx::default()` in a test or a non-read
+/// path never accidentally discloses every fabric's entries. Tests that
+/// deliberately want the whole table should use `ReadCtx::unfiltered`
+/// instead of relying on `default()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadCtx {
     pub fabric_index: u8,
     pub fabric_filtered: bool,
+}
+
+impl Default for ReadCtx {
+    fn default() -> Self {
+        Self {
+            fabric_index: 0,
+            fabric_filtered: true,
+        }
+    }
+}
+
+impl ReadCtx {
+    /// 全 fabric を返す読み（IsFabricFiltered=false 相当）。テスト用 —
+    /// production の ReadCtx は必ず decode 済みフラグから組む。
+    pub fn unfiltered(fabric_index: u8) -> Self {
+        Self {
+            fabric_index,
+            fabric_filtered: false,
+        }
+    }
 }
 
 /// A cluster's outcome for one invoked command: either a bare status (the

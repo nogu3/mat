@@ -1450,11 +1450,13 @@ mod tests {
         }
     }
 
-    /// A `ReadCtx` for a session on `fabric_index`, leaving
-    /// `fabric_filtered` at its unfiltered default — for the tests that only
-    /// care *which* fabric is reading. The fabric-filtering behavior itself
-    /// is covered by `oc_reads_are_fabric_scoped_when_fabric_filtered`,
-    /// which spells both fields out at every call site.
+    /// A `ReadCtx` for a session on `fabric_index`, at the (now filtered)
+    /// default — for the tests that only care *which* fabric is reading and
+    /// always pass the fabric that's actually installed, so filtered vs.
+    /// unfiltered makes no difference to what comes back. The
+    /// fabric-filtering behavior itself is covered by
+    /// `oc_reads_are_fabric_scoped_when_fabric_filtered`, which spells both
+    /// fields out at every call site.
     fn read_ctx(fabric_index: u8) -> ReadCtx {
         ReadCtx {
             fabric_index,
@@ -1668,7 +1670,7 @@ mod tests {
         // として現れることを Reader で確認する。
         let (_, oc, _) = server.into_cluster_handlers();
         let fabrics_tlv = oc
-            .read(ATTR_OC_FABRICS, &ReadCtx::default())
+            .read(ATTR_OC_FABRICS, &ReadCtx::unfiltered(0))
             .expect("Fabrics");
         let mut r = Reader::new(&fabrics_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
@@ -2057,7 +2059,9 @@ mod tests {
         let (_, oc, _) = server.into_cluster_handlers();
 
         // NOCs(0): array[ struct{1: noc_tlv, 2: icac_tlv?, 254: fabric_index} ]
-        let nocs_tlv = oc.read(ATTR_OC_NOCS, &ReadCtx::default()).expect("NOCs");
+        let nocs_tlv = oc
+            .read(ATTR_OC_NOCS, &ReadCtx::unfiltered(0))
+            .expect("NOCs");
         let mut r = Reader::new(&nocs_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
         assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
@@ -2078,7 +2082,7 @@ mod tests {
         // Fabrics(1): array[ struct{1: root_public_key, 2: admin_vendor_id,
         // 3: fabric_id, 4: node_id, 5: label, 254: fabric_index} ]
         let fabrics_tlv = oc
-            .read(ATTR_OC_FABRICS, &ReadCtx::default())
+            .read(ATTR_OC_FABRICS, &ReadCtx::unfiltered(0))
             .expect("Fabrics");
         let mut r = Reader::new(&fabrics_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
@@ -2121,7 +2125,7 @@ mod tests {
 
         // TrustedRootCertificates(4): array[ bytes(root_tlv) ]
         let roots_tlv = oc
-            .read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &ReadCtx::default())
+            .read(ATTR_OC_TRUSTED_ROOT_CERTIFICATES, &ReadCtx::unfiltered(0))
             .expect("TrustedRootCertificates");
         let mut r = Reader::new(&roots_tlv);
         assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
