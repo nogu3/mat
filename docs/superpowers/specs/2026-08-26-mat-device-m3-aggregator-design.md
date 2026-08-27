@@ -165,9 +165,8 @@ dirty レポートのチャンク化 / 逐次ハンドシェイクの head-of-li
 のコマンド群 / Timed write・chunked write / FabricFiltered=false の厳密化（read 全般 + ACL
 read の全 fabric 返しの解消を含む）/ ChipTest モードの VID/PID 検証ガード / dirty 期限
 floor=ceiling の keep-alive 同時刻問題 / ACL enforcement（認可判定）/ Reachable の実判定・
-mando 転送・Apple Home 実機ゲート / 台帳の壊れ JSON silent-fallback に `tracing::warn` 追加を
-検討 / `str_value`・`bool_value` のクラスタファイル間重複を `pub(crate)` 昇格して DRY 化を
-検討 / `net/runtime.rs:1096` の既存 fmt drift 解消 / Descriptor の必須属性 ClientList
+mando 転送・Apple Home 実機ゲート / `str_value`・`bool_value` のクラスタファイル間重複を
+`pub(crate)` 昇格して DRY 化を検討 / Descriptor の必須属性 ClientList
 （0x0002）が全 endpoint で未実装（AttributeList にも無い。M2 以前からの既存ギャップ —
 Apple interview 前に空配列実装、3 行）/ DeviceTypeStruct.Revision が全 device type で 1
 固定（On/Off Light の現行 revision は 1 でない。ClusterRevision と同型のギャップ）/
