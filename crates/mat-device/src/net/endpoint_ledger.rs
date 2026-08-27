@@ -60,7 +60,15 @@ impl EndpointLedger {
                 // Can't recover a device-id → endpoint mapping out of bytes
                 // that don't even parse — the best available fallback is a
                 // fresh ledger rather than a hard failure.
-                Err(_) => fresh(),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "endpoint ledger file is corrupt JSON — falling back to a fresh ledger; \
+                         all bridged endpoints will be renumbered from {FIRST_BRIDGED_ENDPOINT}"
+                    );
+                    fresh()
+                }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => fresh(),
             Err(e) => return Err(e),
