@@ -1096,8 +1096,7 @@ async fn serve_secured(
             return ServeOutcome::Continue; // decrypt/screen failure — drop, don't kill the session on noise
         }
     };
-    if serve_secured_message(msg, session, fabric_index, state).await == ServeOutcome::DropSession
-    {
+    if serve_secured_message(msg, session, fabric_index, state).await == ServeOutcome::DropSession {
         return ServeOutcome::DropSession;
     }
 
