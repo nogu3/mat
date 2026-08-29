@@ -1,35 +1,54 @@
 # mat
 
+[![CI](https://github.com/nogu3/mat/actions/workflows/ci.yml/badge.svg)](https://github.com/nogu3/mat/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-nogu3.github.io%2Fmat-blue)](https://nogu3.github.io/mat/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-`mat` is a CLI for controlling Matter devices. It drives a **from-scratch native
-Matter controller** (crate `mat-controller`, in this workspace) in-process and
-returns **pure structured JSON**, normalized to `mat`'s own schema.
+**Control your Matter smart home from the command line — pure Rust, pure
+JSON.**
 
-- stdout = one JSON object per command. No human decoration.
-- diagnostics go to stderr as structured logs (`tracing`).
-- it holds no state except the credential KVS (the process is one-shot).
+`mat` is a command-line Matter controller built for scripts and AI agents,
+not apps. It speaks Matter directly — TLV, CASE, the Interaction Model,
+groupcast, mDNS discovery, and commissioning are implemented from scratch in
+Rust and run in-process — and prints exactly one JSON object per command on
+stdout.
+
+![mat commissioning and controlling a virtual Matter light](docs/assets/demo.gif)
+
+The demo runs against `matv`, the virtual Matter device that ships in this
+workspace — the whole Quickstart works with no hardware at all.
 
 For the design background, the `mat` / `matd` split, and what `mat` does and
 does not do, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Why mat
 
-- **Pure JSON in, pure JSON out** — one object per command on stdout; stable
-  error `kind`s and exit codes. Built to be driven by scripts and AI agents.
-- **Native pure-Rust controller** — TLV, CASE, IM, groupcast, mDNS, and
-  commissioning (on-network and BLE+Thread) run in-process. No external
-  controller subprocess.
-- **One-shot CLI, optional resident daemon** — `mat` holds no state except the
-  credential store; `matd` adds warm sessions and a resident Subscribe
+Most ways to script Matter go through a hub, a cloud API, or a heavyweight
+controller SDK. `mat` is the other extreme: one small binary that *is* the
+controller.
+
+- **Built for scripts and AI agents.** stdout carries exactly one JSON object
+  per command; diagnostics stay on stderr as structured logs. Error `kind`s
+  and exit codes are stable, so a program (or an LLM) can decide recovery
+  without parsing prose.
+- **The whole Matter stack, in-process.** TLV, CASE, the Interaction Model,
+  groupcast, mDNS, and commissioning (on-network and BLE+Thread) are a
+  from-scratch pure-Rust implementation (crate `mat-controller`). No
+  chip-tool, no Python matter-server, no vendor SDK, no subprocess.
+- **One-shot by design.** `mat` holds no state except the credential store —
+  run it from cron, a shell pipeline, or an agent loop. When you want warm
+  sessions and live subscriptions, the optional `matd` daemon adds them
   (`mat listen`).
-- **Optional alias layer** — human names live in a local `aliases.toml` only;
-  the wire stays numeric.
+- **Names at the edge, numbers on the wire.** An optional local `aliases.toml`
+  maps node / group / endpoint names to numbers right after arg parsing; the
+  protocol layer stays numeric.
+- **Test without hardware.** The workspace ships `matv`, a virtual Matter
+  device you can commission and control end-to-end on a laptop.
 
 ## Quickstart
 
 ```bash
-# build & install -> ~/.cargo/bin/{mat,matd}
+# build & install -> ~/.cargo/bin/{mat,matd,matv}
 task install
 
 # create your first fabric (writes the credential store; no network I/O)
@@ -58,6 +77,39 @@ Every command prints exactly one JSON object on stdout:
 
 Errors are structured the same way (stderr, stable `kind` + exit code — see
 [Errors and exit codes](./docs/errors.md)).
+
+### Try it without hardware
+
+`matv` hosts a virtual Matter device (a bridge with one on/off light), so the
+whole flow above runs end-to-end on a single machine:
+
+```bash
+cat > matv.toml <<'EOF'
+passcode = 20202021
+discriminator = 3840
+vendor_id = 0xFFF1
+product_id = 0x8000
+port = 0
+store = "./device-store"
+iface = "eth0"            # an interface with an IPv6 link-local address
+
+[[device]]
+id = "demo-light"
+kind = "onoff-light"
+name = "Demo Light"
+EOF
+
+matv --config matv.toml &   # prints the setup payload (qr_payload) as JSON
+
+export MAT_STORE=./mat-store
+# trust the virtual device's self-generated dev attestation root
+export MAT_PAA_TRUST_STORE=./device-store/paa
+
+mat fabric init
+mat commission --setup-code "MT:Y.K90AFN00KA0648G00" --node 1
+mat on --node 1 --endpoint 2    # endpoint 2 = the bridged light
+mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
+```
 
 ## Requirements
 

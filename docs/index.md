@@ -1,8 +1,8 @@
 # mat
 
-`mat` is a CLI for controlling Matter devices: it drives a from-scratch,
-pure-Rust native Matter controller in-process and prints pure structured
-JSON on stdout.
+`mat` is a command-line Matter controller built for scripts and AI agents:
+a from-scratch, pure-Rust Matter stack that runs in-process and prints
+exactly one JSON object per command on stdout.
 
 This site is the command and configuration reference. For the project
 overview, Quickstart, and design background, see the
