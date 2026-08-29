@@ -1,10 +1,15 @@
 [package]
-name = "mat"
+# crates.io の `mat` は先住クレートに取られているためパッケージ名は mat-cli
+# （ripgrep→rg 方式）。インストールされるバイナリ名は下の [[bin]] どおり mat。
+name = "mat-cli"
 description = "Matter device control CLI — drives a native Rust Matter controller in-process and emits pure structured JSON"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["matter", "smart-home", "iot", "home-automation", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "mat"

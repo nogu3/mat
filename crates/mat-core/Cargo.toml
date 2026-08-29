@@ -1,10 +1,12 @@
 [package]
 name = "mat-core"
-description = "Shared core for mat/matd — mat's JSON schema, error/exit-code classification, credential store"
+description = "Shared core for the mat Matter CLI — mat's JSON schema, error/exit-code classification, credential store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["matter", "smart-home", "iot"]
+categories = ["network-programming"]
 
 [dependencies]
 serde.workspace = true

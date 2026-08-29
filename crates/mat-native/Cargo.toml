@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared native backend engine (mat one-shot / matd resident) on mat-controller"
+description = "Shared native backend engine on mat-controller, driving the mat CLI (one-shot) and matd (resident)"
+keywords = ["matter", "smart-home", "iot"]
+categories = ["network-programming"]
 
 [features]
 # 他 crate のテストから fake / fixture を使うための注入面。

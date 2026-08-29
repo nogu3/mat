@@ -615,7 +615,7 @@ stage2_main() {
   FRESH_STORE=""
 
   echo "== 準備1/5: aarch64-gnu + BLE クロスビルド（task dist:arm64 相当、Cross.toml の arm64 libdbus pre-build 使用）"
-  cross build --release --target "$TARGET" --features ble -p mat -p matd
+  cross build --release --target "$TARGET" --features ble -p mat-cli -p matd
   local MAT_BIN="target/$TARGET/release/mat"
   local MATD_BIN="target/$TARGET/release/matd"
 
@@ -672,7 +672,7 @@ stage2_main() {
   # `path+file:///...#1.24.0` 形式（名前がディレクトリ名と異なる場合は
   # `#name@1.24.0`）なので `#` 以降 → `@` 以降の順で剥がす。
   local EXPECTED_VERSION
-  EXPECTED_VERSION=$(cargo pkgid -p mat | sed 's/.*#//; s/.*@//')
+  EXPECTED_VERSION=$(cargo pkgid -p mat-cli | sed 's/.*#//; s/.*@//')
   [ -n "$EXPECTED_VERSION" ] || { echo "FAIL: cargo pkgid から期待バージョンを導出できない" >&2; exit 1; }
   local VER_OUT
   VER_OUT=$(ssh -n "$MAT_E2E_HOST" "'$REMOTE_MAT_BIN' --version")
@@ -925,7 +925,7 @@ stage1_main() {
   echo "== 準備1/3: クロスビルド (mat + matd, $TARGET, rust-lld) — BLE 不要（commission は on-network のみ）"
   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
   export RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes"
-  cargo build --release --target "$TARGET" -p mat -p matd
+  cargo build --release --target "$TARGET" -p mat-cli -p matd
   local MAT_BIN="target/$TARGET/release/mat"
   local MATD_BIN="target/$TARGET/release/matd"
   file "$MAT_BIN" | grep -q 'aarch64' || { echo "FAIL: stale/wrong-arch binary: $MAT_BIN" >&2; exit 1; }

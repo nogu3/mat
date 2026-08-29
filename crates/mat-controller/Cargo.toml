@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "From-scratch Matter controller library (Phase 5 backend)"
+description = "From-scratch pure-Rust Matter controller library — TLV, PASE/CASE, Interaction Model, mDNS, groupcast, commissioning"
+keywords = ["matter", "smart-home", "iot", "commissioning", "thread"]
+categories = ["network-programming"]
 
 [features]
 # BLE commissioning (bluer は libdbus にリンクするため隔離。

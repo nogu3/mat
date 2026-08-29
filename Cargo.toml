@@ -9,10 +9,12 @@ license = "MIT"
 repository = "https://github.com/nogu3/mat"
 
 [workspace.dependencies]
-mat-core = { path = "crates/mat-core" }
-mat-controller = { path = "crates/mat-controller" }
-mat-native = { path = "crates/mat-native" }
-mat-device = { path = "crates/mat-device" }
+# path + version の併記は crates.io publish 用（ローカルでは path が勝ち、
+# publish 時は version だけが残る）。workspace.package.version と同時に上げる。
+mat-core = { path = "crates/mat-core", version = "1.28.0" }
+mat-controller = { path = "crates/mat-controller", version = "1.28.0" }
+mat-native = { path = "crates/mat-native", version = "1.28.0" }
+mat-device = { path = "crates/mat-device", version = "1.28.0" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

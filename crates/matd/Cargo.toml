@@ -1,10 +1,12 @@
 [package]
 name = "matd"
-description = "Matter resident daemon (Phase 4) — warm CASE sessions over mat-core"
+description = "Resident Matter daemon for the mat CLI — warm CASE sessions and a resident Subscribe (mat listen)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["matter", "smart-home", "iot", "daemon"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "matd"

@@ -1,10 +1,12 @@
 [package]
 name = "matv"
-description = "Virtual Matter device host CLI (M1: single self-contained node) — thin wrapper around mat-device's Device runtime"
+description = "Virtual Matter device host — a commissionable bridge with virtual devices, for testing Matter controllers without hardware"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["matter", "smart-home", "iot", "virtual-device", "testing"]
+categories = ["command-line-utilities", "simulation"]
 
 [[bin]]
 name = "matv"
