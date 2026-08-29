@@ -216,3 +216,24 @@ Echo Show 11 から再試行（`~/matv-alexa/`, discriminator 1859, port 5540, s
 → **「リージョン/アカウント段階のロールアウト（JP 未解除）」説が最有力に更新**。
 JP + Echo Show 11 + 独立 Rust 実装で同日失敗という本試行はこの説の裏付けデータ点。
 引き続きウォッチ + JP データ点の #605 への投稿を検討。
+
+## 追試 2026-08-29: Apple Home 共有（ECM 窓）経由 — 同一シグネチャで失敗
+
+マルチアドミン共有なら Amazon のクラウド attestation 検証を迂回できるか、の白黒付け。
+Apple Home「ペアリングモードをオン」→ RevokeCommissioning + OpenCommissioningWindow が
+matv（`~/matv-apple/`, port 5540, Apple ペアリング済み）に着弾 → Alexa アプリにコード入力:
+
+- 09:59:26 JST Echo が ECM PASE 確立（窓・verifier PASE は正常動作）→ ArmFailSafe(80)
+  → SetRegulatoryConfig → SetTCAcknowledgements（UNSUPPORTED_COMMAND 応答、08-26 と同じ）
+  → CertificateChainRequest×2 → AttestationRequest 応答（09:59:26.927）
+- 以降 80 秒沈黙 → 10:00:46 fail-safe 失効 → アプリは GS014
+
+**判定**: 直接 commission と寸分違わぬクラウド側 attestation 拒否シグネチャ。共有経由でも
+2 人目のアドミンは attestation を丸ごと実行するため迂回にならない（仕様どおり）。
+**共有経路は選択肢から消去**。引き続き JP ロールアウト解除待ちが正。
+
+**副産物（M4 への実測データ点）**: Echo の PASE 確立 37 秒後、Apple TV の定例 re-CASE +
+再購読が runtime の current session を奪い、以降 Echo セッション宛の secured datagram が
+drop された（今回は Echo が先に沈黙していたため敗因ではない）。M2 申し送りの「並行セッション
+処理（顕在化時のみ）」が multi-admin 共存で初めて実測顕在化 — **Alexa 共存（共有 or 直接）を
+やる時点で multi-session 対応が事実上必須**。
