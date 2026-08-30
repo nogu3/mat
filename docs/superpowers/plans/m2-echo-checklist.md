@@ -237,3 +237,11 @@ matv（`~/matv-apple/`, port 5540, Apple ペアリング済み）に着弾 → A
 drop された（今回は Echo が先に沈黙していたため敗因ではない）。M2 申し送りの「並行セッション
 処理（顕在化時のみ）」が multi-admin 共存で初めて実測顕在化 — **Alexa 共存（共有 or 直接）を
 やる時点で multi-session 対応が事実上必須**。
+
+## 2026-08-29/30 追記: ウォッチの自動化と新データ点
+
+- **matterbridge #605 は 08-26 に未解決のままクローズ**（JP 報告者 k9i が Google Home 代替を選び離脱。メンテナは「ローカル環境問題だろう」と判断 — JP 失敗の原因は未解明のまま）。
+- **homebridge #4002（08-27 起票）が同一シグネチャの新規データ点**: attestationRequest 応答後 CSRRequest に進まず GS014、Apple Home は完走。
+  <https://github.com/homebridge/homebridge/issues/4002>
+- **ウォッチを rutinas の `matv-alexa-watch` DAG で自動化（08-29 稼働開始）**: 毎週月曜 07:20 JST に #605 / RiDDiX#449 の新コメント・状態変化と、GS014/RN002 言及の新規 issue 検索を実行し、新着時のみ Slack 通知。実装は rutinas repo `scripts/matv_alexa_watch.py`。
+- 音声入口のゼロベース検討（vault `docs/superpowers/specs/2026-08-30-voice-device-design.md`）の結果、**ユーザー決定: 当面 matv 待ち**（Echo Show 続投、自作音声端末は ¥0 方針で保留）。
