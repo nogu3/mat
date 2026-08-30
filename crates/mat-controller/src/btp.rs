@@ -294,7 +294,7 @@ impl SessionState {
             // 初回データフレームの期待 seq は 1（CHIP BtpEngine::Init の central 側
             // mRxNextSeqNum = 1 と同値）。255 番兵にすると期待が 0 になり、実機
             // （Nanoleaf）の正しい初回フレーム seq=1 を out-of-order 誤判定して
-            // PASE が落ちる（2026-08-11 jarvis 実機で確認）。tx 側と非対称なのは
+            // PASE が落ちる（2026-08-11 実機で確認）。tx 側と非対称なのは
             // handshake request（write）が seq を消費しないため。
             last_rx_seq: 0,
             pending_ack: false,
@@ -393,7 +393,7 @@ async fn run_session(
                         // we stay idle, the keepalive tick flushes it within
                         // KEEPALIVE_INTERVAL. Sending a separate ack-only frame before
                         // every response doubled our frame count and left a real
-                        // Nanoleaf silent after Pake3 (observed live on jarvis).
+                        // Nanoleaf silent after Pake3 (observed live on real hardware).
                     }
                     Ok(None) => {
                         // 複数segmentメッセージの途中: 閾値超えなら早めにack
@@ -428,7 +428,7 @@ async fn run_session(
                 // 埋め草で送ると、request と response の間に余計な sequenced
                 // フレームが1枚挟まり、後続メッセージの seq が 1 つずれる。実機
                 // の Nanoleaf はこの埋め草 ack のせいで直後の Pake3（本来 seq2 が
-                // seq3 にずれる）を無言ドロップした（jarvis 実機 + btmon HCI
+                // seq3 にずれる）を無言ドロップした（実機 + btmon HCI
                 // キャプチャで確認。chip-tool は owe していない ack を送らず
                 // PBKDF=seq0/Pake1=seq1/Pake3=seq2 で成功）。pending_ack を
                 // 立てたまま送るデータが無い場合の flush 経路としては残す。

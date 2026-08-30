@@ -49,7 +49,7 @@ struct Cli {
     #[arg(long, env = "MAT_MATD_THREAD_IFACE")]
     thread_iface: Option<String>,
 
-    /// KVS fabric テーブルの index（jarvis 本番は 2、alpha は 1）。
+    /// KVS fabric テーブルの index（本番機で 2、検証機で 1 のような使い分け）。
     #[arg(long, env = "MAT_MATD_FABRIC_INDEX", default_value_t = 1)]
     fabric_index: u8,
 
@@ -145,7 +145,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // native warm session バックエンド。iface は env / --iface、未設定なら自動
     // 検出（M8c-3 native 既定化）。自動検出の候補 0 / 複数は起動拒否 —
     // 全 op が死ぬ設定不備なので per-op エラーではなく fail-fast にする
-    // （jarvis の systemd unit は env 設定済みで影響なし）。
+    // （本番機の systemd unit は env 設定済みで影響なし）。
     let iface: String = match &cli.iface {
         Some(i) => i.clone(),
         None => match mat_native::iface_select::autodetect() {

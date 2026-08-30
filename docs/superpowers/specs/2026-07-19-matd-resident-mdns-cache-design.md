@@ -13,7 +13,7 @@ chip-tool は解決可）。真因は 2 層:
 **層1（受信経路・ソケット — 本 spec の前提。実装済み）**: `mat-controller::
 dnssd` の resolver は `[::]:0`（ephemeral ポート）で bind し `ff02::fb` に
 join していなかった。node5/8/14 を広告する OTBR mDNS advertising proxy
-（`192.168.1.112` / `fe80::56ef:44ff:fe81:ce58`）は SRV/AAAA を **ff02::fb へ
+（`192.0.2.112` / `fe80::200:ff:fe00:1`）は SRV/AAAA を **ff02::fb へ
 マルチキャストで応答**する（QU ビットを立てても無視、RFC 6762 §5.4 が許容）。
 ephemeral ソケットはこれを受信できず必ず timeout。→ **修正済み**: resolver の
 ソケットを `[::]:5353`（`SO_REUSEADDR` のみ。`SO_REUSEPORT` はマルチキャストを

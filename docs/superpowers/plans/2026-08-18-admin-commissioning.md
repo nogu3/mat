@@ -633,7 +633,7 @@ task e2e:device:m2-chip         # chip-tool ゲート（commission/OnOff/再起�
 
 jarvis に `task dist:arm64` → `~/.local/bin/matv` 配布 → `~/matv-ha/` を新 store で起動。
 jarvis の `~/ms-test`（matter-server 1.1.7 導入済み）を `--enable-test-net-dcl` で起動し、
-WS `commission_on_network`（setup_pin_code=63852174, ip_addr=192.168.1.190）→
+WS `commission_on_network`（setup_pin_code=20202021, ip_addr=192.0.2.190）→
 `COMMISSION_OK` と OnOff toggle 往復を確認（本セッションで使った
 `jarvis_commission.py` / `toggle_test.py` の手順）。
 

@@ -1,13 +1,13 @@
 //! M6b 実機受け入れ: 工場リセット済みデバイスを BLE+Thread で使い捨て
 //! fabric へ native commission → onoff 確認 → native open-window →
 //! （オペレータが本番 `mat commission` を実行）→ RemoveFabric 撤収。
-//! 実行は scripts/e2e-m6b-real.sh 経由（jarvis 上）。
+//! 実行は scripts/e2e-m6b-real.sh 経由（実機上）。
 //!
 //! 必須 env:
 //!   MAT_E2E_BLE_PASSCODE      デバイス印字の setup passcode
 //!   MAT_E2E_BLE_DISCRIMINATOR 12-bit discriminator（10進）
 //!   MAT_E2E_THREAD_DATASET    `ot-ctl dataset active -x` の hex
-//!   MAT_E2E_IFACE             operational 発見用 iface（jarvis は eth0）
+//!   MAT_E2E_IFACE             operational 発見用 iface（例: eth0）
 //!   MAT_E2E_PAA_DIR           本番 PAA ストア（<store>/paa-trust-store）
 //!   MAT_E2E_NODE_ID           使い捨て fabric 上の新 node_id（例 200）
 
@@ -35,7 +35,7 @@ fn hex_bytes(s: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "requires jarvis BLE + factory-reset device + OTBR dataset (task e2e:m6b:real)"]
+#[ignore = "requires controller-host BLE + factory-reset device + OTBR dataset (task e2e:m6b:real)"]
 async fn commission_factory_device_over_ble_thread() {
     // Diagnostics to stderr (RUST_LOG controls level; --nocapture shows them).
     let _ = tracing_subscriber::fmt()

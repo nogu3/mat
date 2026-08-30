@@ -144,4 +144,4 @@ enum CommissioningWindow {
 - 最終 fabric 削除後に再 commissioning 不能（要 restart。spec は commissioning mode 再進入を期待）
 - DropSession 伝播・mDNS retry の seam 自動テスト無し（pure-fn テスト + 実機ゲートでカバー中）
 
-**検証リグ（再利用可）**: jarvis `~/ms-test`（matter-server 1.1.7 npm 導入済み、`--enable-test-net-dcl` で起動）、`~/matv-ha/`（matv 手動起動、discriminator 2314 / passcode 63852174）。WS 自動化スクリプトの手順は plan の Task 7 参照。
+**検証リグ（再利用可）**: jarvis `~/ms-test`（matter-server 1.1.7 npm 導入済み、`--enable-test-net-dcl` で起動）、`~/matv-ha/`（matv 手動起動、discriminator 3840 / passcode 20202021）。WS 自動化スクリプトの手順は plan の Task 7 参照。

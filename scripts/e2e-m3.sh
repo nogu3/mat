@@ -17,16 +17,16 @@ cd "$(dirname "$0")/.."
 echo "== 1/3 クロスビルド (aarch64-unknown-linux-musl, rust-lld)"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
 export RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes"
-cargo test -p mat-controller --test live_jarvis --release \
+cargo test -p mat-controller --test live_remote --release \
   --target aarch64-unknown-linux-musl --no-run
-BIN=$(ls -t target/aarch64-unknown-linux-musl/release/deps/live_jarvis-* \
+BIN=$(ls -t target/aarch64-unknown-linux-musl/release/deps/live_remote-* \
   | grep -v '\.d$' | head -1)
 file "$BIN" | grep -q 'aarch64' || { echo "stale/wrong-arch binary: $BIN"; exit 1; }
 echo "binary: $BIN"
 
 echo "== 2/3 転送 → $MAT_E2E_HOST"
 # scp は ssh-agent の状態に左右されるため、確実な ssh cat 方式で送る
-ssh "$MAT_E2E_HOST" 'cat > /tmp/live_jarvis && chmod +x /tmp/live_jarvis' < "$BIN"
+ssh "$MAT_E2E_HOST" 'cat > /tmp/live_remote && chmod +x /tmp/live_remote' < "$BIN"
 
 echo "== 3/3 実機で実行"
 ssh "$MAT_E2E_HOST" \
@@ -47,7 +47,7 @@ fi
 export MAT_E2E_KVS_DIR
 [ -n "${MAT_E2E_IFACE}" ] && export MAT_E2E_IFACE || unset MAT_E2E_IFACE
 [ -n "${MAT_E2E_PEER}" ] && export MAT_E2E_PEER || unset MAT_E2E_PEER
-exec /tmp/live_jarvis --ignored --nocapture
+exec /tmp/live_remote --ignored --nocapture
 EOF
 
 echo "== e2e:m3 PASS"

@@ -398,7 +398,7 @@ EOF
     #[test]
     fn fold_operational_populates_cache_from_one_message() {
         let (cache, _rx) = OperationalCache::new();
-        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        let addr: Ipv6Addr = "fd00:1111:2222:1::b92a".parse().unwrap();
         // operational instance の完成応答（SRV+TXT+AAAA を 1 メッセージに）。
         let msg = synth_response(
             "AB7DE08802E0CD54-0000000000000005._matter._tcp.local",

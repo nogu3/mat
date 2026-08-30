@@ -75,11 +75,11 @@ CHIP_TOOL_STORE=/tmp/chip-tool-store-test2 scripts/chip-tool.sh \
 
 **ここまで到達（成功箇所）**:
 - chip-tool がフル起動し RCAC/ICAC/NOC を生成、fabric に参加。
-- **matv を実 mDNS で発見**: `CHIP:TOO: Discovered Device: fe80::2351:9165:67de:87b4:47977`
+- **matv を実 mDNS で発見**: `CHIP:TOO: Discovered Device: fe80::200:ff:fe00:3:47977`
 - matv の UDP エンドポイントへ実際に PBKDFParamRequest を送信:
   ```
   CHIP:EM: <<< [E:47271i S:0 M:217627266] (U) Msg TX to 0:0000000000000000 [0000] --- Type 0000:20 (SecureChannel:PBKDFParamRequest)
-  CHIP:IN: (U) Sending msg 217627266 to IP address 'UDP:[fe80::2351:9165:67de:87b4%eth1]:47977'
+  CHIP:IN: (U) Sending msg 217627266 to IP address 'UDP:[fe80::200:ff:fe00:3%eth1]:47977'
   ```
   → **ここまでで brief の目的「WSL2 上で chip-tool が実 mDNS を引けて matv に UDP が通る」は達成**。
 

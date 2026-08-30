@@ -69,7 +69,7 @@ async fn commission_second_fabric_and_remove() {
     // 側は clone を wrap するだけ。
     let session_transport = Arc::new(Transport::Udp(Arc::clone(&transport)));
 
-    // 1/7: 本番 fabric credentials（live_jarvis.rs と同じ読み方 — 相乗り
+    // 1/7: 本番 fabric credentials（live_remote.rs と同じ読み方 — 相乗り
     // identity の自己発行のみ、KVS への書き込みは一切しない）。
     eprintln!("== 1/7 本番 fabric credentials 読み取り");
     let materials = kvs::read_self_issue_materials(
@@ -169,7 +169,7 @@ async fn commission_second_fabric_and_remove() {
     // 残留し続ける（fabric slot は数個しかなく、再実行で更に１つ増える）。
     // そのため制御・検証は panic しない Result 化した exercise() に閉じ込め、
     // 呼び出し側は成否に関わらず必ず RemoveFabric を試みてから、最後に
-    // まとめて結果を expect する（live_jarvis.rs の exercise/復元パターンと
+    // まとめて結果を expect する（live_remote.rs の exercise/復元パターンと
     // 同じ考え方）。
     let result = exercise(
         &mut second_session,

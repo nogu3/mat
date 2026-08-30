@@ -13,7 +13,7 @@
 1. **購読は確立する。** SubscriptionManager は commissioned 全ノードへ購読を張り、到達可能なノードで SubscribeResponse を受信し `subscription established`（node_id / subscription_id / max_interval_s=3600）を info ログ。
 2. **配信路の下流は全て正常。** `mat listen` の接続・ack 行・フィルタ（node/endpoint/cluster/attribute、名前/数値）・count/timeout・exit code（0/3/13）・lag 切断は期待どおり動作（統合テストと実機で確認）。
 3. **live レポートが pump に届かない。** 購読済みノードの on-off を実際に変化させても（`mat read` で true↔false を実証）、`mat listen` は **イベントゼロで exit 3 timeout**。session 層に受信ログ（`recv_from` 直後）を仕込んで再デプロイした結果、**どの購読ソケットも device 発 datagram を1つも受信していない**（全ノード合計 0 件）。`events_from_report` / pump ループ本体（`next_subscription_report` の Ok 分岐）にも一切到達しない。
-4. **デバイスは live レポートを送っている。** tcpdump で、node 6 は状態変化のたびにレポート（len 147/173）を **LAN 上の別 Matter コントローラ（別 fabric、別ホスト `fdcd:3f07:c294:6868:cb38:e02f:6ead:6e99`、port 54994）の購読へ確実に送っていた**（多admin 環境）。→ デバイス側の live 報告は機能している。matd の fabric 購読へは送られていない/受けられていない。
+4. **デバイスは live レポートを送っている。** tcpdump で、node 6 は状態変化のたびにレポート（len 147/173）を **LAN 上の別 Matter コントローラ（別 fabric、別ホスト `fd00:3333:4444:1::99`、port 54994）の購読へ確実に送っていた**（多admin 環境）。→ デバイス側の live 報告は機能している。matd の fabric 購読へは送られていない/受けられていない。
 5. **matd の購読ポートへの live レポートは tcpdump に出ない。** node 6 のトグル時、eth0 capture には matd の **OP コマンド traffic のみ**（matd `ba27:...96f6` → node6:5540）で、device → matd 購読ポートの live レポートは観測されなかった。
 
 → 問題の局在: **「デバイス → matd の購読ポンプ」の受信のみ**。listen→broadcast→client 側は無罪。
@@ -21,7 +21,7 @@
 ## 環境の重要な前提（次セッションで必須の背景）
 
 - **jarvis に OTBR を移行済み**（2026-07-20、ユーザー確認）。jarvis は `wpan0`（802.15.4 Thread ラジオ）を持つ Thread BR。HA 側 OTBR は無い。メモリ `[[thread-network-topology]]` は更新済み。
-- **Thread プレフィックス 2 系統を観測**: `fd54:4b81:8cce`（eth0 の別 BR `fe80::1ac2:3cff:fe48:7e45` 経由でも到達）と `fdd8:2861:a64d`（wpan0 直、node 7-12）。node のルートは `ip -6 route get <addr>` で確認（例: node8=fdd8→dev wpan0、node6=fd54→dev eth0）。
+- **Thread プレフィックス 2 系統を観測**: `fd00:1111:2222`（eth0 の別 BR `fe80::200:ff:fe00:2` 経由でも到達）と `fd00:5555:6666`（wpan0 直、node 7-12）。node のルートは `ip -6 route get <addr>` で確認（例: node8=fd00:5555→dev wpan0、node6=fd00:1111→dev eth0）。
 - **matd の unit は `MAT_MATD_IFACE=eth0`**。しかし多くのデバイスは wpan0 経由。socket は `[::]` bind（全 iface 受信）だが、**送信元アドレス選択はルート依存**（wpan0 の `fd54:...f289` か eth0 の `ba27:...96f6`）。
 - **多admin**: 同一デバイスに matd 以外の Matter コントローラ（別 fabric）が購読中。
 - **matd の tracing は `RUST_LOG` を読む**（`MAT_LOG` は無効。mat 本体は `MAT_LOG`）。デバッグ時は `RUST_LOG="matd=debug,mat_native=debug,mat_controller=debug,info"`。

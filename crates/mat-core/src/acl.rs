@@ -73,7 +73,7 @@ pub fn group_acl_entry(group_id: u16, fabric_index: u8) -> AclEntry {
 /// encode_read_request` 経由で常にこれを満たす）。非フィルタの集合を渡すと、
 /// 他 fabric の Group エントリを「付与済み」と誤認して冪等 skip し、自 fabric
 /// に Group ACL が無いまま groupcast が届かなくなる（マルチ admin デバイス、
-/// 例えば jarvis fabric + Home Assistant fabric 併存で顕在化）。
+/// 例えば自宅 fabric + Home Assistant fabric 併存で顕在化）。
 pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {
     let gid = u64::from(group_id);
     if entries.iter().any(|e| {
@@ -678,7 +678,7 @@ mod tests {
     }
 
     /// 実機 chip-tool の `accesscontrol read acl` TOO ログ（admin 1 エントリ）。
-    /// この形式は 2026-07-06 の実機デバッグ（jarvis）に基づく想定形。upstream の
+    /// この形式は 2026-07-06 の実機デバッグに基づく想定形。upstream の
     /// バージョン変化はこのテストで検知する（CLAUDE.md の fragile-parse ルール）。
     const ACL_ADMIN_ONLY: &str = "\
 [1656][CHIP:TOO]   ACL: 1 entries

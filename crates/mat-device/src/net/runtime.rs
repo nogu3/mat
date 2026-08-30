@@ -455,7 +455,7 @@ fn random_hex_name() -> String {
 /// address — same parsing technique `mat_native::iface_select::scan` uses
 /// for the same file, duplicated locally rather than shared (that helper
 /// lives in a different crate and returns iface *names*, not addresses).
-/// Linux-specific; this runtime targets Linux (jarvis) like the rest of the
+/// Linux-specific; this runtime targets Linux like the rest of the
 /// `net` feature (raw `socket2`/`/proc` usage throughout `net::mdns`).
 fn iface_link_local_addr(iface: &str) -> Result<Ipv6Addr, DeviceError> {
     let content = std::fs::read_to_string("/proc/net/if_inet6").map_err(DeviceError::Io)?;

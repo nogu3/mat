@@ -1,4 +1,4 @@
-//! jarvis preflight: Matter BLE advertisement scanner.
+//! Controller-host preflight: Matter BLE advertisement scanner.
 //! 実行: cargo run -p mat-controller --features ble --example ble-scan
 //! 30 秒スキャンして 0xFFF6 service data を持つデバイスを列挙する。
 

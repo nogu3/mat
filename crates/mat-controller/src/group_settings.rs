@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn ipk_keyset_zero_in_chain_is_preserved() {
-        // keyset id 0（IPK）が既にチェーンにいる状態（jarvis 実機と同型）を
+        // keyset id 0（IPK）が既にチェーンにいる状態（実機と同型）を
         // 手組みで再現: まず 99/99 を書き、first_keyset チェーンを
         // 99 → 0 に差し替え + k/0 を置く（0 は有効 id、終端は 0xFFFF）。
         let (_d, p) = tmp_ini("[Default]\n");

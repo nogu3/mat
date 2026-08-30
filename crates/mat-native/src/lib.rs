@@ -42,7 +42,7 @@ pub struct NativeConfig {
     pub iface: String,
     /// groupcast の第 2 egress に使う Thread TUN iface 名（`None` = LAN 単独）。
     pub thread_iface: Option<ThreadIfaceChoice>,
-    /// KVS fabric テーブルの index（jarvis 本番は 2、alpha は 1）。
+    /// KVS fabric テーブルの index（本番機で 2、検証機で 1 のような使い分け）。
     pub fabric_index: u8,
     /// CA issuer index（既定 0）。
     pub issuer_index: u8,

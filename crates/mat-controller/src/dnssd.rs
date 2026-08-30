@@ -626,7 +626,7 @@ impl OperationalQuery {
 /// Resolves many operational nodes over ONE shared mDNS socket, folding
 /// answers per instance name. Sharing the socket is load-bearing, not an
 /// optimization: a responder honoring the QU bit (avahi as the SRP
-/// advertising proxy — jarvis pcap, 2026-08-05) answers by unicast, and a
+/// advertising proxy — production pcap, 2026-08-05) answers by unicast, and a
 /// unicast datagram to the shared port 5353 is delivered to only ONE bound
 /// socket. With per-node sockets (the pre-1.21.0 probe) every answer lands
 /// on an arbitrary socket whose per-instance filter silently discards it
@@ -1651,7 +1651,7 @@ mod tests {
     #[test]
     fn fold_operational_populates_cache_from_one_message() {
         let (cache, _rx) = OperationalCache::new();
-        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        let addr: Ipv6Addr = "fd00:1111:2222:1::b92a".parse().unwrap();
         // operational instance の完成応答（SRV+TXT+AAAA を 1 メッセージに）。
         let msg = synth_response(
             "AB7DE08802E0CD54-0000000000000005._matter._tcp.local",
@@ -1762,7 +1762,7 @@ mod tests {
 
     /// avahi（SRP advertising proxy）型 responder の模擬: クエリを受信し、
     /// **問い合わせ元アドレスへの unicast でのみ**応答する（QU 準拠。
-    /// 2026-08-05 jarvis pcap で確定した挙動）。served に無い instance には
+    /// 2026-08-05 実機 pcap で確定した挙動）。served に無い instance には
     /// 応答しない。unicast は同一ポート多重 bind の 1 ソケットにしか配達
     /// されないため、並行 resolve がソケットを共有しない限り他ノード宛の
     /// 答えを黙殺する — という本番機序をそのまま再現する。
@@ -2886,7 +2886,7 @@ mod tests {
         let (cache, _rx) = OperationalCache::new();
         let service = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
         let target = "12b41a22758b788a.local";
-        let addr: Ipv6Addr = "fd54:4b81:8cce:1::b92a".parse().unwrap();
+        let addr: Ipv6Addr = "fd00:1111:2222:1::b92a".parse().unwrap();
         let mut fold = OperationalFold::default();
 
         let msg1 = synth_srv_txt_only(service, target, 5540, &["SII=5000"]);
@@ -3028,7 +3028,7 @@ mod tests {
         let mut fold = OperationalFold::default();
         let service_a = "AB7DE08802E0CD54-0000000000000005._matter._tcp.local";
         let target_a = "hosta.local";
-        let addr_a: Ipv6Addr = "fd54:4b81:8cce:1::a".parse().unwrap();
+        let addr_a: Ipv6Addr = "fd00:1111:2222:1::a".parse().unwrap();
 
         let msg_a = synth_response(service_a, target_a, 5540, &["SII=5000"], addr_a);
         let records_a = parse_message(&msg_a).unwrap();
@@ -3045,7 +3045,7 @@ mod tests {
         );
 
         // 無関係な datagram: A に一切触れない (別ホストの AAAA のみ)。
-        let addr_b: Ipv6Addr = "fd54:4b81:8cce:1::b".parse().unwrap();
+        let addr_b: Ipv6Addr = "fd00:1111:2222:1::b".parse().unwrap();
         let msg_unrelated = synth_aaaa_only("unrelated.local", 120, addr_b);
         let records_unrelated = parse_message(&msg_unrelated).unwrap();
         fold_operational_into_cache(&records_unrelated, &mut fold, &cache, Instant::now());
