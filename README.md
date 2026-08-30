@@ -1,6 +1,7 @@
 # mat
 
 [![CI](https://github.com/nogu3/mat/actions/workflows/ci.yml/badge.svg)](https://github.com/nogu3/mat/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/matterctl.svg)](https://crates.io/crates/matterctl)
 [![Docs](https://img.shields.io/badge/docs-nogu3.github.io%2Fmat-blue)](https://nogu3.github.io/mat/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
@@ -48,8 +49,9 @@ controller.
 ## Quickstart
 
 ```bash
-# build & install -> ~/.cargo/bin/{mat,matd,matv}
-task install
+# install from crates.io -> ~/.cargo/bin/{mat,matd,matv}
+# (the CLI package is named `matterctl`; the binary it installs is `mat`)
+cargo install matterctl matd matv
 
 # create your first fabric (writes the credential store; no network I/O)
 mat fabric init
@@ -127,9 +129,23 @@ mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
 
 ## Install
 
+From crates.io — the CLI package is `matterctl` (the `mat` name was taken);
+the binary it installs is `mat`:
+
 ```bash
-task build      # release build -> target/release/{mat,matd}
-task install    # install both binaries into ~/.cargo/bin
+cargo install matterctl   # the mat CLI (binary: mat)
+cargo install matd        # optional: the resident daemon
+cargo install matv        # optional: the virtual device host
+```
+
+BLE commissioning is an opt-in cargo feature (pulls in `libdbus`):
+`cargo install matterctl --features ble`.
+
+From a checkout:
+
+```bash
+task build      # release build -> target/release/{mat,matd,matv}
+task install    # install all three binaries into ~/.cargo/bin
 ```
 
 ## Documentation
