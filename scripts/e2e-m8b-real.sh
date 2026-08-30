@@ -112,7 +112,7 @@ confirm() {
 echo "== 1/6 クロスビルド (mat, $TARGET, rust-lld) — matd は不要（discover/diag は常に直経路）"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
 export RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes"
-cargo build --release --target "$TARGET" -p mat-cli
+cargo build --release --target "$TARGET" -p matterctl
 MAT_BIN="target/$TARGET/release/mat"
 file "$MAT_BIN" | grep -q 'aarch64' || { echo "stale/wrong-arch binary: $MAT_BIN"; exit 1; }
 echo "mat: $MAT_BIN"

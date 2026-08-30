@@ -147,7 +147,7 @@ confirm_yn() {
 }
 
 echo "== 1/6 cross build (mat, $TARGET, features ble — docker 経由、Cross.toml の arm64 libdbus pre-build 使用)"
-cross build --release --target "$TARGET" -p mat-cli --features ble
+cross build --release --target "$TARGET" -p matterctl --features ble
 MAT_BIN="target/$TARGET/release/mat"
 FILE_OUT=$(file "$MAT_BIN")
 echo "$FILE_OUT"

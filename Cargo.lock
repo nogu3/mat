@@ -892,24 +892,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baee0bbc17ce759db233beb01648088061bf678383130602a298e6998eedb2d8"
 
 [[package]]
-name = "mat-cli"
-version = "1.28.0"
-dependencies = [
- "assert_cmd",
- "async-trait",
- "clap",
- "mat-controller",
- "mat-core",
- "mat-native",
- "predicates",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mat-controller"
 version = "1.28.0"
 dependencies = [
@@ -1007,6 +989,24 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "matterctl"
+version = "1.28.0"
+dependencies = [
+ "assert_cmd",
+ "async-trait",
+ "clap",
+ "mat-controller",
+ "mat-core",
+ "mat-native",
+ "predicates",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

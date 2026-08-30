@@ -65,7 +65,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building (release)" >&2
-cargo build --release -p mat-cli
+cargo build --release -p matterctl
 cargo build --release -p matv
 
 cat >"$MATV_CONFIG" <<EOF
