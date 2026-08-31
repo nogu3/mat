@@ -332,6 +332,19 @@ impl ClusterHandler for GroupKeyManagementHandler {
         ctx.changed.push(im::ATTR_GROUP_KEY_MAP);
         Ok(())
     }
+
+    /// spec §11.2.5 のアクセス表: KeySet 系コマンド（この実装が受理するの
+    /// は `CMD_KEY_SET_WRITE` だけ）は Administer — group key は fabric の
+    /// 共有秘密そのものなので、Operate 権限の controller には書かせない。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
+    }
+
+    /// `ATTR_GROUP_KEY_MAP` の write は Manage（read は View のまま =
+    /// trait default）。書ける属性はこれだけ。
+    fn write_privilege(&self, _attribute: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_MANAGE
+    }
 }
 
 /// `decode_key_set_write_fields`の失敗理由。TLV ストリーム自体が壊れて

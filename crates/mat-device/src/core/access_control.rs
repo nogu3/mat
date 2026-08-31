@@ -39,7 +39,7 @@ pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
 /// 唯一の値 — CASE。Group/PASE の auth mode は `check`/`decode_acl_entry_body`
 /// のどちらも意味的に扱わない（PASE は fabric を持たないので ACL の対象
 /// 外、Group は subject 解決を実装していない）。
-const AUTH_MODE_CASE: u8 = 2;
+pub(crate) const AUTH_MODE_CASE: u8 = 2;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
 /// `AccessControlEntriesPerFabric` (spec §11.1.5) — 固定値を返すのみで
@@ -213,6 +213,16 @@ impl AclStore {
         guard.entries.push(entry);
         Self::save(&guard);
     }
+
+    #[cfg(test)]
+    /// テスト専用: 任意の privilege/subject のエントリ列を fabric に据える。
+    /// production の投入経路は AddNOC 由来の `add_case_admin`（常に
+    /// Administer）と `write` の 2 つだけなので、enforcement を検証する
+    /// 側（`datamodel` の ACL テスト）が「Operate だけの subject」のような
+    /// 中間状態を組むにはこれが要る。
+    pub(crate) fn set_entries_for_test(&self, fabric_index: u8, entries: Vec<AclDeviceEntry>) {
+        self.replace_fabric(fabric_index, entries);
+    }
 }
 
 pub struct AccessControlHandler {
@@ -324,6 +334,22 @@ impl ClusterHandler for AccessControlHandler {
 
     fn feature_map(&self) -> u32 {
         0
+    }
+
+    /// spec §11.1.5 のアクセス表: `ACL` は read/write とも Administer
+    /// （ACL 自身を読み書きできる者は事実上その fabric の管理者）。容量
+    /// 系の 3 属性は View のまま（trait default）。
+    fn read_privilege(&self, attribute: u32) -> u8 {
+        match attribute {
+            im::ATTR_ACL => PRIVILEGE_ADMINISTER,
+            _ => PRIVILEGE_VIEW,
+        }
+    }
+
+    /// 書ける属性は `ATTR_ACL` だけ（他は `write` が
+    /// `STATUS_UNSUPPORTED_WRITE`）なので、属性を問わず Administer。
+    fn write_privilege(&self, _attribute: u32) -> u8 {
+        PRIVILEGE_ADMINISTER
     }
 }
 
@@ -477,7 +503,8 @@ pub(crate) struct AclTargetDev {
 }
 
 /// `raw` は `AclDeviceEntry::targets_raw`（`Tag::Anonymous` に再タグされた
-/// `TargetStruct` array の raw TLV、doc :43-48）。ArrayStart → 各
+/// `TargetStruct` array の raw TLV — 上の `AclDeviceEntry` の doc 参照）。
+/// ArrayStart → 各
 /// StructStart（`Context(0)`=cluster / `Context(1)`=endpoint /
 /// `Context(2)`=device_type、いずれも `Null` 可）→ ContainerEnd。
 /// パース不能（想定外の形、truncated 等）は `None` — 呼び出し側

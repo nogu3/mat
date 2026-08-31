@@ -295,6 +295,12 @@ impl Device {
         getrandom::getrandom(&mut version_seed)
             .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
         node.set_data_version_base(u32::from_le_bytes(version_seed));
+        // ACL enforcement (spec §9.10) を有効化する唯一の呼び出し —
+        // `Node::set_acl_store` を呼ばない `Node`（テストが組む素の Node）は
+        // 全許可のまま（`Node::acl`の doc 参照）。クラスタ登録より前に
+        // 置く必要は無いが、「この Node は enforcement する」という宣言を
+        // 組み立ての先頭にまとめておく。
+        node.set_acl_store(acl_store.clone());
         let (general_commissioning, operational_credentials, admin_commissioning) =
             comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);

@@ -516,6 +516,15 @@ impl ClusterHandler for GeneralCommissioningHandler {
             RESP_COMMISSIONING_COMPLETE,
         ]
     }
+
+    /// spec §11.10.5: General Commissioning のコマンドは全て Administer。
+    /// commissioning 本番の呼び出しは PASE（fabric 0 = implicit
+    /// Administer、`datamodel::acl_allows`）か、AddNOC 後の CASE で
+    /// commissioner 自身の admin エントリ（`AclStore::add_case_admin`）
+    /// 経由なので、この要求で正規フローが塞がることはない。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Node Operational Credentials (0x003E).
@@ -566,6 +575,13 @@ impl ClusterHandler for OperationalCredentialsHandler {
     fn generated_commands(&self) -> Vec<u32> {
         vec![RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR, RESP_NOC]
     }
+
+    /// spec §11.17.5: Operational Credentials のコマンドは全て Administer
+    /// （AddNOC / RemoveFabric は fabric 資格そのものの操作）。理由は
+    /// `GeneralCommissioningHandler::invoke_privilege` の doc と同じ。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Administrator Commissioning (0x003C).
@@ -600,6 +616,13 @@ impl ClusterHandler for AdminCommissioningHandler {
 
     fn accepted_commands(&self) -> Vec<u32> {
         vec![CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING]
+    }
+
+    /// spec §11.19.5: Administrator Commissioning のコマンドは全て
+    /// Administer（別 admin を招き入れる窓の開閉なので、Manage 止まりの
+    /// controller には出させない）。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
     }
 }
 
@@ -2218,6 +2241,7 @@ mod tests {
             let ctx = ReadCtx {
                 fabric_index: accessing,
                 fabric_filtered: true,
+                ..ReadCtx::default()
             };
             assert_eq!(
                 fabric_indices_of_list(&read(ATTR_OC_NOCS, &ctx)),
@@ -2240,6 +2264,7 @@ mod tests {
         let pase = ReadCtx {
             fabric_index: 0,
             fabric_filtered: true,
+            ..ReadCtx::default()
         };
         assert!(fabric_indices_of_list(&read(ATTR_OC_NOCS, &pase)).is_empty());
         assert!(fabric_indices_of_list(&read(ATTR_OC_FABRICS, &pase)).is_empty());
@@ -2252,6 +2277,7 @@ mod tests {
         let unfiltered = ReadCtx {
             fabric_index: 1,
             fabric_filtered: false,
+            ..ReadCtx::default()
         };
         assert_eq!(
             fabric_indices_of_list(&read(ATTR_OC_NOCS, &unfiltered)),
