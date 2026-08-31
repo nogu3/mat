@@ -3,8 +3,6 @@
 //! chip-tool 撤去（M8c-3）に伴い、chip-tool のログ志向テキスト出力を読むパーサ群は
 //! 撤去済み。ここに残るのは native 経路でも使う汎用の値正規化と、native mDNS 探索
 //! 結果を `mat` のスキーマへ写すためのデータ型のみ。
-//!
-//! ACL 読み出しのテキストパーサ（`parse_acl_from_chip_log`）は `acl.rs` に残っている。
 
 use serde::Serialize;
 
@@ -58,51 +56,4 @@ pub fn normalize_value(raw: &str) -> serde_json::Value {
         }
     }
     serde_json::Value::String(raw.to_string())
-}
-
-/// 行頭の chip-tool ログ接頭辞を取り除いた残り（payload）を返す。
-///
-/// chip-tool のログ形式はバージョンで揺れる。少なくとも次の2系統を扱う:
-/// - 旧テスト fixture: `[1717][CHIP:DIS] payload`（整数 ts + `CHIP:` タグ、隙間なし）
-/// - 実機 v1.4.2.0:   `[1780817887.948] [32231:32235] [TOO] payload`
-///   （小数点 ts + `pid:tid` + `CHIP:` 無しタグ、スペース区切り）
-///
-/// 方針: 行頭から `[...]` ブロックを見て、
-/// - 英字を含むブロック（`CHIP:DIS` / `TOO` / `DMG` 等のタグ）に当たったら、それを
-///   接頭辞の最後とみなして以降の payload を返す。
-/// - 数字・ドット・コロンのみのブロック（ts / `pid:tid`）で、直後に別ブロックが続く
-///   ものはメタ情報として読み飛ばす。
-/// - それ以外（`[1]: 6` のようなインデックス行）は剥がさない。
-///
-/// `acl.rs` の `parse_acl_from_chip_log`（ACL 読み出し）が使う。
-pub(crate) fn strip_log_prefix(line: &str) -> Option<&str> {
-    let mut rest = line;
-    loop {
-        let trimmed = rest.trim_start();
-        if !trimmed.starts_with('[') {
-            return Some(trimmed);
-        }
-        let Some(close) = trimmed.find(']') else {
-            return Some(trimmed);
-        };
-        let block = &trimmed[1..close];
-        let after = trimmed[close + 1..].trim_start();
-
-        // タグブロック（英字を含む）= 接頭辞の最後。payload を返す。
-        if block.chars().any(|c| c.is_ascii_alphabetic()) {
-            return Some(after);
-        }
-        // メタブロック（ts `1780817887.948` / pid:tid `32231:32235`）は数字・ドット・
-        // コロンのみで構成され、直後に別ブロックが続く。読み飛ばして継続。素の
-        // `[1]: 6`（直後が `[` でない）はインデックス行なので剥がさない。
-        let is_meta = !block.is_empty()
-            && block
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '.' || c == ':');
-        if is_meta && after.starts_with('[') {
-            rest = after;
-            continue;
-        }
-        return Some(trimmed);
-    }
 }
