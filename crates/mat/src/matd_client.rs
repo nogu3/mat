@@ -261,7 +261,7 @@ fn to_op(command: &Command) -> Result<Value, ToOpError> {
         } => {
             // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み mireds を
             // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
-            let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+            let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
             json!({
                 "op": "color_temp", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "mireds": mireds, "kelvin": kelvin, "transition": transition,
@@ -275,7 +275,7 @@ fn to_op(command: &Command) -> Result<Value, ToOpError> {
         } => {
             // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み level を
             // 渡し、percent は応答エコー用。
-            let level = crate::commands::invoke::resolve_level(*percent);
+            let level = crate::units::resolve_level(*percent);
             json!({
                 "op": "level", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
                 "level": level, "percent": percent, "transition": transition,
@@ -353,8 +353,7 @@ fn to_op(command: &Command) -> Result<Value, ToOpError> {
                 endpoint,
             } => {
                 // 換算は mat 側で 1 箇所（直経路と同じ規則）。kelvin はエコー用。
-                let (mireds, kelvin) =
-                    crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+                let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
                 json!({
                     "op": "group_color_temp", "group_id": group_id.id()?,
                     "mireds": mireds, "kelvin": kelvin,
@@ -368,7 +367,7 @@ fn to_op(command: &Command) -> Result<Value, ToOpError> {
                 endpoint,
             } => {
                 // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
-                let level = crate::commands::invoke::resolve_level(*percent);
+                let level = crate::units::resolve_level(*percent);
                 json!({
                     "op": "group_level", "group_id": group_id.id()?,
                     "level": level, "percent": percent,

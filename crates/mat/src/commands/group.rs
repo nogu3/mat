@@ -64,7 +64,6 @@ pub(crate) fn emit_bump(from: u32, to: u32) {
 }
 
 /// `color_temp` の出力部（body は `mat_core::body` 共有）。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_color_temp_sent(
     group_id: u16,
     kelvin: u32,
@@ -79,7 +78,6 @@ pub(crate) fn emit_color_temp_sent(
 }
 
 /// `level` の出力部（body は `mat_core::body` 共有）。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_level_sent(
     group_id: u16,
     percent: u8,

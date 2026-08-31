@@ -17,6 +17,7 @@ use mat_core::color::ResolvedColor;
 use mat_core::error::MatError;
 use mat_core::ids::ScalarValue;
 use mat_core::store::Store;
+use mat_core::{body, output};
 use mat_native::group::GroupOutcome;
 use mat_native::{Engine, NativeConfig};
 
@@ -227,7 +228,7 @@ fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
             mireds,
             transition,
         } => {
-            let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+            let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
             NativeOp::ColorTemp {
                 node_id: node_id.id()?,
                 endpoint: endpoint.id()?,
@@ -242,7 +243,7 @@ fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
             percent,
             transition,
         } => {
-            let level = crate::commands::invoke::resolve_level(*percent);
+            let level = crate::units::resolve_level(*percent);
             NativeOp::Level {
                 node_id: node_id.id()?,
                 endpoint: endpoint.id()?,
@@ -313,7 +314,7 @@ fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
                     endpoint,
                 },
         } => {
-            let (mireds, kelvin) = crate::commands::invoke::resolve_color_temp(*kelvin, *mireds);
+            let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
             NativeOp::GroupColorTemp {
                 group_id: group_id.id()?,
                 kelvin,
@@ -331,7 +332,7 @@ fn classify_inner(command: &Command) -> Result<Option<NativeOp>, MatError> {
                     endpoint,
                 },
         } => {
-            let level = crate::commands::invoke::resolve_level(*percent);
+            let level = crate::units::resolve_level(*percent);
             NativeOp::GroupLevel {
                 group_id: group_id.id()?,
                 percent: *percent,
@@ -817,7 +818,7 @@ async fn op_on(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatEr
             command = "on",
             "invoke executed (native direct)"
         );
-        crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "on");
+        output::emit(body::invoke_success(node_id, endpoint, "onoff", "on"));
         Ok(())
     }
     .await;
@@ -843,7 +844,7 @@ async fn op_off(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(), MatE
             command = "off",
             "invoke executed (native direct)"
         );
-        crate::commands::invoke::emit_invoke_success(node_id, endpoint, "onoff", "off");
+        output::emit(body::invoke_success(node_id, endpoint, "onoff", "off"));
         Ok(())
     }
     .await;
@@ -862,13 +863,13 @@ async fn op_read_onoff(engine: &Engine, node_id: u64, endpoint: u16) -> Result<(
             attribute = "on-off",
             "read executed (native direct)"
         );
-        crate::commands::read::emit_read_success(
+        output::emit(body::read_success(
             node_id,
             endpoint,
             "onoff",
             "on-off",
             serde_json::json!(v),
-        );
+        ));
         Ok(())
     }
     .await;
@@ -902,7 +903,7 @@ async fn op_color(
             command = "move-to-hue-and-saturation",
             "invoke executed (native direct)"
         );
-        crate::commands::invoke::emit_color_success(node_id, endpoint, color, transition);
+        output::emit(body::color_success(node_id, endpoint, color, transition));
         Ok(())
     }
     .await;
@@ -936,9 +937,9 @@ async fn op_color_temp(
             command = "move-to-color-temperature",
             "invoke executed (native direct)"
         );
-        crate::commands::invoke::emit_color_temp_success(
+        output::emit(body::color_temp_success(
             node_id, endpoint, kelvin, mireds, transition,
-        );
+        ));
         Ok(())
     }
     .await;
@@ -972,7 +973,12 @@ async fn op_level(
             command = "move-to-level",
             "invoke executed (native direct)"
         );
-        crate::commands::invoke::emit_level_success(node_id, endpoint, percent, level, transition);
+        output::emit(body::level_success(
+            node_id,
+            endpoint,
+            body::LevelEcho { percent, level },
+            transition,
+        ));
         Ok(())
     }
     .await;
@@ -1232,7 +1238,13 @@ async fn op_read_attr(
     let result = async {
         let v = conn.read_json(endpoint, cluster, attribute).await?;
         tracing::info!(node_id, cluster, attribute, "read executed (native direct)");
-        crate::commands::read::emit_read_success(node_id, endpoint, cluster_in, attribute_in, v);
+        output::emit(body::read_success(
+            node_id,
+            endpoint,
+            cluster_in,
+            attribute_in,
+            v,
+        ));
         Ok(())
     }
     .await;
@@ -1270,13 +1282,13 @@ async fn op_write_attr(
             attribute,
             "write executed (native direct)"
         );
-        crate::commands::write::emit_write_success(
+        output::emit(body::write_success(
             node_id,
             endpoint,
             cluster_in,
             attribute_in,
             value_in,
-        );
+        ));
         Ok(())
     }
     .await;
@@ -1302,7 +1314,9 @@ async fn op_invoke_generic(
         conn.invoke(endpoint, cluster, command, fields_tlv.clone(), timed)
             .await?;
         tracing::info!(node_id, cluster, command, "invoke executed (native direct)");
-        crate::commands::invoke::emit_invoke_success(node_id, endpoint, cluster_in, command_in);
+        output::emit(body::invoke_success(
+            node_id, endpoint, cluster_in, command_in,
+        ));
         Ok(())
     }
     .await;
@@ -1316,7 +1330,7 @@ async fn op_describe(engine: &Engine, node_id: u64) -> Result<(), MatError> {
     let result = async {
         let endpoints = mat_native::ops::describe(&mut *conn).await?;
         tracing::info!(node_id, "describe executed (native direct)");
-        crate::commands::describe::emit_describe_success(node_id, &endpoints);
+        output::emit(body::describe_success(node_id, &endpoints));
         Ok(())
     }
     .await;
@@ -2492,7 +2506,7 @@ mod tests {
     // これまで chip-tool 統合テスト（`read_parses_value` / `write_reports_success`
     // / `invoke_reports_success` / `describe_lists_endpoints_and_clusters`）が
     // 担っていた「成功系が最後まで走ること」の代替。stdout の JSON 内容自体は
-    // `emit_read_success` 等が `println!` 直書き（戻り値なし）で、プロセス
+    // `output::emit`（`println!` 直書き、戻り値なし）で、プロセス
     // stdout を安全にキャプチャする手段がこのテストバイナリに無いため検証
     // できない（`open_window_runs_via_fake_and_emits_codes` のコメント参照）。
     // ここでは `classify()` が実際に出す `NativeOp`（＝本番と同じ cluster/

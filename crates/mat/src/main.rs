@@ -11,6 +11,7 @@ mod matd_client;
 mod native_direct;
 mod probe;
 mod resolve;
+mod units;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
