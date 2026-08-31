@@ -1,11 +1,18 @@
 //! Poison 耐性のあるロック取得ヘルパ。
 //!
 //! `Mutex` / `RwLock` の poison は「他スレッドがガード保持中に panic した」
-//! 事実の伝搬でしかなく、保護対象データ自体は壊れていない。ここで
-//! `.expect()` すると 1 スレッドの panic が全経路（op 実行 / mDNS 広告 /
-//! commissioning サーバ）へ連鎖するため、panic させるより回収が正しい
-//! （安定性監査 Tier 3 と同裁定 — matd `SubHealth` の先行例を全クレートへ
-//! 共通化したもの）。
+//! 事実の伝搬でしかない。ここで `.expect()` すると 1 スレッドの panic が
+//! 全経路（op 実行 / mDNS 広告 / commissioning サーバ）へ連鎖するため、
+//! panic させるより回収する（安定性監査 Tier 3 と同裁定 — matd
+//! `SubHealth` の先行例を全クレートへ共通化したもの）。
+//!
+//! 回収が無条件に正しいのは guard 跨ぎの複合不変条件を持たない状態
+//! （SubHealth のテーブル群、mDNS 広告スロット、dnssd opcache など）。
+//! 複合状態を 1 つの guard に載せている呼び出し側（commissioning サーバの
+//! `Inner`: pending 鍵材料 + fabric store + fail-safe）は、途中まで書けた
+//! 状態の後始末を自前の巻き戻し（fail-safe 失効 →
+//! `rollback_uncommitted_fabric`）に負っており、このヘルパはそれを
+//! 肩代わりしない。
 
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
