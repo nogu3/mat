@@ -1064,7 +1064,7 @@ mod tests {
                 transport,
                 scope_id: cand.index,
             }];
-            // 受信はしない (送出成功の 送出成功の iface 名リストだけ固定する) が、宛先 port
+            // 受信はしない (送出成功の iface 名リストだけ固定する) が、宛先 port
             // は実 5540 を避けエフェメラルにする (LAN へ流れても無害な宛先)。
             let sink = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             let port = sink.local_addr().unwrap().port();
