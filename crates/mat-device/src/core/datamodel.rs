@@ -3121,6 +3121,107 @@ mod tests {
         assert!(entries.iter().all(|e| matches!(e, ReportEntryOut::Data(_))));
     }
 
+    /// Groups の **mutating** コマンド（AddGroup / RemoveGroup /
+    /// RemoveAllGroups / AddGroupIfIdentifying）は spec §1.3.5 で Manage —
+    /// Operate だけの fabric メンバーにグループ台帳を書き換え／全消しさせ
+    /// ない。読み取り系（ViewGroup / GetGroupMembership）は Operate のまま
+    /// なので、同じ subject が ViewGroup は通せることも併せて固定する。
+    #[test]
+    fn acl_groups_mutating_commands_need_manage_but_reads_stay_operate() {
+        let add_group_fields = |group_id: u16| {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(0), u64::from(group_id));
+            w.put_str(Tag::Context(1), "");
+            w.end_container();
+            w.finish()
+        };
+        // `(IM status, クラスタ応答の Status フィールド)`。拒否は
+        // CommandStatusIB（fields なし）なので後者は `None` になり、
+        // 許可された AddGroup/ViewGroup は Data 応答（IM status 0）の中に
+        // クラスタ側の Status を持つ — 「通った」と「実際に台帳が動いた」
+        // を取り違えないための 2 値。
+        let invoke = |node: &mut Node, command: u32, subject: u64| -> (u8, Option<u8>) {
+            let req = im::encode_invoke_request(
+                1,
+                im::CLUSTER_GROUPS,
+                command,
+                Some(&add_group_fields(5)),
+            );
+            let mut ctx = InvokeCtx {
+                fabric_index: 1,
+                subject,
+                ..InvokeCtx::default()
+            };
+            let out = node
+                .handle_im(
+                    im::OPCODE_INVOKE_REQUEST,
+                    &req,
+                    &mut ctx,
+                    &case_read_ctx(1, subject),
+                )
+                .unwrap();
+            let resp = im::decode_invoke_response_data(&out.payload).unwrap();
+            let cluster_status = resp.fields_tlv.as_deref().and_then(|fields| {
+                // `{0: Status, 1: GroupID}` の Status だけ拾う。
+                let mut r = Reader::new(fields);
+                r.next().ok()??;
+                loop {
+                    match r.next().ok()?? {
+                        el if el.value == Value::ContainerEnd => return None,
+                        el => {
+                            if let (Tag::Context(0), Value::Uint(v)) = (el.tag, el.value) {
+                                return u8::try_from(v).ok();
+                            }
+                        }
+                    }
+                }
+            });
+            (resp.status, cluster_status)
+        };
+        let with_groups = |privilege: u8| {
+            let mut node = node_with_acl(privilege, 7);
+            let (identify, state) = crate::core::identify::IdentifyHandler::new();
+            node.add_cluster(1, Box::new(identify));
+            node.add_cluster(1, Box::new(crate::core::groups::GroupsHandler::new(state)));
+            node
+        };
+
+        // Operate だけの subject: 4 つの mutating コマンドは全て拒否。
+        let mut node = with_groups(PRIVILEGE_OPERATE);
+        for command in [
+            im::CMD_ADD_GROUP,
+            im::CMD_REMOVE_GROUP,
+            im::CMD_REMOVE_ALL_GROUPS,
+            im::CMD_ADD_GROUP_IF_IDENTIFYING,
+        ] {
+            assert_eq!(
+                invoke(&mut node, command, 7),
+                (im::STATUS_UNSUPPORTED_ACCESS, None),
+                "command 0x{command:02X} must need Manage"
+            );
+        }
+        // 同じ Operate の subject でも読み取り系は通る — そして拒否された
+        // AddGroup が台帳に何も足していないことがここで分かる
+        // （ViewGroup のクラスタ Status が NOT_FOUND）。
+        assert_eq!(
+            invoke(&mut node, im::CMD_VIEW_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_NOT_FOUND)),
+            "ViewGroup must stay at Operate, and group 5 must not exist"
+        );
+
+        // Manage を持つ subject なら AddGroup が通り、実際に台帳に載る。
+        let mut node = with_groups(PRIVILEGE_MANAGE);
+        assert_eq!(
+            invoke(&mut node, im::CMD_ADD_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_SUCCESS))
+        );
+        assert_eq!(
+            invoke(&mut node, im::CMD_VIEW_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_SUCCESS))
+        );
+    }
+
     /// read の必要 privilege は属性ごと（`AccessControlHandler` の
     /// override）: `ATTR_ACL` は Administer、容量属性と global 属性
     /// (spec §7.13) は View。View だけの subject では wildcard 展開から
