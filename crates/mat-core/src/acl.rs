@@ -22,7 +22,8 @@ pub const AUTH_MODE_GROUP: u8 = 3;
 
 /// ACL エントリの target（クラスタ / エンドポイント / デバイス種別の限定）。
 /// `mat` 自身は targets: null（全許可）しか生成しないが、既存エントリの保全のため
-/// read 側は非 null も解釈できる必要がある。IM read の数値キー規約（`{0: cluster, 1: endpoint, 2: deviceType}`）から解釈される。
+/// read 側は非 null も解釈できる必要がある。
+/// IM read の数値キー規約（`{0: cluster, 1: endpoint, 2: deviceType}`）から解釈される。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclTarget {
     pub cluster: Option<u32>,
@@ -95,10 +96,10 @@ pub fn entries_from_im_json(v: &Value) -> Result<Vec<AclEntry>, MatError> {
     arr.iter().map(ws_entry).collect()
 }
 
-/// TOO ログパーサ（`too_log_unknown_key_inside_entry_is_parse_error` 等）と同じ
-/// fail-closed を ws 変換にも適用する: 既知キー以外が 1 つでもあれば `ParseError`。
-/// 黙って落とすと、chip-tool が将来フィールドを追加したときに劣化したエントリを
-/// 全置換 write してしまうため。
+/// fail-closed ポリシー: 既知キー以外が 1 つでもあれば `ParseError`。
+/// 黙って落とすと、全置換 write で劣化したエントリ（未知フィールドが欠落した状態）を
+/// 書き込んでしまうため、未知フィールドは拒否する必要がある。
+/// テスト例：`ws_value_unknown_entry_field_is_parse_error`。
 fn reject_unknown_keys(
     obj: &serde_json::Map<String, Value>,
     known: &[&str],
