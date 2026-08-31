@@ -657,10 +657,7 @@ fn unresolved_op_error(command: &Command) -> MatError {
             return e;
         }
     }
-    MatError::parse_error(
-        "unknown cluster/attribute/command name (or unsupported non-scalar type); \
-         numeric IDs are accepted",
-    )
+    MatError::unresolved_op()
 }
 
 /// エンジン構築失敗（M8c-3: chip-tool フォールバック撤去後のハードエラー化）。
@@ -675,21 +672,6 @@ fn map_engine_build_error(mut e: MatError) -> MatError {
         );
     }
     e
-}
-
-/// group ctx / group_settings ctx 未構成（本番 `Engine::build` では常に `Some`
-/// なので実質到達しない — `with_parts` テスト注入時のみ `None`）。
-fn group_ctx_unconfigured_error() -> MatError {
-    MatError::new(
-        mat_core::error::ErrorKind::Other,
-        "native group context not configured (internal)",
-    )
-}
-
-/// group 送信不能（未 provision・KVS 不備等）。撤去前は chip-tool フォールバック
-/// だった。理由文字列に `mat group provision` 誘導を含む（`mat_native::group`）。
-fn group_unavailable_error(reason: &str) -> MatError {
-    MatError::store_parse(format!("native group send unavailable: {reason}"))
 }
 
 fn execute(
@@ -1006,14 +988,14 @@ async fn op_group_onoff(
     endpoint: u16,
 ) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     match mat_native::group::send(ctx, group_id, im::CLUSTER_ON_OFF, command_id, None).await? {
         GroupOutcome::Sent { egress } => {
             crate::commands::group::emit_invoke_sent(group_id, "onoff", command, endpoint, &egress);
         }
         GroupOutcome::Unavailable(reason) => {
-            return Err(group_unavailable_error(&reason));
+            return Err(MatError::group_unavailable(&reason));
         }
     }
     Ok(())
@@ -1027,7 +1009,7 @@ async fn op_group_color(
     endpoint: u16,
 ) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     let fields =
         im::encode_move_to_hue_and_saturation_fields(color.hue_raw, color.sat_raw, transition);
@@ -1044,7 +1026,7 @@ async fn op_group_color(
             crate::commands::group::emit_color_sent(group_id, color, transition, endpoint, &egress);
         }
         GroupOutcome::Unavailable(reason) => {
-            return Err(group_unavailable_error(&reason));
+            return Err(MatError::group_unavailable(&reason));
         }
     }
     Ok(())
@@ -1059,7 +1041,7 @@ async fn op_group_color_temp(
     endpoint: u16,
 ) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
     match mat_native::group::send(
@@ -1077,7 +1059,7 @@ async fn op_group_color_temp(
             );
         }
         GroupOutcome::Unavailable(reason) => {
-            return Err(group_unavailable_error(&reason));
+            return Err(MatError::group_unavailable(&reason));
         }
     }
     Ok(())
@@ -1092,7 +1074,7 @@ async fn op_group_level(
     endpoint: u16,
 ) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     let fields = im::encode_move_to_level_fields(level, transition);
     match mat_native::group::send(
@@ -1110,7 +1092,7 @@ async fn op_group_level(
             );
         }
         GroupOutcome::Unavailable(reason) => {
-            return Err(group_unavailable_error(&reason));
+            return Err(MatError::group_unavailable(&reason));
         }
     }
     Ok(())
@@ -1128,7 +1110,7 @@ async fn op_group_invoke_generic(
     endpoint: u16,
 ) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     match mat_native::group::send(ctx, group_id, cluster, command, fields_tlv.clone()).await? {
         GroupOutcome::Sent { egress } => {
@@ -1137,7 +1119,7 @@ async fn op_group_invoke_generic(
             );
         }
         GroupOutcome::Unavailable(reason) => {
-            return Err(group_unavailable_error(&reason));
+            return Err(MatError::group_unavailable(&reason));
         }
     }
     Ok(())
@@ -1145,7 +1127,7 @@ async fn op_group_invoke_generic(
 
 async fn op_group_bump(engine: &Engine) -> Result<(), MatError> {
     let Some(ctx) = &engine.group else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     match mat_native::group::bump(ctx).await {
         mat_native::group::BumpOutcome::Bumped { from, to } => {
@@ -1153,7 +1135,7 @@ async fn op_group_bump(engine: &Engine) -> Result<(), MatError> {
             Ok(())
         }
         mat_native::group::BumpOutcome::Unavailable(reason) => {
-            Err(group_unavailable_error(&reason))
+            Err(MatError::group_unavailable(&reason))
         }
     }
 }
@@ -1173,7 +1155,7 @@ async fn op_group_provision(
     //    は本番 Engine::build では起きない（Other 内部エラー）。書込エラーは
     //    hard error（ラッパー側 doc 参照 — flock WouldBlock 含む）。
     let Some(gs) = &engine.group_settings else {
-        return Err(group_ctx_unconfigured_error());
+        return Err(MatError::group_ctx_unconfigured());
     };
     let epoch_key_hex = mat_core::group::resolve_epoch_key(epoch_key)?;
     let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key_hex)?;

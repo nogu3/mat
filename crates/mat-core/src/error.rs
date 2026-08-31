@@ -112,12 +112,39 @@ impl MatError {
         MatError::new(ErrorKind::ParseError, detail)
     }
 
+    /// 名前解決できない op（未知の cluster/attribute/command 名、または非スカラー型）。
+    /// M8c-3 の chip-tool 撤去でフォールバック先が無くなったため数値 ID 以外は拒否
+    /// する。mat 直経路と matd が同一文言を共有する（逐語コピーの一本化）。
+    pub fn unresolved_op() -> Self {
+        MatError::parse_error(
+            "unknown cluster/attribute/command name (or unsupported non-scalar type); \
+             numeric IDs are accepted",
+        )
+    }
+
+    /// group 送信不能（未 provision・KVS 不備等）。理由文字列に
+    /// `mat group provision` 誘導を含む（`mat_native::group` 由来）。
+    pub fn group_unavailable(reason: &str) -> Self {
+        MatError::store_parse(format!("native group send unavailable: {reason}"))
+    }
+
+    /// group ctx / group_settings ctx 未構成（本番 `Engine::build` では常に `Some`
+    /// なので実質到達しない — テスト注入時のみ）。
+    pub fn group_ctx_unconfigured() -> Self {
+        MatError::new(
+            ErrorKind::Other,
+            "native group context not configured (internal)",
+        )
+    }
+
+    /// `{"error":{"kind","detail"}}` ボディ。stderr emit と matd 応答が共有する。
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "error": { "kind": self.kind, "detail": self.detail } })
+    }
+
     /// stderr に構造化 JSON で1行出す。
     pub fn emit(&self) {
-        let body = serde_json::json!({
-            "error": { "kind": self.kind, "detail": self.detail }
-        });
-        eprintln!("{body}");
+        eprintln!("{}", self.to_json());
     }
 }
 
@@ -162,6 +189,26 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorKind::MatdUnavailable).unwrap(),
             "\"matd_unavailable\""
+        );
+    }
+
+    #[test]
+    fn shared_helper_wordings_are_stable() {
+        assert_eq!(
+            MatError::unresolved_op().detail,
+            "unknown cluster/attribute/command name (or unsupported non-scalar type); numeric IDs are accepted"
+        );
+        assert_eq!(
+            MatError::group_unavailable("no keyset").detail,
+            "native group send unavailable: no keyset"
+        );
+        assert_eq!(
+            MatError::group_ctx_unconfigured().detail,
+            "native group context not configured (internal)"
+        );
+        assert_eq!(
+            MatError::unresolved_op().to_json().to_string(),
+            r#"{"error":{"detail":"unknown cluster/attribute/command name (or unsupported non-scalar type); numeric IDs are accepted","kind":"parse_error"}}"#
         );
     }
 }

@@ -120,7 +120,7 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> E
         // 返すのは「2 = CLI 引数エラー」の documented シグナルを保つ意図的な
         // 例外（spec B 節、テストでピン留め）。
         Err(ToOpError::Unsupported(detail)) => {
-            emit_error(ErrorKind::Other, &detail);
+            MatError::new(ErrorKind::Other, &detail).emit();
             return ExitCode::from(2);
         }
         // alias / color spec 解決失敗など実エラーは固有 kind / exit を返す。
@@ -133,7 +133,7 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> E
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            emit_error(ErrorKind::MatdUnavailable, &detail);
+            MatError::new(ErrorKind::MatdUnavailable, &detail).emit();
             return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
         }
     };
@@ -574,12 +574,6 @@ fn emit_response(resp: Value) -> ExitCode {
     }
 }
 
-/// mat 自身のエラーを stderr に構造化 JSON で出す（matd へ届く前の失敗用）。
-fn emit_error(kind: ErrorKind, detail: &str) {
-    let body = json!({ "error": { "kind": kind, "detail": detail } });
-    eprintln!("{body}");
-}
-
 /// listen リクエスト行を組む（None フィルタは省略）。
 fn listen_request_json(
     node: Option<u64>,
@@ -648,10 +642,11 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            emit_error(
+            MatError::new(
                 ErrorKind::MatdUnavailable,
-                &format!("{detail}; `mat listen` requires a running matd"),
-            );
+                format!("{detail}; `mat listen` requires a running matd"),
+            )
+            .emit();
             return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
         }
     };
@@ -660,7 +655,7 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     match run_listen_stream(stream, &op, *count, *timeout_ms) {
         Ok(code) => code,
         Err(detail) => {
-            emit_error(ErrorKind::MatdUnavailable, &detail);
+            MatError::new(ErrorKind::MatdUnavailable, &detail).emit();
             ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
         }
     }
@@ -743,7 +738,7 @@ fn run_listen_stream(
 /// timeout 打ち切り: 0 件なら timeout(exit 3)、1 件以上なら成功（enl 準拠）。
 fn finish_on_timeout(received: u32) -> ExitCode {
     if received == 0 {
-        emit_error(ErrorKind::Timeout, "no events received within --timeout-ms");
+        MatError::new(ErrorKind::Timeout, "no events received within --timeout-ms").emit();
         ExitCode::from(ErrorKind::Timeout.exit_code())
     } else {
         ExitCode::SUCCESS

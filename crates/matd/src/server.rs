@@ -572,7 +572,7 @@ async fn dispatch(
 /// M8c-3: native が唯一の経路。`NativeState::Unavailable`（起動時の構築失敗）は
 /// 全 op（Ping/Shutdown を除く）へそのエラーをそのまま返す。native 構築済みでも
 /// 名前解決できない cluster/attribute/command（chip-tool 互換の任意名を受けられた
-/// 旧経路の名残）は [`unresolved_op_error`] で即 parse_error にする — フォールバック
+/// 旧経路の名残）は [`MatError::unresolved_op`] で即 parse_error にする — フォールバック
 /// 先が無いため（数値 ID は resolve 済みなので影響しない）。
 async fn run_op(
     op: &Op,
@@ -623,7 +623,7 @@ async fn run_op(
                 {
                     crate::native::GroupOutcome::Sent { egress } => Ok(build_body(&egress)),
                     crate::native::GroupOutcome::Unavailable(reason) => {
-                        Err(group_unavailable_error(&reason))
+                        Err(MatError::group_unavailable(&reason))
                     }
                 }
             }
@@ -643,7 +643,7 @@ async fn run_op(
                     Ok(mat_core::body::group_bump(from, to))
                 }
                 mat_native::group::BumpOutcome::Unavailable(reason) => {
-                    Err(group_unavailable_error(&reason))
+                    Err(MatError::group_unavailable(&reason))
                 }
             }
         }
@@ -651,12 +651,12 @@ async fn run_op(
         // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Level/Describe は常に
         // is_native_hotpath、GroupColorTemp/GroupColor/GroupLevel は native_group_params が
         // 常に Some を返すため到達しない）。
-        _ => Err(unresolved_op_error()),
+        _ => Err(MatError::unresolved_op()),
     }
 }
 
 /// この op を native warm session で処理するか（ホットパス）。それ以外は
-/// [`unresolved_op_error`] で拒否する。
+/// [`MatError::unresolved_op`] で拒否する。
 ///
 /// Read/Write/Invoke/Describe の判定は mat-core::ids（`classify_write` /
 /// `classify_invoke` / `resolve_cluster` + `resolve_attribute`）に委ねる —
@@ -806,7 +806,7 @@ type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>, SentBodyBuilder);
 /// mat-core::ids の `classify_invoke` に通す（onoff 限定を撤廃 — M8a
 /// Task10、mat 直経路の `native_direct::classify_strict` の group invoke 腕と
 /// 同じ判定）。戻り値:
-/// - `None` — 非対象（cluster/command 名が解決できない）→ [`unresolved_op_error`]。
+/// - `None` — 非対象（cluster/command 名が解決できない）→ [`MatError::unresolved_op`]。
 /// - `Some(Ok(params))` — native 送信対象。
 /// - `Some(Err(e))` — 名前は解決できたが引数が符号化不能 → 即座にそのエラーを
 ///   返す（mat 側と同じ拒否規則）。
@@ -1193,7 +1193,7 @@ async fn group_provision(
     // 1) コントローラ側 group state。
     let gs = native
         .group_settings_ctx()
-        .ok_or_else(group_ctx_unconfigured_error)?;
+        .ok_or_else(MatError::group_ctx_unconfigured)?;
     mat_native::group_settings::write_group_provision(
         gs,
         *group_id,
@@ -1228,33 +1228,6 @@ async fn group_provision(
 fn require_node(store_path: &Path, node_id: u64) -> Result<(), MatError> {
     Store::open(store_path)?.require_node(node_id)?;
     Ok(())
-}
-
-/// 名前解決できない（未知の cluster/attribute/command 名）op のハードエラー。
-/// mat 直経路の `native_direct::unresolved_op_error` と同じ文言 —— M8c-3 で
-/// chip-tool 撤去によりフォールバック先が無くなったため、数値 ID 以外は拒否する。
-fn unresolved_op_error() -> MatError {
-    MatError::parse_error(
-        "unknown cluster/attribute/command name (or unsupported non-scalar type); \
-         numeric IDs are accepted",
-    )
-}
-
-/// group 送信不能（未 provision・KVS 不備等）。`mat_native::group::send` からの
-/// `Unavailable` 理由をそのまま detail に載せる（`mat group provision` 誘導を
-/// 含む）。mat 直経路の `native_direct::group_unavailable_error` と同じ kind。
-fn group_unavailable_error(reason: &str) -> MatError {
-    MatError::store_parse(format!("native group send unavailable: {reason}"))
-}
-
-/// `group_settings_ctx` / group send コンテキスト未構成（本番 `Engine::build` では
-/// 常に `Some` なので実質到達しない — テスト注入時のみ）。mat 直経路の
-/// `native_direct::group_ctx_unconfigured_error` と同じ。
-fn group_ctx_unconfigured_error() -> MatError {
-    MatError::new(
-        ErrorKind::Other,
-        "native group context not configured (internal)",
-    )
 }
 
 /// `status` op の応答ボディ（timestamp / id は dispatch が付ける）。
@@ -1294,12 +1267,12 @@ fn status_body(
 
 /// エラー応答 `{"error":{"kind","detail"}, "id"?, "timestamp"}`。
 fn error_response(id: Option<Value>, e: &MatError) -> Value {
-    let mut body = json!({
-        "error": { "kind": e.kind, "detail": e.detail },
-        "timestamp": now_iso8601(),
-    });
-    if let (Value::Object(map), Some(id)) = (&mut body, id) {
-        map.insert("id".into(), id);
+    let mut body = e.to_json();
+    if let Value::Object(map) = &mut body {
+        map.insert("timestamp".into(), json!(now_iso8601()));
+        if let Some(id) = id {
+            map.insert("id".into(), id);
+        }
     }
     body
 }
@@ -1483,7 +1456,7 @@ mod tests {
 
     #[test]
     fn hotpath_routing_rejects_unresolved_names() {
-        // 未知 cluster/attribute 名は native 対象外 → run_op が unresolved_op_error。
+        // 未知 cluster/attribute 名は native 対象外 → run_op が MatError::unresolved_op。
         assert!(!is_native_hotpath(&Op::Read {
             node_id: 1,
             endpoint: 1,
@@ -1573,7 +1546,7 @@ mod tests {
         );
         assert!(fields.is_none()); // 引数なし → fields_tlv は None。
 
-        // 未知コマンド名は非対象（run_op が unresolved_op_error にする）。
+        // 未知コマンド名は非対象（run_op が MatError::unresolved_op にする）。
         let unknown_command = Op::GroupInvoke {
             group_id: 10,
             cluster: "onoff".into(),
@@ -1688,7 +1661,7 @@ mod tests {
             cluster: "nosuch".into(),
             attribute: "x".into(),
         };
-        assert!(!is_native_hotpath(&unknown)); // 未知名は unresolved_op_error（run_op）。
+        assert!(!is_native_hotpath(&unknown)); // 未知名は MatError::unresolved_op（run_op）。
         let write = Op::Write {
             node_id: 5,
             endpoint: 1,
