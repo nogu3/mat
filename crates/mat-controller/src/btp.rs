@@ -239,7 +239,7 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(2500);
 
-/// GATT リンクの土管。ble.rs（feature "ble"、未実装）が実体を、テストが
+/// GATT リンクの土管。ble.rs（feature "ble"）が実体を、テストが
 /// fake を作る。
 pub struct GattLink {
     /// C1 への write。cap 1 のチャネルにして GATT write 完了で背圧をかける。
