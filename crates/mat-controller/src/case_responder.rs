@@ -63,7 +63,7 @@ use crate::crypto::{decrypt_payload, encrypt_payload, sign_ecdsa_p256, verify_ec
 use crate::fabric::case_destination_id;
 use crate::message::OPCODE_STATUS_REPORT;
 use crate::session::SessionKeys;
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 
 // Wire opcodes (spec §4.14) — mirror of the ones in `case.rs`.
 pub(crate) const OPCODE_SIGMA1: u8 = 0x30;
@@ -406,24 +406,6 @@ struct Sigma1Fields {
 /// ignored; `case::encode_sigma1` never sends them). Resumption fields (tag
 /// 6/7) are deliberately tolerated and ignored — full-handshake fallback per
 /// spec §4.14.2; Sigma2Resume is out of M2 scope.
-/// Consumes a just-opened container up to and including its matching
-/// `ContainerEnd`. Local copy of `pase::skip_container`（あちらは module
-/// private — 同じ理由でここにも複製）。フラットな field ループが
-/// ネストした struct（例: Sigma1 の initiatorSessionParams）の中身を
-/// 同じレベルの context tag として誤読しないための必須処理。
-fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        let el = r.next()?.ok_or(TlvError::Truncated)?;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn parse_sigma1(payload: &[u8]) -> Result<Sigma1Fields, CaseCoreError> {
     let mut r = Reader::new(payload);
     match r

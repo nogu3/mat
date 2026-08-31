@@ -197,15 +197,11 @@ impl Writer {
 
 /// Deep-copies one TLV element (and, if a container, its full subtree) from
 /// `r` into `w`, re-tagging only the top-level element as `tag`. Shared by
-/// `Writer::put_raw_element` (splicing a standalone pre-encoded element) and
+/// `Writer::put_raw_element` (splicing a standalone pre-encoded element),
 /// callers that need to copy a value already positioned mid-stream (e.g.
-/// `im::decode_command_data_ib`'s CommandFields echo).
-pub(crate) fn copy_value(
-    w: &mut Writer,
-    r: &mut Reader,
-    tag: Tag,
-    value: Value,
-) -> Result<(), TlvError> {
+/// `im::decode_command_data_ib`'s CommandFields echo), and mat-device's
+/// responder-side decoders (e.g. `access_control`'s ACL entry targets echo).
+pub fn copy_value(w: &mut Writer, r: &mut Reader, tag: Tag, value: Value) -> Result<(), TlvError> {
     match value {
         Value::Int(v) => w.put_int(tag, v),
         Value::Uint(v) => w.put_uint(tag, v),
@@ -232,7 +228,7 @@ pub(crate) fn copy_value(
     Ok(())
 }
 
-fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
+pub fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
     loop {
         let el = r.next()?.ok_or(TlvError::Truncated)?;
         if el.value == Value::ContainerEnd {
@@ -241,6 +237,22 @@ fn copy_container(w: &mut Writer, r: &mut Reader) -> Result<(), TlvError> {
         }
         copy_value(w, r, el.tag, el.value)?;
     }
+}
+
+/// Skips a container (struct/array/list) whose `StructStart`/`ArrayStart`/
+/// `ListStart` element has already been consumed, up to and including its
+/// matching `ContainerEnd`.
+pub fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
+    let mut depth = 1usize;
+    while depth > 0 {
+        let el = r.next()?.ok_or(TlvError::Truncated)?;
+        match el.value {
+            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
+            Value::ContainerEnd => depth -= 1,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 impl Default for Writer {

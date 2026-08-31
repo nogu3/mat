@@ -19,7 +19,7 @@ use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::session::{SecureSession, SessionKeys};
 use crate::spake2p::{self, SpakeError};
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 use crate::transport::Transport;
 
 /// PASE opcodes (spec §4.13.1.2): PBKDFParamRequest/Response and
@@ -119,24 +119,6 @@ impl std::fmt::Display for PaseError {
 }
 
 impl std::error::Error for PaseError {}
-
-/// Skips a container (struct/array/list) whose `StructStart`/`ArrayStart`/
-/// `ListStart` element has already been consumed, up to and including its
-/// matching `ContainerEnd`. Local copy of `case::skip_container` (that one
-/// is module-private and this file must not widen case.rs's surface beyond
-/// `random_nonzero_u16`).
-fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        let el = r.next()?.ok_or(TlvError::Truncated)?;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
-}
 
 /// Encodes PBKDFParamRequest: `struct{1: initiatorRandom[32],
 /// 2: initiatorSessionId, 3: passcodeId=0, 4: hasPBKDFParameters=false}`.

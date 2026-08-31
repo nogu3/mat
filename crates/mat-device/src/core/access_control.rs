@@ -377,12 +377,13 @@ fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
             (Tag::Context(4), Value::Null) => targets_raw = None,
             (Tag::Context(4), Value::ArrayStart) => {
                 let mut w = Writer::new();
-                copy_element(&mut w, r, Tag::Anonymous, Value::ArrayStart)?;
+                mat_controller::tlv::copy_value(&mut w, r, Tag::Anonymous, Value::ArrayStart)
+                    .ok()?;
                 targets_raw = Some(w.finish());
             }
             (Tag::Context(254), Value::Uint(v)) => fabric_index = u8::try_from(v).ok()?,
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                mat_controller::tlv::skip_container(r).ok()?;
             }
             _ => {}
         }
@@ -394,66 +395,6 @@ fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
         targets_raw,
         fabric_index,
     })
-}
-
-/// `StructStart`/`ArrayStart`/`ListStart` を既に消費した位置から、対応する
-/// `ContainerEnd` まで読み飛ばす（未知のネストしたフィールドを黙って
-/// 無視するため — 現状 ACL entry には該当しないが、`case.rs` 等既存の
-/// decoder と同じ防御を踏襲）。
-fn skip_container(r: &mut Reader) -> Option<()> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        let el = r.next().ok()??;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Some(())
-}
-
-/// `mat_controller::tlv::copy_value`/`copy_container` の
-/// mat-device 内版（あちらは `pub(crate)` で mat-controller 限定）。
-/// `Writer::put_raw_element` が使う deep-copy と同じロジックを、Reader を
-/// 読み進めながらその場で行う必要がある箇所（Context(4) の値要素を
-/// `Tag::Anonymous` に再タグして丸ごと退避する）向け。
-fn copy_element(w: &mut Writer, r: &mut Reader, tag: Tag, value: Value) -> Option<()> {
-    match value {
-        Value::Int(v) => w.put_int(tag, v),
-        Value::Uint(v) => w.put_uint(tag, v),
-        Value::Bool(v) => w.put_bool(tag, v),
-        Value::F32(v) => w.put_f32(tag, v),
-        Value::F64(v) => w.put_f64(tag, v),
-        Value::Utf8(v) => w.put_str(tag, v),
-        Value::Bytes(v) => w.put_bytes(tag, v),
-        Value::Null => w.put_null(tag),
-        Value::StructStart => {
-            w.start_struct(tag);
-            return copy_container(w, r);
-        }
-        Value::ArrayStart => {
-            w.start_array(tag);
-            return copy_container(w, r);
-        }
-        Value::ListStart => {
-            w.start_list(tag);
-            return copy_container(w, r);
-        }
-        Value::ContainerEnd => {}
-    }
-    Some(())
-}
-
-fn copy_container(w: &mut Writer, r: &mut Reader) -> Option<()> {
-    loop {
-        let el = r.next().ok()??;
-        if el.value == Value::ContainerEnd {
-            w.end_container();
-            return Some(());
-        }
-        copy_element(w, r, el.tag, el.value)?;
-    }
 }
 
 #[cfg(test)]

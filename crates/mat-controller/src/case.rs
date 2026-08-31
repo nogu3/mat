@@ -18,7 +18,7 @@ use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::fabric::{case_destination_id, FabricCredentials};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::session::{SecureSession, SessionKeys};
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 use crate::transport::Transport;
 
 const OPCODE_CASE_SIGMA1: u8 = 0x30;
@@ -158,22 +158,6 @@ pub fn encode_sigma1(
     w.put_bytes(Tag::Context(4), eph_pub);
     w.end_container();
     w.finish()
-}
-
-/// Skips a container (struct/array/list) whose `StructStart`/`ArrayStart`/
-/// `ListStart` element has already been consumed, up to and including its
-/// matching `ContainerEnd`.
-fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        let el = r.next()?.ok_or(TlvError::Truncated)?;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// Parses Sigma2: `struct{1: responder_random, 2: responder_session_id,

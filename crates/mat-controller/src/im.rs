@@ -328,17 +328,12 @@ fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
 /// read (depth 1), including its matching `ContainerEnd`. Used to skip
 /// unknown tags/containers and additional report/response entries beyond
 /// the first (M2 only interprets a single attribute/command per message).
+/// Delegates to `tlv::skip_container`, restoring this module's error wording.
 fn skip_container(r: &mut Reader) -> Result<(), ImError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        let el = r.next()?.ok_or(ImError::Malformed("truncated container"))?;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
+    crate::tlv::skip_container(r).map_err(|e| match e {
+        TlvError::Truncated => ImError::Malformed("truncated container"),
+        other => ImError::from(other),
+    })
 }
 
 /// ReadRequestMessage (spec §8.9.2) for a single attribute path.
