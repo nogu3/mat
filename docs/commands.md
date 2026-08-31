@@ -433,36 +433,63 @@ mat diag mesh --nodes 5 16
 >
 > A node's stable `id` is `ext:<HEX16>` when its ExtAddress is known (either
 > self-identified via cluster 0x33, for fabric nodes, or observed in a
-> neighbor/route table row, for unknown participants), `rloc:<hex>` when only
-> the RLOC16 could be derived (reserved — unused by the current
-> implementation: RLOC16 derivation depends on the same ExtAddress
-> canonicalization `ext:` needs, so a canonicalization failure suppresses
-> both), and `node:<node_id>` for a fabric node whose probe never got far
-> enough to read either (e.g. cluster 0x33 unreadable). Unknown participants
+> neighbor/route table row, for unknown participants), and `node:<node_id>`
+> for a fabric node whose ExtAddress could not be determined at all (e.g.
+> probe failure). Unknown participants
 > get a `label` from `aliases.toml`'s `[thread]` section (see
 > [Aliases](configuration.md#aliases-aliasestoml-optional)) instead of an `alias`,
 > which is reserved for commissioned nodes' own node alias.
 >
-> A fabric node `mat` could not self-identify (probe failure, cluster 0x33
-> unreadable, or a duplicate self-ext claim invalidated below) shows up as a
-> `node:<id>` graph node — and still contributes its own viewpoint edges,
-> anchored at `node:<id>` rather than an `ext:` vertex, from its own
+> A probed fabric node whose cluster 0x33 self-identification failed
+> (unreadable, or a duplicate self-ext claim invalidated below) is rescued
+> deterministically before falling back to `node:<id>` (issue #13). Real-device
+> finding (2026-09-01): a router/leader's own route table contains a row for
+> itself, shaped `NextHop` = 63 (invalid) plus `PathCost` = 0 with `Age` ≈ 0
+> (OpenThread gives routers with a lost route the same 63/0 shape, so an
+> aged 63/0 row is not treated as a self-row, and 63/0 rows are never
+> ingested as participants or edges). Vendor-dependently the self-row carries
+> either the node's real ExtAddress (used directly; the node gets
+> `"identified_by": "route-table"`) or `ExtAddress: 0` with the node's own
+> Rloc16. A self Rloc16 — from the self-row, or derived from cluster 0x33
+> IPv6Addresses + mesh-local-prefix (this derivation is independent of
+> ExtAddress canonicalization) — is then matched against every probed node's
+> neighbor/route table observations (real ext + Rloc16): exactly one observed
+> ext, not already claimed by another fabric node, merges the two vertices
+> into one (`"identified_by": "rloc16"`). Anything ambiguous is rejected —
+> several exts observed under that Rloc16, a resolution colliding with an
+> already-identified ext or with another rescued node, or a mesh currently
+> split into several partitions (Rloc16 uniqueness only holds within one
+> partition, so the whole correlation is skipped while `partition_ids` has
+> more than one entry). `mat` never merges by guesswork: neighbor-set
+> similarity heuristics were evaluated on the real mesh and mis-merge dense
+> routers into the border router, so they are deliberately not used. Note the
+> rescue trusts the freshest tables available in one snapshot; a Rloc16
+> reassigned moments before the probe while every peer's table is still stale
+> can in principle mislabel a node for one run — `identified_by` marks such
+> merges as evidence-based rather than 0x33-claimed, and the next run
+> self-heals.
+>
+> A fabric node that still could not self-identify (probe failed outright, or
+> every rescue path was rejected as ambiguous) shows up as a `node:<id>`
+> graph node without a `rloc16` — and still contributes its own viewpoint
+> edges, anchored at `node:<id>` rather than an `ext:` vertex, from its own
 > neighbor/route table rows. The same physical radio may *also* surface
 > separately as an `ext:` unknown-participant node if another probed node's
-> neighbor/route table observed it. `mat` does not correlate the two into a
-> single entry today — merging them is future work.
+> neighbor/route table observed it.
 >
 > Real-device finding (2026-07-23): some Thread devices (ESP32-based tape
 > lights) report an identical, firmware-hardcoded HardwareAddress on cluster
 > 0x33 across every unit (with an empty IPv6Addresses list). Since that ext
 > claim is physically impossible once two or more fabric nodes make it, `mat`
 > invalidates the self-identification of *all* nodes that claimed the same
-> ext — they fall back to `node:<id>` (see above) rather than merging into one
-> bogus graph vertex. Separately, some devices encode `mesh-local-prefix` as a
+> ext — the bogus claim is discarded for *all* of them (the rescue above then
+> usually recovers each node's real ext from its route-table self-row).
+> Separately, some devices encode `mesh-local-prefix` as a
 > length-prefixed octstr (`0x40` = 64-bit length byte + 8-byte prefix, 18 hex
 > chars) rather than the bare 8-byte form (16 hex chars); `mat` normalizes both
 > to the 16-hex form before deriving RLOC16. A route-table row with
-> `ExtAddress: 0` is treated as garbage and ignored (no node, no edge).
+> `ExtAddress: 0` that is not the self-row is treated as garbage and ignored
+> (no node, no edge — REEDs list far routers this way).
 >
 > Like `diag node`, `diag mesh` is direct path only (native, not part of the
 > `matd` protocol) and always fixes on endpoint 0 (cluster 53 / 0x33 are
