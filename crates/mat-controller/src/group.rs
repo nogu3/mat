@@ -384,6 +384,23 @@ impl GroupSender {
     pub fn bump_counter(&mut self) -> std::io::Result<(u32, u32)> {
         self.counter.jump()
     }
+
+    /// 稼働中の sender へ egress を後付けする (issue #23: matd が otbr より
+    /// 先に起動して thread egress 無しで構築された場合の遅延確立)。`new()`
+    /// と同じ sockopt を焼き、失敗した egress は追加しない (呼び出し側が
+    /// warn し、次回送信で再試行する)。counter には触れない。
+    pub fn add_egress(&mut self, e: GroupEgress) -> std::io::Result<()> {
+        e.transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
+        e.transport.set_multicast_if_v6(e.scope_id)?;
+        self.egress.push(e);
+        Ok(())
+    }
+
+    /// 現在の egress 本数 (先頭は常に運用 iface)。thread egress 後付け要否の
+    /// 判定 (mat-native::group) が読む。
+    pub fn egress_count(&self) -> usize {
+        self.egress.len()
+    }
 }
 
 #[cfg(test)]
@@ -1027,5 +1044,62 @@ mod tests {
             "全 egress が setsockopt 失敗なら Err のまま（後方互換）"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// issue #23 起動順対応の土台: 稼働中の sender へ egress を後付けできる
+    /// こと。sockopt (hop limit + IPV6_MULTICAST_IF) が new() と同じく焼かれ、
+    /// 以後の send_invoke が全 egress へ送出することを固定する。
+    #[tokio::test]
+    async fn add_egress_applies_sockopts_and_joins_send() {
+        use crate::transport::UdpTransport;
+
+        let mut tried = Vec::new();
+        for cand in multicast_capable_interfaces() {
+            let p = tmp_counter_path(&format!("late-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            let egress = vec![GroupEgress {
+                iface: cand.name.clone(),
+                transport,
+                scope_id: cand.index,
+            }];
+            // 受信はしない (送出成功の 送出成功の iface 名リストだけ固定する) が、宛先 port
+            // は実 5540 を避けエフェメラルにする (LAN へ流れても無害な宛先)。
+            let sink = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = sink.local_addr().unwrap().port();
+            let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
+            assert_eq!(s.egress_count(), 1);
+
+            let t2 = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            s.add_egress(GroupEgress {
+                iface: "late0".into(),
+                transport: std::sync::Arc::clone(&t2),
+                scope_id: cand.index, // 同一 iface の独立 socket (2 本目の実 iface は環境に無い前提)
+            })
+            .unwrap();
+            assert_eq!(s.egress_count(), 2);
+            assert_eq!(t2.multicast_if_v6().unwrap(), cand.index);
+
+            match s
+                .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+                .await
+            {
+                Ok((_c, sent)) => {
+                    let _ = std::fs::remove_file(&p);
+                    assert_eq!(sent, vec![cand.name.clone(), "late0".to_string()]);
+                    return;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue; // docker0/veth 等の EADDRNOTAVAIL は次候補へ
+                }
+            }
+        }
+        panic!("no candidate accepted a 2-egress send; tried: {tried:?}");
     }
 }
