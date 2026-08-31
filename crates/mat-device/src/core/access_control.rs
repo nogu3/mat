@@ -11,11 +11,12 @@
 //! `core::fabric_store::FabricPersist`/`FabricStore::with_persist` と同じ
 //! パターン — `core` はファイル I/O を持ち込まず、具象（JSON ファイル）は
 //! `crate::net::store::FileAclStore` にある。save 失敗は `tracing::warn`
-//! して続行する（fabric 撤去等の後始末をブロックしない — ACL enforcement
-//! は未実装のため即時の実害はなく、復旧はコントローラの再 write で可能。
+//! して続行する（fabric 撤去等の後始末をブロックしない — 復旧はコント
+//! ローラの再 write で可能。
 //! `FabricStore::insert`のロールバック（save 失敗で in-memory も戻す）とは
 //! 非対称 — あちらは fabric-index の払い出しなど整合性が壊れうる箇所を
-//! 守る必要があるが、こちらは ACL が直前の状態のまま残っても実害がない）。
+//! 守る必要があるが、こちらは ACL が直前の状態のまま残っても「古い正当な
+//! 状態」であり安全性は落ちない）。
 use std::sync::{Arc, Mutex};
 
 use mat_controller::im;
@@ -25,10 +26,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 
-/// AddNOC (spec §11.17.6.8) が自動発行する admin エントリの
-/// privilege/auth_mode 固定値 — Administer(5) / CASE(2)。
-const CASE_ADMIN_PRIVILEGE: u8 = 5;
-const CASE_ADMIN_AUTH_MODE: u8 = 2;
+/// `AccessControlEntryPrivilegeEnum` (spec §11.1.7.1) の全値。`check` の
+/// privilege lattice（`privilege_grants`）と AddNOC 自動 admin エントリの
+/// 両方がこれを使う。
+pub(crate) const PRIVILEGE_VIEW: u8 = 1;
+pub(crate) const PRIVILEGE_PROXY_VIEW: u8 = 2;
+pub(crate) const PRIVILEGE_OPERATE: u8 = 3;
+pub(crate) const PRIVILEGE_MANAGE: u8 = 4;
+pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
+
+/// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が扱う
+/// 唯一の値 — CASE。Group/PASE の auth mode は `check`/`decode_acl_entry_body`
+/// のどちらも意味的に扱わない（PASE は fabric を持たないので ACL の対象
+/// 外、Group は subject 解決を実装していない）。
+const AUTH_MODE_CASE: u8 = 2;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
 /// `AccessControlEntriesPerFabric` (spec §11.1.5) — 固定値を返すのみで
@@ -107,8 +118,8 @@ impl AclStore {
     pub fn add_case_admin(&self, fabric_index: u8, case_admin_subject: u64) {
         let mut guard = self.lock();
         guard.entries.push(AclDeviceEntry {
-            privilege: CASE_ADMIN_PRIVILEGE,
-            auth_mode: CASE_ADMIN_AUTH_MODE,
+            privilege: PRIVILEGE_ADMINISTER,
+            auth_mode: AUTH_MODE_CASE,
             subjects: vec![case_admin_subject],
             targets_raw: None,
             fabric_index,
@@ -137,6 +148,45 @@ impl AclStore {
                 tracing::warn!("acl store save failed: {e}");
             }
         }
+    }
+
+    /// ACL 判定 (spec §9.10, Access Control のポリシー本体):
+    /// `fabric_index`/`subject`/`required_privilege`/`endpoint`/`cluster` の
+    /// 5 つ組を、fabric スコープのエントリ群のうち **いずれか 1 件でも**
+    /// 満たせば許可する。エントリごとの条件は AND:
+    /// - `fabric_index` が一致する
+    /// - `auth_mode` が CASE（`AUTH_MODE_CASE` = 2）— この実装が持つ唯一の
+    ///   auth mode で、Group/PASE の subject は扱わない
+    /// - `subjects` が空（wildcard）か `subject` を含む — CAT
+    ///   (`0xFFFF_FFFD_xxxx_xxxx`) は未対応で、常に完全一致のみを見る
+    ///   （CAT レンジマッチは実装しないので、CAT 値を持つ subject を書いた
+    ///   エントリは実質誰にもマッチしなくなる — 拒否側に倒れるので安全）
+    /// - `privilege_grants(e.privilege, required_privilege)` が true
+    /// - target が一致する（`targets_match`、下記）
+    ///
+    /// `fabric_index == 0` は呼び出し側（PASE bypass）が `check` 自体を
+    /// 呼ばない前提だが、防御的に常に `false` を返す — PASE セッションは
+    /// どのエントリの `fabric_index` とも一致しないので自然に `false` に
+    /// なるはずだが、0 を「一致条件を持たない」特別な値として扱うバグを
+    /// 将来のエントリ走査ロジックの変更が持ち込む余地を先に潰しておく。
+    pub fn check(
+        &self,
+        fabric_index: u8,
+        subject: u64,
+        required_privilege: u8,
+        endpoint: u16,
+        cluster: u32,
+    ) -> bool {
+        if fabric_index == 0 {
+            return false;
+        }
+        self.lock().entries.iter().any(|e| {
+            e.fabric_index == fabric_index
+                && e.auth_mode == AUTH_MODE_CASE
+                && (e.subjects.is_empty() || e.subjects.contains(&subject))
+                && privilege_grants(e.privilege, required_privilege)
+                && targets_match(&e.targets_raw, endpoint, cluster)
+        })
     }
 
     fn entries_for(&self, fabric_index: u8) -> Vec<AclDeviceEntry> {
@@ -395,6 +445,103 @@ fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
         subjects,
         targets_raw,
         fabric_index,
+    })
+}
+
+/// privilege lattice (spec §11.1.7.1 Table "Privilege Semantics"): エントリ
+/// の `privilege` が要求 privilege を含むかどうか。Administer は全部、
+/// Manage は {Manage,Operate,View}、Operate は {Operate,View}、ProxyView は
+/// {ProxyView,View}、View は {View} のみ。未知の `entry_privilege` 値
+/// （decode で弾かれるはずだが防御的に）は何も grant しない。
+pub(crate) fn privilege_grants(entry_privilege: u8, required: u8) -> bool {
+    match entry_privilege {
+        PRIVILEGE_ADMINISTER => true,
+        PRIVILEGE_MANAGE => matches!(
+            required,
+            PRIVILEGE_MANAGE | PRIVILEGE_OPERATE | PRIVILEGE_VIEW
+        ),
+        PRIVILEGE_OPERATE => matches!(required, PRIVILEGE_OPERATE | PRIVILEGE_VIEW),
+        PRIVILEGE_PROXY_VIEW => matches!(required, PRIVILEGE_PROXY_VIEW | PRIVILEGE_VIEW),
+        PRIVILEGE_VIEW => required == PRIVILEGE_VIEW,
+        _ => false,
+    }
+}
+
+/// `TargetStruct` (spec §11.1.7.1) 1 件分をデコードした形。3 フィールド
+/// いずれも optional/null 可 — `None` は「このフィールドでは絞り込まない」
+/// (`decode_targets` の doc も参照)。
+pub(crate) struct AclTargetDev {
+    pub cluster: Option<u32>,
+    pub endpoint: Option<u16>,
+    pub device_type: Option<u32>,
+}
+
+/// `raw` は `AclDeviceEntry::targets_raw`（`Tag::Anonymous` に再タグされた
+/// `TargetStruct` array の raw TLV、doc :43-48）。ArrayStart → 各
+/// StructStart（`Context(0)`=cluster / `Context(1)`=endpoint /
+/// `Context(2)`=device_type、いずれも `Null` 可）→ ContainerEnd。
+/// パース不能（想定外の形、truncated 等）は `None` — 呼び出し側
+/// (`targets_match`) はこれを「どの target にもマッチしない」= 拒否側の
+/// 安全なフォールバックとして扱う。
+pub(crate) fn decode_targets(raw: &[u8]) -> Option<Vec<AclTargetDev>> {
+    let mut r = Reader::new(raw);
+    let el = r.next().ok()??;
+    if el.value != Value::ArrayStart {
+        return None;
+    }
+    let mut targets = Vec::new();
+    loop {
+        let el = r.next().ok()??;
+        match el.value {
+            Value::ContainerEnd => break,
+            Value::StructStart => targets.push(decode_acl_target_body(&mut r)?),
+            _ => return None,
+        }
+    }
+    Some(targets)
+}
+
+fn decode_acl_target_body(r: &mut Reader) -> Option<AclTargetDev> {
+    let mut cluster = None;
+    let mut endpoint = None;
+    let mut device_type = None;
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => cluster = Some(u32::try_from(v).ok()?),
+            (Tag::Context(0), Value::Null) => {}
+            (Tag::Context(1), Value::Uint(v)) => endpoint = Some(u16::try_from(v).ok()?),
+            (Tag::Context(1), Value::Null) => {}
+            (Tag::Context(2), Value::Uint(v)) => device_type = Some(u32::try_from(v).ok()?),
+            (Tag::Context(2), Value::Null) => {}
+            _ => return None,
+        }
+    }
+    Some(AclTargetDev {
+        cluster,
+        endpoint,
+        device_type,
+    })
+}
+
+/// `check` の target 条件: `targets_raw: None` は無制限（全 endpoint/
+/// cluster に一致）。`Some` はデコードして、いずれか 1 件の target が
+/// `cluster`/`endpoint` の両方を満たせば一致 — `device_type` 制約付きの
+/// target は（このデバイス側で device type 解決を実装していないので）
+/// 常に不一致扱い、安全側に倒す（設計メモ通り）。デコード失敗
+/// (`decode_targets` が `None`) も同様に不一致扱い。
+fn targets_match(targets_raw: &Option<Vec<u8>>, endpoint: u16, cluster: u32) -> bool {
+    let Some(raw) = targets_raw else {
+        return true;
+    };
+    let Some(targets) = decode_targets(raw) else {
+        return false;
+    };
+    targets.iter().any(|t| {
+        t.cluster.is_none_or(|c| c == cluster)
+            && t.endpoint.is_none_or(|ep| ep == endpoint)
+            && t.device_type.is_none()
     })
 }
 
@@ -734,5 +881,76 @@ mod tests {
             decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             1
         );
+    }
+
+    #[test]
+    fn check_matches_subject_privilege_and_targets() {
+        let store = AclStore::new();
+        store.add_case_admin(1, 112233); // Administer / CASE / 制限なし
+        assert!(store.check(1, 112233, PRIVILEGE_ADMINISTER, 0, 0x001F));
+        assert!(store.check(1, 112233, PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(!store.check(1, 999, PRIVILEGE_VIEW, 2, 0x0006)); // subject 不一致
+        assert!(!store.check(2, 112233, PRIVILEGE_VIEW, 2, 0x0006)); // fabric 不一致
+        assert!(!store.check(0, 112233, PRIVILEGE_VIEW, 2, 0x0006)); // fabric 0 は常に false
+    }
+
+    #[test]
+    fn check_respects_privilege_lattice() {
+        let store = AclStore::new();
+        store.replace_fabric(
+            1,
+            vec![AclDeviceEntry {
+                privilege: PRIVILEGE_OPERATE,
+                auth_mode: 2,
+                subjects: vec![5],
+                targets_raw: None,
+                fabric_index: 1,
+            }],
+        );
+        assert!(store.check(1, 5, PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(!store.check(1, 5, PRIVILEGE_MANAGE, 2, 0x0006));
+        assert!(!store.check(1, 5, PRIVILEGE_ADMINISTER, 0, 0x001F));
+    }
+
+    #[test]
+    fn check_with_cluster_target_limits_scope() {
+        // targets_raw は write と同形の raw TLV を Writer で組む:
+        // array[ struct{ Context(0)=0x0006 } ]（cluster=OnOff のみ許可）
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 0x0006);
+        w.end_container();
+        w.end_container();
+        let store = AclStore::new();
+        store.replace_fabric(
+            1,
+            vec![AclDeviceEntry {
+                privilege: PRIVILEGE_OPERATE,
+                auth_mode: 2,
+                subjects: vec![5],
+                targets_raw: Some(w.finish()),
+                fabric_index: 1,
+            }],
+        );
+        assert!(store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(!store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0008)); // 他 cluster は拒否
+    }
+
+    #[test]
+    fn empty_subjects_entry_is_a_wildcard() {
+        let store = AclStore::new();
+        store.replace_fabric(
+            1,
+            vec![AclDeviceEntry {
+                privilege: PRIVILEGE_VIEW,
+                auth_mode: 2,
+                subjects: vec![],
+                targets_raw: None,
+                fabric_index: 1,
+            }],
+        );
+        assert!(store.check(1, 424242, PRIVILEGE_VIEW, 2, 0x0006));
     }
 }
