@@ -262,8 +262,8 @@ pub enum InvokeClass {
 }
 
 /// invoke op の分類: cluster/command 名を解決し、引数をコマンド定義の field 型で
-/// 順にスカラー化する。数値 ID 直指定（def なし）は引数なしのみ native
-/// （引数ありは型不明のため非対象）。エラーメッセージ文言は移設元と同一
+/// 順にスカラー化する。数値 ID 直指定（def なし）は引数を値リテラルから
+/// 型推定してスカラー化する（write の数値直指定と同じ）。エラーメッセージ文言は移設元と同一
 /// （"invoke ..." プレフィックス — 旧 group invoke 経路の "group invoke ..."
 /// 文言とは統合により差異が生じるが、その文言を検査する既存テストは無い）。
 pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeClass {
@@ -301,19 +301,15 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
                 timed: def.timed,
             }
         }
-        // 数値直指定（def なし）: 引数の型が不明なので、引数ありは native
-        // 対象外（chip-tool へ）。引数なしのみ native。
-        None => {
-            if !args.is_empty() {
-                return InvokeClass::NotNative;
-            }
-            InvokeClass::Native {
-                cluster: cluster_id,
-                command: cmd.id,
-                fields: Vec::new(),
-                timed: false,
-            }
-        }
+        // 数値直指定（def なし）: 引数は write の数値直指定と同じく値リテラル
+        // から型推定してスカラー化する（推定は失敗しない）。timed は定義が
+        // 無いので false 固定 — 上書きしたい場合の CLI フラグは未提供。
+        None => InvokeClass::Native {
+            cluster: cluster_id,
+            command: cmd.id,
+            fields: args.iter().map(|a| parse_scalar_inferred(a)).collect(),
+            timed: false,
+        },
     }
 }
 
@@ -541,7 +537,7 @@ mod tests {
 
     #[test]
     fn classify_invoke_numeric_id_without_args_is_native() {
-        // 数値直指定（def なし）: 引数なしのみ native。
+        // 数値直指定（def なし）: 引数なし。
         let c = classify_invoke("6", "1", &[]);
         assert_eq!(
             c,
@@ -552,9 +548,24 @@ mod tests {
                 timed: false,
             }
         );
+    }
+
+    #[test]
+    fn classify_invoke_numeric_id_with_args_infers_types() {
+        // 数値直指定（def なし）+ 引数あり: write と同じ推定スカラー化で native。
+        let c = classify_invoke("8", "0", &["128".into(), "true".into(), "hex:00ff".into()]);
         assert_eq!(
-            classify_invoke("6", "1", &["1".into()]),
-            InvokeClass::NotNative
+            c,
+            InvokeClass::Native {
+                cluster: 8,
+                command: 0,
+                fields: vec![
+                    ScalarValue::UInt(128),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Bytes(vec![0, 0xff]),
+                ],
+                timed: false,
+            }
         );
     }
 
