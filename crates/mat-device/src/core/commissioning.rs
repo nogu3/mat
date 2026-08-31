@@ -45,6 +45,7 @@ use mat_controller::commissioning::{
 use mat_controller::crypto::sign_ecdsa_p256;
 use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
 use mat_controller::im;
+use mat_controller::sync::locked;
 use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::{generate_csr, DevAttestation};
 
@@ -302,21 +303,13 @@ impl CommissioningServer {
     /// reads back. Must be called before any commissioning command that
     /// touches fabrics — in practice, before `into_cluster_handlers`.
     pub fn set_acl_store(&mut self, store: AclStore) {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .acl_store = Some(store);
+        locked(&self.inner).acl_store = Some(store);
     }
 
     /// Fabrics installed so far (cloned out of the shared state — this
     /// device expects at most a handful, so the copy is cheap).
     pub fn fabrics(&self) -> Vec<FabricEntry> {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .store
-            .entries()
-            .to_vec()
+        locked(&self.inner).store.entries().to_vec()
     }
 
     /// Test-only visibility into whether any CSR/AddTrustedRoot material is
@@ -324,10 +317,7 @@ impl CommissioningServer {
     /// was actually discarded without making the field `pub`.
     #[cfg(test)]
     fn pending_is_empty(&self) -> bool {
-        let inner = self
-            .inner
-            .lock()
-            .expect("commissioning server mutex poisoned");
+        let inner = locked(&self.inner);
         inner.pending.op_private_key.is_none()
             && inner.pending.op_public_key.is_none()
             && inner.pending.trusted_root_tlv.is_none()
@@ -339,11 +329,7 @@ impl CommissioningServer {
     /// call `expire_fail_safe` right when the window closes instead of
     /// only noticing on the next incoming command.
     pub fn fail_safe_deadline(&self) -> Option<Instant> {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .fail_safe
-            .deadline()
+        locked(&self.inner).fail_safe.deadline()
     }
 
     /// spec §11.10.7.2: if the fail-safe's deadline has passed, rolls back
@@ -361,10 +347,7 @@ impl CommissioningServer {
     /// before doing anything else — not yet wired up; core only exposes
     /// the primitive) or from the runtime's own deadline timer.
     pub fn expire_fail_safe(&self) -> Option<FabricEntry> {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .expire_fail_safe()
+        locked(&self.inner).expire_fail_safe()
     }
 
     /// Takes (clearing) the `WindowRequest` staged by the most recent
@@ -373,11 +356,7 @@ impl CommissioningServer {
     /// actual PASE listener. `None` if no `OpenCommissioningWindow` has
     /// succeeded since the last time this was called.
     pub fn take_pending_window_request(&self) -> Option<WindowRequest> {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .pending_window_request
-            .take()
+        locked(&self.inner).pending_window_request.take()
     }
 
     /// Takes (clearing) the `FabricEntry` a successful `RemoveFabric`
@@ -388,22 +367,14 @@ impl CommissioningServer {
     /// session's own fabric) end that session. `None` if no `RemoveFabric`
     /// has succeeded since the last time this was called.
     pub fn take_removed_fabric(&self) -> Option<FabricEntry> {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .removed_fabric
-            .take()
+        locked(&self.inner).removed_fabric.take()
     }
 
     /// Whether an Administrator Commissioning window is currently open —
     /// the net runtime (Task 4) polls this to decide whether its own PASE
     /// listener should still be accepting connections.
     pub fn admin_window_is_open(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .admin_window
-            .is_some()
+        locked(&self.inner).admin_window.is_some()
     }
 
     /// Closes the Administrator Commissioning window without going through
@@ -412,20 +383,13 @@ impl CommissioningServer {
     /// `handle_revoke_commissioning`'s effect on the AC attributes. A no-op
     /// if already closed.
     pub fn close_admin_window(&self) {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .admin_window = None;
+        locked(&self.inner).admin_window = None;
     }
 
     /// Test-only: see `FailSafeState::force_expire`.
     #[cfg(test)]
     fn force_expire_fail_safe(&self) {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .fail_safe
-            .force_expire();
+        locked(&self.inner).fail_safe.force_expire();
     }
 
     /// Splits into the three `ClusterHandler` adapters `Node::add_cluster`
@@ -464,10 +428,7 @@ impl CommissioningServer {
         fields_tlv: &[u8],
         ctx: &InvokeCtx,
     ) -> InvokeReply {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("commissioning server mutex poisoned");
+        let mut inner = locked(&self.inner);
         match cluster {
             CLUSTER_GENERAL_COMMISSIONING => {
                 inner.handle_general_commissioning(command, fields_tlv)
@@ -508,17 +469,11 @@ impl ClusterHandler for GeneralCommissioningHandler {
     }
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .read_general_commissioning(attribute)
+        locked(&self.0).read_general_commissioning(attribute)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], _ctx: &mut InvokeCtx) -> InvokeReply {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .handle_general_commissioning(command, fields_tlv)
+        locked(&self.0).handle_general_commissioning(command, fields_tlv)
     }
 
     fn accepted_commands(&self) -> Vec<u32> {
@@ -564,17 +519,11 @@ impl ClusterHandler for OperationalCredentialsHandler {
     }
 
     fn read(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .read_operational_credentials(attribute, ctx)
+        locked(&self.0).read_operational_credentials(attribute, ctx)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .handle_operational_credentials(command, fields_tlv, ctx)
+        locked(&self.0).handle_operational_credentials(command, fields_tlv, ctx)
     }
 
     fn accepted_commands(&self) -> Vec<u32> {
@@ -617,17 +566,11 @@ impl ClusterHandler for AdminCommissioningHandler {
     }
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .read_admin_commissioning(attribute)
+        locked(&self.0).read_admin_commissioning(attribute)
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
-        self.0
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .handle_admin_commissioning(command, fields_tlv, ctx)
+        locked(&self.0).handle_admin_commissioning(command, fields_tlv, ctx)
     }
 
     fn accepted_commands(&self) -> Vec<u32> {

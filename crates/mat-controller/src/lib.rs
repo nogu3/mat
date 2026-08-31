@@ -28,6 +28,7 @@ pub mod pase;
 pub mod session;
 pub mod setup_code;
 pub mod spake2p;
+pub mod sync;
 #[cfg(feature = "test-responder")]
 #[doc(hidden)]
 pub mod test_support;

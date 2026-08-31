@@ -149,14 +149,12 @@ struct TouchedState {
     notify: Arc<tokio::sync::Notify>,
 }
 
-/// SubHealth 専用の poison 耐性 lock。保持スレッドが panic して毒化した
-/// Mutex からデータを回収して続行する。各テーブルは ephemeral な単発
-/// insert/remove のみで guard 跨ぎの複合不変条件が無く、毒化を伝播させて
-/// 全 hot-path（op 経路 / pump / status op）を panic させるより回収が正しい
-/// （安定性監査 Tier 3 の保険枠 — 到達可能な panic は精読では未発見）。
-fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+// SubHealth の毒化 Mutex はデータを回収して続行する: 各テーブルは
+// ephemeral な単発 insert/remove のみで guard 跨ぎの複合不変条件が無く、
+// 毒化を伝播させて全 hot-path（op 経路 / pump / status op）を panic
+// させるより回収が正しい（安定性監査 Tier 3 の保険枠 — この局所ヘルパを
+// `mat_controller::sync` へ共通化した）。
+use mat_controller::sync::locked;
 
 impl SubHealth {
     pub fn new(clusters: Option<Vec<u32>>) -> Self {

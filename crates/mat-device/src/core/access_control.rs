@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use mat_controller::im;
+use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +124,7 @@ impl AclStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AclInner> {
-        self.0.lock().expect("acl store mutex poisoned")
+        locked(&self.0)
     }
 
     /// 現在の `guard.entries` を persist backend に保存する（backend 未設定

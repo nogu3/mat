@@ -35,7 +35,9 @@ controller.
 - **The whole Matter stack, in-process.** TLV, CASE, the Interaction Model,
   groupcast, mDNS, and commissioning (on-network and BLE+Thread) are a
   from-scratch pure-Rust implementation (crate `mat-controller`). No
-  chip-tool, no Python matter-server, no vendor SDK, no subprocess.
+  chip-tool, no Python matter-server, no vendor SDK, no controller
+  subprocess. (The one exception: `mat diag --deep` shells out to `ping6`
+  for its IP-liveness probe.)
 - **One-shot by design.** `mat` holds no state except the credential store —
   run it from cron, a shell pipeline, or an agent loop. When you want warm
   sessions and live subscriptions, the optional `matd` daemon adds them
