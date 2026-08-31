@@ -4,14 +4,12 @@
 //! （M8c-3: chip-tool フォールバック撤去）。
 
 use std::path::PathBuf;
-#[cfg(test)]
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use mat_controller::group::{GroupEgress, GroupSender, PersistedGroupCounter};
 use mat_controller::kvs;
-#[cfg(test)]
 use mat_controller::transport::UdpTransport;
 use mat_core::error::{ErrorKind, MatError};
 
@@ -27,6 +25,14 @@ pub struct GroupCtx {
     /// 送出先リスト。先頭 = 運用 iface（従来挙動）。
     pub egress: Vec<GroupEgress>,
     pub dest_port: u16,
+    /// 運用 iface 名 (egress[0] と同じもの)。thread egress 後付け時の
+    /// 二重送出回避 (同名なら張らない) に使う。
+    pub op_iface: String,
+    /// build 時に thread egress を確立できなかった Auto/None 由来の構成なら
+    /// true — send のたびに検出を引き直して後付けを試みる (issue #23 起動順の
+    /// 罠)。Explicit 指定は build 時に確定する (解決失敗はハードエラー) ため
+    /// 常に false。
+    pub thread_retry: bool,
     pub sender: Mutex<Option<GroupSender>>,
 }
 
@@ -95,9 +101,18 @@ pub async fn send(
     if let Err(reason) = init_sender(ctx, &mut slot) {
         return Ok(GroupOutcome::Unavailable(reason));
     }
-    match slot
-        .as_mut()
-        .expect("built above")
+    let sender = slot.as_mut().expect("built above");
+    // thread egress が未確立 (egress = 運用 iface のみ) なら送信前に検出を
+    // 引き直す (issue #23: matd が otbr より先に起動した場合の後付け確立)。
+    if ctx.thread_retry && sender.egress_count() < 2 {
+        acquire_late_thread_egress(
+            &ctx.op_iface,
+            crate::iface_select::detect_thread_iface_auto(),
+            sender,
+        )
+        .await;
+    }
+    match sender
         .send_invoke(&creds, group_id, cluster, command, fields.as_deref())
         .await
     {
@@ -137,6 +152,50 @@ fn group_send_error(group_id: u16, e: mat_controller::group::GroupSendError) -> 
         GroupSendError::Crypto(_) => ErrorKind::Other,
     };
     MatError::new(kind, format!("groupcast send to group {group_id}: {e}"))
+}
+
+/// thread egress の後付け確立 (issue #23 起動順の罠)。best-effort: どの
+/// 失敗も warn + LAN 単独継続で、次回送信でまた試す。`detected` は
+/// `detect_thread_iface_auto()` の結果を呼び出し側が渡す (テスト注入点)。
+async fn acquire_late_thread_egress(
+    op_iface: &str,
+    detected: Option<String>,
+    sender: &mut GroupSender,
+) {
+    let Some(name) = detected else { return };
+    if name == op_iface {
+        // 運用 iface と同一なら二重送出になるだけ (build 時の
+        // thread_egress_decision と同じ規律)。毎送信で通り得るので debug。
+        tracing::debug!(iface = %name, "late thread iface matches operating iface; skipping");
+        return;
+    }
+    let scope_id = match mat_controller::dnssd::iface_index(&name) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(iface = %name, error = %e,
+                "late thread iface detected but unresolvable; groupcast stays LAN-only");
+            return;
+        }
+    };
+    let transport = match UdpTransport::bind().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(iface = %name, error = %e,
+                "late thread egress socket bind failed; groupcast stays LAN-only");
+            return;
+        }
+    };
+    match sender.add_egress(GroupEgress {
+        iface: name.clone(),
+        transport: Arc::new(transport),
+        scope_id,
+    }) {
+        Ok(()) => {
+            tracing::info!(iface = %name, scope_id, "groupcast thread egress acquired late")
+        }
+        Err(e) => tracing::warn!(iface = %name, error = %e,
+            "late thread egress sockopt setup failed; groupcast stays LAN-only"),
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +265,8 @@ mod tests {
                     scope_id: cand.index,
                 }],
                 dest_port: port,
+                op_iface: cand.name.clone(),
+                thread_retry: false,
                 sender: Mutex::new(None),
             };
             // send 失敗も次候補へ（join 失敗と同じ扱い）: docker0 / veth* /
@@ -272,6 +333,8 @@ mod tests {
                 scope_id: 1,
             }],
             dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
             sender: Mutex::new(None),
         };
         let r = bump(&ctx).await;
@@ -288,6 +351,61 @@ mod tests {
         assert_eq!(f2, to);
         assert!(t2 > to);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// issue #23 起動順の罠: matd が otbr より先に起動して thread egress 無しで
+    /// 構築されても、送信時の再検出 (注入) で egress が後付けされること。
+    /// op iface と同名・検出無し・未解決名は現状維持 (LAN 単独継続)。
+    #[tokio::test]
+    async fn late_thread_egress_acquired_and_skipped_correctly() {
+        use mat_controller::transport::UdpTransport;
+
+        let Some(cand) = crate::test_support::multicast_capable_interfaces()
+            .into_iter()
+            .next()
+        else {
+            panic!("no multicast-capable interface");
+        };
+
+        async fn one_egress_sender(tag: &str, cand_index: u32) -> GroupSender {
+            let p =
+                std::env::temp_dir().join(format!("mat-native-late-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            GroupSender::new(
+                vec![GroupEgress {
+                    iface: "op0".into(),
+                    transport,
+                    scope_id: cand_index,
+                }],
+                5540,
+                1,
+                0x0001_0001,
+                counter,
+            )
+            .unwrap()
+        }
+
+        // 検出あり + op iface と別名 → 後付け成功
+        let mut s = one_egress_sender("add", cand.index).await;
+        acquire_late_thread_egress("op0", Some(cand.name.clone()), &mut s).await;
+        assert_eq!(s.egress_count(), 2);
+
+        // op iface と同名 → 張らない (二重送出回避)
+        let mut s = one_egress_sender("dup", cand.index).await;
+        acquire_late_thread_egress(&cand.name, Some(cand.name.clone()), &mut s).await;
+        assert_eq!(s.egress_count(), 1);
+
+        // 検出無し → no-op
+        let mut s = one_egress_sender("none", cand.index).await;
+        acquire_late_thread_egress("op0", None, &mut s).await;
+        assert_eq!(s.egress_count(), 1);
+
+        // 検出名が解決不能 (iface 実在せず) → warn + 現状維持
+        let mut s = one_egress_sender("bad", cand.index).await;
+        acquire_late_thread_egress("op0", Some("no-such-iface0".into()), &mut s).await;
+        assert_eq!(s.egress_count(), 1);
     }
 
     #[tokio::test]
@@ -311,6 +429,8 @@ mod tests {
                 scope_id: 1,
             }],
             dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
             sender: Mutex::new(None),
         };
         assert!(matches!(bump(&ctx).await, BumpOutcome::Unavailable(_)));
