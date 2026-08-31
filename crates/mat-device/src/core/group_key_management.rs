@@ -2,13 +2,13 @@
 //! RootNode デバイスタイプの必須クラスタ（Device Library §9.2.2）。Apple
 //! Home は commissioning 直後の interview でこのクラスタの不在を咎める。
 //!
-//! `GroupKeyWrite`（spec §11.2.7.1）を実装し、書き込まれた KeySet を
-//! `GroupKeyStore` に保持する。`GroupKeyMap`/`GroupTable` 属性の実データ
-//! 反映（`ATTR_GROUP_KEY_MAP` write, `KeySetRead`/`KeySetRemove`/
-//! `KeySetReadAllIndices` コマンド）と永続化は未実装（既知ギャップ、M3
-//! 送り）— `GroupKeyStore` は Task 2 以降（groupcast 実配線）が読み書きする
-//! 共有 state として用意するのみで、本ファイルはまだ `map` を読みに使わ
-//! ない。
+//! `KeySetWrite`（spec §11.2.7.1）と `ATTR_GROUP_KEY_MAP` の write/read
+//! （spec §11.2.7.6、全置換 + `ListIndex` null append の両径路）を実装し、
+//! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は空 array のまま
+//! （`GroupTable` は Groups クラスタ側のエンドポイント紐付けが要る派生
+//! ビューで、groupcast タスク送り）。`KeySetRead`/`KeySetRemove`/
+//! `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ、
+//! groupcast タスク送り）。
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mat_controller::im;
@@ -52,7 +52,8 @@ struct GroupKeyInner {
 }
 
 /// GroupKeyManagement の共有 state。`GroupKeyManagementHandler`（EP0 の
-/// クラスタハンドラ）と、将来の groupcast 配線・fabric 撤去の purge の
+/// クラスタハンドラ）と、`CommissioningServer`（fabric 撤去の purge、
+/// `core::commissioning::set_group_key_store`）・将来の groupcast 配線の
 /// 両方から触られる想定で `Arc<Mutex<..>>` + `Clone`（`AclStore` と同じ
 /// パターン、モジュール doc 参照）。永続化なし（M3 送り）。
 #[derive(Clone, Default)]
@@ -123,7 +124,7 @@ impl GroupKeyStore {
     }
 
     /// 書き込み fabric の GroupKeyMap エントリを丸ごと入れ替える
-    /// （`ATTR_GROUP_KEY_MAP` write の全置換径路 — 配線は後続タスク）。
+    /// （`ATTR_GROUP_KEY_MAP` write の全置換径路）。
     pub fn replace_fabric_map(&self, fabric_index: u8, entries: Vec<(u16, u16)>) {
         let mut guard = self.lock();
         guard.map.retain(|m| m.fabric_index != fabric_index);
@@ -139,7 +140,7 @@ impl GroupKeyStore {
     }
 
     /// 書き込み fabric の GroupKeyMap 末尾に 1 件足す（write の
-    /// ListIndex null append 径路 — 配線は後続タスク）。
+    /// ListIndex null append 径路）。
     pub fn append_map_entry(&self, fabric_index: u8, group_id: u16, keyset_id: u16) {
         self.lock().map.push(GroupKeyMapEntry {
             fabric_index,
@@ -178,6 +179,17 @@ impl GroupKeyManagementHandler {
     pub fn new(store: GroupKeyStore) -> Self {
         Self { store }
     }
+
+    /// `write` の共通制約チェック（設計メモ参照）: `group_id == 0`（無効
+    /// GroupId）または `fabric_index` に `keyset_id` の KeySet が無ければ
+    /// `STATUS_CONSTRAINT_ERROR`。
+    fn check_map_entry(&self, fabric_index: u8, entry: &(u16, u16)) -> Result<(), u8> {
+        let (group_id, keyset_id) = *entry;
+        if group_id == 0 || !self.store.keyset_exists(fabric_index, keyset_id) {
+            return Err(im::STATUS_CONSTRAINT_ERROR);
+        }
+        Ok(())
+    }
 }
 
 impl ClusterHandler for GroupKeyManagementHandler {
@@ -200,9 +212,26 @@ impl ClusterHandler for GroupKeyManagementHandler {
         ]
     }
 
-    fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+    /// `ATTR_GROUP_KEY_MAP`（spec §11.2.7.6）は `ctx.fabric_filtered` を
+    /// 尊重する fabric-scoped list（`AccessControlHandler::read`の
+    /// `ATTR_ACL`と同じ扱い）: filtered なら `ctx.fabric_index` 分のみ、
+    /// unfiltered なら全 fabric 分。`ATTR_GROUP_TABLE` はエンドポイント
+    /// 紐付けの派生ビューで未実装につき常に空 array（モジュール doc）。
+    fn read(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_GROUP_KEY_MAP | im::ATTR_GROUP_TABLE => {
+            im::ATTR_GROUP_KEY_MAP => {
+                let entries: Vec<(u8, u16, u16)> = if ctx.fabric_filtered {
+                    self.store
+                        .map_entries_for(ctx.fabric_index)
+                        .into_iter()
+                        .map(|(group_id, keyset_id)| (ctx.fabric_index, group_id, keyset_id))
+                        .collect()
+                } else {
+                    self.store.all_map_entries()
+                };
+                Some(encode_group_key_map(&entries))
+            }
+            im::ATTR_GROUP_TABLE => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
                 w.end_container();
@@ -256,6 +285,52 @@ impl ClusterHandler for GroupKeyManagementHandler {
 
     fn accepted_commands(&self) -> Vec<u32> {
         vec![im::CMD_KEY_SET_WRITE]
+    }
+
+    /// write の対象は `ATTR_GROUP_KEY_MAP` のみ（`ATTR_GROUP_TABLE` は
+    /// spec 上も read-only）。パターンは `AccessControlHandler::write`
+    /// （access_control.rs）を踏襲: (1) `attribute` ルーティング外は
+    /// `STATUS_UNSUPPORTED_WRITE`、(2) `ctx.fabric_index == 0`（PASE）は
+    /// `STATUS_UNSUPPORTED_ACCESS`、(3) `list_append` で「全置換」/「1 件
+    /// append」を切り替え、どちらも各エントリの `group_id == 0`（無効
+    /// GroupId、spec §11.2.7.6）または書き込み fabric に
+    /// `keyset_id` の KeySet が無い（`GroupKeyStore::keyset_exists`）場合は
+    /// `STATUS_CONSTRAINT_ERROR` — 存在しない keyset への参照を弾く。wire
+    /// 形の `fabricIndex`（254）は無視し、常に `ctx.fabric_index` を使う
+    /// （`decode_group_key_map_entries`/`decode_single_group_key_map_entry`
+    /// はそもそも 254 を読まない — クライアント実装 `im.rs:1373` の
+    /// コメントどおり、書く側もこのフィールドを送らない）。
+    fn write(
+        &mut self,
+        attribute: u32,
+        data_tlv: &[u8],
+        list_append: bool,
+        ctx: &mut InvokeCtx,
+    ) -> Result<(), u8> {
+        if attribute != im::ATTR_GROUP_KEY_MAP {
+            return Err(im::STATUS_UNSUPPORTED_WRITE);
+        }
+        if ctx.fabric_index == 0 {
+            return Err(im::STATUS_UNSUPPORTED_ACCESS);
+        }
+        if list_append {
+            let Some(entry) = decode_single_group_key_map_entry(data_tlv) else {
+                return Err(im::STATUS_CONSTRAINT_ERROR);
+            };
+            self.check_map_entry(ctx.fabric_index, &entry)?;
+            self.store
+                .append_map_entry(ctx.fabric_index, entry.0, entry.1);
+        } else {
+            let Some(entries) = decode_group_key_map_entries(data_tlv) else {
+                return Err(im::STATUS_CONSTRAINT_ERROR);
+            };
+            for entry in &entries {
+                self.check_map_entry(ctx.fabric_index, entry)?;
+            }
+            self.store.replace_fabric_map(ctx.fabric_index, entries);
+        }
+        ctx.changed.push(im::ATTR_GROUP_KEY_MAP);
+        Ok(())
     }
 }
 
@@ -335,6 +410,84 @@ fn next_element<'a>(
     r.next()
         .map_err(|_| KeySetWriteError::Malformed)?
         .ok_or(KeySetWriteError::Malformed)
+}
+
+/// `ATTR_GROUP_KEY_MAP` の read: `(fabric_index, group_id, keyset_id)`
+/// 列を `array[GroupKeyMapStruct{ Context(1)=GroupId, Context(2)=
+/// GroupKeySetID, Context(254)=FabricIndex }]` に符号化する（fabricIndex
+/// 出力の流儀は `access_control.rs::write_acl_entry` の Context(254) と
+/// 同じ）。
+fn encode_group_key_map(entries: &[(u8, u16, u16)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (fabric_index, group_id, keyset_id) in entries {
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(*group_id));
+        w.put_uint(Tag::Context(2), u64::from(*keyset_id));
+        w.put_uint(Tag::Context(254), u64::from(*fabric_index));
+        w.end_container();
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// `ATTR_GROUP_KEY_MAP` write の全置換径路: `data_tlv` は
+/// `array[GroupKeyMapStruct{1:GroupId(u16), 2:GroupKeySetID(u16)}]`
+/// （wire 形はクライアント実装
+/// `mat_controller::im::encode_group_key_map_tlv` が正 — `fabricIndex`
+/// (254) は送られてこない前提で、来ても `decode_group_key_map_entry_body`
+/// が無視する）。構造が array/struct のネストと食い違う、または必須
+/// フィールド（GroupId/GroupKeySetID のどちらか）が欠けていれば `None`
+/// — `write` はこれを一律 `STATUS_CONSTRAINT_ERROR` に畳む
+/// （`decode_acl_entries`/`AccessControlHandler::write`と同じ裁定）。
+fn decode_group_key_map_entries(data_tlv: &[u8]) -> Option<Vec<(u16, u16)>> {
+    let mut r = Reader::new(data_tlv);
+    let el = r.next().ok()??;
+    if el.value != Value::ArrayStart {
+        return None;
+    }
+    let mut entries = Vec::new();
+    loop {
+        let el = r.next().ok()??;
+        match el.value {
+            Value::ContainerEnd => break,
+            Value::StructStart => entries.push(decode_group_key_map_entry_body(&mut r)?),
+            _ => return None,
+        }
+    }
+    Some(entries)
+}
+
+/// write の `ListIndex` null append 径路: `data_tlv` は単一の
+/// `GroupKeyMapStruct`（array に包まれない）。
+fn decode_single_group_key_map_entry(data_tlv: &[u8]) -> Option<(u16, u16)> {
+    let mut r = Reader::new(data_tlv);
+    let el = r.next().ok()??;
+    if el.value != Value::StructStart {
+        return None;
+    }
+    decode_group_key_map_entry_body(&mut r)
+}
+
+/// `GroupKeyMapStruct` 1 件分のフィールド列を読む。呼び出し側がその
+/// `StructStart` を消費済みであることが前提。`Context(1)`=GroupId,
+/// `Context(2)`=GroupKeySetID 以外（`fabricIndex`含む）は読み捨てる。
+fn decode_group_key_map_entry_body(r: &mut Reader) -> Option<(u16, u16)> {
+    let mut group_id = None;
+    let mut keyset_id = None;
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(1), Value::Uint(v)) => group_id = u16::try_from(v).ok(),
+            (Tag::Context(2), Value::Uint(v)) => keyset_id = u16::try_from(v).ok(),
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                mat_controller::tlv::skip_container(r).ok()?;
+            }
+            _ => {}
+        }
+    }
+    Some((group_id?, keyset_id?))
 }
 
 #[cfg(test)]
@@ -471,5 +624,172 @@ mod tests {
         store.purge_fabric(1);
         assert!(!store.keyset_exists(1, 10));
         assert!(store.keyset_exists(2, 20));
+    }
+
+    /// group-key-map write の全置換 + 存在しない keyset 参照の拒否 +
+    /// fabric_filtered read（自 fabric のみ・`Context(254)` 付き）を
+    /// 一通り確認する（brief Step 1 のテスト）。
+    #[test]
+    fn group_key_map_write_replace_append_and_fabric_filtered_read() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
+        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+
+        // 全置換 write
+        let data = mat_controller::im::encode_group_key_map_tlv(&[(0x000A, 7)]);
+        h.write(im::ATTR_GROUP_KEY_MAP, &data, false, &mut ctx)
+            .unwrap();
+        assert_eq!(ctx.changed, vec![im::ATTR_GROUP_KEY_MAP]);
+        assert_eq!(store.map_entries_for(1), vec![(0x000A, 7)]);
+
+        // 存在しない keyset 参照は CONSTRAINT_ERROR（store は変化しない）
+        let bad = mat_controller::im::encode_group_key_map_tlv(&[(0x000B, 99)]);
+        assert_eq!(
+            h.write(im::ATTR_GROUP_KEY_MAP, &bad, false, &mut ctx),
+            Err(im::STATUS_CONSTRAINT_ERROR)
+        );
+        assert_eq!(store.map_entries_for(1), vec![(0x000A, 7)]);
+
+        // fabric_filtered read は自 fabric のみ・fabricIndex(254) 付き
+        let read_ctx = ReadCtx {
+            fabric_index: 1,
+            ..ReadCtx::default()
+        };
+        let tlv = h.read(im::ATTR_GROUP_KEY_MAP, &read_ctx).unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let mut group_id = None;
+        let mut keyset_id = None;
+        let mut fabric_index = None;
+        loop {
+            let el = r.next().unwrap().unwrap();
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(1), Value::Uint(v)) => group_id = Some(v),
+                (Tag::Context(2), Value::Uint(v)) => keyset_id = Some(v),
+                (Tag::Context(254), Value::Uint(v)) => fabric_index = Some(v),
+                other => panic!("unexpected field {other:?}"),
+            }
+        }
+        assert_eq!(group_id, Some(0x000A));
+        assert_eq!(keyset_id, Some(7));
+        assert_eq!(fabric_index, Some(1));
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ContainerEnd); // array end
+        assert!(r.next().unwrap().is_none());
+    }
+
+    /// `list_append=true` は単一 struct の追加径路。
+    #[test]
+    fn group_key_map_write_list_append_adds_one_entry() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
+        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0x000A);
+        w.put_uint(Tag::Context(2), 7);
+        w.end_container();
+        let single = w.finish();
+
+        h.write(im::ATTR_GROUP_KEY_MAP, &single, true, &mut ctx)
+            .unwrap();
+        assert_eq!(store.map_entries_for(1), vec![(0x000A, 7)]);
+    }
+
+    /// `group_id == 0`（無効 GroupId）は keyset の有無に関わらず
+    /// CONSTRAINT_ERROR。
+    #[test]
+    fn group_key_map_write_rejects_group_id_zero() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
+        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+
+        let data = mat_controller::im::encode_group_key_map_tlv(&[(0, 7)]);
+        assert_eq!(
+            h.write(im::ATTR_GROUP_KEY_MAP, &data, false, &mut ctx),
+            Err(im::STATUS_CONSTRAINT_ERROR)
+        );
+    }
+
+    /// `ATTR_GROUP_TABLE` は read-only — write は `STATUS_UNSUPPORTED_WRITE`。
+    /// PASE セッション（fabric_index 0）は `ATTR_GROUP_KEY_MAP` write でも
+    /// `STATUS_UNSUPPORTED_ACCESS`。
+    #[test]
+    fn write_rejects_unsupported_attribute_and_pase() {
+        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let data = mat_controller::im::encode_group_key_map_tlv(&[]);
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            h.write(im::ATTR_GROUP_TABLE, &data, false, &mut ctx),
+            Err(im::STATUS_UNSUPPORTED_WRITE)
+        );
+
+        let mut pase = InvokeCtx::default(); // fabric_index 0 = PASE
+        assert_eq!(
+            h.write(im::ATTR_GROUP_KEY_MAP, &data, false, &mut pase),
+            Err(im::STATUS_UNSUPPORTED_ACCESS)
+        );
+    }
+
+    /// unfiltered read（`IsFabricFiltered=false`）は fabric をまたいで
+    /// 全エントリを返す。
+    #[test]
+    fn group_key_map_read_unfiltered_returns_all_fabrics() {
+        let store = GroupKeyStore::new();
+        let h = GroupKeyManagementHandler::new(store.clone());
+        store.upsert_keyset(1, 7, [0u8; 16]).unwrap();
+        store.upsert_keyset(2, 8, [0u8; 16]).unwrap();
+        store.replace_fabric_map(1, vec![(0x000A, 7)]);
+        store.replace_fabric_map(2, vec![(0x000B, 8)]);
+
+        let tlv = h
+            .read(im::ATTR_GROUP_KEY_MAP, &ReadCtx::unfiltered(0))
+            .unwrap();
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let mut seen = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            if el.value == Value::ContainerEnd {
+                break;
+            }
+            assert_eq!(el.value, Value::StructStart);
+            let mut group_id = None;
+            let mut keyset_id = None;
+            let mut fabric_index = None;
+            loop {
+                let el = r.next().unwrap().unwrap();
+                match (el.tag, el.value) {
+                    (_, Value::ContainerEnd) => break,
+                    (Tag::Context(1), Value::Uint(v)) => group_id = Some(v),
+                    (Tag::Context(2), Value::Uint(v)) => keyset_id = Some(v),
+                    (Tag::Context(254), Value::Uint(v)) => fabric_index = Some(v),
+                    other => panic!("unexpected field {other:?}"),
+                }
+            }
+            seen.push((fabric_index.unwrap(), group_id.unwrap(), keyset_id.unwrap()));
+        }
+        seen.sort();
+        assert_eq!(seen, vec![(1, 0x000A, 7), (2, 0x000B, 8)]);
     }
 }
