@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mat_controller::im;
+use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
@@ -23,10 +24,7 @@ pub struct IdentifyState(Arc<Mutex<Option<Instant>>>);
 
 impl IdentifyState {
     pub fn is_identifying(&self) -> bool {
-        self.0
-            .lock()
-            .expect("identify state mutex poisoned")
-            .is_some_and(|deadline| deadline > Instant::now())
+        locked(&self.0).is_some_and(|deadline| deadline > Instant::now())
     }
 }
 
@@ -48,9 +46,7 @@ impl IdentifyHandler {
     }
 
     fn remaining_secs(&self) -> u64 {
-        self.deadline
-            .lock()
-            .expect("identify state mutex poisoned")
+        locked(&self.deadline)
             .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs())
             .unwrap_or(0)
     }
@@ -88,7 +84,7 @@ impl ClusterHandler for IdentifyHandler {
                 let Some(secs) = decode_identify_time(fields_tlv) else {
                     return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
                 };
-                *self.deadline.lock().expect("identify state mutex poisoned") = if secs == 0 {
+                *locked(&self.deadline) = if secs == 0 {
                     None
                 } else {
                     Some(Instant::now() + Duration::from_secs(u64::from(secs)))

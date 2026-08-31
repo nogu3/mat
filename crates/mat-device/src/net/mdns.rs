@@ -17,6 +17,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use mat_controller::sync::{read_locked, write_locked};
 use tokio::net::UdpSocket;
 
 use crate::core::mdns_records::{
@@ -106,16 +107,8 @@ impl MdnsAdvertiser {
     /// holding either lock across an `.await` (a `RwLockReadGuard` isn't
     /// `Send`, and every send here happens on a socket, i.e. async).
     fn snapshot(&self) -> (Option<CommissionableAdvert>, Vec<OperationalAdvert>) {
-        let commissionable = self
-            .commissionable
-            .read()
-            .expect("mdns commissionable lock poisoned")
-            .clone();
-        let operational = self
-            .operational
-            .read()
-            .expect("mdns operational lock poisoned")
-            .clone();
+        let commissionable = read_locked(&self.commissionable).clone();
+        let operational = read_locked(&self.operational).clone();
         (commissionable, operational)
     }
 
@@ -167,30 +160,20 @@ impl MdnsAdvertiser {
     /// state actually changes.
     pub async fn set_commissionable(self: &Arc<Self>, ad: Option<CommissionableAdvert>) {
         if ad.is_none() {
-            let old = self
-                .commissionable
-                .read()
-                .expect("mdns commissionable lock poisoned")
-                .clone();
+            let old = read_locked(&self.commissionable).clone();
             if let Some(old) = old {
                 let goodbye = encode_goodbye(Some(&old), &[]);
                 self.send_doubled(goodbye).await;
             }
         }
-        *self
-            .commissionable
-            .write()
-            .expect("mdns commissionable lock poisoned") = ad;
+        *write_locked(&self.commissionable) = ad;
         self.announce().await;
     }
 
     /// Adds one operational advert (e.g. one per commissioned fabric),
     /// then announces the resulting advert set.
     pub async fn add_operational(self: &Arc<Self>, ad: OperationalAdvert) {
-        self.operational
-            .write()
-            .expect("mdns operational lock poisoned")
-            .push(ad);
+        write_locked(&self.operational).push(ad);
         self.announce().await;
     }
 
@@ -207,21 +190,13 @@ impl MdnsAdvertiser {
         let cfid = compressed_fabric_id.to_be_bytes();
         let matches =
             |ad: &&OperationalAdvert| ad.compressed_fabric_id == cfid && ad.node_id == node_id;
-        let target = self
-            .operational
-            .read()
-            .expect("mdns operational lock poisoned")
-            .iter()
-            .find(matches)
-            .cloned();
+        let target = read_locked(&self.operational).iter().find(matches).cloned();
         let Some(target) = target else {
             return;
         };
         let goodbye = encode_goodbye(None, std::slice::from_ref(&target));
         self.send_doubled(goodbye).await;
-        self.operational
-            .write()
-            .expect("mdns operational lock poisoned")
+        write_locked(&self.operational)
             .retain(|ad| !(ad.compressed_fabric_id == cfid && ad.node_id == node_id));
     }
 
@@ -262,16 +237,8 @@ impl MdnsAdvertiser {
             // Clone the (small) advert snapshot out from under the lock
             // before any `.await` — a `RwLockReadGuard` isn't `Send`, and
             // this task must stay `Send` for `tokio::spawn`.
-            let commissionable = self
-                .commissionable
-                .read()
-                .expect("mdns commissionable lock poisoned")
-                .clone();
-            let operational = self
-                .operational
-                .read()
-                .expect("mdns operational lock poisoned")
-                .clone();
+            let commissionable = read_locked(&self.commissionable).clone();
+            let operational = read_locked(&self.operational).clone();
 
             if let Some(ad) = &commissionable {
                 if let Some(msg) = encode_commissionable_response(name, ad, *qu) {

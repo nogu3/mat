@@ -1303,7 +1303,7 @@ impl OperationalCache {
     /// で恒久ミスにならないようにする。
     pub fn get(&self, instance: &str) -> Option<ResolvedNode> {
         let key = instance.to_ascii_lowercase();
-        let map = self.inner.map.lock().expect("opcache mutex");
+        let map = crate::sync::locked(&self.inner.map);
         map.get(&key)
             .filter(|e| Instant::now() < e.expiry)
             .map(|e| e.node.clone())
@@ -1321,7 +1321,7 @@ impl OperationalCache {
     /// `get` と同じく ASCII 小文字正規化して格納する（最終レビュー #2）。
     pub fn insert(&self, instance: String, node: ResolvedNode, ttl: Duration) {
         let key = instance.to_ascii_lowercase();
-        let mut map = self.inner.map.lock().expect("opcache mutex");
+        let mut map = crate::sync::locked(&self.inner.map);
         if !map.contains_key(&key) && map.len() >= MAX_CACHE {
             return;
         }
