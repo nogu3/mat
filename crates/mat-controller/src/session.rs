@@ -128,6 +128,12 @@ pub struct SecureSession {
     keys: SessionKeys,
     local_node_id: u64,
     peer_node_id: u64,
+    /// The peer's CASE Authenticated Tags (spec §6.6.2.1.2), read off its
+    /// NOC by the CASE responder. Only meaningful on a device-role CASE
+    /// session (set via `with_peer_cats`); empty on every other session —
+    /// PASE (no NOC), and the controller role, whose ACL decisions are made
+    /// by the device, not by us.
+    peer_cats: crate::cert::CaseAuthTags,
     counter: TxCounter,
     rx_window: RxWindow,
     /// screen のフィルタ落ちで捨てると永久喪失する device 発 ReportData の待避
@@ -177,6 +183,7 @@ impl SecureSession {
             keys,
             local_node_id,
             peer_node_id,
+            peer_cats: crate::cert::CaseAuthTags::default(),
             counter: TxCounter::new_random(),
             rx_window: RxWindow::new(),
             peer_initiated: std::collections::VecDeque::new(),
@@ -220,6 +227,20 @@ impl SecureSession {
 
     pub fn peer_node_id(&self) -> u64 {
         self.peer_node_id
+    }
+
+    /// Attaches the peer's CASE Authenticated Tags (from
+    /// `CaseOutput::Established::peer_cats`) to a device-role session so
+    /// `peer_cats()` can complete the ACL identity `peer_node_id()` starts.
+    pub fn with_peer_cats(mut self, peer_cats: crate::cert::CaseAuthTags) -> Self {
+        self.peer_cats = peer_cats;
+        self
+    }
+
+    /// The peer's CASE Authenticated Tags — empty unless `with_peer_cats`
+    /// attached some (see the field doc for when that happens).
+    pub fn peer_cats(&self) -> crate::cert::CaseAuthTags {
+        self.peer_cats
     }
 
     /// PASE で確立したセッションの Attestation Challenge (spec §11.17.5.4 が
@@ -3837,6 +3858,13 @@ mod tests {
         );
         let mut dev =
             SecureSession::new_device_role(Arc::new(tb), RELIABLE_PEER, 20, 10, keys, 222, 111);
+        // A device-role session starts with no peer CATs; `with_peer_cats`
+        // is how the CASE driver attaches the ones read off the peer's NOC.
+        assert!(dev.peer_cats().is_empty());
+        let cats = crate::cert::CaseAuthTags::new(&[0x0001_0002]).unwrap();
+        dev = dev.with_peer_cats(cats);
+        assert_eq!(dev.peer_cats(), cats);
+        assert_eq!(dev.peer_node_id(), 111);
         let server = tokio::spawn(async move {
             let req = dev
                 .recv_request(Duration::from_secs(5))

@@ -252,6 +252,7 @@ pub async fn responder_task(
             keys,
             peer_session_id,
             peer_node_id: _,
+            peer_cats: _,
             fabric_index: _,
         } = core
             .on_message(OPCODE_SIGMA3, &payload)
