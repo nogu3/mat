@@ -5,9 +5,13 @@
 //! level は raw 値、`*_in` は応答エコー用の入力文字列）。名前解決と換算の
 //! 規則はこのモジュールのコンストラクタだけが持つ。
 
+use crate::NodeConn;
+use mat_controller::im;
+use mat_core::body;
 use mat_core::color::ResolvedColor;
 use mat_core::error::MatError;
 use mat_core::ids::{self, InvokeClass, ScalarValue, WriteClass};
+use serde_json::Value;
 
 /// 経路非依存の入力換算（CLI 入力 → Matter 生値）。旧 `mat/src/units.rs`。
 pub mod units {
@@ -332,11 +336,182 @@ pub struct ProvisionParams {
     pub rebind: bool,
 }
 
+/// 単一ノード op を 1 回実行し、成功 body（timestamp 抜き）を返す。
+/// op → NodeConn 呼び出し（TLV 符号化）→ body 組立はここだけ。セッションの
+/// 取得・後始末は呼び出し側（`runner`）の責務。
+pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, MatError> {
+    let node_id = op.node_id;
+    let body = match &op.kind {
+        NodeOpKind::On { endpoint } => {
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_ON,
+                None,
+                false,
+            )
+            .await?;
+            body::invoke_success(node_id, *endpoint, "onoff", "on")
+        }
+        NodeOpKind::Off { endpoint } => {
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_OFF,
+                None,
+                false,
+            )
+            .await?;
+            body::invoke_success(node_id, *endpoint, "onoff", "off")
+        }
+        NodeOpKind::Color {
+            endpoint,
+            color,
+            transition,
+        } => {
+            let fields = im::encode_move_to_hue_and_saturation_fields(
+                color.hue_raw,
+                color.sat_raw,
+                *transition,
+            );
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_HUE_AND_SATURATION,
+                Some(fields),
+                false,
+            )
+            .await?;
+            body::color_success(node_id, *endpoint, color, *transition)
+        }
+        NodeOpKind::ColorTemp {
+            endpoint,
+            kelvin,
+            mireds,
+            transition,
+        } => {
+            let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+                Some(fields),
+                false,
+            )
+            .await?;
+            body::color_temp_success(node_id, *endpoint, *kelvin, *mireds, *transition)
+        }
+        NodeOpKind::Level {
+            endpoint,
+            percent,
+            level,
+            transition,
+        } => {
+            let fields = im::encode_move_to_level_fields(*level, *transition);
+            conn.invoke(
+                *endpoint,
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL,
+                Some(fields),
+                false,
+            )
+            .await?;
+            body::level_success(
+                node_id,
+                *endpoint,
+                body::LevelEcho {
+                    percent: *percent,
+                    level: *level,
+                },
+                *transition,
+            )
+        }
+        NodeOpKind::Read {
+            endpoint,
+            cluster_in,
+            attribute_in,
+            cluster,
+            attribute,
+        } => {
+            // onoff/on-off は bool 専用 read（両経路の従来挙動）。数値 ID 指定
+            // （6/0）も同じ腕に落ちるが JSON は Bool で同形。
+            let v = if *cluster == im::CLUSTER_ON_OFF && *attribute == im::ATTR_ON_OFF {
+                Value::Bool(conn.read_onoff(*endpoint).await?)
+            } else {
+                conn.read_json(*endpoint, *cluster, *attribute).await?
+            };
+            body::read_success(node_id, *endpoint, cluster_in, attribute_in, v)
+        }
+        NodeOpKind::Write {
+            endpoint,
+            cluster_in,
+            attribute_in,
+            cluster,
+            attribute,
+            value_in,
+            value,
+            timed,
+        } => {
+            conn.write_tlv(
+                *endpoint,
+                *cluster,
+                *attribute,
+                crate::scalar_to_tlv(value),
+                *timed,
+            )
+            .await?;
+            body::write_success(node_id, *endpoint, cluster_in, attribute_in, value_in)
+        }
+        NodeOpKind::Invoke {
+            endpoint,
+            cluster_in,
+            command_in,
+            cluster,
+            command,
+            fields_tlv,
+            timed,
+            ..
+        } => {
+            conn.invoke(*endpoint, *cluster, *command, fields_tlv.clone(), *timed)
+                .await?;
+            body::invoke_success(node_id, *endpoint, cluster_in, command_in)
+        }
+        NodeOpKind::Describe => {
+            let endpoints = crate::ops::describe(conn).await?;
+            body::describe_success(node_id, &endpoints)
+        }
+        NodeOpKind::DiagThread { endpoint } => {
+            let snap = crate::ops::diag_thread(conn, *endpoint).await?;
+            body::diag_thread_success(node_id, *endpoint, snap.fields, &snap.unavailable)
+        }
+        NodeOpKind::OpenWindow {
+            timeout,
+            iteration,
+            discriminator,
+        } => {
+            // CLI の timeout は u32、window API は u16（spec 上 16-bit）。飽和。
+            let timeout_u16 = u16::try_from(*timeout).unwrap_or(u16::MAX);
+            let (manual_code, qr_payload) = conn
+                .open_window(timeout_u16, *discriminator, *iteration)
+                .await?;
+            body::open_window_success(node_id, &manual_code, &qr_payload, *timeout)
+        }
+    };
+    tracing::debug!(node_id, op = op.kind.name(), "node op executed");
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mat_controller::im::{CLUSTER_ON_OFF, CMD_ON_OFF_ON, CMD_ON_OFF_TOGGLE};
+    use crate::test_support::FakeConn;
+    use mat_controller::im::{self, CLUSTER_ON_OFF, CMD_ON_OFF_ON, CMD_ON_OFF_TOGGLE};
     use mat_core::error::ErrorKind;
+    use serde_json::json;
+
+    fn node(kind: NodeOpKind) -> NodeOp {
+        NodeOp { node_id: 5, kind }
+    }
 
     #[test]
     fn kelvin_2700_converts_to_370_mireds() {
@@ -543,5 +718,206 @@ mod tests {
             "open_window"
         );
         assert_eq!(GroupOpKind::level(1, 0).name(), "group_level");
+    }
+
+    #[tokio::test]
+    async fn on_off_invoke_onoff_and_build_invoke_body() {
+        let mut conn = FakeConn::default();
+        let body = run_node_op(&mut conn, &node(NodeOpKind::On { endpoint: 1 }))
+            .await
+            .unwrap();
+        assert_eq!(body, mat_core::body::invoke_success(5, 1, "onoff", "on"));
+        let body = run_node_op(&mut conn, &node(NodeOpKind::Off { endpoint: 1 }))
+            .await
+            .unwrap();
+        assert_eq!(body, mat_core::body::invoke_success(5, 1, "onoff", "off"));
+        assert_eq!(
+            conn.calls(),
+            &[
+                format!(
+                    "invoke(1,{:#06X},{:#06X})",
+                    im::CLUSTER_ON_OFF,
+                    im::CMD_ON_OFF_ON
+                ),
+                format!(
+                    "invoke(1,{:#06X},{:#06X})",
+                    im::CLUSTER_ON_OFF,
+                    im::CMD_ON_OFF_OFF
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn color_color_temp_level_send_expected_commands() {
+        let mut conn = FakeConn::default();
+        let color = ResolvedColor {
+            hue_raw: 233,
+            sat_raw: 203,
+            hue: 330,
+            sat: 80,
+            name: None,
+            rgb: None,
+        };
+        let body = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::Color {
+                endpoint: 1,
+                color: color.clone(),
+                transition: 30,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, mat_core::body::color_success(5, 1, &color, 30));
+        let body = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::color_temp(1, Some(2700), None, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, mat_core::body::color_temp_success(5, 1, 2700, 370, 0));
+        let body = run_node_op(&mut conn, &node(NodeOpKind::level(1, 50, 0)))
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            mat_core::body::level_success(
+                5,
+                1,
+                mat_core::body::LevelEcho {
+                    percent: 50,
+                    level: 127
+                },
+                0
+            )
+        );
+        assert_eq!(
+            conn.calls(),
+            &[
+                format!(
+                    "invoke(1,{:#06X},{:#06X})",
+                    im::CLUSTER_COLOR_CONTROL,
+                    im::CMD_MOVE_TO_HUE_AND_SATURATION
+                ),
+                format!(
+                    "invoke(1,{:#06X},{:#06X})",
+                    im::CLUSTER_COLOR_CONTROL,
+                    im::CMD_MOVE_TO_COLOR_TEMPERATURE
+                ),
+                format!(
+                    "invoke(1,{:#06X},{:#06X})",
+                    im::CLUSTER_LEVEL_CONTROL,
+                    im::CMD_MOVE_TO_LEVEL
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_onoff_uses_bool_fast_path_and_generic_read_uses_json() {
+        // FakeConn::read_onoff は常に true、read_json は登録値（未登録は 1）。
+        let mut conn = FakeConn::scripted().with_read(1, 0x0008, 0x0000, json!(200));
+        let body = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::read(1, "onoff", "on-off").unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body,
+            mat_core::body::read_success(5, 1, "onoff", "on-off", json!(true))
+        );
+        let body = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::read(1, "levelcontrol", "current-level").unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["value"], json!(200));
+        assert_eq!(body["cluster"], "levelcontrol");
+        assert_eq!(body["attribute"], "current-level");
+    }
+
+    #[tokio::test]
+    async fn write_encodes_scalar_tlv_and_echoes_normalized_value() {
+        let mut conn = FakeConn::default();
+        let op = node(NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap());
+        let body = run_node_op(&mut conn, &op).await.unwrap();
+        assert_eq!(
+            body,
+            mat_core::body::write_success(5, 1, "levelcontrol", "on-level", "128")
+        );
+        let (ep, cluster, attr, tlv) = &conn.written_tlv()[0];
+        assert_eq!((*ep, *cluster, *attr), (1, 0x0008, 0x0011));
+        assert_eq!(tlv, &crate::scalar_to_tlv(&ScalarValue::UInt(128)));
+    }
+
+    #[tokio::test]
+    async fn invoke_generic_forwards_ids_and_builds_body() {
+        let mut conn = FakeConn::default();
+        let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
+        let op = node(NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args).unwrap());
+        let body = run_node_op(&mut conn, &op).await.unwrap();
+        assert_eq!(
+            body,
+            mat_core::body::invoke_success(5, 1, "levelcontrol", "move-to-level")
+        );
+        assert_eq!(
+            conn.calls(),
+            &[format!(
+                "invoke(1,{:#06X},{:#06X})",
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_diag_thread_and_open_window_build_bodies() {
+        let mut conn = FakeConn::scripted().with_cluster(
+            0,
+            0x0035,
+            vec![(0x0007, json!([{"5": 200}, {"5": 100}]))],
+        );
+        let body = run_node_op(&mut conn, &node(NodeOpKind::Describe))
+            .await
+            .unwrap();
+        assert_eq!(body["node_id"], 5);
+        assert!(body["endpoints"].is_array());
+
+        let body = run_node_op(&mut conn, &node(NodeOpKind::DiagThread { endpoint: 0 }))
+            .await
+            .unwrap();
+        assert_eq!(body["endpoint"], 0);
+        assert!(body["thread"].is_object());
+
+        let body = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::OpenWindow {
+                timeout: 180,
+                iteration: 1000,
+                discriminator: 3840,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["manual_code"], "34970112332");
+        assert!(body["qr_payload"].as_str().unwrap().starts_with("MT:"));
+        assert!(body["expires_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn conn_error_propagates_unchanged() {
+        let mut conn = FakeConn::default();
+        conn.fail_first_send = true;
+        conn.fail_kind = ErrorKind::Timeout;
+        let err = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::read(1, "onoff", "on-off").unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Timeout);
     }
 }
