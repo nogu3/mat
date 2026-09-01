@@ -204,6 +204,22 @@ impl ClusterHandler for GroupsHandler {
             RESP_REMOVE_GROUP,
         ]
     }
+
+    /// spec §1.3.5 のアクセス表: group 台帳を**書き換える** 4 コマンドは
+    /// Manage。Operate 止まりの fabric メンバー（「使う」だけの
+    /// controller）に AddGroup / RemoveGroup、まして RemoveAllGroups
+    /// （その fabric のエントリを全消し）をさせないための線引き。
+    /// 読み取り系の ViewGroup / GetGroupMembership は Operate のまま
+    /// （trait default）。
+    fn invoke_privilege(&self, command: u32) -> u8 {
+        match command {
+            im::CMD_ADD_GROUP
+            | im::CMD_REMOVE_GROUP
+            | im::CMD_REMOVE_ALL_GROUPS
+            | im::CMD_ADD_GROUP_IF_IDENTIFYING => crate::core::access_control::PRIVILEGE_MANAGE,
+            _ => crate::core::access_control::PRIVILEGE_OPERATE,
+        }
+    }
 }
 
 /// `{0: GroupID (uint16), ...}` — AddGroup/ViewGroup/RemoveGroup/

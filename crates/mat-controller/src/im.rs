@@ -201,10 +201,13 @@ pub const STATUS_FAILSAFE_REQUIRED: u8 = 0xCA;
 pub const STATUS_INVALID_COMMAND: u8 = 0x85;
 /// "The received request cannot be handled" (spec §8.10.1 Table 8-19) —
 /// `mat-device`'s data model dispatch (`core::datamodel::Node::handle_im`)
-/// returns this `StatusResponse` for any opcode it has no handler for
-/// (`ReadRequest`/`InvokeRequest`/`WriteRequest` are implemented —
-/// `SubscribeRequest`/etc. still land here) instead of silently dropping
-/// the request.
+/// returns this `StatusResponse` for any opcode it has no handler for,
+/// instead of silently dropping the request. `ReadRequest`/`InvokeRequest`/
+/// `WriteRequest` are implemented there. `SubscribeRequest` is implemented
+/// too, but one layer up: `mat-device`'s `net::runtime` intercepts it
+/// before `handle_im` ever sees it (its own multi-message flow — priming
+/// chunks + the subscription's lifetime — doesn't fit a single
+/// `StatusResponse`), so it no longer lands here.
 pub const STATUS_INVALID_ACTION: u8 = 0x80;
 /// "The specified action can't be performed" (spec §8.10.1 Table 8-19) for
 /// a `WriteRequest` targeting an attribute the cluster doesn't accept

@@ -102,6 +102,14 @@ impl ClusterHandler for IdentifyHandler {
     fn accepted_commands(&self) -> Vec<u32> {
         vec![im::CMD_IDENTIFY, im::CMD_IDENTIFY_TRIGGER_EFFECT]
     }
+
+    /// spec §1.2.5 のアクセス表: Identify / TriggerEffect は Manage
+    /// （「どの物理デバイスか」を人に示す操作は、単なる Operate 権限の
+    /// 利用者ではなく管理者の操作という spec の裁定）。read 側の
+    /// IdentifyTime / IdentifyType は View のまま = trait default。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_MANAGE
+    }
 }
 
 /// `Identify` request fields (spec §1.2.7.1): `{0: IdentifyTime (uint16)}`.

@@ -52,6 +52,7 @@ use mat_controller::x509::{generate_csr, DevAttestation};
 use crate::core::access_control::AclStore;
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::fabric_store::{FabricEntry, FabricStore};
+use crate::core::group_key_management::GroupKeyStore;
 
 /// Response command ids (spec §11.10.6 / §11.17.6 — the comments next to
 /// each `CMD_*` request const in `mat_controller::commissioning` record
@@ -270,6 +271,12 @@ struct Inner {
     /// `rollback_uncommitted_fabric`'s purge become no-ops rather than
     /// panicking, so every pre-existing test keeps passing unmodified.
     acl_store: Option<AclStore>,
+    /// The shared GroupKeyStore `GroupKeyManagementHandler` (EP0) also
+    /// holds, if a runtime has wired one in via
+    /// `CommissioningServer::set_group_key_store` — same `Option`/purge
+    /// shape as `acl_store` (doc above), including the `None`-is-a-no-op
+    /// discipline for pre-existing tests.
+    group_key_store: Option<GroupKeyStore>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -292,6 +299,7 @@ impl CommissioningServer {
                 pending_window_request: None,
                 removed_fabric: None,
                 acl_store: None,
+                group_key_store: None,
             })),
         }
     }
@@ -304,6 +312,23 @@ impl CommissioningServer {
     /// touches fabrics — in practice, before `into_cluster_handlers`.
     pub fn set_acl_store(&mut self, store: AclStore) {
         locked(&self.inner).acl_store = Some(store);
+    }
+
+    /// Wires a shared `GroupKeyStore` in — the same store a runtime
+    /// registers `GroupKeyManagementHandler` on EP0 with (`device.rs`), so
+    /// `handle_remove_fabric`/the fail-safe rollback purge the removed
+    /// fabric's KeySets and GroupKeyMap entries out of the store the
+    /// cluster actually reads back (`AclStore`'s `set_acl_store` doc above
+    /// — same purpose, same "call before any fabric-touching command"
+    /// requirement). Unlike `AclStore`, no commissioning command installs
+    /// anything into this store automatically — `KeySetWrite`/the
+    /// `ATTR_GROUP_KEY_MAP` write are commissionee-invoked commands the
+    /// cluster handler itself serves, not something `AddNOC` stages.
+    pub fn set_group_key_store(&mut self, store: GroupKeyStore) {
+        self.inner
+            .lock()
+            .expect("commissioning server mutex poisoned")
+            .group_key_store = Some(store);
     }
 
     /// Fabrics installed so far (cloned out of the shared state — this
@@ -491,6 +516,15 @@ impl ClusterHandler for GeneralCommissioningHandler {
             RESP_COMMISSIONING_COMPLETE,
         ]
     }
+
+    /// spec §11.10.5: General Commissioning のコマンドは全て Administer。
+    /// commissioning 本番の呼び出しは PASE（fabric 0 = implicit
+    /// Administer、`datamodel::acl_allows`）か、AddNOC 後の CASE で
+    /// commissioner 自身の admin エントリ（`AclStore::add_case_admin`）
+    /// 経由なので、この要求で正規フローが塞がることはない。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Node Operational Credentials (0x003E).
@@ -541,6 +575,25 @@ impl ClusterHandler for OperationalCredentialsHandler {
     fn generated_commands(&self) -> Vec<u32> {
         vec![RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR, RESP_NOC]
     }
+
+    /// spec §11.17.5: Operational Credentials のコマンドは全て Administer
+    /// （AddNOC / RemoveFabric は fabric 資格そのものの操作）。理由は
+    /// `GeneralCommissioningHandler::invoke_privilege` の doc と同じ。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
+    }
+
+    /// spec §11.17.5 のアクセス表: `NOCs` は read が Administer（NOC/ICAC
+    /// はそれ自体クレデンシャルであり、`ACL` と同様にその fabric の管理者
+    /// だけが読める — `access_control.rs` の `read_privilege` と同じ書き
+    /// 方）。`Fabrics`/`TrustedRootCertificates`/`CurrentFabricIndex`/容量系
+    /// は trait default の View のまま。
+    fn read_privilege(&self, attribute: u32) -> u8 {
+        match attribute {
+            ATTR_OC_NOCS => crate::core::access_control::PRIVILEGE_ADMINISTER,
+            _ => crate::core::access_control::PRIVILEGE_VIEW,
+        }
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Administrator Commissioning (0x003C).
@@ -575,6 +628,13 @@ impl ClusterHandler for AdminCommissioningHandler {
 
     fn accepted_commands(&self) -> Vec<u32> {
         vec![CMD_OPEN_COMMISSIONING_WINDOW, CMD_REVOKE_COMMISSIONING]
+    }
+
+    /// spec §11.19.5: Administrator Commissioning のコマンドは全て
+    /// Administer（別 admin を招き入れる窓の開閉なので、Manage 止まりの
+    /// controller には出させない）。
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_ADMINISTER
     }
 }
 
@@ -858,6 +918,9 @@ impl Inner {
         // command).
         let _ = self.store.remove(fabric_index);
         if let Some(store) = &self.acl_store {
+            store.purge_fabric(fabric_index);
+        }
+        if let Some(store) = &self.group_key_store {
             store.purge_fabric(fabric_index);
         }
         removed
@@ -1184,6 +1247,9 @@ impl Inner {
                 if let Some(store) = &self.acl_store {
                     store.purge_fabric(fabric_index);
                 }
+                if let Some(store) = &self.group_key_store {
+                    store.purge_fabric(fabric_index);
+                }
                 InvokeReply::Data {
                     response_command: RESP_NOC,
                     fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
@@ -1223,6 +1289,9 @@ impl Inner {
                 tracing::debug!(error = %e, fabric_index, "RemoveFabric: persist failed");
                 self.removed_fabric = Some(entry);
                 if let Some(store) = &self.acl_store {
+                    store.purge_fabric(fabric_index);
+                }
+                if let Some(store) = &self.group_key_store {
                     store.purge_fabric(fabric_index);
                 }
                 InvokeReply::Status(im::STATUS_FAILURE)
@@ -1756,7 +1825,10 @@ mod tests {
     /// AddNOC が case admin subject に Administer の自動 ACL エントリを
     /// 発行し、その後の RemoveFabric がそのエントリを purge することを
     /// `set_acl_store` で配線した `AclStore` 越しに検証する
-    /// （Task 3 rulings）。
+    /// （Task 3 rulings）。あわせて `set_group_key_store` で配線した
+    /// `GroupKeyStore` の KeySet/GroupKeyMap も同じ RemoveFabric で
+    /// purge されることを確認する（Task 2、`handle_remove_fabric`の
+    /// 成功径路 = purge 3箇所のうちの1つ）。
     #[test]
     fn add_noc_installs_case_admin_acl_and_remove_fabric_purges_it() {
         use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
@@ -1765,6 +1837,8 @@ mod tests {
         let mut server = CommissioningServer::new(dev, FabricStore::new());
         let acl_store = AclStore::new();
         server.set_acl_store(acl_store.clone());
+        let gk_store = GroupKeyStore::new();
+        server.set_group_key_store(gk_store.clone());
 
         // install_fabric drives ArmFailSafe/CSR/AddTrustedRoot/AddNOC with
         // admin subject fixed at 0xAA (see its doc comment).
@@ -1773,6 +1847,13 @@ mod tests {
         let handler = AccessControlHandler::new(acl_store.clone());
         let entries = decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert_eq!(entries, vec![(5u8, 2u8, vec![0xAAu64], 1u8)]);
+
+        // GroupKeyStore side of the same fabric: a KeySet and a GroupKeyMap
+        // entry, both scoped to fabric_index 1.
+        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
+        assert!(gk_store.keyset_exists(1, 7));
+        assert_eq!(gk_store.map_entries_for(1), vec![(0x000A, 7)]);
 
         let ctx = InvokeCtx {
             fabric_index: 1,
@@ -1789,6 +1870,8 @@ mod tests {
 
         let entries = decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
         assert!(entries.is_empty());
+        assert!(!gk_store.keyset_exists(1, 7));
+        assert!(gk_store.map_entries_for(1).is_empty());
     }
 
     /// 存在しない index は InvalidFabricIndex(0x0A)。
@@ -1853,7 +1936,8 @@ mod tests {
     /// for `removed_fabric`), and `next_fabric_index` reissues a removed
     /// index as `max(existing)+1` — an unpurged entry here would let a
     /// later `AddNOC` at that same index inherit the previous occupant's
-    /// ACL (cross-fabric leak).
+    /// ACL (cross-fabric leak). Same reasoning applies to `GroupKeyStore`
+    /// (Task 2's purge site, `handle_remove_fabric`'s error branch).
     #[test]
     fn remove_fabric_persist_failure_still_purges_acl() {
         use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
@@ -1866,6 +1950,8 @@ mod tests {
         let mut server = CommissioningServer::new(dev, store);
         let acl_store = AclStore::new();
         server.set_acl_store(acl_store.clone());
+        let gk_store = GroupKeyStore::new();
+        server.set_group_key_store(gk_store.clone());
         install_fabric(&mut server, 0x1122, 0x5001);
 
         let handler = AccessControlHandler::new(acl_store.clone());
@@ -1873,6 +1959,8 @@ mod tests {
             decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             1
         );
+        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
 
         fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
         let ctx = InvokeCtx {
@@ -1889,6 +1977,8 @@ mod tests {
         assert!(
             decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).is_empty()
         );
+        assert!(!gk_store.keyset_exists(1, 7));
+        assert!(gk_store.map_entries_for(1).is_empty());
     }
 
     #[test]
@@ -2163,6 +2253,7 @@ mod tests {
             let ctx = ReadCtx {
                 fabric_index: accessing,
                 fabric_filtered: true,
+                ..ReadCtx::default()
             };
             assert_eq!(
                 fabric_indices_of_list(&read(ATTR_OC_NOCS, &ctx)),
@@ -2185,6 +2276,7 @@ mod tests {
         let pase = ReadCtx {
             fabric_index: 0,
             fabric_filtered: true,
+            ..ReadCtx::default()
         };
         assert!(fabric_indices_of_list(&read(ATTR_OC_NOCS, &pase)).is_empty());
         assert!(fabric_indices_of_list(&read(ATTR_OC_FABRICS, &pase)).is_empty());
@@ -2197,6 +2289,7 @@ mod tests {
         let unfiltered = ReadCtx {
             fabric_index: 1,
             fabric_filtered: false,
+            ..ReadCtx::default()
         };
         assert_eq!(
             fabric_indices_of_list(&read(ATTR_OC_NOCS, &unfiltered)),
@@ -2223,6 +2316,72 @@ mod tests {
                 Value::Uint(u64::from(SUPPORTED_FABRICS))
             );
         }
+    }
+
+    /// spec §11.17.5 のアクセス表: `NOCs` の read は Administer — Operate
+    /// までしか持たない subject には `STATUS_UNSUPPORTED_ACCESS` が
+    /// per-entry status で返り、Administer を持つ subject には通常どおり
+    /// data が返る（`access_control.rs` の
+    /// `acl_read_privilege_is_per_attribute_and_global_attributes_stay_view`
+    /// と同じ検証手法を `Node`/ACL 経由で行う）。
+    #[test]
+    fn oc_nocs_read_requires_administer() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001); // fabric_index 1
+        let (_, oc, _) = server.into_cluster_handlers();
+
+        let acl = AclStore::new();
+        acl.set_entries_for_test(
+            1,
+            vec![
+                crate::core::access_control::AclDeviceEntry {
+                    privilege: crate::core::access_control::PRIVILEGE_OPERATE,
+                    auth_mode: crate::core::access_control::AUTH_MODE_CASE,
+                    subjects: vec![7],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+                crate::core::access_control::AclDeviceEntry {
+                    privilege: crate::core::access_control::PRIVILEGE_ADMINISTER,
+                    auth_mode: crate::core::access_control::AUTH_MODE_CASE,
+                    subjects: vec![9],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+            ],
+        );
+
+        let mut node = crate::core::datamodel::Node::new();
+        node.add_endpoint(0, vec![oc]);
+        node.set_acl_store(acl);
+
+        let nocs_path = [im::AttrPathIn {
+            endpoint: Some(0),
+            cluster: Some(CLUSTER_OPERATIONAL_CREDENTIALS),
+            attribute: Some(ATTR_OC_NOCS),
+        }];
+
+        // Operate だけの subject: per-entry UNSUPPORTED_ACCESS status。
+        let operate_ctx = ReadCtx {
+            fabric_index: 1,
+            subject: 7,
+            ..ReadCtx::default()
+        };
+        let entries = node.read_entries(&nocs_path, &operate_ctx);
+        assert!(matches!(
+            &entries[..],
+            [im::ReportEntryOut::Status { status, .. }]
+                if *status == im::STATUS_UNSUPPORTED_ACCESS
+        ));
+
+        // Administer を持つ subject: data が返る。
+        let admin_ctx = ReadCtx {
+            fabric_index: 1,
+            subject: 9,
+            ..ReadCtx::default()
+        };
+        let entries = node.read_entries(&nocs_path, &admin_ctx);
+        assert!(matches!(&entries[..], [im::ReportEntryOut::Data(_)]));
     }
 
     /// spec §11.17.5.2: `SupportedFabrics` is the device's capacity, and
@@ -2558,8 +2717,16 @@ mod tests {
     #[test]
     fn fail_safe_expiry_rolls_back_uncommitted_fabric() {
         let mut server = test_server();
+        let gk_store = GroupKeyStore::new();
+        server.set_group_key_store(gk_store.clone());
         install_fabric(&mut server, 0x1122, 0x5001);
         assert_eq!(server.fabrics().len(), 1);
+
+        // `rollback_uncommitted_fabric` (Task 2 purge site) must purge the
+        // uncommitted fabric's GroupKeyStore state exactly like the
+        // RemoveFabric path does.
+        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
 
         server.force_expire_fail_safe();
 
@@ -2567,6 +2734,8 @@ mod tests {
         assert_eq!(removed.map(|e| e.fabric_index), Some(1));
         assert!(server.fabrics().is_empty());
         assert!(server.fail_safe_deadline().is_none());
+        assert!(!gk_store.keyset_exists(1, 7));
+        assert!(gk_store.map_entries_for(1).is_empty());
 
         // Idempotent: the marker and the timer are both already cleared.
         assert!(server.expire_fail_safe().is_none());

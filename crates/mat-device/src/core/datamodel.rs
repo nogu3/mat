@@ -8,10 +8,15 @@
 //!
 //! `ReadRequest` (with wildcard endpoint/cluster/attribute expansion — see
 //! `Node::read_entries`), `InvokeRequest` (single command), and
-//! `WriteRequest` (`Node::handle_write`) are all handled — still no
-//! subscriptions. Every other opcode gets
-//! `StatusResponse(STATUS_INVALID_ACTION)` (spec §8.10.1) rather than being
-//! silently dropped or failing the whole exchange.
+//! `WriteRequest` (`Node::handle_write`) are the opcodes `Node::handle_im`
+//! dispatches here. `SubscribeRequest` is handled, but not by this
+//! dispatch: `mat-device`'s `net::runtime` intercepts it before ever
+//! calling `handle_im` (see `serve_subscribe_request`), since the
+//! interaction spans priming chunks plus the subscription's lifetime
+//! rather than one request/response pair. Every opcode `handle_im` itself
+//! has no handler for still gets `StatusResponse(STATUS_INVALID_ACTION)`
+//! (spec §8.10.1) rather than being silently dropped or failing the whole
+//! exchange.
 
 use std::collections::HashMap;
 
@@ -63,6 +68,12 @@ pub struct InvokeCtx {
     /// `OpenCommissioningWindow` records this as `AdminFabricIndex` (spec
     /// §11.19.7.2.1) — the only current consumer.
     pub fabric_index: u8,
+    /// The invoking session's authenticated subject — the peer's operational
+    /// Node ID for a CASE session (spec §6.6.2.1), meaningless (and left 0)
+    /// for PASE. Paired with `fabric_index` it is the identity every ACL
+    /// decision is made against (`Node::handle_invoke`/`handle_write` →
+    /// `AclStore::check`). `Default` is 0, which no real CASE peer uses.
+    pub subject: u64,
 }
 
 /// What `Node::handle_im` produced for one incoming IM message: the reply
@@ -112,6 +123,11 @@ impl ImOutcome {
 pub struct ReadCtx {
     pub fabric_index: u8,
     pub fabric_filtered: bool,
+    /// The reading session's authenticated subject — same meaning as
+    /// `InvokeCtx::subject` (the peer's operational Node ID on CASE, 0 on
+    /// PASE), and the identity `Node::read_entries` checks every expanded
+    /// path against.
+    pub subject: u64,
 }
 
 impl Default for ReadCtx {
@@ -119,6 +135,7 @@ impl Default for ReadCtx {
         Self {
             fabric_index: 0,
             fabric_filtered: true,
+            subject: 0,
         }
     }
 }
@@ -130,6 +147,7 @@ impl ReadCtx {
         Self {
             fabric_index,
             fabric_filtered: false,
+            subject: 0,
         }
     }
 }
@@ -239,6 +257,35 @@ pub trait ClusterHandler: Send {
     fn revision(&self) -> u16 {
         1
     }
+    /// The privilege (spec §9.10.5) a session must hold over this
+    /// `(endpoint, cluster)` to *read* `attribute` — `Node`'s dispatch
+    /// checks it against the ACL before calling `read` (see
+    /// `Node::read_entries`). The defaults below are the spec's own
+    /// defaults for a cluster that says nothing else: View to read, Operate
+    /// to write or invoke. Clusters whose spec access table differs
+    /// override these (e.g. AccessControl's `ACL` attribute is Administer
+    /// on both sides, Group Key Management's `KeySetWrite` is Administer).
+    ///
+    /// The five global attributes (spec §7.13, 0xFFF8-0xFFFD) never reach
+    /// these methods — `Node` answers them itself and always requires View,
+    /// so an override that returns Administer for `_` doesn't lock a
+    /// controller out of a cluster's own metadata.
+    fn read_privilege(&self, _attribute: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_VIEW
+    }
+    /// Write-side counterpart of [`read_privilege`], defaulting to Operate.
+    ///
+    /// [`read_privilege`]: Self::read_privilege
+    fn write_privilege(&self, _attribute: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_OPERATE
+    }
+    /// Invoke-side counterpart of [`read_privilege`], defaulting to Operate
+    /// — the privilege an ordinary "use the device" controller holds.
+    ///
+    /// [`read_privilege`]: Self::read_privilege
+    fn invoke_privilege(&self, _command: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_OPERATE
+    }
 }
 
 /// Interaction Model server-side dispatch errors: either a malformed
@@ -298,6 +345,13 @@ pub struct Node {
     /// §7.10.3) so a restarted node's DataVersions don't coincide with
     /// whatever a subscriber cached from the previous boot.
     version_base: u32,
+    /// The ACL this node enforces read/write/invoke against (spec §9.10),
+    /// wired by `set_acl_store` — `device::Device::new`'s assembly is the
+    /// only caller. `None` (every `Node` built in a test or by a `core`
+    /// unit test) means **no enforcement at all**: every path is allowed,
+    /// which is what keeps this dispatch's own tests — and every cluster's
+    /// — about the thing they actually test rather than about ACL wiring.
+    acl: Option<crate::core::access_control::AclStore>,
 }
 
 /// Bundles the (endpoint id, its clusters, the reading session's fabric
@@ -320,6 +374,7 @@ impl Node {
             endpoints: Vec::new(),
             versions: HashMap::new(),
             version_base: INITIAL_DATA_VERSION,
+            acl: None,
         }
     }
 
@@ -465,6 +520,16 @@ impl Node {
     /// `INITIAL_DATA_VERSION` default.
     pub fn set_data_version_base(&mut self, base: u32) {
         self.version_base = base;
+    }
+
+    /// Turns on ACL enforcement (spec §9.10) for every read/write/invoke
+    /// this node dispatches, against `store` — the same `AclStore` the EP0
+    /// `AccessControlHandler` serves and `CommissioningServer` seeds from
+    /// AddNOC. Call once, at assembly time and *before* the request loop
+    /// starts (`device::Device::new`); a `Node` that never gets one keeps
+    /// enforcement off (see the `acl` field's doc).
+    pub fn set_acl_store(&mut self, store: crate::core::access_control::AclStore) {
+        self.acl = Some(store);
     }
 
     /// Dispatches one incoming IM message. Returns the reply to send back
@@ -745,32 +810,60 @@ impl Node {
     ) {
         let cluster = handler.cluster_id();
         match path.attribute {
-            Some(attribute) => match self.read_attribute_value(ectx, handler, attribute) {
-                Some(value_tlv) => out.push(ReportEntryOut::Data(AttrReportOut {
-                    endpoint: ectx.endpoint,
-                    cluster,
-                    attribute,
-                    data_version: self.data_version(ectx.endpoint, cluster),
-                    value_tlv,
-                })),
-                None if concrete_so_far => out.push(ReportEntryOut::Status {
-                    endpoint: ectx.endpoint,
-                    cluster,
-                    attribute,
-                    status: im::STATUS_UNSUPPORTED_ATTRIBUTE,
-                }),
-                // Wildcard-expanded attribute that resolved to nothing:
-                // shouldn't happen (only ids from `attributes()` reach here
-                // in the wildcard branch below), but dropped defensively
-                // rather than reported.
-                None => {}
-            },
+            Some(attribute) => {
+                // ACL (spec §9.10) before the value is even read. A denied
+                // *concrete* path is reported as `UNSUPPORTED_ACCESS` (the
+                // requester asked for exactly this attribute and deserves
+                // to know it was refused); a denied path that got here by
+                // wildcard expansion is dropped silently, the same
+                // treatment `UNSUPPORTED_ATTRIBUTE` gets below — otherwise
+                // one wildcard read from a low-privilege controller would
+                // come back as a wall of status entries.
+                if !self.read_allowed(ectx, handler, attribute) {
+                    if concrete_so_far {
+                        out.push(ReportEntryOut::Status {
+                            endpoint: ectx.endpoint,
+                            cluster,
+                            attribute,
+                            status: im::STATUS_UNSUPPORTED_ACCESS,
+                        });
+                    }
+                    return;
+                }
+                match self.read_attribute_value(ectx, handler, attribute) {
+                    Some(value_tlv) => out.push(ReportEntryOut::Data(AttrReportOut {
+                        endpoint: ectx.endpoint,
+                        cluster,
+                        attribute,
+                        data_version: self.data_version(ectx.endpoint, cluster),
+                        value_tlv,
+                    })),
+                    None if concrete_so_far => out.push(ReportEntryOut::Status {
+                        endpoint: ectx.endpoint,
+                        cluster,
+                        attribute,
+                        status: im::STATUS_UNSUPPORTED_ATTRIBUTE,
+                    }),
+                    // Wildcard-expanded attribute that resolved to nothing:
+                    // shouldn't happen (only ids from `attributes()` reach
+                    // here in the wildcard branch below), but dropped
+                    // defensively rather than reported.
+                    None => {}
+                }
+            }
             None => {
                 // Wildcard attribute: enumerate the cluster's own
                 // attributes only — global attributes are deliberately
                 // excluded from wildcard expansion (see `read_entries`'s
                 // doc).
                 for attribute in handler.attributes() {
+                    // Per-attribute ACL: a cluster can be readable at View
+                    // for most of its attributes and Administer for one
+                    // (AccessControl's `ACL`), so the check belongs here,
+                    // not once per cluster. Denied = silently skipped.
+                    if !self.read_allowed(ectx, handler, attribute) {
+                        continue;
+                    }
                     if let Some(value_tlv) = self.read_attribute_value(ectx, handler, attribute) {
                         out.push(ReportEntryOut::Data(AttrReportOut {
                             endpoint: ectx.endpoint,
@@ -786,6 +879,20 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Whether the reading session (`ectx.read_ctx`'s fabric/subject) may
+    /// read this `(endpoint, cluster, attribute)` — see `acl_allows` and
+    /// `read_privilege_for` for the two halves of the decision.
+    fn read_allowed(&self, ectx: &ExpandCtx, handler: &dyn ClusterHandler, attribute: u32) -> bool {
+        acl_allows(
+            &self.acl,
+            ectx.read_ctx.fabric_index,
+            ectx.read_ctx.subject,
+            read_privilege_for(handler, attribute),
+            ectx.endpoint,
+            handler.cluster_id(),
+        )
     }
 
     /// Reads one concrete (endpoint, cluster, attribute), intercepting the
@@ -871,6 +978,30 @@ impl Node {
                 ),
             ));
         };
+        // ACL (spec §9.10): the command's required privilege comes from the
+        // cluster (`invoke_privilege`, Operate unless overridden). Denied is
+        // an `UNSUPPORTED_ACCESS` CommandStatusIB — same shape as the
+        // `UNSUPPORTED_COMMAND` reply above it, so a controller sees a
+        // per-command refusal rather than a dead exchange.
+        if !acl_allows(
+            &self.acl,
+            ctx.fabric_index,
+            ctx.subject,
+            handler.invoke_privilege(req.command),
+            req.endpoint,
+            req.cluster,
+        ) {
+            return Ok(ImOutcome::unchanged(
+                im::OPCODE_INVOKE_RESPONSE,
+                im::encode_invoke_response_status(
+                    req.endpoint,
+                    req.cluster,
+                    req.command,
+                    im::STATUS_UNSUPPORTED_ACCESS,
+                    None,
+                ),
+            ));
+        }
         // Each `invoke` gets a fresh change list: `ctx` is per-session
         // scratch (`attestation_challenge` outlives one command), so a
         // leftover `changed` from an earlier command in the same session
@@ -973,6 +1104,21 @@ impl Node {
                 results.push((endpoint, cluster, attribute, im::STATUS_UNSUPPORTED_CLUSTER));
                 continue;
             };
+            // ACL (spec §9.10), per write entry: denied is this entry's own
+            // `AttributeStatusIB(UNSUPPORTED_ACCESS)`, exactly like the
+            // unresolvable-path statuses above — one refused attribute
+            // never fails the other entries in the same WriteRequest.
+            if !acl_allows(
+                &self.acl,
+                ctx.fabric_index,
+                ctx.subject,
+                handler.write_privilege(attribute),
+                endpoint,
+                cluster,
+            ) {
+                results.push((endpoint, cluster, attribute, im::STATUS_UNSUPPORTED_ACCESS));
+                continue;
+            }
             // Same rationale as `handle_invoke`: `ctx` is per-session
             // scratch, so a leftover `changed` from an earlier write/invoke
             // in the same session must not be re-reported as this one's.
@@ -1007,6 +1153,57 @@ impl Node {
 impl Default for Node {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The ACL decision every dispatch path funnels through (spec §9.10):
+/// - `ctx_fabric == 0` is a PASE session, which has no fabric and therefore
+///   no ACL entries to match — spec §9.10.5 grants it implicit Administer
+///   (it is how a commissioner writes the very first ACL entry), so it is
+///   allowed unconditionally. `AclStore::check` deliberately answers `false`
+///   for fabric 0, which makes this bypass the *caller's* responsibility —
+///   here, in the one place it belongs.
+/// - No store wired (`None`) = enforcement off, everything allowed (see
+///   `Node::acl`).
+/// - Otherwise the store decides.
+///
+/// A free function rather than a `Node` method so `handle_invoke`/
+/// `handle_write` can call it while `self.endpoints` is mutably borrowed —
+/// passing `&self.acl` keeps the borrow to that one field.
+fn acl_allows(
+    acl: &Option<crate::core::access_control::AclStore>,
+    ctx_fabric: u8,
+    subject: u64,
+    required: u8,
+    endpoint: u16,
+    cluster: u32,
+) -> bool {
+    if ctx_fabric == 0 {
+        return true;
+    }
+    match acl {
+        Some(store) => store.check(ctx_fabric, subject, required, endpoint, cluster),
+        None => true,
+    }
+}
+
+/// The five global attributes (spec §7.13, ids 0xFFF8-0xFFFD, EventList
+/// 0xFFFA included even though this dispatch doesn't serve it) — answered by
+/// `Node` itself, never by a `ClusterHandler`, and readable at View
+/// regardless of what the cluster's own `read_privilege` says (see that
+/// method's doc).
+fn is_global_attribute(attribute: u32) -> bool {
+    (0xFFF8..=0xFFFD).contains(&attribute)
+}
+
+/// The privilege needed to read `attribute` off `handler`: the cluster's own
+/// answer, except for the global attributes (always View, see
+/// `is_global_attribute`).
+fn read_privilege_for(handler: &dyn ClusterHandler, attribute: u32) -> u8 {
+    if is_global_attribute(attribute) {
+        crate::core::access_control::PRIVILEGE_VIEW
+    } else {
+        handler.read_privilege(attribute)
     }
 }
 
@@ -1400,6 +1597,13 @@ impl ClusterHandler for BasicInformationHandler {
             _ => Err(im::STATUS_UNSUPPORTED_WRITE),
         }
     }
+
+    /// spec §11.1.6 のアクセス表: NodeLabel / Location の write は Manage
+    /// （read は View のまま = trait default）。書けるのはこの 2 属性だけ
+    /// なので属性を問わず Manage を要求する。
+    fn write_privilege(&self, _attribute: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_MANAGE
+    }
 }
 
 /// CapabilityMinima (spec §11.1.6.16, attribute id 0x0013): a
@@ -1417,6 +1621,10 @@ fn encode_capability_minima() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::access_control::{
+        AclDeviceEntry, AclStore, AUTH_MODE_CASE, PRIVILEGE_MANAGE, PRIVILEGE_OPERATE,
+        PRIVILEGE_VIEW,
+    };
     use mat_controller::im::{decode_invoke_response, decode_report_data_message};
 
     /// `handle_im` with the default contexts, unwrapped down to the
@@ -1588,8 +1796,22 @@ mod tests {
     /// Writes a single anonymous UTF-8 TLV element to `attribute` and
     /// returns the resulting `ImOutcome` — shared by the Task 10
     /// NodeLabel/Location tests below (dedup, Location constraint, persist)
-    /// so each test body is just the assertions.
+    /// so each test body is just the assertions. The default `InvokeCtx`
+    /// means fabric 0 (PASE), which the ACL enforcement below always
+    /// admits — the ACL tests use [`write_bi_str_as`] to write as a
+    /// specific fabric/subject instead.
     fn write_bi_str(node: &mut Node, attribute: u32, value: &str) -> ImOutcome {
+        write_bi_str_as(node, attribute, value, &mut InvokeCtx::default())
+    }
+
+    /// [`write_bi_str`] with the caller's own `InvokeCtx` — the ACL tests'
+    /// way of writing as a given `(fabric_index, subject)`.
+    fn write_bi_str_as(
+        node: &mut Node,
+        attribute: u32,
+        value: &str,
+        ctx: &mut InvokeCtx,
+    ) -> ImOutcome {
         let mut data = Writer::new();
         data.put_str(Tag::Anonymous, value);
         let payload = im::encode_write_request_tlv(
@@ -1598,13 +1820,8 @@ mod tests {
             attribute,
             &data.finish(),
         );
-        node.handle_im(
-            im::OPCODE_WRITE_REQUEST,
-            &payload,
-            &mut InvokeCtx::default(),
-            &ReadCtx::default(),
-        )
-        .unwrap()
+        node.handle_im(im::OPCODE_WRITE_REQUEST, &payload, ctx, &ReadCtx::default())
+            .unwrap()
     }
 
     /// A write equal to the current NodeLabel is `Ok` but must not appear
@@ -2718,6 +2935,446 @@ mod tests {
             &ReadCtx::default(),
         );
         assert!(matches!(result, Err(ImServerError::NoReply)));
+    }
+
+    // ── Task 4: ACL enforcement (spec §9.10) ────────────────────────────
+
+    /// [`node_with_onoff`] plus an `AclStore` holding exactly one entry:
+    /// fabric 1, CASE `subject`, `privilege`, no target restriction. Every
+    /// other `Node` in this module is built *without* `set_acl_store`, which
+    /// is the "enforcement off" case (`node_without_an_acl_store_allows_
+    /// every_subject` pins it deliberately).
+    fn node_with_acl(privilege: u8, subject: u64) -> Node {
+        let mut node = node_with_onoff();
+        let store = AclStore::new();
+        store.set_entries_for_test(
+            1,
+            vec![AclDeviceEntry {
+                privilege,
+                auth_mode: AUTH_MODE_CASE,
+                subjects: vec![subject],
+                targets_raw: None,
+                fabric_index: 1,
+            }],
+        );
+        node.set_acl_store(store);
+        node
+    }
+
+    /// A `ReadCtx` as a CASE session on `fabric_index` authenticated as
+    /// `subject` — the pair every ACL decision is made against.
+    fn case_read_ctx(fabric_index: u8, subject: u64) -> ReadCtx {
+        ReadCtx {
+            fabric_index,
+            subject,
+            ..ReadCtx::default()
+        }
+    }
+
+    /// Invokes one command as `(fabric_index, subject)` and returns the
+    /// InvokeResponse's status.
+    fn invoke_status_as(
+        node: &mut Node,
+        fabric_index: u8,
+        subject: u64,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+    ) -> u8 {
+        let req = im::encode_invoke_request(endpoint, cluster, command, None);
+        let mut ctx = InvokeCtx {
+            fabric_index,
+            subject,
+            ..InvokeCtx::default()
+        };
+        let out = node
+            .handle_im(
+                im::OPCODE_INVOKE_REQUEST,
+                &req,
+                &mut ctx,
+                &case_read_ctx(fabric_index, subject),
+            )
+            .unwrap();
+        decode_invoke_response(&out.payload).unwrap().status
+    }
+
+    /// Reads one concrete `(endpoint, cluster, attribute)` path.
+    fn read_concrete(
+        node: &Node,
+        ctx: &ReadCtx,
+        endpoint: u16,
+        cluster: u32,
+        attribute: u32,
+    ) -> Vec<ReportEntryOut> {
+        node.read_entries(
+            &[AttrPathIn {
+                endpoint: Some(endpoint),
+                cluster: Some(cluster),
+                attribute: Some(attribute),
+            }],
+            ctx,
+        )
+    }
+
+    /// The one status a denied path is expected to produce, asserted on the
+    /// single-entry reports the tests below issue.
+    fn only_status(entries: &[ReportEntryOut]) -> Option<u8> {
+        match entries {
+            [ReportEntryOut::Status { status, .. }] => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// invoke は `ClusterHandler::invoke_privilege`（OnOff は default =
+    /// Operate）を `AclStore::check` に通す。fabric 0（PASE）は spec
+    /// §9.10.5 の implicit Administer で素通り。
+    #[test]
+    fn acl_gates_invoke_by_subject_fabric_and_privilege() {
+        let mut node = node_with_acl(PRIVILEGE_OPERATE, 7);
+        let toggle = |node: &mut Node, fabric_index: u8, subject: u64| {
+            invoke_status_as(
+                node,
+                fabric_index,
+                subject,
+                1,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_TOGGLE,
+            )
+        };
+        // Operate を持つ subject 7 は通る。
+        assert_eq!(toggle(&mut node, 1, 7), im::STATUS_SUCCESS);
+        // エントリに載っていない subject 8 は拒否。
+        assert_eq!(toggle(&mut node, 1, 8), im::STATUS_UNSUPPORTED_ACCESS);
+        // 同じ subject でも別 fabric のセッションは拒否。
+        assert_eq!(toggle(&mut node, 2, 7), im::STATUS_UNSUPPORTED_ACCESS);
+        // PASE (fabric 0) は ACL を経由しない。
+        assert_eq!(toggle(&mut node, 0, 0), im::STATUS_SUCCESS);
+    }
+
+    /// Manage を要求する invoke（`IdentifyHandler`）は Operate だけの
+    /// subject には出せない — privilege lattice が read/write と同じく
+    /// invoke にも効いていることのピン。
+    #[test]
+    fn acl_invoke_privilege_override_needs_manage_for_identify() {
+        let mut node = node_with_acl(PRIVILEGE_OPERATE, 7);
+        let (identify, _state) = crate::core::identify::IdentifyHandler::new();
+        node.add_cluster(1, Box::new(identify));
+        let mut fields = Writer::new();
+        fields.start_struct(Tag::Anonymous);
+        fields.put_uint(Tag::Context(0), 5); // IdentifyTime
+        fields.end_container();
+        let fields = fields.finish();
+
+        let invoke = |node: &mut Node, subject: u64| {
+            let req =
+                im::encode_invoke_request(1, im::CLUSTER_IDENTIFY, im::CMD_IDENTIFY, Some(&fields));
+            let mut ctx = InvokeCtx {
+                fabric_index: 1,
+                subject,
+                ..InvokeCtx::default()
+            };
+            let out = node
+                .handle_im(
+                    im::OPCODE_INVOKE_REQUEST,
+                    &req,
+                    &mut ctx,
+                    &case_read_ctx(1, subject),
+                )
+                .unwrap();
+            decode_invoke_response(&out.payload).unwrap().status
+        };
+        assert_eq!(invoke(&mut node, 7), im::STATUS_UNSUPPORTED_ACCESS);
+
+        // 同じコマンドを Manage の subject で。
+        let mut node = node_with_acl(PRIVILEGE_MANAGE, 7);
+        let (identify, _state) = crate::core::identify::IdentifyHandler::new();
+        node.add_cluster(1, Box::new(identify));
+        assert_eq!(invoke(&mut node, 7), im::STATUS_SUCCESS);
+    }
+
+    /// 不許可の read は経路で応答が変わる（設計メモ）: **具体パス**は
+    /// `UNSUPPORTED_ACCESS` の status entry、**wildcard 由来のパス**は
+    /// 何も出さずに黙って落ちる（既存の UNSUPPORTED_ATTRIBUTE の
+    /// wildcard 扱いと同じ流儀 — wildcard read が権限の無いノードで
+    /// エラーだらけにならないため）。
+    #[test]
+    fn acl_denied_read_is_a_status_on_a_concrete_path_but_silent_under_a_wildcard() {
+        let node = node_with_acl(PRIVILEGE_OPERATE, 7);
+        let denied = case_read_ctx(1, 8);
+        let wildcard = [AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        }];
+
+        // (a) 具体パス: status entry になる。
+        let entries = read_concrete(&node, &denied, 1, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF);
+        assert_eq!(only_status(&entries), Some(im::STATUS_UNSUPPORTED_ACCESS));
+
+        // (b) wildcard: 1 件も出ない（status entry も出ない）。
+        let entries = node.read_entries(&wildcard, &denied);
+        assert!(
+            entries.is_empty(),
+            "wildcard read for a subject with no ACL entry must drop silently, got {entries:?}"
+        );
+
+        // (c) 許可 subject では同じ wildcard が実データを返す — (b) が
+        //     「wildcard 展開が壊れている」ではなく「拒否で落ちている」
+        //     ことの対照。
+        let entries = node.read_entries(&wildcard, &case_read_ctx(1, 7));
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|e| matches!(e, ReportEntryOut::Data(_))));
+    }
+
+    /// Groups の **mutating** コマンド（AddGroup / RemoveGroup /
+    /// RemoveAllGroups / AddGroupIfIdentifying）は spec §1.3.5 で Manage —
+    /// Operate だけの fabric メンバーにグループ台帳を書き換え／全消しさせ
+    /// ない。読み取り系（ViewGroup / GetGroupMembership）は Operate のまま
+    /// なので、同じ subject が ViewGroup は通せることも併せて固定する。
+    #[test]
+    fn acl_groups_mutating_commands_need_manage_but_reads_stay_operate() {
+        let add_group_fields = |group_id: u16| {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(0), u64::from(group_id));
+            w.put_str(Tag::Context(1), "");
+            w.end_container();
+            w.finish()
+        };
+        // `(IM status, クラスタ応答の Status フィールド)`。拒否は
+        // CommandStatusIB（fields なし）なので後者は `None` になり、
+        // 許可された AddGroup/ViewGroup は Data 応答（IM status 0）の中に
+        // クラスタ側の Status を持つ — 「通った」と「実際に台帳が動いた」
+        // を取り違えないための 2 値。
+        let invoke = |node: &mut Node, command: u32, subject: u64| -> (u8, Option<u8>) {
+            let req = im::encode_invoke_request(
+                1,
+                im::CLUSTER_GROUPS,
+                command,
+                Some(&add_group_fields(5)),
+            );
+            let mut ctx = InvokeCtx {
+                fabric_index: 1,
+                subject,
+                ..InvokeCtx::default()
+            };
+            let out = node
+                .handle_im(
+                    im::OPCODE_INVOKE_REQUEST,
+                    &req,
+                    &mut ctx,
+                    &case_read_ctx(1, subject),
+                )
+                .unwrap();
+            let resp = im::decode_invoke_response_data(&out.payload).unwrap();
+            let cluster_status = resp.fields_tlv.as_deref().and_then(|fields| {
+                // `{0: Status, 1: GroupID}` の Status だけ拾う。
+                let mut r = Reader::new(fields);
+                r.next().ok()??;
+                loop {
+                    match r.next().ok()?? {
+                        el if el.value == Value::ContainerEnd => return None,
+                        el => {
+                            if let (Tag::Context(0), Value::Uint(v)) = (el.tag, el.value) {
+                                return u8::try_from(v).ok();
+                            }
+                        }
+                    }
+                }
+            });
+            (resp.status, cluster_status)
+        };
+        let with_groups = |privilege: u8| {
+            let mut node = node_with_acl(privilege, 7);
+            let (identify, state) = crate::core::identify::IdentifyHandler::new();
+            node.add_cluster(1, Box::new(identify));
+            node.add_cluster(1, Box::new(crate::core::groups::GroupsHandler::new(state)));
+            node
+        };
+
+        // Operate だけの subject: 4 つの mutating コマンドは全て拒否。
+        let mut node = with_groups(PRIVILEGE_OPERATE);
+        for command in [
+            im::CMD_ADD_GROUP,
+            im::CMD_REMOVE_GROUP,
+            im::CMD_REMOVE_ALL_GROUPS,
+            im::CMD_ADD_GROUP_IF_IDENTIFYING,
+        ] {
+            assert_eq!(
+                invoke(&mut node, command, 7),
+                (im::STATUS_UNSUPPORTED_ACCESS, None),
+                "command 0x{command:02X} must need Manage"
+            );
+        }
+        // 同じ Operate の subject でも読み取り系は通る — そして拒否された
+        // AddGroup が台帳に何も足していないことがここで分かる
+        // （ViewGroup のクラスタ Status が NOT_FOUND）。
+        assert_eq!(
+            invoke(&mut node, im::CMD_VIEW_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_NOT_FOUND)),
+            "ViewGroup must stay at Operate, and group 5 must not exist"
+        );
+
+        // Manage を持つ subject なら AddGroup が通り、実際に台帳に載る。
+        let mut node = with_groups(PRIVILEGE_MANAGE);
+        assert_eq!(
+            invoke(&mut node, im::CMD_ADD_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_SUCCESS))
+        );
+        assert_eq!(
+            invoke(&mut node, im::CMD_VIEW_GROUP, 7),
+            (im::STATUS_SUCCESS, Some(im::STATUS_SUCCESS))
+        );
+    }
+
+    /// read の必要 privilege は属性ごと（`AccessControlHandler` の
+    /// override）: `ATTR_ACL` は Administer、容量属性と global 属性
+    /// (spec §7.13) は View。View だけの subject では wildcard 展開から
+    /// `ATTR_ACL` **だけ**が落ちる。
+    #[test]
+    fn acl_read_privilege_is_per_attribute_and_global_attributes_stay_view() {
+        let store = AclStore::new();
+        store.set_entries_for_test(
+            1,
+            vec![AclDeviceEntry {
+                privilege: PRIVILEGE_VIEW,
+                auth_mode: AUTH_MODE_CASE,
+                subjects: vec![7],
+                targets_raw: None,
+                fabric_index: 1,
+            }],
+        );
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_cluster(
+            0,
+            Box::new(crate::core::access_control::AccessControlHandler::new(
+                store.clone(),
+            )),
+        );
+        node.set_acl_store(store);
+        let ctx = case_read_ctx(1, 7);
+
+        // ATTR_ACL は Administer 要求 — View だけでは読めない。
+        let entries = read_concrete(&node, &ctx, 0, im::CLUSTER_ACCESS_CONTROL, im::ATTR_ACL);
+        assert_eq!(only_status(&entries), Some(im::STATUS_UNSUPPORTED_ACCESS));
+
+        // 容量属性は View のまま。
+        let entries = read_concrete(
+            &node,
+            &ctx,
+            0,
+            im::CLUSTER_ACCESS_CONTROL,
+            im::ATTR_ACL_SUBJECTS_PER_ENTRY,
+        );
+        assert!(matches!(&entries[..], [ReportEntryOut::Data(_)]));
+
+        // global 属性 (ClusterRevision) も View 固定 — クラスタの
+        // `read_privilege` override に引きずられない。
+        let entries = read_concrete(
+            &node,
+            &ctx,
+            0,
+            im::CLUSTER_ACCESS_CONTROL,
+            im::ATTR_CLUSTER_REVISION,
+        );
+        assert!(matches!(&entries[..], [ReportEntryOut::Data(_)]));
+
+        // wildcard 属性展開では ATTR_ACL だけが黙って落ちる。
+        let entries = node.read_entries(
+            &[AttrPathIn {
+                endpoint: Some(0),
+                cluster: Some(im::CLUSTER_ACCESS_CONTROL),
+                attribute: None,
+            }],
+            &ctx,
+        );
+        let reported: Vec<u32> = entries
+            .iter()
+            .map(|e| match e {
+                ReportEntryOut::Data(r) => r.attribute,
+                other => panic!("expected data entries only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                im::ATTR_ACL_SUBJECTS_PER_ENTRY,
+                im::ATTR_ACL_TARGETS_PER_ENTRY,
+                im::ATTR_ACL_ENTRIES_PER_FABRIC,
+            ]
+        );
+    }
+
+    /// write は per-entry の `AttributeStatusIB` で拒否する（既存の
+    /// UNSUPPORTED_WRITE と同じ経路）。BasicInformation の NodeLabel は
+    /// Manage 要求（`write_privilege` override）なので Operate だけの
+    /// subject では書けず、値も変わらない。
+    #[test]
+    fn acl_gates_write_with_a_per_entry_unsupported_access_status() {
+        let mut node = node_with_acl(PRIVILEGE_OPERATE, 7);
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            subject: 7,
+            ..InvokeCtx::default()
+        };
+        let outcome = write_bi_str_as(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room", &mut ctx);
+        assert_eq!(
+            im::decode_write_response(&outcome.payload).unwrap(),
+            im::STATUS_UNSUPPORTED_ACCESS
+        );
+        assert!(outcome.changed.is_empty());
+        let entries = read_concrete(
+            &node,
+            &case_read_ctx(1, 7),
+            0,
+            im::CLUSTER_BASIC_INFORMATION,
+            im::ATTR_BI_NODE_LABEL,
+        );
+        match &entries[..] {
+            [ReportEntryOut::Data(r)] => {
+                assert_eq!(r.value_tlv, str_value(""), "NodeLabel must be untouched")
+            }
+            other => panic!("expected a NodeLabel data report, got {other:?}"),
+        }
+
+        // Manage を持つ subject なら同じ write が通る。
+        let mut node = node_with_acl(PRIVILEGE_MANAGE, 7);
+        let outcome = write_bi_str_as(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room", &mut ctx);
+        assert_eq!(
+            im::decode_write_response(&outcome.payload).unwrap(),
+            im::STATUS_SUCCESS
+        );
+        assert_eq!(
+            outcome.changed,
+            vec![(0u16, im::CLUSTER_BASIC_INFORMATION, im::ATTR_BI_NODE_LABEL)]
+        );
+    }
+
+    /// `set_acl_store` を呼ばない `Node`（このモジュールの他のテスト全部と
+    /// `core` の各クラスタ単体テストが組む形）は enforcement 無効 = 全許可
+    /// — CASE セッション相当の fabric/subject でも素通りする。
+    #[test]
+    fn node_without_an_acl_store_allows_every_subject() {
+        let mut node = node_with_onoff();
+        assert_eq!(
+            invoke_status_as(
+                &mut node,
+                1,
+                999,
+                1,
+                im::CLUSTER_ON_OFF,
+                im::CMD_ON_OFF_TOGGLE
+            ),
+            im::STATUS_SUCCESS
+        );
+        let entries = read_concrete(
+            &node,
+            &case_read_ctx(1, 999),
+            1,
+            im::CLUSTER_ON_OFF,
+            im::ATTR_ON_OFF,
+        );
+        assert!(matches!(&entries[..], [ReportEntryOut::Data(_)]));
     }
 }
 

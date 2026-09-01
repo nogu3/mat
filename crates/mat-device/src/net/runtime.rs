@@ -1233,6 +1233,7 @@ async fn serve_secured_message(
         let mut ctx = InvokeCtx {
             attestation_challenge: session.attestation_challenge(),
             fabric_index,
+            subject: session.peer_node_id(),
             ..InvokeCtx::default()
         };
         // Invoke/write dispatch: no `IsFabricFiltered` on the wire for those
@@ -1241,6 +1242,7 @@ async fn serve_secured_message(
         let read_ctx = ReadCtx {
             fabric_index,
             fabric_filtered: true,
+            subject: session.peer_node_id(),
         };
         let fabrics_before = comm_server.fabrics().len();
         let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
@@ -1498,6 +1500,7 @@ async fn serve_subscribe_request(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: req.fabric_filtered,
+        subject: session.peer_node_id(),
     };
     let chunks = node.read_chunks(
         &req.paths,
@@ -1620,6 +1623,7 @@ async fn send_subscription_report(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: sub.fabric_filtered,
+        subject: session.peer_node_id(),
     };
     // Values are read *now*, not captured when the change happened: the
     // report carries the attribute's current value (spec §8.10.2), so two
@@ -1858,6 +1862,7 @@ async fn serve_read_request_chunked(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: req.fabric_filtered,
+        subject: session.peer_node_id(),
     };
     let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
     let last_index = chunks.len().saturating_sub(1);

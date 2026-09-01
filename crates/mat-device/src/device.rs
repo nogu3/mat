@@ -262,6 +262,15 @@ impl Device {
         ));
         comm_server.set_acl_store(acl_store.clone());
 
+        // GroupKeyManagement（spec §11.2）の共有ストア: `AclStore` と同じ
+        // 「RemoveFabric・fail-safe rollback の purge は
+        // `CommissioningServer` が書き、EP0 のクラスタハンドラが読み書き
+        // する」配線（`set_acl_store`の doc 参照）。`GroupKeyStore` は
+        // Task 1 時点で非永続（`with_persist` 相当は無い、モジュール doc
+        // 参照）— 再起動で KeySet/GroupKeyMap が消えるのは既知ギャップ。
+        let gk_store = crate::core::group_key_management::GroupKeyStore::new();
+        comm_server.set_group_key_store(gk_store.clone());
+
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
         // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
         // 保存値（無ければ spec default の ("", "XX")）を初期値として渡し、
@@ -286,6 +295,12 @@ impl Device {
         getrandom::getrandom(&mut version_seed)
             .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
         node.set_data_version_base(u32::from_le_bytes(version_seed));
+        // ACL enforcement (spec §9.10) を有効化する唯一の呼び出し —
+        // `Node::set_acl_store` を呼ばない `Node`（テストが組む素の Node）は
+        // 全許可のまま（`Node::acl`の doc 参照）。クラスタ登録より前に
+        // 置く必要は無いが、「この Node は enforcement する」という宣言を
+        // 組み立ての先頭にまとめておく。
+        node.set_acl_store(acl_store.clone());
         let (general_commissioning, operational_credentials, admin_commissioning) =
             comm_server.into_cluster_handlers();
         node.add_cluster(0, general_commissioning);
@@ -318,7 +333,7 @@ impl Device {
         );
         node.add_cluster(
             0,
-            Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new()),
+            Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new(gk_store)),
         );
 
         // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
