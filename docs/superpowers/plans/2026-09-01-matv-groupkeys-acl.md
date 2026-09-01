@@ -176,7 +176,7 @@ fn group_key_map_write_replace_append_and_fabric_filtered_read() {
 - `privilege_grants`: Administer→全部 true。Manage→{Manage,Operate,View}。Operate→{Operate,View}。ProxyView→{ProxyView,View}。View→{View}。
 - `decode_targets`: `targets_raw` は「`Tag::Anonymous` に再タグされた array の raw TLV」（`AclDeviceEntry` doc :43-48）。`Reader` で ArrayStart→各 StructStart→`Context(0)`=cluster/`Context(1)`=endpoint/`Context(2)`=deviceType（各 null 可）→ContainerEnd。パース不能は `None`（呼び出し側で「どこにもマッチしない」扱い=安全側）。
 - `AclStore::check`: `fabric_index == 0` は呼ばない前提（enforcement 側で PASE bypass）だが、防御的に `false`。エントリ走査: `e.fabric_index == fabric_index && e.auth_mode == 2(CASE) && (e.subjects.is_empty() || e.subjects.contains(&subject)) && privilege_grants(e.privilege, required)` かつ target マッチ（`targets_raw: None` → 無制限 / `Some` → decode して、いずれかの target が `cluster.map_or(true, |c| c == cluster) && endpoint.map_or(true, |ep| ep == endpoint) && device_type.is_none()` — device_type 制約付きは不一致=安全側）。
-- CAT（0xFFFF_FFFD_xxxx_xxxx）は未対応・完全一致のみ、doc に明記。
+- CAT（0xFFFF_FFFD_xxxx_xxxx）は未対応・完全一致のみ、doc に明記。（**2026-09-02 に superseded**: CAT subject マッチ実装済み、`Subject::matches` / `tests/acl_cat_subject.rs`）
 - モジュール doc :14-18 の「ACL enforcement は未実装のため即時の実害はなく」を書き換え（save 失敗黙認の理由付けが enforcement 実装後も成立するよう文面を調整: ACL が直前状態のまま残っても「古い正当な状態」であり安全性は落ちない）。
 
 - [ ] **Step 1: 失敗するテストを書く**:

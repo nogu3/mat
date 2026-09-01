@@ -82,7 +82,9 @@ group-key-map write → AddGroup → ACL merge write）のうち欠けている 
   - `AclStore::check(fabric_index, subject, required_privilege, endpoint,
     cluster) -> bool` — 対象 fabric のエントリのうち、auth_mode==CASE(2)
     かつ subjects が subject を含む（**空 subjects は wildcard**、CAT は
-    未対応 = 完全一致のみ、doc 明記）かつ privilege が required を含意し、
+    未対応 = 完全一致のみ、doc 明記 — **2026-09-02 に superseded**: CAT
+    subject マッチは `Subject::matches` で実装済み、`tests/acl_cat_subject.rs`
+    参照）かつ privilege が required を含意し、
     targets が None（無制限）または いずれかの target が
     (endpoint, cluster) にマッチ（device_type 制約付き target は不一致
     扱い=安全側）するものが 1 件でもあれば許可。
