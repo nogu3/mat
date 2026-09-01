@@ -13,6 +13,9 @@ use mat_core::error::MatError;
 use mat_core::ids::{self, InvokeClass, ScalarValue, WriteClass};
 use serde_json::Value;
 
+use crate::group::{self, BumpOutcome, GroupOutcome};
+use crate::Engine;
+
 /// 経路非依存の入力換算（CLI 入力 → Matter 生値）。旧 `mat/src/units.rs`。
 pub mod units {
     /// `--kelvin` / `--mireds`（排他・どちらか必須）を `(mireds, kelvin)` に
@@ -501,6 +504,121 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
     Ok(body)
 }
 
+impl GroupOpKind {
+    /// 送出する (cluster, command, CommandFields TLV)。
+    pub fn wire(&self) -> (u32, u32, Option<Vec<u8>>) {
+        match self {
+            GroupOpKind::Invoke {
+                cluster,
+                command,
+                fields_tlv,
+                ..
+            } => (*cluster, *command, fields_tlv.clone()),
+            GroupOpKind::Color { color, transition } => (
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_HUE_AND_SATURATION,
+                Some(im::encode_move_to_hue_and_saturation_fields(
+                    color.hue_raw,
+                    color.sat_raw,
+                    *transition,
+                )),
+            ),
+            GroupOpKind::ColorTemp {
+                mireds, transition, ..
+            } => (
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+                Some(im::encode_move_to_color_temperature_fields(
+                    *mireds,
+                    *transition,
+                )),
+            ),
+            GroupOpKind::Level {
+                level, transition, ..
+            } => (
+                im::CLUSTER_LEVEL_CONTROL,
+                im::CMD_MOVE_TO_LEVEL,
+                Some(im::encode_move_to_level_fields(*level, *transition)),
+            ),
+        }
+    }
+}
+
+impl GroupOp {
+    /// 送出後の "sent" body。`egress` は実送出した iface 名。
+    pub fn sent_body(&self, egress: &[String]) -> Value {
+        match &self.kind {
+            GroupOpKind::Invoke {
+                cluster_in,
+                command_in,
+                ..
+            } => body::group_invoke_sent(
+                self.group_id,
+                cluster_in,
+                command_in,
+                self.endpoint,
+                egress,
+            ),
+            GroupOpKind::Color { color, transition } => {
+                body::group_color_sent(self.group_id, color, *transition, self.endpoint, egress)
+            }
+            GroupOpKind::ColorTemp {
+                kelvin,
+                mireds,
+                transition,
+            } => body::group_color_temp_sent(
+                self.group_id,
+                *kelvin,
+                *mireds,
+                *transition,
+                self.endpoint,
+                egress,
+            ),
+            GroupOpKind::Level {
+                percent,
+                level,
+                transition,
+            } => body::group_level_sent(
+                self.group_id,
+                body::LevelEcho {
+                    percent: *percent,
+                    level: *level,
+                },
+                *transition,
+                self.endpoint,
+                egress,
+            ),
+        }
+    }
+}
+
+/// groupcast を 1 発送り "sent" body を返す。`engine.group` 未構成（テスト
+/// 注入時のみ）は Other、未 provision / KVS 不備は `store_parse`。
+pub async fn run_group_op(engine: &Engine, op: &GroupOp) -> Result<Value, MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(MatError::group_ctx_unconfigured());
+    };
+    let (cluster, command, fields) = op.kind.wire();
+    match group::send(ctx, op.group_id, cluster, command, fields).await? {
+        GroupOutcome::Sent { egress } => {
+            tracing::debug!(group_id = op.group_id, op = op.kind.name(), "group op sent");
+            Ok(op.sent_body(&egress))
+        }
+        GroupOutcome::Unavailable(reason) => Err(MatError::group_unavailable(&reason)),
+    }
+}
+
+/// group 送信 counter の窓ジャンプ（Issue #14）。
+pub async fn run_group_bump(engine: &Engine) -> Result<Value, MatError> {
+    let Some(ctx) = &engine.group else {
+        return Err(MatError::group_ctx_unconfigured());
+    };
+    match group::bump(ctx).await {
+        BumpOutcome::Bumped { from, to } => Ok(body::group_bump(from, to)),
+        BumpOutcome::Unavailable(reason) => Err(MatError::group_unavailable(&reason)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,5 +1037,149 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn group_wire_and_sent_body_for_shortcuts() {
+        let ct = GroupOp {
+            group_id: 10,
+            endpoint: 1,
+            kind: GroupOpKind::color_temp(Some(2702), None, 0),
+        };
+        let (cluster, command, fields) = ct.kind.wire();
+        assert_eq!(
+            (cluster, command),
+            (im::CLUSTER_COLOR_CONTROL, im::CMD_MOVE_TO_COLOR_TEMPERATURE)
+        );
+        assert_eq!(
+            fields.unwrap(),
+            im::encode_move_to_color_temperature_fields(370, 0)
+        );
+        assert_eq!(
+            ct.sent_body(&["eth0".into()]),
+            mat_core::body::group_color_temp_sent(10, 2702, 370, 0, 1, &["eth0".to_string()])
+        );
+
+        let lv = GroupOp {
+            group_id: 10,
+            endpoint: 1,
+            kind: GroupOpKind::level(100, 0),
+        };
+        let (cluster, command, fields) = lv.kind.wire();
+        assert_eq!(
+            (cluster, command),
+            (im::CLUSTER_LEVEL_CONTROL, im::CMD_MOVE_TO_LEVEL)
+        );
+        assert_eq!(fields.unwrap(), im::encode_move_to_level_fields(254, 0));
+
+        let color = ResolvedColor {
+            hue_raw: 180,
+            sat_raw: 200,
+            hue: 254,
+            sat: 78,
+            name: None,
+            rgb: None,
+        };
+        let c = GroupOp {
+            group_id: 10,
+            endpoint: 1,
+            kind: GroupOpKind::Color {
+                color: color.clone(),
+                transition: 0,
+            },
+        };
+        let (cluster, command, fields) = c.kind.wire();
+        assert_eq!(
+            (cluster, command),
+            (
+                im::CLUSTER_COLOR_CONTROL,
+                im::CMD_MOVE_TO_HUE_AND_SATURATION
+            )
+        );
+        assert_eq!(
+            fields.unwrap(),
+            im::encode_move_to_hue_and_saturation_fields(180, 200, 0)
+        );
+        assert_eq!(
+            c.sent_body(&[]),
+            mat_core::body::group_color_sent(10, &color, 0, 1, &[])
+        );
+
+        let inv = GroupOp {
+            group_id: 10,
+            endpoint: 1,
+            kind: GroupOpKind::invoke("onoff", "on", &[]).unwrap(),
+        };
+        assert_eq!(
+            inv.kind.wire(),
+            (im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
+        );
+        assert_eq!(
+            inv.sent_body(&[]),
+            mat_core::body::group_invoke_sent(10, "onoff", "on", 1, &[])
+        );
+    }
+
+    #[tokio::test]
+    async fn group_op_hard_errors_when_engine_group_ctx_unconfigured() {
+        use crate::test_support::FakeEstablisher;
+        let engine = crate::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let op = GroupOp {
+            group_id: 10,
+            endpoint: 1,
+            kind: GroupOpKind::invoke("onoff", "toggle", &[]).unwrap(),
+        };
+        let err = run_group_op(&engine, &op)
+            .await
+            .expect_err("group ctx unconfigured must hard-error");
+        assert_eq!(err.kind, ErrorKind::Other);
+        let err = run_group_bump(&engine)
+            .await
+            .expect_err("bump without ctx must hard-error");
+        assert_eq!(err.kind, ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn group_bump_advances_counter_via_engine() {
+        // 旧 native_direct::tests::group_bump_advances_counter_via_engine の移植。
+        use crate::group::GroupCtx;
+        use crate::test_support::{write_group_fixture_ini, FakeEstablisher};
+        use mat_controller::transport::UdpTransport;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+        let counter_path = dir.path().join("native_group_counter");
+        let transport = Arc::new(UdpTransport::bind().await.unwrap());
+        let group_ctx = GroupCtx {
+            main_ini: ini,
+            counter_path: counter_path.clone(),
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            egress: vec![mat_controller::group::GroupEgress {
+                iface: "lo".into(),
+                transport,
+                scope_id: 1,
+            }],
+            dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
+            sender: Mutex::new(None),
+        };
+        let engine =
+            crate::Engine::with_parts(Box::new(FakeEstablisher::default()), Some(group_ctx));
+        assert!(!counter_path.exists());
+        let body = run_group_bump(&engine)
+            .await
+            .expect("bump must succeed when ctx is configured");
+        assert!(body["group_counter"]["from"].is_number());
+        assert!(body["group_counter"]["to"].is_number());
+        assert!(
+            counter_path.exists(),
+            "counter file must be created/advanced by bump"
+        );
     }
 }
