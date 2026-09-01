@@ -582,6 +582,18 @@ impl ClusterHandler for OperationalCredentialsHandler {
     fn invoke_privilege(&self, _command: u32) -> u8 {
         crate::core::access_control::PRIVILEGE_ADMINISTER
     }
+
+    /// spec §11.17.5 のアクセス表: `NOCs` は read が Administer（NOC/ICAC
+    /// はそれ自体クレデンシャルであり、`ACL` と同様にその fabric の管理者
+    /// だけが読める — `access_control.rs` の `read_privilege` と同じ書き
+    /// 方）。`Fabrics`/`TrustedRootCertificates`/`CurrentFabricIndex`/容量系
+    /// は trait default の View のまま。
+    fn read_privilege(&self, attribute: u32) -> u8 {
+        match attribute {
+            ATTR_OC_NOCS => crate::core::access_control::PRIVILEGE_ADMINISTER,
+            _ => crate::core::access_control::PRIVILEGE_VIEW,
+        }
+    }
 }
 
 /// Thin `ClusterHandler` adapter for Administrator Commissioning (0x003C).
@@ -2304,6 +2316,72 @@ mod tests {
                 Value::Uint(u64::from(SUPPORTED_FABRICS))
             );
         }
+    }
+
+    /// spec §11.17.5 のアクセス表: `NOCs` の read は Administer — Operate
+    /// までしか持たない subject には `STATUS_UNSUPPORTED_ACCESS` が
+    /// per-entry status で返り、Administer を持つ subject には通常どおり
+    /// data が返る（`access_control.rs` の
+    /// `acl_read_privilege_is_per_attribute_and_global_attributes_stay_view`
+    /// と同じ検証手法を `Node`/ACL 経由で行う）。
+    #[test]
+    fn oc_nocs_read_requires_administer() {
+        let mut server = test_server();
+        install_fabric(&mut server, 0x1122, 0x5001); // fabric_index 1
+        let (_, oc, _) = server.into_cluster_handlers();
+
+        let acl = AclStore::new();
+        acl.set_entries_for_test(
+            1,
+            vec![
+                crate::core::access_control::AclDeviceEntry {
+                    privilege: crate::core::access_control::PRIVILEGE_OPERATE,
+                    auth_mode: crate::core::access_control::AUTH_MODE_CASE,
+                    subjects: vec![7],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+                crate::core::access_control::AclDeviceEntry {
+                    privilege: crate::core::access_control::PRIVILEGE_ADMINISTER,
+                    auth_mode: crate::core::access_control::AUTH_MODE_CASE,
+                    subjects: vec![9],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+            ],
+        );
+
+        let mut node = crate::core::datamodel::Node::new();
+        node.add_endpoint(0, vec![oc]);
+        node.set_acl_store(acl);
+
+        let nocs_path = [im::AttrPathIn {
+            endpoint: Some(0),
+            cluster: Some(CLUSTER_OPERATIONAL_CREDENTIALS),
+            attribute: Some(ATTR_OC_NOCS),
+        }];
+
+        // Operate だけの subject: per-entry UNSUPPORTED_ACCESS status。
+        let operate_ctx = ReadCtx {
+            fabric_index: 1,
+            subject: 7,
+            ..ReadCtx::default()
+        };
+        let entries = node.read_entries(&nocs_path, &operate_ctx);
+        assert!(matches!(
+            &entries[..],
+            [im::ReportEntryOut::Status { status, .. }]
+                if *status == im::STATUS_UNSUPPORTED_ACCESS
+        ));
+
+        // Administer を持つ subject: data が返る。
+        let admin_ctx = ReadCtx {
+            fabric_index: 1,
+            subject: 9,
+            ..ReadCtx::default()
+        };
+        let entries = node.read_entries(&nocs_path, &admin_ctx);
+        assert!(matches!(&entries[..], [im::ReportEntryOut::Data(_)]));
     }
 
     /// spec §11.17.5.2: `SupportedFabrics` is the device's capacity, and

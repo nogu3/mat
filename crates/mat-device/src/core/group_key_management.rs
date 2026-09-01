@@ -741,6 +741,34 @@ mod tests {
         );
     }
 
+    /// `keyset_exists` は accessing fabric でスコープされる（他 fabric の
+    /// keyset は「存在しない」）— fabric 1 に書いた keyset_id を fabric 2 の
+    /// group-key-map から参照しようとすると `STATUS_CONSTRAINT_ERROR` に
+    /// なることのピン留め。
+    #[test]
+    fn group_key_map_write_rejects_other_fabrics_keyset() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut ctx1 = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
+        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx1);
+        assert!(store.keyset_exists(1, 7));
+
+        let mut ctx2 = InvokeCtx {
+            fabric_index: 2,
+            ..Default::default()
+        };
+        let data = mat_controller::im::encode_group_key_map_tlv(&[(0x000A, 7)]);
+        assert_eq!(
+            h.write(im::ATTR_GROUP_KEY_MAP, &data, false, &mut ctx2),
+            Err(im::STATUS_CONSTRAINT_ERROR)
+        );
+        assert!(store.map_entries_for(2).is_empty());
+    }
+
     /// `ATTR_GROUP_TABLE` は read-only — write は `STATUS_UNSUPPORTED_WRITE`。
     /// PASE セッション（fabric_index 0）は `ATTR_GROUP_KEY_MAP` write でも
     /// `STATUS_UNSUPPORTED_ACCESS`。

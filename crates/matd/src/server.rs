@@ -176,6 +176,9 @@ async fn handle_conn(
                 write_half.flush().await?;
                 // 「センサーが反応しなかった」の切り分けに、購読者が居たか
                 // どうかを残す。フィルタは全て Option なので未指定は省略される。
+                // `scripts/e2e-device-m3.sh` はこのログの `"listen client
+                // attached"` という文字列を verbatim に grep して attach 検知
+                // している — この文字列を変えるならスクリプト側も直すこと。
                 tracing::info!(
                     node_id = filter.node_id,
                     endpoint = filter.endpoint,
