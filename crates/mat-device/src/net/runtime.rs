@@ -59,6 +59,7 @@ use mat_controller::pase::{
 use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, MAX_DATAGRAM};
 
+use crate::core::access_control::Subject;
 use crate::core::commissioning::{CommissioningServer, WindowRequest};
 use crate::core::datamodel::{ImOutcome, InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
@@ -1233,7 +1234,7 @@ async fn serve_secured_message(
         let mut ctx = InvokeCtx {
             attestation_challenge: session.attestation_challenge(),
             fabric_index,
-            subject: session.peer_node_id(),
+            subject: session_subject(session),
             ..InvokeCtx::default()
         };
         // Invoke/write dispatch: no `IsFabricFiltered` on the wire for those
@@ -1242,7 +1243,7 @@ async fn serve_secured_message(
         let read_ctx = ReadCtx {
             fabric_index,
             fabric_filtered: true,
-            subject: session.peer_node_id(),
+            subject: session_subject(session),
         };
         let fabrics_before = comm_server.fabrics().len();
         let Ok(outcome) = node.handle_im(msg.proto.opcode, &msg.payload, &mut ctx, &read_ctx)
@@ -1500,7 +1501,7 @@ async fn serve_subscribe_request(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: req.fabric_filtered,
-        subject: session.peer_node_id(),
+        subject: session_subject(session),
     };
     let chunks = node.read_chunks(
         &req.paths,
@@ -1623,7 +1624,7 @@ async fn send_subscription_report(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: sub.fabric_filtered,
-        subject: session.peer_node_id(),
+        subject: session_subject(session),
     };
     // Values are read *now*, not captured when the change happened: the
     // report carries the attribute's current value (spec §8.10.2), so two
@@ -1862,7 +1863,7 @@ async fn serve_read_request_chunked(
     let read_ctx = ReadCtx {
         fabric_index,
         fabric_filtered: req.fabric_filtered,
-        subject: session.peer_node_id(),
+        subject: session_subject(session),
     };
     let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
     let last_index = chunks.len().saturating_sub(1);
@@ -1913,6 +1914,14 @@ async fn serve_read_request_chunked(
             return;
         }
     }
+}
+
+/// The ACL identity of a device-role CASE session: node id + CATs as read
+/// off the peer's NOC by `net::case` (`SecureSession::peer_cats`). On a
+/// PASE session both are their placeholders (node 0, no CATs), which the
+/// fabric-0 bypass in `datamodel::acl_allows` never consults.
+fn session_subject(session: &SecureSession) -> Subject {
+    Subject::new(session.peer_node_id(), session.peer_cats())
 }
 
 #[cfg(test)]

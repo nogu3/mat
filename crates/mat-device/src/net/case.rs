@@ -234,6 +234,7 @@ pub(crate) async fn drive_established(
                 keys,
                 peer_session_id,
                 peer_node_id,
+                peer_cats,
                 fabric_index,
             } => {
                 ex.reply_final(PROTOCOL_ID_SECURE_CHANNEL, opcode, &reply, &cfg)
@@ -251,7 +252,8 @@ pub(crate) async fn drive_established(
                     keys,
                     local_node_id,
                     peer_node_id,
-                );
+                )
+                .with_peer_cats(peer_cats);
                 return Ok((session, fabric_index));
             }
         }

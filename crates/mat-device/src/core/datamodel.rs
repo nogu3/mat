@@ -21,6 +21,8 @@
 use std::collections::HashMap;
 
 use mat_controller::im::{self, AttrPathIn, AttrReportOut, ImError, ReportEntryOut};
+
+use crate::core::access_control::Subject;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 /// The DataVersion (spec §7.10.3) every `(endpoint, cluster)` starts at,
@@ -69,11 +71,12 @@ pub struct InvokeCtx {
     /// §11.19.7.2.1) — the only current consumer.
     pub fabric_index: u8,
     /// The invoking session's authenticated subject — the peer's operational
-    /// Node ID for a CASE session (spec §6.6.2.1), meaningless (and left 0)
-    /// for PASE. Paired with `fabric_index` it is the identity every ACL
+    /// Node ID plus its NOC's CASE Authenticated Tags for a CASE session
+    /// (spec §6.6.2.1), meaningless (and left at the node-0 default) for
+    /// PASE. Paired with `fabric_index` it is the identity every ACL
     /// decision is made against (`Node::handle_invoke`/`handle_write` →
-    /// `AclStore::check`). `Default` is 0, which no real CASE peer uses.
-    pub subject: u64,
+    /// `AclStore::check`). `Default` is node 0, which no real CASE peer uses.
+    pub subject: Subject,
 }
 
 /// What `Node::handle_im` produced for one incoming IM message: the reply
@@ -124,10 +127,10 @@ pub struct ReadCtx {
     pub fabric_index: u8,
     pub fabric_filtered: bool,
     /// The reading session's authenticated subject — same meaning as
-    /// `InvokeCtx::subject` (the peer's operational Node ID on CASE, 0 on
-    /// PASE), and the identity `Node::read_entries` checks every expanded
-    /// path against.
-    pub subject: u64,
+    /// `InvokeCtx::subject` (the peer's node id + CATs on CASE, the node-0
+    /// placeholder on PASE), and the identity `Node::read_entries` checks
+    /// every expanded path against.
+    pub subject: Subject,
 }
 
 impl Default for ReadCtx {
@@ -135,7 +138,7 @@ impl Default for ReadCtx {
         Self {
             fabric_index: 0,
             fabric_filtered: true,
-            subject: 0,
+            subject: Subject::default(),
         }
     }
 }
@@ -147,7 +150,7 @@ impl ReadCtx {
         Self {
             fabric_index,
             fabric_filtered: false,
-            subject: 0,
+            subject: Subject::default(),
         }
     }
 }
@@ -1173,7 +1176,7 @@ impl Default for Node {
 fn acl_allows(
     acl: &Option<crate::core::access_control::AclStore>,
     ctx_fabric: u8,
-    subject: u64,
+    subject: Subject,
     required: u8,
     endpoint: u16,
     cluster: u32,
@@ -2966,7 +2969,7 @@ mod tests {
     fn case_read_ctx(fabric_index: u8, subject: u64) -> ReadCtx {
         ReadCtx {
             fabric_index,
-            subject,
+            subject: Subject::node(subject),
             ..ReadCtx::default()
         }
     }
@@ -2984,7 +2987,7 @@ mod tests {
         let req = im::encode_invoke_request(endpoint, cluster, command, None);
         let mut ctx = InvokeCtx {
             fabric_index,
-            subject,
+            subject: Subject::node(subject),
             ..InvokeCtx::default()
         };
         let out = node
@@ -3070,7 +3073,7 @@ mod tests {
                 im::encode_invoke_request(1, im::CLUSTER_IDENTIFY, im::CMD_IDENTIFY, Some(&fields));
             let mut ctx = InvokeCtx {
                 fabric_index: 1,
-                subject,
+                subject: Subject::node(subject),
                 ..InvokeCtx::default()
             };
             let out = node
@@ -3155,7 +3158,7 @@ mod tests {
             );
             let mut ctx = InvokeCtx {
                 fabric_index: 1,
-                subject,
+                subject: Subject::node(subject),
                 ..InvokeCtx::default()
             };
             let out = node
@@ -3314,7 +3317,7 @@ mod tests {
         let mut node = node_with_acl(PRIVILEGE_OPERATE, 7);
         let mut ctx = InvokeCtx {
             fabric_index: 1,
-            subject: 7,
+            subject: Subject::node(7),
             ..InvokeCtx::default()
         };
         let outcome = write_bi_str_as(&mut node, im::ATTR_BI_NODE_LABEL, "Living Room", &mut ctx);
