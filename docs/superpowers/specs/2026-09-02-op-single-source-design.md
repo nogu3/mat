@@ -145,7 +145,8 @@ matd の再送のため。closure 環境の借用は不可 — `provision_node` 
 - **matd**: `impl NodeRunner for NativeBackend` = 現 `with_session` の本体（warm
   slot・Timeout 1 回再確立・`RETRY_MIN_BUDGET`・`on_new_session` 発火は不変）。
 
-`NodeRunner` の上に立つ共有関数（`mat_native::op`）:
+`NodeRunner` の上に立つ共有関数（`mat_native::runner` — トレイトと `OneShotRunner`
+も同モジュール。`op` は型と `run_*_op` に絞る）:
 
 ```rust
 pub async fn run_node(r: &impl NodeRunner, op: &NodeOp, deadline) -> Result<Value, MatError>;
