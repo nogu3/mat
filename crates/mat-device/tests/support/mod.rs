@@ -29,6 +29,7 @@ use mat_controller::commissioning::{
     CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST,
 };
 use mat_controller::exchange::MrpConfig;
+use mat_controller::fabric::FabricCredentials;
 use mat_controller::pase;
 use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, UdpTransport};
@@ -102,10 +103,35 @@ pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
 /// `operational_case_and_complete`, which are private and therefore not
 /// callable from here. Returns the post-CASE, post-CommissioningComplete
 /// `SecureSession` on success.
+///
+/// `allow(dead_code)`: see `BRIDGED_EP` — `acl_cat_subject.rs` only calls
+/// `commission_directly_as`.
+#[allow(dead_code)]
 pub async fn commission_directly(
     addr: SocketAddr,
     paa_der: &[u8],
     fabric: &CommissioningFabric,
+) -> SecureSession {
+    let creds = fabric.admin_credentials().expect("admin credentials");
+    commission_directly_as(addr, paa_der, fabric, fabric.admin_node_id, &creds).await
+}
+
+/// [`commission_directly`] with the admin identity spelled out: the
+/// `CaseAdminSubject` AddNOC installs as the automatic Administer ACL
+/// entry's subject (a node id, or a CAT subject as Apple Home sends), and
+/// the operational credentials the post-AddNOC CASE presents (whose NOC
+/// may carry CATs). `commission_directly` is the node-id-only special
+/// case: `fabric.admin_node_id` + `fabric.admin_credentials()`.
+///
+/// `allow(dead_code)`: see `BRIDGED_EP` — only the CAT-subject test calls
+/// this directly.
+#[allow(dead_code)]
+pub async fn commission_directly_as(
+    addr: SocketAddr,
+    paa_der: &[u8],
+    fabric: &CommissioningFabric,
+    case_admin_subject: u64,
+    creds: &FabricCredentials,
 ) -> SecureSession {
     let cfg = fast_cfg();
     let transport = Arc::new(Transport::Udp(Arc::new(
@@ -232,7 +258,7 @@ pub async fn commission_directly(
             Some(&encode_add_noc(
                 &noc_tlv,
                 &fabric.ipk_epoch,
-                fabric.admin_node_id,
+                case_admin_subject,
                 ADMIN_VENDOR_ID,
             )),
             None,
@@ -247,7 +273,6 @@ pub async fn commission_directly(
 
     // 8. CASE on the new fabric (retry: AddNOC just completed, the runtime
     // needs no warm-up in-process but real hardware/timing might).
-    let creds = fabric.admin_credentials().expect("admin credentials");
     let case_transport = Arc::new(Transport::Udp(Arc::new(
         UdpTransport::bind().await.unwrap(),
     )));
@@ -257,7 +282,7 @@ pub async fn commission_directly(
         match case::establish(
             Arc::clone(&case_transport),
             addr,
-            &creds,
+            creds,
             DEVICE_NODE_ID,
             &cfg,
         )

@@ -58,7 +58,7 @@ use sha2::{Digest, Sha256};
 use crate::case::{
     derive_session_keys, derive_sigma_key, encode_status_report, eph_pub_bytes, random_p256_secret,
 };
-use crate::cert::{verify_noc_chain, CertError, MatterCert};
+use crate::cert::{verify_noc_chain, CaseAuthTags, CertError, MatterCert};
 use crate::crypto::{decrypt_payload, encrypt_payload, sign_ecdsa_p256, verify_ecdsa_p256};
 use crate::fabric::case_destination_id;
 use crate::message::OPCODE_STATUS_REPORT;
@@ -97,8 +97,9 @@ pub struct CaseFabric {
 /// One `on_message` step's result. `Reply` is a mid-handshake response
 /// (Sigma2) the caller must send back reliably. `Established` is the
 /// terminal StatusReport(success) plus the derived session keys, the peer's
-/// (initiator's) session id and node id, and which fabric was selected — the
-/// caller needs all of these to build a `SecureSession::new_device_role(...)`.
+/// (initiator's) session id, node id and CASE Authenticated Tags, and which
+/// fabric was selected — the caller needs all of these to build a
+/// `SecureSession::new_device_role(...)` (`.with_peer_cats(peer_cats)`).
 pub enum CaseOutput {
     Reply(Vec<u8>, u8),
     Established {
@@ -107,6 +108,10 @@ pub enum CaseOutput {
         keys: SessionKeys,
         peer_session_id: u16,
         peer_node_id: u64,
+        /// The CATs in the peer's verified NOC (spec §6.6.2.1.2) — the rest
+        /// of the peer's ACL identity next to `peer_node_id`. Empty for a
+        /// NOC without CAT attributes.
+        peer_cats: CaseAuthTags,
         fabric_index: u8,
     },
 }
@@ -358,6 +363,10 @@ impl CaseResponderCore {
             .map_err(CaseCoreError::PeerCertInvalid)?;
 
         let peer_node_id = init_noc.node_id().expect("verify_noc_chain guarantees ids");
+        // A NOC whose CAT attributes break the spec's rules (too many,
+        // version 0, duplicate identifier) is rejected outright rather than
+        // admitted with a partial identity.
+        let peer_cats = init_noc.cats().map_err(CaseCoreError::PeerCertInvalid)?;
         let peer_fabric_id = init_noc
             .fabric_id()
             .expect("verify_noc_chain guarantees ids");
@@ -386,6 +395,7 @@ impl CaseResponderCore {
             keys,
             peer_session_id: initiator_session_id,
             peer_node_id,
+            peer_cats,
             fabric_index: fabric.fabric_index,
         })
     }
@@ -884,14 +894,19 @@ mod tests {
     /// prior test exercised it). Everything up to the fabric-id comparison
     /// must succeed for this test to be meaningful, so a broken/inverted
     /// comparison would go undetected without it.
-    #[test]
-    fn rejects_peer_noc_chaining_to_our_root_with_a_different_fabric_id() {
-        let f = fabric();
+    /// Drives a full Sigma1 -> Sigma2 -> Sigma3 handshake against a fresh
+    /// responder for fabric `f`, presenting `(init_noc, init_op_priv)` as
+    /// the initiator's operational identity, and returns whatever the
+    /// responder makes of the Sigma3 (the `Established` output, or the
+    /// error it rejected the peer with). Keeps the initiator's ephemeral
+    /// secret around (unlike `build_sigma1`) so the Sigma3 is real: correct
+    /// S3K, correct TBS3 signature under the presented NOC's own key.
+    fn handshake_with_initiator(
+        f: &CaseFabric,
+        init_noc: &MatterCert,
+        init_op_priv: &[u8; 32],
+    ) -> Result<CaseOutput, CaseCoreError> {
         let mut core = CaseResponderCore::new(vec![f.clone()], 0xB0B1);
-
-        // --- Sigma1 -> Sigma2, keeping the initiator's ephemeral secret
-        // around (unlike `build_sigma1`) so we can carry the handshake
-        // through to a real Sigma3 below. ---
         let initiator_secret = random_p256_secret();
         let initiator_eph = eph_pub_bytes(&initiator_secret);
         let initiator_random = [0x42u8; 32];
@@ -909,36 +924,9 @@ mod tests {
         };
         let (_responder_session_id, responder_eph_pub) = decode_sigma2_session_id_and_eph(&sigma2);
         let shared = ecdh(&initiator_secret, &responder_eph_pub).expect("ecdh");
+        let fake_noc_tlv = init_noc.to_tlv();
+        let fake_op_priv = init_op_priv;
 
-        // --- A second NOC, signed by the SAME root01 key (so
-        // `verify_noc_chain` succeeds), but with a fabric id different from
-        // `f.fabric_id` — the case `PeerFabricMismatch` guards against. ---
-        let root_cert = MatterCert::parse(ROOT01_CHIP).expect("parse root01");
-        let root_priv: [u8; 32] = ROOT01_PRIV.try_into().expect("32 bytes");
-        let wrong_fabric_id = f.fabric_id.wrapping_add(1);
-        let fake_op_secret = random_p256_secret();
-        let fake_op_pub = eph_pub_bytes(&fake_op_secret);
-        let fake_op_priv: [u8; 32] = fake_op_secret.to_bytes().into();
-        let mut serial = [0u8; 8];
-        getrandom::getrandom(&mut serial).expect("os rng");
-        serial[0] &= 0x7F; // BER INTEGER minimal positive form
-        let fake_noc = crate::cert::issue_noc(
-            &fake_op_pub,
-            0xAAAA_BBBB,
-            wrong_fabric_id,
-            &root_cert,
-            &root_priv,
-            &serial,
-        )
-        .expect("issue second noc under root01");
-        // Sanity: this NOC really does chain to our root, so the failure we
-        // assert below is specifically the fabric-id check, not an
-        // (unrelated) chain-verification failure.
-        verify_noc_chain(&fake_noc, None, &root_cert).expect("fake noc chains to root01");
-        let fake_noc_tlv = fake_noc.to_tlv();
-
-        // --- Real Sigma3: correct S3K, correct TBS3 signature under the
-        // fake NOC's own key. ---
         let mut s1s2 = Vec::with_capacity(sigma1.len() + sigma2.len());
         s1s2.extend_from_slice(&sigma1);
         s1s2.extend_from_slice(&sigma2);
@@ -949,7 +937,7 @@ mod tests {
         let s3k = derive_sigma_key(&shared, &s3k_salt, INFO_S3K);
 
         let tbs3 = encode_tbs(&fake_noc_tlv, None, &initiator_eph, &responder_eph_pub);
-        let sig3 = sign_ecdsa_p256(&fake_op_priv, &tbs3).expect("sign tbs3");
+        let sig3 = sign_ecdsa_p256(fake_op_priv, &tbs3).expect("sign tbs3");
         let tbe3 = encode_tbe(&fake_noc_tlv, None, &sig3, None);
         let encrypted3 = encrypt_payload(&s3k, TBE3_NONCE, b"", &tbe3).expect("encrypt tbe3");
         let sigma3 = {
@@ -959,10 +947,80 @@ mod tests {
             w.end_container();
             w.finish()
         };
+        core.on_message(OPCODE_SIGMA3, &sigma3)
+    }
 
+    /// A fresh operational key pair plus a NOC for it under root01
+    /// (`fabric_id` / `cats` as given), i.e. an initiator identity that
+    /// chains to the responder fabric's root.
+    fn initiator_identity_under_root01(
+        node_id: u64,
+        fabric_id: u64,
+        cats: &[u32],
+    ) -> (MatterCert, [u8; 32]) {
+        let root_cert = MatterCert::parse(ROOT01_CHIP).expect("parse root01");
+        let root_priv: [u8; 32] = ROOT01_PRIV.try_into().expect("32 bytes");
+        let op_secret = random_p256_secret();
+        let op_pub = eph_pub_bytes(&op_secret);
+        let op_priv: [u8; 32] = op_secret.to_bytes().into();
+        let mut serial = [0u8; 8];
+        getrandom::getrandom(&mut serial).expect("os rng");
+        serial[0] &= 0x7F; // BER INTEGER minimal positive form
+        let noc = crate::cert::issue_noc_with_cats(
+            &op_pub, node_id, fabric_id, &root_cert, &root_priv, &serial, cats,
+        )
+        .expect("issue noc under root01");
+        // Sanity: this NOC really does chain to our root, so whatever the
+        // responder decides below is not an (unrelated) chain failure.
+        verify_noc_chain(&noc, None, &root_cert).expect("noc chains to root01");
+        (noc, op_priv)
+    }
+
+    #[test]
+    fn rejects_peer_noc_chaining_to_our_root_with_a_different_fabric_id() {
+        let f = fabric();
+        // A second NOC, signed by the SAME root01 key (so `verify_noc_chain`
+        // succeeds), but with a fabric id different from `f.fabric_id` —
+        // the case `PeerFabricMismatch` guards against.
+        let (fake_noc, fake_op_priv) =
+            initiator_identity_under_root01(0xAAAA_BBBB, f.fabric_id.wrapping_add(1), &[]);
         assert!(matches!(
-            core.on_message(OPCODE_SIGMA3, &sigma3),
+            handshake_with_initiator(&f, &fake_noc, &fake_op_priv),
             Err(CaseCoreError::PeerFabricMismatch)
         ));
+    }
+
+    /// The peer's CASE Authenticated Tags (spec §6.6.2.1.2) are read off
+    /// the verified Sigma3 NOC and handed out with `Established`, next to
+    /// the node id — the device-side ACL matcher needs both to honor
+    /// CAT-subject entries (an admin whose `CaseAdminSubject` was a CAT is
+    /// otherwise locked out the moment commissioning ends).
+    #[test]
+    fn established_carries_the_peer_nocs_cats() {
+        let f = fabric();
+        let cats = [0xABCD_0001, 0x0001_0003];
+        let (noc, op_priv) = initiator_identity_under_root01(0xAAAA_BBBB, f.fabric_id, &cats);
+        let Ok(CaseOutput::Established {
+            peer_node_id,
+            peer_cats,
+            ..
+        }) = handshake_with_initiator(&f, &noc, &op_priv)
+        else {
+            panic!("expected Established");
+        };
+        assert_eq!(peer_node_id, 0xAAAA_BBBB);
+        assert_eq!(peer_cats, CaseAuthTags::new(&cats).unwrap());
+    }
+
+    #[test]
+    fn established_has_no_cats_for_a_plain_noc() {
+        let f = fabric();
+        let (noc, op_priv) = initiator_identity_under_root01(0xAAAA_BBBB, f.fabric_id, &[]);
+        let Ok(CaseOutput::Established { peer_cats, .. }) =
+            handshake_with_initiator(&f, &noc, &op_priv)
+        else {
+            panic!("expected Established");
+        };
+        assert!(peer_cats.is_empty());
     }
 }

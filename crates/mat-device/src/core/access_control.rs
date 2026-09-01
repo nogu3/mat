@@ -19,6 +19,8 @@
 //! 状態」であり安全性は落ちない）。
 use std::sync::{Arc, Mutex};
 
+use mat_controller::cert::{cat_identifier, cat_version, CaseAuthTags};
+
 use mat_controller::im;
 use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
@@ -51,6 +53,66 @@ const ACL_TARGETS_PER_ENTRY: u64 = 3;
 /// `write` の容量ガードが実際に強制する上限でもある — 単一の定数で
 /// 「申告と実装が食い違う」を構造的にあり得なくする。
 pub(crate) const ACL_ENTRIES_PER_FABRIC: usize = 4;
+
+/// Upper 32 bits of a CASE-Authenticated-Tag subject in an ACL entry
+/// (spec §6.6.2.1.2: `0xFFFF_FFFD_hhhh_vvvv`, `hhhh` = CAT identifier,
+/// `vvvv` = minimum version).
+pub const CAT_SUBJECT_PREFIX: u64 = 0xFFFF_FFFD;
+
+/// The ACL subject value that names CAT `cat` (identifier + version) —
+/// what a controller puts in `AddNOC.CaseAdminSubject` or an ACL entry's
+/// `Subjects` to grant by tag instead of by node id.
+pub fn cat_subject(cat: u32) -> u64 {
+    (CAT_SUBJECT_PREFIX << 32) | u64::from(cat)
+}
+
+/// The authenticated identity of one CASE session, as the ACL sees it
+/// (spec §6.6.2): the peer's operational node id plus the CASE
+/// Authenticated Tags in its NOC. Built once per session from the
+/// verified Sigma3 NOC (`net::case` → `SecureSession::peer_cats`) and
+/// carried by value in every `ReadCtx` / `InvokeCtx`. `Default` (node 0,
+/// no CATs) is the PASE placeholder — PASE bypasses `AclStore::check`
+/// entirely, so it never matches anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Subject {
+    pub node_id: u64,
+    pub cats: CaseAuthTags,
+}
+
+impl Subject {
+    pub fn new(node_id: u64, cats: CaseAuthTags) -> Self {
+        Self { node_id, cats }
+    }
+
+    /// A subject identified by node id only (a NOC without CATs).
+    pub fn node(node_id: u64) -> Self {
+        Self::new(node_id, CaseAuthTags::default())
+    }
+
+    /// Whether one ACL entry subject (`AccessControlEntryStruct.Subjects`
+    /// element) names this session. Two shapes (spec §6.6.2.1.2):
+    ///
+    /// - a CAT subject (`CAT_SUBJECT_PREFIX` in the upper 32 bits) matches
+    ///   when the NOC carries a CAT with the **same identifier** and a
+    ///   **version at or above** the subject's — and never when the
+    ///   subject's version is 0, which the spec reserves as invalid;
+    /// - anything else is an operational node id and must equal the
+    ///   peer's node id exactly. A node id whose bits happen to fall in the
+    ///   CAT range is judged as a CAT, never as a node id.
+    pub fn matches(&self, acl_subject: u64) -> bool {
+        if acl_subject >> 32 != CAT_SUBJECT_PREFIX {
+            return acl_subject == self.node_id;
+        }
+        let wanted = acl_subject as u32;
+        if cat_version(wanted) == 0 {
+            return false;
+        }
+        self.cats.iter().any(|have| {
+            cat_identifier(have) == cat_identifier(wanted)
+                && cat_version(have) >= cat_version(wanted)
+        })
+    }
+}
 
 /// デバイス上の 1 ACL エントリ (`AccessControlEntryStruct`, spec
 /// §11.1.7.1)。`targets_raw` は Context(4) の値要素をそのまま
@@ -157,10 +219,10 @@ impl AclStore {
     /// - `fabric_index` が一致する
     /// - `auth_mode` が CASE（`AUTH_MODE_CASE` = 2）— この実装が持つ唯一の
     ///   auth mode で、Group/PASE の subject は扱わない
-    /// - `subjects` が空（wildcard）か `subject` を含む — CAT
-    ///   (`0xFFFF_FFFD_xxxx_xxxx`) は未対応で、常に完全一致のみを見る
-    ///   （CAT レンジマッチは実装しないので、CAT 値を持つ subject を書いた
-    ///   エントリは実質誰にもマッチしなくなる — 拒否側に倒れるので安全）
+    /// - `subjects` が空（wildcard）か、いずれかの要素が `subject` に
+    ///   マッチする（`Subject::matches`: node id は完全一致、CAT subject
+    ///   `0xFFFF_FFFD_hhhh_vvvv` は NOC の CAT と identifier 一致かつ
+    ///   version が vvvv 以上。vvvv = 0 は spec 上無効で誰にもマッチしない）
     /// - `privilege_grants(e.privilege, required_privilege)` が true
     /// - target が一致する（`targets_match`、下記）
     ///
@@ -172,7 +234,7 @@ impl AclStore {
     pub fn check(
         &self,
         fabric_index: u8,
-        subject: u64,
+        subject: Subject,
         required_privilege: u8,
         endpoint: u16,
         cluster: u32,
@@ -183,7 +245,7 @@ impl AclStore {
         self.lock().entries.iter().any(|e| {
             e.fabric_index == fabric_index
                 && e.auth_mode == AUTH_MODE_CASE
-                && (e.subjects.is_empty() || e.subjects.contains(&subject))
+                && (e.subjects.is_empty() || e.subjects.iter().any(|&s| subject.matches(s)))
                 && privilege_grants(e.privilege, required_privilege)
                 && targets_match(&e.targets_raw, endpoint, cluster)
         })
@@ -914,11 +976,12 @@ mod tests {
     fn check_matches_subject_privilege_and_targets() {
         let store = AclStore::new();
         store.add_case_admin(1, 112233); // Administer / CASE / 制限なし
-        assert!(store.check(1, 112233, PRIVILEGE_ADMINISTER, 0, 0x001F));
-        assert!(store.check(1, 112233, PRIVILEGE_VIEW, 2, 0x0006));
-        assert!(!store.check(1, 999, PRIVILEGE_VIEW, 2, 0x0006)); // subject 不一致
-        assert!(!store.check(2, 112233, PRIVILEGE_VIEW, 2, 0x0006)); // fabric 不一致
-        assert!(!store.check(0, 112233, PRIVILEGE_VIEW, 2, 0x0006)); // fabric 0 は常に false
+        assert!(store.check(1, Subject::node(112233), PRIVILEGE_ADMINISTER, 0, 0x001F));
+        assert!(store.check(1, Subject::node(112233), PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(!store.check(1, Subject::node(999), PRIVILEGE_VIEW, 2, 0x0006)); // subject 不一致
+        assert!(!store.check(2, Subject::node(112233), PRIVILEGE_VIEW, 2, 0x0006)); // fabric 不一致
+        assert!(!store.check(0, Subject::node(112233), PRIVILEGE_VIEW, 2, 0x0006));
+        // fabric 0 は常に false
     }
 
     #[test]
@@ -934,10 +997,10 @@ mod tests {
                 fabric_index: 1,
             }],
         );
-        assert!(store.check(1, 5, PRIVILEGE_VIEW, 2, 0x0006));
-        assert!(store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0006));
-        assert!(!store.check(1, 5, PRIVILEGE_MANAGE, 2, 0x0006));
-        assert!(!store.check(1, 5, PRIVILEGE_ADMINISTER, 0, 0x001F));
+        assert!(store.check(1, Subject::node(5), PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(store.check(1, Subject::node(5), PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(!store.check(1, Subject::node(5), PRIVILEGE_MANAGE, 2, 0x0006));
+        assert!(!store.check(1, Subject::node(5), PRIVILEGE_ADMINISTER, 0, 0x001F));
     }
 
     #[test]
@@ -961,8 +1024,9 @@ mod tests {
                 fabric_index: 1,
             }],
         );
-        assert!(store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0006));
-        assert!(!store.check(1, 5, PRIVILEGE_OPERATE, 2, 0x0008)); // 他 cluster は拒否
+        assert!(store.check(1, Subject::node(5), PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(!store.check(1, Subject::node(5), PRIVILEGE_OPERATE, 2, 0x0008));
+        // 他 cluster は拒否
     }
 
     #[test]
@@ -978,6 +1042,68 @@ mod tests {
                 fabric_index: 1,
             }],
         );
-        assert!(store.check(1, 424242, PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(store.check(1, Subject::node(424242), PRIVILEGE_VIEW, 2, 0x0006));
+    }
+
+    // --- CASE Authenticated Tag subjects (spec §6.6.2.1.2) ---
+
+    /// A session for node 999 whose NOC carries exactly one CAT.
+    fn session_with_cat(cat: u32) -> Subject {
+        Subject::new(999, CaseAuthTags::new(&[cat]).unwrap())
+    }
+
+    /// The Apple Home shape: AddNOC's `CaseAdminSubject` is a CAT subject,
+    /// so the auto-created admin entry's only subject is that CAT — the
+    /// admin's later CASE sessions must match it through their NOC's CATs
+    /// (same identifier, version at or above the entry's), never through
+    /// the node id.
+    #[test]
+    fn check_matches_a_cat_subject_by_identifier_and_minimum_version() {
+        let store = AclStore::new();
+        store.add_case_admin(1, cat_subject(0xABCD_0002));
+        let admin = |subject: Subject| store.check(1, subject, PRIVILEGE_ADMINISTER, 0, 0x001F);
+        assert!(admin(session_with_cat(0xABCD_0002)), "same version");
+        assert!(admin(session_with_cat(0xABCD_0007)), "newer version");
+        assert!(!admin(session_with_cat(0xABCD_0001)), "older version");
+        assert!(!admin(session_with_cat(0x1234_0002)), "other identifier");
+        assert!(!admin(Subject::node(999)), "no CATs at all");
+        assert!(
+            !admin(Subject::node(cat_subject(0xABCD_0002))),
+            "a node id that merely equals the CAT subject's bits is not a CAT"
+        );
+    }
+
+    #[test]
+    fn check_matches_any_of_several_session_cats() {
+        let store = AclStore::new();
+        store.add_case_admin(1, cat_subject(0x0002_0001));
+        let cats = CaseAuthTags::new(&[0x0001_0001, 0x0002_0003, 0x0003_0001]).unwrap();
+        assert!(store.check(1, Subject::new(999, cats), PRIVILEGE_ADMINISTER, 0, 0x001F));
+    }
+
+    #[test]
+    fn cat_entry_with_version_zero_never_matches() {
+        let store = AclStore::new();
+        store.add_case_admin(1, cat_subject(0xABCD_0000));
+        assert!(!store.check(1, session_with_cat(0xABCD_0001), PRIVILEGE_VIEW, 2, 0x0006));
+    }
+
+    #[test]
+    fn node_id_entry_still_matches_a_session_that_also_has_cats() {
+        let store = AclStore::new();
+        store.add_case_admin(1, 999);
+        assert!(store.check(1, session_with_cat(0xABCD_0001), PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(!store.check(
+            1,
+            Subject::new(998, CaseAuthTags::new(&[0xABCD_0001]).unwrap()),
+            PRIVILEGE_VIEW,
+            2,
+            0x0006
+        ));
+    }
+
+    #[test]
+    fn cat_subject_encodes_the_spec_prefix() {
+        assert_eq!(cat_subject(0xABCD_0002), 0xFFFF_FFFD_ABCD_0002);
     }
 }

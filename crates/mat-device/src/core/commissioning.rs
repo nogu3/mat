@@ -2364,7 +2364,7 @@ mod tests {
         // Operate だけの subject: per-entry UNSUPPORTED_ACCESS status。
         let operate_ctx = ReadCtx {
             fabric_index: 1,
-            subject: 7,
+            subject: crate::core::access_control::Subject::node(7),
             ..ReadCtx::default()
         };
         let entries = node.read_entries(&nocs_path, &operate_ctx);
@@ -2377,7 +2377,7 @@ mod tests {
         // Administer を持つ subject: data が返る。
         let admin_ctx = ReadCtx {
             fabric_index: 1,
-            subject: 9,
+            subject: crate::core::access_control::Subject::node(9),
             ..ReadCtx::default()
         };
         let entries = node.read_entries(&nocs_path, &admin_ctx);
