@@ -8,10 +8,15 @@
 //!
 //! `ReadRequest` (with wildcard endpoint/cluster/attribute expansion — see
 //! `Node::read_entries`), `InvokeRequest` (single command), and
-//! `WriteRequest` (`Node::handle_write`) are all handled — still no
-//! subscriptions. Every other opcode gets
-//! `StatusResponse(STATUS_INVALID_ACTION)` (spec §8.10.1) rather than being
-//! silently dropped or failing the whole exchange.
+//! `WriteRequest` (`Node::handle_write`) are the opcodes `Node::handle_im`
+//! dispatches here. `SubscribeRequest` is handled, but not by this
+//! dispatch: `mat-device`'s `net::runtime` intercepts it before ever
+//! calling `handle_im` (see `serve_subscribe_request`), since the
+//! interaction spans priming chunks plus the subscription's lifetime
+//! rather than one request/response pair. Every opcode `handle_im` itself
+//! has no handler for still gets `StatusResponse(STATUS_INVALID_ACTION)`
+//! (spec §8.10.1) rather than being silently dropped or failing the whole
+//! exchange.
 
 use std::collections::HashMap;
 
