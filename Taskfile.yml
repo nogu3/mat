@@ -55,6 +55,11 @@ tasks:
       - task: clippy
       - task: test
 
+  semver:
+    desc: "crates.io 公開版との semver 判定（publish 前に必ず実行。要: cargo install cargo-semver-checks。ble 等の非 default feature は対象外 — libdbus 無しで回すため）"
+    cmds:
+      - cargo semver-checks --default-features
+
   dist:arm64:
     desc: "aarch64 gnu + BLE の deploy 成果物を ./dist/arm64/ に作る（jarvis 用標準ビルド）"
     cmds:

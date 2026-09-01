@@ -142,6 +142,12 @@ Run `task check` (CI equivalent: fmt:check + clippy + test) before any commit.
 Matter uses mDNS / IPv6 multicast, so Docker runs require host networking
 (`docker run --network host`).
 
+**crates.io publish rule:** the version bump follows `task semver`
+(cargo-semver-checks against the published baseline) — mechanical, not
+judgment. If it reports a major-level break anywhere in the workspace, the
+next publish bumps the workspace major (all 7 crates share one version); no
+"probably nobody depends on it yet" downgrades.
+
 ## Compact instructions
 
 When compacting, preserve: node ids and their observed device states, version
