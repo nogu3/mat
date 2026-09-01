@@ -142,11 +142,14 @@ Run `task check` (CI equivalent: fmt:check + clippy + test) before any commit.
 Matter uses mDNS / IPv6 multicast, so Docker runs require host networking
 (`docker run --network host`).
 
-**crates.io publish rule:** the version bump follows `task semver`
-(cargo-semver-checks against the published baseline) — mechanical, not
-judgment. If it reports a major-level break anywhere in the workspace, the
-next publish bumps the workspace major (all 7 crates share one version); no
-"probably nobody depends on it yet" downgrades.
+**crates.io publish rule (user decision, 2026-09-02):** regular releases
+stay **minor** even when `task semver` reports technical breaks — external
+downstream is effectively zero and the 7 crates share one workspace
+version. A **major** bump is reserved for a deliberate milestone (large
+breaking rework plus new features) and is called by the user explicitly;
+agents never bump major on their own. Still run `task semver` before every
+publish: not to pick the number, but to inventory what breaks so the
+release notes can say so.
 
 ## Compact instructions
 
