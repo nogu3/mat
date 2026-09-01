@@ -9,9 +9,10 @@
 //! ビューで、groupcast タスク送り）。`KeySetRead`/`KeySetRemove`/
 //! `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ、
 //! groupcast タスク送り）。
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use mat_controller::im;
+use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
@@ -65,11 +66,11 @@ impl GroupKeyStore {
         Self::default()
     }
 
-    /// poison 耐性 lock（`matd::subscription`と同じ
-    /// `unwrap_or_else(PoisonError::into_inner)` パターン）— 1 パニックで
-    /// ストア全体が触れなくなるのを避ける。
+    /// poison 耐性 lock（`mat_controller::sync::locked` — `AclStore` と同じ
+    /// 全クレート共通ヘルパ）— 1 パニックでストア全体が触れなくなるのを
+    /// 避ける。
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupKeyInner> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        locked(&self.0)
     }
 
     /// KeySetWrite (spec §11.2.7.1) の実処理: 同 `(fabric_index,
