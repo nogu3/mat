@@ -1865,6 +1865,8 @@ mod tests {
                     scope_id: cand.index,
                 }],
                 dest_port: port,
+                op_iface: cand.name.clone(),
+                thread_retry: false,
                 sender: tokio::sync::Mutex::new(None),
             };
             let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
@@ -1952,6 +1954,8 @@ mod tests {
                 scope_id: 1,
             }],
             dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
             sender: tokio::sync::Mutex::new(None),
         };
         let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));

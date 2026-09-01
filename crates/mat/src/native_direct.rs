@@ -2035,6 +2035,8 @@ mod tests {
                 scope_id: 1,
             }],
             dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
             sender: Mutex::new(None),
         };
         let engine =

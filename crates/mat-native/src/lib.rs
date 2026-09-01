@@ -354,7 +354,9 @@ impl Resolver for CachingResolver {
 
 impl Engine {
     /// KVS から資格情報を1回読み、NOC を自己発行し、UDP transport を bind、
-    /// iface の scope_id を解決して実確立器を構築する。プロセス寿命で不変。
+    /// iface の scope_id を解決して実確立器を構築する。op (unicast) 側の
+    /// scope_id はプロセス寿命で不変。group egress の scope_id は送信時に
+    /// self-heal する (issue #23 — otbr 再起動で wpan0 の ifindex が変わる)。
     pub async fn build(cfg: &NativeConfig) -> Result<Self, MatError> {
         Self::build_with_resolver(cfg, Arc::new(OneShotResolver)).await
     }
@@ -439,6 +441,11 @@ impl Engine {
             Ok(None) => {}
             Err(detail) => return Err(MatError::new(ErrorKind::Other, detail)),
         }
+        // thread egress を build 時に確立できなかった Auto/None 由来の構成は
+        // 送信時再検出の対象にする (issue #23 起動順の罠)。Explicit は build
+        // 時に確定 (解決失敗はハードエラー) なので対象外。
+        let thread_retry =
+            !matches!(&cfg.thread_iface, Some(ThreadIfaceChoice::Explicit(_))) && egress.len() == 1;
         let group = group::GroupCtx {
             main_ini,
             counter_path: cfg.store.join("native_group_counter"),
@@ -447,6 +454,8 @@ impl Engine {
             node_id,
             egress,
             dest_port: MATTER_PORT,
+            op_iface: cfg.iface.clone(),
+            thread_retry,
             sender: tokio::sync::Mutex::new(None),
         };
         // build が bind する共有 UdpTransport は group multicast 送信専用。

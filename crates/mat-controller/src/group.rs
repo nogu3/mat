@@ -208,6 +208,19 @@ pub struct GroupSender {
     fabric_id: u64,
     source_node_id: u64,
     counter: PersistedGroupCounter,
+    /// 送出失敗時の scope_id 再解決 (issue #23 self-heal)。既定は
+    /// `dnssd::iface_index`。テストは同一モジュールから直接差し替える。
+    #[allow(clippy::type_complexity)]
+    iface_resolver: Box<dyn Fn(&str) -> std::io::Result<u32> + Send + Sync>,
+}
+
+/// otbr 再起動などで iface が破棄・再作成されると、保持している ifindex
+/// (scope_id) が失効して送出がこれらの errno で落ちる (issue #23)。
+/// EADDRNOTAVAIL は対象外 — iface は生きていて IPv6 源アドレスが無いだけ
+/// (docker0/veth 等) で、ifindex 再解決では直らない。
+fn is_stale_iface_error(e: &std::io::Error) -> bool {
+    // Linux errno: ENETUNREACH=101, ENODEV=19 (libc 依存を避け数値で持つ)
+    matches!(e.raw_os_error(), Some(101) | Some(19))
 }
 
 impl GroupSender {
@@ -264,6 +277,7 @@ impl GroupSender {
             fabric_id,
             source_node_id,
             counter,
+            iface_resolver: Box::new(crate::dnssd::iface_index),
         })
     }
 
@@ -297,16 +311,58 @@ impl GroupSender {
         .map_err(GroupSendError::Crypto)?;
         let mut sent = Vec::new();
         let mut first_err: Option<std::io::Error> = None;
-        for e in &self.egress {
-            let dest = SocketAddr::V6(SocketAddrV6::new(
-                group_multicast_addr(self.fabric_id, group_id),
-                self.dest_port,
-                0,
+        let dest_port = self.dest_port;
+        let dest_addr = group_multicast_addr(self.fabric_id, group_id);
+        let Self {
+            egress,
+            iface_resolver,
+            ..
+        } = self;
+        for e in egress.iter_mut() {
+            let dest = |scope_id: u32| {
                 // multicast 宛先では sin6_scope_id が送出 iface を選ぶ
-                e.scope_id,
-            ));
-            match e.transport.send_to(&datagram, dest).await {
+                SocketAddr::V6(SocketAddrV6::new(dest_addr, dest_port, 0, scope_id))
+            };
+            match e.transport.send_to(&datagram, dest(e.scope_id)).await {
                 Ok(_) => sent.push(e.iface.clone()),
+                Err(err) if is_stale_iface_error(&err) => {
+                    // ifindex 失効の疑い (otbr 再起動で TUN が再作成されると
+                    // 名前は同じまま index が変わる — issue #23)。iface 名から
+                    // 再解決し、sockopt を焼き直して同一送信内で 1 回だけ
+                    // リトライする。再解決失敗 (iface がまだ無い = otbr 起動中)
+                    // は従来どおり warn + この egress 脱落 — 次回送信が自然な
+                    // 再試行になる。
+                    match (iface_resolver)(&e.iface)
+                        .and_then(|idx| e.transport.set_multicast_if_v6(idx).map(|()| idx))
+                    {
+                        Ok(idx) => {
+                            let old = e.scope_id;
+                            e.scope_id = idx;
+                            match e.transport.send_to(&datagram, dest(idx)).await {
+                                Ok(_) => {
+                                    tracing::info!(iface = %e.iface, old_scope_id = old,
+                                        new_scope_id = idx,
+                                        "groupcast egress scope_id refreshed; send retried");
+                                    sent.push(e.iface.clone());
+                                }
+                                Err(err2) => {
+                                    tracing::warn!(iface = %e.iface, error = %err2,
+                                        "groupcast egress send failed after scope_id refresh");
+                                    if first_err.is_none() {
+                                        first_err = Some(err2);
+                                    }
+                                }
+                            }
+                        }
+                        Err(re) => {
+                            tracing::warn!(iface = %e.iface, error = %err, refresh_error = %re,
+                                "groupcast egress send failed; iface re-resolve failed (iface absent?)");
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                        }
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(iface = %e.iface, error = %err, "groupcast egress send failed");
                     if first_err.is_none() {
@@ -328,11 +384,45 @@ impl GroupSender {
     pub fn bump_counter(&mut self) -> std::io::Result<(u32, u32)> {
         self.counter.jump()
     }
+
+    /// 稼働中の sender へ egress を後付けする (issue #23: matd が otbr より
+    /// 先に起動して thread egress 無しで構築された場合の遅延確立)。`new()`
+    /// と同じ sockopt を焼き、失敗した egress は追加しない (呼び出し側が
+    /// warn し、次回送信で再試行する)。counter には触れない。
+    pub fn add_egress(&mut self, e: GroupEgress) -> std::io::Result<()> {
+        e.transport.set_multicast_hops_v6(MULTICAST_HOP_LIMIT)?;
+        e.transport.set_multicast_if_v6(e.scope_id)?;
+        self.egress.push(e);
+        Ok(())
+    }
+
+    /// 現在の egress 本数 (先頭は常に運用 iface)。thread egress 後付け要否の
+    /// 判定 (mat-native::group) が読む。
+    pub fn egress_count(&self) -> usize {
+        self.egress.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// issue #23: otbr 再起動で ifindex が失効したときの errno だけを
+    /// self-heal 対象にする。EADDRNOTAVAIL は iface が生きていて v6 源
+    /// アドレスが無いだけ (docker0/veth) なので対象外。
+    #[test]
+    fn stale_iface_error_classifier() {
+        assert!(is_stale_iface_error(
+            &std::io::Error::from_raw_os_error(101) // ENETUNREACH (実発生 2026-08-31)
+        ));
+        assert!(is_stale_iface_error(
+            &std::io::Error::from_raw_os_error(19) // ENODEV
+        ));
+        assert!(!is_stale_iface_error(
+            &std::io::Error::from_raw_os_error(99) // EADDRNOTAVAIL
+        ));
+        assert!(!is_stale_iface_error(&std::io::Error::other("not os")));
+    }
 
     #[test]
     fn multicast_addr_packs_fabric_and_group() {
@@ -732,6 +822,102 @@ mod tests {
         );
     }
 
+    /// issue #23 本丸: 失効した scope_id での送出失敗を検知し、iface 名から
+    /// ifindex を再解決して同一送信内でリトライすること。
+    ///
+    /// 実装差異メモ（このテストの成立条件を実測して分かったこと、2026-09-01）:
+    /// `IPV6_MULTICAST_IF`（`GroupEgress::scope_id` を焼き込む sockopt）は
+    /// 送出先 `sin6_scope_id` より優先される。つまり `GroupSender::new()` の
+    /// **後で** `GroupEgress.scope_id` フィールドだけを書き換えても sockopt は
+    /// 変わらないため実際の送出結果は無変化 — この方法では「失効」を再現
+    /// できない（実測: docker0/veth は元々 EADDRNOTAVAIL 固定、v6 実アドレス
+    /// を持つ iface は書き換え後も無条件で成功する）。iface 再作成そのもの
+    /// はテストでは作れない（CAP_NET_ADMIN 不可）ため、代わりに **`new()`
+    /// 呼び出し時点の scope_id を `lo`（ifindex はほぼ必ず 1、multicast 不可
+    /// と `multicast_capable_interfaces` のコメントで既知）にして** sockopt
+    /// 自体を最初から stale にする。`lo` 経由の送出は実測で
+    /// ENETUNREACH(101) を返す（2026-08-31 の実発生と同じ errno）。
+    #[tokio::test]
+    async fn send_invoke_heals_stale_scope_id_and_retries() {
+        use crate::transport::UdpTransport;
+
+        let addr = group_multicast_addr(1, 10);
+        let mut tried = Vec::new();
+        // lo の ifindex を動的取得（環境依存を避ける。取れなければ通例値 1）。
+        let stale_idx: u32 = std::fs::read_to_string("/sys/class/net/lo/ifindex")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1);
+
+        for cand in multicast_capable_interfaces() {
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = recv.local_addr().unwrap().port();
+            if recv.join_multicast_v6(&addr, cand.index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+                continue;
+            }
+
+            let p = tmp_counter_path(&format!("heal-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            // otbr 再起動相当: iface 名は実物の cand.name のまま、new() 時点で
+            // 既に stale な scope_id (lo) を持つ egress として構成する。
+            let egress = vec![GroupEgress {
+                iface: cand.name.clone(),
+                transport,
+                scope_id: stale_idx,
+            }];
+            let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
+            assert_eq!(s.egress[0].scope_id, stale_idx);
+
+            let good = cand.index;
+            s.iface_resolver = Box::new(move |_| Ok(good));
+
+            let (sent_counter, sent) = match s
+                .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue;
+                }
+            };
+            assert_eq!(
+                sent,
+                vec![cand.name.clone()],
+                "healed egress must be counted as sent"
+            );
+            assert_eq!(
+                s.egress[0].scope_id, cand.index,
+                "scope_id must be refreshed"
+            );
+
+            let mut buf = [0u8; 1280];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            let _ = std::fs::remove_file(&p);
+
+            match result {
+                Ok(Ok((n, _))) => {
+                    let (header, _) = MessageHeader::decode(&buf[..n]).unwrap();
+                    assert_eq!(header.message_counter, sent_counter);
+                    return; // 配達できる iface が 1 本見つかれば PASS
+                }
+                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+            }
+        }
+        panic!("no candidate healed+delivered; tried: {tried:?}");
+    }
+
     /// 監査 I-1 の中核: egress 2 本のうち 1 本が setsockopt に失敗しても
     /// `GroupSender::new` は Err にならず、生存 egress だけで送信を継続する
     /// （その egress の scope_id への setsockopt 失敗を「不正 ifindex」で
@@ -858,5 +1044,62 @@ mod tests {
             "全 egress が setsockopt 失敗なら Err のまま（後方互換）"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// issue #23 起動順対応の土台: 稼働中の sender へ egress を後付けできる
+    /// こと。sockopt (hop limit + IPV6_MULTICAST_IF) が new() と同じく焼かれ、
+    /// 以後の send_invoke が全 egress へ送出することを固定する。
+    #[tokio::test]
+    async fn add_egress_applies_sockopts_and_joins_send() {
+        use crate::transport::UdpTransport;
+
+        let mut tried = Vec::new();
+        for cand in multicast_capable_interfaces() {
+            let p = tmp_counter_path(&format!("late-{}", cand.index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            let egress = vec![GroupEgress {
+                iface: cand.name.clone(),
+                transport,
+                scope_id: cand.index,
+            }];
+            // 受信はしない (送出成功の iface 名リストだけ固定する) が、宛先 port
+            // は実 5540 を避けエフェメラルにする (LAN へ流れても無害な宛先)。
+            let sink = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let port = sink.local_addr().unwrap().port();
+            let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
+            assert_eq!(s.egress_count(), 1);
+
+            let t2 = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
+            s.add_egress(GroupEgress {
+                iface: "late0".into(),
+                transport: std::sync::Arc::clone(&t2),
+                scope_id: cand.index, // 同一 iface の独立 socket (2 本目の実 iface は環境に無い前提)
+            })
+            .unwrap();
+            assert_eq!(s.egress_count(), 2);
+            assert_eq!(t2.multicast_if_v6().unwrap(), cand.index);
+
+            match s
+                .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
+                .await
+            {
+                Ok((_c, sent)) => {
+                    let _ = std::fs::remove_file(&p);
+                    assert_eq!(sent, vec![cand.name.clone(), "late0".to_string()]);
+                    return;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!(
+                        "{}(idx={}): send failed: {e:?}",
+                        cand.name, cand.index
+                    ));
+                    continue; // docker0/veth 等の EADDRNOTAVAIL は次候補へ
+                }
+            }
+        }
+        panic!("no candidate accepted a 2-egress send; tried: {tried:?}");
     }
 }
