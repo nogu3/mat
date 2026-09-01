@@ -39,6 +39,37 @@ pub fn issue_noc(
     issuer_private_key: &[u8; 32],
     serial: &[u8],
 ) -> Result<MatterCert, CertError> {
+    issue_noc_with_cats(
+        op_public_key,
+        node_id,
+        fabric_id,
+        issuer,
+        issuer_private_key,
+        serial,
+        &[],
+    )
+}
+
+/// [`issue_noc`] plus CASE Authenticated Tags (spec §6.6.2.1.2) in the
+/// subject DN — one `matter-noc-cat` (TLV tag 22) attribute per entry of
+/// `cats`, in the given order, after the node-id / fabric-id attributes.
+/// `cats` must satisfy [`CaseAuthTags::new`] (at most 3, nonzero version,
+/// distinct identifiers) — anything else is `CertError::Malformed`, so a
+/// NOC this issues always parses back through [`MatterCert::cats`].
+///
+/// `mat` itself never issues CAT-bearing NOCs (its fabrics are single-
+/// admin, keyed by node id); this exists so tests and other controllers
+/// built on this crate can mint the NOCs that e.g. Apple Home hands out.
+pub fn issue_noc_with_cats(
+    op_public_key: &[u8; 65],
+    node_id: u64,
+    fabric_id: u64,
+    issuer: &MatterCert,
+    issuer_private_key: &[u8; 32],
+    serial: &[u8],
+    cats: &[u32],
+) -> Result<MatterCert, CertError> {
+    let cats = CaseAuthTags::new(cats).ok_or(CertError::Malformed(CAT_MALFORMED))?;
     // 発行者(root)の SubjectKeyId を AKID に使う
     let issuer_skid = issuer
         .extensions
@@ -60,21 +91,27 @@ pub fn issue_noc(
         CertExtension::AuthorityKeyId(issuer_skid),
     ];
 
+    let mut subject = vec![
+        DnAttr {
+            tlv_tag: 17,
+            value: DnValue::MatterId(node_id),
+        },
+        DnAttr {
+            tlv_tag: 21,
+            value: DnValue::MatterId(fabric_id),
+        },
+    ];
+    subject.extend(cats.iter().map(|cat| DnAttr {
+        tlv_tag: 22,
+        value: DnValue::MatterId(u64::from(cat)),
+    }));
+
     let mut noc = MatterCert {
         serial: serial.to_vec(),
         issuer: issuer.subject.clone(),
         not_before: MATTER_EPOCH_2021,
         not_after: MATTER_EPOCH_2021.saturating_add(NOC_VALIDITY_SECS),
-        subject: vec![
-            DnAttr {
-                tlv_tag: 17,
-                value: DnValue::MatterId(node_id),
-            },
-            DnAttr {
-                tlv_tag: 21,
-                value: DnValue::MatterId(fabric_id),
-            },
-        ],
+        subject,
         pub_key: *op_public_key,
         extensions,
         signature: [0u8; 64], // TBS 署名で埋める
@@ -177,6 +214,71 @@ const OID_EXT_KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x0F]; // 2.5.29.15
 const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x25]; // 2.5.29.37
 const OID_EXT_SUBJECT_KEY_ID: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x0E]; // 2.5.29.14
 const OID_EXT_AUTHORITY_KEY_ID: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x23]; // 2.5.29.35
+
+/// `CertError::Malformed` detail for every CASE Authenticated Tag rule
+/// violation (`CaseAuthTags::new` / `MatterCert::cats`).
+const CAT_MALFORMED: &str = "case authenticated tag";
+
+/// The CASE Authenticated Tags (CATs, spec §6.6.2.1.2) carried by one NOC's
+/// subject DN (`matter-noc-cat`, TLV tag 22). A CAT is a 32-bit value:
+/// upper 16 bits = identifier, lower 16 bits = version. A NOC carries at
+/// most [`CaseAuthTags::MAX`] of them, each with a nonzero version and a
+/// distinct identifier — `new` enforces all three rules, so a value of this
+/// type is always well-formed and the ACL matcher on the device side never
+/// has to re-validate.
+///
+/// Stored as a fixed `[u32; MAX]` (0 = empty slot, which no valid CAT can
+/// be since its version would be 0) so the type is `Copy` and can ride
+/// inside per-request contexts by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CaseAuthTags([u32; CaseAuthTags::MAX]);
+
+impl CaseAuthTags {
+    /// Maximum number of CATs one NOC may carry (spec §6.6.2.1.2, SDK
+    /// `kMaxSubjectCATAttributeCount`).
+    pub const MAX: usize = 3;
+
+    /// `None` if `cats` has more than `MAX` entries, an entry with version
+    /// 0, or two entries sharing an identifier.
+    pub fn new(cats: &[u32]) -> Option<Self> {
+        if cats.len() > Self::MAX {
+            return None;
+        }
+        let mut out = [0u32; Self::MAX];
+        for (i, &cat) in cats.iter().enumerate() {
+            if cat_version(cat) == 0 {
+                return None;
+            }
+            if cats[..i]
+                .iter()
+                .any(|&prev| cat_identifier(prev) == cat_identifier(cat))
+            {
+                return None;
+            }
+            out[i] = cat;
+        }
+        Some(Self(out))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0[0] == 0
+    }
+
+    /// The tags, in NOC order, without the empty slots.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().copied().take_while(|&c| c != 0)
+    }
+}
+
+/// Upper 16 bits of a CAT: the identifier.
+pub fn cat_identifier(cat: u32) -> u16 {
+    (cat >> 16) as u16
+}
+
+/// Lower 16 bits of a CAT: the version.
+pub fn cat_version(cat: u32) -> u16 {
+    (cat & 0xFFFF) as u16
+}
 
 /// Parsed Matter operational certificate (NOC / ICAC / RCAC).
 #[derive(Debug, Clone)]
@@ -412,6 +514,26 @@ impl MatterCert {
 
     pub fn fabric_id(&self) -> Option<u64> {
         self.subject_matter_id(21)
+    }
+
+    /// The subject's CASE Authenticated Tags (every `matter-noc-cat`, TLV
+    /// tag 22, attribute in DN order). Empty for a NOC without CATs.
+    /// `CertError::Malformed` if the DN violates any [`CaseAuthTags`] rule
+    /// (more than `MAX`, version 0, duplicate identifier) or a value does
+    /// not fit in 32 bits — a peer presenting such a NOC is rejected rather
+    /// than partially trusted.
+    pub fn cats(&self) -> Result<CaseAuthTags, CertError> {
+        let mut raw: Vec<u32> = Vec::with_capacity(CaseAuthTags::MAX);
+        for attr in &self.subject {
+            if attr.tlv_tag != 22 {
+                continue;
+            }
+            let DnValue::MatterId(id) = attr.value else {
+                return Err(CertError::Malformed(CAT_MALFORMED));
+            };
+            raw.push(u32::try_from(id).map_err(|_| CertError::Malformed(CAT_MALFORMED))?);
+        }
+        CaseAuthTags::new(&raw).ok_or(CertError::Malformed(CAT_MALFORMED))
     }
 
     /// basicConstraints 拡張の (is_ca, path_len)。拡張が無ければ None。
@@ -1382,5 +1504,95 @@ mod tests {
 
         // 正常系: 無改変チェーンは引き続き通る
         verify_noc_chain(&noc, None, &rcac).unwrap();
+    }
+    // --- CASE Authenticated Tags (spec §6.6.2.1.2 / §6.5.6.1) ---
+
+    fn root_and_op_keys() -> (MatterCert, [u8; 32], [u8; 65]) {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        (root, root_priv, op_pub)
+    }
+
+    #[test]
+    fn issue_noc_with_cats_round_trips_through_tlv_and_cats() {
+        let (root, root_priv, op_pub) = root_and_op_keys();
+        let noc = issue_noc_with_cats(
+            &op_pub,
+            0x1B669,
+            1,
+            &root,
+            &root_priv,
+            &[0x05],
+            &[0xABCD_0001, 0x0001_0003],
+        )
+        .unwrap();
+        // The CAT-bearing NOC still verifies under its root (DER TBS rebuild
+        // handles tag 22 — otherwise the signature would not match).
+        verify_noc_chain(&noc, None, &root).unwrap();
+        let reparsed = MatterCert::parse(&noc.to_tlv()).unwrap();
+        assert_eq!(
+            reparsed.cats().unwrap(),
+            CaseAuthTags::new(&[0xABCD_0001, 0x0001_0003]).unwrap()
+        );
+        assert_eq!(reparsed.node_id(), Some(0x1B669));
+    }
+
+    #[test]
+    fn cats_is_empty_for_a_noc_without_cat_attributes() {
+        let (root, root_priv, op_pub) = root_and_op_keys();
+        let noc = issue_noc(&op_pub, 0x1B669, 1, &root, &root_priv, &[0x05]).unwrap();
+        let cats = noc.cats().unwrap();
+        assert!(cats.is_empty());
+        assert_eq!(cats.iter().count(), 0);
+        // A NOC issued with an empty CAT slice is byte-identical to a plain one.
+        let same =
+            issue_noc_with_cats(&op_pub, 0x1B669, 1, &root, &root_priv, &[0x05], &[]).unwrap();
+        assert_eq!(same.subject, noc.subject);
+    }
+
+    fn noc_with_subject_cats(cats: &[u64]) -> MatterCert {
+        let (root, root_priv, op_pub) = root_and_op_keys();
+        let mut noc = issue_noc(&op_pub, 0x1B669, 1, &root, &root_priv, &[0x05]).unwrap();
+        for &c in cats {
+            noc.subject.push(DnAttr {
+                tlv_tag: 22,
+                value: DnValue::MatterId(c),
+            });
+        }
+        noc
+    }
+
+    #[test]
+    fn cats_rejects_more_than_three_tags() {
+        let noc = noc_with_subject_cats(&[0x0001_0001, 0x0002_0001, 0x0003_0001, 0x0004_0001]);
+        assert!(matches!(noc.cats(), Err(CertError::Malformed(_))));
+        assert!(CaseAuthTags::new(&[1 << 16, 2 << 16, 3 << 16, 4 << 16]).is_none());
+    }
+
+    #[test]
+    fn cats_rejects_version_zero() {
+        let noc = noc_with_subject_cats(&[0x0001_0000]);
+        assert!(matches!(noc.cats(), Err(CertError::Malformed(_))));
+        assert!(CaseAuthTags::new(&[0x0001_0000]).is_none());
+    }
+
+    #[test]
+    fn cats_rejects_duplicate_identifiers() {
+        let noc = noc_with_subject_cats(&[0x0001_0001, 0x0001_0002]);
+        assert!(matches!(noc.cats(), Err(CertError::Malformed(_))));
+        assert!(CaseAuthTags::new(&[0x0001_0001, 0x0001_0002]).is_none());
+    }
+
+    #[test]
+    fn cats_rejects_values_wider_than_32_bits() {
+        let noc = noc_with_subject_cats(&[0x1_0000_0001]);
+        assert!(matches!(noc.cats(), Err(CertError::Malformed(_))));
     }
 }
