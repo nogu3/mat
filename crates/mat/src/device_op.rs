@@ -29,7 +29,6 @@ pub(crate) enum DeviceOp {
 
 impl DeviceOp {
     /// ログ用の op 名。
-    #[allow(dead_code)]
     pub(crate) fn name(&self) -> &'static str {
         match self {
             DeviceOp::Node(n) => n.kind.name(),
@@ -157,6 +156,8 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 transition: *transition,
             },
         ),
+        // QR 画像のレンダリングは `mat` の責務ではない。複数機器の一括共有は
+        // Matter 仕様上不可。
         Command::OpenWindow {
             node_id,
             timeout,

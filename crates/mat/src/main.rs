@@ -12,7 +12,6 @@ mod matd_client;
 mod native_direct;
 mod probe;
 mod resolve;
-mod units;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -180,8 +179,8 @@ fn main() -> ExitCode {
         issuer_index: args.issuer_index,
     });
     if let Some(cfg) = &native_cfg {
-        if let Some(result) = native_direct::run(&command, &store_path, cfg, args.op_timeout_ms) {
-            return match result {
+        if let Some(op) = device_op {
+            return match native_direct::run(op, &store_path, cfg, args.op_timeout_ms) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
@@ -192,9 +191,7 @@ fn main() -> ExitCode {
         }
     }
 
-    // native_direct::run が `None` を返す op = 専用コマンド層を持つもの
-    // （discover / commission / diag node）。それ以外の op はすべて native_direct
-    // が処理済み（M8c-3 で chip-tool 経路は撤去）。
+    // `Dispatch::Dedicated` の残り（fabric / listen は早期 return 済み）。
     let result = match &command {
         Command::Discover { probe } => {
             commands::discover::run(&store_path, *probe, native_cfg.as_ref())
@@ -233,8 +230,8 @@ fn main() -> ExitCode {
             .map(mat_core::alias::NodeRef::id)
             .collect::<Result<Vec<u64>, MatError>>()
             .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
-        // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
-        // Command::Fabric は route dispatch より前の早期 return で処理済み。
+        // 他の全 op（`Dispatch::Device`）は上の native_direct::run 早期 return で
+        // 処理済み。Command::Fabric は route dispatch より前の早期 return で処理済み。
         // 不変条件が破れても panic せず typed error（v1 Task6 と同じ規律）。
         _ => Err(MatError::parse_error(
             "internal: op not handled by native_direct::run (route dispatch invariant violated)",
