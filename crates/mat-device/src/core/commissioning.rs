@@ -85,6 +85,10 @@ const NOC_STATUS_TABLE_FULL: u8 = 5;
 /// outcome (spec §11.17.6.14.1, `InvalidFabricIndex`). Returned by both
 /// `handle_update_fabric_label` and `handle_remove_fabric`.
 const NOC_STATUS_INVALID_FABRIC_INDEX: u8 = 0x0A;
+/// `NodeOperationalCertStatusEnum::InvalidAdminSubject` (spec §11.17.5.9):
+/// `AddNOC.CaseAdminSubject` が operational node id でも CAT でもない
+/// （`access_control::subject_kind` が `None`）。
+const NOC_STATUS_INVALID_ADMIN_SUBJECT: u8 = 0x0B;
 
 /// General Commissioning (0x0030) attribute ids this server serves (spec
 /// §11.10.5). This cluster has no `CurrentFabricIndex` — that attribute is
@@ -1078,6 +1082,22 @@ impl Inner {
             return noc_status(NOC_STATUS_TABLE_FULL);
         }
 
+        // spec §11.17.6.8.1: the admin subject must be a real operational
+        // node id or a CAT with a non-zero version — anything else would
+        // install an Administer ACL entry nobody can ever match (a fabric
+        // whose only admin is locked out). Checked before the certificate
+        // work, like `TableFull`: no point verifying a chain for a fabric
+        // that can't be administered. `pending` is left intact so the same
+        // session can retry with a valid subject.
+        if crate::core::access_control::subject_kind(case_admin_subject).is_none() {
+            tracing::debug!(
+                reason = "invalid admin subject",
+                case_admin_subject = format_args!("{case_admin_subject:#x}"),
+                "AddNOC rejected: InvalidAdminSubject"
+            );
+            return noc_status(NOC_STATUS_INVALID_ADMIN_SUBJECT);
+        }
+
         let (Some(root_tlv), Some(op_private_key), Some(op_public_key)) = (
             self.pending.trusted_root_tlv.clone(),
             self.pending.op_private_key,
@@ -1490,12 +1510,26 @@ mod tests {
     /// the caller; admin subject `0xAA` and admin vendor id `0xFFF1` fixed —
     /// no test here needs to vary those). Returns the `AddNOC` reply so
     /// callers that care about the command's own response (like
-    /// `add_noc_installs_fabric`) can assert on it directly.
+    /// `add_noc_installs_fabric`) can assert on it directly. Delegates to
+    /// `install_fabric_with_admin` with admin subject `0xAA`.
     fn install_fabric(
         server: &mut CommissioningServer,
         fabric_id: u64,
         node_id: u64,
     ) -> InvokeReply {
+        install_fabric_with_admin(server, fabric_id, node_id, 0xAA).0
+    }
+
+    /// `install_fabric` の admin subject 可変版: ArmFailSafe → CSR →
+    /// AddTrustedRoot まで進めてから `case_admin_subject` で AddNOC を
+    /// 打ち、その reply と「同じ pending で再 AddNOC するための NOC/
+    /// fabric」を返す。
+    fn install_fabric_with_admin(
+        server: &mut CommissioningServer,
+        fabric_id: u64,
+        node_id: u64,
+        case_admin_subject: u64,
+    ) -> (InvokeReply, Vec<u8>, CommissioningFabric) {
         let fabric = CommissioningFabric::generate(fabric_id, 0xAA).unwrap();
 
         drive_invoke(
@@ -1526,12 +1560,13 @@ mod tests {
             InvokeReply::Status(im::STATUS_SUCCESS)
         );
 
-        drive_invoke(
+        let reply = drive_invoke(
             server,
             CLUSTER_OPERATIONAL_CREDENTIALS,
             CMD_ADD_NOC,
-            &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
-        )
+            &encode_add_noc(&noc, &fabric.ipk_epoch, case_admin_subject, 0xFFF1),
+        );
+        (reply, noc, fabric)
     }
 
     /// A `CommissioningServer` with one fabric already installed
@@ -2407,6 +2442,67 @@ mod tests {
             usize::from(SUPPORTED_FABRICS),
             "a rejected AddNOC must not install anything"
         );
+    }
+
+    /// spec §11.17.6.8.1: `CaseAdminSubject` は operational node id か
+    /// CAT（version ≠ 0）でなければ `NOCResponse(InvalidAdminSubject=0x0B)`。
+    /// fabric も ACL エントリも作られず、pending（CSR/root）は残るので
+    /// 同じセッションで正しい subject の AddNOC をやり直せる。
+    #[test]
+    fn add_noc_rejects_invalid_case_admin_subject_and_allows_retry() {
+        use crate::core::access_control::{
+            cat_subject, AclStore, Subject, OPERATIONAL_NODE_ID_MAX, PRIVILEGE_ADMINISTER,
+        };
+        for bad in [
+            0u64,
+            cat_subject(0xABCD_0000),    // CAT version 0
+            OPERATIONAL_NODE_ID_MAX + 1, // 予約域の先頭
+            0xFFFF_FFFF_FFFF_0001,       // group 域
+        ] {
+            let mut server = test_server();
+            let acl_store = AclStore::new();
+            server.set_acl_store(acl_store.clone());
+
+            let (reply, noc, fabric) = install_fabric_with_admin(&mut server, 0x1122, 0x5001, bad);
+            let (response_command, resp) = expect_data(reply);
+            assert_eq!(response_command, RESP_NOC);
+            let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+            assert_eq!(status, NOC_STATUS_INVALID_ADMIN_SUBJECT, "subject {bad:#x}");
+            assert_eq!(fabric_index, None);
+            assert!(
+                server.fabrics().is_empty(),
+                "rejected AddNOC must not install a fabric"
+            );
+            assert!(
+                !acl_store.check(1, Subject::node(0x5001), PRIVILEGE_ADMINISTER, 0, 0x001F),
+                "rejected AddNOC must not add an admin ACL entry"
+            );
+
+            // 同じ pending（CSR keypair / trusted root）で正しい subject なら通る。
+            let (_, resp) = expect_data(drive_invoke(
+                &mut server,
+                CLUSTER_OPERATIONAL_CREDENTIALS,
+                CMD_ADD_NOC,
+                &encode_add_noc(&noc, &fabric.ipk_epoch, 0xAA, 0xFFF1),
+            ));
+            let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+            assert_eq!(status, NOC_STATUS_OK, "retry after {bad:#x}");
+            assert_eq!(fabric_index, Some(1));
+            assert_eq!(server.fabrics().len(), 1);
+        }
+    }
+
+    /// CAT 形の admin subject（Apple Home が送る形）は version ≠ 0 なら受理。
+    #[test]
+    fn add_noc_accepts_cat_case_admin_subject() {
+        use crate::core::access_control::cat_subject;
+        let mut server = test_server();
+        let (reply, _, _) =
+            install_fabric_with_admin(&mut server, 0x1122, 0x5001, cat_subject(0xABCD_0002));
+        let (_, resp) = expect_data(reply);
+        let (status, fabric_index) = decode_noc_response(&resp).unwrap();
+        assert_eq!(status, NOC_STATUS_OK);
+        assert_eq!(fabric_index, Some(1));
     }
 
     #[test]
