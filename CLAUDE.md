@@ -95,8 +95,8 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   to start on an ambiguous autodetect. No state is held between runs (design
   rule 4).
 - Generic `write`/`invoke`/`group invoke` encode **scalar** JSON→TLV only
-  (bool/int/uint/enum/bitmap/string/octstr, bytes as `hex:`). `list`/`struct`/
-  `float` fields and names the `mat-core::ids` table does not know are
+  (bool/int/uint/enum/bitmap/float/string/octstr, bytes as `hex:`). `list`/`struct`
+  fields and names the `mat-core::ids` table does not know are
   `parse_error` (numeric IDs are the escape hatch) — a documented limitation,
   not a fallback. `group provision`/`grant` list/struct writes use dedicated
   encoders.

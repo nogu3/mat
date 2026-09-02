@@ -4,6 +4,12 @@
 使い方:
     python3 scripts/gen-ids.py /path/to/connectedhomeip > crates/mat-core/src/ids_gen.rs
 
+connectedhomeip の取得（フル clone 不要、data-model XML だけ sparse checkout）:
+    git clone --depth 1 --branch v1.4.2.0 --filter=blob:none --sparse \
+        https://github.com/project-chip/connectedhomeip.git chip
+    git -C chip sparse-checkout set src/app/zap-templates/zcl/data-model/chip
+    python3 scripts/gen-ids.py chip > crates/mat-core/src/ids_gen.rs
+
 前提: connectedhomeip は **タグ v1.4.2.0** を checkout していること
 （chip-tool KVS リーダと同じバージョン固定。ids のスポットチェック単体テストが
 名前・ID の回帰を検知する）。
@@ -37,7 +43,7 @@ def kebab(name: str) -> str:
 
 BASE_TYPES = {
     "boolean": "Bool",
-    "single": "Float", "double": "Float",
+    "single": "F32", "double": "F64",
     "char_string": "Str", "long_char_string": "Str",
     "octet_string": "Bytes", "long_octet_string": "Bytes",
 }

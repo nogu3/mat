@@ -12,7 +12,10 @@ pub enum TypeTag {
     Bool,
     UInt,
     Int,
-    Float,
+    /// Matter `single`（TLV 0x0A）。
+    F32,
+    /// Matter `double`（TLV 0x0B）。
+    F64,
     Str,
     Bytes,
     List,
@@ -112,6 +115,8 @@ pub enum ScalarValue {
     Bool(bool),
     UInt(u64),
     Int(i64),
+    F32(f32),
+    F64(f64),
     Str(String),
     Bytes(Vec<u8>),
     Null,
@@ -130,6 +135,15 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
             u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| format!("invalid hex literal: {s:?}"))
         })
         .collect()
+}
+
+/// float リテラル（`1.5` / `-3` / `2e-3`）。nan / inf は拒否 — TLV には載るが
+/// デバイス側は CONSTRAINT_ERROR にしかならないので早期に parse_error にする。
+fn parse_finite_f64(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(f),
+        _ => Err(format!("not a finite float literal: {s:?}")),
+    }
 }
 
 /// 型タグに従って CLI 入力文字列をスカラーへ。Err は人間可読の理由
@@ -162,9 +176,8 @@ pub fn parse_scalar_typed(input: &str, ty: TypeTag) -> Result<ScalarValue, Strin
             "this attribute is a struct type; generic native write supports scalars only (M8a)"
                 .into(),
         ),
-        TypeTag::Float => {
-            Err("float attributes are not supported by generic native write (M8a)".into())
-        }
+        TypeTag::F32 => parse_finite_f64(s).map(|f| ScalarValue::F32(f as f32)),
+        TypeTag::F64 => parse_finite_f64(s).map(ScalarValue::F64),
         TypeTag::Unknown => Err("attribute type unknown; cannot encode value".into()),
     }
 }
@@ -187,6 +200,11 @@ pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
     }
     if let Ok(i) = s.parse::<i64>() {
         return ScalarValue::Int(i);
+    }
+    if (s.contains('.') || s.contains(['e', 'E'])) && !s.starts_with("0x") {
+        if let Ok(f) = parse_finite_f64(s) {
+            return ScalarValue::F64(f);
+        }
     }
     ScalarValue::Str(s.to_string())
 }
@@ -443,7 +461,6 @@ mod tests {
     fn parse_scalar_typed_rejects_unsupported_and_bad_literals() {
         assert!(parse_scalar_typed("[]", TypeTag::List).is_err());
         assert!(parse_scalar_typed("{}", TypeTag::Struct).is_err());
-        assert!(parse_scalar_typed("1.5", TypeTag::Float).is_err()); // float write は M8a 未対応
         assert!(parse_scalar_typed("abc", TypeTag::UInt).is_err());
         assert!(parse_scalar_typed("xyz", TypeTag::Bool).is_err());
         assert!(parse_scalar_typed("hex:zz", TypeTag::Bytes).is_err());
@@ -451,6 +468,38 @@ mod tests {
         // エラーメッセージは型名を含む（spec 受け入れ5: AI が判断できる detail）。
         let e = parse_scalar_typed("[]", TypeTag::List).unwrap_err();
         assert!(e.contains("list"), "{e}");
+    }
+
+    #[test]
+    fn float_attributes_resolve_to_f32_or_f64() {
+        // unittesting (0xFFF1FC05): FloatSingle = single → F32, FloatDouble = double → F64。
+        let a = resolve_attribute(0xFFF1FC05, "float-single").unwrap();
+        assert_eq!(a.def.unwrap().ty, TypeTag::F32);
+        let a = resolve_attribute(0xFFF1FC05, "float-double").unwrap();
+        assert_eq!(a.def.unwrap().ty, TypeTag::F64);
+    }
+
+    #[test]
+    fn parse_scalar_typed_floats() {
+        use ScalarValue as V;
+        assert_eq!(parse_scalar_typed("1.5", TypeTag::F64), Ok(V::F64(1.5)));
+        assert_eq!(parse_scalar_typed("-3", TypeTag::F64), Ok(V::F64(-3.0)));
+        assert_eq!(parse_scalar_typed("2e-3", TypeTag::F32), Ok(V::F32(2e-3)));
+        assert_eq!(parse_scalar_typed("null", TypeTag::F32), Ok(V::Null));
+        // nan / inf / 非数値は拒否（TLV には載るがデバイスは CONSTRAINT_ERROR)。
+        assert!(parse_scalar_typed("nan", TypeTag::F64).is_err());
+        assert!(parse_scalar_typed("inf", TypeTag::F32).is_err());
+        assert!(parse_scalar_typed("abc", TypeTag::F64).is_err());
+    }
+
+    #[test]
+    fn parse_scalar_inferred_float_literal() {
+        // 数値 ID 直指定: 小数点 / 指数を含む数値リテラルは F64 に推定する。
+        assert_eq!(parse_scalar_inferred("1.5"), ScalarValue::F64(1.5));
+        assert_eq!(parse_scalar_inferred("2e3"), ScalarValue::F64(2000.0));
+        // 整数はこれまでどおり UInt / Int。
+        assert_eq!(parse_scalar_inferred("42"), ScalarValue::UInt(42));
+        assert_eq!(parse_scalar_inferred("-1"), ScalarValue::Int(-1));
     }
 
     #[test]

@@ -111,6 +111,8 @@ pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> ImValue {
         S::Bool(b) => ImValue::Bool(*b),
         S::UInt(n) => ImValue::Uint(*n),
         S::Int(n) => ImValue::Int(*n),
+        S::F32(f) => ImValue::F32(*f),
+        S::F64(f) => ImValue::F64(*f),
         S::Str(s) => ImValue::Utf8(s.clone()),
         S::Bytes(b) => ImValue::Bytes(b.clone()),
         S::Null => ImValue::Null,
@@ -127,6 +129,8 @@ pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
         S::Bool(b) => w.put_bool(Tag::Anonymous, *b),
         S::UInt(n) => w.put_uint(Tag::Anonymous, *n),
         S::Int(n) => w.put_int(Tag::Anonymous, *n),
+        S::F32(f) => w.put_f32(Tag::Anonymous, *f),
+        S::F64(f) => w.put_f64(Tag::Anonymous, *f),
         S::Str(s) => w.put_str(Tag::Anonymous, s),
         S::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
         S::Null => w.put_null(Tag::Anonymous),
@@ -149,6 +153,8 @@ pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
             S::Bool(b) => w.put_bool(tag, *b),
             S::UInt(n) => w.put_uint(tag, *n),
             S::Int(n) => w.put_int(tag, *n),
+            S::F32(f) => w.put_f32(tag, *f),
+            S::F64(f) => w.put_f64(tag, *f),
             S::Str(s) => w.put_str(tag, s),
             S::Bytes(b) => w.put_bytes(tag, b),
             S::Null => w.put_null(tag),
@@ -997,6 +1003,13 @@ mod tests {
         assert!(matches!(
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::Utf8("x")
+        ));
+
+        let b = scalar_to_tlv(&S::F64(0.5));
+        let mut r = mat_controller::tlv::Reader::new(&b);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            mat_controller::tlv::Value::F64(f) if f == 0.5
         ));
     }
 

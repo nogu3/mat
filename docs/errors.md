@@ -45,7 +45,7 @@ is `unreachable` (exit `5`).
   refusals (wrong passcode / StatusReport rejection / bad Sigma2 signature) map
   to `device_rejected` instead of landing here.
 - `parse_error` — this kind is returned when a generic `write` / `invoke` names
-  a known attribute or command field whose type is `list` / `struct` / `float`
+  a known attribute or command field whose type is `list` / `struct`
   (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
   names a cluster / attribute / command the generated table does not know (pass
   the numeric id instead).

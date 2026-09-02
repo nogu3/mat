@@ -1024,9 +1024,10 @@ the event stream's receive wait, not a single op).
 
 Generic `write` / `invoke` (and `group invoke`) encode **scalar** JSON→TLV types
 only: bool / int / uint / enum / bitmap / string / octstr (bytes as a
-`hex:`-prefixed string). An attribute or command field the name table knows to be
-`list` / `struct` / `float` is rejected up front with `parse_error` (the detail
-names the type). This is a deliberate, documented limitation — the practical
+`hex:`-prefixed string) / float (single/double, decimal literal like 1.5). An
+attribute or command field the name table knows to be `list` / `struct` is
+rejected up front with `parse_error` (the detail names the type). This is a
+deliberate, documented limitation — the practical
 cases (onoff / level / color, and the ACL entry `group grant` appends) are all
 covered, and the numeric-ID escape hatch remains for names the generated table
 does not resolve (an unknown name is also a `parse_error`; pass the numeric id).
