@@ -47,7 +47,6 @@ pub(crate) const AUTH_MODE_CASE: u8 = 2;
 /// `AccessControlEntryAuthModeEnum::Group` — `mat group grant` が書く
 /// エントリの auth mode。`write` の妥当性検査（`validate_entry`）が
 /// subject を GroupId として検査する根拠。
-#[allow(dead_code)]
 pub(crate) const AUTH_MODE_GROUP: u8 = 3;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
@@ -76,12 +75,10 @@ pub fn cat_subject(cat: u32) -> u64 {
 /// Operational Node ID の上限 (spec §2.5.5.1: 0x0000_0000_0000_0001 ..=
 /// 0xFFFF_FFEF_FFFF_FFFF)。これより上は予約域（temporary local /
 /// CAT / group 等）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const OPERATIONAL_NODE_ID_MAX: u64 = 0xFFFF_FFEF_FFFF_FFFF;
 
 /// `subject_kind` の答え — CASE 文脈で subject が取れる 2 つの形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum SubjectKind {
     /// Operational node id（1..=`OPERATIONAL_NODE_ID_MAX`）。
     Node,
@@ -95,7 +92,6 @@ pub(crate) enum SubjectKind {
 /// `None` — 呼び側はこれを `InvalidAdminSubject` / `CONSTRAINT_ERROR` に
 /// 写す。version 0 の CAT は `Subject::matches` でも誰にもマッチしない
 /// が、そもそも書かせないのがここの役目。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn subject_kind(subject: u64) -> Option<SubjectKind> {
     if (1..=OPERATIONAL_NODE_ID_MAX).contains(&subject) {
         return Some(SubjectKind::Node);
@@ -108,7 +104,6 @@ pub(crate) fn subject_kind(subject: u64) -> Option<SubjectKind> {
 
 /// Group auth mode の ACL `Subjects` 要素として妥当か: GroupId そのもの
 /// （1..=0xFFFF、spec §11.1.7.1 "the subject is a GroupId"）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_group_subject(subject: u64) -> bool {
     (1..=0xFFFF).contains(&subject)
 }
@@ -396,7 +391,11 @@ impl ClusterHandler for AccessControlHandler {
     /// で「エントリ全置換」と「1 件 append」を切り替える — どちらも
     /// decode 失敗は `STATUS_CONSTRAINT_ERROR`、書き込み fabric のエントリ
     /// の `fabric_index` フィールドは無視して `ctx.fabric_index` で上書き
-    /// する（commissioner が書く値を信用しない）。
+    /// する（commissioner が書く値を信用しない）。decode の直後に
+    /// `validate_entry`（spec §11.1.7.1 の制約: privilege / auth mode /
+    /// subject の形 / targets）を全エントリへかけ、1 件でも違反なら store
+    /// 不変で `STATUS_CONSTRAINT_ERROR`。容量判定より先（正しいエントリが
+    /// 入り切らないときだけ RESOURCE_EXHAUSTED）。
     fn write(
         &mut self,
         attribute: u32,
@@ -414,6 +413,7 @@ impl ClusterHandler for AccessControlHandler {
             let Some(entry) = decode_single_acl_entry(data_tlv) else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
+            validate_entry(&entry)?;
             if self.store.entries_for(ctx.fabric_index).len() >= ACL_ENTRIES_PER_FABRIC {
                 return Err(im::STATUS_RESOURCE_EXHAUSTED);
             }
@@ -425,6 +425,9 @@ impl ClusterHandler for AccessControlHandler {
             let Some(entries) = decode_acl_entries(data_tlv) else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
+            for entry in &entries {
+                validate_entry(entry)?;
+            }
             if entries.len() > ACL_ENTRIES_PER_FABRIC {
                 return Err(im::STATUS_RESOURCE_EXHAUSTED);
             }
@@ -611,6 +614,75 @@ pub(crate) struct AclTargetDev {
     pub device_type: Option<u32>,
 }
 
+/// chip `IsValidClusterId`: 下位 16 bit が標準域 0x0000..=0x7FFF か
+/// manufacturer-specific 域 0xFC00..=0xFFFE。
+fn is_valid_cluster_id(cluster: u32) -> bool {
+    matches!(cluster & 0xFFFF, 0x0000..=0x7FFF | 0xFC00..=0xFFFE)
+}
+
+/// chip `IsValidDeviceTypeId`: 下位 16 bit が 0x0000..=0xBFFF。
+fn is_valid_device_type_id(device_type: u32) -> bool {
+    (device_type & 0xFFFF) <= 0xBFFF
+}
+
+/// spec §11.1.7.1 `AccessControlEntryStruct` の制約 + chip
+/// `AccessControl::Entry` validation 相当。`write` が decode 直後・容量
+/// ガードの前に全エントリへかける — 1 件でも違反なら store に触らず
+/// `STATUS_CONSTRAINT_ERROR`。規則は spec ドキュメント
+/// (`docs/superpowers/specs/2026-09-03-matv-subject-checks-design.md` §3)
+/// の表と 1:1。
+pub(crate) fn validate_entry(entry: &AclDeviceEntry) -> Result<(), u8> {
+    const ERR: u8 = im::STATUS_CONSTRAINT_ERROR;
+    if !(PRIVILEGE_VIEW..=PRIVILEGE_ADMINISTER).contains(&entry.privilege) {
+        return Err(ERR);
+    }
+    match entry.auth_mode {
+        AUTH_MODE_CASE => {
+            if !entry.subjects.iter().all(|s| subject_kind(*s).is_some()) {
+                return Err(ERR);
+            }
+        }
+        AUTH_MODE_GROUP => {
+            // spec §11.1.7.1: "Administer privilege SHALL only be granted
+            // to CASE"
+            if entry.privilege == PRIVILEGE_ADMINISTER {
+                return Err(ERR);
+            }
+            if !entry.subjects.iter().all(|s| is_group_subject(*s)) {
+                return Err(ERR);
+            }
+        }
+        _ => return Err(ERR), // PASE(1) / 未知値
+    }
+    if entry.subjects.len() > ACL_SUBJECTS_PER_ENTRY as usize {
+        return Err(ERR);
+    }
+    if let Some(raw) = &entry.targets_raw {
+        let targets = decode_targets(raw).ok_or(ERR)?;
+        if targets.len() > ACL_TARGETS_PER_ENTRY as usize {
+            return Err(ERR);
+        }
+        for t in &targets {
+            if t.cluster.is_none() && t.endpoint.is_none() && t.device_type.is_none() {
+                return Err(ERR);
+            }
+            if t.endpoint.is_some() && t.device_type.is_some() {
+                return Err(ERR);
+            }
+            if t.cluster.is_some_and(|c| !is_valid_cluster_id(c)) {
+                return Err(ERR);
+            }
+            if t.endpoint.is_some_and(|e| e == 0xFFFF) {
+                return Err(ERR);
+            }
+            if t.device_type.is_some_and(|d| !is_valid_device_type_id(d)) {
+                return Err(ERR);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `raw` は `AclDeviceEntry::targets_raw`（`Tag::Anonymous` に再タグされた
 /// `TargetStruct` array の raw TLV — 上の `AclDeviceEntry` の doc 参照）。
 /// ArrayStart → 各
@@ -716,6 +788,34 @@ pub(crate) fn encode_entry_for_test(privilege: u8, auth_mode: u8, subjects: Vec<
             fabric_index: 0,
         },
     );
+    w.finish()
+}
+
+#[cfg(test)]
+/// テスト専用: `(cluster, endpoint, device_type)` 列 → `AclDeviceEntry::
+/// targets_raw` の形（Anonymous 再タグ済み TargetStruct array）。
+pub(crate) fn encode_targets_for_test(
+    targets: &[(Option<u32>, Option<u16>, Option<u32>)],
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (cluster, endpoint, device_type) in targets {
+        w.start_struct(Tag::Anonymous);
+        match cluster {
+            Some(c) => w.put_uint(Tag::Context(0), u64::from(*c)),
+            None => w.put_null(Tag::Context(0)),
+        }
+        match endpoint {
+            Some(e) => w.put_uint(Tag::Context(1), u64::from(*e)),
+            None => w.put_null(Tag::Context(1)),
+        }
+        match device_type {
+            Some(d) => w.put_uint(Tag::Context(2), u64::from(*d)),
+            None => w.put_null(Tag::Context(2)),
+        }
+        w.end_container();
+    }
+    w.end_container();
     w.finish()
 }
 
@@ -1192,5 +1292,276 @@ mod tests {
         assert!(!is_group_subject(0));
         assert!(!is_group_subject(0x1_0000));
         assert!(!is_group_subject(cat_subject(0xABCD_0001)));
+    }
+
+    // --- validate_entry (spec §11.1.7.1 の制約) ---
+
+    fn entry(
+        privilege: u8,
+        auth_mode: u8,
+        subjects: Vec<u64>,
+        targets_raw: Option<Vec<u8>>,
+    ) -> AclDeviceEntry {
+        AclDeviceEntry {
+            privilege,
+            auth_mode,
+            subjects,
+            targets_raw,
+            fabric_index: 1,
+        }
+    }
+
+    /// spec §11.1.7.1 / chip `AccessControl::Entry` validation の受理側:
+    /// AddNOC 自動 admin 形、`mat group grant` 形（Operate/Group/[gid]/
+    /// targets null）、CAT subject、4 subject / 3 target の上限ちょうど、
+    /// 各 target 1 フィールド指定。
+    #[test]
+    fn validate_entry_accepts_well_formed_entries() {
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_ADMINISTER,
+                AUTH_MODE_CASE,
+                vec![112233],
+                None
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_OPERATE,
+                AUTH_MODE_GROUP,
+                vec![0x0102],
+                None
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![cat_subject(0xABCD_0001)],
+                None
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![], None)),
+            Ok(()),
+            "empty subjects = wildcard"
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1, 2, 3, 4],
+                None
+            )),
+            Ok(())
+        );
+        let three_targets = encode_targets_for_test(&[
+            (Some(0x0006), None, None),
+            (None, Some(1), None),
+            (None, None, Some(0x0100)),
+        ]);
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1],
+                Some(three_targets)
+            )),
+            Ok(())
+        );
+        let ms_cluster = encode_targets_for_test(&[(Some(0xFFF1_FC00), Some(0xFFFE), None)]);
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1],
+                Some(ms_cluster)
+            )),
+            Ok(())
+        );
+    }
+
+    /// 同 validation の拒否側 — 表（spec §3）の各行を 1 ケースずつ。
+    #[test]
+    fn validate_entry_rejects_each_constraint_violation() {
+        const E: Result<(), u8> = Err(im::STATUS_CONSTRAINT_ERROR);
+        // privilege
+        assert_eq!(validate_entry(&entry(0, AUTH_MODE_CASE, vec![1], None)), E);
+        assert_eq!(validate_entry(&entry(6, AUTH_MODE_CASE, vec![1], None)), E);
+        // auth mode: PASE(1) と未知値
+        assert_eq!(validate_entry(&entry(PRIVILEGE_VIEW, 1, vec![1], None)), E);
+        assert_eq!(validate_entry(&entry(PRIVILEGE_VIEW, 0, vec![1], None)), E);
+        assert_eq!(validate_entry(&entry(PRIVILEGE_VIEW, 4, vec![1], None)), E);
+        // Administer × Group
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_ADMINISTER, AUTH_MODE_GROUP, vec![1], None)),
+            E
+        );
+        // subjects 数
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1, 2, 3, 4, 5],
+                None
+            )),
+            E
+        );
+        // CASE subject の形
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![0], None)),
+            E
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![cat_subject(0xABCD_0000)],
+                None
+            )),
+            E
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![OPERATIONAL_NODE_ID_MAX + 1],
+                None
+            )),
+            E
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1, cat_subject(0xABCD_0000)],
+                None
+            )),
+            E,
+            "one bad subject poisons the entry"
+        );
+        // Group subject の形
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_OPERATE, AUTH_MODE_GROUP, vec![0], None)),
+            E
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_OPERATE,
+                AUTH_MODE_GROUP,
+                vec![0x1_0000],
+                None
+            )),
+            E
+        );
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_OPERATE,
+                AUTH_MODE_GROUP,
+                vec![cat_subject(0xABCD_0001)],
+                None
+            )),
+            E
+        );
+        // targets 数
+        let four = encode_targets_for_test(&[(Some(1), None, None); 4]);
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(four))),
+            E
+        );
+        // target: 全 null
+        let empty = encode_targets_for_test(&[(None, None, None)]);
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(empty))),
+            E
+        );
+        // target: endpoint と device_type の同時指定
+        let both = encode_targets_for_test(&[(None, Some(1), Some(0x0100))]);
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(both))),
+            E
+        );
+        // target: cluster 域外（下位 16 bit が 0x8000..=0xFBFF / 0xFFFF）
+        for c in [0x8000u32, 0xFBFF, 0xFFFF, 0x0001_FFFF] {
+            let t = encode_targets_for_test(&[(Some(c), None, None)]);
+            assert_eq!(
+                validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(t))),
+                E,
+                "cluster {c:#x}"
+            );
+        }
+        // target: endpoint 0xFFFF / device_type 下位 16 bit > 0xBFFF
+        let ep = encode_targets_for_test(&[(None, Some(0xFFFF), None)]);
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(ep))),
+            E
+        );
+        let dt = encode_targets_for_test(&[(None, None, Some(0xC000))]);
+        assert_eq!(
+            validate_entry(&entry(PRIVILEGE_VIEW, AUTH_MODE_CASE, vec![1], Some(dt))),
+            E
+        );
+        // target: decode 不能な raw
+        assert_eq!(
+            validate_entry(&entry(
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![1],
+                Some(vec![0xFF])
+            )),
+            E
+        );
+    }
+
+    /// `write` は decode → validate → 容量の順: 全置換で 1 件でも不正なら
+    /// store 不変で CONSTRAINT_ERROR、append も同じ。
+    #[test]
+    fn write_rejects_invalid_entries_and_leaves_store_intact() {
+        let store = AclStore::new();
+        store.add_case_admin(1, 111);
+        let mut h = AccessControlHandler::new(store);
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..InvokeCtx::default()
+        };
+        // 全置換: 正しい 1 件 + CAT v0 の 1 件
+        let tlv = encode_entries_for_test(&[
+            (PRIVILEGE_ADMINISTER, AUTH_MODE_CASE, vec![111]),
+            (
+                PRIVILEGE_VIEW,
+                AUTH_MODE_CASE,
+                vec![cat_subject(0xABCD_0000)],
+            ),
+        ]);
+        assert_eq!(
+            h.write(im::ATTR_ACL, &tlv, false, &mut ctx),
+            Err(im::STATUS_CONSTRAINT_ERROR)
+        );
+        assert!(ctx.changed.is_empty());
+        let entries = decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap());
+        assert_eq!(
+            entries,
+            vec![(PRIVILEGE_ADMINISTER, AUTH_MODE_CASE, vec![111], 1)]
+        );
+        // append: Administer × Group
+        let tlv = encode_entry_for_test(PRIVILEGE_ADMINISTER, AUTH_MODE_GROUP, vec![0x0102]);
+        assert_eq!(
+            h.write(im::ATTR_ACL, &tlv, true, &mut ctx),
+            Err(im::STATUS_CONSTRAINT_ERROR)
+        );
+        assert_eq!(
+            decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
+            1
+        );
+        // append: `mat group grant` 形は通る
+        let tlv = encode_entry_for_test(PRIVILEGE_OPERATE, AUTH_MODE_GROUP, vec![0x0102]);
+        assert_eq!(h.write(im::ATTR_ACL, &tlv, true, &mut ctx), Ok(()));
+        assert_eq!(
+            decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
+            2
+        );
     }
 }
