@@ -7,6 +7,7 @@
 
 use super::ids_gen::CLUSTERS;
 
+/// スカラー型。list / struct の形は `Ty` が持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeTag {
     Bool,
@@ -18,9 +19,52 @@ pub enum TypeTag {
     F64,
     Str,
     Bytes,
-    List,
-    Struct,
+    /// 生成テーブルが型を解決できなかった（符号化は拒否）。
     Unknown,
+}
+
+/// 属性 / コマンド引数 / struct フィールドに共通の型記述。
+#[derive(Clone, Copy)]
+pub enum Ty {
+    Scalar(TypeTag),
+    Struct(&'static StructDef),
+    /// スカラー要素の list（Matter の `array`、TLV Array）。
+    List(TypeTag),
+    ListOfStruct(&'static StructDef),
+}
+
+// 派生 Debug はネストした struct 定義を丸ごと展開してしまうので手書きする。
+impl std::fmt::Debug for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::Scalar(t) => write!(f, "Scalar({t:?})"),
+            Ty::Struct(d) => write!(f, "Struct({})", d.name),
+            Ty::List(t) => write!(f, "List({t:?})"),
+            Ty::ListOfStruct(d) => write!(f, "ListOfStruct({})", d.name),
+        }
+    }
+}
+
+impl Ty {
+    /// 人間可読の型名（parse_error detail 用）。
+    pub fn describe(&self) -> String {
+        format!("{self:?}").to_lowercase()
+    }
+}
+
+/// struct 型の定義（ids_gen.rs の `S_*` static）。`fields` は fieldId 昇順。
+pub struct StructDef {
+    pub name: &'static str,
+    pub fields: &'static [StructField],
+}
+/// struct のフィールド。`id` は TLV context tag。fabric-scoped struct には生成側が
+/// `fabric-index`(254, optional) を末尾に付ける — read 出力の `"254"` をそのまま
+/// 書き戻せるようにするため（サーバは書込時にこの値を無視・置換する）。
+pub struct StructField {
+    pub name: &'static str,
+    pub id: u8,
+    pub ty: Ty,
+    pub optional: bool,
 }
 
 pub struct ClusterDef {
@@ -32,7 +76,7 @@ pub struct ClusterDef {
 pub struct AttrDef {
     pub name: &'static str,
     pub id: u32,
-    pub ty: TypeTag,
+    pub ty: Ty,
     pub writable: bool,
     pub timed_write: bool,
 }
@@ -45,7 +89,7 @@ pub struct CmdDef {
 /// TLV context tag は `CmdDef::fields` 内の添字（0-based）。
 pub struct FieldDef {
     pub name: &'static str,
-    pub ty: TypeTag,
+    pub ty: Ty,
     pub optional: bool,
 }
 
@@ -146,10 +190,21 @@ fn parse_finite_f64(s: &str) -> Result<f64, String> {
     }
 }
 
-/// 型タグに従って CLI 入力文字列をスカラーへ。Err は人間可読の理由
-/// （そのまま parse_error detail に使える）。
-pub fn parse_scalar_typed(input: &str, ty: TypeTag) -> Result<ScalarValue, String> {
+/// 型記述に従って CLI 入力文字列を値へ。Err は人間可読の理由（そのまま
+/// parse_error detail に使える）。スカラーはリテラル構文、list / struct は
+/// JSON（Task 3 で実装 — 本 Task では Err）。
+pub fn parse_value_typed(input: &str, ty: &Ty) -> Result<ScalarValue, String> {
     let s = input.trim();
+    match ty {
+        Ty::Scalar(tag) => parse_scalar_literal(s, *tag),
+        other => Err(format!(
+            "this attribute is a {} type; generic native write supports scalars only (M8a)",
+            other.describe()
+        )),
+    }
+}
+
+fn parse_scalar_literal(s: &str, ty: TypeTag) -> Result<ScalarValue, String> {
     if s == "null" {
         return Ok(ScalarValue::Null); // nullable 属性の消去 write。
     }
@@ -166,18 +221,10 @@ pub fn parse_scalar_typed(input: &str, ty: TypeTag) -> Result<ScalarValue, Strin
             .parse::<i64>()
             .map(ScalarValue::Int)
             .map_err(|_| format!("not an integer: {s:?}")),
-        TypeTag::Str => Ok(ScalarValue::Str(s.to_string())),
-        TypeTag::Bytes => parse_hex_bytes(s).map(ScalarValue::Bytes),
-        TypeTag::List => Err(
-            "this attribute is a list type; generic native write supports scalars only (M8a)"
-                .into(),
-        ),
-        TypeTag::Struct => Err(
-            "this attribute is a struct type; generic native write supports scalars only (M8a)"
-                .into(),
-        ),
         TypeTag::F32 => parse_finite_f64(s).map(|f| ScalarValue::F32(f as f32)),
         TypeTag::F64 => parse_finite_f64(s).map(ScalarValue::F64),
+        TypeTag::Str => Ok(ScalarValue::Str(s.to_string())),
+        TypeTag::Bytes => parse_hex_bytes(s).map(ScalarValue::Bytes),
         TypeTag::Unknown => Err("attribute type unknown; cannot encode value".into()),
     }
 }
@@ -244,7 +291,7 @@ pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass
     };
     let timed = attr.def.map(|d| d.timed_write).unwrap_or(false);
     let parsed = match attr.def {
-        Some(def) => parse_scalar_typed(value, def.ty),
+        Some(def) => parse_value_typed(value, &def.ty),
         None => Ok(parse_scalar_inferred(value)),
     };
     match parsed {
@@ -306,7 +353,7 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
             }
             let mut values = Vec::with_capacity(args.len());
             for (i, arg) in args.iter().enumerate() {
-                match parse_scalar_typed(arg, def.fields[i].ty) {
+                match parse_value_typed(arg, &def.fields[i].ty) {
                     Ok(v) => values.push(v),
                     Err(msg) => {
                         return InvokeClass::Reject(format!(
@@ -361,19 +408,19 @@ mod tests {
     fn resolves_known_attributes_with_types() {
         let a = resolve_attribute(0x0006, "on-off").unwrap();
         assert_eq!(a.id, 0x0000);
-        assert_eq!(a.def.unwrap().ty, TypeTag::Bool);
+        assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::Bool)));
         let a = resolve_attribute(0x0300, "color-temperature-mireds").unwrap();
         assert_eq!(a.id, 0x0007);
-        assert_eq!(a.def.unwrap().ty, TypeTag::UInt);
+        assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::UInt)));
         let a = resolve_attribute(0x0035, "neighbor-table").unwrap();
         assert_eq!(a.id, 0x0007);
-        assert_eq!(a.def.unwrap().ty, TypeTag::List);
+        assert!(matches!(a.def.unwrap().ty, Ty::ListOfStruct(_)));
         let a = resolve_attribute(0x001F, "acl").unwrap();
         assert_eq!(a.id, 0x0000);
-        assert_eq!(a.def.unwrap().ty, TypeTag::List);
+        assert!(matches!(a.def.unwrap().ty, Ty::ListOfStruct(_)));
         let a = resolve_attribute(0x003F, "group-key-map").unwrap();
         assert_eq!(a.id, 0x0000);
-        assert_eq!(a.def.unwrap().ty, TypeTag::List);
+        assert!(matches!(a.def.unwrap().ty, Ty::ListOfStruct(_)));
         let a = resolve_attribute(0x001D, "parts-list").unwrap();
         assert_eq!(a.id, 0x0003);
         // descriptor server-list。
@@ -394,11 +441,14 @@ mod tests {
         assert_eq!(c.id, 0x0A);
         // fields: ColorTemperatureMireds, TransitionTime, OptionsMask, OptionsOverride
         assert_eq!(c.def.unwrap().fields.len(), 4);
-        assert_eq!(c.def.unwrap().fields[0].ty, TypeTag::UInt);
+        assert!(matches!(
+            c.def.unwrap().fields[0].ty,
+            Ty::Scalar(TypeTag::UInt)
+        ));
         let c = resolve_command(0x003F, "key-set-write").unwrap();
         assert_eq!(c.id, 0x00);
         // KeySetWrite の field 0 は GroupKeySetStruct。
-        assert_eq!(c.def.unwrap().fields[0].ty, TypeTag::Struct);
+        assert!(matches!(c.def.unwrap().fields[0].ty, Ty::Struct(_)));
         let c = resolve_command(0x0004, "add-group").unwrap();
         assert_eq!(c.id, 0x00);
         // open-commissioning-window は timed invoke 必須。
@@ -422,12 +472,12 @@ mod tests {
         for cluster in [0x0006u32, 0x0300, 0x0035, 0x001D] {
             let a = resolve_attribute(cluster, "feature-map").unwrap();
             assert_eq!(a.id, 0xFFFC);
-            assert_eq!(a.def.unwrap().ty, TypeTag::UInt);
+            assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::UInt)));
             let a = resolve_attribute(cluster, "cluster-revision").unwrap();
             assert_eq!(a.id, 0xFFFD);
             let a = resolve_attribute(cluster, "attribute-list").unwrap();
             assert_eq!(a.id, 0xFFFB);
-            assert_eq!(a.def.unwrap().ty, TypeTag::List);
+            assert!(matches!(a.def.unwrap().ty, Ty::List(_)));
         }
     }
 
@@ -438,35 +488,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_scalar_typed_scalars() {
+    fn parse_value_typed_scalars() {
         use ScalarValue as V;
-        assert_eq!(parse_scalar_typed("true", TypeTag::Bool), Ok(V::Bool(true)));
-        assert_eq!(parse_scalar_typed("0", TypeTag::Bool), Ok(V::Bool(false)));
-        assert_eq!(parse_scalar_typed("1", TypeTag::Bool), Ok(V::Bool(true)));
-        assert_eq!(parse_scalar_typed("128", TypeTag::UInt), Ok(V::UInt(128)));
-        assert_eq!(parse_scalar_typed("0x80", TypeTag::UInt), Ok(V::UInt(128)));
-        assert_eq!(parse_scalar_typed("-5", TypeTag::Int), Ok(V::Int(-5)));
         assert_eq!(
-            parse_scalar_typed("hello", TypeTag::Str),
+            parse_value_typed("true", &Ty::Scalar(TypeTag::Bool)),
+            Ok(V::Bool(true))
+        );
+        assert_eq!(
+            parse_value_typed("0", &Ty::Scalar(TypeTag::Bool)),
+            Ok(V::Bool(false))
+        );
+        assert_eq!(
+            parse_value_typed("1", &Ty::Scalar(TypeTag::Bool)),
+            Ok(V::Bool(true))
+        );
+        assert_eq!(
+            parse_value_typed("128", &Ty::Scalar(TypeTag::UInt)),
+            Ok(V::UInt(128))
+        );
+        assert_eq!(
+            parse_value_typed("0x80", &Ty::Scalar(TypeTag::UInt)),
+            Ok(V::UInt(128))
+        );
+        assert_eq!(
+            parse_value_typed("-5", &Ty::Scalar(TypeTag::Int)),
+            Ok(V::Int(-5))
+        );
+        assert_eq!(
+            parse_value_typed("hello", &Ty::Scalar(TypeTag::Str)),
             Ok(V::Str("hello".into()))
         );
         assert_eq!(
-            parse_scalar_typed("hex:d0d1", TypeTag::Bytes),
+            parse_value_typed("hex:d0d1", &Ty::Scalar(TypeTag::Bytes)),
             Ok(V::Bytes(vec![0xd0, 0xd1]))
         );
-        assert_eq!(parse_scalar_typed("null", TypeTag::UInt), Ok(V::Null));
+        assert_eq!(
+            parse_value_typed("null", &Ty::Scalar(TypeTag::UInt)),
+            Ok(V::Null)
+        );
     }
 
     #[test]
-    fn parse_scalar_typed_rejects_unsupported_and_bad_literals() {
-        assert!(parse_scalar_typed("[]", TypeTag::List).is_err());
-        assert!(parse_scalar_typed("{}", TypeTag::Struct).is_err());
-        assert!(parse_scalar_typed("abc", TypeTag::UInt).is_err());
-        assert!(parse_scalar_typed("xyz", TypeTag::Bool).is_err());
-        assert!(parse_scalar_typed("hex:zz", TypeTag::Bytes).is_err());
-        assert!(parse_scalar_typed("1", TypeTag::Unknown).is_err());
+    fn parse_value_typed_rejects_unsupported_and_bad_literals() {
+        assert!(parse_value_typed("[]", &Ty::List(TypeTag::UInt)).is_err());
+        assert!(parse_value_typed("{}", &Ty::Struct(&DUMMY)).is_err());
+        assert!(parse_value_typed("abc", &Ty::Scalar(TypeTag::UInt)).is_err());
+        assert!(parse_value_typed("xyz", &Ty::Scalar(TypeTag::Bool)).is_err());
+        assert!(parse_value_typed("hex:zz", &Ty::Scalar(TypeTag::Bytes)).is_err());
+        assert!(parse_value_typed("1", &Ty::Scalar(TypeTag::Unknown)).is_err());
         // エラーメッセージは型名を含む（spec 受け入れ5: AI が判断できる detail）。
-        let e = parse_scalar_typed("[]", TypeTag::List).unwrap_err();
+        let e = parse_value_typed("[]", &Ty::List(TypeTag::UInt)).unwrap_err();
         assert!(e.contains("list"), "{e}");
     }
 
@@ -474,22 +545,34 @@ mod tests {
     fn float_attributes_resolve_to_f32_or_f64() {
         // unittesting (0xFFF1FC05): FloatSingle = single → F32, FloatDouble = double → F64。
         let a = resolve_attribute(0xFFF1FC05, "float-single").unwrap();
-        assert_eq!(a.def.unwrap().ty, TypeTag::F32);
+        assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::F32)));
         let a = resolve_attribute(0xFFF1FC05, "float-double").unwrap();
-        assert_eq!(a.def.unwrap().ty, TypeTag::F64);
+        assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::F64)));
     }
 
     #[test]
-    fn parse_scalar_typed_floats() {
+    fn parse_value_typed_floats() {
         use ScalarValue as V;
-        assert_eq!(parse_scalar_typed("1.5", TypeTag::F64), Ok(V::F64(1.5)));
-        assert_eq!(parse_scalar_typed("-3", TypeTag::F64), Ok(V::F64(-3.0)));
-        assert_eq!(parse_scalar_typed("2e-3", TypeTag::F32), Ok(V::F32(2e-3)));
-        assert_eq!(parse_scalar_typed("null", TypeTag::F32), Ok(V::Null));
+        assert_eq!(
+            parse_value_typed("1.5", &Ty::Scalar(TypeTag::F64)),
+            Ok(V::F64(1.5))
+        );
+        assert_eq!(
+            parse_value_typed("-3", &Ty::Scalar(TypeTag::F64)),
+            Ok(V::F64(-3.0))
+        );
+        assert_eq!(
+            parse_value_typed("2e-3", &Ty::Scalar(TypeTag::F32)),
+            Ok(V::F32(2e-3))
+        );
+        assert_eq!(
+            parse_value_typed("null", &Ty::Scalar(TypeTag::F32)),
+            Ok(V::Null)
+        );
         // nan / inf / 非数値は拒否（TLV には載るがデバイスは CONSTRAINT_ERROR)。
-        assert!(parse_scalar_typed("nan", TypeTag::F64).is_err());
-        assert!(parse_scalar_typed("inf", TypeTag::F32).is_err());
-        assert!(parse_scalar_typed("abc", TypeTag::F64).is_err());
+        assert!(parse_value_typed("nan", &Ty::Scalar(TypeTag::F64)).is_err());
+        assert!(parse_value_typed("inf", &Ty::Scalar(TypeTag::F32)).is_err());
+        assert!(parse_value_typed("abc", &Ty::Scalar(TypeTag::F64)).is_err());
     }
 
     #[test]
@@ -631,5 +714,84 @@ mod tests {
         assert_eq!(parse_scalar_inferred("-1"), V::Int(-1));
         assert_eq!(parse_scalar_inferred("hex:00ff"), V::Bytes(vec![0, 0xff]));
         assert_eq!(parse_scalar_inferred("foo"), V::Str("foo".into()));
+    }
+
+    static DUMMY: StructDef = StructDef {
+        name: "Dummy",
+        fields: &[],
+    };
+
+    #[test]
+    fn struct_schema_is_generated_for_acl_and_group_key_map() {
+        // acl = list of AccessControlEntryStruct（cluster 0x001F スコープ）。
+        let a = resolve_attribute(0x001F, "acl").unwrap();
+        let Ty::ListOfStruct(entry) = a.def.unwrap().ty else {
+            panic!("acl should be ListOfStruct, got {:?}", a.def.unwrap().ty);
+        };
+        assert_eq!(entry.name, "AccessControlEntryStruct");
+        let names: Vec<&str> = entry.fields.iter().map(|f| f.name).collect();
+        assert_eq!(
+            names,
+            [
+                "privilege",
+                "auth-mode",
+                "subjects",
+                "targets",
+                "fabric-index"
+            ]
+        );
+        let subjects = &entry.fields[2];
+        assert_eq!(subjects.id, 3);
+        assert!(matches!(subjects.ty, Ty::List(TypeTag::UInt)));
+        let targets = &entry.fields[3];
+        assert_eq!(targets.id, 4);
+        let Ty::ListOfStruct(t) = targets.ty else {
+            panic!("targets")
+        };
+        assert_eq!(t.name, "AccessControlTargetStruct");
+        assert_eq!(t.fields.len(), 3); // Cluster / Endpoint / DeviceType（fabric-scoped ではない）
+                                       // fabric-index は生成側で付けた暗黙 optional フィールド（read 出力の "254" を書き戻せる）。
+        let fi = &entry.fields[4];
+        assert_eq!((fi.id, fi.optional), (254, true));
+        assert!(matches!(fi.ty, Ty::Scalar(TypeTag::UInt)));
+
+        let a = resolve_attribute(0x003F, "group-key-map").unwrap();
+        let Ty::ListOfStruct(m) = a.def.unwrap().ty else {
+            panic!("group-key-map")
+        };
+        assert_eq!(m.name, "GroupKeyMapStruct");
+        assert_eq!(m.fields[0].name, "group-id");
+        assert_eq!(m.fields[1].name, "group-key-set-id");
+        assert_eq!(m.fields[1].id, 2);
+    }
+
+    #[test]
+    fn command_struct_args_and_scalar_lists_are_typed() {
+        let c = resolve_command(0x003F, "key-set-write").unwrap();
+        let Ty::Struct(ks) = c.def.unwrap().fields[0].ty else {
+            panic!("key-set-write arg0")
+        };
+        assert_eq!(ks.name, "GroupKeySetStruct");
+        assert_eq!(ks.fields.len(), 8);
+        assert!(matches!(ks.fields[2].ty, Ty::Scalar(TypeTag::Bytes))); // EpochKey0
+                                                                        // スカラー list 属性: descriptor server-list = list<cluster_id>。
+        let a = resolve_attribute(0x001D, "server-list").unwrap();
+        assert!(matches!(a.def.unwrap().ty, Ty::List(TypeTag::UInt)));
+        // 同名 struct のクラスタスコープ解決: modeselect の supported-modes は
+        // modeselect 自身の ModeOptionStruct（Label/Mode/SemanticTags）。
+        let a = resolve_attribute(0x0050, "supported-modes").unwrap();
+        let Ty::ListOfStruct(mo) = a.def.unwrap().ty else {
+            panic!("supported-modes")
+        };
+        assert_eq!(mo.fields[0].name, "label");
+        assert_eq!(mo.fields[1].name, "mode");
+    }
+
+    #[test]
+    fn global_attributes_keep_scalar_list_shape() {
+        let a = resolve_attribute(0x0006, "attribute-list").unwrap();
+        assert!(matches!(a.def.unwrap().ty, Ty::List(TypeTag::UInt)));
+        let a = resolve_attribute(0x0006, "feature-map").unwrap();
+        assert!(matches!(a.def.unwrap().ty, Ty::Scalar(TypeTag::UInt)));
     }
 }
