@@ -110,6 +110,12 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   the opposite case and the first of its kind: it is **matd-only**, with no
   direct-path fallback at all (subscriptions need a resident daemon). See
   docs/commands.md ("Routing through matd") for the exact op list.
+- **op → TLV → body lives once**, in `mat-native::op` (`run_node_op` /
+  `run_group_op`). `mat` and `matd` differ only in session strategy
+  (`mat-native::runner::NodeRunner`: one-shot vs warm). Adding an op means
+  one arm in `NodeOpKind` + `run_node_op`, plus the CLI (`cli.rs` / `resolve.rs`
+  / `device_op::classify` / `matd_client::to_op`) and wire (`protocol::Op` /
+  `server::to_device_op`) mappings — never a second copy of the encoding.
 - `mat` couples to the backend only through `mat`'s own JSON schema —
   subcommands and output schema are the contract.
 - **Fragile parts (keep tests):** (1) the **chip-tool INI KVS compatibility** —

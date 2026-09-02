@@ -1136,6 +1136,33 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
 
 ---
 
+### Phase 5 保守 — op 単一ソース化（監査④、2026-09-02）
+
+1 op 追加で `mat` / `matd` の 6 箇所以上の網羅 match と 2 系統の op 実行本体
+（TLV 符号化 + 成功 body 組立）を書いていた構造を解消した。
+
+- **`mat-native::op`**: 解決済み op 型 `NodeOp` / `GroupOp` / `ProvisionParams` と
+  名前解決・換算コンストラクタ（`mat-core::ids` / `color` の規則をここで 1 回だけ
+  適用）、`run_node_op` / `run_group_op` / `run_group_bump` = op → TLV → body の
+  唯一の場所。`budget_applies`（`--op-timeout-ms` / matd `deadline_ms` の対象）もここ。
+- **`mat-native::runner`**: `NodeRunner::with_node` がセッション取得戦略の差し替え点。
+  `mat` = `OneShotRunner`（確立 → 1 op → close → matd へ node_touched ヒント、
+  設計ルール 4）、`matd` = `NativeBackend`（per-node warm slot、Timeout で 1 回だけ
+  再確立、Issue #16 の予算）。`run_node` / `provision` / `grant` は両経路共通。
+- **`mat`**: `device_op::classify` が `Command` → `DeviceOp` の match 1 本
+  （旧 `classify` / `classify_strict` の 2 段は chip-tool fallback の遺物として撤去）。
+  `matd_client::to_op` は `DeviceOp` から wire JSON を組む（wire は名前のまま、契約不変）。
+  matd 経路でも名前解決を mat 側で先に行うため、未知名は matd に送る前に
+  `parse_error` になる（kind / exit / JSON 形は同一）。
+- **`matd`**: `server::to_device_op` が wire `Op` → `MatdOp` の match 1 本
+  （旧 `is_native_hotpath` / `native_op` / `native_group_params` / `group_provision` を撤去）。
+  `protocol.rs` の `Op` と helper、born-dead 判定（`op_state_target`）は不変。
+- 1 op 追加で触る場所: cli / resolve / `device_op::classify` / `to_op` / `protocol::Op` /
+  `to_device_op` / `NodeOpKind` + `run_node_op` の 7 箇所（旧 ~15）。
+- spec: `docs/superpowers/specs/2026-09-02-op-single-source-design.md`。
+
+---
+
 ## Things we never do
 
 - Implement TLV / CASE / multicast routing inside `mat` or `matd` command
