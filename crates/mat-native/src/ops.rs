@@ -660,6 +660,16 @@ mod tests {
             ) -> Result<(), MatError> {
                 unimplemented!()
             }
+            async fn invoke_for_data(
+                &mut self,
+                _endpoint: u16,
+                _cluster: u32,
+                _command: u32,
+                _fields: Option<Vec<u8>>,
+                _timed: bool,
+            ) -> Result<Vec<u8>, MatError> {
+                unimplemented!()
+            }
             async fn read_json(
                 &mut self,
                 _endpoint: u16,
