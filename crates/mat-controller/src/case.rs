@@ -617,7 +617,9 @@ pub struct Established {
     pub session: SecureSession,
     /// 勝った候補アドレス。
     pub peer: SocketAddr,
-    /// 勝った試行の専用ソケットの local addr（`ss -uanp` / tcpdump 突合ログ用）。
+    /// 勝った試行の専用ソケットの bind アドレス（wildcard bind なら `[::]:port`）。
+    /// `ss -uanp` 等とのポート突合用 — IP 部分は bind アドレスそのもので、
+    /// 実際の発信元 IP（OS が経路で選ぶもの）とは限らない。
     pub local: Option<SocketAddr>,
 }
 
@@ -653,29 +655,6 @@ impl std::fmt::Display for EstablishAnyError {
 
 impl std::error::Error for EstablishAnyError {}
 
-/// `peer` 向けの専用ソケットを bind して `connect()` する。
-///
-/// `UdpTransport::bind()`（ワイルドカード bind、他の直経路と同じ流儀）のままだと
-/// `local_addr()` は bind アドレスの `[::]` を返し続け、実際の発信元 IP（宛先
-/// への経路で OS が選ぶもの、例えばループバック宛なら `::1`）と食い違う —
-/// [`Established::local`] はログ突合用の実アドレスを謳っているのでこれでは
-/// 嘘になる。1 試行 1 ソケット・1 peer固定という設計そのままに `connect()`
-/// しておけば `local_addr()` が経路解決済みの正しい値を返すようになり、かつ
-/// 受信も「この connect 先以外は最初から捨てる」という OS レベルの絞り込み
-/// が `UnsecuredExchange::screen` に重ねてかかる（`establish` は常に同じ
-/// `peer` にしか `send_to` しないので害はない）。bind/connect は UDP では
-/// ローカルなカーネル操作のみでブロックしない。
-fn bind_connected(peer: SocketAddr) -> std::io::Result<UdpTransport> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    let unspecified: SocketAddr = match peer {
-        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-    };
-    let sock = std::net::UdpSocket::bind(unspecified)?;
-    sock.connect(peer)?;
-    UdpTransport::from_std(sock)
-}
-
 /// 複数の候補アドレスへ CASE を Happy Eyeballs 方式で確立する: 候補ごとに
 /// **専用の** UDP ソケットを bind し、`stagger` 間隔で [`establish`] を起動、
 /// 最初に成功した試行を採用して残りを drop する（[`crate::race`]）。
@@ -699,7 +678,9 @@ pub async fn establish_any(
     }
     let mut attempts: Vec<(SocketAddr, Arc<Transport>)> = Vec::with_capacity(peers.len());
     for peer in peers {
-        let udp = bind_connected(*peer).map_err(EstablishAnyError::Bind)?;
+        let udp = UdpTransport::bind()
+            .await
+            .map_err(EstablishAnyError::Bind)?;
         attempts.push((*peer, Arc::new(Transport::Udp(Arc::new(udp)))));
     }
 

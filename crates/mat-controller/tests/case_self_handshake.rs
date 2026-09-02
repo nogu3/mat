@@ -160,8 +160,9 @@ async fn establish_any_dead_first_address_falls_through_to_live_second() {
 
     let observed = responder.await.expect("responder task panicked");
     assert_eq!(
-        observed, local,
-        "responder saw the winning attempt's socket"
+        observed.port(),
+        local.port(),
+        "responder saw the winning attempt's socket (wildcard-bound, so compare ports)"
     );
 }
 
