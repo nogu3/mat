@@ -37,11 +37,18 @@ pub(crate) const PRIVILEGE_OPERATE: u8 = 3;
 pub(crate) const PRIVILEGE_MANAGE: u8 = 4;
 pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
 
-/// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が扱う
-/// 唯一の値 — CASE。Group/PASE の auth mode は `check`/`decode_acl_entry_body`
-/// のどちらも意味的に扱わない（PASE は fabric を持たないので ACL の対象
-/// 外、Group は subject 解決を実装していない）。
+/// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が
+/// 照合に使う唯一の値 — CASE。PASE は fabric を持たないので ACL の対象外
+/// （`write` は PASE エントリを `CONSTRAINT_ERROR` で拒否する）。Group
+/// エントリは `write` が受理・検査して保持するが、`check` は CASE
+/// セッションに対して Group エントリを一致させない（groupcast 受信の
+/// 配線 = `Subject` に group 形を足すのは別フェーズ）。
 pub(crate) const AUTH_MODE_CASE: u8 = 2;
+/// `AccessControlEntryAuthModeEnum::Group` — `mat group grant` が書く
+/// エントリの auth mode。`write` の妥当性検査（`validate_entry`）が
+/// subject を GroupId として検査する根拠。
+#[allow(dead_code)]
+pub(crate) const AUTH_MODE_GROUP: u8 = 3;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
 /// `AccessControlEntriesPerFabric` (spec §11.1.5) — 固定値を返すのみで
@@ -64,6 +71,46 @@ pub const CAT_SUBJECT_PREFIX: u64 = 0xFFFF_FFFD;
 /// `Subjects` to grant by tag instead of by node id.
 pub fn cat_subject(cat: u32) -> u64 {
     (CAT_SUBJECT_PREFIX << 32) | u64::from(cat)
+}
+
+/// Operational Node ID の上限 (spec §2.5.5.1: 0x0000_0000_0000_0001 ..=
+/// 0xFFFF_FFEF_FFFF_FFFF)。これより上は予約域（temporary local /
+/// CAT / group 等）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const OPERATIONAL_NODE_ID_MAX: u64 = 0xFFFF_FFEF_FFFF_FFFF;
+
+/// `subject_kind` の答え — CASE 文脈で subject が取れる 2 つの形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum SubjectKind {
+    /// Operational node id（1..=`OPERATIONAL_NODE_ID_MAX`）。
+    Node,
+    /// CASE Authenticated Tag subject（`CAT_SUBJECT_PREFIX` + version ≠ 0）。
+    Cat,
+}
+
+/// CASE 文脈の subject 値（`AddNOC.CaseAdminSubject`、CASE auth mode の
+/// ACL `Subjects` 要素）の形を判定する (spec §6.6.2.1.2 / §2.5.5)。
+/// 0、CAT version 0、CAT prefix 以外の予約域（0xFFFF_FFF0_0000_0000..）は
+/// `None` — 呼び側はこれを `InvalidAdminSubject` / `CONSTRAINT_ERROR` に
+/// 写す。version 0 の CAT は `Subject::matches` でも誰にもマッチしない
+/// が、そもそも書かせないのがここの役目。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn subject_kind(subject: u64) -> Option<SubjectKind> {
+    if (1..=OPERATIONAL_NODE_ID_MAX).contains(&subject) {
+        return Some(SubjectKind::Node);
+    }
+    if subject >> 32 == CAT_SUBJECT_PREFIX && cat_version(subject as u32) != 0 {
+        return Some(SubjectKind::Cat);
+    }
+    None
+}
+
+/// Group auth mode の ACL `Subjects` 要素として妥当か: GroupId そのもの
+/// （1..=0xFFFF、spec §11.1.7.1 "the subject is a GroupId"）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_group_subject(subject: u64) -> bool {
+    (1..=0xFFFF).contains(&subject)
 }
 
 /// The authenticated identity of one CASE session, as the ACL sees it
@@ -1105,5 +1152,45 @@ mod tests {
     #[test]
     fn cat_subject_encodes_the_spec_prefix() {
         assert_eq!(cat_subject(0xABCD_0002), 0xFFFF_FFFD_ABCD_0002);
+    }
+
+    /// spec §6.6.2.1.2 / §2.5.5: CaseAdminSubject と ACL の CASE subject が
+    /// 取れる形は operational node id（1..=0xFFFF_FFEF_FFFF_FFFF）か
+    /// CAT（prefix 0xFFFF_FFFD、version ≠ 0）の 2 つだけ。
+    #[test]
+    fn subject_kind_classifies_node_cat_and_rejects_reserved_values() {
+        // node id の両端
+        assert!(matches!(subject_kind(1), Some(SubjectKind::Node)));
+        assert!(matches!(subject_kind(0xFFFF), Some(SubjectKind::Node)));
+        assert!(matches!(
+            subject_kind(OPERATIONAL_NODE_ID_MAX),
+            Some(SubjectKind::Node)
+        ));
+        // CAT
+        assert!(matches!(
+            subject_kind(cat_subject(0xABCD_0001)),
+            Some(SubjectKind::Cat)
+        ));
+        assert!(matches!(
+            subject_kind(cat_subject(0x0001_FFFF)),
+            Some(SubjectKind::Cat)
+        ));
+        // 無効: 0、CAT version 0、CAT 以外の予約域、予約域の先頭と末尾
+        assert!(subject_kind(0).is_none());
+        assert!(subject_kind(cat_subject(0xABCD_0000)).is_none());
+        assert!(subject_kind(OPERATIONAL_NODE_ID_MAX + 1).is_none()); // 0xFFFF_FFF0_0000_0000
+        assert!(subject_kind(0xFFFF_FFFE_0000_0001).is_none()); // temporary local
+        assert!(subject_kind(0xFFFF_FFFF_FFFF_0001).is_none()); // group range
+        assert!(subject_kind(u64::MAX).is_none());
+    }
+
+    /// Group auth mode の subject は GroupId（1..=0xFFFF）そのもの。
+    #[test]
+    fn is_group_subject_accepts_only_nonzero_u16() {
+        assert!(is_group_subject(1));
+        assert!(is_group_subject(0xFFFF));
+        assert!(!is_group_subject(0));
+        assert!(!is_group_subject(0x1_0000));
+        assert!(!is_group_subject(cat_subject(0xABCD_0001)));
     }
 }
