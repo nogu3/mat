@@ -410,10 +410,13 @@ async fn shutdown_op_stops_server() {
 }
 
 /// group ctx（group 送信用の native コンテキスト）が未構成の native backend は
-/// `mat_native::group::send` が `Unavailable` を返す。M8c-3: フォールバック無しで
-/// 即 store_parse（`mat group provision` への誘導 detail 付き）。
+/// `mat_native::op::run_group_op`（監査④: matd も `mat` 直経路と同じ
+/// `mat_native::op` を経由する）が `MatError::group_ctx_unconfigured()`
+/// （other、本番 `Engine::build` では常に `Some` — テスト注入時のみ到達）を
+/// 返す。旧 matd 固有の store_parse マッピング（`GroupOutcome::Unavailable`
+/// 経由）は単一ソース化で撤去された。
 #[tokio::test]
-async fn group_invoke_without_group_ctx_returns_store_parse() {
+async fn group_invoke_without_group_ctx_returns_other() {
     let (_dir, store_path) = make_store();
     let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), None);
     let (socket, handle) = start_matd(store_path, NativeState::Ready(Box::new(native))).await;
@@ -423,22 +426,23 @@ async fn group_invoke_without_group_ctx_returns_store_parse() {
         &[json!({"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","endpoint":1})],
     )
     .await;
-    assert_eq!(resps[0]["error"]["kind"], "store_parse");
+    assert_eq!(resps[0]["error"]["kind"], "other");
     assert!(resps[0]["error"]["detail"]
         .as_str()
         .unwrap()
-        .contains("native group send unavailable"));
+        .contains("native group context not configured"));
 
     handle.abort();
 }
 
-/// group ctx 未構成の backend への group_bump は send と同じ store_parse。
+/// group ctx 未構成の backend への group_bump は send と同じ other
+/// （`mat_native::op::run_group_bump` 経由、上の group_invoke と同じ理由）。
 #[tokio::test]
-async fn group_bump_without_group_ctx_returns_store_parse() {
+async fn group_bump_without_group_ctx_returns_other() {
     let (store_dir, store_path) = make_store();
     let (socket, handle) = start_matd_with_fake(store_path).await;
     let resps = roundtrip(&socket, &[json!({"op":"group_bump"})]).await;
-    assert_eq!(resps[0]["error"]["kind"], json!("store_parse"));
+    assert_eq!(resps[0]["error"]["kind"], json!("other"));
     handle.abort();
     drop(store_dir);
 }
