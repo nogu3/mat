@@ -56,7 +56,6 @@ pub(crate) fn resolve_discriminator(node_id: u64, discriminator: Option<u16>) ->
 /// `Command` の網羅 match（`_` 無し）: 新しいサブコマンドを足すとここが
 /// コンパイルエラーになり、経路割当の考慮漏れを防ぐ。`Err` = 未解決 alias
 /// （内部バグ）/ 名前未解決 / 値符号化不能 / 不正 color spec。
-#[allow(dead_code)]
 pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
     fn node(node_id: &NodeRef, kind: NodeOpKind) -> Result<Dispatch, MatError> {
         Ok(Dispatch::Device(DeviceOp::Node(NodeOp {

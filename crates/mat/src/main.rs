@@ -106,6 +106,20 @@ fn main() -> ExitCode {
         };
     }
 
+    // Command → DeviceOp（名前解決・換算・color spec は経路によらずここで 1 回。
+    // 未知名・符号化不能・不正 color spec は matd に触れる前に固有 kind で失敗）。
+    let dispatch = match device_op::classify(&command) {
+        Ok(d) => d,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let device_op = match &dispatch {
+        device_op::Dispatch::Device(op) => Some(op),
+        device_op::Dispatch::Dedicated(_) => None,
+    };
+
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
     // 失敗時と非対応 op は下の native 直経路へフォールスルー）。store の locate は
@@ -116,11 +130,19 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD"),
     ) {
         matd_client::Route::Forced(sockets) => {
-            return matd_client::dispatch(&sockets, &command, args.op_timeout_ms)
+            return match &dispatch {
+                device_op::Dispatch::Device(op) => {
+                    matd_client::dispatch(&sockets, op, args.op_timeout_ms)
+                }
+                // 専用コマンド層の op は matd プロトコルに無い（従来どおり exit 2）。
+                device_op::Dispatch::Dedicated(name) => matd_client::unsupported_exit(name),
+            };
         }
         matd_client::Route::Auto(sockets) => {
-            if let Some(code) = matd_client::dispatch_auto(&sockets, &command, args.op_timeout_ms) {
-                return code;
+            if let Some(op) = device_op {
+                if let Some(code) = matd_client::dispatch_auto(&sockets, op, args.op_timeout_ms) {
+                    return code;
+                }
             }
         }
         matd_client::Route::Direct => {}
