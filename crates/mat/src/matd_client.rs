@@ -24,25 +24,28 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::cli::{Command, GroupCommand};
+use crate::cli::Command;
+use crate::device_op::DeviceOp;
 use mat_core::alias::NodeRef;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::socket::default_socket_candidates;
+use mat_native::op::{GroupOpKind, NodeOpKind};
 
 /// matd の構造化エラーを待つ read timeout の余裕。matd は予算ちょうどで構造化
 /// timeout を返すので、こちらは予算 + slack まで待って必ず先に受け取る。
 /// slack を使い切る（= matd が予算内に応答しない）のは旧 matd か matd 停止。
 const CLIENT_SLACK: Duration = Duration::from_secs(2);
 
-/// 単一ノード op（top-level に node_id を持つ op JSON）へ deadline_ms を付与し、
-/// 適用時の read timeout を返す。非対象 op は無変更・read timeout なし。
+/// 予算対象 op（`DeviceOp::budget_applies`）へ deadline_ms を付与し、
+/// 適用時の read timeout を返す。非対象は無変更・read timeout なし。
 /// 0 = 明示無制限（matd 既定 60s の適用を止める）— read timeout も掛けない。
-fn attach_deadline(op: &mut Value, op_timeout_ms: u64) -> Option<Duration> {
-    let Value::Object(map) = op else { return None };
-    if !map.contains_key("node_id") {
+fn attach_deadline(op: &mut Value, applies: bool, op_timeout_ms: u64) -> Option<Duration> {
+    if !applies {
         return None;
     }
-    map.insert("deadline_ms".into(), json!(op_timeout_ms));
+    if let Value::Object(map) = op {
+        map.insert("deadline_ms".into(), json!(op_timeout_ms));
+    }
     (op_timeout_ms > 0).then(|| Duration::from_millis(op_timeout_ms) + CLIENT_SLACK)
 }
 
@@ -112,21 +115,31 @@ fn is_falsy(v: &OsStr) -> bool {
     )
 }
 
-/// `--matd` 指定時のディスパッチ。非対応サブコマンドは CLI 利用の誤り（exit 2）。
-pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> ExitCode {
-    let mut op = match to_op(command) {
-        Ok(op) => op,
+/// `--matd` 強制時の非対応 op。kind=other だが exit 2 を返すのは「2 = CLI
+/// 引数エラー」の documented シグナルを保つ意図的な例外（spec B 節）。
+pub fn unsupported_exit(name: &str) -> ExitCode {
+    MatError::new(ErrorKind::Other, unsupported_detail(name)).emit();
+    ExitCode::from(2)
+}
+
+fn unsupported_detail(name: &str) -> String {
+    format!(
+        "`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)"
+    )
+}
+
+/// `--matd` 指定時のディスパッチ。非対応 op は CLI 利用の誤り（exit 2）。
+/// alias / color spec 解決は `device_op::classify` が既に済ませているため、
+/// ここでの唯一の失敗理由は matd 非対応 op（`to_op` の `Err`）。
+pub fn dispatch(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> ExitCode {
+    let mut op_json = match to_op(op) {
+        Ok(v) => v,
         // 非対応 op は CLI 利用誤り。kind=other(exit_code()=1) だが exit 2 を
         // 返すのは「2 = CLI 引数エラー」の documented シグナルを保つ意図的な
         // 例外（spec B 節、テストでピン留め）。
-        Err(ToOpError::Unsupported(detail)) => {
+        Err(detail) => {
             MatError::new(ErrorKind::Other, &detail).emit();
             return ExitCode::from(2);
-        }
-        // alias / color spec 解決失敗など実エラーは固有 kind / exit を返す。
-        Err(ToOpError::Mat(e)) => {
-            e.emit();
-            return ExitCode::from(e.kind.exit_code());
         }
     };
 
@@ -139,8 +152,8 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> E
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
-    let read_timeout = attach_deadline(&mut op, op_timeout_ms);
-    match exchange_on_stream(stream, &op, read_timeout) {
+    let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
+    match exchange_on_stream(stream, &op_json, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {
             e.emit();
@@ -155,21 +168,11 @@ pub fn dispatch(sockets: &[PathBuf], command: &Command, op_timeout_ms: u64) -> E
 /// connect した stream をそのまま本リクエストに使う（probe 後の再接続はしない）ので、
 /// フォールバックが起きるのは 1 バイトも送る前だけ。接続後のエラーは matd 経路の
 /// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
-pub fn dispatch_auto(
-    sockets: &[PathBuf],
-    command: &Command,
-    op_timeout_ms: u64,
-) -> Option<ExitCode> {
-    // matd 非対応 op（discover / commission / open-window / diag）は probe せず直経路。
-    let mut op = match to_op(command) {
-        Ok(op) => op,
-        Err(ToOpError::Unsupported(_)) => return None,
-        // 実エラーは直経路でも同じ解決関数が同じエラーで失敗する（決定的）。
-        // ここで emit して解決 2 回を 1 回に短縮（stderr / exit は直経路と同一）。
-        Err(ToOpError::Mat(e)) => {
-            e.emit();
-            return Some(ExitCode::from(e.kind.exit_code()));
-        }
+pub fn dispatch_auto(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> Option<ExitCode> {
+    // matd 非対応 op（open-window / diag thread / grant）は probe せず直経路。
+    let mut op_json = match to_op(op) {
+        Ok(v) => v,
+        Err(_) => return None,
     };
 
     let (stream, socket) = match connect_candidates(sockets) {
@@ -184,8 +187,8 @@ pub fn dispatch_auto(
     };
     tracing::info!(socket = %socket.display(), "using matd (auto-detected)");
 
-    let read_timeout = attach_deadline(&mut op, op_timeout_ms);
-    Some(match exchange_on_stream(stream, &op, read_timeout) {
+    let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
+    Some(match exchange_on_stream(stream, &op_json, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {
             e.emit();
@@ -194,237 +197,149 @@ pub fn dispatch_auto(
     })
 }
 
-/// `to_op` のエラー。matd 非対応 op（CLI 利用誤り）と、alias / color spec
-/// 解決失敗など固有 kind を持つ実エラーを区別する（post-1.0 defer:
-/// kind=other / exit 2 不一致の解消）。
-#[derive(Debug)]
-enum ToOpError {
-    /// matd 非対応サブコマンド。forced では kind=other + exit 2 の意図的例外。
-    Unsupported(String),
-    /// 固有 kind を持つ実エラー。forced では kind どおりの exit を返す。
-    Mat(MatError),
-}
-
-/// `id()?` / `resolve_spec(...)?` を to_op 内でそのまま流すための変換。
-impl From<MatError> for ToOpError {
-    fn from(e: MatError) -> Self {
-        ToOpError::Mat(e)
-    }
-}
-
-/// サブコマンドを matd の op JSON に変換する。matd 非対応のものは
-/// `Unsupported`、alias / color spec 解決失敗は固有 kind を保った `Mat`。
-fn to_op(command: &Command) -> Result<Value, ToOpError> {
-    let op = match command {
-        Command::Read {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-        } => json!({
-            "op": "read", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-            "cluster": cluster, "attribute": attribute,
-        }),
-        Command::Write {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-            value,
-        } => json!({
-            "op": "write", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-            "cluster": cluster, "attribute": attribute, "value": value,
-        }),
-        Command::Invoke {
-            node_id,
-            endpoint,
-            cluster,
-            command,
-            args,
-        } => json!({
-            "op": "invoke", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-            "cluster": cluster, "command": command, "args": args,
-        }),
-        Command::Describe { node_id } => json!({ "op": "describe", "node_id": node_id.id()? }),
-        Command::On { node_id, endpoint } => {
-            json!({ "op": "on", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
-        }
-        Command::Off { node_id, endpoint } => {
-            json!({ "op": "off", "node_id": node_id.id()?, "endpoint": endpoint.id()? })
-        }
-        Command::ColorTemp {
-            node_id,
-            endpoint,
-            kelvin,
-            mireds,
-            transition,
-        } => {
-            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み mireds を
-            // 渡し、kelvin は応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
-            let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
-            json!({
-                "op": "color_temp", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-                "mireds": mireds, "kelvin": kelvin, "transition": transition,
-            })
-        }
-        Command::Level {
-            node_id,
-            endpoint,
-            percent,
-            transition,
-        } => {
-            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み level を
-            // 渡し、percent は応答エコー用。
-            let level = crate::units::resolve_level(*percent);
-            json!({
-                "op": "level", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-                "level": level, "percent": percent, "transition": transition,
-            })
-        }
-        Command::Color {
-            node_id,
-            endpoint,
-            spec,
-            transition,
-        } => {
-            // 換算は mat 側で 1 箇所（直経路と同じ規則）。matd へは換算済み 0–254 値を
-            // 渡し、度 / % / name / rgb は応答エコー用。
-            let c = mat_core::color::resolve_spec(
-                spec.name.as_deref(),
-                spec.rgb.as_deref(),
-                spec.hue,
-                spec.sat,
-            )?;
-            let mut op = json!({
-                "op": "color", "node_id": node_id.id()?, "endpoint": endpoint.id()?,
-                "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
-                "hue": c.hue, "saturation": c.sat, "transition": transition,
-            });
-            if let Some(name) = &c.name {
-                op["name"] = json!(name);
+/// `DeviceOp` を matd の op JSON に変換する。wire は名前のまま（`*_in`）—
+/// 契約不変。直経路専用 op は `Err(detail)`。
+fn to_op(op: &DeviceOp) -> Result<Value, String> {
+    Ok(match op {
+        DeviceOp::Node(n) => {
+            let node_id = n.node_id;
+            match &n.kind {
+                NodeOpKind::Read {
+                    endpoint,
+                    cluster_in,
+                    attribute_in,
+                    ..
+                } => json!({
+                    "op": "read", "node_id": node_id, "endpoint": endpoint,
+                    "cluster": cluster_in, "attribute": attribute_in,
+                }),
+                NodeOpKind::Write {
+                    endpoint,
+                    cluster_in,
+                    attribute_in,
+                    value_in,
+                    ..
+                } => json!({
+                    "op": "write", "node_id": node_id, "endpoint": endpoint,
+                    "cluster": cluster_in, "attribute": attribute_in, "value": value_in,
+                }),
+                NodeOpKind::Invoke {
+                    endpoint,
+                    cluster_in,
+                    command_in,
+                    args_in,
+                    ..
+                } => json!({
+                    "op": "invoke", "node_id": node_id, "endpoint": endpoint,
+                    "cluster": cluster_in, "command": command_in, "args": args_in,
+                }),
+                NodeOpKind::Describe => json!({ "op": "describe", "node_id": node_id }),
+                NodeOpKind::On { endpoint } => {
+                    json!({ "op": "on", "node_id": node_id, "endpoint": endpoint })
+                }
+                NodeOpKind::Off { endpoint } => {
+                    json!({ "op": "off", "node_id": node_id, "endpoint": endpoint })
+                }
+                // 換算済み値を渡し、kelvin / percent / 度 / % / name / rgb は
+                // 応答エコー用（matd 側で逆算すると丸めで入力とずれる）。
+                NodeOpKind::ColorTemp {
+                    endpoint,
+                    kelvin,
+                    mireds,
+                    transition,
+                } => json!({
+                    "op": "color_temp", "node_id": node_id, "endpoint": endpoint,
+                    "mireds": mireds, "kelvin": kelvin, "transition": transition,
+                }),
+                NodeOpKind::Level {
+                    endpoint,
+                    percent,
+                    level,
+                    transition,
+                } => json!({
+                    "op": "level", "node_id": node_id, "endpoint": endpoint,
+                    "level": level, "percent": percent, "transition": transition,
+                }),
+                NodeOpKind::Color {
+                    endpoint,
+                    color,
+                    transition,
+                } => {
+                    let mut op = json!({
+                        "op": "color", "node_id": node_id, "endpoint": endpoint,
+                        "hue_raw": color.hue_raw, "saturation_raw": color.sat_raw,
+                        "hue": color.hue, "saturation": color.sat, "transition": transition,
+                    });
+                    if let Some(name) = &color.name {
+                        op["name"] = json!(name);
+                    }
+                    if let Some(rgb) = &color.rgb {
+                        op["rgb"] = json!(rgb);
+                    }
+                    op
+                }
+                // matd は warm CASE セッション層。これらは直経路でしか実行できない。
+                NodeOpKind::DiagThread { .. } => return Err(unsupported_detail("diag")),
+                NodeOpKind::OpenWindow { .. } => return Err(unsupported_detail("open-window")),
             }
-            if let Some(rgb) = &c.rgb {
-                op["rgb"] = json!(rgb);
-            }
-            op
         }
-        Command::Group { action } => match action {
-            GroupCommand::Provision {
-                group_id,
-                node_ids,
-                keyset_id,
-                name,
-                endpoint,
-                epoch_key,
-                rebind,
-            } => {
-                // name 未指定なら group_id から決定的に補完（main の直接経路と同じ規則）。
-                let gid = group_id.id()?;
-                let name = name.clone().unwrap_or_else(|| format!("grp{gid}"));
-                let ids: Vec<u64> = node_ids
-                    .iter()
-                    .map(NodeRef::id)
-                    .collect::<Result<Vec<u64>, MatError>>()?;
-                json!({
-                    "op": "group_provision", "group_id": gid, "node_ids": ids,
-                    "keyset_id": keyset_id, "name": name, "endpoint": endpoint,
-                    "epoch_key": epoch_key, "rebind": rebind,
-                })
-            }
-            GroupCommand::Invoke {
-                group_id,
-                cluster,
-                command,
-                args,
-                endpoint,
-            } => json!({
-                "op": "group_invoke", "group_id": group_id.id()?, "cluster": cluster,
-                "command": command, "args": args, "endpoint": endpoint,
-            }),
-            GroupCommand::Bump => json!({ "op": "group_bump" }),
-            // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
-            // バージョンスキューにも安全なため直経路のみ（matd に op を足さない）。
-            GroupCommand::Grant { .. } => return Err(unsupported("group grant")),
-            GroupCommand::ColorTemp {
-                group_id,
-                kelvin,
-                mireds,
-                transition,
-                endpoint,
-            } => {
-                // 換算は mat 側で 1 箇所（直経路と同じ規則）。kelvin はエコー用。
-                let (mireds, kelvin) = crate::units::resolve_color_temp(*kelvin, *mireds);
-                json!({
-                    "op": "group_color_temp", "group_id": group_id.id()?,
+        DeviceOp::Group(g) => {
+            let (group_id, endpoint) = (g.group_id, g.endpoint);
+            match &g.kind {
+                GroupOpKind::Invoke {
+                    cluster_in,
+                    command_in,
+                    args_in,
+                    ..
+                } => json!({
+                    "op": "group_invoke", "group_id": group_id, "cluster": cluster_in,
+                    "command": command_in, "args": args_in, "endpoint": endpoint,
+                }),
+                GroupOpKind::ColorTemp {
+                    kelvin,
+                    mireds,
+                    transition,
+                } => json!({
+                    "op": "group_color_temp", "group_id": group_id,
                     "mireds": mireds, "kelvin": kelvin,
                     "transition": transition, "endpoint": endpoint,
-                })
-            }
-            GroupCommand::Level {
-                group_id,
-                percent,
-                transition,
-                endpoint,
-            } => {
-                // 換算は mat 側で 1 箇所（直経路と同じ規則）。percent はエコー用。
-                let level = crate::units::resolve_level(*percent);
-                json!({
-                    "op": "group_level", "group_id": group_id.id()?,
+                }),
+                GroupOpKind::Level {
+                    percent,
+                    level,
+                    transition,
+                } => json!({
+                    "op": "group_level", "group_id": group_id,
                     "level": level, "percent": percent,
                     "transition": transition, "endpoint": endpoint,
-                })
-            }
-            GroupCommand::Color {
-                group_id,
-                spec,
-                transition,
-                endpoint,
-            } => {
-                // 換算は mat 側で 1 箇所。度 / % / name / rgb は応答エコー用。
-                let c = mat_core::color::resolve_spec(
-                    spec.name.as_deref(),
-                    spec.rgb.as_deref(),
-                    spec.hue,
-                    spec.sat,
-                )?;
-                let mut op = json!({
-                    "op": "group_color", "group_id": group_id.id()?,
-                    "hue_raw": c.hue_raw, "saturation_raw": c.sat_raw,
-                    "hue": c.hue, "saturation": c.sat,
-                    "transition": transition, "endpoint": endpoint,
-                });
-                if let Some(name) = &c.name {
-                    op["name"] = json!(name);
+                }),
+                GroupOpKind::Color { color, transition } => {
+                    let mut op = json!({
+                        "op": "group_color", "group_id": group_id,
+                        "hue_raw": color.hue_raw, "saturation_raw": color.sat_raw,
+                        "hue": color.hue, "saturation": color.sat,
+                        "transition": transition, "endpoint": endpoint,
+                    });
+                    if let Some(name) = &color.name {
+                        op["name"] = json!(name);
+                    }
+                    if let Some(rgb) = &color.rgb {
+                        op["rgb"] = json!(rgb);
+                    }
+                    op
                 }
-                if let Some(rgb) = &c.rgb {
-                    op["rgb"] = json!(rgb);
-                }
-                op
             }
-        },
-        // matd は warm CASE セッション層。これらは native 直経路でしか実行できない。
-        Command::Discover { .. } => return Err(unsupported("discover")),
-        Command::Commission { .. } => return Err(unsupported("commission")),
-        Command::OpenWindow { .. } => return Err(unsupported("open-window")),
-        Command::Diag { .. } => return Err(unsupported("diag")),
-        // fabric bootstrap は main.rs が経路解決より前に処理するため、
-        // ここへは到達しない（網羅 match を保つためだけの腕）。
-        Command::Fabric { .. } => return Err(unsupported("fabric")),
-        // listen はストリーミング op で main.rs が経路解決より前に先取りする
-        // （`dispatch_listen` 専用経路）ため、ここへは実際には到達しない。
-        Command::Listen { .. } => {
-            return Err(unsupported(
-                "listen (streaming op; handled before route dispatch)",
-            ))
         }
-    };
-    Ok(op)
-}
-
-fn unsupported(name: &str) -> ToOpError {
-    ToOpError::Unsupported(format!(
-        "`mat --matd` does not support the `{name}` subcommand; run it without --matd (direct native path)"
-    ))
+        DeviceOp::GroupProvision(p) => json!({
+            "op": "group_provision", "group_id": p.group_id, "node_ids": p.node_ids,
+            "keyset_id": p.keyset_id, "name": p.name, "endpoint": p.endpoint,
+            "epoch_key": p.epoch_key, "rebind": p.rebind,
+        }),
+        DeviceOp::GroupBump => json!({ "op": "group_bump" }),
+        // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
+        // バージョンスキューにも安全なため直経路のみ。
+        DeviceOp::GroupGrant { .. } => return Err(unsupported_detail("group grant")),
+    })
 }
 
 /// 直経路 op（native_direct）完了後、matd がいれば `node_touched` ヒントを送る
@@ -747,81 +662,70 @@ fn finish_on_timeout(received: u32) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
+    use crate::device_op::DeviceOp;
+    use mat_native::op::{GroupOp, GroupOpKind, NodeOp, NodeOpKind, ProvisionParams};
+
+    fn node(node_id: u64, kind: NodeOpKind) -> DeviceOp {
+        DeviceOp::Node(NodeOp { node_id, kind })
+    }
+    fn group(group_id: u16, endpoint: u16, kind: GroupOpKind) -> DeviceOp {
+        DeviceOp::Group(GroupOp {
+            group_id,
+            endpoint,
+            kind,
+        })
+    }
 
     #[test]
     fn read_maps_to_read_op() {
-        let cmd = Command::Read {
-            node_id: NodeRef::Id(1),
-            endpoint: EndpointRef::Id(2),
-            cluster: "onoff".into(),
-            attribute: "on-off".into(),
-        };
+        let op = node(1, NodeOpKind::read(2, "onoff", "on-off").unwrap());
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({"op":"read","node_id":1,"endpoint":2,"cluster":"onoff","attribute":"on-off"})
         );
     }
 
     #[test]
     fn on_maps_to_on_op_with_endpoint() {
-        let cmd = Command::On {
-            node_id: NodeRef::Id(3),
-            endpoint: EndpointRef::Id(1),
-        };
+        let op = node(3, NodeOpKind::On { endpoint: 1 });
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({"op":"on","node_id":3,"endpoint":1})
         );
     }
 
     #[test]
     fn color_temp_kelvin_maps_to_color_temp_op_with_converted_mireds() {
-        let cmd = Command::ColorTemp {
-            node_id: NodeRef::Id(6),
-            endpoint: EndpointRef::Id(1),
-            kelvin: Some(2700),
-            mireds: None,
-            transition: 30,
-        };
+        let op = node(6, NodeOpKind::color_temp(1, Some(2700), None, 30));
         // 換算（2700K → 370 mireds）は mat 側で行い、kelvin はエコー用に併送する。
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2700,"transition":30})
         );
     }
 
     #[test]
     fn color_temp_mireds_maps_with_computed_kelvin_echo() {
-        let cmd = Command::ColorTemp {
-            node_id: NodeRef::Id(6),
-            endpoint: EndpointRef::Id(1),
-            kelvin: None,
-            mireds: Some(370),
-            transition: 0,
-        };
+        let op = node(6, NodeOpKind::color_temp(1, None, Some(370), 0));
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({"op":"color_temp","node_id":6,"endpoint":1,"mireds":370,"kelvin":2703,"transition":0})
         );
     }
 
     #[test]
     fn color_maps_to_color_op_with_converted_values() {
-        let cmd = Command::Color {
-            node_id: NodeRef::Id(6),
-            endpoint: EndpointRef::Id(1),
-            spec: crate::cli::ColorSpecArgs {
-                name: None,
-                rgb: None,
-                hue: Some(330),
-                sat: Some(80),
+        let op = node(
+            6,
+            NodeOpKind::Color {
+                endpoint: 1,
+                color: mat_core::color::resolve_spec(None, None, Some(330), Some(80)).unwrap(),
+                transition: 30,
             },
-            transition: 30,
-        };
+        );
         // 換算（330° → 233、80% → 203）は mat 側で行い、度 / % はエコー用に併送する。
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"color","node_id":6,"endpoint":1,
                 "hue_raw":233,"saturation_raw":203,
@@ -833,19 +737,17 @@ mod tests {
     #[test]
     fn color_name_op_includes_name_and_rgb_echo() {
         // resolve 層通過後の形（name あり + 正規化済み rgb）。
-        let cmd = Command::Color {
-            node_id: NodeRef::Id(6),
-            endpoint: EndpointRef::Id(1),
-            spec: crate::cli::ColorSpecArgs {
-                name: Some("red".into()),
-                rgb: Some("#ff0000".into()),
-                hue: None,
-                sat: None,
+        let op = node(
+            6,
+            NodeOpKind::Color {
+                endpoint: 1,
+                color: mat_core::color::resolve_spec(Some("red"), Some("#ff0000"), None, None)
+                    .unwrap(),
+                transition: 0,
             },
-            transition: 0,
-        };
+        );
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"color","node_id":6,"endpoint":1,
                 "hue_raw":0,"saturation_raw":254,
@@ -857,20 +759,18 @@ mod tests {
 
     #[test]
     fn group_provision_fills_default_name_and_keeps_null_epoch() {
-        let cmd = Command::Group {
-            action: GroupCommand::Provision {
-                group_id: GroupRef::Id(7),
-                node_ids: vec![NodeRef::Id(1), NodeRef::Id(2)],
-                keyset_id: 42,
-                name: None,
-                endpoint: 1,
-                epoch_key: None,
-                rebind: false,
-            },
-        };
-        // name 未指定は grp<group_id> に補完。epoch_key は null のまま（matd 側で生成）。
+        // name 補完（grp<group_id>）は Task 8 の classify のテストで担保。
+        let op = DeviceOp::GroupProvision(ProvisionParams {
+            group_id: 7,
+            node_ids: vec![1, 2],
+            keyset_id: 42,
+            name: "grp7".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: false,
+        });
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"group_provision","group_id":7,"node_ids":[1,2],
                 "keyset_id":42,"name":"grp7","endpoint":1,"epoch_key":null,
@@ -881,10 +781,40 @@ mod tests {
 
     #[test]
     fn group_bump_maps_to_group_bump_op() {
-        let cmd = Command::Group {
-            action: GroupCommand::Bump,
-        };
-        assert_eq!(to_op(&cmd).unwrap(), json!({ "op": "group_bump" }));
+        assert_eq!(
+            to_op(&DeviceOp::GroupBump).unwrap(),
+            json!({ "op": "group_bump" })
+        );
+    }
+
+    #[test]
+    fn write_invoke_and_group_invoke_keep_names_and_args_on_the_wire() {
+        let w = node(
+            1,
+            NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap(),
+        );
+        assert_eq!(
+            to_op(&w).unwrap(),
+            json!({"op":"write","node_id":1,"endpoint":1,"cluster":"levelcontrol","attribute":"on-level","value":"128"})
+        );
+        let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
+        let i = node(
+            1,
+            NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args).unwrap(),
+        );
+        assert_eq!(
+            to_op(&i).unwrap(),
+            json!({"op":"invoke","node_id":1,"endpoint":1,"cluster":"levelcontrol","command":"move-to-level","args":["128","0","0","0"]})
+        );
+        let g = group(10, 1, GroupOpKind::invoke("onoff", "on", &[]).unwrap());
+        assert_eq!(
+            to_op(&g).unwrap(),
+            json!({"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","args":[],"endpoint":1})
+        );
+        assert_eq!(
+            to_op(&node(1, NodeOpKind::Describe)).unwrap(),
+            json!({"op":"describe","node_id":1})
+        );
     }
 
     #[test]
@@ -977,28 +907,18 @@ mod tests {
     fn group_grant_is_unsupported_via_matd() {
         // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd バージョン
         // スキューにも安全なため直経路のみ（matd プロトコルに op を足さない）。
-        let cmd = Command::Group {
-            action: GroupCommand::Grant {
-                group_id: GroupRef::Id(1),
-                node_ids: vec![NodeRef::Id(5)],
-            },
+        let op = DeviceOp::GroupGrant {
+            group_id: 1,
+            node_ids: vec![5],
         };
-        assert!(to_op(&cmd).is_err());
+        assert!(to_op(&op).unwrap_err().contains("group grant"));
     }
 
     #[test]
     fn group_color_temp_maps_to_group_color_temp_op() {
-        let cmd = Command::Group {
-            action: GroupCommand::ColorTemp {
-                group_id: GroupRef::Id(1),
-                kelvin: Some(2700),
-                mireds: None,
-                transition: 0,
-                endpoint: 1,
-            },
-        };
+        let op = group(1, 1, GroupOpKind::color_temp(Some(2700), None, 0));
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"group_color_temp","group_id":1,
                 "mireds":370,"kelvin":2700,"transition":0,"endpoint":1
@@ -1008,16 +928,9 @@ mod tests {
 
     #[test]
     fn group_level_maps_to_group_level_op() {
-        let cmd = Command::Group {
-            action: GroupCommand::Level {
-                group_id: GroupRef::Id(1),
-                percent: 50,
-                transition: 0,
-                endpoint: 1,
-            },
-        };
+        let op = group(1, 1, GroupOpKind::level(50, 0));
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"group_level","group_id":1,
                 "level":127,"percent":50,"transition":0,"endpoint":1
@@ -1027,21 +940,17 @@ mod tests {
 
     #[test]
     fn group_color_maps_to_group_color_op_with_echo() {
-        let cmd = Command::Group {
-            action: GroupCommand::Color {
-                group_id: GroupRef::Id(1),
-                spec: crate::cli::ColorSpecArgs {
-                    name: Some("blue".into()),
-                    rgb: Some("#0000ff".into()),
-                    hue: None,
-                    sat: None,
-                },
+        let op = group(
+            1,
+            1,
+            GroupOpKind::Color {
+                color: mat_core::color::resolve_spec(Some("blue"), Some("#0000ff"), None, None)
+                    .unwrap(),
                 transition: 0,
-                endpoint: 1,
             },
-        };
+        );
         assert_eq!(
-            to_op(&cmd).unwrap(),
+            to_op(&op).unwrap(),
             json!({
                 "op":"group_color","group_id":1,
                 "hue_raw":169,"saturation_raw":254,
@@ -1071,40 +980,20 @@ mod tests {
         );
     }
 
+    /// 直経路専用 op は matd へ送らない（文言はサブコマンド名入り）。
     #[test]
-    fn discover_and_commission_are_unsupported() {
-        assert!(to_op(&Command::Discover { probe: false }).is_err());
-        assert!(to_op(&Command::Commission {
-            setup_code: "MT:DUMMY".into(),
-            node_id: None,
-            alias: None,
-            thread_dataset: None,
-            transport: crate::cli::TransportArg::Auto,
-        })
-        .is_err());
-    }
-
-    /// post-1.0 defer: to_op のエラー 2 種の分離をピン留め。
-    /// - 非対応 op = Unsupported → forced dispatch は kind=other + exit 2 の
-    ///   意図的例外（「2 = CLI 引数エラー」の documented シグナル維持）。
-    /// - alias 解決失敗 = Mat → 固有 kind / exit（ここでは Other = exit 1）。
-    #[test]
-    fn to_op_separates_unsupported_from_real_errors() {
-        match to_op(&Command::Discover { probe: false }) {
-            Err(ToOpError::Unsupported(msg)) => assert!(msg.contains("discover")),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-        let cmd = Command::On {
-            node_id: NodeRef::Alias("kitchen".into()),
-            endpoint: EndpointRef::Id(1),
-        };
-        match to_op(&cmd) {
-            Err(ToOpError::Mat(e)) => {
-                assert_eq!(e.kind, ErrorKind::Other);
-                assert!(e.detail.contains("kitchen"), "detail={}", e.detail);
-            }
-            other => panic!("expected Mat, got {other:?}"),
-        }
+    fn direct_only_ops_are_unsupported_via_matd() {
+        let dt = node(1, NodeOpKind::DiagThread { endpoint: 0 });
+        assert!(to_op(&dt).unwrap_err().contains("diag"));
+        let ow = node(
+            1,
+            NodeOpKind::OpenWindow {
+                timeout: 180,
+                iteration: 1000,
+                discriminator: 1,
+            },
+        );
+        assert!(to_op(&ow).unwrap_err().contains("open-window"));
     }
 
     /// v1 品質修正 3: matd 経路の途中失敗が一律 `other` だったのを分離。
@@ -1211,32 +1100,22 @@ mod tests {
     }
 
     #[test]
-    fn attach_deadline_only_for_single_node_ops() {
-        // 単一ノード op（top-level node_id あり）: deadline_ms が付き read timeout が返る。
+    fn attach_deadline_only_when_budget_applies() {
         let mut op =
             json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff","attribute":"on-off"});
-        let rt = attach_deadline(&mut op, 15_000);
+        let rt = attach_deadline(&mut op, true, 15_000);
         assert_eq!(op["deadline_ms"], json!(15_000));
         assert_eq!(
             rt,
             Some(std::time::Duration::from_millis(15_000) + CLIENT_SLACK)
         );
-
         // 0 = 明示無制限: フィールドは付く（matd の既定 60s を止める）が read timeout なし。
         let mut op = json!({"op":"on","node_id":3,"endpoint":1});
-        let rt = attach_deadline(&mut op, 0);
+        assert_eq!(attach_deadline(&mut op, true, 0), None);
         assert_eq!(op["deadline_ms"], json!(0));
-        assert_eq!(rt, None);
-
-        // group 系（node_id なし）: 無変更・read timeout なし。
-        let mut op = json!({"op":"group_invoke","group_id":10,"cluster":"onoff","command":"on","endpoint":1});
-        let rt = attach_deadline(&mut op, 15_000);
-        assert!(op.get("deadline_ms").is_none());
-        assert_eq!(rt, None);
-
-        // ping / group_bump も対象外。
-        let mut op = json!({"op":"ping"});
-        assert!(attach_deadline(&mut op, 15_000).is_none());
+        // 対象外（group 系・bump）: 無変更・read timeout なし。
+        let mut op = json!({"op":"group_bump"});
+        assert_eq!(attach_deadline(&mut op, false, 15_000), None);
         assert!(op.get("deadline_ms").is_none());
     }
 

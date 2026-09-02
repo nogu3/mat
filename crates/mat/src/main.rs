@@ -7,11 +7,11 @@
 
 mod cli;
 mod commands;
+mod device_op;
 mod matd_client;
 mod native_direct;
 mod probe;
 mod resolve;
-mod units;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -105,6 +105,20 @@ fn main() -> ExitCode {
         };
     }
 
+    // Command → DeviceOp（名前解決・換算・color spec は経路によらずここで 1 回。
+    // 未知名・符号化不能・不正 color spec は matd に触れる前に固有 kind で失敗）。
+    let dispatch = match device_op::classify(&command) {
+        Ok(d) => d,
+        Err(e) => {
+            e.emit();
+            return ExitCode::from(e.kind.exit_code());
+        }
+    };
+    let device_op = match &dispatch {
+        device_op::Dispatch::Device(op) => Some(op),
+        device_op::Dispatch::Dedicated(_) => None,
+    };
+
     // 経路解決（matd_client::resolve_route）: --matd / MAT_MATD=truthy は強制 matd、
     // MAT_MATD=falsy は強制直、どちらも無ければ自動検出（connect 成功時のみ matd 経由、
     // 失敗時と非対応 op は下の native 直経路へフォールスルー）。store の locate は
@@ -115,11 +129,19 @@ fn main() -> ExitCode {
         std::env::var_os("MAT_MATD"),
     ) {
         matd_client::Route::Forced(sockets) => {
-            return matd_client::dispatch(&sockets, &command, args.op_timeout_ms)
+            return match &dispatch {
+                device_op::Dispatch::Device(op) => {
+                    matd_client::dispatch(&sockets, op, args.op_timeout_ms)
+                }
+                // 専用コマンド層の op は matd プロトコルに無い（従来どおり exit 2）。
+                device_op::Dispatch::Dedicated(name) => matd_client::unsupported_exit(name),
+            };
         }
         matd_client::Route::Auto(sockets) => {
-            if let Some(code) = matd_client::dispatch_auto(&sockets, &command, args.op_timeout_ms) {
-                return code;
+            if let Some(op) = device_op {
+                if let Some(code) = matd_client::dispatch_auto(&sockets, op, args.op_timeout_ms) {
+                    return code;
+                }
             }
         }
         matd_client::Route::Direct => {}
@@ -157,8 +179,8 @@ fn main() -> ExitCode {
         issuer_index: args.issuer_index,
     });
     if let Some(cfg) = &native_cfg {
-        if let Some(result) = native_direct::run(&command, &store_path, cfg, args.op_timeout_ms) {
-            return match result {
+        if let Some(op) = device_op {
+            return match native_direct::run(op, &store_path, cfg, args.op_timeout_ms) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
@@ -169,9 +191,7 @@ fn main() -> ExitCode {
         }
     }
 
-    // native_direct::run が `None` を返す op = 専用コマンド層を持つもの
-    // （discover / commission / diag node）。それ以外の op はすべて native_direct
-    // が処理済み（M8c-3 で chip-tool 経路は撤去）。
+    // `Dispatch::Dedicated` の残り（fabric / listen は早期 return 済み）。
     let result = match &command {
         Command::Discover { probe } => {
             commands::discover::run(&store_path, *probe, native_cfg.as_ref())
@@ -210,8 +230,8 @@ fn main() -> ExitCode {
             .map(mat_core::alias::NodeRef::id)
             .collect::<Result<Vec<u64>, MatError>>()
             .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
-        // 他の全 op は native_direct::run が `Some` を返して上で処理済み。
-        // Command::Fabric は route dispatch より前の早期 return で処理済み。
+        // 他の全 op（`Dispatch::Device`）は上の native_direct::run 早期 return で
+        // 処理済み。Command::Fabric は route dispatch より前の早期 return で処理済み。
         // 不変条件が破れても panic せず typed error（v1 Task6 と同じ規律）。
         _ => Err(MatError::parse_error(
             "internal: op not handled by native_direct::run (route dispatch invariant violated)",

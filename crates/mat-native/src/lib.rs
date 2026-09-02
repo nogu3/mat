@@ -22,7 +22,9 @@ pub mod commission;
 pub mod group;
 pub mod group_settings;
 pub mod iface_select;
+pub mod op;
 pub mod ops;
+pub mod runner;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 

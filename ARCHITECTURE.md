@@ -346,7 +346,8 @@ This repo ships two binaries from one install:
   repainted onto a live subscription before the device's next report can be
   lost to the abandoned one. Two paths feed the same trigger: 経路1 is
   `mat`'s own direct-path ops (`diag` included) firing a fire-and-forget
-  `node_touched` line over the matd socket after `finish_conn`'s close, only
+  `node_touched` line over the matd socket after the one-shot mechanism's
+  close (`OneShotRunner`: establish → op → close → node_touched hint), only
   when a CASE session was actually established (or, since 1.17.0, when the
   op deadline expires — see below); 経路2 is `matd`'s own
   internal cold-establish (or resend-establish) inside a warm op, calling
@@ -1133,6 +1134,44 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   フィルタ→lag 切断、バイナリ統合テストの count/timeout/exit code）で fragile
   part を釘打ち。実機 E2E（人感未着でも Nanoleaf の on-off 変化で検証可能）は
   実装・デプロイ後の別セッションで実施予定 — 本タスクの時点では未実施。
+
+---
+
+### Phase 5 保守 — op 単一ソース化（監査④、2026-09-02）
+
+1 op 追加で `mat` / `matd` の 6 箇所以上の網羅 match と 2 系統の op 実行本体
+（TLV 符号化 + 成功 body 組立）を書いていた構造を解消した。
+
+- **`mat-native::op`**: 解決済み op 型 `NodeOp` / `GroupOp` / `ProvisionParams` と
+  名前解決・換算コンストラクタ（`mat-core::ids` / `color` の規則をここで 1 回だけ
+  適用）、`run_node_op` / `run_group_op` / `run_group_bump` = op → TLV → body の
+  唯一の場所。`budget_applies`（`--op-timeout-ms` / matd `deadline_ms` の対象）もここ。
+- **`mat-native::runner`**: `NodeRunner::with_node` がセッション取得戦略の差し替え点。
+  `mat` = `OneShotRunner`（確立 → 1 op → close → matd へ node_touched ヒント、
+  設計ルール 4）、`matd` = `NativeBackend`（per-node warm slot、Timeout で 1 回だけ
+  再確立、Issue #16 の予算）。`run_node` / `provision` / `grant` は両経路共通。
+- **`mat`**: `device_op::classify` が `Command` → `DeviceOp` の match 1 本
+  （旧 `classify` / `classify_strict` の 2 段は chip-tool fallback の遺物として撤去）。
+  `matd_client::to_op` は `DeviceOp` から wire JSON を組む（wire は名前のまま、契約不変）。
+  matd 経路でも名前解決を mat 側で先に行うため、未知名は matd に送る前に
+  `parse_error` になる（kind / exit / JSON 形は同一）。
+- **`matd`**: `server::to_device_op` が wire `Op` → `MatdOp` の match 1 本
+  （旧 `is_native_hotpath` / `native_op` / `native_group_params` / `group_provision` を撤去）。
+  `protocol.rs` の `Op` と helper、born-dead 判定（`op_state_target`）は不変。
+- 1 op 追加で触る場所: cli / resolve / `device_op::classify` / `to_op` / `protocol::Op` /
+  `to_device_op` / `NodeOpKind` + `run_node_op` の 7 箇所（旧 ~15）。
+- **単一ソース化に伴う挙動差分**（旧経路との差、いずれも kind/exit code 表は不変）:
+  - matd 経路の「group ctx 未構成」エラー（テスト注入時のみ発生 — 本番の
+    `Engine::build` は常に `Some` を返す）は `store_parse` から `other` に
+    変わった（直経路と同一に統一）。未 provision / KVS 不備由来の
+    `GroupOutcome::Unavailable` は従来どおり `store_parse`。
+  - matd 経路でも名前解決と値の符号化（`Reject`）が `require_node` より先に
+    走るようになったため、未 commission ノード × 符号化不能な値の組み合わせは
+    `node_not_commissioned`(11) ではなく `parse_error`(1) になる（直経路と
+    同順に収束）。
+  - 直経路の `group provision` / `grant` は establish 失敗時の `detail` にも
+    `node N: ` を前置するようになった（matd と同一化。kind / exit code 不変）。
+- spec: `docs/superpowers/specs/2026-09-02-op-single-source-design.md`。
 
 ---
 

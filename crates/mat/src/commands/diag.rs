@@ -6,8 +6,9 @@
 //! を読み取れる。
 //!
 //! バックエンド実行は native 直経路（`native_direct`）が担う（M8c-3 で chip-tool
-//! 経路は撤去）。`diag thread` の emit（`emit_diag_thread_success`）は native 経路の
-//! 単一ソース。`diag node` は native IM probe（operational + thread）に加え、
+//! 経路は撤去）。`diag thread` の成功 body は `mat_core::body::diag_thread_success`
+//! （直経路・matd 共有の単一ソース、`mat_native::op::run_node_op` 経由）。
+//! `diag node` は native IM probe（operational + thread）に加え、
 //! `--deep` の補助プローブ（ping6 / native mDNS targeted resolve）をこのモジュール
 //! で実施する（Task 11 で avahi-browse フォールバックを撤去 — mDNS は dnssd 一本）。
 
@@ -21,26 +22,6 @@ use mat_core::diag::{derive_verdict, parse_ping6, Checks, IpCheck, MdnsCheck, Op
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
 use mat_core::store::Store;
-
-/// `diag thread` の成功 JSON を stdout へ emit する。native 直経路
-/// （`native_direct`）から呼ばれる単一ソース（スキーマ不変）。
-/// `unavailable` は空なら省略する（native 経路では通常空 — `ops::diag_thread`
-/// のコメント参照）。
-pub(crate) fn emit_diag_thread_success(
-    node_id: u64,
-    endpoint: u16,
-    thread: Map<String, Value>,
-    unavailable: Vec<Value>,
-) {
-    let mut body = Map::new();
-    body.insert("node_id".to_string(), json!(node_id));
-    body.insert("endpoint".to_string(), json!(endpoint));
-    body.insert("thread".to_string(), Value::Object(thread));
-    if !unavailable.is_empty() {
-        body.insert("unavailable".to_string(), Value::Array(unavailable));
-    }
-    output::emit(Value::Object(body));
-}
 
 /// `mat diag node` — 到達不能の根本原因を層別チェックで分類する。
 pub fn node(

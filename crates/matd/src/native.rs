@@ -1,27 +1,19 @@
 //! matd の native バックエンド（Phase 5 M4、M8c-3 で唯一の実行経路に）。
 //!
-//! mat-controller の warm CASE セッションを matd プロセス内に保持し、read/write/
-//! invoke/on/off/色/色温度/describe/group を in-process で処理する。名前解決
-//! できない cluster/attribute/command や、native 構築そのものの失敗は
-//! server 層が per-op のハードエラーへ変換する（chip-tool フォールバックは
-//! M8c-3 で撤去済み）。
-//!
-//! 確立器・group 送信のコアロジックは `mat-native`（mat one-shot と共有）に
-//! 集約されている。ここに残るのは warm session を per-node に保持する責務のみ。
+//! op の実体は `mat_native::op` / `runner`（mat one-shot と共有）。確立器・
+//! group 送信のコアロジックも `mat-native` に集約されている。ここに残るのは
+//! warm session を per-node に保持する責務（`NodeRunner` 実装）のみ。
 
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use mat_controller::im::{
-    self, CLUSTER_COLOR_CONTROL, CLUSTER_LEVEL_CONTROL, CLUSTER_ON_OFF,
-    CMD_MOVE_TO_COLOR_TEMPERATURE, CMD_MOVE_TO_HUE_AND_SATURATION, CMD_MOVE_TO_LEVEL,
-    CMD_ON_OFF_OFF, CMD_ON_OFF_ON,
-};
 use mat_core::error::{ErrorKind, MatError};
+use mat_native::runner::NodeRunner;
 
 pub use mat_native::group::{GroupCtx, GroupOutcome};
 pub use mat_native::{Establisher, NativeConfig, NodeConn, Resolver};
@@ -163,6 +155,12 @@ impl NativeBackend {
     /// （`server::group_provision`）は internal エラーとして拒否する（M8c-3）。
     pub fn group_settings_ctx(&self) -> Option<&mat_native::group_settings::GroupSettingsCtx> {
         self.engine.group_settings.as_ref()
+    }
+
+    /// group 送信 / group_settings / 確立器を持つ共有エンジン（`mat_native::op`
+    /// の group 系関数が受ける）。
+    pub fn engine(&self) -> &mat_native::Engine {
+        &self.engine
     }
 
     /// この node の per-node slot（`Arc<Mutex<Option<..>>>`）を得る。外側ロックは
@@ -354,193 +352,6 @@ impl NativeBackend {
         }
     }
 
-    pub async fn read_onoff(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        deadline: Option<Instant>,
-    ) -> Result<bool, MatError> {
-        self.with_session(node_id, deadline, |c| c.read_onoff(endpoint))
-            .await
-    }
-
-    pub async fn on(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        self.with_session(node_id, deadline, |c| {
-            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None, false)
-        })
-        .await
-    }
-
-    pub async fn off(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        self.with_session(node_id, deadline, |c| {
-            c.invoke(endpoint, CLUSTER_ON_OFF, CMD_ON_OFF_OFF, None, false)
-        })
-        .await
-    }
-
-    pub async fn color(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        hue_raw: u8,
-        saturation_raw: u8,
-        transition: u16,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        let fields =
-            im::encode_move_to_hue_and_saturation_fields(hue_raw, saturation_raw, transition);
-        self.with_session(node_id, deadline, move |c| {
-            c.invoke(
-                endpoint,
-                CLUSTER_COLOR_CONTROL,
-                CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(fields.clone()),
-                false,
-            )
-        })
-        .await
-    }
-
-    pub async fn color_temp(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        mireds: u16,
-        transition: u16,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        let fields = im::encode_move_to_color_temperature_fields(mireds, transition);
-        self.with_session(node_id, deadline, move |c| {
-            c.invoke(
-                endpoint,
-                CLUSTER_COLOR_CONTROL,
-                CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(fields.clone()),
-                false,
-            )
-        })
-        .await
-    }
-
-    pub async fn level(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        level: u8,
-        transition: u16,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        let fields = im::encode_move_to_level_fields(level, transition);
-        self.with_session(node_id, deadline, move |c| {
-            c.invoke(
-                endpoint,
-                CLUSTER_LEVEL_CONTROL,
-                CMD_MOVE_TO_LEVEL,
-                Some(fields.clone()),
-                false,
-            )
-        })
-        .await
-    }
-
-    /// 単一属性を任意形状で JSON 読み取る（汎用 read、M8a Task10）。
-    pub async fn read_json(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        cluster: u32,
-        attribute: u32,
-        deadline: Option<Instant>,
-    ) -> Result<serde_json::Value, MatError> {
-        self.with_session(node_id, deadline, move |c| {
-            c.read_json(endpoint, cluster, attribute)
-        })
-        .await
-    }
-
-    /// 単一属性へ 1 個の TLV 要素を書き込む（汎用 write、M8a Task10）。
-    #[allow(clippy::too_many_arguments)] // deadline（Issue #16）追加で 7→8。分割は可読性を落とすだけ。
-    pub async fn write_tlv(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        cluster: u32,
-        attribute: u32,
-        data_tlv: Vec<u8>,
-        timed: bool,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        self.with_session(node_id, deadline, move |c| {
-            c.write_tlv(endpoint, cluster, attribute, data_tlv.clone(), timed)
-        })
-        .await
-    }
-
-    /// 任意のクラスタコマンドを実行する（汎用 invoke、M8a Task10）。
-    #[allow(clippy::too_many_arguments)] // deadline（Issue #16）追加で 7→8。分割は可読性を落とすだけ。
-    pub async fn invoke_generic(
-        &self,
-        node_id: u64,
-        endpoint: u16,
-        cluster: u32,
-        command: u32,
-        fields: Option<Vec<u8>>,
-        timed: bool,
-        deadline: Option<Instant>,
-    ) -> Result<(), MatError> {
-        self.with_session(node_id, deadline, move |c| {
-            c.invoke(endpoint, cluster, command, fields.clone(), timed)
-        })
-        .await
-    }
-
-    /// ノードを introspect する（`mat describe` 相当、M8a Task10）。
-    pub async fn describe(
-        &self,
-        node_id: u64,
-        deadline: Option<Instant>,
-    ) -> Result<Vec<(u16, Vec<u64>)>, MatError> {
-        self.with_session(node_id, deadline, |c| {
-            Box::pin(mat_native::ops::describe(c.as_mut()))
-        })
-        .await
-    }
-
-    /// group provision のデバイス側 4 ステップを 1 ノードへ実行する
-    /// （`mat group provision` のデバイス側相当、M8a Task10）。
-    ///
-    /// `p` は closure ごとに clone して `async move` ブロックへ渡す ——
-    /// `with_session` の `F: for<'a> Fn(...) -> Pin<Box<dyn Future + 'a>>` は
-    /// 戻り値の Future が `'a`（= 引数の conn の借用）以外の外部借用を持てない
-    /// （closure 環境への参照は self の匿名生存期間に縛られ 'a と無関係なため
-    /// コンパイルが通らない）。値を async ブロックへ move すれば Future 自身が
-    /// 所有するため 'a のみで閉じる。
-    ///
-    /// provision は deadline 対象外（spec）— 内部で `with_session(.., None, ..)`
-    /// を渡し、常に無制限予算で実行する。
-    pub async fn provision_node(
-        &self,
-        node_id: u64,
-        p: &mat_native::ops::ProvisionNodeParams,
-    ) -> Result<(), MatError> {
-        let p = p.clone();
-        self.with_session(node_id, None, move |c| {
-            let p = p.clone();
-            Box::pin(async move { mat_native::ops::provision_node(c.as_mut(), &p).await })
-        })
-        .await
-    }
-
     /// 購読専用コネクション（専用ソケット + 専用 CASE）を確立する。warm session
     /// slot（`with_session`）とは独立 — 購読ポンプが独占する。
     pub async fn establish_subscription(
@@ -552,34 +363,28 @@ impl NativeBackend {
             .establish_subscription(node_id)
             .await
     }
+}
 
-    /// group へ groupcast を 1 発送る。native で送れない事情（未 provision・
-    /// KVS 不備・counter 初期化不能）は `Unavailable` で返し、送出自体の失敗
-    /// （socket）だけを Err にする。
-    pub async fn group_invoke(
+/// warm セッション戦略の差し替え点: `with_session`（per-node slot、Timeout で
+/// 1 回だけ再確立、deadline 予算、`on_new_session` 発火）をそのまま使う。
+#[async_trait]
+impl NodeRunner for NativeBackend {
+    async fn with_node<T, F>(
         &self,
-        group_id: u16,
-        cluster: u32,
-        command: u32,
-        fields: Option<Vec<u8>>,
-    ) -> Result<GroupOutcome, MatError> {
-        let Some(ctx) = &self.engine.group else {
-            return Ok(GroupOutcome::Unavailable(
-                "native group context not configured".into(),
-            ));
-        };
-        mat_native::group::send(ctx, group_id, cluster, command, fields).await
-    }
-
-    /// group 送信 counter の窓ジャンプ（Issue #14）。ctx 未構成は send と同じ
-    /// Unavailable（消費側で store_parse 化）。
-    pub async fn group_bump(&self) -> mat_native::group::BumpOutcome {
-        let Some(ctx) = &self.engine.group else {
-            return mat_native::group::BumpOutcome::Unavailable(
-                "native group context not configured".into(),
-            );
-        };
-        mat_native::group::bump(ctx).await
+        node_id: u64,
+        deadline: Option<Instant>,
+        f: F,
+    ) -> Result<T, MatError>
+    where
+        T: Send,
+        F: for<'a> Fn(
+                &'a mut Box<dyn NodeConn>,
+            ) -> Pin<
+                Box<dyn std::future::Future<Output = Result<T, MatError>> + Send + 'a>,
+            > + Send
+            + Sync,
+    {
+        self.with_session(node_id, deadline, f).await
     }
 }
 
@@ -589,6 +394,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    /// 旧 `NativeBackend::read_onoff` 相当（with_session の挙動テスト用）。
+    async fn read_onoff(
+        b: &NativeBackend,
+        node_id: u64,
+        endpoint: u16,
+        deadline: Option<Instant>,
+    ) -> Result<bool, MatError> {
+        b.with_node(node_id, deadline, move |c| c.read_onoff(endpoint))
+            .await
+    }
 
     #[tokio::test]
     async fn deadline_cuts_send_and_drops_slot() {
@@ -600,15 +416,14 @@ mod tests {
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         let deadline = Some(Instant::now() + Duration::from_millis(50));
-        let err = backend
-            .read_onoff(0x1234, 1, deadline)
+        let err = read_onoff(&backend, 0x1234, 1, deadline)
             .await
             .expect_err("deadline must cut the slow send");
         assert_eq!(err.kind, ErrorKind::Timeout);
         assert!(err.detail.contains("in send"), "detail: {}", err.detail);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // slot は破棄済み: 無制限の次 op は再確立してから成功する。
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -620,8 +435,7 @@ mod tests {
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         let deadline = Some(Instant::now() + Duration::from_millis(50));
-        let err = backend
-            .read_onoff(0x1234, 1, deadline)
+        let err = read_onoff(&backend, 0x1234, 1, deadline)
             .await
             .expect_err("deadline must cut the slow establish");
         assert_eq!(err.kind, ErrorKind::Timeout);
@@ -644,15 +458,14 @@ mod tests {
         let backend = NativeBackend::with_establisher(Box::new(est));
         // fake の失敗は即時なので、残り予算 ≈ 5s < RETRY_MIN_BUDGET(10s)。
         let deadline = Some(Instant::now() + Duration::from_secs(5));
-        let err = backend
-            .read_onoff(0x1234, 1, deadline)
+        let err = read_onoff(&backend, 0x1234, 1, deadline)
             .await
             .expect_err("timeout must surface when retry is skipped");
         assert_eq!(err.kind, ErrorKind::Timeout);
         // 再確立していない: establish は初回の 1 回だけ。
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // slot は破棄済み（MRP 尽きの session は持ち越さない）。
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -668,7 +481,7 @@ mod tests {
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 残り予算 ≈ 60s ≥ RETRY_MIN_BUDGET → 従来どおり再確立+再送。
         let deadline = Some(Instant::now() + Duration::from_secs(60));
-        let v = backend.read_onoff(0x1234, 1, deadline).await.unwrap();
+        let v = read_onoff(&backend, 0x1234, 1, deadline).await.unwrap();
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -683,8 +496,8 @@ mod tests {
             ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         // 2 回のコマンドで establish は 1 回だけ（warm 再利用）。
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -700,7 +513,7 @@ mod tests {
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が Timeout → slot 破棄 → 再確立 → 再送成功。
-        let v = backend.read_onoff(0x1234, 1, None).await.unwrap();
+        let v = read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -717,16 +530,14 @@ mod tests {
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が DeviceRejected（コマンドは届いている）→ 再確立せず
         // そのままエラーを返す契約 (3)。
-        let err = backend
-            .read_onoff(0x1234, 1, None)
+        let err = read_onoff(&backend, 0x1234, 1, None)
             .await
             .expect_err("device rejected must surface as an error");
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // slot は破棄されず維持される: 同ノードへの 2 回目のコマンドは warm 再利用で
         // 成功し、establish は 1 のまま（session 健全なので捨てない）。
-        let v = backend
-            .read_onoff(0x1234, 1, None)
+        let v = read_onoff(&backend, 0x1234, 1, None)
             .await
             .expect("warm session must be reused after device_rejected");
         assert!(v);
@@ -745,29 +556,17 @@ mod tests {
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が session 致命エラー（Other=復号失敗/counter desync 等）。
         // (a) エラー kind は Other、(b) 再送しない → establish は 1 回のみ。
-        let err = backend
-            .read_onoff(0x1234, 1, None)
+        let err = read_onoff(&backend, 0x1234, 1, None)
             .await
             .expect_err("session-fatal error must surface");
         assert_eq!(err.kind, ErrorKind::Other);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // (c) 死んだ session は破棄済み → 2 回目のコマンドで再確立して成功。
-        let v = backend
-            .read_onoff(0x1234, 1, None)
+        let v = read_onoff(&backend, 0x1234, 1, None)
             .await
             .expect("session must be lazily re-established after fatal error");
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn group_invoke_without_ctx_is_unavailable() {
-        let b = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let r = b
-            .group_invoke(10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
-            .await
-            .unwrap();
-        assert!(matches!(r, GroupOutcome::Unavailable(_)));
     }
 
     #[test]
@@ -801,14 +600,14 @@ mod tests {
         };
         let backend = std::sync::Arc::new(NativeBackend::with_establisher(Box::new(est)));
         // warm session を作る（establish 1 回目）。
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         // 別 op が実行中のように slot を握った状態で drop_session を呼ぶ。
         let slot = backend.slot(0x1234).await;
         let guard = slot.lock().await;
         backend.drop_session(0x1234).await; // 待たず・破棄せず即返る
         drop(guard);
         // session は生きている: 次 op は warm 再利用で establish は 1 回のまま。
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -827,7 +626,7 @@ mod tests {
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
         // 1 回目の send が Timeout → 旧 conn を close してから捨て、再確立して再送成功。
-        let v = backend.read_onoff(0x1234, 1, None).await.unwrap();
+        let v = read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert!(v);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
@@ -841,7 +640,7 @@ mod tests {
             ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         backend.drop_session(0x1234).await;
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
@@ -854,10 +653,10 @@ mod tests {
             ..Default::default()
         };
         let backend = NativeBackend::with_establisher(Box::new(est));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         backend.drop_session(0x1234).await;
         // slot は破棄済み: 次 op は再確立する。
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -871,7 +670,7 @@ mod tests {
         backend.set_on_new_session(Box::new(move |_node_id| {
             fired2.fetch_add(1, Ordering::SeqCst);
         }));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
@@ -885,8 +684,8 @@ mod tests {
         backend.set_on_new_session(Box::new(move |_node_id| {
             fired2.fetch_add(1, Ordering::SeqCst);
         }));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         // cold 1回 → 2回目の op（warm 再利用）→ 計1回のまま。
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
@@ -906,7 +705,7 @@ mod tests {
         backend.set_on_new_session(Box::new(move |_node_id| {
             fired2.fetch_add(1, Ordering::SeqCst);
         }));
-        backend.read_onoff(0x1234, 1, None).await.unwrap();
+        read_onoff(&backend, 0x1234, 1, None).await.unwrap();
         // 同一 with_session 呼び出し内で cold + resend-establish の 2 回
         // 新設が起きても発火は 1 回のみ（op 完了後に一度だけ判定するため）。
         assert_eq!(fired.load(Ordering::SeqCst), 1);

@@ -6,8 +6,10 @@
 //! クラスの再発防止)。timestamp は含めない — 直経路は `output::emit`、
 //! matd は応答 envelope が付与する。
 //!
-//! 対象は両経路に存在する op のみ。直経路専用 op(open-window / diag /
-//! grant / discover / commission 等)の emit は重複が無いため `mat` 側に残す。
+//! 直経路専用 op(open-window / diag thread / grant)の body もここに置く
+//! (mat-native::op::run_node_op / runner::grant が経路によらず組むため)。
+//! discover / commission / diag node / mesh は専用コマンド層(`mat/commands`)
+//! が emit する。
 
 use serde_json::{json, Value};
 
@@ -270,6 +272,64 @@ pub fn group_provision_success(
     body
 }
 
+/// `diag thread` の成功 body。`unavailable` は (chip-tool 属性名, kind)
+/// — 空なら `unavailable` キー自体を出さない（既存形）。
+pub fn diag_thread_success(
+    node_id: u64,
+    endpoint: u16,
+    thread: serde_json::Map<String, Value>,
+    unavailable: &[(String, crate::error::ErrorKind)],
+) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("node_id".to_string(), json!(node_id));
+    body.insert("endpoint".to_string(), json!(endpoint));
+    body.insert("thread".to_string(), Value::Object(thread));
+    if !unavailable.is_empty() {
+        let rows: Vec<Value> = unavailable
+            .iter()
+            .map(|(attr, kind)| {
+                json!({
+                    "attribute": attr,
+                    "kind": serde_json::to_value(kind).unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        body.insert("unavailable".to_string(), Value::Array(rows));
+    }
+    Value::Object(body)
+}
+
+/// `open-window` の成功 body。`expires_at` は timeout 秒後の ISO 8601。
+pub fn open_window_success(
+    node_id: u64,
+    manual_code: &str,
+    qr_payload: &str,
+    timeout: u32,
+) -> Value {
+    json!({
+        "node_id": node_id,
+        "manual_code": manual_code,
+        "qr_payload": qr_payload,
+        "expires_at": crate::output::expires_in(i64::from(timeout)),
+    })
+}
+
+/// `group grant` の成功 body。
+pub fn group_grant_success(
+    group_id: u16,
+    node_ids: &[u64],
+    updated: &[u64],
+    unchanged: &[u64],
+) -> Value {
+    json!({
+        "group_id": group_id,
+        "nodes": node_ids,
+        "updated": updated,
+        "unchanged": unchanged,
+        "status": "granted",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +570,46 @@ mod tests {
         );
         let with_note = group_provision_success(10, 60, "living", 1, &[5], Some("x"));
         assert_eq!(with_note["note"], json!("x"));
+    }
+
+    #[test]
+    fn diag_thread_success_omits_empty_unavailable() {
+        let mut thread = serde_json::Map::new();
+        thread.insert("channel".into(), json!(15));
+        let body = diag_thread_success(5, 0, thread.clone(), &[]);
+        assert_eq!(
+            body,
+            json!({ "node_id": 5, "endpoint": 0, "thread": { "channel": 15 } })
+        );
+        let body = diag_thread_success(
+            5,
+            0,
+            thread,
+            &[("rloc16".to_string(), crate::error::ErrorKind::Timeout)],
+        );
+        assert_eq!(
+            body["unavailable"],
+            json!([{ "attribute": "rloc16", "kind": "timeout" }])
+        );
+    }
+
+    #[test]
+    fn open_window_success_shape() {
+        let body = open_window_success(5, "34970112332", "MT:ABC", 180);
+        assert_eq!(body["node_id"], 5);
+        assert_eq!(body["manual_code"], "34970112332");
+        assert_eq!(body["qr_payload"], "MT:ABC");
+        assert!(body["expires_at"].is_string());
+    }
+
+    #[test]
+    fn group_grant_success_shape() {
+        assert_eq!(
+            group_grant_success(10, &[5, 6], &[5], &[6]),
+            json!({
+                "group_id": 10, "nodes": [5, 6], "updated": [5],
+                "unchanged": [6], "status": "granted",
+            })
+        );
     }
 }

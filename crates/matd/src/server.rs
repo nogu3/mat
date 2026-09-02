@@ -20,7 +20,6 @@ use tokio::sync::{broadcast, Notify};
 
 use mat_controller::im;
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::group::resolve_epoch_key;
 use mat_core::output::now_iso8601;
 use mat_core::store::Store;
 
@@ -577,6 +576,9 @@ async fn dispatch(
 /// 名前解決できない cluster/attribute/command（chip-tool 互換の任意名を受けられた
 /// 旧経路の名残）は [`MatError::unresolved_op`] で即 parse_error にする — フォールバック
 /// 先が無いため（数値 ID は resolve 済みなので影響しない）。
+///
+/// 名前解決・値符号化は `to_device_op` → `mat_native::op` に集約（監査④）。
+/// 未解決名は `require_node` より先に `parse_error` になる（mat 直経路と同順）。
 async fn run_op(
     op: &Op,
     native: &NativeState,
@@ -603,104 +605,240 @@ async fn run_op(
         NativeState::Unavailable(e) => return Err(e.clone()),
     };
 
-    if is_native_hotpath(op) {
-        let result = native_op(op, native, store_path, deadline).await;
-        if result.is_ok() {
+    match to_device_op(op)? {
+        MatdOp::Node(node_op) => {
+            // commission 済みか毎回 KVS で確認する。
+            require_node(store_path, node_op.node_id)?;
+            let body = mat_native::runner::run_node(native.as_ref(), &node_op, deadline).await?;
             // 前提: デバイスは invoke 応答を先に、購読 report を後に送る。
             // report が note_op より先に pump へ届く逆順だと pending が残り
-            // 健全購読を 1 回余分に再購読するが、それが最悪ケース（イベント
-            // 自体は配信済みで priming が状態を再配達する）。
+            // 健全購読を 1 回余分に再購読するが、それが最悪ケース。
             note_op_expectation(op, health);
+            Ok(body)
         }
-        return result;
-    }
-
-    if let Some(result) = native_group_params(op) {
-        return match result {
-            Ok((group_id, cluster, command, fields, build_body)) => {
-                // chip-tool 撤去前と同じ前提チェック（store が開けること）。
-                let _store = Store::open(store_path)?;
-                match native
-                    .group_invoke(group_id, cluster, command, fields)
-                    .await?
-                {
-                    crate::native::GroupOutcome::Sent { egress } => Ok(build_body(&egress)),
-                    crate::native::GroupOutcome::Unavailable(reason) => {
-                        Err(MatError::group_unavailable(&reason))
-                    }
-                }
-            }
-            // 名前は解決できたが引数が符号化不能 → 即座に拒否（mat 側
-            // classify_strict と同じ規則）。
-            Err(e) => Err(e),
-        };
-    }
-
-    match op {
-        Op::GroupProvision { .. } => group_provision(op, native, store_path).await,
-        Op::GroupBump => {
-            // 前提チェックは group invoke と同じ（store が開けること）。
+        MatdOp::Group(group_op) => {
+            // chip-tool 撤去前と同じ前提チェック（store が開けること）。
             let _store = Store::open(store_path)?;
-            match native.group_bump().await {
-                mat_native::group::BumpOutcome::Bumped { from, to } => {
-                    Ok(mat_core::body::group_bump(from, to))
-                }
-                mat_native::group::BumpOutcome::Unavailable(reason) => {
-                    Err(MatError::group_unavailable(&reason))
-                }
-            }
+            mat_native::op::run_group_op(native.engine(), &group_op).await
         }
-        // ここに来るのは Read/Write/Invoke/GroupInvoke で cluster/attribute/command
-        // 名が解決できなかった場合のみ（On/Off/Color/ColorTemp/Level/Describe は常に
-        // is_native_hotpath、GroupColorTemp/GroupColor/GroupLevel は native_group_params が
-        // 常に Some を返すため到達しない）。
-        _ => Err(MatError::unresolved_op()),
+        MatdOp::Provision(p) => {
+            let store = Store::open(store_path)?;
+            // 全ノードが commission 済みか先に確認（1つでも未登録なら停止）。
+            for &node_id in &p.node_ids {
+                store.require_node(node_id)?;
+            }
+            // matd 経路の provision は note 無し（KVS は matd 自身が書くため
+            // 再起動案内は不要）。
+            mat_native::runner::provision(native.as_ref(), native.engine(), &p, None).await
+        }
+        MatdOp::Bump => {
+            let _store = Store::open(store_path)?;
+            mat_native::op::run_group_bump(native.engine()).await
+        }
     }
 }
 
-/// この op を native warm session で処理するか（ホットパス）。それ以外は
-/// [`MatError::unresolved_op`] で拒否する。
-///
-/// Read/Write/Invoke/Describe の判定は mat-core::ids（`classify_write` /
-/// `classify_invoke` / `resolve_cluster` + `resolve_attribute`）に委ねる —
-/// mat 直経路の `native_direct::classify_strict` と同じ判定を共有する
-/// （M8a Task10）。cluster/attribute/command 名が解決できない場合のみ false、
-/// 名前は解決できたが値が符号化不能（list 型等）な場合は true のまま
-/// native_op へ進み、そこで即 parse_error を返す（M8c-3: フォールバック先が
-/// 無いため拒否する — spec 決定と同じ）。
-pub(crate) fn is_native_hotpath(op: &Op) -> bool {
-    match op {
-        Op::On { .. }
-        | Op::Off { .. }
-        | Op::Color { .. }
-        | Op::ColorTemp { .. }
-        | Op::Level { .. }
-        | Op::Describe { .. } => true,
+/// wire `Op` → 解決済み op。名前解決・引数符号化の規則は `mat_native::op` の
+/// コンストラクタ（mat 直経路と同一）。Ping / Shutdown / Listen / Status /
+/// NodeTouched は `run_op` 冒頭 / `dispatch` / `handle_conn` が先取りするため
+/// ここへは来ない（不変条件が破れても panic せず typed error）。
+#[derive(Debug)]
+pub(crate) enum MatdOp {
+    Node(mat_native::op::NodeOp),
+    Group(mat_native::op::GroupOp),
+    Provision(mat_native::op::ProvisionParams),
+    Bump,
+}
+
+pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
+    use mat_native::op::{GroupOp, GroupOpKind, NodeOp, NodeOpKind, ProvisionParams};
+    let node = |node_id: u64, kind: NodeOpKind| MatdOp::Node(NodeOp { node_id, kind });
+    Ok(match op {
         Op::Read {
-            cluster, attribute, ..
-        } => mat_core::ids::resolve_cluster(cluster)
-            .and_then(|cid| mat_core::ids::resolve_attribute(cid, attribute))
-            .is_some(),
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+        } => node(*node_id, NodeOpKind::read(*endpoint, cluster, attribute)?),
         Op::Write {
+            node_id,
+            endpoint,
             cluster,
             attribute,
             value,
-            ..
-        } => !matches!(
-            mat_core::ids::classify_write(cluster, attribute, value),
-            mat_core::ids::WriteClass::NotNative
+        } => node(
+            *node_id,
+            NodeOpKind::write(*endpoint, cluster, attribute, value)?,
         ),
         Op::Invoke {
+            node_id,
+            endpoint,
             cluster,
             command,
             args,
-            ..
-        } => !matches!(
-            mat_core::ids::classify_invoke(cluster, command, args),
-            mat_core::ids::InvokeClass::NotNative
+        } => node(
+            *node_id,
+            NodeOpKind::invoke(*endpoint, cluster, command, args)?,
         ),
-        _ => false,
-    }
+        Op::On { node_id, endpoint } => node(
+            *node_id,
+            NodeOpKind::On {
+                endpoint: *endpoint,
+            },
+        ),
+        Op::Off { node_id, endpoint } => node(
+            *node_id,
+            NodeOpKind::Off {
+                endpoint: *endpoint,
+            },
+        ),
+        // 換算済み値が wire で届く（protocol.rs の約束）— struct リテラルで組む。
+        Op::ColorTemp {
+            node_id,
+            endpoint,
+            mireds,
+            kelvin,
+            transition,
+        } => node(
+            *node_id,
+            NodeOpKind::ColorTemp {
+                endpoint: *endpoint,
+                kelvin: *kelvin,
+                mireds: *mireds,
+                transition: *transition,
+            },
+        ),
+        Op::Level {
+            node_id,
+            endpoint,
+            level,
+            percent,
+            transition,
+        } => node(
+            *node_id,
+            NodeOpKind::Level {
+                endpoint: *endpoint,
+                percent: *percent,
+                level: *level,
+                transition: *transition,
+            },
+        ),
+        Op::Color {
+            node_id,
+            endpoint,
+            hue_raw,
+            saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
+            transition,
+        } => node(
+            *node_id,
+            NodeOpKind::Color {
+                endpoint: *endpoint,
+                color: mat_core::color::ResolvedColor {
+                    hue_raw: *hue_raw,
+                    sat_raw: *saturation_raw,
+                    hue: *hue,
+                    sat: *saturation,
+                    name: name.clone(),
+                    rgb: rgb.clone(),
+                },
+                transition: *transition,
+            },
+        ),
+        Op::Describe { node_id } => node(*node_id, NodeOpKind::Describe),
+        Op::GroupProvision {
+            group_id,
+            node_ids,
+            keyset_id,
+            name,
+            endpoint,
+            epoch_key,
+            rebind,
+        } => MatdOp::Provision(ProvisionParams {
+            group_id: *group_id,
+            node_ids: node_ids.clone(),
+            keyset_id: *keyset_id,
+            name: name.clone(),
+            endpoint: *endpoint,
+            epoch_key: epoch_key.clone(),
+            rebind: *rebind,
+        }),
+        Op::GroupInvoke {
+            group_id,
+            cluster,
+            command,
+            args,
+            endpoint,
+        } => MatdOp::Group(GroupOp {
+            group_id: *group_id,
+            endpoint: *endpoint,
+            kind: GroupOpKind::invoke(cluster, command, args)?,
+        }),
+        Op::GroupColorTemp {
+            group_id,
+            mireds,
+            kelvin,
+            transition,
+            endpoint,
+        } => MatdOp::Group(GroupOp {
+            group_id: *group_id,
+            endpoint: *endpoint,
+            kind: GroupOpKind::ColorTemp {
+                kelvin: *kelvin,
+                mireds: *mireds,
+                transition: *transition,
+            },
+        }),
+        Op::GroupLevel {
+            group_id,
+            level,
+            percent,
+            transition,
+            endpoint,
+        } => MatdOp::Group(GroupOp {
+            group_id: *group_id,
+            endpoint: *endpoint,
+            kind: GroupOpKind::Level {
+                percent: *percent,
+                level: *level,
+                transition: *transition,
+            },
+        }),
+        Op::GroupColor {
+            group_id,
+            hue_raw,
+            saturation_raw,
+            hue,
+            saturation,
+            name,
+            rgb,
+            transition,
+            endpoint,
+        } => MatdOp::Group(GroupOp {
+            group_id: *group_id,
+            endpoint: *endpoint,
+            kind: GroupOpKind::Color {
+                color: mat_core::color::ResolvedColor {
+                    hue_raw: *hue_raw,
+                    sat_raw: *saturation_raw,
+                    hue: *hue,
+                    sat: *saturation,
+                    name: name.clone(),
+                    rgb: rgb.clone(),
+                },
+                transition: *transition,
+            },
+        }),
+        Op::GroupBump => MatdOp::Bump,
+        Op::Listen { .. } | Op::Ping | Op::Status | Op::Shutdown | Op::NodeTouched { .. } => {
+            return Err(MatError::parse_error(
+                "internal: non-device op reached to_device_op (dispatch invariant violated)",
+            ))
+        }
+    })
 }
 
 /// 状態変更 op → (node_id, 変化が現れる cluster)。op 相関の born-dead 検知
@@ -791,439 +929,6 @@ pub(crate) fn note_op_expectation(op: &Op, health: &SubHealth) {
     if let Some((node_id, cluster)) = op_report_expectation(op, on_off.as_ref(), level.as_ref()) {
         health.note_op(node_id, cluster);
     }
-}
-
-/// 成功 body ビルダー。`egress`(実送信後にしか判らない iface 名の配列)を
-/// 受けて sent body を組む(`Box<dyn FnOnce>` を裸で使うと clippy
-/// `type_complexity` に触れるため alias 化)。
-type SentBodyBuilder = Box<dyn FnOnce(&[String]) -> Value + Send>;
-
-/// `native_group_params` の Ok 内訳: (group_id, cluster_id, command_id, fields_tlv,
-/// 成功時 sent body ビルダー)。body の固定部は op 変種が確定しているここで
-/// 決める(旧 `group_sent_body` の `let … else unreachable!` を型で排除)が、
-/// `egress` は実送信(`group_invoke`)後にしか判らないため、body 生成はクロージャ
-/// で遅延する。
-type GroupSendParams = (u16, u32, u32, Option<Vec<u8>>, SentBodyBuilder);
-
-/// group 送信 op の native 適用判定。`GroupInvoke` の cluster/command/引数は
-/// mat-core::ids の `classify_invoke` に通す（onoff 限定を撤廃 — M8a
-/// Task10、mat 直経路の `native_direct::classify_strict` の group invoke 腕と
-/// 同じ判定）。戻り値:
-/// - `None` — 非対象（cluster/command 名が解決できない）→ [`MatError::unresolved_op`]。
-/// - `Some(Ok(params))` — native 送信対象。
-/// - `Some(Err(e))` — 名前は解決できたが引数が符号化不能 → 即座にそのエラーを
-///   返す（mat 側と同じ拒否規則）。
-fn native_group_params(op: &Op) -> Option<Result<GroupSendParams, MatError>> {
-    match op {
-        Op::GroupInvoke {
-            group_id,
-            cluster,
-            command,
-            args,
-            endpoint,
-            ..
-        } => match mat_core::ids::classify_invoke(cluster, command, args) {
-            mat_core::ids::InvokeClass::NotNative => None,
-            mat_core::ids::InvokeClass::Reject(msg) => Some(Err(MatError::parse_error(msg))),
-            mat_core::ids::InvokeClass::Native {
-                cluster: cluster_id,
-                command: cmd_id,
-                fields,
-                ..
-            } => {
-                let fields_tlv = if fields.is_empty() {
-                    None
-                } else {
-                    Some(mat_native::encode_command_fields(&fields))
-                };
-                let group_id_v = *group_id;
-                let cluster = cluster.clone();
-                let command = command.clone();
-                let endpoint_v = *endpoint;
-                let build_body: SentBodyBuilder = Box::new(move |egress| {
-                    mat_core::body::group_invoke_sent(
-                        group_id_v, &cluster, &command, endpoint_v, egress,
-                    )
-                });
-                Some(Ok((*group_id, cluster_id, cmd_id, fields_tlv, build_body)))
-            }
-        },
-        Op::GroupColorTemp {
-            group_id,
-            mireds,
-            kelvin,
-            transition,
-            endpoint,
-        } => {
-            let (group_id, mireds, kelvin, transition, endpoint) =
-                (*group_id, *mireds, *kelvin, *transition, *endpoint);
-            let build_body: SentBodyBuilder = Box::new(move |egress| {
-                mat_core::body::group_color_temp_sent(
-                    group_id, kelvin, mireds, transition, endpoint, egress,
-                )
-            });
-            Some(Ok((
-                group_id,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(im::encode_move_to_color_temperature_fields(
-                    mireds, transition,
-                )),
-                build_body,
-            )))
-        }
-        Op::GroupLevel {
-            group_id,
-            level,
-            percent,
-            transition,
-            endpoint,
-        } => {
-            let (group_id, level, percent, transition, endpoint) =
-                (*group_id, *level, *percent, *transition, *endpoint);
-            let build_body: SentBodyBuilder = Box::new(move |egress| {
-                mat_core::body::group_level_sent(
-                    group_id,
-                    mat_core::body::LevelEcho { percent, level },
-                    transition,
-                    endpoint,
-                    egress,
-                )
-            });
-            Some(Ok((
-                group_id,
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(im::encode_move_to_level_fields(level, transition)),
-                build_body,
-            )))
-        }
-        Op::GroupColor {
-            group_id,
-            hue_raw,
-            saturation_raw,
-            hue,
-            saturation,
-            name,
-            rgb,
-            transition,
-            endpoint,
-        } => {
-            let color = mat_core::color::ResolvedColor {
-                hue_raw: *hue_raw,
-                sat_raw: *saturation_raw,
-                hue: *hue,
-                sat: *saturation,
-                name: name.clone(),
-                rgb: rgb.clone(),
-            };
-            let group_id_v = *group_id;
-            let transition_v = *transition;
-            let endpoint_v = *endpoint;
-            let build_body: SentBodyBuilder = Box::new(move |egress| {
-                mat_core::body::group_color_sent(
-                    group_id_v,
-                    &color,
-                    transition_v,
-                    endpoint_v,
-                    egress,
-                )
-            });
-            Some(Ok((
-                *group_id,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(im::encode_move_to_hue_and_saturation_fields(
-                    *hue_raw,
-                    *saturation_raw,
-                    *transition,
-                )),
-                build_body,
-            )))
-        }
-        _ => None,
-    }
-}
-
-/// native ホットパス op を warm session で実行し、成功 body を組む。
-async fn native_op(
-    op: &Op,
-    native: &NativeBackend,
-    store_path: &Path,
-    deadline: Option<std::time::Instant>,
-) -> Result<Value, MatError> {
-    // commission 済みか毎回 KVS で確認する。
-    if let Some(node_id) = op.node_id() {
-        require_node(store_path, node_id)?;
-    }
-    match op {
-        Op::On { node_id, endpoint } => {
-            native.on(*node_id, *endpoint, deadline).await?;
-            Ok(mat_core::body::invoke_success(
-                *node_id, *endpoint, "onoff", "on",
-            ))
-        }
-        Op::Off { node_id, endpoint } => {
-            native.off(*node_id, *endpoint, deadline).await?;
-            Ok(mat_core::body::invoke_success(
-                *node_id, *endpoint, "onoff", "off",
-            ))
-        }
-        Op::Color {
-            node_id,
-            endpoint,
-            hue_raw,
-            saturation_raw,
-            hue,
-            saturation,
-            name,
-            rgb,
-            transition,
-        } => {
-            native
-                .color(
-                    *node_id,
-                    *endpoint,
-                    *hue_raw,
-                    *saturation_raw,
-                    *transition,
-                    deadline,
-                )
-                .await?;
-            let color = mat_core::color::ResolvedColor {
-                hue_raw: *hue_raw,
-                sat_raw: *saturation_raw,
-                hue: *hue,
-                sat: *saturation,
-                name: name.clone(),
-                rgb: rgb.clone(),
-            };
-            Ok(mat_core::body::color_success(
-                *node_id,
-                *endpoint,
-                &color,
-                *transition,
-            ))
-        }
-        Op::ColorTemp {
-            node_id,
-            endpoint,
-            mireds,
-            kelvin,
-            transition,
-        } => {
-            native
-                .color_temp(*node_id, *endpoint, *mireds, *transition, deadline)
-                .await?;
-            Ok(mat_core::body::color_temp_success(
-                *node_id,
-                *endpoint,
-                *kelvin,
-                *mireds,
-                *transition,
-            ))
-        }
-        Op::Level {
-            node_id,
-            endpoint,
-            level,
-            percent,
-            transition,
-        } => {
-            native
-                .level(*node_id, *endpoint, *level, *transition, deadline)
-                .await?;
-            Ok(mat_core::body::level_success(
-                *node_id,
-                *endpoint,
-                mat_core::body::LevelEcho {
-                    percent: *percent,
-                    level: *level,
-                },
-                *transition,
-            ))
-        }
-        Op::Read {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-        } => {
-            if cluster == "onoff" && attribute == "on-off" {
-                let v = native.read_onoff(*node_id, *endpoint, deadline).await?;
-                Ok(mat_core::body::read_success(
-                    *node_id,
-                    *endpoint,
-                    cluster,
-                    attribute,
-                    Value::Bool(v),
-                ))
-            } else {
-                // is_native_hotpath が解決済みのはずだが、不変条件が破れても
-                // panic せず typed error（v1 品質修正 6 — alias.rs id() と同じ規律）。
-                let cluster_id = mat_core::ids::resolve_cluster(cluster).ok_or_else(|| {
-                    MatError::parse_error(format!(
-                        "internal: unknown cluster name '{cluster}' (is_native_hotpath invariant violated)"
-                    ))
-                })?;
-                let attr =
-                    mat_core::ids::resolve_attribute(cluster_id, attribute).ok_or_else(|| {
-                        MatError::parse_error(format!(
-                            "internal: unknown attribute name '{attribute}' for cluster '{cluster}' (is_native_hotpath invariant violated)"
-                        ))
-                    })?;
-                let v = native
-                    .read_json(*node_id, *endpoint, cluster_id, attr.id, deadline)
-                    .await?;
-                Ok(mat_core::body::read_success(
-                    *node_id, *endpoint, cluster, attribute, v,
-                ))
-            }
-        }
-        Op::Write {
-            node_id,
-            endpoint,
-            cluster,
-            attribute,
-            value,
-        } => match mat_core::ids::classify_write(cluster, attribute, value) {
-            mat_core::ids::WriteClass::NotNative => Err(MatError::parse_error(
-                "internal: NotNative write reached native_op (is_native_hotpath invariant violated)",
-            )),
-            mat_core::ids::WriteClass::Reject(msg) => Err(MatError::parse_error(msg)),
-            mat_core::ids::WriteClass::Native {
-                cluster: cluster_id,
-                attribute: attr_id,
-                value: scalar,
-                timed,
-            } => {
-                native
-                    .write_tlv(
-                        *node_id,
-                        *endpoint,
-                        cluster_id,
-                        attr_id,
-                        mat_native::scalar_to_tlv(&scalar),
-                        timed,
-                        deadline,
-                    )
-                    .await?;
-                Ok(mat_core::body::write_success(
-                    *node_id, *endpoint, cluster, attribute, value,
-                ))
-            }
-        },
-        Op::Invoke {
-            node_id,
-            endpoint,
-            cluster,
-            command,
-            args,
-        } => match mat_core::ids::classify_invoke(cluster, command, args) {
-            mat_core::ids::InvokeClass::NotNative => Err(MatError::parse_error(
-                "internal: NotNative invoke reached native_op (is_native_hotpath invariant violated)",
-            )),
-            mat_core::ids::InvokeClass::Reject(msg) => Err(MatError::parse_error(msg)),
-            mat_core::ids::InvokeClass::Native {
-                cluster: cluster_id,
-                command: cmd_id,
-                fields,
-                timed,
-            } => {
-                let fields_tlv = if fields.is_empty() {
-                    None
-                } else {
-                    Some(mat_native::encode_command_fields(&fields))
-                };
-                native
-                    .invoke_generic(
-                        *node_id, *endpoint, cluster_id, cmd_id, fields_tlv, timed, deadline,
-                    )
-                    .await?;
-                Ok(mat_core::body::invoke_success(
-                    *node_id, *endpoint, cluster, command,
-                ))
-            }
-        },
-        Op::Describe { node_id } => {
-            let endpoints = native.describe(*node_id, deadline).await?;
-            Ok(mat_core::body::describe_success(*node_id, &endpoints))
-        }
-        _ => Err(MatError::parse_error(
-            "internal: native_op called with non-hotpath op (dispatch invariant violated)",
-        )),
-    }
-}
-
-/// `group_provision` — group の鍵束・マッピングを各ノードへ焼き、コントローラ側 group
-/// state も設定する（`mat group provision` 相当）。最初の失敗で停止する。
-///
-/// M8c-3: コントローラ側 group state（groupsettings 系）・デバイス側 4 ステップ
-/// （KeySetWrite / group-key-map / AddGroup / ACL）ともに常に native
-/// （`mat_native::group_settings::write_group_provision` /
-/// `mat_native::ops::provision_node`）— chip-tool へのフォールバックは撤去した。
-/// `group_settings_ctx()` が `None`（本番 `Engine::build` では常に `Some` —
-/// テスト注入時のみ起こり得る）は internal エラーとして拒否する。
-async fn group_provision(
-    op: &Op,
-    native: &NativeBackend,
-    store_path: &Path,
-) -> Result<Value, MatError> {
-    let Op::GroupProvision {
-        group_id,
-        node_ids,
-        keyset_id,
-        name,
-        endpoint,
-        epoch_key,
-        rebind,
-    } = op
-    else {
-        return Err(MatError::parse_error(
-            "internal: group_provision called with non-GroupProvision op (dispatch invariant violated)",
-        ));
-    };
-
-    let store = Store::open(store_path)?;
-    // 全ノードが commission 済みか先に確認（1つでも未登録なら停止）。
-    for &node_id in node_ids {
-        store.require_node(node_id)?;
-    }
-
-    let epoch_key = resolve_epoch_key(epoch_key.as_deref())?;
-    let epoch_key_bytes = mat_native::ops::epoch_key_from_hex(&epoch_key)?;
-
-    // 1) コントローラ側 group state。
-    let gs = native
-        .group_settings_ctx()
-        .ok_or_else(MatError::group_ctx_unconfigured)?;
-    mat_native::group_settings::write_group_provision(
-        gs,
-        *group_id,
-        *keyset_id,
-        name,
-        &epoch_key_bytes,
-        *rebind,
-    )?;
-
-    // 2) 各デバイスへ provision（unicast, acknowledged）。
-    for &node_id in node_ids {
-        let p = mat_native::ops::ProvisionNodeParams {
-            group_id: *group_id,
-            keyset_id: *keyset_id,
-            name: name.clone(),
-            endpoint: *endpoint,
-            epoch_key: epoch_key_bytes,
-        };
-        native
-            .provision_node(node_id, &p)
-            .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
-    }
-
-    Ok(mat_core::body::group_provision_success(
-        *group_id, *keyset_id, name, *endpoint, node_ids, None,
-    ))
 }
 
 /// store を開いて node_id が commission 済みか確認する（常駐中の台帳更新を拾うよう
@@ -1380,213 +1085,198 @@ mod tests {
         assert!(f.matches(&ev));
     }
 
+    use mat_native::op::{GroupOpKind, NodeOpKind};
+
     #[test]
-    fn hotpath_routing_selects_native_ops() {
-        // native で処理するホットパス（onoff ショートカット群）。
-        assert!(is_native_hotpath(&Op::On {
+    fn to_device_op_maps_node_ops_with_resolved_ids() {
+        let m = to_device_op(&Op::On {
             node_id: 1,
-            endpoint: 1
-        }));
-        assert!(is_native_hotpath(&Op::Off {
-            node_id: 1,
-            endpoint: 1
-        }));
-        assert!(is_native_hotpath(&Op::ColorTemp {
+            endpoint: 1,
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if n.node_id == 1 && n.kind == NodeOpKind::On { endpoint: 1 })
+        );
+        let m = to_device_op(&Op::ColorTemp {
             node_id: 1,
             endpoint: 1,
             mireds: 370,
             kelvin: 2700,
-            transition: 0
-        }));
-        assert!(is_native_hotpath(&Op::Color {
+            transition: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            m,
+            MatdOp::Node(ref n) if n.kind == NodeOpKind::ColorTemp { endpoint: 1, kelvin: 2700, mireds: 370, transition: 0 }
+        ));
+        let m = to_device_op(&Op::Level {
+            node_id: 1,
+            endpoint: 1,
+            level: 127,
+            percent: 50,
+            transition: 0,
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if n.kind == NodeOpKind::Level { endpoint: 1, percent: 50, level: 127, transition: 0 })
+        );
+        let m = to_device_op(&Op::Color {
             node_id: 1,
             endpoint: 1,
             hue_raw: 0,
             saturation_raw: 254,
             hue: 0,
             saturation: 100,
-            name: None,
-            rgb: None,
-            transition: 0
-        }));
-        assert!(is_native_hotpath(&Op::Level {
-            node_id: 1,
-            endpoint: 1,
-            level: 127,
-            percent: 50,
-            transition: 0
-        }));
-        // onoff on-off の read。
-        assert!(is_native_hotpath(&Op::Read {
-            node_id: 1,
-            endpoint: 1,
-            cluster: "onoff".into(),
-            attribute: "on-off".into()
-        }));
-        // 汎用 read/write/invoke/describe も ids で名前解決できれば native
-        // （M8a Task10 — mat 直経路の classify_strict と同じ判定を共有）。
-        assert!(is_native_hotpath(&Op::Read {
-            node_id: 1,
+            name: Some("red".into()),
+            rgb: Some("#ff0000".into()),
+            transition: 0,
+        })
+        .unwrap();
+        match m {
+            MatdOp::Node(n) => match n.kind {
+                NodeOpKind::Color { color, .. } => {
+                    assert_eq!(
+                        (color.hue_raw, color.sat_raw, color.hue, color.sat),
+                        (0, 254, 0, 100)
+                    );
+                    assert_eq!(color.name.as_deref(), Some("red"));
+                    assert_eq!(color.rgb.as_deref(), Some("#ff0000"));
+                }
+                other => panic!("expected Color, got {other:?}"),
+            },
+            other => panic!("expected Node, got {other:?}"),
+        }
+        let m = to_device_op(&Op::Read {
+            node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into()
-        }));
-        assert!(is_native_hotpath(&Op::Write {
-            node_id: 1,
+            attribute: "current-level".into(),
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Read { cluster: 0x0008, attribute: 0, .. }))
+        );
+        let m = to_device_op(&Op::Write {
+            node_id: 5,
             endpoint: 1,
-            cluster: "onoff".into(),
-            attribute: "on-off".into(),
-            value: "1".into()
-        }));
-        assert!(is_native_hotpath(&Op::Invoke {
-            node_id: 1,
+            cluster: "levelcontrol".into(),
+            attribute: "on-level".into(),
+            value: "128".into(),
+        })
+        .unwrap();
+        assert!(matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Write { .. })));
+        let m = to_device_op(&Op::Invoke {
+            node_id: 5,
             endpoint: 1,
-            cluster: "identify".into(),
-            command: "identify".into(),
-            args: vec![]
-        }));
-        assert!(is_native_hotpath(&Op::Describe { node_id: 1 }));
-        // 名前は解決できるが値が符号化不能（list 型）な write も、拒否せず
-        // native_op で即 parse_error にするため hotpath=true のまま。
-        assert!(is_native_hotpath(&Op::Write {
-            node_id: 1,
-            endpoint: 1,
-            cluster: "accesscontrol".into(),
-            attribute: "acl".into(),
-            value: "[]".into()
-        }));
+            cluster: "levelcontrol".into(),
+            command: "move-to-level".into(),
+            args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Invoke { fields_tlv: Some(_), .. }))
+        );
+        assert!(
+            matches!(to_device_op(&Op::Describe { node_id: 5 }).unwrap(), MatdOp::Node(ref n) if n.kind == NodeOpKind::Describe)
+        );
     }
 
     #[test]
-    fn hotpath_routing_rejects_unresolved_names() {
-        // 未知 cluster/attribute 名は native 対象外 → run_op が MatError::unresolved_op。
-        assert!(!is_native_hotpath(&Op::Read {
-            node_id: 1,
-            endpoint: 1,
-            cluster: "nosuchcluster".into(),
-            attribute: "x".into()
-        }));
-        assert!(!is_native_hotpath(&Op::Write {
+    fn to_device_op_rejects_unresolved_names_and_unencodable_values() {
+        // 未知名 → unresolved_op（parse_error、数値 ID 案内付き）。
+        let err = to_device_op(&Op::Read {
             node_id: 1,
             endpoint: 1,
             cluster: "nosuchcluster".into(),
             attribute: "x".into(),
-            value: "1".into()
-        }));
-        assert!(!is_native_hotpath(&Op::Invoke {
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(
+            err.detail.contains("numeric IDs are accepted"),
+            "{}",
+            err.detail
+        );
+        let err = to_device_op(&Op::Invoke {
             node_id: 1,
             endpoint: 1,
             cluster: "nosuchcluster".into(),
             command: "x".into(),
-            args: vec![]
-        }));
-        // GroupInvoke は native_group_params が別途扱う（is_native_hotpath の
-        // 対象外 — group 送信は特定ノード宛ではないため）。
-        assert!(!is_native_hotpath(&Op::GroupInvoke {
-            group_id: 1,
-            cluster: "onoff".into(),
-            command: "on".into(),
             args: vec![],
-            endpoint: 1
-        }));
-        assert!(!is_native_hotpath(&Op::Ping));
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        // 名前は解決できるが list 型 → parse_error（classify の msg）。
+        let err = to_device_op(&Op::Write {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "accesscontrol".into(),
+            attribute: "acl".into(),
+            value: "[]".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.contains("list"), "{}", err.detail);
     }
 
     #[test]
-    fn native_group_params_maps_onoff_and_shortcuts() {
-        let on = Op::GroupInvoke {
-            group_id: 10,
-            cluster: "onoff".into(),
-            command: "on".into(),
-            args: vec![],
-            endpoint: 1,
-        };
-        let (gid, cluster, command, fields, _) = native_group_params(&on).unwrap().unwrap();
-        assert_eq!(
-            (gid, cluster, command),
-            (10, im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON)
-        );
-        assert!(fields.is_none());
-
-        // 引数過多（onoff on は 0 引数）は即 parse_error
-        // （M8a Task10: ids ベースの classify_invoke と同じ拒否規則）。
-        let with_args = Op::GroupInvoke {
+    fn to_device_op_maps_group_ops_and_shortcuts() {
+        let m = to_device_op(&group_on_op()).unwrap();
+        match m {
+            MatdOp::Group(g) => {
+                assert_eq!((g.group_id, g.endpoint), (10, 1));
+                assert_eq!(g.kind.wire(), (im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None));
+            }
+            other => panic!("expected Group, got {other:?}"),
+        }
+        // 引数過多（onoff on は 0 引数）は即 parse_error。
+        let err = to_device_op(&Op::GroupInvoke {
             group_id: 10,
             cluster: "onoff".into(),
             command: "on".into(),
             args: vec!["1".into()],
             endpoint: 1,
-        };
-        // build_body ビルダーが `Debug` を実装しないため unwrap_err は使えない
-        // （T: Debug 境界）— match で明示的に取り出す。
-        let err = match native_group_params(&with_args).unwrap() {
-            Err(e) => e,
-            Ok(_) => panic!("expected parse_error for over-argumented onoff on"),
-        };
+        })
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-
-        // onoff 以外の cluster も、名前解決できれば native 対象（onoff 限定は
-        // M8a Task10 で撤廃）。
-        let other_cluster = Op::GroupInvoke {
-            group_id: 10,
-            cluster: "levelcontrol".into(),
-            command: "move-to-level".into(),
-            args: vec![],
-            endpoint: 1,
-        };
-        let (gid, cluster, command, fields, _) =
-            native_group_params(&other_cluster).unwrap().unwrap();
-        assert_eq!(gid, 10);
-        assert_eq!(
-            cluster,
-            mat_core::ids::resolve_cluster("levelcontrol").unwrap()
-        );
-        assert_eq!(
-            command,
-            mat_core::ids::resolve_command(cluster, "move-to-level")
-                .unwrap()
-                .id
-        );
-        assert!(fields.is_none()); // 引数なし → fields_tlv は None。
-
-        // 未知コマンド名は非対象（run_op が MatError::unresolved_op にする）。
-        let unknown_command = Op::GroupInvoke {
+        // 未知コマンド名は unresolved_op。
+        let err = to_device_op(&Op::GroupInvoke {
             group_id: 10,
             cluster: "onoff".into(),
             command: "foo".into(),
             args: vec![],
             endpoint: 1,
-        };
-        assert!(native_group_params(&unknown_command).is_none());
+        })
+        .unwrap_err();
+        assert!(
+            err.detail.contains("numeric IDs are accepted"),
+            "{}",
+            err.detail
+        );
 
-        let ct = Op::GroupColorTemp {
+        let m = to_device_op(&Op::GroupColorTemp {
             group_id: 10,
             mireds: 370,
             kelvin: 2702,
             transition: 0,
             endpoint: 1,
-        };
-        let (_, cluster, command, fields, _) = native_group_params(&ct).unwrap().unwrap();
-        assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
-        assert_eq!(command, im::CMD_MOVE_TO_COLOR_TEMPERATURE);
-        assert_eq!(
-            fields.unwrap(),
-            im::encode_move_to_color_temperature_fields(370, 0)
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Group(ref g) if g.kind == GroupOpKind::ColorTemp { kelvin: 2702, mireds: 370, transition: 0 })
         );
-
-        let lv = Op::GroupLevel {
+        let m = to_device_op(&Op::GroupLevel {
             group_id: 10,
             level: 254,
             percent: 100,
             transition: 0,
             endpoint: 1,
-        };
-        let (_, cluster, command, fields, _) = native_group_params(&lv).unwrap().unwrap();
-        assert_eq!(cluster, im::CLUSTER_LEVEL_CONTROL);
-        assert_eq!(command, im::CMD_MOVE_TO_LEVEL);
-        assert_eq!(fields.unwrap(), im::encode_move_to_level_fields(254, 0));
-
-        let color = Op::GroupColor {
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Group(ref g) if g.kind == GroupOpKind::Level { percent: 100, level: 254, transition: 0 })
+        );
+        let m = to_device_op(&Op::GroupColor {
             group_id: 10,
             hue_raw: 180,
             saturation_raw: 200,
@@ -1596,17 +1286,47 @@ mod tests {
             rgb: None,
             transition: 0,
             endpoint: 1,
-        };
-        let (_, cluster, command, fields, _) = native_group_params(&color).unwrap().unwrap();
-        assert_eq!(cluster, im::CLUSTER_COLOR_CONTROL);
-        assert_eq!(command, im::CMD_MOVE_TO_HUE_AND_SATURATION);
-        assert_eq!(
-            fields.unwrap(),
-            im::encode_move_to_hue_and_saturation_fields(180, 200, 0)
+        })
+        .unwrap();
+        assert!(matches!(m, MatdOp::Group(ref g) if matches!(g.kind, GroupOpKind::Color { .. })));
+        assert!(matches!(
+            to_device_op(&Op::GroupBump).unwrap(),
+            MatdOp::Bump
+        ));
+        let m = to_device_op(&Op::GroupProvision {
+            group_id: 7,
+            node_ids: vec![1, 2],
+            keyset_id: 42,
+            name: "grp7".into(),
+            endpoint: 1,
+            epoch_key: None,
+            rebind: true,
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Provision(ref p) if p.group_id == 7 && p.node_ids == vec![1, 2] && p.rebind)
         );
+    }
 
-        // GroupProvision は native_group_params の対象外（専用ハンドラ group_provision）。
-        assert!(native_group_params(&Op::Ping).is_none());
+    /// dispatch 不変条件が破れても panic しない（v1 Task6 規律）。
+    #[test]
+    fn to_device_op_rejects_non_device_ops_without_panic() {
+        for op in [
+            Op::Ping,
+            Op::Status,
+            Op::Shutdown,
+            Op::NodeTouched { node_id: 1 },
+            Op::Listen {
+                node_id: None,
+                endpoint: None,
+                cluster: None,
+                attribute: None,
+            },
+        ] {
+            let err = to_device_op(&op).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::ParseError);
+            assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
+        }
     }
 
     use crate::native::test_support::{write_group_fixture_ini, FakeEstablisher};
@@ -1649,52 +1369,19 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn generic_ops_join_the_native_hotpath() {
-        let read = Op::Read {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
-        };
-        assert!(is_native_hotpath(&read));
-        let unknown = Op::Read {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "nosuch".into(),
-            attribute: "x".into(),
-        };
-        assert!(!is_native_hotpath(&unknown)); // 未知名は MatError::unresolved_op（run_op）。
-        let write = Op::Write {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "levelcontrol".into(),
-            attribute: "on-level".into(),
-            value: "128".into(),
-        };
-        assert!(is_native_hotpath(&write));
-        let inv = Op::Invoke {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "levelcontrol".into(),
-            command: "move-to-level".into(),
-            args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
-        };
-        assert!(is_native_hotpath(&inv));
-        assert!(is_native_hotpath(&Op::Describe { node_id: 5 }));
-    }
-
     #[tokio::test]
     async fn native_generic_read_body_matches_expected_schema() {
         // FakeConn の read_json は json!(1) を返す（Task 6 の fake 仕様）。
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
         let op = Op::Read {
             node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
             attribute: "current-level".into(),
         };
-        let body = native_op(&op, &native, store_with_node_5().path(), None)
+        let body = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
             .unwrap();
         // 既存 hotpath_success_body(Read) と同形（node_id/endpoint/cluster/attribute/value）。
@@ -1708,6 +1395,8 @@ mod tests {
     #[tokio::test]
     async fn native_write_rejects_list_type_with_parse_error() {
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
         let op = Op::Write {
             node_id: 5,
             endpoint: 0,
@@ -1715,7 +1404,7 @@ mod tests {
             attribute: "acl".into(),
             value: "[]".into(),
         };
-        let err = native_op(&op, &native, store_with_node_5().path(), None)
+        let err = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1724,6 +1413,8 @@ mod tests {
     #[tokio::test]
     async fn native_generic_invoke_and_describe_bodies_match_expected_schema() {
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
         let dir = store_with_node_5();
 
         let invoke = Op::Invoke {
@@ -1733,7 +1424,9 @@ mod tests {
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
         };
-        let body = native_op(&invoke, &native, dir.path(), None).await.unwrap();
+        let body = run_op(&invoke, &state, dir.path(), &health, None)
+            .await
+            .unwrap();
         // 既存 simple_op(Invoke) と同形（node_id/endpoint/cluster/command/status）。
         assert_eq!(body["node_id"], 5);
         assert_eq!(body["endpoint"], 1);
@@ -1742,7 +1435,7 @@ mod tests {
         assert_eq!(body["status"], "success");
 
         let describe = Op::Describe { node_id: 5 };
-        let body = native_op(&describe, &native, dir.path(), None)
+        let body = run_op(&describe, &state, dir.path(), &health, None)
             .await
             .unwrap();
         // node_id/endpoints[].{endpoint,clusters} の形。
@@ -1790,6 +1483,8 @@ mod tests {
             cfid: [7u8; 8],
         };
         let native = NativeBackend::with_parts_gs(Box::new(ScriptedEstablisher), None, Some(gs));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
 
         let (_dir2, store_path) = make_store();
         let op = Op::GroupProvision {
@@ -1801,7 +1496,9 @@ mod tests {
             epoch_key: None,
             rebind: false,
         };
-        let body = group_provision(&op, &native, &store_path).await.unwrap();
+        let body = run_op(&op, &state, &store_path, &health, None)
+            .await
+            .unwrap();
         assert_eq!(body["status"], "provisioned");
         assert_eq!(body["nodes"], json!([1]));
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
@@ -1811,6 +1508,8 @@ mod tests {
     #[tokio::test]
     async fn group_provision_without_group_settings_ctx_is_internal_error() {
         let native = NativeBackend::with_establisher(Box::new(ScriptedEstablisher));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
         let (_dir, store_path) = make_store();
         let op = Op::GroupProvision {
             group_id: 1,
@@ -1821,7 +1520,7 @@ mod tests {
             epoch_key: None,
             rebind: false,
         };
-        let err = group_provision(&op, &native, &store_path)
+        let err = run_op(&op, &state, &store_path, &health, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Other);
@@ -1908,10 +1607,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_op_returns_store_parse_when_group_ctx_unavailable() {
+    async fn group_op_hard_errors_when_group_ctx_unavailable() {
         let (_dir, store_path) = make_store();
-        // group ctx なしの native → Unavailable → M8c-3: フォールバック無しで
-        // store_parse（`mat group provision` へ誘導する detail）を即返す。
+        // group ctx なしの native → `mat_native::op::run_group_op` が
+        // `MatError::group_ctx_unconfigured()`（Other）で即返す。監査④で
+        // matd の group 送信も `mat` 直経路と同じ `mat_native::op` を経由する
+        // ようになったため、旧 store_parse（`GroupOutcome::Unavailable` 経由の
+        // matd 固有マッピング）ではなく Other に統一された（本番 `Engine::build`
+        // では group ctx は常に `Some` — テスト注入時のみ到達）。
         let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), None);
         let err = run_op(
             &group_on_op(),
@@ -1922,8 +1625,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::StoreParse);
-        assert!(err.detail.contains("native group send unavailable"));
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("native group context not configured"));
     }
 
     /// Issue #14 応急コマンド: group ctx が構成済みなら `Op::GroupBump` は
@@ -2115,60 +1818,6 @@ mod tests {
         .await
         .unwrap();
         assert!(health.pending_elapsed(5).is_none());
-    }
-
-    /// post-1.0 defer: dispatch 不変条件が破れても panic しない（v1 Task6 規律）。
-    #[tokio::test]
-    async fn native_op_invariant_violations_are_typed_errors_not_panics() {
-        let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let store = store_with_node_5();
-
-        // NotNative write（未知 cluster 名 → classify_write が NotNative）
-        let op = Op::Write {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "nosuchcluster".into(),
-            attribute: "x".into(),
-            value: "1".into(),
-        };
-        let err = native_op(&op, &native, store.path(), None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
-
-        // NotNative invoke
-        let op = Op::Invoke {
-            node_id: 5,
-            endpoint: 1,
-            cluster: "nosuchcluster".into(),
-            command: "x".into(),
-            args: vec![],
-        };
-        let err = native_op(&op, &native, store.path(), None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
-
-        // non-hotpath op（Ping は node_id() が None なので require_node を素通りして
-        // catch-all に到達する）
-        let err = native_op(&Op::Ping, &native, store.path(), None)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
-    }
-
-    #[tokio::test]
-    async fn group_provision_rejects_non_group_provision_op_without_panic() {
-        let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        let dir = tempfile::tempdir().unwrap();
-        let err = group_provision(&Op::Ping, &native, dir.path())
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.starts_with("internal:"), "detail={}", err.detail);
     }
 
     /// op → レポート期待の分類（spec 2026-07-24 の表）。

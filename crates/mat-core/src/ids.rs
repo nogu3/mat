@@ -191,8 +191,9 @@ pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
     ScalarValue::Str(s.to_string())
 }
 
-/// 汎用 write の分類結果（mat 直経路 `native_direct::classify_strict` の
-/// `Command::Write` 判定を移設・一本化 — M8a Task10）。
+/// 汎用 write の分類結果（旧 mat 直経路 `native_direct::classify_strict` の
+/// `Command::Write` 判定を移設・一本化 — M8a Task10。現在の呼び出し口は
+/// `mat_native::op::NodeOpKind::write`）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteClass {
     /// native で実行可能。`cluster` / `attribute` は数値 ID、`value` は型に沿って
@@ -213,8 +214,9 @@ pub enum WriteClass {
 }
 
 /// write op の分類: cluster/attribute 名を解決し、値を属性の型（数値直指定なら
-/// 推定型）でスカラー化する。挙動は移設元（`native_direct::classify_strict` の
-/// `Command::Write` 腕）と同一 — エラーメッセージ文言も維持。
+/// 推定型）でスカラー化する。挙動は移設元（旧 `native_direct::classify_strict` の
+/// `Command::Write` 腕）と同一 — エラーメッセージ文言も維持。呼び出し口は
+/// `mat_native::op::NodeOpKind::write`。
 pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass {
     let Some(cluster_id) = resolve_cluster(cluster) else {
         return WriteClass::NotNative;
@@ -238,8 +240,10 @@ pub fn classify_write(cluster: &str, attribute: &str, value: &str) -> WriteClass
     }
 }
 
-/// 汎用 invoke の分類結果（mat 直経路 `native_direct::classify_strict` の
+/// 汎用 invoke の分類結果（旧 mat 直経路 `native_direct::classify_strict` の
 /// `Command::Invoke` / `GroupCommand::Invoke` 判定を移設・一本化 — M8a Task10。
+/// 現在の呼び出し口は `mat_native::op::NodeOpKind::invoke` /
+/// `GroupOpKind::invoke`。
 /// 単体 invoke と group invoke の判定ロジックはこれまで ~50 行重複していた
 /// — この型がその一本化の受け皿）。
 #[derive(Debug, Clone, PartialEq)]

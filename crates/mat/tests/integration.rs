@@ -22,8 +22,9 @@ use tempfile::TempDir;
 /// 自動検出に切り替わるため、先にこのテストスイート側を「明示 iface 指定」の
 /// 形に揃えておく（`lo` は実在するが KVS 資材が無いので native 経路は必ず
 /// warn + フォールスルーし、store/require_node チェックはこれまでどおり
-/// コマンド層 or native_direct::execute() の同一ロジックで exit 10/11 を出す
-/// — 詳細は native_direct.rs の `execute()` の doc コメント参照）。
+/// コマンド層 or native_direct::run() の同一ロジックで exit 10/11 を出す
+/// （`run` は `Store::open` + `require_node` を engine 構築より前に行う）
+/// — 詳細は native_direct.rs の `run()` の doc コメント参照）。
 /// `MAT_MATD=0` で直経路に固定する（matd 自動検出が既定のため、開発機で実
 /// matd が動いていても拾わない）。
 fn mat(store: &std::path::Path) -> Command {
@@ -252,7 +253,7 @@ fn color_unknown_name_exits_2_and_broken_colors_exits_10() {
 
 // ── store エラー（Store::open / require_node、バックエンド不到達）──────────
 //
-// native 直経路（`native_direct::execute()`）は Store::open / require_node を
+// native 直経路（`native_direct::run()`）は Store::open / require_node を
 // Engine 構築より前に行う（chip-tool 経路と同一の順序・エラー）ので、
 // `MAT_IFACE=lo` 固定でもこれらのテストは変わらず backend 不到達で完結する。
 
