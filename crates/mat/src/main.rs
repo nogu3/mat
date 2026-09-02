@@ -7,6 +7,7 @@
 
 mod cli;
 mod commands;
+mod device_op;
 mod matd_client;
 mod native_direct;
 mod probe;
