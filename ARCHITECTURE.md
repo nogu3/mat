@@ -346,7 +346,8 @@ This repo ships two binaries from one install:
   repainted onto a live subscription before the device's next report can be
   lost to the abandoned one. Two paths feed the same trigger: 経路1 is
   `mat`'s own direct-path ops (`diag` included) firing a fire-and-forget
-  `node_touched` line over the matd socket after `finish_conn`'s close, only
+  `node_touched` line over the matd socket after the one-shot mechanism's
+  close (`OneShotRunner`: establish → op → close → node_touched hint), only
   when a CASE session was actually established (or, since 1.17.0, when the
   op deadline expires — see below); 経路2 is `matd`'s own
   internal cold-establish (or resend-establish) inside a warm op, calling
@@ -1159,6 +1160,17 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   `protocol.rs` の `Op` と helper、born-dead 判定（`op_state_target`）は不変。
 - 1 op 追加で触る場所: cli / resolve / `device_op::classify` / `to_op` / `protocol::Op` /
   `to_device_op` / `NodeOpKind` + `run_node_op` の 7 箇所（旧 ~15）。
+- **単一ソース化に伴う挙動差分**（旧経路との差、いずれも kind/exit code 表は不変）:
+  - matd 経路の「group ctx 未構成」エラー（テスト注入時のみ発生 — 本番の
+    `Engine::build` は常に `Some` を返す）は `store_parse` から `other` に
+    変わった（直経路と同一に統一）。未 provision / KVS 不備由来の
+    `GroupOutcome::Unavailable` は従来どおり `store_parse`。
+  - matd 経路でも名前解決と値の符号化（`Reject`）が `require_node` より先に
+    走るようになったため、未 commission ノード × 符号化不能な値の組み合わせは
+    `node_not_commissioned`(11) ではなく `parse_error`(1) になる（直経路と
+    同順に収束）。
+  - 直経路の `group provision` / `grant` は establish 失敗時の `detail` にも
+    `node N: ` を前置するようになった（matd と同一化。kind / exit code 不変）。
 - spec: `docs/superpowers/specs/2026-09-02-op-single-source-design.md`。
 
 ---

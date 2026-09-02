@@ -36,7 +36,7 @@ use mat_native::op::{GroupOpKind, NodeOpKind};
 /// slack を使い切る（= matd が予算内に応答しない）のは旧 matd か matd 停止。
 const CLIENT_SLACK: Duration = Duration::from_secs(2);
 
-/// 予算対象 op（`NodeOpKind::budget_applies`）へ deadline_ms を付与し、
+/// 予算対象 op（`DeviceOp::budget_applies`）へ deadline_ms を付与し、
 /// 適用時の read timeout を返す。非対象は無変更・read timeout なし。
 /// 0 = 明示無制限（matd 既定 60s の適用を止める）— read timeout も掛けない。
 fn attach_deadline(op: &mut Value, applies: bool, op_timeout_ms: u64) -> Option<Duration> {
@@ -47,11 +47,6 @@ fn attach_deadline(op: &mut Value, applies: bool, op_timeout_ms: u64) -> Option<
         map.insert("deadline_ms".into(), json!(op_timeout_ms));
     }
     (op_timeout_ms > 0).then(|| Duration::from_millis(op_timeout_ms) + CLIENT_SLACK)
-}
-
-/// `op` が `--op-timeout-ms` / matd `deadline_ms` の対象か（単一ノード op のみ）。
-fn budget_applies(op: &DeviceOp) -> bool {
-    matches!(op, DeviceOp::Node(n) if n.kind.budget_applies())
 }
 
 /// mat の実行経路。`resolve_route` が決める。socket は探索候補リスト
@@ -157,7 +152,7 @@ pub fn dispatch(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> ExitC
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
-    let read_timeout = attach_deadline(&mut op_json, budget_applies(op), op_timeout_ms);
+    let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
     match exchange_on_stream(stream, &op_json, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {
@@ -192,7 +187,7 @@ pub fn dispatch_auto(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> 
     };
     tracing::info!(socket = %socket.display(), "using matd (auto-detected)");
 
-    let read_timeout = attach_deadline(&mut op_json, budget_applies(op), op_timeout_ms);
+    let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
     Some(match exchange_on_stream(stream, &op_json, read_timeout) {
         Ok(resp) => emit_response(resp),
         Err(e) => {

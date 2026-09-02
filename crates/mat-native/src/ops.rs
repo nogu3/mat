@@ -1,8 +1,8 @@
 //! mat / matd 共有の native op ロジック（describe / diag thread）。
 //!
 //! `NodeConn` の上に立つ純粋ロジック層 —— バックエンド（実 CASE / test fake）
-//! を問わない。値の符号化を伴わない読み取り専用 op なので `classify`（M8a
-//! Task7 の `classify_strict` と違い）は常に `Some/None` — 値エラーはない。
+//! を問わない。値の符号化を伴わない読み取り専用 op なので `classify`（`op::NodeOpKind`
+//! の write/invoke コンストラクタと違い）は常に `Some/None` — 値エラーはない。
 
 use std::collections::HashMap;
 

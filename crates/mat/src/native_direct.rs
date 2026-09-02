@@ -84,7 +84,7 @@ pub(crate) fn run(
         let engine = Engine::build(&native_cfg)
             .await
             .map_err(map_engine_build_error)?;
-        let budget = matches!(op, DeviceOp::Node(n) if n.kind.budget_applies());
+        let budget = op.budget_applies();
         if budget && op_timeout_ms > 0 {
             // 直経路にも matd 経路と同じ予算セマンティクス（exit 3）。
             run_op_with_deadline(
@@ -98,13 +98,28 @@ pub(crate) fn run(
             run_with_engine(&engine, op).await
         }
     })?;
-    tracing::info!(op = op.name(), "op executed (native direct)");
+    // group_id は Group/GroupProvision/GroupGrant のみ Some（GroupBump は
+    // 特定 group 宛ではない）。node_id は上で計算済みの値をそのまま使う。
+    let group_id: Option<u16> = match op {
+        DeviceOp::Group(g) => Some(g.group_id),
+        DeviceOp::GroupProvision(p) => Some(p.group_id),
+        DeviceOp::GroupGrant { group_id, .. } => Some(*group_id),
+        DeviceOp::Node(_) | DeviceOp::GroupBump => None,
+    };
+    tracing::info!(
+        op = op.name(),
+        node_id,
+        group_id,
+        "op executed (native direct)"
+    );
     output::emit(body);
     Ok(())
 }
 
 /// engine 上で 1 op を実行し成功 body を返す（emit しない — テスト可能な単位）。
 async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::Value, MatError> {
+    // ヒント送信はブロッキング std I/O だが、ここは one-shot CLI の `block_on`
+    // 直下で他に走る非同期タスクが無いため async 化する価値が無い（旧 `finish_conn` の doc を継承）。
     let runner = OneShotRunner::new(engine, crate::matd_client::hint_node_touched);
     match op {
         DeviceOp::Node(n) => mat_native::runner::run_node(&runner, n, None).await,
@@ -457,7 +472,7 @@ mod tests {
     /// `classify` が出す DeviceOp を engine ごと直経路の実行関数に通し、
     /// FakeConn 応答で最後まで body が返ることを保証する。
     #[tokio::test]
-    async fn run_with_engine_completes_for_node_group_bump_and_grant() {
+    async fn run_with_engine_completes_for_read_open_window_group_invoke_and_bump() {
         use crate::cli::{Command, GroupCommand};
         use crate::device_op::{classify, Dispatch};
         use mat_core::alias::{EndpointRef, GroupRef, NodeRef};
@@ -511,5 +526,58 @@ mod tests {
             run_with_engine(&engine, &op).await.unwrap_err().kind,
             mat_core::error::ErrorKind::Other
         );
+    }
+
+    /// `group provision` の直経路成功 body には `PROVISION_NOTE`（KVS 直書き +
+    /// matd 再起動案内）が付く（matd 経路は `note: None`）。
+    #[tokio::test]
+    async fn run_with_engine_provision_attaches_direct_path_note() {
+        use mat_native::group_settings::GroupSettingsCtx;
+        use mat_native::op::ProvisionParams;
+        use mat_native::test_support::FakeConn;
+        use serde_json::json;
+
+        struct ScriptedEstablisher;
+        #[async_trait::async_trait]
+        impl mat_native::Establisher for ScriptedEstablisher {
+            async fn establish(
+                &self,
+                _node_id: u64,
+            ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+                Ok(Box::new(
+                    FakeConn::scripted()
+                        .with_read(0, 0x003F, 0x0000, json!([]))
+                        .with_read(
+                            0,
+                            0x001F,
+                            0x0000,
+                            json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
+                        ),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let mut engine = Engine::with_parts(Box::new(ScriptedEstablisher), None);
+        engine.group_settings = Some(GroupSettingsCtx {
+            main_ini: ini,
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        });
+
+        let op = DeviceOp::GroupProvision(ProvisionParams {
+            group_id: 99,
+            node_ids: vec![5],
+            keyset_id: 99,
+            name: "e2e".into(),
+            endpoint: 1,
+            epoch_key: Some("42".repeat(16)),
+            rebind: false,
+        });
+        let body = run_with_engine(&engine, &op).await.unwrap();
+        assert_eq!(body["status"], "provisioned");
+        assert_eq!(body["note"], PROVISION_NOTE);
     }
 }

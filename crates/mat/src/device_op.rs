@@ -38,6 +38,11 @@ impl DeviceOp {
             DeviceOp::GroupBump => "group_bump",
         }
     }
+
+    /// `--op-timeout-ms` / matd `deadline_ms` の対象か。
+    pub(crate) fn budget_applies(&self) -> bool {
+        matches!(self, DeviceOp::Node(n) if n.kind.budget_applies())
+    }
 }
 
 /// `classify` の結果。`Dedicated(name)` = 専用コマンド層を持つ op。
@@ -654,5 +659,24 @@ mod tests {
             .unwrap(),
             Dispatch::Device(DeviceOp::GroupBump)
         );
+    }
+
+    #[test]
+    fn budget_applies_only_to_budgeted_node_ops() {
+        assert!(DeviceOp::Node(NodeOp {
+            node_id: 5,
+            kind: NodeOpKind::On { endpoint: 1 },
+        })
+        .budget_applies());
+        assert!(!DeviceOp::Node(NodeOp {
+            node_id: 5,
+            kind: NodeOpKind::OpenWindow {
+                timeout: 180,
+                iteration: 1000,
+                discriminator: 1,
+            },
+        })
+        .budget_applies());
+        assert!(!DeviceOp::GroupBump.budget_applies());
     }
 }

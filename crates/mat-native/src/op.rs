@@ -17,7 +17,7 @@ use crate::group::{self, BumpOutcome, GroupOutcome};
 use crate::Engine;
 
 /// 経路非依存の入力換算（CLI 入力 → Matter 生値）。旧 `mat/src/units.rs`。
-pub mod units {
+pub(crate) mod units {
     /// `--kelvin` / `--mireds`（排他・どちらか必須）を `(mireds, kelvin)` に
     /// 解決する。与えられなかった側は `round(1_000_000 / x)` で補完し、出力
     /// JSON へのエコーに使う。デバイス対応範囲の検証はしない。
