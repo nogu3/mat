@@ -1476,11 +1476,15 @@ enum SubscribeOutcome {
 /// Serves one `SubscribeRequest` end to end (spec §8.10): priming
 /// ReportData (chunked, each chunk acknowledged with `StatusResponse(0)`
 /// by the initiator) followed by a `SubscribeResponse`, all on the
-/// requesting exchange, and returns the resulting `ActiveSubscription` —
-/// or `None` if any step failed, in which case this device simply has no
-/// subscription and the initiator is free to retry from scratch (same
+/// requesting exchange, and returns a `SubscribeOutcome`: `Installed` with
+/// the resulting `ActiveSubscription` on success; `TornDown` if any step
+/// failed mid-flow, in which case this device simply has no subscription
+/// and the initiator is free to retry from scratch (same
 /// abort-and-let-the-initiator-retry policy `serve_read_request_chunked`
-/// uses for chunked reads).
+/// uses for chunked reads); or `Rejected` if the request was refused
+/// up front with `StatusResponse(INVALID_ACTION)` before any of that
+/// flow started, which leaves any existing subscription on this node
+/// untouched.
 ///
 /// Two ways this differs from a chunked read (both are why priming needs
 /// its own flow rather than reusing `serve_read_request_chunked`): every
