@@ -104,6 +104,10 @@ pub struct DeviceConfig {
     /// to [`AttestationMode::Self_`] — existing chip-tool e2e behavior is
     /// unchanged unless a caller opts into `ChipTest` explicitly.
     pub attestation: AttestationMode,
+    /// groupcast 受信ソケットの UDP ポート。Matter の multicast 宛先は
+    /// 5540 固定なので本番は 5540（SO_REUSEPORT で他プロセスと共存）。
+    /// `0` = エフェメラル（統合テストが `group_local_addr` で知る）。
+    pub group_port: u16,
     /// M3: Aggregator (EP1) 配下に載せる bridged device 群、設定ファイルの
     /// `[[device]]` 宣言順。空でも `Device::new` は通る（EP1 の PartsList が
     /// 空の Aggregator になるだけ）— 「1 台以上必要」の判断は
@@ -198,6 +202,7 @@ pub struct Device {
     local_addr: SocketAddr,
     node: Node,
     comm_server: CommissioningServer,
+    group: crate::net::group_rx::GroupRx,
     /// 各 bridged device の `(設定ファイルの id, OnOff 状態ハンドル)` —
     /// 宣言順。`Device` 自身はまだ読まない（M4 で mando への転送/状態
     /// ログが消費する）。
@@ -349,7 +354,7 @@ impl Device {
             0,
             Box::new(
                 crate::core::group_key_management::GroupKeyManagementHandler::new(
-                    gk_store,
+                    gk_store.clone(),
                     membership.clone(),
                 ),
             ),
@@ -405,12 +410,33 @@ impl Device {
         let local_addr = udp.local_addr().map_err(DeviceError::Io)?;
         let transport = Arc::new(Transport::Udp(Arc::new(udp)));
 
+        let iface_index = mat_controller::dnssd::iface_index(&config.iface).unwrap_or_else(|e| {
+            tracing::warn!(iface = %config.iface, error = %e, "groupcast: interface index unknown; joining on the kernel default");
+            0
+        });
+        let group_socket = match crate::net::group_rx::GroupSocket::bind(
+            config.group_port,
+            iface_index,
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
+                None
+            }
+        };
+        let group = crate::net::group_rx::GroupRx {
+            socket: group_socket,
+            gk_store: gk_store.clone(),
+            membership: membership.clone(),
+        };
+
         Ok(Self {
             config,
             transport,
             local_addr,
             node,
             comm_server,
+            group,
             onoff_states,
         })
     }
@@ -420,6 +446,15 @@ impl Device {
     /// mDNS) uses this to reach the device without discovery.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The groupcast receive socket's actual bound address, if it bound
+    /// (`None` when it didn't — the device still serves unicast only; see
+    /// `new`'s doc comment). Resolves `DeviceConfig::group_port == 0` to the
+    /// ephemeral port the OS picked, same as `local_addr` for the unicast
+    /// socket.
+    pub fn group_local_addr(&self) -> Option<SocketAddr> {
+        self.group.socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
     /// QR onboarding payload (`MT:...`, spec §5.1.4) — `mat commission
@@ -478,6 +513,7 @@ impl Device {
             self.config,
             self.node,
             self.comm_server,
+            self.group,
         )
         .await
     }
@@ -542,6 +578,7 @@ mod tests {
             store_dir: dir.path().to_path_buf(),
             iface: "lo".into(),
             attestation: AttestationMode::default(),
+            group_port: 0,
             devices,
         };
         let dev = |id: &str, name: &str| VirtualDeviceConfig {
@@ -681,6 +718,7 @@ mod tests {
             store_dir: dir.path().to_path_buf(),
             iface: "lo".into(),
             attestation: AttestationMode::default(),
+            group_port: 0,
             devices: vec![
                 VirtualDeviceConfig {
                     id: "e2e-light".into(),
@@ -734,6 +772,29 @@ mod tests {
         assert_eq!(unique_id_at(&mut d2.node, 2), first);
         assert_eq!(unique_id_at(&mut d2.node, 3), second);
         drop(d2);
+    }
+
+    /// `Device::new` binds the groupcast receive socket alongside the
+    /// unicast one — `group_local_addr` resolves `group_port == 0` to
+    /// whatever ephemeral port the OS picked, just like `local_addr` does
+    /// for the unicast socket.
+    #[tokio::test]
+    async fn group_socket_is_bound_on_the_configured_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = DeviceConfig {
+            passcode: 20202021,
+            discriminator: 0xF00,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            port: 0,
+            store_dir: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            attestation: AttestationMode::default(),
+            group_port: 0,
+            devices: vec![],
+        };
+        let d = Device::new(cfg).unwrap();
+        assert!(d.group_local_addr().unwrap().port() != 0);
     }
 
     /// First call with an empty `store_dir` generates a fresh UniqueID and

@@ -5,7 +5,9 @@
 //! `runtime`。応答は送らない（全 drop は `GroupDrop` で理由を返し、runtime が
 //! debug ログにする）。
 use std::collections::{HashSet, VecDeque};
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
+
+use socket2::{Domain, Protocol, Socket, Type};
 
 use mat_controller::crypto::open_message;
 use mat_controller::fabric::{
@@ -187,6 +189,83 @@ pub fn desired_group_addrs(
         .collect()
 }
 
+/// groupcast 受信ソケット: `[::]:port`（既定 5540）を SO_REUSEADDR +
+/// SO_REUSEPORT で bind（同ホストの他プロセスと共存）、multicast join は
+/// `sync_joins` で差分管理。`mat_controller::transport::UdpTransport` に
+/// join API が無いので mat-device で直接組む。
+pub struct GroupSocket {
+    socket: tokio::net::UdpSocket,
+    iface_index: u32,
+    joined: HashSet<Ipv6Addr>,
+}
+
+impl GroupSocket {
+    pub fn bind(port: u16, iface_index: u32) -> std::io::Result<Self> {
+        let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_only_v6(true)?;
+        sock.set_reuse_address(true)?;
+        sock.set_reuse_port(true)?;
+        sock.bind(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port).into())?;
+        sock.set_nonblocking(true)?;
+        let socket = tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(sock))?;
+        Ok(Self {
+            socket,
+            iface_index,
+            joined: HashSet::new(),
+        })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
+    }
+
+    /// desired との差分だけ join/leave。失敗は warn（`lo` は join 不可 —
+    /// テスト経路）で、成功分だけ `joined` に記録する（失敗分は次回再試行）。
+    pub fn sync_joins(&mut self, desired: &HashSet<Ipv6Addr>) {
+        for addr in desired.difference(&self.joined.clone()) {
+            match self.socket.join_multicast_v6(addr, self.iface_index) {
+                Ok(()) => {
+                    self.joined.insert(*addr);
+                    tracing::info!(%addr, iface_index = self.iface_index, "groupcast: joined");
+                }
+                Err(e) => {
+                    tracing::warn!(%addr, iface_index = self.iface_index, error = %e, "groupcast: join failed (will retry)");
+                }
+            }
+        }
+        for addr in self.joined.clone().difference(desired) {
+            if let Err(e) = self.socket.leave_multicast_v6(addr, self.iface_index) {
+                tracing::warn!(%addr, error = %e, "groupcast: leave failed");
+            }
+            self.joined.remove(addr);
+            tracing::info!(%addr, "groupcast: left");
+        }
+    }
+}
+
+/// `runtime::run` が受け取る groupcast 一式（`Device` が組む）。
+pub struct GroupRx {
+    pub socket: Option<GroupSocket>,
+    pub gk_store: GroupKeyStore,
+    pub membership: GroupMembershipStore,
+}
+
+/// `select!` 用: ソケットが無ければ永遠に pending（`subscription_deadline`
+/// と同じ流儀）。
+pub async fn group_recv(
+    socket: &Option<GroupSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(s) => s.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +431,24 @@ mod tests {
         }
         // 最古（fabric 1, source 7）が退去 → 同じ counter がまた通る
         assert!(g.accept(1, 7, 11));
+    }
+
+    #[tokio::test]
+    async fn group_socket_binds_ephemeral_and_survives_failed_joins() {
+        let mut s = GroupSocket::bind(0, 1 /* lo */).unwrap();
+        assert_ne!(s.local_addr().unwrap().port(), 0);
+        let mut want = HashSet::new();
+        want.insert(mat_controller::group::group_multicast_addr(FABRIC_ID, 10));
+        s.sync_joins(&want); // lo は IFF_MULTICAST 無し → join 失敗でも panic しない
+        s.sync_joins(&HashSet::new()); // leave 側も同様
+    }
+
+    #[tokio::test]
+    async fn two_group_sockets_can_share_one_port() {
+        let a = GroupSocket::bind(0, 1).unwrap();
+        let port = a.local_addr().unwrap().port();
+        let _b = GroupSocket::bind(port, 1)
+            .expect("SO_REUSEPORT lets a second socket bind the same port");
     }
 
     #[test]

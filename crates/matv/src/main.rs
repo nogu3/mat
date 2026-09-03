@@ -201,6 +201,9 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         store_dir: cfg.store,
         iface: cfg.iface,
         attestation: cfg.attestation,
+        // Task 9 wires this to a real config value; for now the device
+        // binds the groupcast socket on an ephemeral port.
+        group_port: 0,
         devices,
     })
     .map_err(|e| format!("failed to start device: {e}"))?;

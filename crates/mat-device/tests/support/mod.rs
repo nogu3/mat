@@ -85,6 +85,7 @@ pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
         store_dir,
         iface: "lo".to_string(),
         attestation: AttestationMode::default(),
+        group_port: 0,
         // The standard e2e `[[device]]` block (same id/kind/name as
         // `matv`'s own tests and `scripts/e2e-*`), landing on
         // [`BRIDGED_EP`].
