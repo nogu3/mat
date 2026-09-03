@@ -14,6 +14,8 @@ use mat_core::store::Store;
 use mat_native::runner::OneShotRunner;
 use mat_native::{Engine, NativeConfig};
 
+use mat_native::op::{NodeOp, NodeOpKind};
+
 use crate::device_op::DeviceOp;
 
 pub(crate) struct Config<'a> {
@@ -27,18 +29,57 @@ pub(crate) struct Config<'a> {
 const PROVISION_NOTE: &str =
     "controller group state written natively to kvs; if matd is running, restart it to reload group state";
 
-/// 直経路 native の入口。store / commission チェック → engine 構築 →
-/// `OneShotRunner`（確立 → 1 op → close → matd へ node_touched ヒント）で実行し、
-/// 成功 body を stdout へ emit する。
+/// `node_touched` ヒントを撃ってはいけない op か。
+///
+/// `unpair`（`RemoveFabric`）だけが該当する。ヒントは matd に「このノードを
+/// 今触ったので warm セッションを張り直せ」と伝えるものだが、fabric から
+/// 外した直後のノードに対して撃つと matd が再購読 → CASE 失敗 → backoff を
+/// 台帳 rescan（最大 `LEDGER_RESCAN_INTERVAL` = 60s）まで回し続ける。
+/// 消えるノードなので黙って落とすのが正しい。
+fn suppresses_node_touched_hint(op: &DeviceOp) -> bool {
+    matches!(
+        op,
+        DeviceOp::Node(NodeOp {
+            kind: NodeOpKind::RemoveFabric,
+            ..
+        })
+    )
+}
+
+/// この op に使う `node_touched` ヒント（抑止対象なら no-op）。
+fn hint_for(op: &DeviceOp) -> fn(u64) {
+    if suppresses_node_touched_hint(op) {
+        |_| {}
+    } else {
+        crate::matd_client::hint_node_touched
+    }
+}
+
+/// 直経路 native の入口。`execute` で成功 body を得て stdout へ emit する。
 pub(crate) fn run(
     op: &DeviceOp,
     store_path: &Path,
     cfg: &Config,
     op_timeout_ms: u64,
 ) -> Result<(), MatError> {
+    let body = execute(op, store_path, cfg, op_timeout_ms)?;
+    output::emit(body);
+    Ok(())
+}
+
+/// store / commission チェック → engine 構築 → `OneShotRunner`（確立 → 1 op →
+/// close → matd へ node_touched ヒント）で 1 op を実行し、成功 body（timestamp
+/// 抜き）を返す。emit しない — `unpair` のように body を別の JSON へ合成する
+/// 呼び手のための単位。
+pub(crate) fn execute(
+    op: &DeviceOp,
+    store_path: &Path,
+    cfg: &Config,
+    op_timeout_ms: u64,
+) -> Result<serde_json::Value, MatError> {
     let store = Store::open(store_path)?;
     // group 送信 / bump は特定ノード宛ではないため require_node をしない。
-    // provision / grant は「1 つでも未 commission なら exit 11」。
+    // provision / grant / remove は「1 つでも未 commission なら exit 11」。
     let node_id = match op {
         DeviceOp::Node(n) => Some(n.node_id),
         DeviceOp::GroupProvision(p) => {
@@ -47,7 +88,7 @@ pub(crate) fn run(
             }
             None
         }
-        DeviceOp::GroupGrant { node_ids, .. } => {
+        DeviceOp::GroupGrant { node_ids, .. } | DeviceOp::GroupRemove { node_ids, .. } => {
             for &id in node_ids {
                 store.require_node(id)?;
             }
@@ -91,19 +132,21 @@ pub(crate) fn run(
                 run_with_engine(&engine, op),
                 op_timeout_ms,
                 node_id,
-                crate::matd_client::hint_node_touched,
+                hint_for(op),
             )
             .await
         } else {
             run_with_engine(&engine, op).await
         }
     })?;
-    // group_id は Group/GroupProvision/GroupGrant のみ Some（GroupBump は
+    // group_id は Group/GroupProvision/GroupGrant/GroupRemove のみ Some（GroupBump は
     // 特定 group 宛ではない）。node_id は上で計算済みの値をそのまま使う。
     let group_id: Option<u16> = match op {
         DeviceOp::Group(g) => Some(g.group_id),
         DeviceOp::GroupProvision(p) => Some(p.group_id),
-        DeviceOp::GroupGrant { group_id, .. } => Some(*group_id),
+        DeviceOp::GroupGrant { group_id, .. } | DeviceOp::GroupRemove { group_id, .. } => {
+            Some(*group_id)
+        }
         DeviceOp::Node(_) | DeviceOp::GroupBump => None,
     };
     tracing::info!(
@@ -112,15 +155,14 @@ pub(crate) fn run(
         group_id,
         "op executed (native direct)"
     );
-    output::emit(body);
-    Ok(())
+    Ok(body)
 }
 
 /// engine 上で 1 op を実行し成功 body を返す（emit しない — テスト可能な単位）。
 async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::Value, MatError> {
     // ヒント送信はブロッキング std I/O だが、ここは one-shot CLI の `block_on`
     // 直下で他に走る非同期タスクが無いため async 化する価値が無い（旧 `finish_conn` の doc を継承）。
-    let runner = OneShotRunner::new(engine, crate::matd_client::hint_node_touched);
+    let runner = OneShotRunner::new(engine, hint_for(op));
     match op {
         DeviceOp::Node(n) => mat_native::runner::run_node(&runner, n, None).await,
         DeviceOp::Group(g) => mat_native::op::run_group_op(engine, g).await,
@@ -129,6 +171,13 @@ async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::V
         }
         DeviceOp::GroupGrant { group_id, node_ids } => {
             mat_native::runner::grant(&runner, *group_id, node_ids).await
+        }
+        DeviceOp::GroupRemove {
+            group_id,
+            endpoint,
+            node_ids,
+        } => {
+            mat_native::runner::remove_group(&runner, engine, *group_id, *endpoint, node_ids).await
         }
         DeviceOp::GroupBump => mat_native::op::run_group_bump(engine).await,
     }
@@ -428,6 +477,29 @@ mod tests {
         assert!(p.thread.is_err());
     }
 
+    /// F6: `unpair`（RemoveFabric）だけは node_touched ヒントを撃たない。
+    /// 撃つと matd が外したばかりのノードへ再購読し、次の台帳 rescan（最大
+    /// 60s）まで CASE 失敗の backoff ノイズを出す。
+    #[test]
+    fn remove_fabric_suppresses_the_node_touched_hint() {
+        let unpair = DeviceOp::Node(NodeOp {
+            node_id: 24,
+            kind: NodeOpKind::RemoveFabric,
+        });
+        assert!(suppresses_node_touched_hint(&unpair));
+        // no-op であること（生きたヒントなら env 依存の socket 接続を試みる）。
+        let hint = hint_for(&unpair);
+        hint(24);
+
+        // 他の op はヒントを撃つ（= 抑止対象ではない）。
+        let read = DeviceOp::Node(NodeOp {
+            node_id: 24,
+            kind: NodeOpKind::read(1, "onoff", "on-off").unwrap(),
+        });
+        assert!(!suppresses_node_touched_hint(&read));
+        assert!(!suppresses_node_touched_hint(&DeviceOp::GroupBump));
+    }
+
     /// Issue #22: deadline 超過で future ごと drop されると `OneShotRunner` の
     /// close+hint が走らない。Err 腕で node_touched ヒントだけは撃つこと
     /// （close はセッション所有権が drop 済みで送れない）。
@@ -482,7 +554,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         let Dispatch::Device(op) = classify(&read).unwrap() else {
             panic!("device op")

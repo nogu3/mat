@@ -110,12 +110,15 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   fabric bootstrap is `mat fabric init` (random-epoch IPK). A fabric first
   created by chip-tool is handled by verifying its fixed epoch against the KVS
   materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`).
-- `matd`-only ops vs direct-only ops: `discover` / `commission` / `fabric init`
-  / `open-window` / `diag` / `group grant` are never part of the `matd` socket
-  protocol — they always run on `mat`'s own one-shot direct path. `listen` is
-  the opposite case and the first of its kind: it is **matd-only**, with no
-  direct-path fallback at all (subscriptions need a resident daemon). See
-  docs/commands.md ("Routing through matd") for the exact op list.
+- `matd`-only ops vs direct-only ops: `discover` / `commission` / `unpair` /
+  `fabric init` / `open-window` / `diag` / `group grant` / `group remove` are
+  never part of the `matd` socket protocol — they always run on `mat`'s own
+  one-shot direct path. `fabric list` / `group list` are local-only KVS reads
+  dispatched before route selection (no network, no daemon), so `--matd` is
+  ignored there rather than exit `2`. `listen` is the opposite case and the
+  first of its kind: it is **matd-only**, with no direct-path fallback at all
+  (subscriptions need a resident daemon). See docs/commands.md ("Routing
+  through matd") for the exact op list.
 - **op → TLV → body lives once**, in `mat-native::op` (`run_node_op` /
   `run_group_op`). `mat` and `matd` differ only in session strategy
   (`mat-native::runner::NodeRunner`: one-shot vs warm). Adding an op means

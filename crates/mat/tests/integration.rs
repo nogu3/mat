@@ -431,6 +431,31 @@ fn group_grant_unknown_node_exits_11() {
 }
 
 #[test]
+fn group_remove_requires_nodes_and_rejects_forced_matd() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "remove", "--group", "1"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .env_remove("MAT_MATD")
+        .args(["group", "remove", "--group", "1", "--nodes", "5", "--matd"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("group remove"));
+}
+
+#[test]
+fn group_remove_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "remove", "--group", "1", "--nodes", "5", "6"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
 fn group_provision_rejects_bad_epoch_key() {
     // require_node(5) はここでは通る（台帳にある）。epoch key の検証は
     // controller state 書込（KVS/chip-tool）より前に走るので、この失敗は
@@ -668,4 +693,144 @@ fn fabric_init_full_local_cycle() {
     let out2 = mat(dir.path()).args(["fabric", "init"]).output().unwrap();
     assert_eq!(out2.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
+}
+
+// ── fabric list（Task11: ローカル完結、iface/matd 不到達）──────────────────
+
+#[test]
+fn fabric_list_after_init_reports_current_fabric() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args(["fabric", "init", "--fabric-id", "7"])
+        .assert()
+        .success();
+    mat(store.path())
+        .args(["fabric", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"fabric_index\":1"))
+        .stdout(predicate::str::contains("\"fabric_id\":7"))
+        .stdout(predicate::str::contains("\"admin_node_id\":112233"))
+        .stdout(predicate::str::contains("\"ipk_epoch\":\"mat\""))
+        .stdout(predicate::str::contains("\"current\":true"));
+}
+
+#[test]
+fn fabric_list_without_kvs_exits_10() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["fabric", "list"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("fabric init"));
+}
+
+// ── group list（M8c-3 Task10: ローカル完結、iface/matd 不到達）────────────
+
+#[test]
+fn group_list_missing_store_exits_10() {
+    let dir = TempDir::new().unwrap();
+    mat(&dir.path().join("nope"))
+        .args(["group", "list"])
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn group_list_without_kvs_ini_exits_10_with_fabric_init_hint() {
+    // store ディレクトリはあるが chip_tool_config.ini が無い（fabric init 前）。
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "list"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("fabric init"));
+}
+
+#[test]
+fn group_list_on_fresh_fabric_emits_empty_arrays() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args(["fabric", "init"])
+        .assert()
+        .success();
+    mat(store.path())
+        .args(["group", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"groups\":[]"))
+        .stdout(predicate::str::contains("\"keysets\":[]"))
+        .stdout(predicate::str::contains("\"fabric_index\":1"));
+}
+
+// ── unpair（RemoveFabric + 台帳/alias 削除、直経路のみ）────────────────────
+
+#[test]
+fn unpair_with_forced_matd_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env_remove("MAT_MATD")
+        .args(["unpair", "--node", "5", "--matd"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "does not support the `unpair` subcommand",
+        ));
+}
+
+#[test]
+fn unpair_missing_store_exits_10() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("nope");
+    mat(&missing)
+        .args(["unpair", "--node", "5"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_missing"));
+}
+
+#[test]
+fn unpair_unknown_node_exits_11_even_with_force() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["unpair", "--node", "6", "--force"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+// ── --timed（invoke / write の timed 上書き）─────────────────────────────
+
+#[test]
+fn timed_flag_is_accepted_by_invoke_and_write() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("nope");
+    mat(&missing)
+        .args([
+            "invoke",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+            "--timed",
+        ])
+        .assert()
+        .code(10);
+    mat(&missing)
+        .args([
+            "write",
+            "--node",
+            "5",
+            "--cluster",
+            "levelcontrol",
+            "--attribute",
+            "on-level",
+            "--value",
+            "128",
+            "--timed",
+        ])
+        .assert()
+        .code(10);
 }

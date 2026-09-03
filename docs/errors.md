@@ -13,7 +13,7 @@ Errors go to stderr as `{"error":{"kind":"...","detail":"..."}}`.
 | 4 | device rejected |
 | 5 | unreachable / network |
 | 6 | CASE session establishment failed |
-| 13 | `matd` absent / unreachable (`mat listen` only) |
+| 13 | `matd` absent / unreachable (`mat listen` only; `mat listen --reconnect` retries with backoff instead of exiting — see below) |
 | 1 | other |
 
 When `commission` tries more than one route, the reported `kind` and exit code are
@@ -53,7 +53,11 @@ is `unreachable` (exit `5`).
 - `matd_unavailable` (exit 13) — `matd` was not reachable or died mid-request.
   For `mat listen`: no socket, connection refused, `MAT_MATD=0`, or the
   connection was cut partway through the event stream (`mat listen` has no
-  direct-path fallback). Since 1.0.0 also for every other op on the matd path:
+  direct-path fallback). With `mat listen --reconnect` those losses (connect
+  failure, EOF, a non-JSON line) are retried with backoff (1 s → 30 s) instead
+  of exiting `13`; `MAT_MATD=0` still exits `13` immediately (the route is
+  resolved before the stream, so there is nothing to reconnect to), and an
+  `error` line `matd` sends inline still terminates the run. Since 1.0.0 also for every other op on the matd path:
   forced `--matd` failing to connect, or an I/O failure / silent disconnect
   after the request line was sent (the request may or may not have been
   executed — the detail says so; there is deliberately no direct-path retry, to

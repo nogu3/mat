@@ -16,6 +16,9 @@ use base64ct::{Base64, Encoding};
 
 use crate::tlv::{Element, Reader, Tag, Value};
 
+/// chip-tool 互換 main KVS のファイル名（store ルート直下）。
+pub const MAIN_INI_FILE: &str = "chip_tool_config.ini";
+
 /// Fabric credentials read from chip-tool's ini KVS, still in raw form
 /// (opaque certs, unparsed keys) as CASE needs them.
 #[derive(Clone)]
@@ -344,7 +347,7 @@ fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], Optio
 /// hash is `Option` — see [`parse_key_struct`] for why; callers that need the
 /// hash (group send) must check for `None` themselves, callers that don't
 /// (IPK read, via [`parse_keyset`]) ignore it entirely.
-fn parse_keyset_first_entry(
+pub(crate) fn parse_keyset_first_entry(
     blob: &[u8],
     fabric_index: u8,
 ) -> Result<([u8; 16], Option<u16>), KvsError> {
@@ -532,6 +535,59 @@ pub fn read_self_issue_materials(
         node_id,
         fabric_id,
     })
+}
+
+/// main KVS の `[Default]` から `f/<n>/n`（fabric table の NOC）を持つ index を
+/// 昇順で列挙する。`mat fabric list` 用。
+pub fn list_fabric_indices(main_ini: &Path) -> Result<Vec<u8>, KvsError> {
+    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    let mut out: Vec<u8> = sec
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(k, _)| k.trim()))
+        .filter_map(|k| {
+            k.strip_prefix("f/")
+                .and_then(|rest| rest.strip_suffix("/n"))
+                .and_then(|n| n.parse::<u8>().ok())
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// `f/<idx>/n` の NOC subject から `(node_id, fabric_id)` を読む（alpha.ini 不要）。
+pub fn read_noc_identity(main_ini: &Path, fabric_index: u8) -> Result<(u64, u64), KvsError> {
+    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    let noc_key = format!("f/{fabric_index}/n");
+    let noc_tlv = decode_b64(sec, &noc_key)?.ok_or(KvsError::KeyMissing(noc_key))?;
+    let noc = crate::cert::MatterCert::parse(&noc_tlv).map_err(|_| KvsError::BadNoc {
+        fabric_index,
+        reason: "unparseable matter-tlv certificate",
+    })?;
+    let node_id = noc.node_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing node id (tag 17)",
+    })?;
+    let fabric_id = noc.fabric_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing fabric id (tag 21)",
+    })?;
+    Ok((node_id, fabric_id))
+}
+
+/// `f/<idx>/r` の RCAC 公開鍵（compressed fabric id の導出用）。
+pub fn read_rcac_pubkey(main_ini: &Path, fabric_index: u8) -> Result<[u8; 65], KvsError> {
+    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
+    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    let key = format!("f/{fabric_index}/r");
+    let rcac = decode_b64(sec, &key)?.ok_or(KvsError::KeyMissing(key))?;
+    let cert = crate::cert::MatterCert::parse(&rcac).map_err(|_| KvsError::BadNoc {
+        fabric_index,
+        reason: "unparseable rcac",
+    })?;
+    Ok(cert.pub_key)
 }
 
 /// Group send credentials from the GroupKeyMap + keyset blob: the group
@@ -1525,5 +1581,19 @@ mod tests {
         )
         .unwrap();
         assert!(read_mat_ipk_epoch(&ini, 1).is_err());
+    }
+
+    // ---- Task 11: mat fabric list ----
+
+    #[test]
+    fn list_fabric_indices_scans_noc_keys_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chip_tool_config.ini");
+        std::fs::write(
+            &p,
+            "[Default]\nf/3/n=AA==\nf/1/n=AA==\nf/1/r=AA==\ng/gdc=AA==\nmat/f/1/ipk-epoch=AA==\n",
+        )
+        .unwrap();
+        assert_eq!(list_fabric_indices(&p).unwrap(), vec![1, 3]);
     }
 }

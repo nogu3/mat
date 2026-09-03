@@ -145,6 +145,9 @@ pub struct FakeConn {
     pub sent: usize,
     reads: HashMap<(u16, u32, u32), serde_json::Value>,
     clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
+    /// `invoke_for_data(endpoint, cluster, command)` の応答 CommandFields TLV
+    /// プリセット（`with_invoke_response` で流し込む）。未登録は空 Vec。
+    invoke_responses: HashMap<(u16, u32, u32), Vec<u8>>,
     /// `invoke`/`write_tlv` の呼び出し記録（M8a Task9）。順序・宛先の検証用
     /// — `"invoke(ep,0xCCCC,0xCCCC)"` / `"write_tlv(ep,0xCCCC,0xCCCC)"` 形
     /// （cluster/command/attribute は `{:#06X}` — 4桁ゼロ埋め大文字 hex）。
@@ -168,6 +171,7 @@ impl Default for FakeConn {
             sent: 0,
             reads: HashMap::new(),
             clusters: HashMap::new(),
+            invoke_responses: HashMap::new(),
             calls: Vec::new(),
             written_tlv: Vec::new(),
             delay: None,
@@ -217,6 +221,20 @@ impl FakeConn {
         self.clusters.insert((endpoint, cluster), rows);
         self
     }
+
+    /// `invoke_for_data(endpoint, cluster, command)` の応答 CommandFields TLV を
+    /// 1 件登録する（未登録は空 Vec = status-only 応答の形）。
+    pub fn with_invoke_response(
+        mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        tlv: Vec<u8>,
+    ) -> Self {
+        self.invoke_responses
+            .insert((endpoint, cluster, command), tlv);
+        self
+    }
 }
 
 #[async_trait]
@@ -246,6 +264,27 @@ impl NodeConn for FakeConn {
         self.calls
             .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
         Ok(())
+    }
+
+    async fn invoke_for_data(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        _fields: Option<Vec<u8>>,
+        _timed: bool,
+    ) -> Result<Vec<u8>, MatError> {
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
+        self.calls.push(format!(
+            "invoke_for_data({endpoint},{cluster:#06X},{command:#06X})"
+        ));
+        Ok(self
+            .invoke_responses
+            .get(&(endpoint, cluster, command))
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn read_json(
@@ -579,5 +618,33 @@ mod close_tests {
         let counter = std::sync::Arc::clone(&c.close_calls);
         c.close().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fake_conn_invoke_for_data_returns_registered_tlv_and_records_call() {
+        let mut c = FakeConn::scripted().with_invoke_response(0, 0x003E, 0x0A, vec![0x15, 0x18]);
+        let got = c
+            .invoke_for_data(0, 0x003E, 0x0A, None, false)
+            .await
+            .unwrap();
+        assert_eq!(got, vec![0x15, 0x18]);
+        // 未登録は空 Vec（status-only 応答の形）。
+        let empty = c
+            .invoke_for_data(1, 0x0004, 0x03, None, false)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            c.calls(),
+            &[
+                "invoke_for_data(0,0x003E,0x000A)".to_string(),
+                "invoke_for_data(1,0x0004,0x0003)".to_string(),
+            ]
+        );
     }
 }

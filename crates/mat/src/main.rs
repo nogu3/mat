@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, DiagCommand, FabricAction};
+use cli::{Cli, Command, DiagCommand, FabricAction, GroupCommand};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
@@ -63,17 +63,35 @@ fn main() -> ExitCode {
     // なので、iface 自動検出（下のブロック）にも matd 経路にも巻き込まない —
     // ここで最優先 dispatch する。
     if let Command::Fabric { action } = &command {
-        let FabricAction::Init {
-            fabric_id,
-            admin_node_id,
-        } = action;
-        return match commands::fabric::run_init(
-            &store_path,
-            *fabric_id,
-            *admin_node_id,
-            args.fabric_index,
-            args.issuer_index,
-        ) {
+        let result = match action {
+            FabricAction::Init {
+                fabric_id,
+                admin_node_id,
+            } => commands::fabric::run_init(
+                &store_path,
+                *fabric_id,
+                *admin_node_id,
+                args.fabric_index,
+                args.issuer_index,
+            ),
+            FabricAction::List => commands::fabric::run_list(&store_path, args.fabric_index),
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                e.emit();
+                ExitCode::from(e.kind.exit_code())
+            }
+        };
+    }
+
+    // group list もローカル完結（KVS 読み取りのみ）— fabric と同じ扱いで
+    // iface 解決・matd 経路に巻き込まない。
+    if let Command::Group {
+        action: GroupCommand::List,
+    } = &command
+    {
+        return match commands::group::run_list(&store_path, args.fabric_index) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 e.emit();
@@ -211,6 +229,15 @@ fn main() -> ExitCode {
             thread_dataset.as_deref(),
             *transport,
         ),
+        Command::Unpair { node_id, force } => node_id.id().and_then(|node| {
+            commands::unpair::run(
+                &store_path,
+                node,
+                *force,
+                native_cfg.as_ref(),
+                args.op_timeout_ms,
+            )
+        }),
         Command::Diag {
             action:
                 DiagCommand::Node {

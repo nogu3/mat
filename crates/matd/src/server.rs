@@ -659,16 +659,23 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             endpoint,
             cluster,
             attribute,
-        } => node(*node_id, NodeOpKind::read(*endpoint, cluster, attribute)?),
+        } => node(
+            *node_id,
+            match attribute {
+                Some(a) => NodeOpKind::read(*endpoint, cluster, a)?,
+                None => NodeOpKind::read_cluster(*endpoint, cluster)?,
+            },
+        ),
         Op::Write {
             node_id,
             endpoint,
             cluster,
             attribute,
             value,
+            timed,
         } => node(
             *node_id,
-            NodeOpKind::write(*endpoint, cluster, attribute, value)?,
+            NodeOpKind::write(*endpoint, cluster, attribute, value, *timed)?,
         ),
         Op::Invoke {
             node_id,
@@ -676,9 +683,10 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             cluster,
             command,
             args,
+            timed,
         } => node(
             *node_id,
-            NodeOpKind::invoke(*endpoint, cluster, command, args)?,
+            NodeOpKind::invoke(*endpoint, cluster, command, args, *timed)?,
         ),
         Op::On { node_id, endpoint } => node(
             *node_id,
@@ -1150,7 +1158,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         })
         .unwrap();
         assert!(
@@ -1162,6 +1170,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         })
         .unwrap();
         assert!(matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Write { .. })));
@@ -1171,6 +1180,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         })
         .unwrap();
         assert!(
@@ -1182,13 +1192,29 @@ mod tests {
     }
 
     #[test]
+    fn to_device_op_applies_timed_override() {
+        let m = to_device_op(&Op::Invoke {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec![],
+            timed: true,
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Invoke { timed: true, .. }))
+        );
+    }
+
+    #[test]
     fn to_device_op_rejects_unresolved_names_and_unencodable_values() {
         // 未知名 → unresolved_op（parse_error、数値 ID 案内付き）。
         let err = to_device_op(&Op::Read {
             node_id: 1,
             endpoint: 1,
             cluster: "nosuchcluster".into(),
-            attribute: "x".into(),
+            attribute: Some("x".into()),
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1203,6 +1229,7 @@ mod tests {
             cluster: "nosuchcluster".into(),
             command: "x".into(),
             args: vec![],
+            timed: false,
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1213,6 +1240,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1383,7 +1411,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         let body = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
@@ -1407,6 +1435,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         };
         let err = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
@@ -1432,6 +1461,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         };
         let body = run_op(&invoke, &state, dir.path(), &health, None)
             .await
@@ -1710,7 +1740,7 @@ mod tests {
             node_id: 1,
             endpoint: 1,
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         let err = run_op(&read, &state, &store_path, &health, None)
             .await
@@ -1817,7 +1847,7 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
                 cluster: "onoff".into(),
-                attribute: "on-off".into(),
+                attribute: Some("on-off".into()),
             },
             &state,
             dir.path(),
@@ -1915,6 +1945,7 @@ mod tests {
             cluster: "onoff".into(),
             command: "toggle".into(),
             args: vec![],
+            timed: false,
         };
         assert_eq!(op_report_expectation(&invoke, Some(&t), Some(&l128)), None);
         let write = Op::Write {
@@ -1923,6 +1954,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         };
         assert_eq!(op_report_expectation(&write, Some(&t), Some(&l128)), None);
         // Read は元から対象外。
@@ -1930,7 +1962,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         assert_eq!(op_report_expectation(&read, Some(&f), None), None);
     }

@@ -62,6 +62,17 @@ pub trait NodeConn: Send {
         fields: Option<Vec<u8>>,
         timed: bool,
     ) -> Result<(), MatError>;
+    /// データ応答（CommandDataIB）を持つコマンドの invoke（NOCResponse /
+    /// RemoveGroupResponse 等）。応答の CommandFields TLV を返す（status-only
+    /// 応答は空 Vec）。IM status ≠ 0 は `invoke` と同じく Err。
+    async fn invoke_for_data(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields: Option<Vec<u8>>,
+        timed: bool,
+    ) -> Result<Vec<u8>, MatError>;
     /// 単一属性を任意形状（scalar/struct/array/list）で JSON 読み取る。
     async fn read_json(
         &mut self,
@@ -713,6 +724,29 @@ impl NodeConn for SessionConn {
                 .map_err(map_session_err)?;
         }
         Ok(())
+    }
+
+    async fn invoke_for_data(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields: Option<Vec<u8>>,
+        timed: bool,
+    ) -> Result<Vec<u8>, MatError> {
+        let data = self
+            .session
+            .invoke_for_data(
+                endpoint,
+                cluster,
+                command,
+                fields.as_deref(),
+                timed.then_some(TIMED_REQUEST_MS),
+                &self.mrp,
+            )
+            .await
+            .map_err(map_session_err)?;
+        Ok(data.fields_tlv.unwrap_or_default())
     }
 
     async fn read_json(

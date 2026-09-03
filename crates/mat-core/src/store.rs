@@ -32,6 +32,12 @@ struct Ledger {
     version: u32,
     #[serde(default)]
     nodes: BTreeMap<u64, NodeRecord>,
+    /// 払い出し済み node_id の high-water mark（次に配る id）。`unpair` で
+    /// 台帳から消えた id を再利用しないための単調増加カウンタ。0 = 未設定
+    /// （このフィールドを持たない旧形式台帳）で、その場合は `nodes` の最大値
+    /// から復元する。
+    #[serde(default)]
+    next_node_id: u64,
 }
 
 fn ledger_version() -> u32 {
@@ -107,12 +113,23 @@ impl Store {
             return Ok(Ledger {
                 version: ledger_version(),
                 nodes: BTreeMap::new(),
+                // 空台帳の watermark は 1（最初に払い出す id）。
+                next_node_id: 1,
             });
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| MatError::store_parse(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_str(&text)
-            .map_err(|e| MatError::store_parse(format!("cannot parse {}: {e}", path.display())))
+        let mut ledger: Ledger = serde_json::from_str(&text)
+            .map_err(|e| MatError::store_parse(format!("cannot parse {}: {e}", path.display())))?;
+        // `next_node_id` を持たない旧形式台帳（= このフィールド導入以前の全ストア）
+        // は、load 時にここで watermark を復元する。これをしないと `remove_node`
+        // が `next_node_id: 0` のまま保存し直し、次の `next_node_id()` が
+        // `max(nodes)+1` = 今まさに外した id に落ちる（stale SRP レコードで
+        // CASE が必ず失敗する罠）。以後は `upsert_node` が前進させる。
+        ledger.next_node_id = ledger
+            .next_node_id
+            .max(ledger.nodes.keys().max().map_or(1, |m| m + 1));
+        Ok(ledger)
     }
 
     fn save_ledger(&self) -> Result<(), MatError> {
@@ -147,10 +164,34 @@ impl Store {
             .ok_or_else(|| MatError::node_not_commissioned(node_id))
     }
 
-    /// ノードを台帳に追加し、ディスクへ永続化する。
+    /// 次に払い出す node_id。台帳の high-water mark と現在の最大 id の大きい方
+    /// （どちらも無ければ 1）。`unpair` で消えた id は再利用しない — stale な
+    /// SRP レコードが残ったまま同じ id で再 commission すると CASE が必ず失敗
+    /// するため（docs/commands.md の unpair 節）。
+    pub fn next_node_id(&self) -> u64 {
+        let from_nodes = self.ledger.nodes.keys().max().map_or(1, |m| m + 1);
+        self.ledger.next_node_id.max(from_nodes).max(1)
+    }
+
+    /// ノードを台帳に追加し、ディスクへ永続化する。high-water mark も前進させる。
+    ///
+    /// `remove_node` 側は watermark を触らなくてよい: `load_ledger` が読み込み時に
+    /// 必ず `max(nodes)+1` 以上へ補完してから返すので、削除の save が書き出す
+    /// `next_node_id` は既に「削除前の最大 id + 1」以上になっている。
     pub fn upsert_node(&mut self, record: NodeRecord) -> Result<(), MatError> {
+        self.ledger.next_node_id = self.ledger.next_node_id.max(record.node_id + 1);
         self.ledger.nodes.insert(record.node_id, record);
         self.save_ledger()
+    }
+
+    /// ノードを台帳から削除して永続化する。無ければ `Ok(false)`（ファイルは
+    /// 触らない）。`mat unpair` が使う唯一の削除経路。
+    pub fn remove_node(&mut self, node_id: u64) -> Result<bool, MatError> {
+        if self.ledger.nodes.remove(&node_id).is_none() {
+            return Ok(false);
+        }
+        self.save_ledger()?;
+        Ok(true)
     }
 }
 
@@ -224,5 +265,96 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(dir.path().join("nodes.json")).unwrap();
         assert!(!text.contains("address"));
+    }
+
+    #[test]
+    fn next_node_id_never_recycles_removed_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = Store::open_or_init(dir.path()).unwrap();
+            assert_eq!(store.next_node_id(), 1, "空台帳は 1 から");
+            for id in [5u64, 6u64] {
+                store
+                    .upsert_node(NodeRecord {
+                        node_id: id,
+                        commissioned_at: "2026-01-01T00:00:00+09:00".into(),
+                    })
+                    .unwrap();
+            }
+            assert_eq!(store.next_node_id(), 7);
+            assert!(store.remove_node(6).unwrap());
+            assert_eq!(
+                store.next_node_id(),
+                7,
+                "削除しても払い出し済み id は戻らない"
+            );
+        }
+        // high-water mark はディスクに残る。
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.next_node_id(), 7);
+    }
+
+    #[test]
+    fn next_node_id_tolerates_old_ledger_without_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.json"),
+            r#"{"version":1,"nodes":{"9":{"node_id":9,"commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
+        )
+        .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.next_node_id(), 10);
+    }
+
+    /// F1 残件: このフィールドを持たない**既存**の台帳（= 本番を含む全ストア）で
+    /// unpair しても id が戻らないこと。load 時に watermark を補完していないと、
+    /// `remove_node` が `next_node_id: 0` のまま保存し直してしまい、
+    /// `max(nodes)+1` が今まさに外した id に落ちる。
+    #[test]
+    fn legacy_ledger_does_not_recycle_the_id_it_just_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.json"),
+            r#"{"version":1,"nodes":{
+                 "5":{"node_id":5,"commissioned_at":"2026-01-01T00:00:00+09:00"},
+                 "6":{"node_id":6,"commissioned_at":"2026-01-02T00:00:00+09:00"}}}"#,
+        )
+        .unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.next_node_id(), 7, "load 時に watermark が補完される");
+            assert!(store.remove_node(6).unwrap());
+            assert_eq!(
+                store.next_node_id(),
+                7,
+                "外したばかりの 6 を払い出してはならない"
+            );
+        }
+        // 補完された watermark は remove_node の save で永続化されている。
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.next_node_id(), 7);
+    }
+
+    #[test]
+    fn remove_node_deletes_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_init(dir.path()).unwrap();
+        for id in [5u64, 6u64] {
+            store
+                .upsert_node(NodeRecord {
+                    node_id: id,
+                    commissioned_at: "2026-01-01T00:00:00+09:00".into(),
+                })
+                .unwrap();
+        }
+        assert!(store.remove_node(5).unwrap());
+        assert!(!store.remove_node(5).unwrap(), "2 回目は無いので false");
+        let reopened = Store::open(dir.path()).unwrap();
+        let ids: Vec<u64> = reopened.nodes().map(|n| n.node_id).collect();
+        assert_eq!(ids, vec![6]);
+        assert_eq!(
+            reopened.require_node(5).unwrap_err().kind,
+            ErrorKind::NodeNotCommissioned
+        );
     }
 }

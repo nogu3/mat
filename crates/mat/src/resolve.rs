@@ -41,6 +41,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 transport,
             }
         }
+        Command::Unpair { node_id, force } => Command::Unpair {
+            node_id: NodeRef::Id(book.resolve_node(&node_id)?),
+            force,
+        },
         Command::Read {
             node_id,
             endpoint,
@@ -62,6 +66,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             cluster,
             attribute,
             value,
+            timed,
         } => {
             let node = book.resolve_node(&node_id)?;
             let ep = book.resolve_endpoint(node, &endpoint)?;
@@ -71,6 +76,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 cluster,
                 attribute,
                 value,
+                timed,
             }
         }
         Command::Invoke {
@@ -79,6 +85,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             cluster,
             command,
             args,
+            timed,
         } => {
             let node = book.resolve_node(&node_id)?;
             let ep = book.resolve_endpoint(node, &endpoint)?;
@@ -88,6 +95,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 cluster,
                 command,
                 args,
+                timed,
             }
         }
         Command::Describe { node_id } => Command::Describe {
@@ -209,8 +217,22 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                         .map(|n| book.resolve_node(n).map(NodeRef::Id))
                         .collect::<Result<Vec<_>, _>>()?,
                 },
+                GroupCommand::Remove {
+                    group_id,
+                    node_ids,
+                    endpoint,
+                } => GroupCommand::Remove {
+                    group_id: GroupRef::Id(book.resolve_group(&group_id)?),
+                    node_ids: node_ids
+                        .iter()
+                        .map(|n| book.resolve_node(n).map(NodeRef::Id))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    endpoint,
+                },
                 // 引数なし（group 指定すら無い）— alias 解決対象が無い。
                 GroupCommand::Bump => GroupCommand::Bump,
+                // 引数なし（fabric_index はグローバル引数）— alias 解決対象が無い。
+                GroupCommand::List => GroupCommand::List,
                 GroupCommand::ColorTemp {
                     group_id,
                     kelvin,
@@ -255,6 +277,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             attribute,
             count,
             timeout_ms,
+            reconnect,
         } => {
             let node = node_id.map(|n| book.resolve_node(&n)).transpose()?;
             let endpoint = match endpoint {
@@ -280,6 +303,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 attribute,
                 count,
                 timeout_ms,
+                reconnect,
             }
         }
         Command::Diag { action } => Command::Diag {
@@ -372,7 +396,7 @@ mod tests {
             node_id: NodeRef::Alias("living-light".into()),
             endpoint: EndpointRef::Alias("night".into()),
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         let resolved = resolve_command(cmd, dir.path()).unwrap();
         match resolved {
@@ -460,6 +484,7 @@ mod tests {
             attribute: None,
             count: 1,
             timeout_ms: 60_000,
+            reconnect: false,
         };
         match resolve_command(cmd, dir.path()).unwrap() {
             Command::Listen {
@@ -478,6 +503,7 @@ mod tests {
             attribute: None,
             count: 1,
             timeout_ms: 60_000,
+            reconnect: false,
         };
         assert!(resolve_command(cmd, dir.path()).is_err());
     }

@@ -30,8 +30,12 @@ pub struct Cli {
     /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
-    /// matd 対応は read/write/invoke/on/off/color-temp/color/level/describe/group のみ
-    /// （discover/commission/open-window/diag/fabric は常に直経路; fabric 以外は本フラグ明示時は exit 2）。
+    /// matd 対応は read/write/invoke/on/off/color-temp/color/level/describe/
+    /// group provision・invoke・bump のみ。
+    /// discover/commission/unpair/open-window/diag/group grant/group remove は
+    /// 常に直経路で、本フラグ明示時は exit 2。
+    /// fabric init/fabric list/group list は KVS 読み書きだけのローカル完結処理で、
+    /// 経路解決より前に実行される（本フラグは無視されエラーにならない）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
@@ -130,7 +134,24 @@ pub enum Command {
         transport: TransportArg,
     },
 
+    /// ノードを fabric から外す: デバイスへ RemoveFabric（自 fabric の index）を
+    /// 送り、成功したら台帳 `nodes.json` と aliases.toml の当該 alias を削除する。
+    /// 直経路のみ（`--matd` 明示は exit 2）。node_id は再利用しない。
+    Unpair {
+        /// commission 済みノードの node_id、または aliases.toml の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// デバイス側が失敗（到達不能・拒否・タイムアウト・セッション失敗）しても
+        /// 台帳と alias を削除する（実体の無い台帳エントリの掃除用）。出力の
+        /// `device.removed` が false になる。ローカル側の失敗（store 不在・
+        /// parse_error・iface 自動検出失敗）はそのままエラー終了する。
+        #[arg(long)]
+        force: bool,
+    },
+
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
+    /// `--attribute` 省略時は cluster 内の全属性を読み
+    /// `{ node_id, endpoint, cluster, attributes, timestamp }`。
     Read {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
@@ -141,9 +162,10 @@ pub enum Command {
         /// クラスタ名（chip-tool 表記、例: `onoff` / `levelcontrol`）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
-        /// 属性名（chip-tool 表記、例: `on-off` / `current-level`）。
+        /// 属性名（chip-tool 表記、例: `on-off` / `current-level`）。省略すると
+        /// cluster 内の全属性を wildcard read し `attributes` オブジェクトで返す。
         #[arg(short = 'a', long, value_name = "NAME")]
-        attribute: String,
+        attribute: Option<String>,
     },
 
     /// 書き込み可能属性を設定する。
@@ -163,6 +185,11 @@ pub enum Command {
         /// 書き込む値（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(long, value_name = "VALUE")]
         value: String,
+        /// Timed Request を先行送信して timed 実行にする（true への上書きのみ。
+        /// 表が timed のコマンド/属性は本フラグ無しでも常に timed）。数値 ID 指定
+        /// や表に無いコマンドを timed にしたいときに使う。
+        #[arg(long)]
+        timed: bool,
     },
 
     /// コマンドを実行する。照明 ON/OFF 等の「制御」はここ（属性 write ではない）。
@@ -182,6 +209,11 @@ pub enum Command {
         /// コマンド引数（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+        /// Timed Request を先行送信して timed 実行にする（true への上書きのみ。
+        /// 表が timed のコマンド/属性は本フラグ無しでも常に timed）。数値 ID 指定
+        /// や表に無いコマンドを timed にしたいときに使う。
+        #[arg(long)]
+        timed: bool,
     },
 
     /// ノードのエンドポイント / クラスタを introspect する。
@@ -329,6 +361,11 @@ pub enum Command {
         #[arg(long = "timeout-ms", value_name = "T", default_value_t = 60_000,
               value_parser = clap::value_parser!(u64).range(0..=86_400_000))]
         timeout_ms: u64,
+        /// matd の接続失敗・切断（再起動）で exit 13 せず、backoff（1s→…→30s）
+        /// で再接続してストリームを続ける。`--count` は再接続を跨いで累積、
+        /// `--timeout-ms` は全体を束ねる。stdout にマーカー行は出さない。
+        #[arg(long)]
+        reconnect: bool,
     },
 
     /// ネットワーク診断スナップショット（メッシュ健全性の分析用）。
@@ -356,6 +393,8 @@ pub enum FabricAction {
         #[arg(long, default_value_t = 112_233)]
         admin_node_id: u64,
     },
+    /// KVS にある fabric（`f/<idx>/n` を持つ index）を一覧する。ローカルのみ。
+    List,
 }
 
 /// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/
@@ -555,6 +594,26 @@ pub enum GroupCommand {
         #[arg(long = "nodes", required = true, num_args = 1..)]
         node_ids: Vec<NodeRef>,
     },
+
+    /// provision の逆: 各ノードから ACL の Group エントリ / RemoveGroup /
+    /// group-key-map の行 / （未参照なら）KeySet を外し、全ノード成功後に
+    /// コントローラ KVS の group state も削除する。KVS はメンバー一覧を持たない
+    /// ので --nodes は必須。常に直経路（--matd 明示時は exit 2）。
+    Remove {
+        /// Matter GroupId、または aliases.toml の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// 撤収対象の commission 済み node_id または node alias（1つ以上）。
+        #[arg(long = "nodes", required = true, num_args = 1..)]
+        node_ids: Vec<NodeRef>,
+        /// RemoveGroup を送るエンドポイント（既定 1、数値のみ）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+    },
+
+    /// コントローラ KVS の group テーブル（group / keymap / keyset チェーン）を
+    /// 一覧する。ローカル読み取りのみ（ネットワーク・matd に触れない）。
+    List,
 
     /// group 送信 counter を「matd 再起動 1 回相当」前方ジャンプする応急
     /// コマンド（Issue #14）。受信側のリプレイ窓が送信系列より先行して

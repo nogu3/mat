@@ -130,6 +130,86 @@ mat fabric init
   fixed epoch against the fabric's KVS materials and adopts it (see
   [Backend](backend.md#backend), "epoch").
 
+List what the store already holds with `mat fabric list` — a local read of the
+KVS (no network, no key material on stdout):
+
+```bash
+mat fabric list
+```
+
+```json
+{
+  "timestamp": "2026-06-06T12:34:56+09:00",
+  "store": "/home/you/.config/mat",
+  "fabrics": [
+    { "fabric_index": 1, "fabric_id": 1, "admin_node_id": 112233,
+      "compressed_fabric_id": "AAAAAAAAAAAAAAAA", "ipk_epoch": "mat", "current": true }
+  ]
+}
+```
+
+- `ipk_epoch` says where the fabric's IPK came from: `"mat"` for a fabric
+  bootstrapped by `fabric init` (random epoch, recorded as
+  `mat/f/<idx>/ipk-epoch`), `"chip-tool"` for a fabric created by `chip-tool`
+  whose fixed epoch `mat` verified and adopted.
+- `current` marks the index this invocation would use for device ops
+  (`--fabric-index` / `MAT_FABRIC_INDEX`, default `1`).
+- Local only, like `fabric init`: it is dispatched before route selection, so
+  `--matd` is **ignored** (no daemon is contacted). A missing store INI is
+  `store_missing` (exit `10`) with the `fabric init` hint. There is no
+  `fabric show` — the one line per fabric carries everything.
+
+#### Unpair (`unpair`)
+
+The reverse of `commission`: `mat` sends **RemoveFabric** (its own fabric
+index) to the device, and on success deletes the node from the ledger
+(`nodes.json`) and every `aliases.toml` entry that pointed at it. Direct path
+only — `mat` is the sole writer of the ledger — so auto-detection skips it and
+an explicit `--matd` exits `2`.
+
+```bash
+# unpair --node <N|ALIAS> [--force]
+mat unpair --node 5
+
+# --force: drop the ledger entry even when the device side fails (unreachable
+# or rejected) — for cleaning out entries with no device behind them
+mat unpair --node 15 --force
+```
+
+Outputs:
+
+```json
+// success — the device left the fabric, ledger and aliases followed
+{ "timestamp": "...", "node_id": 5, "aliases_removed": ["desk_light"], "device": { "removed": true, "fabric_index": 1 }, "ledger": { "removed": true } }
+
+// --force against a dead node — the failure is folded into device.error, exit 0
+{ "timestamp": "...", "node_id": 15, "aliases_removed": [], "device": { "removed": false, "error": { "kind": "unreachable", "detail": "Node 15 is unreachable" } }, "ledger": { "removed": true } }
+```
+
+- Without `--force`, a device-side failure is a normal typed error (exit
+  `3`/`4`/`5`/`6`) and **the ledger is left untouched** — nothing ends up half
+  removed. `aliases_removed` lists the node aliases that were deleted (its
+  endpoint aliases go with them); it is `[]` when no `aliases.toml` exists.
+- A node that is not in the ledger is `node_not_commissioned` (exit `11`),
+  `--force` included: the ledger is what says a node can be unpaired at all.
+- `--force` only folds **device-side** failures — the transport / IM outcomes
+  `timeout` / `device_rejected` / `unreachable` / `session_failed` (exit
+  `3`/`4`/`5`/`6`). Local failures (`store_missing`, `store_parse`,
+  `parse_error`, interface-autodetect `other`) still exit with their own code
+  and leave the ledger alone: nothing there is evidence the device is gone.
+- **node_id は再利用されない。** A stale SRP record for an unpaired id keeps
+  being advertised and CASE to it fails forever, so the ledger keeps a
+  high-water mark (`next_node_id` in `nodes.json`): `commission` without
+  `--node` always hands out an id above every id ever issued, even after the
+  highest one was unpaired. Ledgers written before this field existed fall back
+  to `max(ledger) + 1` on first load and then start tracking it.
+- With `matd` running, its resident subscription for the removed node goes away
+  by itself at the next ledger rescan (≤ 60 s): the subscription loop is
+  aborted and the node drops out of `matd status`. No restart needed. `unpair`
+  is also the one direct-path op that does **not** send the `node_touched`
+  hint — nudging `matd` to re-establish a session with a node that just left
+  the fabric would only produce CASE-failure backoff until that rescan.
+
 #### Attestation / PAA trust store
 
 Production Matter devices ship a DAC signed by a **production PAA** (Product
@@ -172,6 +252,9 @@ numbers are the only form, exactly as before.
 mat read --node 5 --cluster onoff --attribute on-off
 mat read -n 5 -c onoff -a on-off                 # same, short aliases
 
+# Omit --attribute to read every attribute of the cluster in one wildcard read
+mat read --node 5 --cluster onoff
+
 # Set a writable attribute
 mat write --node 5 --cluster levelcontrol --attribute on-level --value 128
 
@@ -180,6 +263,11 @@ mat write --node 5 --cluster accesscontrol --attribute acl --value '[{"privilege
 
 # Run a command: --command plus trailing command args
 mat invoke --node 5 --cluster levelcontrol --command move-to-level 128 0 0 0
+
+# --timed forces a Timed Request (see below). For invoke it must come before
+# the trailing positional args.
+mat invoke --node 5 --cluster onoff --timed --command off
+mat write --node 5 --cluster onoff --attribute on-time --value 0 --timed
 
 # Introspect a node
 mat describe --node 5
@@ -237,6 +325,11 @@ Outputs:
 // read — the attribute's TLV value normalized to bool/number/string/null
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "attribute": "on-off", "value": true }
 
+// read with --attribute omitted — every attribute of the cluster, keyed by
+// chip-tool attribute name (attribute ids the name table does not know appear
+// as their decimal id in a string key)
+{ "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "onoff", "attributes": { "on-off": true, "global-scene-control": true, "on-time": 0, "65533": 5 } }
+
 // write
 { "timestamp": "...", "node_id": 5, "endpoint": 1, "cluster": "levelcontrol", "attribute": "on-level", "value": "128", "status": "success" }
 
@@ -269,6 +362,36 @@ Outputs:
 > `describe` issues several reads (parts-list plus each endpoint's
 > server-list) over one CASE session, so it does a bit of work, but it finishes
 > in one shot.
+
+**Cluster wildcard read (`--attribute` omitted).** One ReadRequest for the
+whole cluster; the result is an `attributes` object instead of a single
+`value`.
+
+- Keys are chip-tool attribute names, falling back to the decimal attribute id
+  (as a string key) for ids the generated name table does not know — global
+  attributes such as `65533` (ClusterRevision) show up that way.
+- `list` and `struct` values are included as JSON, exactly as a single-attribute
+  `read` prints them. This is also the **workaround for the chunk limit**: a
+  single-attribute read of a large list fails (`chunked report data
+  unsupported`) because that path takes one ReportData message, while the
+  wildcard read collects the `MoreChunkedMessages` train and merges the
+  per-element appends. Read the whole cluster when one attribute is too big.
+- Attributes the device does not implement are simply **absent** — a wildcard
+  read returns no per-attribute status, so there is nothing to report for them.
+  An endpoint or cluster the device does not have at all comes back as an empty
+  `attributes` object, not an error.
+- Routed through `matd` like a normal `read` (see
+  [Routing through `matd`](#routing-through-matd) for the version-skew note on
+  older daemons).
+
+**`--timed` on `write` / `invoke`.** Sends a TimedRequest first, so the device
+enforces the timed-interaction window. It is a **true-only override**: commands
+and attributes the name table marks as timed (door locks, window coverings, …)
+are always timed and the flag cannot switch that off. Use it for numeric ids
+and for entries the table has as untimed but the device insists on timing.
+On `invoke` it must be written **before** the trailing command args, otherwise
+clap takes it as one of them (`... too many arguments`). `group invoke` has no
+`--timed` (groupcast has no timed request).
 
 ### Diagnostics
 
@@ -519,7 +642,7 @@ subscription needs a resident daemon to stay alive between calls (see
 
 ```bash
 mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute <name>]
-           [--count <N>] [--timeout-ms <T>]
+           [--count <N>] [--timeout-ms <T>] [--reconnect]
 ```
 
 - Filters (`--node` / `--endpoint` / `--cluster` / `--attribute`) narrow which
@@ -536,10 +659,9 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   forever. Reaching `--count` exits `0`; the timeout firing with **zero**
   events received exits `3` (with at least one event received, it still exits
   `0` — same UX as `enl listen`).
-- `mat` connects to `matd`, sends the `listen` request, and prints the ack
-  line followed by one JSON event per line to stdout as they arrive:
+- `mat` connects to `matd`, sends the `listen` request, reads (and discards)
+  the ack line, then prints one JSON event per line to stdout as they arrive:
   ```json
-  {"timestamp":"...","listening":true}
   {"timestamp":"2026-07-20T21:00:00+09:00","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy","value":1,"priming":false,"recovered":false}
   ```
   `priming: true` marks events from the initial report burst right after
@@ -578,6 +700,20 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   [Errors and exit codes](errors.md#errors-and-exit-codes). Events already printed
   before a mid-stream matd loss stay printed; the process still exits `13`
   (not `3`), even if `--count` was not reached.
+- `--reconnect` turns those three losses (connect failure, EOF, a
+  non-JSON line) into a retry instead of exit `13`, so a long-running consumer
+  survives a `matd` restart — and can be started *before* `matd` is up. Backoff
+  is 1s → 2s → 4s → … capped at 30s and reset on a successful connect; the
+  attempts are logged to stderr (`warn` on loss, `info` on reconnect). No
+  marker line is written to stdout — the contract stays one JSON event per
+  line. `--count` accumulates **across** reconnects and `--timeout-ms` is a
+  single overall deadline that also covers the waiting, so
+  `--count 5 --timeout-ms 60000 --reconnect` means "5 events within a minute,
+  restarts included" (deadline with zero events still exits `3`). Note that the
+  priming burst after each reconnect counts toward `--count` like any other
+  event — key off the `priming` field if you only want real transitions. An
+  `error` line `matd` sends inline (e.g. the slow-consumer lag disconnect)
+  still terminates `mat listen`; `--reconnect` only covers losing the daemon.
 - Usage form (a consumer like casa reacts per line; `mat`/`matd` never run
   automations — see [Backend](backend.md#backend) / ARCHITECTURE.md "Design rules"):
   ```bash
@@ -667,6 +803,14 @@ mat group invoke --group 1 --cluster onoff --command on
 # Idempotent: nodes that already have the entry are reported as "unchanged".
 # grant --group <ID> --nodes <N>...
 mat group grant --group 1 --nodes 5 6 7
+
+# List the controller-side group state (local KVS read, no network)
+mat group list
+
+# Remove (the reverse of provision): ACL entry / RemoveGroup / group-key-map
+# row / unreferenced KeySet on every node, then the controller-side state.
+# remove --group <ID|ALIAS> --nodes <N|ALIAS>... [--endpoint EP]   (EP default 1)
+mat group remove --group 1 --nodes 5 6 7
 ```
 
 Outputs:
@@ -687,6 +831,12 @@ Outputs:
 
 // grant — per-node repair result (ACL updated vs already had the entry)
 { "timestamp": "...", "group_id": 1, "nodes": [5, 6, 7], "updated": [5, 7], "unchanged": [6], "status": "granted" }
+
+// list — the controller's own group table; key material is never included
+{ "timestamp": "...", "fabric_index": 1, "groups": [ { "group_id": 1, "name": "living", "keyset_id": 42 } ], "keysets": [ { "keyset_id": 42, "bound_groups": [1] } ] }
+
+// remove — per-node teardown result plus the controller-side removal
+{ "timestamp": "...", "group_id": 1, "endpoint": 1, "nodes": [ { "node_id": 5, "acl_removed": true, "group_removed": true, "keymap_removed": true, "keyset_removed": true } ], "controller": { "group_removed": true, "keyset_removed": true }, "status": "removed" }
 ```
 
 - **Groupcast is unacknowledged.** `group invoke` reports `"sent"`, never "all 7
@@ -730,6 +880,40 @@ Outputs:
   `--rebind`, restart `matd` if it is running (it may still hold the old group
   state in memory; the KVS is already updated) — the output `note` says so
   (see Outputs above).
+- **`mat group list` shows the controller side only.** It walks the group /
+  key-map / keyset chains in the credential KVS and prints them; it never talks
+  to a device, never touches the network, and `--matd` is ignored (it is
+  dispatched before route selection, like `fabric init`). Epoch keys,
+  operational keys and GKHs are deliberately **not** in the output — they are
+  credentials. `groups[].keyset_id` is `null` for a group with no key-map row,
+  and `keysets[].bound_groups` is the reverse mapping. A fabric that was never
+  provisioned prints empty arrays and exits `0`; a broken chain is
+  `store_parse`.
+- **`mat group remove` is the reverse of provision, direct path only** (like
+  `grant`: a rare repair/teardown op whose controller-side state only `mat`
+  owns, so `--matd` exits `2`). Per node it strips the ACL Group entry, sends
+  `RemoveGroup`, drops the group's `group-key-map` row and — only if no
+  remaining row on **that** device still references it — the KeySet; then, once
+  every node has succeeded, it removes the group (and any now-unreferenced
+  keyset) from the controller KVS.
+  - `--nodes` is **required**: the controller-side state holds no membership
+    list, so `mat` cannot know which devices to visit. Pass every member.
+  - It stops at the **first failing node** and the controller KVS is left
+    untouched in that case — nodes already processed keep their device-side
+    teardown, so the recovery is to fix that node and re-run with the nodes
+    that are left (each step is idempotent: an already-removed group comes back
+    as `NOT_FOUND` and is reported as `group_removed: false`, not an error).
+  - If the controller KVS no longer holds the group when the devices are
+    already torn down (a re-run after a partial failure, or a teardown someone
+    else finished), that is **not** an error: `controller.group_removed` comes
+    back `false` and the exit code stays `0`. Failing there would only make a
+    finished teardown look unfinished.
+  - The IPK keyset (`keyset-id 0`) is never unlinked from the controller KVS,
+    even if the removed group was the only thing bound to it — it carries the
+    fabric's operational key material, not group-only state.
+  - The ACL step never writes when the read cannot be parsed — same safety rule
+    as provision (a blind ACL write could drop the admin entry).
+  - `mat group list` afterwards is the check that the controller side is clean.
 - **`mat group grant` repairs older groups.** Groups provisioned before this
   step existed — including any provision routed through a `matd` ≤ 0.12, which
   does not run the ACL step — lack the entry and their groupcast is silently
@@ -884,15 +1068,31 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
 - Once connected, errors are reported from the matd path as-is — `mat` never
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
-- Supported over matd: `read` / `write` / `invoke` / `on` / `off` /
-  `color-temp` / `color` / `level` / `describe` / `group` (`provision` /
-  `invoke` / `color-temp` / `color` / `level` / `bump`; `group grant` is
-  direct only — see Groupcast above). `discover` / `commission` / `fabric init` /
-  `open-window` / `diag` are direct-only: auto-detection skips them silently;
-  explicit `--matd` exits `2`. `listen` (below) is the opposite case — it is
-  **matd-only**, with no direct-path fallback at all (not even auto-detect
+- Supported over matd: `read` (the cluster-wildcard form too) / `write` /
+  `invoke` / `on` / `off` / `color-temp` / `color` / `level` / `describe` /
+  `group` (`provision` / `invoke` / `color-temp` / `color` / `level` / `bump`;
+  `group grant` and `group remove` are direct only — see Groupcast above).
+  `discover` / `commission` / `unpair` / `fabric init` / `open-window` / `diag`
+  are direct-only: auto-detection skips them silently; explicit `--matd` exits
+  `2`. `fabric list` and `group list` are neither: they are pure local KVS reads
+  dispatched **before** route selection, so no daemon is contacted and `--matd`
+  is simply ignored (not exit `2`). `listen` (below) is the opposite case — it
+  is **matd-only**, with no direct-path fallback at all (not even auto-detect
   skip-and-run-direct); without a reachable `matd` it is `matd_unavailable`
   (exit `13`).
+- **Version skew: a new `mat` against an older `matd` (≤ 1.30.0).** Two of the
+  additions extend the socket protocol, so an older daemon does not understand
+  them. A cluster-wildcard `read` (`--attribute` omitted) is rejected by the old
+  `matd` with `parse_error` (exit `1`) for the missing `attribute` field, and
+  `--timed` on `write` / `invoke` is silently dropped (an unknown field is
+  ignored, so the op runs untimed). Upgrading `matd` fixes both; until then run
+  those calls on the direct path:
+  ```bash
+  MAT_MATD=0 mat read --node 5 --cluster onoff
+  MAT_MATD=0 mat invoke --node 5 --cluster onoff --timed --command off
+  ```
+  The reverse direction is safe: an older `mat` against a new `matd` sends
+  neither field and behaves exactly as before.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 

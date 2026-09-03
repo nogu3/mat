@@ -84,6 +84,18 @@ pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclE
     Some(merged)
 }
 
+/// Group エントリ（authMode=Group かつ subjects == [group_id]）を除いた全リスト。
+/// 該当が 1 件も無ければ `None`（冪等、write 不要）。`merge_group_entry` と同じく
+/// fabric-filtered read の結果を渡すこと。
+pub fn without_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {
+    let keep: Vec<AclEntry> = entries
+        .iter()
+        .filter(|e| !(e.auth_mode == AUTH_MODE_GROUP && e.subjects == [u64::from(group_id)]))
+        .cloned()
+        .collect();
+    (keep.len() != entries.len()).then_some(keep)
+}
+
 /// native（IM）直経路の `AccessControlEntryStruct` 列 —— `tlv_to_json` の数値
 /// キー規約（`{1: privilege, 2: authMode, 3: subjects, 4: targets, 254:
 /// fabricIndex}`）から `AclEntry` 列へ。targets 内は `"0"`=cluster,
@@ -350,5 +362,24 @@ mod tests {
         assert_eq!(e[0].fabric_index, 2);
         // 解釈不能（privilege 欠落）は Err — read できなければ write しない方針の要。
         assert!(entries_from_im_json(&serde_json::json!([{"2": 2}])).is_err());
+    }
+
+    #[test]
+    fn without_group_entry_removes_only_matching_group_rows() {
+        let admin = AclEntry {
+            privilege: 5,
+            auth_mode: 2,
+            subjects: vec![112233],
+            targets: None,
+            fabric_index: 1,
+        };
+        let g1 = group_acl_entry(1, 1);
+        let g2 = group_acl_entry(2, 1);
+        let out = without_group_entry(&[admin.clone(), g1, g2.clone()], 1).unwrap();
+        assert_eq!(out, vec![admin.clone(), g2]);
+        assert!(
+            without_group_entry(&[admin], 1).is_none(),
+            "無ければ None（write 不要）"
+        );
     }
 }

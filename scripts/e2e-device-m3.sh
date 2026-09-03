@@ -10,7 +10,9 @@
 # store (same as e2e-device-m1.sh) -> `mat group provision` against the
 # commissioned node, asserting `status:"provisioned"` (the KeySetWrite +
 # group-key-map write + AddGroup + ACL write sequence actually lands on
-# matv) -> start `matd` against the same store, poll `matd status` until its
+# matv) -> `mat group list`, asserting the provisioned group shows up in the
+# controller kvs (`mat group remove` is held back — see the comment at that
+# step: matv has no `KeySetRemove`) -> start `matd` against the same store, poll `matd status` until its
 # resident wildcard Subscribe to node 1 reaches `state:"established"` ->
 # start `mat listen --count 1` in the background -> `mat on` (routed through
 # matd) -> assert the backgrounded `mat listen` received an onoff on-off=true
@@ -217,6 +219,31 @@ echo "$GROUP_JSON"
 GROUP_STATUS="$(json_get status "$GROUP_JSON")"
 [[ "$GROUP_STATUS" == "provisioned" ]]
 echo "==> PASS: mat group provision reached status=provisioned (KeySetWrite + group-key-map + AddGroup + ACL all landed on matv)" >&2
+
+echo "==> mat group list (controller kvs)" >&2
+LIST_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat group list)"
+echo "$LIST_JSON" >&2
+printf '%s' "$LIST_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert [g["group_id"] for g in d["groups"]] == ['"$GROUP_ID"'], d
+'
+
+# `mat group remove` はここでは撃てない: matv の GroupKeyManagement は
+# `KeySetWrite` しか実装しておらず（`crates/mat-device/src/core/
+# group_key_management.rs` のモジュール doc に「`KeySetRead`/`KeySetRemove`/
+# `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ）」と明記）、
+# 撤収 4 ステップの最後 `KeySetRemove` が IM status 0x81
+# (UNSUPPORTED_COMMAND) で弾かれる:
+#   {"error":{"detail":"node 1: remove step 'key-set-remove' failed: native:
+#    interaction model error: device rejected command: IM status 0x81",
+#    "kind":"device_rejected"}}
+# デバイス側の既知ギャップであってコントローラ側 `group remove` の不具合では
+# ないため、ここでアサーションを緩めるのではなくステップごと保留する。matv に
+# `KeySetRemove` が実装されたら `mat group remove --group $GROUP_ID --nodes
+# $NODE_ID --endpoint $DEVICE_EP` → `status:"removed"` → `group list` が
+# `groups`/`keysets` とも空、の順で足し直すこと（そのときは以降の matd/listen
+# 脚のために provision し直す必要がある）。
 
 echo "==> starting matd (store=$MAT_STORE_DIR, iface=$IFACE, socket=$MATD_SOCK)" >&2
 RUST_LOG="${RUST_LOG:-info}" \

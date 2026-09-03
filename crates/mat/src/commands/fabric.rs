@@ -60,3 +60,43 @@ pub fn run_init(
     }));
     Ok(())
 }
+
+/// `mat fabric list`: main KVS を走査して fabric ごとの identity を返す。
+/// 鍵素材は出さない。
+pub fn run_list(store_path: &Path, current_fabric_index: u8) -> Result<(), MatError> {
+    use mat_controller::kvs::{self, KvsError, MAIN_INI_FILE};
+    let main_ini = store_path.join(MAIN_INI_FILE);
+    let map_err = |e: KvsError| match e {
+        KvsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            MatError::store_missing(format!(
+                "{} not found — run `mat fabric init` to bootstrap the credential store",
+                main_ini.display()
+            ))
+        }
+        other => MatError::store_parse(format!("fabric list: {other}")),
+    };
+    let mut fabrics = Vec::new();
+    for idx in kvs::list_fabric_indices(&main_ini).map_err(map_err)? {
+        let (admin_node_id, fabric_id) = kvs::read_noc_identity(&main_ini, idx).map_err(map_err)?;
+        let pubkey = kvs::read_rcac_pubkey(&main_ini, idx).map_err(map_err)?;
+        let cfid = mat_controller::fabric::compressed_fabric_id(&pubkey, fabric_id);
+        let ipk_epoch = match kvs::read_mat_ipk_epoch(&main_ini, idx).map_err(map_err)? {
+            Some(_) => "mat",
+            None => "chip-tool",
+        };
+        fabrics.push(json!({
+            "fabric_index": idx,
+            "fabric_id": fabric_id,
+            "admin_node_id": admin_node_id,
+            "compressed_fabric_id": format!("{:016X}", u64::from_be_bytes(cfid)),
+            "ipk_epoch": ipk_epoch,
+            "current": idx == current_fabric_index,
+        }));
+    }
+    tracing::info!(count = fabrics.len(), "fabric list executed");
+    output::emit(mat_core::body::fabric_list_success(
+        &store_path.display().to_string(),
+        fabrics,
+    ));
+    Ok(())
+}

@@ -36,6 +36,34 @@ pub fn read_success(
     })
 }
 
+/// cluster wildcard `read`（`--attribute` 省略）の成功 body。`attributes` は
+/// 属性名（chip-tool 表記、表に無い ID は 10 進文字列）→ 値。list/struct 値も
+/// そのまま載せる。デバイスが持たない属性は返らない（wildcard は per-attribute
+/// status を返さない）。
+pub fn read_cluster_success(
+    node_id: u64,
+    endpoint: u16,
+    cluster_in: &str,
+    cluster: u32,
+    rows: Vec<(u32, Value)>,
+) -> Value {
+    let def = crate::ids::find_cluster(cluster);
+    let mut attrs = serde_json::Map::new();
+    for (id, v) in rows {
+        let key = def
+            .and_then(|d| d.attrs.iter().find(|a| a.id == id))
+            .map(|a| a.name.to_string())
+            .unwrap_or_else(|| id.to_string());
+        attrs.insert(key, v);
+    }
+    json!({
+        "node_id": node_id,
+        "endpoint": endpoint,
+        "cluster": cluster_in,
+        "attributes": Value::Object(attrs),
+    })
+}
+
 /// `write` の成功 body。`value_in` は CLI/プロトコル入力の生文字列 —— read と
 /// 型を揃えるため normalize_value で型推定してから載せる(両経路共通の規則)。
 pub fn write_success(
@@ -314,6 +342,35 @@ pub fn open_window_success(
     })
 }
 
+/// `unpair` のデバイス側成功（出力 JSON の `device` オブジェクト）。
+pub fn unpair_device(fabric_index: u8) -> Value {
+    json!({ "removed": true, "fabric_index": fabric_index })
+}
+
+/// `group list` の成功 body。`groups` = (group_id, name, keyset_id)、
+/// `keysets` = (keyset_id, bound_groups)。鍵素材は含めない。
+pub fn group_list_success(
+    fabric_index: u8,
+    groups: &[(u16, &str, Option<u16>)],
+    keysets: &[(u16, &[u16])],
+) -> Value {
+    json!({
+        "fabric_index": fabric_index,
+        "groups": groups.iter().map(|(id, name, ks)| json!({
+            "group_id": id, "name": name, "keyset_id": ks,
+        })).collect::<Vec<_>>(),
+        "keysets": keysets.iter().map(|(id, bound)| json!({
+            "keyset_id": id, "bound_groups": bound,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// `fabric list` の成功 body。`fabrics` の各要素は呼び手が組む
+/// （fabric_index / fabric_id / admin_node_id / compressed_fabric_id / ipk_epoch / current）。
+pub fn fabric_list_success(store: &str, fabrics: Vec<Value>) -> Value {
+    json!({ "store": store, "fabrics": fabrics })
+}
+
 /// `group grant` の成功 body。
 pub fn group_grant_success(
     group_id: u16,
@@ -327,6 +384,26 @@ pub fn group_grant_success(
         "updated": updated,
         "unchanged": unchanged,
         "status": "granted",
+    })
+}
+
+/// `group remove` の成功 body。`nodes` = (node_id, acl_removed, group_removed, keymap_removed, keyset_removed)。
+pub fn group_remove_success(
+    group_id: u16,
+    endpoint: u16,
+    nodes: &[(u64, bool, bool, bool, bool)],
+    controller_group_removed: bool,
+    controller_keyset_removed: bool,
+) -> Value {
+    json!({
+        "group_id": group_id,
+        "endpoint": endpoint,
+        "nodes": nodes.iter().map(|(id, acl, grp, map, ks)| json!({
+            "node_id": id, "acl_removed": acl, "group_removed": grp,
+            "keymap_removed": map, "keyset_removed": ks,
+        })).collect::<Vec<_>>(),
+        "controller": { "group_removed": controller_group_removed, "keyset_removed": controller_keyset_removed },
+        "status": "removed",
     })
 }
 
@@ -603,12 +680,58 @@ mod tests {
     }
 
     #[test]
+    fn group_list_success_shape() {
+        let body = group_list_success(2, &[(1, "desk", Some(42))], &[(42, &[1])]);
+        assert_eq!(
+            body,
+            json!({ "fabric_index": 2,
+                    "groups": [{ "group_id": 1, "name": "desk", "keyset_id": 42 }],
+                    "keysets": [{ "keyset_id": 42, "bound_groups": [1] }] })
+        );
+    }
+
+    #[test]
     fn group_grant_success_shape() {
         assert_eq!(
             group_grant_success(10, &[5, 6], &[5], &[6]),
             json!({
                 "group_id": 10, "nodes": [5, 6], "updated": [5],
                 "unchanged": [6], "status": "granted",
+            })
+        );
+    }
+
+    #[test]
+    fn group_remove_success_shape() {
+        let body = group_remove_success(1, 1, &[(5, true, true, true, false)], true, false);
+        assert_eq!(
+            body,
+            json!({ "group_id": 1, "endpoint": 1,
+                    "nodes": [{ "node_id": 5, "acl_removed": true, "group_removed": true, "keymap_removed": true, "keyset_removed": false }],
+                    "controller": { "group_removed": true, "keyset_removed": false },
+                    "status": "removed" })
+        );
+    }
+
+    #[test]
+    fn read_cluster_success_keys_by_name_and_falls_back_to_decimal_id() {
+        let body = read_cluster_success(
+            5,
+            1,
+            "onoff",
+            0x0006,
+            vec![
+                (0x0000, json!(true)),
+                (0x4001, json!(0)),
+                (0xFFFD, json!(5)),
+                (0x7777, json!(1)),
+            ],
+        );
+        assert_eq!(
+            body,
+            json!({
+                "node_id": 5, "endpoint": 1, "cluster": "onoff",
+                "attributes": { "on-off": true, "on-time": 0, "cluster-revision": 5, "30583": 1 }
             })
         );
     }

@@ -24,6 +24,12 @@ pub(crate) enum DeviceOp {
         group_id: u16,
         node_ids: Vec<u64>,
     },
+    /// 直経路専用（grant と同じ理由）。
+    GroupRemove {
+        group_id: u16,
+        endpoint: u16,
+        node_ids: Vec<u64>,
+    },
     GroupBump,
 }
 
@@ -35,6 +41,7 @@ impl DeviceOp {
             DeviceOp::Group(g) => g.kind.name(),
             DeviceOp::GroupProvision(_) => "group_provision",
             DeviceOp::GroupGrant { .. } => "group_grant",
+            DeviceOp::GroupRemove { .. } => "group_remove",
             DeviceOp::GroupBump => "group_bump",
         }
     }
@@ -82,6 +89,7 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
     match command {
         Command::Discover { .. } => Ok(Dispatch::Dedicated("discover")),
         Command::Commission { .. } => Ok(Dispatch::Dedicated("commission")),
+        Command::Unpair { .. } => Ok(Dispatch::Dedicated("unpair")),
         Command::Fabric { .. } => Ok(Dispatch::Dedicated("fabric")),
         Command::Listen { .. } => Ok(Dispatch::Dedicated("listen")),
         Command::Diag {
@@ -94,7 +102,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             attribute,
         } => node(
             node_id,
-            NodeOpKind::read(endpoint.id()?, cluster, attribute)?,
+            match attribute {
+                Some(a) => NodeOpKind::read(endpoint.id()?, cluster, a)?,
+                None => NodeOpKind::read_cluster(endpoint.id()?, cluster)?,
+            },
         ),
         Command::Write {
             node_id,
@@ -102,9 +113,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             cluster,
             attribute,
             value,
+            timed,
         } => node(
             node_id,
-            NodeOpKind::write(endpoint.id()?, cluster, attribute, value)?,
+            NodeOpKind::write(endpoint.id()?, cluster, attribute, value, *timed)?,
         ),
         Command::Invoke {
             node_id,
@@ -112,9 +124,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             cluster,
             command,
             args,
+            timed,
         } => node(
             node_id,
-            NodeOpKind::invoke(endpoint.id()?, cluster, command, args)?,
+            NodeOpKind::invoke(endpoint.id()?, cluster, command, args, *timed)?,
         ),
         Command::Describe { node_id } => node(node_id, NodeOpKind::Describe),
         Command::On { node_id, endpoint } => node(
@@ -187,6 +200,13 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 endpoint: endpoint.id()?,
             },
         ),
+        // group list はローカル完結（KVS 読み取りのみ）— fabric init と同じく
+        // main.rs の早期 dispatch で処理済み。ここには到達しない（分岐だけ
+        // このアームで表明し、下の match は網羅性のため
+        // `GroupCommand::List => return ...` を置く）。
+        Command::Group {
+            action: GroupCommand::List,
+        } => Ok(Dispatch::Dedicated("group list")),
         Command::Group { action } => Ok(Dispatch::Device(match action {
             GroupCommand::Provision {
                 group_id,
@@ -258,7 +278,18 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 group_id: group_id.id()?,
                 node_ids: nodes(node_ids)?,
             },
+            GroupCommand::Remove {
+                group_id,
+                node_ids,
+                endpoint,
+            } => DeviceOp::GroupRemove {
+                group_id: group_id.id()?,
+                endpoint: *endpoint,
+                node_ids: nodes(node_ids)?,
+            },
             GroupCommand::Bump => DeviceOp::GroupBump,
+            // 到達しない（上の専用アームで先に処理済み）。網羅性のためだけの腕。
+            GroupCommand::List => return Ok(Dispatch::Dedicated("group list")),
         })),
     }
 }
@@ -307,7 +338,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         assert!(matches!(
             node_op(&read).kind,
@@ -321,7 +352,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "0x0008".into(),
-            attribute: "0".into(),
+            attribute: Some("0".into()),
         };
         assert!(matches!(node_op(&byid).kind, NodeOpKind::Read { .. }));
         // 未知名は parse_error（旧 classify None → unresolved_op_error と同じ kind）。
@@ -329,7 +360,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "nosuchcluster".into(),
-            attribute: "x".into(),
+            attribute: Some("x".into()),
         };
         let err = classify(&unknown).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -429,6 +460,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         };
         assert!(matches!(node_op(&w).kind, NodeOpKind::Write { .. }));
         let acl = Command::Write {
@@ -437,6 +469,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         };
         let err = classify(&acl).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -451,6 +484,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         };
         assert!(matches!(
             node_op(&inv).kind,
@@ -465,6 +499,7 @@ mod tests {
             cluster: "groupkeymanagement".into(),
             command: "key-set-write".into(),
             args: vec!["{}".into()],
+            timed: false,
         };
         assert_eq!(classify(&ks).unwrap_err().kind, ErrorKind::ParseError);
     }
@@ -682,5 +717,23 @@ mod tests {
         })
         .budget_applies());
         assert!(!DeviceOp::GroupBump.budget_applies());
+    }
+
+    #[test]
+    fn read_without_attribute_is_read_cluster() {
+        let c = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "onoff".into(),
+            attribute: None,
+        };
+        assert!(matches!(
+            node_op(&c).kind,
+            NodeOpKind::ReadCluster {
+                endpoint: 1,
+                cluster: 0x0006,
+                ..
+            }
+        ));
     }
 }

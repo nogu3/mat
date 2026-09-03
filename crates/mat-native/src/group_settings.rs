@@ -47,6 +47,35 @@ pub fn write_group_provision(
     Ok(())
 }
 
+/// `mat group remove` のコントローラ側。
+///
+/// 戻り値 `Some(keyset_removed)` = 撤収した（bool は KeySet も外したか）、
+/// `None` = その group がコントローラ KVS に無かった。呼び出し側（`runner::
+/// remove_group`）はデバイス側 4 ステップを済ませた**後**にここへ来るので、
+/// 「KVS に無い」でハードエラーにすると片付いていないように見えるだけで
+/// 復旧の役に立たない。`controller.group_removed: false` として body に載せる。
+/// それ以外の失敗（locked / corrupt など）は従来どおりハードエラー。
+pub fn remove_group(ctx: &GroupSettingsCtx, group_id: u16) -> Result<Option<bool>, MatError> {
+    match mat_controller::group_settings::remove_group(&ctx.main_ini, ctx.fabric_index, group_id) {
+        Ok(out) => {
+            tracing::info!(
+                group_id,
+                keyset_removed = out.keyset_removed,
+                "group controller state removed (native kvs)"
+            );
+            Ok(Some(out.keyset_removed))
+        }
+        Err(GroupSettingsError::NotFound { .. }) => {
+            tracing::warn!(
+                group_id,
+                "group not present in controller kvs; nothing to remove there"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(map_gs_err(e)),
+    }
+}
+
 /// GroupSettingsError → ErrorKind。全て hard error（ワイヤ未接触だが KVS は
 /// 触った可能性があるため chip-tool を重ねない）。kind は Other に寄せ、
 /// detail で復旧手段を示す（chip-tool 経路の分類とは厳密一致しない —
@@ -55,6 +84,9 @@ fn map_gs_err(e: GroupSettingsError) -> MatError {
     let detail = match &e {
         GroupSettingsError::DuplicateBind { group_id, keyset_id } => format!(
             "keyset {keyset_id} is already bound to group {group_id} in the controller kvs; use --rebind"
+        ),
+        GroupSettingsError::NotFound { group_id } => format!(
+            "group {group_id} is not provisioned in the controller kvs (see `mat group list`)"
         ),
         GroupSettingsError::Kvs(mat_controller::kvs::KvsError::Locked) => {
             "controller kvs is locked by another process (concurrent provision?)".to_string()
@@ -102,5 +134,20 @@ mod tests {
         let err = write_group_provision(&c, 99, 99, "e2e", &[0x42; 16], false).unwrap_err();
         assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
         assert!(err.detail.contains("locked"), "{}", err.detail);
+    }
+
+    #[test]
+    fn remove_group_reports_keyset_removal_and_maps_unknown_to_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        write_group_provision(&c, 99, 99, "e2e", &[0x42; 16], false).unwrap();
+        assert_eq!(
+            remove_group(&c, 99).unwrap(),
+            Some(true),
+            "keyset 99 も参照が消える"
+        );
+        assert!(mat_controller::kvs::read_group_credentials(&c.main_ini, 2, 99).is_err());
+        // 未知の group はエラーではなく None（呼び出し側が false として載せる）。
+        assert_eq!(remove_group(&c, 99).unwrap(), None);
     }
 }

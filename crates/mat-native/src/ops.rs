@@ -498,6 +498,189 @@ pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<
     Ok(true)
 }
 
+/// Groups cluster RemoveGroup（spec §1.3.7.4）/ GroupKeyManagement KeySetRemove
+/// （§11.2.8.3）。im.rs はレーン C が触るためここで局所定義する。
+pub const CMD_REMOVE_GROUP: u32 = 0x03;
+pub const CMD_KEY_SET_REMOVE: u32 = 0x03;
+/// RemoveGroupResponse.status の NOT_FOUND（グループ未登録 — 冪等に続行）。
+const STATUS_NOT_FOUND: u8 = 0x8B;
+
+/// 1 ノード分の group 撤収の入力。
+#[derive(Clone)]
+pub struct RemoveGroupNodeParams {
+    pub group_id: u16,
+    /// RemoveGroup を送るエンドポイント（ACL / group-key-map / KeySetRemove は常に ep0）。
+    pub endpoint: u16,
+}
+
+/// 1 ノード分の撤収結果（各ステップで実際に書いたか）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveGroupNodeReport {
+    pub acl_removed: bool,
+    pub group_removed: bool,
+    pub keymap_removed: bool,
+    pub keyset_removed: bool,
+}
+
+/// 撤収の 1 ステップに失敗した際、どのステップかを detail に残す
+/// （`provision_step_err` と同粒度）。
+fn remove_step_err(e: MatError, step: &str) -> MatError {
+    MatError::new(e.kind, format!("remove step '{step}' failed: {}", e.detail))
+}
+
+/// provision の逆順: ACL の Group エントリ除去（read-merge-write、read 失敗時は
+/// 絶対に write しない）→ RemoveGroup（NOT_FOUND は冪等に続行）→ group-key-map
+/// から当該 group の行を除去 → その keyset を参照する行が残らなければ KeySetRemove。
+pub async fn remove_group_node(
+    conn: &mut dyn NodeConn,
+    p: &RemoveGroupNodeParams,
+) -> Result<RemoveGroupNodeReport, MatError> {
+    // 1) ACL（全置換 write なので read できなければ絶対に write しない —
+    //    管理者エントリを失うとデバイスが管理不能になる）。
+    let current = conn
+        .read_json(0, CLUSTER_ACCESS_CONTROL, ATTR_ACL)
+        .await
+        .map_err(|e| remove_step_err(e, "acl read"))?;
+    let entries = entries_from_im_json(&current).map_err(|e| remove_step_err(e, "acl read"))?;
+    let acl_removed = match mat_core::acl::without_group_entry(&entries, p.group_id) {
+        None => false,
+        Some(kept) => {
+            conn.write_tlv(
+                0,
+                CLUSTER_ACCESS_CONTROL,
+                ATTR_ACL,
+                encode_acl_entries_tlv(&kept),
+                false,
+            )
+            .await
+            .map_err(|e| remove_step_err(e, "acl write"))?;
+            true
+        }
+    };
+
+    // 2) RemoveGroup（データ応答 {0: status, 1: groupID}）
+    let resp = conn
+        .invoke_for_data(
+            p.endpoint,
+            CLUSTER_GROUPS,
+            CMD_REMOVE_GROUP,
+            Some(encode_remove_group_fields(p.group_id)),
+            false,
+        )
+        .await
+        .map_err(|e| remove_step_err(e, "groups remove-group"))?;
+    let status =
+        decode_response_status(&resp).map_err(|e| remove_step_err(e, "groups remove-group"))?;
+    let group_removed = match status {
+        0 => true,
+        STATUS_NOT_FOUND => false,
+        s => {
+            return Err(MatError::new(
+                ErrorKind::DeviceRejected,
+                format!(
+                    "remove step 'groups remove-group' failed: RemoveGroupResponse status {s:#04x}"
+                ),
+            ))
+        }
+    };
+
+    // 3) group-key-map read-merge-write
+    let current = conn
+        .read_json(0, CLUSTER_GROUP_KEY_MANAGEMENT, ATTR_GROUP_KEY_MAP)
+        .await
+        .map_err(|e| remove_step_err(e, "group-key-map read"))?;
+    let entries =
+        parse_group_key_map(&current).map_err(|e| remove_step_err(e, "group-key-map read"))?;
+    let removed_keysets: Vec<u16> = entries
+        .iter()
+        .filter(|(g, _)| *g == p.group_id)
+        .map(|(_, k)| *k)
+        .collect();
+    let kept: Vec<(u16, u16)> = entries
+        .iter()
+        .copied()
+        .filter(|(g, _)| *g != p.group_id)
+        .collect();
+    let keymap_removed = !removed_keysets.is_empty();
+    if keymap_removed {
+        conn.write_tlv(
+            0,
+            CLUSTER_GROUP_KEY_MANAGEMENT,
+            ATTR_GROUP_KEY_MAP,
+            encode_group_key_map_tlv(&kept),
+            false,
+        )
+        .await
+        .map_err(|e| remove_step_err(e, "group-key-map write"))?;
+    }
+
+    // 4) KeySetRemove（そのデバイスの map に参照が残っていない keyset だけ）
+    let mut keyset_removed = false;
+    for ks in removed_keysets {
+        if kept.iter().any(|(_, k)| *k == ks) {
+            continue;
+        }
+        conn.invoke(
+            0,
+            CLUSTER_GROUP_KEY_MANAGEMENT,
+            CMD_KEY_SET_REMOVE,
+            Some(encode_key_set_remove_fields(ks)),
+            false,
+        )
+        .await
+        .map_err(|e| remove_step_err(e, "key-set-remove"))?;
+        keyset_removed = true;
+    }
+    Ok(RemoveGroupNodeReport {
+        acl_removed,
+        group_removed,
+        keymap_removed,
+        keyset_removed,
+    })
+}
+
+/// RemoveGroup `{0: groupID}`。
+fn encode_remove_group_fields(group_id: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(group_id));
+    w.end_container();
+    w.finish()
+}
+
+/// KeySetRemove `{0: groupKeySetID}`。
+fn encode_key_set_remove_fields(keyset_id: u16) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.end_container();
+    w.finish()
+}
+
+/// `{0: status, ...}` 形の応答から status（ctx0 の uint）だけを読む。
+fn decode_response_status(fields: &[u8]) -> Result<u8, MatError> {
+    use mat_controller::tlv::{Reader, Value as Tlv};
+    let mut r = Reader::new(fields);
+    let bad = |what: &str| MatError::parse_error(format!("RemoveGroupResponse: {what}"));
+    match r.next().map_err(|_| bad("tlv decode error"))? {
+        Some(el) if el.value == Tlv::StructStart => {}
+        _ => return Err(bad("missing struct")),
+    }
+    loop {
+        let el = r
+            .next()
+            .map_err(|_| bad("tlv decode error"))?
+            .ok_or_else(|| bad("truncated"))?;
+        match (el.tag, el.value) {
+            (_, Tlv::ContainerEnd) => return Err(bad("missing status")),
+            (Tag::Context(0), Tlv::Uint(v)) => {
+                return u8::try_from(v).map_err(|_| bad("status out of range"))
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +841,16 @@ mod tests {
                 _fields: Option<Vec<u8>>,
                 _timed: bool,
             ) -> Result<(), MatError> {
+                unimplemented!()
+            }
+            async fn invoke_for_data(
+                &mut self,
+                _endpoint: u16,
+                _cluster: u32,
+                _command: u32,
+                _fields: Option<Vec<u8>>,
+                _timed: bool,
+            ) -> Result<Vec<u8>, MatError> {
                 unimplemented!()
             }
             async fn read_json(
@@ -830,5 +1023,159 @@ mod tests {
             writes[0].3, expected_tlv,
             "group-key-map must preserve (11, 61) and add (10, 60)"
         );
+    }
+
+    // M8b Task12: group 撤収（remove_group_node）のデバイス側ステップ。
+
+    /// ACL read JSON（IM 形: `{1: privilege, 2: authMode, 3: subjects,
+    /// 4: targets, 254: fabricIndex}`）— 管理者エントリ + 指定 group の
+    /// Group エントリ。
+    fn acl_json_with_group(group_id: u16) -> Value {
+        serde_json::json!([
+            {"1": 5, "2": 2, "3": [112233], "4": null, "254": 1},
+            {"1": 3, "2": 3, "3": [group_id], "4": null, "254": 1}
+        ])
+    }
+
+    /// ACL read JSON — 管理者エントリのみ（Group エントリ無し）。
+    fn acl_json_without_group() -> Value {
+        serde_json::json!([{"1": 5, "2": 2, "3": [112233], "4": null, "254": 1}])
+    }
+
+    fn remove_group_response_tlv(status: u8, group_id: u16) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), u64::from(status));
+        w.put_uint(Tag::Context(1), u64::from(group_id));
+        w.end_container();
+        w.finish()
+    }
+
+    /// group-key-map の read JSON（IM 形: フィールドは数字キー "1"=groupId,
+    /// "2"=groupKeySetID）。
+    fn gkm_json(rows: &[(u16, u16)]) -> Value {
+        Value::Array(
+            rows.iter()
+                .map(|(g, k)| serde_json::json!({ "1": g, "2": k, "254": 1 }))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn remove_group_node_runs_four_steps_and_removes_unreferenced_keyset() {
+        let acl = acl_json_with_group(1);
+        let mut conn = FakeConn::scripted()
+            .with_read(0, CLUSTER_ACCESS_CONTROL, ATTR_ACL, acl)
+            .with_read(
+                0,
+                CLUSTER_GROUP_KEY_MANAGEMENT,
+                ATTR_GROUP_KEY_MAP,
+                gkm_json(&[(1, 42)]),
+            )
+            .with_invoke_response(
+                2,
+                CLUSTER_GROUPS,
+                CMD_REMOVE_GROUP,
+                remove_group_response_tlv(0, 1),
+            );
+        let rep = remove_group_node(
+            &mut conn,
+            &RemoveGroupNodeParams {
+                group_id: 1,
+                endpoint: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rep,
+            RemoveGroupNodeReport {
+                acl_removed: true,
+                group_removed: true,
+                keymap_removed: true,
+                keyset_removed: true
+            }
+        );
+        assert_eq!(
+            conn.calls(),
+            &[
+                format!("write_tlv(0,{CLUSTER_ACCESS_CONTROL:#06X},{ATTR_ACL:#06X})"),
+                format!("invoke_for_data(2,{CLUSTER_GROUPS:#06X},{CMD_REMOVE_GROUP:#06X})"),
+                format!(
+                    "write_tlv(0,{CLUSTER_GROUP_KEY_MANAGEMENT:#06X},{ATTR_GROUP_KEY_MAP:#06X})"
+                ),
+                format!("invoke(0,{CLUSTER_GROUP_KEY_MANAGEMENT:#06X},{CMD_KEY_SET_REMOVE:#06X})"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_group_node_keeps_keyset_still_referenced_and_tolerates_not_found() {
+        let acl = acl_json_without_group();
+        let mut conn = FakeConn::scripted()
+            .with_read(0, CLUSTER_ACCESS_CONTROL, ATTR_ACL, acl)
+            .with_read(
+                0,
+                CLUSTER_GROUP_KEY_MANAGEMENT,
+                ATTR_GROUP_KEY_MAP,
+                gkm_json(&[(1, 42), (2, 42)]),
+            )
+            .with_invoke_response(
+                2,
+                CLUSTER_GROUPS,
+                CMD_REMOVE_GROUP,
+                remove_group_response_tlv(0x8B, 1),
+            );
+        let rep = remove_group_node(
+            &mut conn,
+            &RemoveGroupNodeParams {
+                group_id: 1,
+                endpoint: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rep,
+            RemoveGroupNodeReport {
+                acl_removed: false,
+                group_removed: false,
+                keymap_removed: true,
+                keyset_removed: false
+            }
+        );
+        // ACL write 無し（Group エントリが元々無い）/ KeySetRemove 無し
+        // （keyset 42 は group 2 からまだ参照されている）。command id が
+        // RemoveGroup と同値（0x03）なので部分一致ではなく完全一致で見る。
+        assert_eq!(
+            conn.calls(),
+            &[
+                format!("invoke_for_data(2,{CLUSTER_GROUPS:#06X},{CMD_REMOVE_GROUP:#06X})"),
+                format!(
+                    "write_tlv(0,{CLUSTER_GROUP_KEY_MANAGEMENT:#06X},{ATTR_GROUP_KEY_MAP:#06X})"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_group_node_never_writes_acl_when_read_fails() {
+        let mut conn = FakeConn::scripted().with_read(
+            0,
+            CLUSTER_ACCESS_CONTROL,
+            ATTR_ACL,
+            serde_json::json!("not-a-list"),
+        );
+        let err = remove_group_node(
+            &mut conn,
+            &RemoveGroupNodeParams {
+                group_id: 1,
+                endpoint: 2,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.detail.contains("acl read"), "{}", err.detail);
+        assert!(conn.calls().is_empty(), "read 失敗で一切 write しない");
     }
 }
