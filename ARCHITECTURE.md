@@ -172,7 +172,8 @@ subprocess.
   [Native backend internals](./docs/commands.md#native-backend-internals) for
   interface autodetect (`MAT_IFACE` / `MAT_MATD_IFACE`), fabric index, warm
   vs. one-shot sessions, the shared groupcast counter, epoch adoption, and the
-  scalar-only generic write/invoke rule.
+  generic write/invoke value-encoding rule (scalars as literals,
+  lists/structs as JSON from the generated type table).
 - **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK). A fabric
   first created by `chip-tool` is handled by verifying its fixed epoch
   against the KVS materials and adopting it (persisted to
@@ -1010,8 +1011,10 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       を追加（PAA は公開ルート証明書なので実運用 store のもので良い）。
     - **将来候補（M8c-3 でやらないと決めたもの、記録のみ）**: (1) fake Matter
       デバイス（UDP loopback で PASE/CASE/IM 応答するテスト基盤 — バックエンド
-      挙動を実機なしで回帰させる）。(2) 汎用 list/struct TLV エンコード（現状
-      scalar のみが仕様、汎用 write/invoke の後退を受容）。(3) IPK ローテーション
+      挙動を実機なしで回帰させる）。(2) ~~汎用 list/struct TLV エンコード（現状
+      scalar のみが仕様、汎用 write/invoke の後退を受容）~~【訂正 2026-09-03:
+      実装済み — float/list/struct を生成テーブルの struct スキーマで符号化、
+      docs/superpowers/specs/2026-09-03-write-types-design.md】。(3) IPK ローテーション
       （全ノード KeySetWrite での epoch 完全移行 — 現状は既存 fabric の定数 epoch を
       検証して採用永続するのみ）。(4) ~~CASE の多アドレス試行~~【訂正
       2026-07-20: これは記録が不正確だった。resolve は SRV target に一致する
@@ -1056,10 +1059,12 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     matd プロトコルが元々扱わない op 群のため（warm session の恩恵が薄い
     稀な操作、M8a 以前からの設計）one-shot 直経路 `MAT_IFACE` のみに配線 —
     matd 経由では従来どおり常に chip-tool（`mat` 側が `matd` に op を送らず
-    直接処理する）。(4) **JSON→TLV の型サポートはスカラーのみ**（bool/int/uint/
+    直接処理する）。(4) ~~**JSON→TLV の型サポートはスカラーのみ**（bool/int/uint/
     enum/bitmap/string/octstr、bytes は `hex:` 形式）。既知名で list/struct/
-    float を指定した汎用 write/invoke は `parse_error` で明示拒否。未知名は
-    従来どおり chip-tool にフォールバック。list/struct 書込が要る
+    float を指定した汎用 write/invoke は `parse_error` で明示拒否。~~【訂正
+    2026-09-03: 実装済み — float/list/struct を生成テーブルの struct
+    スキーマで符号化、docs/superpowers/specs/2026-09-03-write-types-design.md】。
+    未知名は従来どおり chip-tool にフォールバック。list/struct 書込が要る
     group provision/grant（KeySetWrite・GroupKeyMap write・binding
     write・ACL read-modify-write）は生成テーブルに依存しない専用エンコーダ
     （`group.rs`/`acl.rs` の延長）。(5) **group-key-map はデバイス側で
@@ -1123,7 +1128,10 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   (`{"error":{"kind":"other","detail":"event stream lagged"}}`) を送って切断。
   イベント形式は `mat` スキーマ（`timestamp`/`node_id`/`endpoint`/`cluster`/
   `attribute`/`value`/`priming`/`recovered`）。scalar 値のみイベント化（list/struct は
-  generic read と同じ既知の制限で debug ログのみに捨てる）。`priming: true`
+  listen だけの制限 — Subscribe 経路は ReportData を 1 通ずつ処理しチャンク
+  再組み立てを持たないため途中 list しか作れず、list-diff recovery も誤爆する。
+  generic read/write は list/struct を JSON で扱う。docs/commands.md「Listen」
+  参照）。`priming: true`
   は購読(再)確立直後の初回全量 report 由来であることを示すフラグ — casa が
   matd 再起動直後の残留状態を新規トリガと誤認しないために存在する。
 - **matd は状態を持たない**: イベントのリングバッファ/リプレイはやらない（

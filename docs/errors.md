@@ -44,11 +44,12 @@ is `unreachable` (exit `5`).
   Since 1.0.0 timeouts during PASE/CASE map to `timeout` and explicit device
   refusals (wrong passcode / StatusReport rejection / bad Sigma2 signature) map
   to `device_rejected` instead of landing here.
-- `parse_error` — this kind is returned when a generic `write` / `invoke` names
-  a known attribute or command field whose type is `list` / `struct` / `float`
-  (not supported by the scalar-only JSON→TLV encoder — rejected up front), or
-  names a cluster / attribute / command the generated table does not know (pass
-  the numeric id instead).
+- `parse_error` — this kind is returned when a generic `write` / `invoke` value
+  does not fit the type the generated table knows for the attribute / command
+  field (bad literal, JSON of the wrong shape, unknown / missing struct field —
+  the detail names the path), when a list / struct JSON is given with a numeric
+  id (no schema), or when a cluster / attribute / command name is not in the
+  table (pass the numeric id instead).
 - `matd_unavailable` (exit 13) — `matd` was not reachable or died mid-request.
   For `mat listen`: no socket, connection refused, `MAT_MATD=0`, or the
   connection was cut partway through the event stream (`mat listen` has no

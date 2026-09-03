@@ -1206,17 +1206,21 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-        // 名前は解決できるが list 型 → parse_error（classify の msg）。
+        // 名前は解決できるが JSON 形が不正（list 属性に struct）→ parse_error（classify の msg）。
         let err = to_device_op(&Op::Write {
             node_id: 1,
             endpoint: 1,
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
-            value: "[]".into(),
+            value: "{}".into(),
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.contains("list"), "{}", err.detail);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
     }
 
     #[test]
@@ -1393,7 +1397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_write_rejects_list_type_with_parse_error() {
+    async fn native_write_rejects_bad_json_shape_with_parse_error() {
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let state = NativeState::Ready(Box::new(native));
         let health = SubHealth::new(None);
@@ -1402,12 +1406,17 @@ mod tests {
             endpoint: 0,
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
-            value: "[]".into(),
+            value: "{}".into(),
         };
         let err = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
     }
 
     #[tokio::test]

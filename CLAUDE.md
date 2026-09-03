@@ -94,12 +94,14 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   hard `other` error). `MAT_IFACE` / `MAT_MATD_IFACE` override it; `matd` refuses
   to start on an ambiguous autodetect. No state is held between runs (design
   rule 4).
-- Generic `write`/`invoke`/`group invoke` encode **scalar** JSON→TLV only
-  (bool/int/uint/enum/bitmap/string/octstr, bytes as `hex:`). `list`/`struct`/
-  `float` fields and names the `mat-core::ids` table does not know are
-  `parse_error` (numeric IDs are the escape hatch) — a documented limitation,
-  not a fallback. `group provision`/`grant` list/struct writes use dedicated
-  encoders.
+- Generic `write`/`invoke`/`group invoke` encode JSON→TLV from the type the
+  `mat-core::ids` table knows: scalars as literals (bool/int/uint/enum/bitmap/
+  float/string/octstr, bytes as `hex:`), lists and structs as JSON (keys =
+  kebab field names or numeric field ids, the shape `read` prints). Names the
+  table does not know are `parse_error` (numeric IDs are the escape hatch for
+  scalars only — no schema, so no list/struct). `group provision`/`grant`
+  list/struct writes keep dedicated encoders, pinned byte-equal to the generic
+  path by tests.
 - `mat` is the sole owner/writer of the persistent Matter KVS (chip-tool-
   compatible INI form: keysets, operational credentials, group tables, the
   group-send counter). Group-settings writes use flock exclusion + tmp+rename

@@ -436,11 +436,15 @@ mod tests {
             endpoint: EndpointRef::Id(1),
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
-            value: "[]".into(),
+            value: "{}".into(),
         };
         let err = classify(&acl).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.contains("list"), "{}", err.detail);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
         let inv = Command::Invoke {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),

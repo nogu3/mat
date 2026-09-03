@@ -366,7 +366,7 @@ fn parse_group_key_map(v: &Value) -> Result<Vec<(u16, u16)>, MatError> {
 /// `AclEntry` 列を `AccessControlEntryStruct` 列の Data TLV へ（write_tlv に
 /// 渡す形）。ACL write は全置換のため、呼び出し側は read-merge 済みの最終形を
 /// 渡すこと。
-fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
+pub(crate) fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_array(Tag::Anonymous);
     for e in entries {

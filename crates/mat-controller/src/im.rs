@@ -236,6 +236,8 @@ pub enum ImValue {
     Bool(bool),
     Uint(u64),
     Int(i64),
+    F32(f32),
+    F64(f64),
     Utf8(String),
     Bytes(Vec<u8>),
     Null,
@@ -368,10 +370,10 @@ fn value_to_im(v: Value) -> Result<ImValue, ImError> {
         Value::Int(i) => Ok(ImValue::Int(i)),
         Value::Utf8(s) => Ok(ImValue::Utf8(s.to_string())),
         Value::Bytes(b) => Ok(ImValue::Bytes(b.to_vec())),
+        Value::F32(f) => Ok(ImValue::F32(f)),
+        Value::F64(f) => Ok(ImValue::F64(f)),
         Value::Null => Ok(ImValue::Null),
         Value::StructStart | Value::ArrayStart | Value::ListStart => Err(ImError::UnsupportedValue),
-        // ImValue has no float variant (M2 scope: bool/uint/int/string/bytes/null).
-        Value::F32(_) | Value::F64(_) => Err(ImError::UnsupportedValue),
         Value::ContainerEnd => Err(ImError::Malformed("unexpected container end as data value")),
     }
 }
@@ -559,6 +561,15 @@ pub struct ReportDataMessage {
 /// 上位層の責務）。
 fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Value, ImError> {
     tlv_element_to_json_impl(r, first, 0)
+}
+
+/// 1 要素の well-formed TLV（container 可）を JSON へ。`tlv_element_to_json` の
+/// 公開入口 — 汎用 write の値ツリー符号化が read 側の JSON 化と同形になることを
+/// mat-native のテストで固定するために使う。
+pub fn tlv_to_json(tlv: &[u8]) -> Result<serde_json::Value, ImError> {
+    let mut r = Reader::new(tlv);
+    let first = r.next()?.ok_or(ImError::Malformed("empty tlv"))?;
+    tlv_element_to_json(&mut r, first)
 }
 
 fn tlv_element_to_json_impl(
@@ -2042,6 +2053,8 @@ fn encode_im_value(value: &ImValue) -> Vec<u8> {
         ImValue::Bool(b) => w.put_bool(Tag::Anonymous, *b),
         ImValue::Uint(u) => w.put_uint(Tag::Anonymous, *u),
         ImValue::Int(i) => w.put_int(Tag::Anonymous, *i),
+        ImValue::F32(f) => w.put_f32(Tag::Anonymous, *f),
+        ImValue::F64(f) => w.put_f64(Tag::Anonymous, *f),
         ImValue::Utf8(s) => w.put_str(Tag::Anonymous, s),
         ImValue::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
         ImValue::Null => w.put_null(Tag::Anonymous),
@@ -3709,5 +3722,22 @@ mod tests {
         assert_eq!(msg.reports[1].data, None);
         assert_eq!(msg.reports[1].attribute, Some(0x7777));
         assert_eq!(msg.reports[1].status, Some(STATUS_UNSUPPORTED_ATTRIBUTE));
+    }
+
+    #[test]
+    fn im_value_floats_roundtrip_through_encode_and_decode() {
+        for v in [ImValue::F32(1.5), ImValue::F64(-2.25)] {
+            let tlv = encode_im_value(&v);
+            // 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte だけ）。
+            let expect = if matches!(v, ImValue::F32(_)) {
+                0x0A
+            } else {
+                0x0B
+            };
+            assert_eq!(tlv[0] & 0x1F, expect, "{v:?}");
+            let mut r = Reader::new(&tlv);
+            let el = r.next().unwrap().unwrap();
+            assert_eq!(value_to_im(el.value).unwrap(), v);
+        }
     }
 }

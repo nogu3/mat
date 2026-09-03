@@ -11,7 +11,8 @@ in-process. There is no `chip-tool` (or any external controller) subprocess.
   [Native backend internals](commands.md#native-backend-internals) for interface
   autodetect (`MAT_IFACE` / `MAT_MATD_IFACE` override), fabric index, warm vs
   one-shot sessions, the shared groupcast counter, epoch adoption, and the
-  scalar-only generic write/invoke rule.
+  generic write/invoke value-encoding rule (scalars as literals,
+  lists/structs as JSON from the generated type table).
 - **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK); see
   [that section](commands.md#first-fabric-bootstrap-fabric-init).
 

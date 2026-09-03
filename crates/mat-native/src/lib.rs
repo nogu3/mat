@@ -103,59 +103,80 @@ pub trait NodeConn: Send {
 /// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
 const TIMED_REQUEST_MS: u16 = 10_000;
 
-/// `mat_core::ids::ScalarValue` → `mat_controller::im::ImValue`。mat-core は
-/// mat-controller に依存しない設計のため、両者を知る mat-native がここで橋渡しする。
-pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> ImValue {
+/// 値ツリー（`mat_core::ids::ScalarValue`）を 1 要素の TLV として `w` に書く。
+/// List → TLV Array（属性 list の型。TLV List 0x17 は path 専用）、Struct →
+/// TLV Struct（context tag = fieldId、呼び出し側で id 昇順整列済み）。
+pub fn put_value(
+    w: &mut mat_controller::tlv::Writer,
+    tag: mat_controller::tlv::Tag,
+    v: &mat_core::ids::ScalarValue,
+) {
+    use mat_controller::tlv::Tag;
     use mat_core::ids::ScalarValue as S;
     match v {
-        S::Bool(b) => ImValue::Bool(*b),
-        S::UInt(n) => ImValue::Uint(*n),
-        S::Int(n) => ImValue::Int(*n),
-        S::Str(s) => ImValue::Utf8(s.clone()),
-        S::Bytes(b) => ImValue::Bytes(b.clone()),
-        S::Null => ImValue::Null,
+        S::Bool(b) => w.put_bool(tag, *b),
+        S::UInt(n) => w.put_uint(tag, *n),
+        S::Int(n) => w.put_int(tag, *n),
+        S::F32(f) => w.put_f32(tag, *f),
+        S::F64(f) => w.put_f64(tag, *f),
+        S::Str(s) => w.put_str(tag, s),
+        S::Bytes(b) => w.put_bytes(tag, b),
+        S::Null => w.put_null(tag),
+        S::List(items) => {
+            w.start_array(tag);
+            for item in items {
+                put_value(w, Tag::Anonymous, item);
+            }
+            w.end_container();
+        }
+        S::Struct(fields) => {
+            w.start_struct(tag);
+            for (id, val) in fields {
+                put_value(w, Tag::Context(*id), val);
+            }
+            w.end_container();
+        }
     }
 }
 
 /// `ScalarValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
 /// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
 pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_core::ids::ScalarValue as S;
-    let mut w = Writer::new();
-    match v {
-        S::Bool(b) => w.put_bool(Tag::Anonymous, *b),
-        S::UInt(n) => w.put_uint(Tag::Anonymous, *n),
-        S::Int(n) => w.put_int(Tag::Anonymous, *n),
-        S::Str(s) => w.put_str(Tag::Anonymous, s),
-        S::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
-        S::Null => w.put_null(Tag::Anonymous),
-    }
+    let mut w = mat_controller::tlv::Writer::new();
+    put_value(&mut w, mat_controller::tlv::Tag::Anonymous, v);
     w.finish()
 }
 
-/// invoke のコマンド引数（スカラー値の列）を CommandFields TLV へ。context tag
-/// は引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` の
-/// コメント参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`)
-/// の両方が使う共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
+/// invoke のコマンド引数（値ツリーの列）を CommandFields TLV へ。context tag は
+/// 引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` のコメント
+/// 参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`) の両方が使う
+/// 共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
 pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
     use mat_controller::tlv::{Tag, Writer};
-    use mat_core::ids::ScalarValue as S;
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     for (i, v) in args.iter().enumerate() {
-        let tag = Tag::Context(i as u8);
-        match v {
-            S::Bool(b) => w.put_bool(tag, *b),
-            S::UInt(n) => w.put_uint(tag, *n),
-            S::Int(n) => w.put_int(tag, *n),
-            S::Str(s) => w.put_str(tag, s),
-            S::Bytes(b) => w.put_bytes(tag, b),
-            S::Null => w.put_null(tag),
-        }
+        put_value(&mut w, Tag::Context(i as u8), v);
     }
     w.end_container();
     w.finish()
+}
+
+/// `ScalarValue` → `ImValue`（スカラーのみ。container は `None`）。mat-core は
+/// mat-controller に依存しない設計のため、両者を知る mat-native がここで橋渡しする。
+pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> Option<ImValue> {
+    use mat_core::ids::ScalarValue as S;
+    Some(match v {
+        S::Bool(b) => ImValue::Bool(*b),
+        S::UInt(n) => ImValue::Uint(*n),
+        S::Int(n) => ImValue::Int(*n),
+        S::F32(f) => ImValue::F32(*f),
+        S::F64(f) => ImValue::F64(*f),
+        S::Str(s) => ImValue::Utf8(s.clone()),
+        S::Bytes(b) => ImValue::Bytes(b.clone()),
+        S::Null => ImValue::Null,
+        S::List(_) | S::Struct(_) => return None,
+    })
 }
 
 /// 購読パラメータ: 人感の即応性優先で floor 0、再購読時に古い購読を掃除するため
@@ -989,8 +1010,8 @@ mod tests {
     fn scalar_conversions() {
         use mat_controller::im::ImValue;
         use mat_core::ids::ScalarValue as S;
-        assert_eq!(scalar_to_im(&S::Bool(true)), ImValue::Bool(true));
-        assert_eq!(scalar_to_im(&S::UInt(7)), ImValue::Uint(7));
+        assert_eq!(scalar_to_im(&S::Bool(true)), Some(ImValue::Bool(true)));
+        assert_eq!(scalar_to_im(&S::UInt(7)), Some(ImValue::Uint(7)));
         // scalar_to_tlv は Reader で読み戻して値一致を確認。
         let b = scalar_to_tlv(&S::Str("x".into()));
         let mut r = mat_controller::tlv::Reader::new(&b);
@@ -998,6 +1019,115 @@ mod tests {
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::Utf8("x")
         ));
+
+        let b = scalar_to_tlv(&S::F64(0.5));
+        let mut r = mat_controller::tlv::Reader::new(&b);
+        assert!(matches!(
+            r.next().unwrap().unwrap().value,
+            mat_controller::tlv::Value::F64(f) if f == 0.5
+        ));
+
+        assert_eq!(scalar_to_im(&S::List(vec![])), None);
+
+        // write 経路の float 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte のみ）。
+        assert_eq!(scalar_to_tlv(&S::F32(1.5))[0] & 0x1F, 0x0A);
+        assert_eq!(scalar_to_tlv(&S::F64(1.5))[0] & 0x1F, 0x0B);
+    }
+
+    #[test]
+    fn put_value_encodes_list_of_struct_as_tlv_array_and_roundtrips_to_read_json() {
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
+        let v = parse_value_typed(
+            r#"[{"privilege":5,"auth-mode":2,"subjects":[112233],"targets":null,"fabric-index":1}]"#,
+            &ty,
+        )
+        .unwrap();
+        let tlv = scalar_to_tlv(&v);
+        // 先頭要素は TLV Array（0x16、anonymous）。
+        assert_eq!(tlv[0], 0x16);
+        // read 側の JSON 化（番号キー）に戻ると同じ内容。
+        let j = mat_controller::im::tlv_to_json(&tlv).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!([{"1":5,"2":2,"3":[112233],"4":null,"254":1}])
+        );
+    }
+
+    #[test]
+    fn generic_acl_encoding_matches_dedicated_encoder() {
+        use mat_core::acl::{AclEntry, AclTarget};
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let entries = vec![
+            AclEntry {
+                privilege: 5,
+                auth_mode: 2,
+                subjects: vec![112233, 0x1122],
+                targets: None,
+                fabric_index: 1,
+            },
+            AclEntry {
+                privilege: 3,
+                auth_mode: 3,
+                subjects: vec![0xFFFF_FFFF_FFFF_0001],
+                targets: Some(vec![AclTarget {
+                    cluster: Some(6),
+                    endpoint: None,
+                    device_type: None,
+                }]),
+                fabric_index: 1,
+            },
+        ];
+        let dedicated = crate::ops::encode_acl_entries_tlv(&entries);
+        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
+        let generic = scalar_to_tlv(
+            &parse_value_typed(
+                r#"[
+                  {"privilege":5,"auth-mode":2,"subjects":[112233,4386],"targets":null,"fabric-index":1},
+                  {"privilege":3,"auth-mode":3,"subjects":["0xFFFFFFFFFFFF0001"],
+                   "targets":[{"cluster":6,"endpoint":null,"device-type":null}],"fabric-index":1}
+                ]"#,
+                &ty,
+            )
+            .unwrap(),
+        );
+        assert_eq!(generic, dedicated);
+    }
+
+    #[test]
+    fn generic_group_key_map_encoding_matches_dedicated_encoder() {
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let dedicated = mat_controller::im::encode_group_key_map_tlv(&[(1, 2), (0x0101, 7)]);
+        let ty = resolve_attribute(0x003F, "group-key-map")
+            .unwrap()
+            .def
+            .unwrap()
+            .ty;
+        let generic = scalar_to_tlv(
+            &parse_value_typed(
+                r#"[{"group-id":1,"group-key-set-id":2},{"1":257,"2":7}]"#,
+                &ty,
+            )
+            .unwrap(),
+        );
+        assert_eq!(generic, dedicated);
+    }
+
+    #[test]
+    fn generic_key_set_write_encoding_matches_dedicated_encoder() {
+        use mat_core::ids::{classify_invoke, InvokeClass};
+        let key: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let dedicated = mat_controller::im::encode_key_set_write_fields(1, &key);
+        let j = r#"{"group-key-set-id":1,"group-key-security-policy":0,"epoch-key0":"hex:00112233445566778899aabbccddeeff","epoch-start-time0":1,"epoch-key1":null,"epoch-start-time1":null,"epoch-key2":null,"epoch-start-time2":null}"#;
+        let InvokeClass::Native { fields, .. } =
+            classify_invoke("groupkeymanagement", "key-set-write", &[j.into()])
+        else {
+            panic!("expected Native");
+        };
+        assert_eq!(encode_command_fields(&fields), dedicated);
     }
 
     #[test]

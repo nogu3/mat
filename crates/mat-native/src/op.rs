@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn write_scalar_ok_list_rejected_unknown_unresolved() {
+    fn write_scalar_ok_bad_json_shape_rejected_unknown_unresolved() {
         let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap();
         assert!(matches!(
             k,
@@ -696,9 +696,13 @@ mod tests {
                 ..
             }
         ));
-        let err = NodeOpKind::write(1, "accesscontrol", "acl", "[]").unwrap_err();
+        let err = NodeOpKind::write(1, "accesscontrol", "acl", "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.contains("list"), "{}", err.detail);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
         let err = NodeOpKind::write(1, "nosuch", "x", "1").unwrap_err();
         assert!(
             err.detail.contains("numeric IDs are accepted"),
