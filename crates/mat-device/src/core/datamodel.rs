@@ -368,6 +368,10 @@ struct ExpandCtx<'a> {
     read_ctx: &'a ReadCtx,
 }
 
+/// `Node::invoke_on_endpoint`'s success case: the cluster's reply plus every
+/// `(endpoint, cluster, attribute)` its command changed.
+type InvokeOnEndpointOk = (InvokeReply, Vec<(u16, u32, u32)>);
+
 impl Node {
     /// An empty node with no endpoints. Use `add_endpoint` to populate it,
     /// or `with_root_endpoint` for a node that already has the mandatory
@@ -998,39 +1002,24 @@ impl Node {
         }
     }
 
-    fn handle_invoke(
+    /// `handle_invoke` と `handle_group_invoke` の共通部: endpoint/cluster を
+    /// 引き、ACL（`invoke_privilege`）を通し、`invoke` して changed を
+    /// `(endpoint, cluster, attribute)` に写し DataVersion を bump する。
+    /// `Err(status)` = endpoint/cluster 不在・ACL 拒否（呼び側が応答するか
+    /// ログするかを決める）。
+    fn invoke_on_endpoint(
         &mut self,
-        payload: &[u8],
+        endpoint: u16,
+        cluster: u32,
+        command: u32,
+        fields_tlv: &[u8],
         ctx: &mut InvokeCtx,
-    ) -> Result<ImOutcome, ImServerError> {
-        let req = im::decode_invoke_request(payload)?;
-        let Some((_, clusters)) = self
-            .endpoints
-            .iter_mut()
-            .find(|(id, _)| *id == req.endpoint)
-        else {
-            return Ok(ImOutcome::unchanged(
-                im::OPCODE_INVOKE_RESPONSE,
-                im::encode_invoke_response_status(
-                    req.endpoint,
-                    req.cluster,
-                    req.command,
-                    im::STATUS_UNSUPPORTED_ENDPOINT,
-                    None,
-                ),
-            ));
+    ) -> Result<InvokeOnEndpointOk, u8> {
+        let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint) else {
+            return Err(im::STATUS_UNSUPPORTED_ENDPOINT);
         };
-        let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == req.cluster) else {
-            return Ok(ImOutcome::unchanged(
-                im::OPCODE_INVOKE_RESPONSE,
-                im::encode_invoke_response_status(
-                    req.endpoint,
-                    req.cluster,
-                    req.command,
-                    im::STATUS_UNSUPPORTED_CLUSTER,
-                    None,
-                ),
-            ));
+        let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == cluster) else {
+            return Err(im::STATUS_UNSUPPORTED_CLUSTER);
         };
         // ACL (spec §9.10): the command's required privilege comes from the
         // cluster (`invoke_privilege`, Operate unless overridden). Denied is
@@ -1041,42 +1030,63 @@ impl Node {
             &self.acl,
             ctx.fabric_index,
             ctx.subject,
-            handler.invoke_privilege(req.command),
-            req.endpoint,
-            req.cluster,
+            handler.invoke_privilege(command),
+            endpoint,
+            cluster,
         ) {
-            return Ok(ImOutcome::unchanged(
-                im::OPCODE_INVOKE_RESPONSE,
-                im::encode_invoke_response_status(
-                    req.endpoint,
-                    req.cluster,
-                    req.command,
-                    im::STATUS_UNSUPPORTED_ACCESS,
-                    None,
-                ),
-            ));
+            return Err(im::STATUS_UNSUPPORTED_ACCESS);
         }
         // Each `invoke` gets a fresh change list: `ctx` is per-session
         // scratch (`attestation_challenge` outlives one command), so a
         // leftover `changed` from an earlier command in the same session
         // must not be re-reported as this one's.
         ctx.changed.clear();
-        let reply = handler.invoke(req.command, &req.fields_tlv, ctx);
+        let reply = handler.invoke(command, fields_tlv, ctx);
         // The handler reports bare attribute ids (it only knows its own
         // cluster); pair them with the endpoint/cluster it was dispatched
         // to, and bump this cluster's DataVersion once if anything changed.
         let changed: Vec<(u16, u32, u32)> = ctx
             .changed
             .drain(..)
-            .map(|attribute| (req.endpoint, req.cluster, attribute))
+            .map(|attribute| (endpoint, cluster, attribute))
             .collect();
         if !changed.is_empty() {
             let version = self
                 .versions
-                .entry((req.endpoint, req.cluster))
+                .entry((endpoint, cluster))
                 .or_insert(self.version_base);
             *version = version.wrapping_add(1);
         }
+        Ok((reply, changed))
+    }
+
+    fn handle_invoke(
+        &mut self,
+        payload: &[u8],
+        ctx: &mut InvokeCtx,
+    ) -> Result<ImOutcome, ImServerError> {
+        let req = im::decode_invoke_request(payload)?;
+        let (reply, changed) = match self.invoke_on_endpoint(
+            req.endpoint,
+            req.cluster,
+            req.command,
+            &req.fields_tlv,
+            ctx,
+        ) {
+            Ok(ok) => ok,
+            Err(status) => {
+                return Ok(ImOutcome::unchanged(
+                    im::OPCODE_INVOKE_RESPONSE,
+                    im::encode_invoke_response_status(
+                        req.endpoint,
+                        req.cluster,
+                        req.command,
+                        status,
+                        None,
+                    ),
+                ));
+            }
+        };
         let resp_payload = match reply {
             InvokeReply::Status(status) => im::encode_invoke_response_status(
                 req.endpoint,
@@ -1110,6 +1120,52 @@ impl Node {
             payload: resp_payload,
             changed,
         })
+    }
+
+    /// groupcast の Invoke（spec §8.2.5: 応答なし）: group の member
+    /// `endpoints` × `invokes` の全組み合わせに `invoke_on_endpoint`。拒否・
+    /// 不在・非 SUCCESS は debug ログのみ。戻りは購読の dirty に流す changed。
+    pub fn handle_group_invoke(
+        &mut self,
+        endpoints: &[u16],
+        invokes: &[crate::core::group_invoke::GroupInvokeIn],
+        ctx: &mut InvokeCtx,
+    ) -> Vec<(u16, u32, u32)> {
+        let mut changed = Vec::new();
+        for &endpoint in endpoints {
+            for inv in invokes {
+                match self.invoke_on_endpoint(
+                    endpoint,
+                    inv.cluster,
+                    inv.command,
+                    &inv.fields_tlv,
+                    ctx,
+                ) {
+                    Ok((reply, mut c)) => {
+                        if let InvokeReply::Status(status) = reply {
+                            if status != im::STATUS_SUCCESS {
+                                tracing::debug!(
+                                    endpoint,
+                                    cluster = inv.cluster,
+                                    command = inv.command,
+                                    status,
+                                    "group invoke: command status"
+                                );
+                            }
+                        }
+                        changed.append(&mut c);
+                    }
+                    Err(status) => tracing::debug!(
+                        endpoint,
+                        cluster = inv.cluster,
+                        command = inv.command,
+                        status,
+                        "group invoke: not applied"
+                    ),
+                }
+            }
+        }
+        changed
     }
 
     /// Dispatches a `WriteRequest`'s attribute writes one at a time —
@@ -1676,8 +1732,8 @@ fn encode_capability_minima() -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::core::access_control::{
-        AclDeviceEntry, AclStore, AUTH_MODE_CASE, PRIVILEGE_MANAGE, PRIVILEGE_OPERATE,
-        PRIVILEGE_VIEW,
+        AclDeviceEntry, AclStore, AUTH_MODE_CASE, AUTH_MODE_GROUP, PRIVILEGE_MANAGE,
+        PRIVILEGE_OPERATE, PRIVILEGE_VIEW,
     };
     use mat_controller::im::{decode_invoke_response, decode_report_data_message};
 
@@ -3103,6 +3159,66 @@ mod tests {
         assert_eq!(toggle(&mut node, 2, 7), im::STATUS_UNSUPPORTED_ACCESS);
         // PASE (fabric 0) は ACL を経由しない。
         assert_eq!(toggle(&mut node, 0, 0), im::STATUS_SUCCESS);
+    }
+
+    /// group invoke は member endpoint 全部に適用し、changed を endpoint 付きで
+    /// 返す。ACL は `Subject::group` × Group エントリで判定。
+    #[test]
+    fn handle_group_invoke_applies_to_every_member_endpoint_under_group_acl() {
+        use crate::core::group_invoke::GroupInvokeIn;
+        let mut node = node_with_onoff(); // endpoint 1 に OnOff
+        let (onoff2, state2) = crate::core::onoff::OnOffHandler::new();
+        node.add_endpoint(2, vec![Box::new(onoff2)]);
+        let store = AclStore::new();
+        store.set_entries_for_test(
+            1,
+            vec![AclDeviceEntry {
+                privilege: PRIVILEGE_OPERATE,
+                auth_mode: AUTH_MODE_GROUP,
+                subjects: vec![10],
+                targets_raw: None,
+                fabric_index: 1,
+            }],
+        );
+        node.set_acl_store(store);
+        let toggle = [GroupInvokeIn {
+            cluster: im::CLUSTER_ON_OFF,
+            command: im::CMD_ON_OFF_TOGGLE,
+            fields_tlv: Vec::new(),
+        }];
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            subject: Subject::group(10),
+            ..InvokeCtx::default()
+        };
+        let changed = node.handle_group_invoke(&[1, 2], &toggle, &mut ctx);
+        assert_eq!(
+            changed,
+            vec![
+                (1, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF),
+                (2, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF)
+            ]
+        );
+        assert!(state2.load(std::sync::atomic::Ordering::SeqCst));
+        // 別 group / 別 fabric は ACL で落ちて無変化
+        let mut other = InvokeCtx {
+            fabric_index: 1,
+            subject: Subject::group(11),
+            ..InvokeCtx::default()
+        };
+        assert!(node
+            .handle_group_invoke(&[1, 2], &toggle, &mut other)
+            .is_empty());
+        assert!(state2.load(std::sync::atomic::Ordering::SeqCst));
+        // 存在しない endpoint / cluster は黙って skip
+        let unknown = [GroupInvokeIn {
+            cluster: 0x7FFF,
+            command: 0,
+            fields_tlv: Vec::new(),
+        }];
+        assert!(node
+            .handle_group_invoke(&[1, 9], &unknown, &mut ctx)
+            .is_empty());
     }
 
     /// Manage を要求する invoke（`IdentifyHandler`）は Operate だけの
