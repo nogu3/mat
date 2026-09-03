@@ -265,10 +265,12 @@ impl Device {
         // GroupKeyManagement（spec §11.2）の共有ストア: `AclStore` と同じ
         // 「RemoveFabric・fail-safe rollback の purge は
         // `CommissioningServer` が書き、EP0 のクラスタハンドラが読み書き
-        // する」配線（`set_acl_store`の doc 参照）。`GroupKeyStore` は
-        // Task 1 時点で非永続（`with_persist` 相当は無い、モジュール doc
-        // 参照）— 再起動で KeySet/GroupKeyMap が消えるのは既知ギャップ。
-        let gk_store = crate::core::group_key_management::GroupKeyStore::new();
+        // する」配線（`set_acl_store`の doc 参照）。`<store_dir>/
+        // group_keys.json` に永続化（`AclStore` と同じ file-backed persist
+        // 注入）。
+        let gk_store = crate::core::group_key_management::GroupKeyStore::with_persist(Box::new(
+            crate::net::store::group_key_store_in_dir(&config.store_dir),
+        ));
         comm_server.set_group_key_store(gk_store.clone());
 
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;

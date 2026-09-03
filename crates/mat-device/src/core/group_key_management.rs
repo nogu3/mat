@@ -7,13 +7,15 @@
 //! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は空 array のまま
 //! （`GroupTable` は Groups クラスタ側のエンドポイント紐付けが要る派生
 //! ビューで、groupcast タスク送り）。`KeySetRead`/`KeySetRemove`/
-//! `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ、
-//! groupcast タスク送り）。
+//! `KeySetReadAllIndices` コマンドは未実装（既知ギャップ、groupcast タスク
+//! 送り）。永続化は `with_persist` で `<store_dir>/group_keys.json`
+//! （`net::store::FileGroupKeyStore`）に行う。
 use std::sync::{Arc, Mutex};
 
 use mat_controller::im;
 use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
+use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 
@@ -26,22 +28,39 @@ use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 const MAX_GROUPS_PER_FABRIC: u64 = 16;
 const MAX_GROUP_KEYS_PER_FABRIC: usize = 1;
 
-/// デバイス上の 1 KeySet（`GroupKeySetStruct` の epoch key 0 のみ保持 —
-/// epoch 1/2 は spec 上 optional でこの実装では未対応、モジュール doc
-/// 参照）。
-#[derive(Debug, Clone)]
-struct GroupKeySet {
-    fabric_index: u8,
-    keyset_id: u16,
-    epoch_key0: [u8; 16],
+/// デバイス上の 1 KeySet（epoch key 0 のみ保持 — epoch 1/2 は spec 上
+/// optional でこの実装では未対応、モジュール doc 参照）。`Debug` は鍵を
+/// 伏せる（`FabricEntry`/`GroupCredentials` と同じ方針）。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupKeySet {
+    pub fabric_index: u8,
+    pub keyset_id: u16,
+    pub epoch_key0: [u8; 16],
+}
+
+impl std::fmt::Debug for GroupKeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupKeySet")
+            .field("fabric_index", &self.fabric_index)
+            .field("keyset_id", &self.keyset_id)
+            .field("epoch_key0", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// `GroupKeyMapStruct` 1 件（spec §11.2.7.6: GroupId → KeySetID）。
-#[derive(Debug, Clone)]
-struct GroupKeyMapEntry {
-    fabric_index: u8,
-    group_id: u16,
-    keyset_id: u16,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupKeyMapEntry {
+    pub fabric_index: u8,
+    pub group_id: u16,
+    pub keyset_id: u16,
+}
+
+/// 永続化境界（`core::access_control::AclPersist` と同型: whole-table
+/// save/load、具象は `net::store::FileGroupKeyStore`）。
+pub trait GroupKeyPersist: Send {
+    fn save(&self, keysets: &[GroupKeySet], map: &[GroupKeyMapEntry]) -> Result<(), String>;
+    fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String>;
 }
 
 /// `GroupKeyStore`'s guarded state — `AclStore`/`AclInner`（
@@ -50,13 +69,15 @@ struct GroupKeyMapEntry {
 struct GroupKeyInner {
     keysets: Vec<GroupKeySet>,
     map: Vec<GroupKeyMapEntry>,
+    persist: Option<Box<dyn GroupKeyPersist>>,
 }
 
 /// GroupKeyManagement の共有 state。`GroupKeyManagementHandler`（EP0 の
 /// クラスタハンドラ）と、`CommissioningServer`（fabric 撤去の purge、
 /// `core::commissioning::set_group_key_store`）・将来の groupcast 配線の
 /// 両方から触られる想定で `Arc<Mutex<..>>` + `Clone`（`AclStore` と同じ
-/// パターン、モジュール doc 参照）。永続化なし（M3 送り）。
+/// パターン、モジュール doc 参照）。永続化は任意（`new` は非永続、
+/// `with_persist` で `<store_dir>/group_keys.json` に永続化）。
 #[derive(Clone, Default)]
 pub struct GroupKeyStore(Arc<Mutex<GroupKeyInner>>);
 
@@ -66,11 +87,43 @@ impl GroupKeyStore {
         Self::default()
     }
 
+    /// `persist` から復元して開始する。load 失敗（壊れた JSON 等）は warn
+    /// して空から始める — 起動を止めない。
+    pub fn with_persist(persist: Box<dyn GroupKeyPersist>) -> Self {
+        let (keysets, map) = match persist.load() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(error = %e, "group key store: load failed; starting empty");
+                (Vec::new(), Vec::new())
+            }
+        };
+        Self(Arc::new(Mutex::new(GroupKeyInner {
+            keysets,
+            map,
+            persist: Some(persist),
+        })))
+    }
+
+    /// 全 fabric の KeySet（groupcast 受信の復号候補列挙用）。
+    pub fn keysets(&self) -> Vec<GroupKeySet> {
+        self.lock().keysets.clone()
+    }
+
     /// poison 耐性 lock（`mat_controller::sync::locked` — `AclStore` と同じ
     /// 全クレート共通ヘルパ）— 1 パニックでストア全体が触れなくなるのを
     /// 避ける。
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupKeyInner> {
         locked(&self.0)
+    }
+
+    /// save 失敗は warn して in-memory を進める（`AclStore::save` と同じ理由:
+    /// 直前の正当な状態が残るだけで安全性は落ちない）。
+    fn save(guard: &GroupKeyInner) {
+        if let Some(persist) = &guard.persist {
+            if let Err(e) = persist.save(&guard.keysets, &guard.map) {
+                tracing::warn!(error = %e, "group key store: save failed; keeping in-memory state");
+            }
+        }
     }
 
     /// KeySetWrite (spec §11.2.7.1) の実処理: 同 `(fabric_index,
@@ -90,6 +143,7 @@ impl GroupKeyStore {
             .find(|k| k.fabric_index == fabric_index && k.keyset_id == keyset_id)
         {
             existing.epoch_key0 = epoch_key0;
+            Self::save(&guard);
             return Ok(());
         }
         let count = guard
@@ -105,6 +159,7 @@ impl GroupKeyStore {
             keyset_id,
             epoch_key0,
         });
+        Self::save(&guard);
         Ok(())
     }
 
@@ -122,6 +177,7 @@ impl GroupKeyStore {
         let mut guard = self.lock();
         guard.keysets.retain(|k| k.fabric_index != fabric_index);
         guard.map.retain(|m| m.fabric_index != fabric_index);
+        Self::save(&guard);
     }
 
     /// 書き込み fabric の GroupKeyMap エントリを丸ごと入れ替える
@@ -138,16 +194,19 @@ impl GroupKeyStore {
                     keyset_id,
                 }),
         );
+        Self::save(&guard);
     }
 
     /// 書き込み fabric の GroupKeyMap 末尾に 1 件足す（write の
     /// ListIndex null append 径路）。
     pub fn append_map_entry(&self, fabric_index: u8, group_id: u16, keyset_id: u16) {
-        self.lock().map.push(GroupKeyMapEntry {
+        let mut guard = self.lock();
+        guard.map.push(GroupKeyMapEntry {
             fabric_index,
             group_id,
             keyset_id,
         });
+        Self::save(&guard);
     }
 
     pub fn map_entries_for(&self, fabric_index: u8) -> Vec<(u16, u16)> {
@@ -833,5 +892,79 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, vec![(1, 0x000A, 7), (2, 0x000B, 8)]);
+    }
+
+    struct MemPersist(std::sync::Arc<std::sync::Mutex<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>)>>);
+    impl GroupKeyPersist for MemPersist {
+        fn save(&self, keysets: &[GroupKeySet], map: &[GroupKeyMapEntry]) -> Result<(), String> {
+            *self.0.lock().unwrap() = (keysets.to_vec(), map.to_vec());
+            Ok(())
+        }
+        fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    /// 変異 4 種（upsert / replace map / append map / purge）が毎回 save され、
+    /// 別インスタンスが load で同じ状態に戻る。
+    #[test]
+    fn mutations_persist_and_reload_in_a_new_instance() {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+        {
+            let store = GroupKeyStore::with_persist(Box::new(MemPersist(cell.clone())));
+            store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+            store.replace_fabric_map(1, vec![(10, 42)]);
+            store.append_map_entry(1, 11, 42);
+            store.upsert_keyset(2, 9, [1u8; 16]).unwrap();
+            store.purge_fabric(2);
+        }
+        let store2 = GroupKeyStore::with_persist(Box::new(MemPersist(cell)));
+        assert_eq!(
+            store2.keysets(),
+            vec![GroupKeySet {
+                fabric_index: 1,
+                keyset_id: 42,
+                epoch_key0: [7u8; 16]
+            }]
+        );
+        assert_eq!(store2.map_entries_for(1), vec![(10, 42), (11, 42)]);
+        assert!(store2.map_entries_for(2).is_empty());
+    }
+
+    struct FailingPersist;
+    impl GroupKeyPersist for FailingPersist {
+        fn save(&self, _: &[GroupKeySet], _: &[GroupKeyMapEntry]) -> Result<(), String> {
+            Err("disk full".into())
+        }
+        fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String> {
+            Err("corrupt".into())
+        }
+    }
+
+    /// load 失敗は空から開始、save 失敗は in-memory を進める（AclStore と同じ）。
+    #[test]
+    fn persist_failures_do_not_block_the_store() {
+        let store = GroupKeyStore::with_persist(Box::new(FailingPersist));
+        assert!(store.keysets().is_empty());
+        store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+        assert!(store.keyset_exists(1, 42));
+    }
+
+    #[test]
+    fn keyset_debug_redacts_the_epoch_key() {
+        let s = format!(
+            "{:?}",
+            GroupKeySet {
+                fabric_index: 1,
+                keyset_id: 42,
+                epoch_key0: [0xAB; 16]
+            }
+        );
+        // Note: a plain `!s.contains("ab")` would false-positive on the
+        // `fabric_index` field label itself (unrelated to the redacted
+        // key), so this checks only for a decimal leak of the 0xAB byte
+        // value (171) — the epoch key is fully redacted either way (no
+        // digits of it appear in `s` at all).
+        assert!(s.contains("REDACTED") && !s.contains("171"), "{s}");
     }
 }
