@@ -317,6 +317,15 @@ impl SubHealth {
         );
     }
 
+    /// 台帳から消えたノードの痕跡を全テーブルから除く（購読ループ abort と
+    /// 同時に呼ぶ）。以後 `status_nodes` に現れない。
+    pub(crate) fn forget(&self, node_id: u64) {
+        locked(&self.pending).remove(&node_id);
+        locked(&self.status).remove(&node_id);
+        locked(&self.touched).remove(&node_id);
+        locked(&self.values).retain(|k, _| k.0 != node_id);
+    }
+
     /// 購読対象クラスタ（status 応答用）。空 = full wildcard = None
     /// （subscribe_config は空リストを起動拒否するので混同はない）。
     pub(crate) fn clusters(&self) -> Option<&[u32]> {
@@ -597,9 +606,9 @@ pub(crate) fn stagger_delay(batch_index: usize, batch_len: usize) -> Duration {
 /// commissioned 全ノードへ購読タスクを張る supervisor を起動する。
 /// `LEDGER_RESCAN_INTERVAL` ごとに台帳を読み直し、新規ノードに購読ループを
 /// 追加 spawn する（op 経路の `require_node` が毎回 store を開き直すのと同じ
-/// 「常駐中の台帳更新を拾う」規律）。ノード削除は台帳 API に存在しないため
-/// 扱わない。cluster 絞り込みは subscriptions.toml で実装済み（`clusters`
-/// パラメータに配線）。native が Unavailable なら何もしない（`mat fabric
+/// 「常駐中の台帳更新を拾う」規律）。`mat unpair` で台帳から消えたノードは
+/// 逆に購読ループを abort して health からも外す。cluster 絞り込みは
+/// subscriptions.toml で実装済み（`clusters` パラメータに配線）。native が Unavailable なら何もしない（`mat fabric
 /// init` 後の再起動で解消 — 再読で直る状態ではないので空回りさせない）。
 pub fn spawn_subscription_manager(
     native: Arc<NativeState>,
@@ -614,9 +623,9 @@ pub fn spawn_subscription_manager(
         if !matches!(&*native, NativeState::Ready(_)) {
             return;
         }
-        // 購読ループを張った node_id。台帳は増える一方（削除 API 無し）なので
-        // 集合の縮小は考えない。
-        let mut subscribed = HashSet::new();
+        // 購読ループを張った node_id → そのループの JoinHandle。台帳から
+        // 消えたノードを abort するために handle を持つ。
+        let mut subscribed: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut announced = false;
         let mut read_fail_streak: u32 = 0;
         loop {
@@ -624,6 +633,25 @@ pub fn spawn_subscription_manager(
                 Ok(store) => {
                     read_fail_streak = 0;
                     let node_ids: Vec<u64> = store.nodes().map(|n| n.node_id).collect();
+                    // レーン B: unpair で台帳から消えたノードは購読ループを abort
+                    // して status からも外す。abort は購読ループの cancel-safe 性に
+                    // 依存しない — ループは establish / Subscribe / pump の await と
+                    // backoff sleep しか持たず、途中で落として壊れる複合不変条件は
+                    // 無い（SubConn は drop で閉じる。RemoveFabric 済みのデバイス側
+                    // セッションはどうせ無効）。
+                    let current: HashSet<u64> = node_ids.iter().copied().collect();
+                    let removed: Vec<u64> = subscribed
+                        .keys()
+                        .filter(|id| !current.contains(id))
+                        .copied()
+                        .collect();
+                    for node_id in removed {
+                        if let Some(handle) = subscribed.remove(&node_id) {
+                            handle.abort();
+                        }
+                        health.forget(node_id);
+                        tracing::info!(node_id, "ledger rescan: node removed; unsubscribed");
+                    }
                     // 初回の成功読みだけ台数つきの starting ログ（現行踏襲）。
                     // 以降の新規検出はノード単位の info（commission は稀な操作
                     // なのでノイズにならず、「ログに一切現れない」誤診の罠を潰す）。
@@ -637,7 +665,7 @@ pub fn spawn_subscription_manager(
                     // 分母はこのバッチのサイズ。台帳全体のサイズではない）。
                     let new_nodes: Vec<u64> = node_ids
                         .into_iter()
-                        .filter(|id| subscribed.insert(*id))
+                        .filter(|id| !subscribed.contains_key(id))
                         .collect();
                     for (i, node_id) in new_nodes.iter().copied().enumerate() {
                         if !initial {
@@ -647,11 +675,19 @@ pub fn spawn_subscription_manager(
                         let native = Arc::clone(&native);
                         let events = events.clone();
                         let clusters = Arc::clone(&clusters);
-                        let health = Arc::clone(&health);
-                        tokio::spawn(async move {
-                            node_subscription_loop(node_id, delay, native, events, clusters, health)
-                                .await
+                        let health_for_task = Arc::clone(&health);
+                        let handle = tokio::spawn(async move {
+                            node_subscription_loop(
+                                node_id,
+                                delay,
+                                native,
+                                events,
+                                clusters,
+                                health_for_task,
+                            )
+                            .await
                         });
+                        subscribed.insert(node_id, handle);
                     }
                 }
                 Err(e) => {
@@ -1920,6 +1956,30 @@ mod tests {
             }
         };
         assert!(ev.priming);
+    }
+
+    /// レーン B（unpair）: 台帳から消えたノードの購読ループは次の再読ティック
+    /// で abort され、status からも消える（従来は「台帳は増える一方」前提で
+    /// 永久に再試行し続けた）。
+    #[tokio::test(start_paused = true)]
+    async fn manager_drops_node_removed_from_ledger() {
+        let (mut rx, health, dir, _handle) = spawn_manager(FakeEstablisher::default(), None);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("node5 priming should arrive")
+            .unwrap();
+        assert_eq!(ev.node_id, 5);
+        assert!(health.status_nodes().iter().any(|n| n["node_id"] == 5));
+        // 稼働中に node 5 を unpair（= 台帳から削除）。
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        assert!(store.remove_node(5).unwrap());
+        // 次の再読ティックを越える。
+        tokio::time::sleep(LEDGER_RESCAN_INTERVAL + std::time::Duration::from_secs(1)).await;
+        assert!(
+            !health.status_nodes().iter().any(|n| n["node_id"] == 5),
+            "removed node must vanish from status: {:?}",
+            health.status_nodes()
+        );
     }
 
     /// 監査#4 の副次修正: 起動時に store が読めなくても supervisor は次の
