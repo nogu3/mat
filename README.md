@@ -121,7 +121,8 @@ mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
 `matv` also receives groupcast: it binds a second UDP socket on `5540`
 (the Matter groupcast multicast destination port; SO_REUSEPORT so several
 `matv` processes can share it) — override with `group_port` in `matv.toml`,
-or set it to `0` for an ephemeral port in tests. Once a group has a
+or set it to `0` for an ephemeral port in tests; `port` must differ from
+`group_port`, and `matv` refuses to start if they are equal. Once a group has a
 KeySetWrite / GroupKeyMap / AddGroup / ACL on the device (`mat group
 provision` sets all four up), a `mat group invoke` sent to that group
 multicasts to the member endpoints. Keys and membership persist under

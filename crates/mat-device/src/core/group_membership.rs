@@ -129,10 +129,13 @@ impl GroupMembershipStore {
 
     pub fn remove_all(&self, fabric_index: u8, endpoint: u16) {
         let mut guard = self.lock();
+        let before = guard.members.len();
         guard
             .members
             .retain(|m| !(m.fabric_index == fabric_index && m.endpoint == endpoint));
-        Self::save(&guard);
+        if guard.members.len() != before {
+            Self::save(&guard);
+        }
     }
 
     pub fn groups_for(&self, fabric_index: u8, endpoint: u16) -> Vec<u16> {
@@ -246,5 +249,50 @@ mod tests {
         }
         let s2 = GroupMembershipStore::with_persist(Box::new(MemPersist(cell)));
         assert_eq!(s2.groups_for(1, 2), vec![10]);
+    }
+
+    #[test]
+    fn remove_all_no_save_when_nothing_removed() {
+        let save_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingPersist(
+            std::sync::Arc<std::sync::Mutex<Vec<GroupMember>>>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        );
+        impl GroupMembershipPersist for CountingPersist {
+            fn save(&self, members: &[GroupMember]) -> Result<(), String> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.0.lock().unwrap() = members.to_vec();
+                Ok(())
+            }
+            fn load(&self) -> Result<Vec<GroupMember>, String> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = GroupMembershipStore::with_persist(Box::new(CountingPersist(
+            cell.clone(),
+            save_count.clone(),
+        )));
+        // Initial load calls save once (empty load)
+        save_count.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // remove_all on endpoint with no memberships should not save
+        s.remove_all(1, 99);
+        assert_eq!(
+            save_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "remove_all should not save when no members removed"
+        );
+
+        // remove_all on endpoint with actual membership should save
+        s.add(1, 10, 2).unwrap();
+        save_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        s.remove_all(1, 2);
+        assert_eq!(
+            save_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remove_all should save when members are removed"
+        );
     }
 }
