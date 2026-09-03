@@ -436,7 +436,7 @@ mod tests {
             endpoint: EndpointRef::Id(1),
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
-            value: "[]".into(),
+            value: "{}".into(),
         };
         let err = classify(&acl).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);

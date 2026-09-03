@@ -103,11 +103,70 @@ pub trait NodeConn: Send {
 /// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
 const TIMED_REQUEST_MS: u16 = 10_000;
 
-/// `mat_core::ids::ScalarValue` → `mat_controller::im::ImValue`。mat-core は
-/// mat-controller に依存しない設計のため、両者を知る mat-native がここで橋渡しする。
-pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> ImValue {
+/// 値ツリー（`mat_core::ids::ScalarValue`）を 1 要素の TLV として `w` に書く。
+/// List → TLV Array（属性 list の型。TLV List 0x17 は path 専用）、Struct →
+/// TLV Struct（context tag = fieldId、呼び出し側で id 昇順整列済み）。
+pub fn put_value(
+    w: &mut mat_controller::tlv::Writer,
+    tag: mat_controller::tlv::Tag,
+    v: &mat_core::ids::ScalarValue,
+) {
+    use mat_controller::tlv::Tag;
     use mat_core::ids::ScalarValue as S;
     match v {
+        S::Bool(b) => w.put_bool(tag, *b),
+        S::UInt(n) => w.put_uint(tag, *n),
+        S::Int(n) => w.put_int(tag, *n),
+        S::F32(f) => w.put_f32(tag, *f),
+        S::F64(f) => w.put_f64(tag, *f),
+        S::Str(s) => w.put_str(tag, s),
+        S::Bytes(b) => w.put_bytes(tag, b),
+        S::Null => w.put_null(tag),
+        S::List(items) => {
+            w.start_array(tag);
+            for item in items {
+                put_value(w, Tag::Anonymous, item);
+            }
+            w.end_container();
+        }
+        S::Struct(fields) => {
+            w.start_struct(tag);
+            for (id, val) in fields {
+                put_value(w, Tag::Context(*id), val);
+            }
+            w.end_container();
+        }
+    }
+}
+
+/// `ScalarValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
+/// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
+pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
+    let mut w = mat_controller::tlv::Writer::new();
+    put_value(&mut w, mat_controller::tlv::Tag::Anonymous, v);
+    w.finish()
+}
+
+/// invoke のコマンド引数（値ツリーの列）を CommandFields TLV へ。context tag は
+/// 引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` のコメント
+/// 参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`) の両方が使う
+/// 共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
+pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
+    use mat_controller::tlv::{Tag, Writer};
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    for (i, v) in args.iter().enumerate() {
+        put_value(&mut w, Tag::Context(i as u8), v);
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// `ScalarValue` → `ImValue`（スカラーのみ。container は `None`）。mat-core は
+/// mat-controller に依存しない設計のため、両者を知る mat-native がここで橋渡しする。
+pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> Option<ImValue> {
+    use mat_core::ids::ScalarValue as S;
+    Some(match v {
         S::Bool(b) => ImValue::Bool(*b),
         S::UInt(n) => ImValue::Uint(*n),
         S::Int(n) => ImValue::Int(*n),
@@ -116,52 +175,8 @@ pub fn scalar_to_im(v: &mat_core::ids::ScalarValue) -> ImValue {
         S::Str(s) => ImValue::Utf8(s.clone()),
         S::Bytes(b) => ImValue::Bytes(b.clone()),
         S::Null => ImValue::Null,
-    }
-}
-
-/// `ScalarValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
-/// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
-pub fn scalar_to_tlv(v: &mat_core::ids::ScalarValue) -> Vec<u8> {
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_core::ids::ScalarValue as S;
-    let mut w = Writer::new();
-    match v {
-        S::Bool(b) => w.put_bool(Tag::Anonymous, *b),
-        S::UInt(n) => w.put_uint(Tag::Anonymous, *n),
-        S::Int(n) => w.put_int(Tag::Anonymous, *n),
-        S::F32(f) => w.put_f32(Tag::Anonymous, *f),
-        S::F64(f) => w.put_f64(Tag::Anonymous, *f),
-        S::Str(s) => w.put_str(Tag::Anonymous, s),
-        S::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
-        S::Null => w.put_null(Tag::Anonymous),
-    }
-    w.finish()
-}
-
-/// invoke のコマンド引数（スカラー値の列）を CommandFields TLV へ。context tag
-/// は引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` の
-/// コメント参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`)
-/// の両方が使う共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
-pub fn encode_command_fields(args: &[mat_core::ids::ScalarValue]) -> Vec<u8> {
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_core::ids::ScalarValue as S;
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    for (i, v) in args.iter().enumerate() {
-        let tag = Tag::Context(i as u8);
-        match v {
-            S::Bool(b) => w.put_bool(tag, *b),
-            S::UInt(n) => w.put_uint(tag, *n),
-            S::Int(n) => w.put_int(tag, *n),
-            S::F32(f) => w.put_f32(tag, *f),
-            S::F64(f) => w.put_f64(tag, *f),
-            S::Str(s) => w.put_str(tag, s),
-            S::Bytes(b) => w.put_bytes(tag, b),
-            S::Null => w.put_null(tag),
-        }
-    }
-    w.end_container();
-    w.finish()
+        S::List(_) | S::Struct(_) => return None,
+    })
 }
 
 /// 購読パラメータ: 人感の即応性優先で floor 0、再購読時に古い購読を掃除するため
@@ -995,8 +1010,8 @@ mod tests {
     fn scalar_conversions() {
         use mat_controller::im::ImValue;
         use mat_core::ids::ScalarValue as S;
-        assert_eq!(scalar_to_im(&S::Bool(true)), ImValue::Bool(true));
-        assert_eq!(scalar_to_im(&S::UInt(7)), ImValue::Uint(7));
+        assert_eq!(scalar_to_im(&S::Bool(true)), Some(ImValue::Bool(true)));
+        assert_eq!(scalar_to_im(&S::UInt(7)), Some(ImValue::Uint(7)));
         // scalar_to_tlv は Reader で読み戻して値一致を確認。
         let b = scalar_to_tlv(&S::Str("x".into()));
         let mut r = mat_controller::tlv::Reader::new(&b);

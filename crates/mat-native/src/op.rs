@@ -696,7 +696,7 @@ mod tests {
                 ..
             }
         ));
-        let err = NodeOpKind::write(1, "accesscontrol", "acl", "[]").unwrap_err();
+        let err = NodeOpKind::write(1, "accesscontrol", "acl", "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         assert!(err.detail.contains("list"), "{}", err.detail);
         let err = NodeOpKind::write(1, "nosuch", "x", "1").unwrap_err();
