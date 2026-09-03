@@ -477,7 +477,6 @@ mod tests {
         assert!(p.thread.is_err());
     }
 
-    /// Issue #22: deadline 超過で future ごと drop されると `OneShotRunner` の
     /// F6: `unpair`（RemoveFabric）だけは node_touched ヒントを撃たない。
     /// 撃つと matd が外したばかりのノードへ再購読し、次の台帳 rescan（最大
     /// 60s）まで CASE 失敗の backoff ノイズを出す。
@@ -501,6 +500,7 @@ mod tests {
         assert!(!suppresses_node_touched_hint(&DeviceOp::GroupBump));
     }
 
+    /// Issue #22: deadline 超過で future ごと drop されると `OneShotRunner` の
     /// close+hint が走らない。Err 腕で node_touched ヒントだけは撃つこと
     /// （close はセッション所有権が drop 済みで送れない）。
     #[test]

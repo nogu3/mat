@@ -77,8 +77,11 @@ mat unpair --node <N|ALIAS> [--force]
 exit 0。`--force` 無しでデバイス側が失敗した場合は通常の typed error（3/4/5/6）で exit、
 台帳は触らない。
 
-**node_id の再利用はしない**: `commission::next_node_id` は max+1 のまま（stale SRP レコード
-で同一 node_id の再 commission が CASE 必敗になる罠、メモリ ble-recommission-traps）。
+**node_id の再利用はしない**: 台帳 `nodes.json` が high-water mark
+（`Ledger::next_node_id`）を持ち、`Store::next_node_id()` がそれと `max(nodes)+1` の
+大きい方を払い出す（`upsert_node` が前進させ、`load_ledger` が旧形式台帳を読み込み時に
+補完する）。単なる max+1 だと unpair 直後に同じ id へ戻ってしまい、stale SRP レコードで
+同一 node_id の再 commission が CASE 必敗になる罠を踏む（メモリ ble-recommission-traps）。
 
 **matd 側**（`matd/src/subscription.rs::spawn_subscription_manager`）: 現状は「台帳は増える一方
 （削除 API 無し）」を前提に `subscribed: HashSet<u64>` を持つ。これを
