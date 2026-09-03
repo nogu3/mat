@@ -118,6 +118,17 @@ mat on --node 1 --endpoint 2    # endpoint 2 = the bridged light
 mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
 ```
 
+`matv` also receives groupcast: it binds a second UDP socket on `5540`
+(the Matter groupcast multicast destination port; SO_REUSEPORT so several
+`matv` processes can share it) — override with `group_port` in `matv.toml`,
+or set it to `0` for an ephemeral port in tests. Once a group has a
+KeySetWrite / GroupKeyMap / AddGroup / ACL on the device (`mat group
+provision` sets all four up), a `mat group invoke` sent to that group
+multicasts to the member endpoints. Keys and membership persist under
+`<store>/group_keys.json` / `groups.json`; replay protection is a
+monotonic (fabric, source) counter. Group-addressed Read/Write and
+privacy-flagged groupcast are not implemented yet.
+
 ## Requirements
 
 - Rust (stable) and [Task](https://taskfile.dev) to build. No external Matter

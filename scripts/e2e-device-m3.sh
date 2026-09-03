@@ -245,6 +245,23 @@ assert [g["group_id"] for g in d["groups"]] == ['"$GROUP_ID"'], d
 # `groups`/`keysets` とも空、の順で足し直すこと（そのときは以降の matd/listen
 # 脚のために provision し直す必要がある）。
 
+echo "==> mat group invoke (multicast) — group=$GROUP_ID cluster=onoff command=on endpoint=$DEVICE_EP" >&2
+MAT_STORE="$MAT_STORE_DIR" \
+    ./target/release/mat --iface "$IFACE" group invoke -g "$GROUP_ID" -c onoff --command on -e "$DEVICE_EP" >&2
+sleep 1
+READ_JSON="$(
+    MAT_STORE="$MAT_STORE_DIR" \
+        ./target/release/mat --iface "$IFACE" read --node "$NODE_ID" --endpoint "$DEVICE_EP" --cluster onoff --attribute on-off
+)"
+echo "$READ_JSON"
+[[ "$(json_get value "$READ_JSON")" == "true" ]] || {
+    echo "groupcast did not reach matv: on-off is not true after mat group invoke on: $READ_JSON" >&2
+    echo "-- matv stderr tail --" >&2; tail -n 40 "$DEVICE_STDERR" >&2
+    exit 1
+}
+echo "==> PASS: groupcast on reached matv over multicast (on-off=true)" >&2
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" off --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+
 echo "==> starting matd (store=$MAT_STORE_DIR, iface=$IFACE, socket=$MATD_SOCK)" >&2
 RUST_LOG="${RUST_LOG:-info}" \
     ./target/release/matd --store "$MAT_STORE_DIR" --iface "$IFACE" --socket "$MATD_SOCK" \

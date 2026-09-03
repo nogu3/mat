@@ -49,6 +49,13 @@ struct Cli {
 /// multi-NIC host has no correct interface to auto-detect, same reasoning
 /// as `mat-native::iface_select`'s own refusal to guess, so this is left
 /// mandatory rather than defaulted to something like `"lo"`).
+/// Default for `FileConfig::group_port` when the TOML omits it: 5540, the
+/// Matter groupcast multicast destination port (spec-fixed, not the
+/// ephemeral-by-default convention `port` uses).
+fn default_group_port() -> u16 {
+    5540
+}
+
 #[derive(Debug, Deserialize)]
 struct FileConfig {
     passcode: u32,
@@ -57,6 +64,10 @@ struct FileConfig {
     product_id: u16,
     /// UDP port to bind. `0` = ephemeral (tests / multi-instance hosts).
     port: u16,
+    /// groupcast 受信ポート（既定 5540 = Matter multicast の宛先。`0` =
+    /// エフェメラル、テスト用）。SO_REUSEPORT で他プロセスと共存する。
+    #[serde(default = "default_group_port")]
+    group_port: u16,
     store: PathBuf,
     /// mDNS/UDP egress interface name (e.g. `"eth0"`).
     iface: String,
@@ -153,6 +164,16 @@ fn load_config(path: &std::path::Path) -> Result<FileConfig, String> {
             cfg.discriminator
         ));
     }
+    // `Device::new` (mat-device) plain-binds the unicast socket and only
+    // warns + disables groupcast when `port == group_port` (both nonzero)
+    // — the two sockets can't share one port. Catch it here as a hard
+    // config error instead of a silent degrade.
+    if cfg.port != 0 && cfg.port == cfg.group_port {
+        return Err(format!(
+            "port and group_port must differ (groupcast needs its own UDP socket); set port = 0 or another port, got port = group_port = {}",
+            cfg.port
+        ));
+    }
 
     // `[[device]]` 群（M3）。`Device::new` は渡されたものをそのまま組む
     // だけなので、設定ファイルの妥当性はここで全部見る。
@@ -201,9 +222,7 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         store_dir: cfg.store,
         iface: cfg.iface,
         attestation: cfg.attestation,
-        // Task 9 wires this to a real config value; for now the device
-        // binds the groupcast socket on an ephemeral port.
-        group_port: 0,
+        group_port: cfg.group_port,
         devices,
     })
     .map_err(|e| format!("failed to start device: {e}"))?;
@@ -214,6 +233,11 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         // Resolves `port == 0` (ephemeral) to the OS-assigned port — the
         // config's literal value would just report back 0 in that case.
         "port": device.local_addr().port(),
+        // `None` when the groupcast socket didn't bind at all (port clash
+        // or bind error — `Device::new` warns and serves unicast-only in
+        // that case); `null` in the JSON, not omitted, so a consumer can
+        // tell "no groupcast" apart from "field missing".
+        "group_port": device.group_local_addr().map(|a| a.port()),
         "store": store.display().to_string(),
     });
     println!("{payload}");
@@ -270,6 +294,34 @@ mod tests {
         assert_eq!(cfg.passcode, 20_202_021);
         assert_eq!(cfg.discriminator, 3840);
         assert_eq!(cfg.iface, "lo");
+    }
+
+    /// `group_port` is optional — an existing `matv.toml` with no
+    /// `group_port` line (like `VALID_BASE`) must still load, and must
+    /// default to 5540 (the Matter groupcast multicast destination port).
+    #[test]
+    fn group_port_defaults_to_5540_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), &valid_config(""));
+        let cfg = load_config(&path).expect("valid config should load");
+        assert_eq!(cfg.group_port, 5540);
+    }
+
+    /// `Device::new` (mat-device) plain-binds the unicast socket and only
+    /// warns + disables groupcast when `port == group_port` — matv rejects
+    /// this combination up front as a config error instead.
+    #[test]
+    fn rejects_port_equal_to_group_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            &valid_config("group_port = 12345\n").replace("port = 0", "port = 12345"),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.contains("port and group_port must differ"),
+            "error should explain the constraint: {err}"
+        );
     }
 
     /// A pure bridge with nothing to bridge is a config mistake, not a
