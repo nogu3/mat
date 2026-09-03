@@ -7,7 +7,9 @@
 //! `SubscribeRequest`, or a new PASE/CASE session, replaces whatever was
 //! there — except a `SubscribeRequest` with no readable path (spec §8.10),
 //! rejected with `INVALID_ACTION`, which leaves any existing subscription
-//! untouched (see `net::runtime`'s `SubscribeOutcome`).
+//! untouched *only* when the request asked `KeepSubscriptions=true`; with
+//! `KeepSubscriptions=false` the existing subscription is torn down before
+//! the refusal, as chip does (see `net::runtime`'s `SubscribeOutcome`).
 //!
 //! Everything here is deliberately I/O-free: `ActiveSubscription` is state
 //! plus arithmetic, so the interval policy (`next_report_deadline`) and the

@@ -614,13 +614,17 @@ pub(crate) struct AclTargetDev {
     pub device_type: Option<u32>,
 }
 
-/// chip `IsValidClusterId`: 下位 16 bit が標準域 0x0000..=0x7FFF か
-/// manufacturer-specific 域 0xFC00..=0xFFFE。
+/// 下位 16 bit が標準域 0x0000..=0x7FFF か manufacturer-specific 域
+/// 0xFC00..=0xFFFE かだけを見る（chip `IsValidClusterId` 相当だが vendor
+/// prefix — 上位 16 bit — は検査しない。chip より緩いのは意図的: この
+/// 緩さはコミッショナー側に安全な方向にしか効かない）。
 fn is_valid_cluster_id(cluster: u32) -> bool {
     matches!(cluster & 0xFFFF, 0x0000..=0x7FFF | 0xFC00..=0xFFFE)
 }
 
-/// chip `IsValidDeviceTypeId`: 下位 16 bit が 0x0000..=0xBFFF。
+/// 下位 16 bit が 0x0000..=0xBFFF かだけを見る（chip `IsValidDeviceTypeId`
+/// 相当だが vendor prefix は検査しない — `is_valid_cluster_id` と同じ理由で
+/// 意図的に緩い）。
 fn is_valid_device_type_id(device_type: u32) -> bool {
     (device_type & 0xFFFF) <= 0xBFFF
 }

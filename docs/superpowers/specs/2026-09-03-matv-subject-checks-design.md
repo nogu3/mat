@@ -132,11 +132,14 @@ im::OPCODE_STATUS_RESPONSE, &im::encode_status_response(im::STATUS_INVALID_ACTIO
 既存購読との関係: 現状 `serve_secured_message` は `**subscription =
 serve_subscribe_request(..)` で、失敗（priming 送信失敗等）も含めて必ず
 置き換える（doc: "this same peer just asked to start over"）。INVALID_ACTION
-拒否は「購読の開始自体が成立しなかった」ので**既存購読を残す**（chip: 拒否
-された SubscribeRequest は既存購読に影響しない）。`serve_subscribe_request` の
-戻りを `enum SubscribeOutcome { Installed(ActiveSubscription), Torn_down,
-Rejected }` にし、`Installed`/`Torn_down`（= 従来の Some/None）は代入、
-`Rejected` は `**subscription` に触らない。
+拒否の扱いは `KeepSubscriptions` 次第（chip: 拒否された SubscribeRequest の
+既存購読への影響は `KeepSubscriptions` が決める — `true` なら既存購読を残す、
+`false` なら chip はパス検証より前に既存購読を破棄するので、拒否理由が
+何であれ既存購読は破棄済み）。`serve_subscribe_request` の戻りを
+`enum SubscribeOutcome { Installed(ActiveSubscription), TornDown, Rejected }`
+にし、`Installed`/`TornDown`（= 従来の Some/None）は代入、`Rejected`
+（= `KeepSubscriptions=true` での拒否）は `**subscription` に触らない。
+`KeepSubscriptions=false` での拒否は `TornDown` を返し、既存購読を破棄する。
 
 ## 5. subscribe: dirty report の 0x7E 非対称の解消
 

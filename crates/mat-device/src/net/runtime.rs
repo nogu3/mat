@@ -1208,8 +1208,10 @@ async fn serve_secured_message(
         // active subscription; failure anywhere in the flow leaves it with
         // none — including tearing down whatever was subscribed before, since
         // this same peer just asked to start over. An up-front `INVALID_ACTION`
-        // refusal is the exception: it leaves the existing subscription alone
-        // (`SubscribeOutcome::Rejected`).
+        // refusal leaves the existing subscription alone only when the request
+        // asked `KeepSubscriptions=true` (`SubscribeOutcome::Rejected`); with
+        // `KeepSubscriptions=false` the old subscription is torn down first,
+        // as chip does (`SubscribeOutcome::TornDown`).
         if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
             match serve_subscribe_request(&msg, session, fabric_index, node).await {
                 SubscribeOutcome::Installed(sub) => **subscription = Some(sub),
@@ -1468,8 +1470,12 @@ enum SubscribeOutcome {
     /// asked to start over and the flow broke, so nothing is subscribed.
     TornDown,
     /// The request was refused up front with `StatusResponse(INVALID_ACTION)`
-    /// (spec §8.10: no readable path) — a refusal, not a restart, so the
-    /// existing subscription (if any) is left alone, as chip does.
+    /// (spec §8.10: no readable path) *and* it asked `KeepSubscriptions=true`
+    /// — a refusal, not a restart, so the existing subscription (if any) is
+    /// left alone, as chip does. A refusal with `KeepSubscriptions=false`
+    /// tears the existing subscription down instead (`TornDown`) — chip
+    /// applies that teardown *before* path validation, so it happens
+    /// regardless of why the request was ultimately refused.
     Rejected,
 }
 
@@ -1481,10 +1487,13 @@ enum SubscribeOutcome {
 /// failed mid-flow, in which case this device simply has no subscription
 /// and the initiator is free to retry from scratch (same
 /// abort-and-let-the-initiator-retry policy `serve_read_request_chunked`
-/// uses for chunked reads); or `Rejected` if the request was refused
-/// up front with `StatusResponse(INVALID_ACTION)` before any of that
-/// flow started, which leaves any existing subscription on this node
-/// untouched.
+/// uses for chunked reads); or, if the request was refused up front with
+/// `StatusResponse(INVALID_ACTION)` before any of that flow started,
+/// `Rejected` when the request asked `KeepSubscriptions=true` (leaves any
+/// existing subscription on this node untouched) or `TornDown` when it
+/// asked `KeepSubscriptions=false` — chip tears down the subscriber's
+/// existing subscriptions *before* path validation, so a refused request
+/// with `KeepSubscriptions=false` still discards them.
 ///
 /// Two ways this differs from a chunked read (both are why priming needs
 /// its own flow rather than reusing `serve_read_request_chunked`): every
@@ -1551,10 +1560,31 @@ async fn serve_subscribe_request(
                 &reply_cfg(),
             )
             .await;
-        if let Err(e) = reply_result {
-            tracing::debug!(exchange_id = msg.proto.exchange_id, error = %e, "INVALID_ACTION StatusResponse not delivered");
+        match &reply_result {
+            Err(e) => {
+                tracing::debug!(exchange_id = msg.proto.exchange_id, error = %e, "INVALID_ACTION StatusResponse not delivered");
+            }
+            Ok(Some(piggybacked)) => {
+                // A peer message piggybacked on the ack — not consumed here
+                // (this refusal has nothing more to do with it), but logged
+                // so it's visibly dropped rather than silently ack-then-lost.
+                tracing::debug!(
+                    exchange_id = piggybacked.proto.exchange_id,
+                    opcode = format_args!("0x{:02X}", piggybacked.proto.opcode),
+                    "INVALID_ACTION StatusResponse ack carried a piggybacked peer message, discarded"
+                );
+            }
+            Ok(None) => {}
         }
-        return SubscribeOutcome::Rejected;
+        // chip tears down the subscriber's existing subscriptions *before*
+        // path validation, so a refusal only leaves them alone when the
+        // request asked KeepSubscriptions=true; KeepSubscriptions=false
+        // discards them here too, as chip does.
+        return if req.keep_subscriptions {
+            SubscribeOutcome::Rejected
+        } else {
+            SubscribeOutcome::TornDown
+        };
     }
 
     let chunks = node.read_chunks(
