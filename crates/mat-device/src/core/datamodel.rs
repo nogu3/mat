@@ -732,8 +732,14 @@ impl Node {
     /// attribute this session may read (ACL included — `read_allowed`,
     /// the same gate `read_entries` applies), while a fully concrete path
     /// always counts (a missing or refused attribute is answered by a
-    /// status entry in the priming report instead). No values are read.
-    /// `false` for an empty `paths`; the caller answers `INVALID_ACTION`.
+    /// status entry in the priming report instead). Values are not read,
+    /// except in one sub-case: a wildcard endpoint/cluster paired with a
+    /// concrete attribute id also needs the value-resolution check
+    /// (`read_attribute_value`, mirroring `expand_attribute`'s concrete-
+    /// attribute branch) — otherwise a nonexistent attribute id would
+    /// count as valid, since every handler's default `read_privilege` lets
+    /// `read_allowed` pass for any id. `false` for an empty `paths`; the
+    /// caller answers `INVALID_ACTION`.
     pub fn has_readable_path(&self, paths: &[AttrPathIn], read_ctx: &ReadCtx) -> bool {
         paths.iter().any(|path| {
             if path.endpoint.is_some() && path.cluster.is_some() && path.attribute.is_some() {
@@ -754,6 +760,9 @@ impl Node {
                         .any(|handler| match path.attribute {
                             Some(attribute) => {
                                 self.read_allowed(&ectx, handler.as_ref(), attribute)
+                                    && self
+                                        .read_attribute_value(&ectx, handler.as_ref(), attribute)
+                                        .is_some()
                             }
                             None => handler
                                 .attributes()
@@ -3196,6 +3205,18 @@ mod tests {
             cluster: Some(0x7FFF),
             attribute: None,
         };
+        // wildcard endpoint + 具体 cluster/attribute: read_allowed だけでは
+        // 存在しない attribute id も通ってしまう罠を塞ぐケア。
+        let wildcard_endpoint_concrete_attr = AttrPathIn {
+            endpoint: None,
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: Some(im::ATTR_ON_OFF),
+        };
+        let wildcard_endpoint_missing_attr = AttrPathIn {
+            endpoint: None,
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: Some(0x7FFF),
+        };
 
         assert!(node.has_readable_path(&[full_wildcard], &allowed));
         assert!(node.has_readable_path(&[onoff_wildcard], &allowed));
@@ -3207,6 +3228,11 @@ mod tests {
         // 1 つでも有効なら全体は有効。
         assert!(node.has_readable_path(&[full_wildcard, concrete], &denied));
         assert!(!node.has_readable_path(&[], &allowed));
+        // wildcard endpoint + 具体 attribute: ACL は同じく効く。
+        assert!(node.has_readable_path(&[wildcard_endpoint_concrete_attr], &allowed));
+        assert!(!node.has_readable_path(&[wildcard_endpoint_concrete_attr], &denied));
+        // 許可 subject でも、存在しない attribute id は値が解決できず無効。
+        assert!(!node.has_readable_path(&[wildcard_endpoint_missing_attr], &allowed));
     }
 
     /// Groups の **mutating** コマンド（AddGroup / RemoveGroup /
