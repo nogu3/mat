@@ -46,6 +46,10 @@ pub enum GroupSettingsError {
         key: String,
         reason: &'static str,
     },
+    /// 撤収対象の group がコントローラ KVS に無い。
+    NotFound {
+        group_id: u16,
+    },
     Kvs(KvsError),
 }
 
@@ -62,6 +66,10 @@ impl std::fmt::Display for GroupSettingsError {
             GroupSettingsError::Corrupt { key, reason } => {
                 write!(f, "group_settings key \"{key}\": {reason}")
             }
+            GroupSettingsError::NotFound { group_id } => write!(
+                f,
+                "group_settings: group {group_id} is not provisioned in the controller kvs"
+            ),
             GroupSettingsError::Kvs(e) => write!(f, "group_settings: {e}"),
         }
     }
@@ -633,25 +641,9 @@ fn write_keymap(
     let max_id = entries.iter().map(|(id, _)| *id).max().unwrap_or(0);
 
     if rebind {
-        if let Some(pos) = entries
-            .iter()
-            .position(|(_, km)| km.group_id == group_id && km.keyset_id == keyset_id)
-        {
-            let (removed_id, removed_km) = entries[pos];
-            txn.remove(&format!("f/{fabric_index}/gk/{removed_id:x}"));
-            if pos == 0 {
-                fabric.first_map = removed_km.next;
-            } else {
-                let (prev_id, mut prev_km) = entries[pos - 1];
-                prev_km.next = removed_km.next;
-                txn.set(
-                    &format!("f/{fabric_index}/gk/{prev_id:x}"),
-                    &prev_km.serialize(),
-                );
-            }
-            fabric.map_count -= 1;
-            entries.remove(pos);
-        }
+        unlink_keymaps_in(txn, fabric_index, fabric, &mut entries, |km| {
+            km.group_id == group_id && km.keyset_id == keyset_id
+        })?;
     }
 
     if entries
@@ -786,6 +778,144 @@ pub fn write_group_provision(
     txn.set(&fkey, &fabric.serialize());
     txn.commit()?;
     Ok(())
+}
+
+/// `entries`（`scan_map` の結果）から `pred` に合う KeyMap を全て外す: レコード
+/// 削除・前ノードの next つなぎ替え・`first_map` / `map_count` 更新。`entries`
+/// も同期して縮める（呼び手が続けて使えるように）。外した KeyMap を返す。
+fn unlink_keymaps_in(
+    txn: &mut KvsTxn,
+    fabric_index: u8,
+    fabric: &mut FabricData,
+    entries: &mut Vec<(u16, KeyMap)>,
+    pred: impl Fn(&KeyMap) -> bool,
+) -> Result<Vec<KeyMap>, GroupSettingsError> {
+    let mut removed = Vec::new();
+    while let Some(pos) = entries.iter().position(|(_, km)| pred(km)) {
+        let (removed_id, removed_km) = entries[pos];
+        txn.remove(&format!("f/{fabric_index}/gk/{removed_id:x}"));
+        if pos == 0 {
+            fabric.first_map = removed_km.next;
+        } else {
+            let (prev_id, mut prev_km) = entries[pos - 1];
+            prev_km.next = removed_km.next;
+            txn.set(
+                &format!("f/{fabric_index}/gk/{prev_id:x}"),
+                &prev_km.serialize(),
+            );
+            entries[pos - 1].1 = prev_km;
+        }
+        fabric.map_count -= 1;
+        entries.remove(pos);
+        removed.push(removed_km);
+    }
+    Ok(removed)
+}
+
+/// KeySetData チェーンから `keyset_id` を外す（前ノードは hash / key を保ったまま
+/// next だけ差し替えて再 serialize）。見つからなければ何もしない。
+fn unlink_keyset(
+    txn: &mut KvsTxn,
+    fabric_index: u8,
+    fabric: &mut FabricData,
+    keyset_id: u16,
+) -> Result<bool, GroupSettingsError> {
+    let chain = scan_keysets(txn, fabric_index, fabric)?;
+    let Some(pos) = chain.iter().position(|(id, _)| *id == keyset_id) else {
+        return Ok(false);
+    };
+    let key = format!("f/{fabric_index}/k/{keyset_id:x}");
+    let removed_next =
+        keyset_next(&chain[pos].1).ok_or_else(|| corrupt(&key, "unparseable KeySetData"))?;
+    txn.remove(&key);
+    if pos == 0 {
+        fabric.first_keyset = removed_next;
+    } else {
+        let (prev_id, prev_blob) = &chain[pos - 1];
+        let prev_key = format!("f/{fabric_index}/k/{prev_id:x}");
+        let (prev_key_bytes, prev_hash) =
+            crate::kvs::parse_keyset_first_entry(prev_blob, fabric_index)
+                .map_err(GroupSettingsError::Kvs)?;
+        let prev_hash = prev_hash.ok_or_else(|| corrupt(&prev_key, "KeySetData missing hash"))?;
+        txn.set(
+            &prev_key,
+            &serialize_keyset(
+                0,
+                EPOCH_START_TIME,
+                prev_hash,
+                &prev_key_bytes,
+                removed_next,
+            ),
+        );
+    }
+    fabric.keyset_count -= 1;
+    Ok(true)
+}
+
+/// [`remove_group`] の結果。KeySet も一緒に外れたかを伝える（CLI の出力用）。
+#[derive(Debug)]
+pub struct RemoveOutcome {
+    pub keyset_removed: bool,
+}
+
+/// `mat group remove` のコントローラ側: GroupData をチェーンから外し、その
+/// group の KeyMap 行を全て外し、参照が無くなった KeySet を外す。1 つの
+/// `KvsTxn` で完結。`g/gfl`（FabricList）は触らない。
+pub fn remove_group(
+    main_ini: &Path,
+    fabric_index: u8,
+    group_id: u16,
+) -> Result<RemoveOutcome, GroupSettingsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    let fkey = format!("f/{fabric_index}/g");
+    let Some(fb) = txn.get(&fkey)? else {
+        return Err(GroupSettingsError::NotFound { group_id });
+    };
+    let mut fabric =
+        parse_fabric_data(&fb).ok_or_else(|| corrupt(&fkey, "unparseable FabricData"))?;
+
+    // 1) GroupData チェーンから外す
+    let groups = scan_groups(&txn, fabric_index, &fabric)?;
+    let pos = groups
+        .iter()
+        .position(|(id, _)| *id == group_id)
+        .ok_or(GroupSettingsError::NotFound { group_id })?;
+    txn.remove(&format!("f/{fabric_index}/g/{group_id:x}"));
+    if pos == 0 {
+        fabric.first_group = groups[pos].1.next;
+    } else {
+        let (prev_id, prev) = &groups[pos - 1];
+        let mut prev = prev.clone();
+        prev.next = groups[pos].1.next;
+        txn.set(
+            &format!("f/{fabric_index}/g/{prev_id:x}"),
+            &prev.serialize(),
+        );
+    }
+    fabric.group_count -= 1;
+
+    // 2) KeyMap 行を外す
+    let mut entries = scan_map(&txn, fabric_index, &fabric)?;
+    let removed = unlink_keymaps_in(&mut txn, fabric_index, &mut fabric, &mut entries, |km| {
+        km.group_id == group_id
+    })?;
+
+    // 3) 参照が無くなった KeySet を外す
+    let mut keyset_removed = false;
+    let mut seen = std::collections::BTreeSet::new();
+    for km in &removed {
+        if !seen.insert(km.keyset_id) {
+            continue;
+        }
+        if entries.iter().any(|(_, m)| m.keyset_id == km.keyset_id) {
+            continue;
+        }
+        keyset_removed |= unlink_keyset(&mut txn, fabric_index, &mut fabric, km.keyset_id)?;
+    }
+
+    txn.set(&fkey, &fabric.serialize());
+    txn.commit()?;
+    Ok(RemoveOutcome { keyset_removed })
 }
 
 #[cfg(test)]
@@ -1100,5 +1230,93 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let err = read_groups(&d.path().join("chip_tool_config.ini"), 2).unwrap_err();
         assert!(matches!(err, GroupSettingsError::Kvs(KvsError::Io(_))));
+    }
+
+    #[test]
+    fn remove_group_unlinks_middle_and_drops_unreferenced_keyset() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 42, false);
+        provision(&p, 2, 7, false);
+        provision(&p, 3, 42, false);
+        let out = remove_group(&p, 2, 2).unwrap();
+        assert!(out.keyset_removed, "keyset 7 は group 2 だけが参照");
+        let t = read_groups(&p, 2).unwrap();
+        let ids: Vec<u16> = t.groups.iter().map(|g| g.group_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(t.keysets.len(), 1);
+        assert_eq!(t.keysets[0].keyset_id, 42);
+        assert_eq!(t.keysets[0].bound_groups, vec![1, 3]);
+        // 再 provision できる（チェーンが壊れていない）。
+        provision(&p, 2, 7, false);
+        assert_eq!(read_groups(&p, 2).unwrap().groups.len(), 3);
+    }
+
+    #[test]
+    fn remove_group_head_and_tail_keep_shared_keyset() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 42, false);
+        provision(&p, 2, 42, false);
+        assert!(
+            !remove_group(&p, 2, 1).unwrap().keyset_removed,
+            "keyset 42 は group 2 が参照中"
+        );
+        assert!(remove_group(&p, 2, 2).unwrap().keyset_removed);
+        let t = read_groups(&p, 2).unwrap();
+        assert!(t.groups.is_empty() && t.keysets.is_empty());
+    }
+
+    #[test]
+    fn remove_group_unknown_is_not_found() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 42, false);
+        assert!(matches!(
+            remove_group(&p, 2, 9).unwrap_err(),
+            GroupSettingsError::NotFound { group_id: 9 }
+        ));
+        // 未 provision（FabricData 無し）も NotFound。
+        let (_d2, p2) = tmp_ini("[Default]\n");
+        assert!(matches!(
+            remove_group(&p2, 2, 1).unwrap_err(),
+            GroupSettingsError::NotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn remove_group_unlinks_middle_keyset_preserving_prev_key_material() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        for (g, ks, epoch) in [(1u16, 10u16, 0x11u8), (2, 20, 0x22), (3, 30, 0x33)] {
+            write_group_provision(
+                &p,
+                2,
+                &CFID,
+                &GroupProvisionWrite {
+                    group_id: g,
+                    keyset_id: ks,
+                    name: "e2e",
+                    epoch_key: [epoch; 16],
+                    rebind: false,
+                },
+            )
+            .unwrap();
+        }
+        // keyset は head 挿入なのでチェーンは 30 → 20 → 10。真ん中の 20 を外す。
+        assert!(remove_group(&p, 2, 2).unwrap().keyset_removed);
+        {
+            let txn = crate::kvs::KvsTxn::open(&p).unwrap();
+            assert!(txn.get("f/2/k/14").unwrap().is_none(), "keyset 20 must go");
+            let fabric = parse_fabric_data(&txn.get("f/2/g").unwrap().unwrap()).unwrap();
+            assert_eq!((fabric.first_keyset, fabric.keyset_count), (30, 2));
+            assert_eq!(
+                keyset_next(&txn.get("f/2/k/1e").unwrap().unwrap()).unwrap(),
+                10,
+                "prev node must skip the removed keyset"
+            );
+        }
+        // 前ノード（30）は next だけ差し替え、鍵素材は無傷。
+        let creds = crate::kvs::read_group_credentials(&p, 2, 3).unwrap();
+        let op = derive_ipk_operational(&[0x33; 16], &CFID);
+        assert_eq!(creds.encryption_key, op);
+        assert_eq!(creds.session_id, derive_group_session_id(&op));
+        assert!(crate::kvs::read_group_credentials(&p, 2, 1).is_ok());
     }
 }

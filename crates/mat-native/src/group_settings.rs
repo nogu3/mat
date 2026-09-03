@@ -47,6 +47,19 @@ pub fn write_group_provision(
     Ok(())
 }
 
+/// `mat group remove` のコントローラ側。戻り値 = KeySet も外したか。
+pub fn remove_group(ctx: &GroupSettingsCtx, group_id: u16) -> Result<bool, MatError> {
+    let out =
+        mat_controller::group_settings::remove_group(&ctx.main_ini, ctx.fabric_index, group_id)
+            .map_err(map_gs_err)?;
+    tracing::info!(
+        group_id,
+        keyset_removed = out.keyset_removed,
+        "group controller state removed (native kvs)"
+    );
+    Ok(out.keyset_removed)
+}
+
 /// GroupSettingsError → ErrorKind。全て hard error（ワイヤ未接触だが KVS は
 /// 触った可能性があるため chip-tool を重ねない）。kind は Other に寄せ、
 /// detail で復旧手段を示す（chip-tool 経路の分類とは厳密一致しない —
@@ -55,6 +68,9 @@ fn map_gs_err(e: GroupSettingsError) -> MatError {
     let detail = match &e {
         GroupSettingsError::DuplicateBind { group_id, keyset_id } => format!(
             "keyset {keyset_id} is already bound to group {group_id} in the controller kvs; use --rebind"
+        ),
+        GroupSettingsError::NotFound { group_id } => format!(
+            "group {group_id} is not provisioned in the controller kvs (see `mat group list`)"
         ),
         GroupSettingsError::Kvs(mat_controller::kvs::KvsError::Locked) => {
             "controller kvs is locked by another process (concurrent provision?)".to_string()
@@ -102,5 +118,18 @@ mod tests {
         let err = write_group_provision(&c, 99, 99, "e2e", &[0x42; 16], false).unwrap_err();
         assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
         assert!(err.detail.contains("locked"), "{}", err.detail);
+    }
+
+    #[test]
+    fn remove_group_reports_keyset_removal_and_maps_unknown_to_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        write_group_provision(&c, 99, 99, "e2e", &[0x42; 16], false).unwrap();
+        assert!(remove_group(&c, 99).unwrap(), "keyset 99 も参照が消える");
+        assert!(mat_controller::kvs::read_group_credentials(&c.main_ini, 2, 99).is_err());
+        // 未知の group は Other + `mat group list` 誘導の detail。
+        let err = remove_group(&c, 99).unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
+        assert!(err.detail.contains("mat group list"), "{}", err.detail);
     }
 }
