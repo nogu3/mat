@@ -536,10 +536,9 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   forever. Reaching `--count` exits `0`; the timeout firing with **zero**
   events received exits `3` (with at least one event received, it still exits
   `0` — same UX as `enl listen`).
-- `mat` connects to `matd`, sends the `listen` request, and prints the ack
-  line followed by one JSON event per line to stdout as they arrive:
+- `mat` connects to `matd`, sends the `listen` request, reads (and discards)
+  the ack line, then prints one JSON event per line to stdout as they arrive:
   ```json
-  {"timestamp":"...","listening":true}
   {"timestamp":"2026-07-20T21:00:00+09:00","node_id":21,"endpoint":1,"cluster":"occupancysensing","attribute":"occupancy","value":1,"priming":false,"recovered":false}
   ```
   `priming: true` marks events from the initial report burst right after

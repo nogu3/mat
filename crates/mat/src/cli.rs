@@ -355,6 +355,11 @@ pub enum Command {
         #[arg(long = "timeout-ms", value_name = "T", default_value_t = 60_000,
               value_parser = clap::value_parser!(u64).range(0..=86_400_000))]
         timeout_ms: u64,
+        /// matd の接続失敗・切断（再起動）で exit 13 せず、backoff（1s→…→30s）
+        /// で再接続してストリームを続ける。`--count` は再接続を跨いで累積、
+        /// `--timeout-ms` は全体を束ねる。stdout にマーカー行は出さない。
+        #[arg(long)]
+        reconnect: bool,
     },
 
     /// ネットワーク診断スナップショット（メッシュ健全性の分析用）。

@@ -536,7 +536,8 @@ fn listen_request_json(
 
 /// `mat listen`: matd へ接続し、ack 後のイベント行をそのまま stdout へ流す。
 /// count/timeout は mat 側制御（enl listen と同じ UX）。matd 不在・応答なし・
-/// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。
+/// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。`--reconnect`
+/// 指定時はその喪失を backoff 再接続で跨ぐ（count 累積・deadline 1 本）。
 pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     let Command::Listen {
         node_id,
@@ -545,6 +546,7 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
         attribute,
         count,
         timeout_ms,
+        reconnect,
     } = command
     else {
         // 内部バグ経路: 非 Listen command が来ても panic しない（v1 Task6 規律）。
@@ -576,6 +578,10 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     };
     let op = listen_request_json(node_num, endpoint_num, cluster, attribute);
 
+    if *reconnect {
+        return run_listen_reconnecting(sockets, &op, *count, *timeout_ms);
+    }
+
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
@@ -598,24 +604,45 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
     }
 }
 
-/// ack → イベント行ループ。戻り値 Ok(exit code) / Err(detail) = matd 落ち扱い。
+/// 従来の単一接続 listen（`--reconnect` 無し）。ack → イベント行ループ。
+/// 戻り値 Ok(exit code) / Err(detail) = matd 落ち扱い。
 fn run_listen_stream(
-    mut stream: UnixStream,
+    stream: UnixStream,
     op: &Value,
     count: u32,
     timeout_ms: u64,
 ) -> Result<ExitCode, String> {
-    use std::time::{Duration, Instant};
+    let deadline = listen_deadline(timeout_ms);
+    let mut received = 0u32;
+    stream_events(BufReader::new(stream), op, count, deadline, &mut received)
+}
+
+/// `--timeout-ms` を締切に変換（0 = 無期限）。
+fn listen_deadline(timeout_ms: u64) -> Option<std::time::Instant> {
+    (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
+}
+
+/// 1 接続分: listen 要求送信 → ack → イベント行ループ。`Ok(code)` = 終端
+/// （count 到達 / timeout / エラー行）、`Err(detail)` = 接続喪失（EOF・read
+/// エラー・非 JSON 行・ack 不正）。`received` は呼び手が再接続を跨いで持つ。
+fn stream_events(
+    mut reader: BufReader<UnixStream>,
+    op: &Value,
+    count: u32,
+    deadline: Option<std::time::Instant>,
+    received: &mut u32,
+) -> Result<ExitCode, String> {
+    use std::time::Instant;
 
     let mut line = serde_json::to_vec(op).map_err(|e| format!("failed to encode request: {e}"))?;
     line.push(b'\n');
-    stream
+    // UnixStream は &mut で write 可（BufReader は読み側だけを包む）。
+    reader
+        .get_mut()
         .write_all(&line)
         .map_err(|e| format!("failed to send listen request to matd: {e}"))?;
 
-    let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
-    let mut reader = BufReader::new(stream);
-    let mut received: u32 = 0;
     let mut first = true; // 1 行目は ack（または即エラー）
 
     loop {
@@ -623,7 +650,7 @@ fn run_listen_stream(
         if let Some(dl) = deadline {
             let remaining = dl.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(finish_on_timeout(received));
+                return Ok(finish_on_timeout(*received));
             }
             reader
                 .get_ref()
@@ -641,7 +668,7 @@ fn run_listen_stream(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Ok(finish_on_timeout(received));
+                return Ok(finish_on_timeout(*received));
             }
             Err(e) => return Err(format!("failed to read from matd: {e}")),
         }
@@ -665,10 +692,61 @@ fn run_listen_stream(
             continue;
         }
         println!("{v}");
-        received += 1;
-        if count > 0 && received >= count {
+        *received += 1;
+        if count > 0 && *received >= count {
             return Ok(ExitCode::SUCCESS);
         }
+    }
+}
+
+/// `--reconnect`: 接続失敗 / 切断を backoff（1s→2s→…→30s 上限、成功でリセット）
+/// で再接続し続ける。deadline は 1 本（再接続待ちも含む）、count は累積。
+fn run_listen_reconnecting(
+    sockets: &[PathBuf],
+    op: &Value,
+    count: u32,
+    timeout_ms: u64,
+) -> ExitCode {
+    use std::time::{Duration, Instant};
+
+    let deadline = listen_deadline(timeout_ms);
+    let mut received = 0u32;
+    let mut backoff = Duration::from_secs(1);
+    let mut attempt: u32 = 0;
+    loop {
+        match connect_candidates(sockets) {
+            Ok((stream, socket)) => {
+                if attempt == 0 {
+                    tracing::info!(socket = %socket.display(), "listening via matd");
+                } else {
+                    tracing::info!(socket = %socket.display(), attempt, "matd reconnected");
+                }
+                backoff = Duration::from_secs(1);
+                match stream_events(BufReader::new(stream), op, count, deadline, &mut received) {
+                    Ok(code) => return code,
+                    Err(detail) => tracing::warn!(error = %detail, "matd lost; reconnecting"),
+                }
+            }
+            Err(detail) => tracing::warn!(error = %detail, "matd unreachable; reconnecting"),
+        }
+        attempt += 1;
+        let wait = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return finish_on_timeout(received);
+                }
+                backoff.min(remaining)
+            }
+            None => backoff,
+        };
+        tracing::warn!(
+            attempt,
+            backoff_ms = wait.as_millis() as u64,
+            "reconnecting to matd"
+        );
+        std::thread::sleep(wait);
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 

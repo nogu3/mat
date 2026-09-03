@@ -196,3 +196,77 @@ fn listen_with_mat_matd_disabled_exits_13() {
         .code(13)
         .stderr(predicate::str::contains("matd_unavailable"));
 }
+
+/// fake matd（複数セッション版）: 接続ごとに (イベント数, hold_ms) を順に
+/// 消費し、各セッションで ack + イベントを流して切る。
+fn spawn_fake_matd_sessions(socket: PathBuf, sessions: Vec<(usize, u64)>) -> JoinHandle<()> {
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        for (events, hold_ms) in sessions {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut req)
+                .unwrap();
+            stream.write_all(ACK.as_bytes()).unwrap();
+            for _ in 0..events {
+                stream.write_all(EVENT.as_bytes()).unwrap();
+            }
+            stream.flush().unwrap();
+            if hold_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            }
+            // drop(stream) = EOF
+        }
+    })
+}
+
+#[test]
+fn listen_reconnect_survives_matd_restart_and_accumulates_count() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    // 1 件流して切る → 再接続後に 1 件流して保持 → count 2 到達で exit 0。
+    let _matd = spawn_fake_matd_sessions(socket.clone(), vec![(1, 0), (1, 3000)]);
+
+    mat_listen(
+        &socket,
+        &["--reconnect", "--count", "2", "--timeout-ms", "10000"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"occupancy\"").count(2))
+    .stderr(predicate::str::contains("reconnecting"));
+}
+
+#[test]
+fn listen_reconnect_waits_for_matd_to_appear() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock");
+    let socket_for_thread = socket.clone();
+    // matd は 1.5 秒遅れて現れる。
+    let starter = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        spawn_fake_matd_sessions(socket_for_thread, vec![(1, 2000)])
+            .join()
+            .unwrap();
+    });
+
+    mat_listen(
+        &socket,
+        &["--reconnect", "--count", "1", "--timeout-ms", "10000"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"occupancy\"").count(1));
+    starter.join().unwrap();
+}
+
+#[test]
+fn listen_reconnect_timeout_without_events_exits_3() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock"); // 誰も bind しない
+    mat_listen(&socket, &["--reconnect", "--timeout-ms", "700"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("timeout"));
+}

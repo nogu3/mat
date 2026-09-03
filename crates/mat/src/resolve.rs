@@ -263,6 +263,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             attribute,
             count,
             timeout_ms,
+            reconnect,
         } => {
             let node = node_id.map(|n| book.resolve_node(&n)).transpose()?;
             let endpoint = match endpoint {
@@ -288,6 +289,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 attribute,
                 count,
                 timeout_ms,
+                reconnect,
             }
         }
         Command::Diag { action } => Command::Diag {
@@ -468,6 +470,7 @@ mod tests {
             attribute: None,
             count: 1,
             timeout_ms: 60_000,
+            reconnect: false,
         };
         match resolve_command(cmd, dir.path()).unwrap() {
             Command::Listen {
@@ -486,6 +489,7 @@ mod tests {
             attribute: None,
             count: 1,
             timeout_ms: 60_000,
+            reconnect: false,
         };
         assert!(resolve_command(cmd, dir.path()).is_err());
     }
