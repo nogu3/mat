@@ -4,8 +4,9 @@
 //! ソケットと join は `GroupSocket`（同ファイル、Task 7）、Node への適用は
 //! `runtime`。応答は送らない（全 drop は `GroupDrop` で理由を返し、runtime が
 //! debug ログにする）。
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -189,14 +190,29 @@ pub fn desired_group_addrs(
         .collect()
 }
 
+/// 失敗した join の再試行間隔（review round 1）: `sync_joins` は毎ループ
+/// 反復（データグラム 1 通・タイマー tick 1 回ごと）呼ばれるので、`lo` の
+/// ような恒久的に join 不可能なインタフェースでは無条件リトライだと
+/// warn ログが同じ頻度で出続けてしまう——1 アドレスあたり高々この間隔に
+/// 1 回だけ試行・warn する。
+pub const JOIN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// groupcast 受信ソケット: `[::]:port`（既定 5540）を SO_REUSEADDR +
-/// SO_REUSEPORT で bind（同ホストの他プロセスと共存）、multicast join は
-/// `sync_joins` で差分管理。`mat_controller::transport::UdpTransport` に
-/// join API が無いので mat-device で直接組む。
+/// SO_REUSEPORT で bind（同ポートを名乗る複数プロセスの共存用——
+/// `DeviceConfig::group_port` の doc 参照。unicast 側には付けられない）、
+/// multicast join は `sync_joins` で差分管理。
+/// `mat_controller::transport::UdpTransport` に join API が無いので
+/// mat-device で直接組む。
 pub struct GroupSocket {
     socket: tokio::net::UdpSocket,
     iface_index: u32,
     joined: HashSet<Ipv6Addr>,
+    /// アドレスごとの直近の join 失敗時刻（`JOIN_RETRY_INTERVAL` 未満は
+    /// 再試行しない）。成功したら消える。
+    failed: HashMap<Ipv6Addr, Instant>,
+    /// 実際に `join_multicast_v6` を呼んだ回数（バックオフでスキップした
+    /// 分は含まない）——テスト用の観測窓。
+    join_attempts: u64,
 }
 
 impl GroupSocket {
@@ -212,6 +228,8 @@ impl GroupSocket {
             socket,
             iface_index,
             joined: HashSet::new(),
+            failed: HashMap::new(),
+            join_attempts: 0,
         })
     }
 
@@ -223,26 +241,46 @@ impl GroupSocket {
         self.socket.recv_from(buf).await
     }
 
-    /// desired との差分だけ join/leave。失敗は warn（`lo` は join 不可 —
-    /// テスト経路）で、成功分だけ `joined` に記録する（失敗分は次回再試行）。
+    /// 実際に join を試行した累計回数（バックオフでスキップした分は
+    /// 含まない）。テストが「同じ desired set で 2 回目は新規試行なし」を
+    /// 確かめるための観測用。
+    #[cfg(test)]
+    pub(crate) fn join_attempts(&self) -> u64 {
+        self.join_attempts
+    }
+
+    /// desired との差分だけ join/leave。直近 `JOIN_RETRY_INTERVAL` 以内に
+    /// 失敗したアドレスは今回の試行をスキップする（`failed` に記録済みの
+    /// まま）——`lo` のような恒久的に join 不可能なインタフェースで、毎
+    /// ループ反復のたびに試行・warn し続けるのを避けるため。成功分は
+    /// `joined` に記録し `failed` から消す（失敗分は `joined` に入れず
+    /// `failed` に残し、次回以降のバックオフ判定に使う）。
     pub fn sync_joins(&mut self, desired: &HashSet<Ipv6Addr>) {
         for addr in desired.difference(&self.joined.clone()) {
+            if let Some(last_failed) = self.failed.get(addr) {
+                if last_failed.elapsed() < JOIN_RETRY_INTERVAL {
+                    continue;
+                }
+            }
+            self.join_attempts += 1;
             match self.socket.join_multicast_v6(addr, self.iface_index) {
                 Ok(()) => {
                     self.joined.insert(*addr);
+                    self.failed.remove(addr);
                     tracing::info!(%addr, iface_index = self.iface_index, "groupcast: joined");
                 }
                 Err(e) => {
+                    self.failed.insert(*addr, Instant::now());
                     tracing::warn!(%addr, iface_index = self.iface_index, error = %e, "groupcast: join failed (will retry)");
                 }
             }
         }
         for addr in self.joined.clone().difference(desired) {
-            if let Err(e) = self.socket.leave_multicast_v6(addr, self.iface_index) {
-                tracing::warn!(%addr, error = %e, "groupcast: leave failed");
+            match self.socket.leave_multicast_v6(addr, self.iface_index) {
+                Ok(()) => tracing::info!(%addr, "groupcast: left"),
+                Err(e) => tracing::warn!(%addr, error = %e, "groupcast: leave failed"),
             }
             self.joined.remove(addr);
-            tracing::info!(%addr, "groupcast: left");
         }
     }
 }
@@ -449,6 +487,57 @@ mod tests {
         let port = a.local_addr().unwrap().port();
         let _b = GroupSocket::bind(port, 1)
             .expect("SO_REUSEPORT lets a second socket bind the same port");
+    }
+
+    /// `DeviceConfig::group_port`'s doc's constraint, pinned directly: a
+    /// plain (non-reuseport) unicast-style socket already sitting on a
+    /// port makes `GroupSocket::bind` on that same port fail — this is
+    /// exactly why `Device::new` refuses `port == group_port` up front
+    /// (review round 1, finding 1) rather than letting the bind race.
+    #[tokio::test]
+    async fn bind_fails_when_a_plain_socket_already_holds_the_port() {
+        let taken = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        assert!(GroupSocket::bind(port, 1).is_err());
+    }
+
+    /// review round 1, finding 2: a failed join is retried at most once
+    /// per `JOIN_RETRY_INTERVAL`, not on every `sync_joins` call — an
+    /// immediate second call with the same desired set makes no new
+    /// attempt, and aging the recorded failure past the interval lets the
+    /// next call retry.
+    ///
+    /// `lo`'s own join behavior turns out to be environment-dependent (it
+    /// lacks `IFF_MULTICAST` per `ip link`, yet some sandboxes' kernels let
+    /// the join through anyway) — bogus (999999) `iface_index` is used
+    /// instead of `lo`'s real one for a join failure that's deterministic
+    /// everywhere (`ENODEV`, "No such device").
+    #[tokio::test]
+    async fn failed_join_is_retried_only_after_the_backoff_interval() {
+        let mut s =
+            GroupSocket::bind(0, 999_999 /* no such interface: join always fails */).unwrap();
+        let addr = mat_controller::group::group_multicast_addr(FABRIC_ID, 10);
+        let mut want = HashSet::new();
+        want.insert(addr);
+
+        s.sync_joins(&want);
+        assert_eq!(s.join_attempts(), 1, "first call always attempts");
+
+        s.sync_joins(&want);
+        assert_eq!(
+            s.join_attempts(),
+            1,
+            "immediate retry within the backoff window makes no new attempt"
+        );
+
+        let backdated = Instant::now() - JOIN_RETRY_INTERVAL - Duration::from_secs(1);
+        *s.failed.get_mut(&addr).expect("recorded as failed") = backdated;
+        s.sync_joins(&want);
+        assert_eq!(
+            s.join_attempts(),
+            2,
+            "past the backoff interval, the address is retried"
+        );
     }
 
     #[test]

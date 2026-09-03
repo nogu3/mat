@@ -105,7 +105,22 @@ pub struct DeviceConfig {
     /// unchanged unless a caller opts into `ChipTest` explicitly.
     pub attestation: AttestationMode,
     /// groupcast 受信ソケットの UDP ポート。Matter の multicast 宛先は
-    /// 5540 固定なので本番は 5540（SO_REUSEPORT で他プロセスと共存）。
+    /// 5540 固定なので本番は 5540。`mat`/`matd` はこのポートに一切 bind
+    /// しない（groupcast 宛には送るだけ）ので、同一ポートを名乗る複数の
+    /// `matv` プロセス間の共存だけが SO_REUSEPORT の対象——`group_port` 自体
+    /// を unicast の `port` と同じ値にするのは NG（下記）。
+    ///
+    /// **`port` は（`group_port == 0` の場合を除き）`group_port` と一致
+    /// させてはならない。** 一致すると group ソケットの bind が
+    /// `EADDRINUSE` で失敗し、groupcast が黙って無効化される
+    /// （`Device::new` が検出して warn を出し、bind そのものを試みない）。
+    /// unicast ソケット側に SO_REUSEPORT を付けて共存させる、という対策は
+    /// **採れない**——Linux の SO_REUSEPORT グループはカーネルが送信元の
+    /// ハッシュで振り分けるため、同じポートに reuseport で 2 ソケットを
+    /// 積むと CASE 等の unicast トラフィックの一部が group ソケット側に
+    /// 誤配送されうる（unicast ソケットは常にただ一つ・reuseport なしの
+    /// まま）。
+    ///
     /// `0` = エフェメラル（統合テストが `group_local_addr` で知る）。
     pub group_port: u16,
     /// M3: Aggregator (EP1) 配下に載せる bridged device 群、設定ファイルの
@@ -414,14 +429,27 @@ impl Device {
             tracing::warn!(iface = %config.iface, error = %e, "groupcast: interface index unknown; joining on the kernel default");
             0
         });
-        let group_socket = match crate::net::group_rx::GroupSocket::bind(
-            config.group_port,
-            iface_index,
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
-                None
+        // `port == group_port` (both nonzero) would make the group bind
+        // race the unicast one for the exact same `[::]:port` — and giving
+        // the *unicast* socket SO_REUSEPORT to dodge that is not a fix
+        // (`DeviceConfig::group_port`'s doc): the kernel would then be free
+        // to hash some unicast (CASE/IM) traffic onto the group socket
+        // instead. So this is refused up front rather than attempting the
+        // bind and letting it fail with a bare `EADDRINUSE`.
+        let group_socket = if config.port != 0 && config.port == config.group_port {
+            tracing::warn!(
+                port = config.port,
+                group_port = config.group_port,
+                "unicast port equals group_port; groupcast disabled — set port to 0 or another value"
+            );
+            None
+        } else {
+            match crate::net::group_rx::GroupSocket::bind(config.group_port, iface_index) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
+                    None
+                }
             }
         };
         let group = crate::net::group_rx::GroupRx {
