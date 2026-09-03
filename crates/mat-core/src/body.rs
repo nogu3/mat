@@ -36,6 +36,34 @@ pub fn read_success(
     })
 }
 
+/// cluster wildcard `read`（`--attribute` 省略）の成功 body。`attributes` は
+/// 属性名（chip-tool 表記、表に無い ID は 10 進文字列）→ 値。list/struct 値も
+/// そのまま載せる。デバイスが持たない属性は返らない（wildcard は per-attribute
+/// status を返さない）。
+pub fn read_cluster_success(
+    node_id: u64,
+    endpoint: u16,
+    cluster_in: &str,
+    cluster: u32,
+    rows: Vec<(u32, Value)>,
+) -> Value {
+    let def = crate::ids::find_cluster(cluster);
+    let mut attrs = serde_json::Map::new();
+    for (id, v) in rows {
+        let key = def
+            .and_then(|d| d.attrs.iter().find(|a| a.id == id))
+            .map(|a| a.name.to_string())
+            .unwrap_or_else(|| id.to_string());
+        attrs.insert(key, v);
+    }
+    json!({
+        "node_id": node_id,
+        "endpoint": endpoint,
+        "cluster": cluster_in,
+        "attributes": Value::Object(attrs),
+    })
+}
+
 /// `write` の成功 body。`value_in` は CLI/プロトコル入力の生文字列 —— read と
 /// 型を揃えるため normalize_value で型推定してから載せる(両経路共通の規則)。
 pub fn write_success(
@@ -614,6 +642,29 @@ mod tests {
             json!({
                 "group_id": 10, "nodes": [5, 6], "updated": [5],
                 "unchanged": [6], "status": "granted",
+            })
+        );
+    }
+
+    #[test]
+    fn read_cluster_success_keys_by_name_and_falls_back_to_decimal_id() {
+        let body = read_cluster_success(
+            5,
+            1,
+            "onoff",
+            0x0006,
+            vec![
+                (0x0000, json!(true)),
+                (0x4001, json!(0)),
+                (0xFFFD, json!(5)),
+                (0x7777, json!(1)),
+            ],
+        );
+        assert_eq!(
+            body,
+            json!({
+                "node_id": 5, "endpoint": 1, "cluster": "onoff",
+                "attributes": { "on-off": true, "on-time": 0, "cluster-revision": 5, "30583": 1 }
             })
         );
     }

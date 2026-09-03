@@ -690,3 +690,19 @@ async fn node_touched_acks_and_flags_health() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn read_without_attribute_returns_attributes_object() {
+    let (_dir, store) = make_store();
+    let (socket, _h) = start_matd_with_fake(store).await;
+    let resp = roundtrip(
+        &socket,
+        &[json!({"op":"read","node_id":1,"endpoint":1,"cluster":"onoff"})],
+    )
+    .await;
+    // FakeConn::read_cluster の既定応答は [(0, true)] → onoff 属性 0 = on-off。
+    assert_eq!(resp[0]["attributes"]["on-off"], true);
+    assert_eq!(resp[0]["cluster"], "onoff");
+    assert!(resp[0].get("attribute").is_none());
+    assert!(resp[0].get("timestamp").is_some());
+}

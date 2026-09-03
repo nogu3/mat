@@ -213,6 +213,14 @@ fn to_op(op: &DeviceOp) -> Result<Value, String> {
                     "op": "read", "node_id": node_id, "endpoint": endpoint,
                     "cluster": cluster_in, "attribute": attribute_in,
                 }),
+                NodeOpKind::ReadCluster {
+                    endpoint,
+                    cluster_in,
+                    ..
+                } => json!({
+                    "op": "read", "node_id": node_id, "endpoint": endpoint,
+                    "cluster": cluster_in,
+                }),
                 NodeOpKind::Write {
                     endpoint,
                     cluster_in,
@@ -1135,6 +1143,15 @@ mod tests {
             err.detail.contains("may have been executed"),
             "detail: {}",
             err.detail
+        );
+    }
+
+    #[test]
+    fn read_cluster_maps_to_read_op_without_attribute_key() {
+        let op = node(1, NodeOpKind::read_cluster(2, "onoff").unwrap());
+        assert_eq!(
+            to_op(&op).unwrap(),
+            json!({"op":"read","node_id":1,"endpoint":2,"cluster":"onoff"})
         );
     }
 }

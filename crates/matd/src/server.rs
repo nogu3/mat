@@ -659,7 +659,13 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             endpoint,
             cluster,
             attribute,
-        } => node(*node_id, NodeOpKind::read(*endpoint, cluster, attribute)?),
+        } => node(
+            *node_id,
+            match attribute {
+                Some(a) => NodeOpKind::read(*endpoint, cluster, a)?,
+                None => NodeOpKind::read_cluster(*endpoint, cluster)?,
+            },
+        ),
         Op::Write {
             node_id,
             endpoint,
@@ -1150,7 +1156,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         })
         .unwrap();
         assert!(
@@ -1188,7 +1194,7 @@ mod tests {
             node_id: 1,
             endpoint: 1,
             cluster: "nosuchcluster".into(),
-            attribute: "x".into(),
+            attribute: Some("x".into()),
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1383,7 +1389,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         let body = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
@@ -1710,7 +1716,7 @@ mod tests {
             node_id: 1,
             endpoint: 1,
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         let err = run_op(&read, &state, &store_path, &health, None)
             .await
@@ -1817,7 +1823,7 @@ mod tests {
                 node_id: 5,
                 endpoint: 1,
                 cluster: "onoff".into(),
-                attribute: "on-off".into(),
+                attribute: Some("on-off".into()),
             },
             &state,
             dir.path(),
@@ -1930,7 +1936,7 @@ mod tests {
             node_id: 5,
             endpoint: 1,
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         assert_eq!(op_report_expectation(&read, Some(&f), None), None);
     }

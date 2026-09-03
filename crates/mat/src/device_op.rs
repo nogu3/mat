@@ -95,7 +95,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             attribute,
         } => node(
             node_id,
-            NodeOpKind::read(endpoint.id()?, cluster, attribute)?,
+            match attribute {
+                Some(a) => NodeOpKind::read(endpoint.id()?, cluster, a)?,
+                None => NodeOpKind::read_cluster(endpoint.id()?, cluster)?,
+            },
         ),
         Command::Write {
             node_id,
@@ -308,7 +311,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         assert!(matches!(
             node_op(&read).kind,
@@ -322,7 +325,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "0x0008".into(),
-            attribute: "0".into(),
+            attribute: Some("0".into()),
         };
         assert!(matches!(node_op(&byid).kind, NodeOpKind::Read { .. }));
         // 未知名は parse_error（旧 classify None → unresolved_op_error と同じ kind）。
@@ -330,7 +333,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "nosuchcluster".into(),
-            attribute: "x".into(),
+            attribute: Some("x".into()),
         };
         let err = classify(&unknown).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -683,5 +686,23 @@ mod tests {
         })
         .budget_applies());
         assert!(!DeviceOp::GroupBump.budget_applies());
+    }
+
+    #[test]
+    fn read_without_attribute_is_read_cluster() {
+        let c = Command::Read {
+            node_id: NodeRef::Id(5),
+            endpoint: EndpointRef::Id(1),
+            cluster: "onoff".into(),
+            attribute: None,
+        };
+        assert!(matches!(
+            node_op(&c).kind,
+            NodeOpKind::ReadCluster {
+                endpoint: 1,
+                cluster: 0x0006,
+                ..
+            }
+        ));
     }
 }

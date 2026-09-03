@@ -26,12 +26,13 @@ pub struct Request {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    /// 属性を読む。
+    /// 属性を読む。`attribute` 省略 = cluster wildcard read。
     Read {
         node_id: u64,
         endpoint: u16,
         cluster: String,
-        attribute: String,
+        #[serde(default)]
+        attribute: Option<String>,
     },
     /// 書き込み可能属性を設定する。
     Write {
@@ -309,8 +310,8 @@ impl Op {
         match self {
             Op::Read {
                 cluster, attribute, ..
-            }
-            | Op::Write {
+            } => Some(format!("{cluster}/{}", attribute.as_deref().unwrap_or("*"))),
+            Op::Write {
                 cluster, attribute, ..
             } => Some(format!("{cluster}/{attribute}")),
             Op::Invoke {
@@ -688,5 +689,20 @@ mod tests {
         assert_eq!(r.op.endpoint(), None);
         assert_eq!(r.op.log_path(), None);
         assert_eq!(r.op.name(), "status");
+    }
+
+    #[test]
+    fn read_without_attribute_parses_as_wildcard() {
+        let req: Request =
+            serde_json::from_str(r#"{"op":"read","node_id":1,"endpoint":1,"cluster":"onoff"}"#)
+                .unwrap();
+        assert!(matches!(
+            req.op,
+            Op::Read {
+                attribute: None,
+                ..
+            }
+        ));
+        assert_eq!(req.op.log_path().as_deref(), Some("onoff/*"));
     }
 }

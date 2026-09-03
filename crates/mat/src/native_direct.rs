@@ -494,7 +494,7 @@ mod tests {
             node_id: NodeRef::Id(5),
             endpoint: EndpointRef::Id(1),
             cluster: "levelcontrol".into(),
-            attribute: "current-level".into(),
+            attribute: Some("current-level".into()),
         };
         let Dispatch::Device(op) = classify(&read).unwrap() else {
             panic!("device op")

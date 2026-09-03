@@ -85,6 +85,12 @@ pub enum NodeOpKind {
         cluster: u32,
         attribute: u32,
     },
+    /// cluster 内の全属性を wildcard read（`--attribute` 省略）。
+    ReadCluster {
+        endpoint: u16,
+        cluster_in: String,
+        cluster: u32,
+    },
     Write {
         endpoint: u16,
         cluster_in: String,
@@ -158,6 +164,16 @@ impl NodeOpKind {
             attribute_in: attribute_in.to_string(),
             cluster,
             attribute: attr.id,
+        })
+    }
+
+    /// cluster 名（または数値 ID）だけを解決する wildcard read。
+    pub fn read_cluster(endpoint: u16, cluster_in: &str) -> Result<Self, MatError> {
+        let cluster = ids::resolve_cluster(cluster_in).ok_or_else(MatError::unresolved_op)?;
+        Ok(NodeOpKind::ReadCluster {
+            endpoint,
+            cluster_in: cluster_in.to_string(),
+            cluster,
         })
     }
 
@@ -251,6 +267,7 @@ impl NodeOpKind {
             NodeOpKind::ColorTemp { .. } => "color_temp",
             NodeOpKind::Level { .. } => "level",
             NodeOpKind::Read { .. } => "read",
+            NodeOpKind::ReadCluster { .. } => "read_cluster",
             NodeOpKind::Write { .. } => "write",
             NodeOpKind::Invoke { .. } => "invoke",
             NodeOpKind::Describe => "describe",
@@ -454,6 +471,14 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
                 conn.read_json(*endpoint, *cluster, *attribute).await?
             };
             body::read_success(node_id, *endpoint, cluster_in, attribute_in, v)
+        }
+        NodeOpKind::ReadCluster {
+            endpoint,
+            cluster_in,
+            cluster,
+        } => {
+            let rows = conn.read_cluster(*endpoint, *cluster).await?;
+            body::read_cluster_success(node_id, *endpoint, cluster_in, *cluster, rows)
         }
         NodeOpKind::Write {
             endpoint,
@@ -1278,5 +1303,30 @@ mod tests {
             counter_path.exists(),
             "counter file must be created/advanced by bump"
         );
+    }
+
+    #[tokio::test]
+    async fn read_cluster_maps_rows_to_attributes_object() {
+        let mut conn = FakeConn::scripted().with_cluster(
+            1,
+            0x0006,
+            vec![
+                (0x0000, serde_json::json!(true)),
+                (0x4000, serde_json::json!(false)),
+            ],
+        );
+        let k = NodeOpKind::read_cluster(1, "onoff").unwrap();
+        assert_eq!(k.name(), "read_cluster");
+        let body = run_node_op(&mut conn, &node(k)).await.unwrap();
+        assert_eq!(body["cluster"], "onoff");
+        assert_eq!(body["attributes"]["on-off"], true);
+        assert_eq!(body["attributes"]["global-scene-control"], false);
+        assert!(body.get("attribute").is_none());
+    }
+
+    #[test]
+    fn read_cluster_unknown_name_is_unresolved_op() {
+        let err = NodeOpKind::read_cluster(1, "nosuchcluster").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
     }
 }

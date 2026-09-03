@@ -376,7 +376,7 @@ mod tests {
             node_id: NodeRef::Alias("living-light".into()),
             endpoint: EndpointRef::Alias("night".into()),
             cluster: "onoff".into(),
-            attribute: "on-off".into(),
+            attribute: Some("on-off".into()),
         };
         let resolved = resolve_command(cmd, dir.path()).unwrap();
         match resolved {

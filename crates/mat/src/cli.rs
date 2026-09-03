@@ -144,6 +144,8 @@ pub enum Command {
     },
 
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
+    /// `--attribute` 省略時は cluster 内の全属性を読み
+    /// `{ node_id, endpoint, cluster, attributes, timestamp }`。
     Read {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
@@ -154,9 +156,10 @@ pub enum Command {
         /// クラスタ名（chip-tool 表記、例: `onoff` / `levelcontrol`）。
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: String,
-        /// 属性名（chip-tool 表記、例: `on-off` / `current-level`）。
+        /// 属性名（chip-tool 表記、例: `on-off` / `current-level`）。省略すると
+        /// cluster 内の全属性を wildcard read し `attributes` オブジェクトで返す。
         #[arg(short = 'a', long, value_name = "NAME")]
-        attribute: String,
+        attribute: Option<String>,
     },
 
     /// 書き込み可能属性を設定する。
