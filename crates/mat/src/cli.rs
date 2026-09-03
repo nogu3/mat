@@ -30,8 +30,12 @@ pub struct Cli {
     /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
     /// `MAT_MATD_SOCKET` は socket パスの指定のみで経路は変えない。
-    /// matd 対応は read/write/invoke/on/off/color-temp/color/level/describe/group のみ
-    /// （discover/commission/open-window/diag/fabric は常に直経路; fabric 以外は本フラグ明示時は exit 2）。
+    /// matd 対応は read/write/invoke/on/off/color-temp/color/level/describe/
+    /// group provision・invoke・bump のみ。
+    /// discover/commission/unpair/open-window/diag/group grant/group remove は
+    /// 常に直経路で、本フラグ明示時は exit 2。
+    /// fabric init/fabric list/group list は KVS 読み書きだけのローカル完結処理で、
+    /// 経路解決より前に実行される（本フラグは無視されエラーにならない）。
     #[arg(long, global = true, value_name = "SOCK", num_args = 0..=1)]
     pub matd: Option<Option<PathBuf>>,
 
