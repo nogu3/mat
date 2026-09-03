@@ -563,6 +563,15 @@ fn tlv_element_to_json(r: &mut Reader, first: Element) -> Result<serde_json::Val
     tlv_element_to_json_impl(r, first, 0)
 }
 
+/// 1 要素の well-formed TLV（container 可）を JSON へ。`tlv_element_to_json` の
+/// 公開入口 — 汎用 write の値ツリー符号化が read 側の JSON 化と同形になることを
+/// mat-native のテストで固定するために使う。
+pub fn tlv_to_json(tlv: &[u8]) -> Result<serde_json::Value, ImError> {
+    let mut r = Reader::new(tlv);
+    let first = r.next()?.ok_or(ImError::Malformed("empty tlv"))?;
+    tlv_element_to_json(&mut r, first)
+}
+
 fn tlv_element_to_json_impl(
     r: &mut Reader,
     first: Element,

@@ -26,6 +26,13 @@ pub struct DiscoveredDevice {
 /// chip-tool の生テキスト値（または write の CLI 入力値）を `mat` の JSON 値へ
 /// 正規化する。read と write で同じ型付けを使い、出力 value の型を一貫させる。
 pub fn normalize_value(raw: &str) -> serde_json::Value {
+    // 汎用 write の list/struct 値（JSON）はそのまま JSON として返す。
+    let t = raw.trim_start();
+    if t.starts_with('[') || t.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            return v;
+        }
+    }
     // 文字列リテラル。実機 chip-tool は文字列に長さ注釈を付ける
     // （`"ha-thread-6562" (14 chars)`）ため、最初の閉じ引用符までを値とし、後続注釈は
     // 捨てる。注釈なし（`"living room"`）も同じ経路で通る。
@@ -56,4 +63,26 @@ pub fn normalize_value(raw: &str) -> serde_json::Value {
         }
     }
     serde_json::Value::String(raw.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_value_parses_json_containers() {
+        assert_eq!(
+            normalize_value(r#"[{"1":5,"2":2}]"#),
+            serde_json::json!([{"1":5,"2":2}])
+        );
+        assert_eq!(
+            normalize_value("{\"a\": [1, 2]}"),
+            serde_json::json!({"a":[1,2]})
+        );
+        // JSON でなければ従来どおり文字列。
+        assert_eq!(
+            normalize_value("[oops"),
+            serde_json::Value::String("[oops".into())
+        );
+    }
 }

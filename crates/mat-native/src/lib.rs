@@ -1026,6 +1026,104 @@ mod tests {
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::F64(f) if f == 0.5
         ));
+
+        assert_eq!(scalar_to_im(&S::List(vec![])), None);
+    }
+
+    #[test]
+    fn put_value_encodes_list_of_struct_as_tlv_array_and_roundtrips_to_read_json() {
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
+        let v = parse_value_typed(
+            r#"[{"privilege":5,"auth-mode":2,"subjects":[112233],"targets":null,"fabric-index":1}]"#,
+            &ty,
+        )
+        .unwrap();
+        let tlv = scalar_to_tlv(&v);
+        // 先頭要素は TLV Array（0x16、anonymous）。
+        assert_eq!(tlv[0], 0x16);
+        // read 側の JSON 化（番号キー）に戻ると同じ内容。
+        let j = mat_controller::im::tlv_to_json(&tlv).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!([{"1":5,"2":2,"3":[112233],"4":null,"254":1}])
+        );
+    }
+
+    #[test]
+    fn generic_acl_encoding_matches_dedicated_encoder() {
+        use mat_core::acl::{AclEntry, AclTarget};
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let entries = vec![
+            AclEntry {
+                privilege: 5,
+                auth_mode: 2,
+                subjects: vec![112233, 0x1122],
+                targets: None,
+                fabric_index: 1,
+            },
+            AclEntry {
+                privilege: 3,
+                auth_mode: 3,
+                subjects: vec![0xFFFF_FFFF_FFFF_0001],
+                targets: Some(vec![AclTarget {
+                    cluster: Some(6),
+                    endpoint: None,
+                    device_type: None,
+                }]),
+                fabric_index: 1,
+            },
+        ];
+        let dedicated = crate::ops::encode_acl_entries_tlv(&entries);
+        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
+        let generic = scalar_to_tlv(
+            &parse_value_typed(
+                r#"[
+                  {"privilege":5,"auth-mode":2,"subjects":[112233,4386],"targets":null,"fabric-index":1},
+                  {"privilege":3,"auth-mode":3,"subjects":["0xFFFFFFFFFFFF0001"],
+                   "targets":[{"cluster":6,"endpoint":null,"device-type":null}],"fabric-index":1}
+                ]"#,
+                &ty,
+            )
+            .unwrap(),
+        );
+        assert_eq!(generic, dedicated);
+    }
+
+    #[test]
+    fn generic_group_key_map_encoding_matches_dedicated_encoder() {
+        use mat_core::ids::{parse_value_typed, resolve_attribute};
+        let dedicated = mat_controller::im::encode_group_key_map_tlv(&[(1, 2), (0x0101, 7)]);
+        let ty = resolve_attribute(0x003F, "group-key-map")
+            .unwrap()
+            .def
+            .unwrap()
+            .ty;
+        let generic = scalar_to_tlv(
+            &parse_value_typed(
+                r#"[{"group-id":1,"group-key-set-id":2},{"1":257,"2":7}]"#,
+                &ty,
+            )
+            .unwrap(),
+        );
+        assert_eq!(generic, dedicated);
+    }
+
+    #[test]
+    fn generic_key_set_write_encoding_matches_dedicated_encoder() {
+        use mat_core::ids::{classify_invoke, InvokeClass};
+        let key: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let dedicated = mat_controller::im::encode_key_set_write_fields(1, &key);
+        let j = r#"{"group-key-set-id":1,"group-key-security-policy":0,"epoch-key0":"hex:00112233445566778899aabbccddeeff","epoch-start-time0":1,"epoch-key1":null,"epoch-start-time1":null,"epoch-key2":null,"epoch-start-time2":null}"#;
+        let InvokeClass::Native { fields, .. } =
+            classify_invoke("groupkeymanagement", "key-set-write", &[j.into()])
+        else {
+            panic!("expected Native");
+        };
+        assert_eq!(encode_command_fields(&fields), dedicated);
     }
 
     #[test]

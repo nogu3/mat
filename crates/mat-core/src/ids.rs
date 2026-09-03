@@ -223,16 +223,19 @@ fn json_to_value(j: &serde_json::Value, ty: &Ty, at: &str) -> Result<ScalarValue
         Ty::Struct(def) => {
             let obj = j
                 .as_object()
-                .ok_or_else(|| format!("{at}: expected a JSON object ({})", def.name))?;
+                .ok_or_else(|| format!("{at}: expected a JSON object ({}), got {j}", def.name))?;
             json_struct(obj, def, at)
         }
     }
 }
 
 fn json_list(j: &serde_json::Value, elem: &Ty, at: &str) -> Result<ScalarValue, String> {
-    let arr = j
-        .as_array()
-        .ok_or_else(|| format!("{at}: expected a JSON array (list of {})", elem.describe()))?;
+    let arr = j.as_array().ok_or_else(|| {
+        format!(
+            "{at}: expected a JSON array (list of {}), got {j}",
+            elem.describe()
+        )
+    })?;
     arr.iter()
         .enumerate()
         .map(|(i, e)| json_to_value(e, elem, &format!("{at}[{i}]")))
@@ -513,8 +516,8 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
         // から型推定してスカラー化する（推定は失敗しない）。timed は定義が
         // 無いので false 固定 — 上書きしたい場合の CLI フラグは未提供。
         None => {
-            let what = format!("invoke {cluster}/{command}");
-            for a in args {
+            for (i, a) in args.iter().enumerate() {
+                let what = format!("invoke {cluster}/{command} arg {i}");
                 if let Some(msg) = reject_container_literal(&what, a) {
                     return InvokeClass::Reject(msg);
                 }

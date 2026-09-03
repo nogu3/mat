@@ -1216,7 +1216,11 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(err.detail.contains("list"), "{}", err.detail);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
     }
 
     #[test]
@@ -1393,7 +1397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_write_rejects_list_type_with_parse_error() {
+    async fn native_write_rejects_bad_json_shape_with_parse_error() {
         let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
         let state = NativeState::Ready(Box::new(native));
         let health = SubHealth::new(None);
@@ -1408,6 +1412,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(
+            err.detail.contains("expected a JSON array"),
+            "{}",
+            err.detail
+        );
     }
 
     #[tokio::test]
