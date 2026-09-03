@@ -75,7 +75,7 @@ tasks:
       - bash scripts/e2e-m8c3-real.sh
 
   e2e:device:m1:
-    desc: "M1 自己コミッショニング E2E: 実 mat commission が matv バイナリに成功する（要: 実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
+    desc: "M1 自己コミッショニング E2E: 実 mat commission が matv バイナリに成功する → mat unpair で fabric/台帳から撤去（要: 実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
     cmds:
       - bash scripts/e2e-device-m1.sh
 
@@ -85,7 +85,7 @@ tasks:
       - bash scripts/e2e-device-m2-chip.sh
 
   e2e:device:m3:
-    desc: "M3 matd×matv 回帰 E2E: mat group provision → 常駐 matd が matv を Subscribe → mat listen が on-off イベントを受信（要: 実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
+    desc: "M3 matd×matv 回帰 E2E: mat group provision → mat group list で KVS 確認 → 常駐 matd が matv を Subscribe → mat listen が on-off イベントを受信（要: 実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
     cmds:
       - bash scripts/e2e-device-m3.sh
 

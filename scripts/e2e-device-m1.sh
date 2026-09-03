@@ -8,7 +8,12 @@
 # background against a generated `matv.toml`, capturing its single stdout
 # JSON line -> `mat fabric init` into a throwaway store -> `mat commission
 # --setup-code <qr> --node 1` against the running device, discovered over
-# real mDNS -> assert the command's stdout JSON has `"status":"success"`.
+# real mDNS -> assert the command's stdout JSON has `"status":"success"` ->
+# `mat unpair --node 1` (RemoveFabric + ledger delete), asserting matv logs
+# the fabric removal and the unpaired node is gone from the ledger (`mat
+# read` exits 11). Re-commissioning is deliberately NOT asserted: matv does
+# not return to a commissionable state after losing its last fabric — see
+# the long comment at the unpair step.
 #
 # Env:
 #   MAT_E2E_IFACE   interface both the device's mDNS advertiser and `mat
@@ -141,3 +146,58 @@ STATUS="$(json_get status "$COMMISSION_JSON")"
 [[ "$STATUS" == "success" ]]
 
 echo "==> PASS: mat commission reached status=success" >&2
+
+echo "==> mat unpair --node 1 (RemoveFabric + ledger delete)" >&2
+UNPAIR_JSON="$(
+    MAT_STORE="$MAT_STORE_DIR" \
+        timeout "${TIMEOUT_S}s" ./target/release/mat --iface "$IFACE" unpair --node 1
+)"
+echo "$UNPAIR_JSON"
+# device.removed / ledger.removed はネストしているので python3 で読む
+# (json_get はフラットなトップレベル鍵しか扱えない)。
+UNPAIR_OK="$(printf '%s' "$UNPAIR_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("yes" if d["device"]["removed"] is True and d["ledger"]["removed"] is True else "no")
+')"
+[[ "$UNPAIR_OK" == "yes" ]]
+
+# デバイス側でも fabric が消えたことは matv のログで確認する。
+#
+# 「同じ setup code で再 commission できる」という確認は**できない**:
+# matv は最後の fabric を RemoveFabric で失っても commissionable な状態には
+# 戻らない（factory reset 相当ではない）。commissioning window は
+# `CommissioningComplete` 成功時点で閉じ（`net/runtime.rs` の
+# 「CommissioningComplete success: stop advertising commissionable」ブロック:
+# `**window = CommissioningWindow::Closed` + `set_commissionable(None)`）、
+# RemoveFabric 側の後始末（同ファイル `take_removed_fabric` ブロック）は
+# operational advert の撤去とセッション破棄だけで window には触れない。
+# PASE は `admit_unsecured` が `window_open` で門番しているので、window が
+# 閉じたままの matv は新しい PASE を黙って落とす。窓を開け直せるのは
+# Administrator Commissioning の OpenCommissioningWindow（＝生きた fabric の
+# admin セッションが必要）だけで、最後の fabric を消した後には残っていない。
+echo "==> checking matv logged the fabric removal" >&2
+FABRIC_REMOVED=""
+for _ in $(seq 1 30); do
+    if grep -q "fabric removed\|RemoveFabric" "$DEVICE_STDERR" 2>/dev/null; then
+        FABRIC_REMOVED=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ -z "$FABRIC_REMOVED" ]]; then
+    echo "matv never logged the RemoveFabric:" >&2
+    cat "$DEVICE_STDERR" >&2
+    exit 1
+fi
+grep -m1 "fabric removed\|RemoveFabric" "$DEVICE_STDERR" >&2
+
+# 台帳から消えた: read は node_not_commissioned（exit 11）。
+set +e
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" \
+    read --node 1 --cluster onoff --attribute on-off >/dev/null 2>&1
+READ_EXIT=$?
+set -e
+[[ "$READ_EXIT" -eq 11 ]]
+
+echo "==> PASS: mat unpair removed the fabric from matv (logged) and node 1 from the ledger (read -> exit 11)" >&2
