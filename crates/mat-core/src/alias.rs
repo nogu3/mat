@@ -349,6 +349,42 @@ impl AliasBook {
     ) -> Result<(), MatError> {
         self.validate_new_node_alias(name)?;
         self.file.nodes.insert(name.to_string(), node_id);
+        self.save(store_root)
+    }
+
+    /// `node_id` を指す node alias（複数可）とその配下の `[endpoints.<alias>]`、
+    /// および数字キー `[endpoints.<node_id>]` を削除して保存する。返り値は消した
+    /// node alias 名（BTreeMap 順）。aliases.toml が無ければ何もしない（absent-file
+    /// 規律 — ファイルを作らない）。何も消えなければ書き込みもしない。
+    pub fn remove_node(
+        &mut self,
+        node_id: u64,
+        store_root: &Path,
+    ) -> Result<Vec<String>, MatError> {
+        if !self.present {
+            return Ok(Vec::new());
+        }
+        let names: Vec<String> = self
+            .file
+            .nodes
+            .iter()
+            .filter(|(_, &v)| v == node_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut changed = false;
+        for n in &names {
+            self.file.nodes.remove(n);
+            changed |= self.file.endpoints.remove(n).is_some();
+        }
+        changed |= self.file.endpoints.remove(&node_id.to_string()).is_some();
+        if !names.is_empty() || changed {
+            self.save(store_root)?;
+        }
+        Ok(names)
+    }
+
+    /// aliases.toml を原子的に書き戻す。
+    fn save(&mut self, store_root: &Path) -> Result<(), MatError> {
         let path = store_root.join(ALIASES_FILE);
         let text = toml::to_string_pretty(&self.file).map_err(|e| {
             MatError::new(ErrorKind::Other, format!("cannot serialize aliases: {e}"))
@@ -591,6 +627,59 @@ mod tests {
             book.resolve_node(&NodeRef::Alias("living-light".into()))
                 .unwrap(),
             5
+        );
+    }
+
+    #[test]
+    fn remove_node_drops_alias_and_its_endpoint_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let mut book = AliasBook::load(dir.path()).unwrap();
+        let removed = book.remove_node(5, dir.path()).unwrap();
+        assert_eq!(removed, vec!["living-light".to_string()]);
+        let reloaded = AliasBook::load(dir.path()).unwrap();
+        assert!(reloaded
+            .resolve_node(&NodeRef::Alias("living-light".into()))
+            .is_err());
+        assert!(reloaded
+            .resolve_endpoint(5, &EndpointRef::Alias("main".into()))
+            .is_err());
+        // 他ノードは無傷。
+        assert_eq!(
+            reloaded
+                .resolve_node(&NodeRef::Alias("hall-sensor".into()))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            reloaded
+                .resolve_endpoint(12, &EndpointRef::Alias("pir".into()))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn remove_node_drops_numeric_endpoint_section_too() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aliases(dir.path(), SAMPLE);
+        let mut book = AliasBook::load(dir.path()).unwrap();
+        let removed = book.remove_node(12, dir.path()).unwrap();
+        assert_eq!(removed, vec!["hall-sensor".to_string()]);
+        let reloaded = AliasBook::load(dir.path()).unwrap();
+        assert!(reloaded
+            .resolve_endpoint(12, &EndpointRef::Alias("pir".into()))
+            .is_err());
+    }
+
+    #[test]
+    fn remove_node_without_aliases_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = AliasBook::load(dir.path()).unwrap();
+        assert!(book.remove_node(5, dir.path()).unwrap().is_empty());
+        assert!(
+            !dir.path().join(ALIASES_FILE).exists(),
+            "ファイルを作らない"
         );
     }
 

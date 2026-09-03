@@ -152,6 +152,16 @@ impl Store {
         self.ledger.nodes.insert(record.node_id, record);
         self.save_ledger()
     }
+
+    /// ノードを台帳から削除して永続化する。無ければ `Ok(false)`（ファイルは
+    /// 触らない）。`mat unpair` が使う唯一の削除経路。
+    pub fn remove_node(&mut self, node_id: u64) -> Result<bool, MatError> {
+        if self.ledger.nodes.remove(&node_id).is_none() {
+            return Ok(false);
+        }
+        self.save_ledger()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +234,28 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(dir.path().join("nodes.json")).unwrap();
         assert!(!text.contains("address"));
+    }
+
+    #[test]
+    fn remove_node_deletes_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_init(dir.path()).unwrap();
+        for id in [5u64, 6u64] {
+            store
+                .upsert_node(NodeRecord {
+                    node_id: id,
+                    commissioned_at: "2026-01-01T00:00:00+09:00".into(),
+                })
+                .unwrap();
+        }
+        assert!(store.remove_node(5).unwrap());
+        assert!(!store.remove_node(5).unwrap(), "2 回目は無いので false");
+        let reopened = Store::open(dir.path()).unwrap();
+        let ids: Vec<u64> = reopened.nodes().map(|n| n.node_id).collect();
+        assert_eq!(ids, vec![6]);
+        assert_eq!(
+            reopened.require_node(5).unwrap_err().kind,
+            ErrorKind::NodeNotCommissioned
+        );
     }
 }
