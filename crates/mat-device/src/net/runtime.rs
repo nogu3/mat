@@ -1207,9 +1207,15 @@ async fn serve_secured_message(
         // one reply through `Node::handle_im`. Success installs the node's one
         // active subscription; failure anywhere in the flow leaves it with
         // none — including tearing down whatever was subscribed before, since
-        // this same peer just asked to start over.
+        // this same peer just asked to start over. An up-front `INVALID_ACTION`
+        // refusal is the exception: it leaves the existing subscription alone
+        // (`SubscribeOutcome::Rejected`).
         if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
-            **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
+            match serve_subscribe_request(&msg, session, fabric_index, node).await {
+                SubscribeOutcome::Installed(sub) => **subscription = Some(sub),
+                SubscribeOutcome::TornDown => **subscription = None,
+                SubscribeOutcome::Rejected => {}
+            }
             return ServeOutcome::Continue;
         }
 
@@ -1453,6 +1459,20 @@ async fn subscription_deadline(subscription: &Option<ActiveSubscription>) {
     }
 }
 
+/// What `serve_subscribe_request` did to the node's single subscription slot.
+enum SubscribeOutcome {
+    /// A new subscription is live (replaces whatever was there).
+    Installed(ActiveSubscription),
+    /// The request was accepted but the interaction failed partway
+    /// (undecodable request, priming send failure, missing ack) — the peer
+    /// asked to start over and the flow broke, so nothing is subscribed.
+    TornDown,
+    /// The request was refused up front with `StatusResponse(INVALID_ACTION)`
+    /// (spec §8.10: no readable path) — a refusal, not a restart, so the
+    /// existing subscription (if any) is left alone, as chip does.
+    Rejected,
+}
+
 /// Serves one `SubscribeRequest` end to end (spec §8.10): priming
 /// ReportData (chunked, each chunk acknowledged with `StatusResponse(0)`
 /// by the initiator) followed by a `SubscribeResponse`, all on the
@@ -1477,13 +1497,13 @@ async fn serve_subscribe_request(
     session: &mut SecureSession,
     fabric_index: u8,
     node: &mut Node,
-) -> Option<ActiveSubscription> {
+) -> SubscribeOutcome {
     let Ok(req) = im::decode_subscribe_request(&msg.payload) else {
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             "SubscribeRequest dropped: undecodable"
         );
-        return None;
+        return SubscribeOutcome::TornDown;
     };
     let subscription_id = random_subscription_id();
     // The device picks the MaxInterval it can actually honor, at or below
@@ -1503,6 +1523,36 @@ async fn serve_subscribe_request(
         fabric_filtered: req.fabric_filtered,
         subject: session_subject(session),
     };
+
+    // spec §8.10 / chip `ParseAttributePaths`: a request none of whose
+    // paths can yield anything this subject may read is refused outright
+    // rather than answered with an empty priming report and a dead
+    // subscription. (Concrete paths always count — their refusal shows up
+    // as a status entry in the priming report; see
+    // `Node::has_readable_path`.)
+    if !node.has_readable_path(&req.paths, &read_ctx) {
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            paths = ?req.paths,
+            subject = ?read_ctx.subject,
+            fabric_index,
+            "SubscribeRequest rejected: no readable attribute path (INVALID_ACTION)"
+        );
+        let reply_result = session
+            .reply_reliable(
+                msg,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                im::OPCODE_STATUS_RESPONSE,
+                &im::encode_status_response(im::STATUS_INVALID_ACTION),
+                &reply_cfg(),
+            )
+            .await;
+        if let Err(e) = reply_result {
+            tracing::debug!(exchange_id = msg.proto.exchange_id, error = %e, "INVALID_ACTION StatusResponse not delivered");
+        }
+        return SubscribeOutcome::Rejected;
+    }
+
     let chunks = node.read_chunks(
         &req.paths,
         &read_ctx,
@@ -1541,10 +1591,10 @@ async fn serve_subscribe_request(
             "priming ReportData chunk sent"
         );
         let Ok(piggybacked) = reply_result else {
-            return None; // ack never came — exchange is dead, give up
+            return SubscribeOutcome::TornDown; // ack never came — exchange is dead, give up
         };
         if !await_peer_status_ok(session, piggybacked, msg.proto.exchange_id).await {
-            return None;
+            return SubscribeOutcome::TornDown;
         }
     }
 
@@ -1566,10 +1616,10 @@ async fn serve_subscribe_request(
         "SubscribeResponse sent"
     );
     if reply_result.is_err() {
-        return None;
+        return SubscribeOutcome::TornDown;
     }
 
-    Some(ActiveSubscription {
+    SubscribeOutcome::Installed(ActiveSubscription {
         id: subscription_id,
         paths: req.paths,
         fabric_filtered: req.fabric_filtered,
