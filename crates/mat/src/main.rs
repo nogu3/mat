@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Command, DiagCommand, FabricAction};
+use cli::{Cli, Command, DiagCommand, FabricAction, GroupCommand};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
@@ -74,6 +74,21 @@ fn main() -> ExitCode {
             args.fabric_index,
             args.issuer_index,
         ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                e.emit();
+                ExitCode::from(e.kind.exit_code())
+            }
+        };
+    }
+
+    // group list もローカル完結（KVS 読み取りのみ）— fabric と同じ扱いで
+    // iface 解決・matd 経路に巻き込まない。
+    if let Command::Group {
+        action: GroupCommand::List,
+    } = &command
+    {
+        return match commands::group::run_list(&store_path, args.fabric_index) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 e.emit();

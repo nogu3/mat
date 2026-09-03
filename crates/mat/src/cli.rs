@@ -587,6 +587,10 @@ pub enum GroupCommand {
         node_ids: Vec<NodeRef>,
     },
 
+    /// コントローラ KVS の group テーブル（group / keymap / keyset チェーン）を
+    /// 一覧する。ローカル読み取りのみ（ネットワーク・matd に触れない）。
+    List,
+
     /// group 送信 counter を「matd 再起動 1 回相当」前方ジャンプする応急
     /// コマンド（Issue #14）。受信側のリプレイ窓が送信系列より先行して
     /// groupcast が黙って捨てられる状態を、matd 再起動なし・常駐購読を

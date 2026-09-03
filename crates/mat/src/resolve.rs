@@ -219,6 +219,8 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 },
                 // 引数なし（group 指定すら無い）— alias 解決対象が無い。
                 GroupCommand::Bump => GroupCommand::Bump,
+                // 引数なし（fabric_index はグローバル引数）— alias 解決対象が無い。
+                GroupCommand::List => GroupCommand::List,
                 GroupCommand::ColorTemp {
                     group_id,
                     kelvin,

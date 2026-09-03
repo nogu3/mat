@@ -193,6 +193,13 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 endpoint: endpoint.id()?,
             },
         ),
+        // group list はローカル完結（KVS 読み取りのみ）— fabric init と同じく
+        // main.rs の早期 dispatch で処理済み。ここには到達しない（分岐だけ
+        // このアームで表明し、下の match は網羅性のため
+        // `GroupCommand::List => return ...` を置く）。
+        Command::Group {
+            action: GroupCommand::List,
+        } => Ok(Dispatch::Dedicated("group list")),
         Command::Group { action } => Ok(Dispatch::Device(match action {
             GroupCommand::Provision {
                 group_id,
@@ -265,6 +272,8 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 node_ids: nodes(node_ids)?,
             },
             GroupCommand::Bump => DeviceOp::GroupBump,
+            // 到達しない（上の専用アームで先に処理済み）。網羅性のためだけの腕。
+            GroupCommand::List => return Ok(Dispatch::Dedicated("group list")),
         })),
     }
 }

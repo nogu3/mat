@@ -5,4 +5,5 @@ pub mod commission;
 pub mod diag;
 pub mod discover;
 pub mod fabric;
+pub mod group;
 pub mod unpair;

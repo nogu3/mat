@@ -347,6 +347,24 @@ pub fn unpair_device(fabric_index: u8) -> Value {
     json!({ "removed": true, "fabric_index": fabric_index })
 }
 
+/// `group list` の成功 body。`groups` = (group_id, name, keyset_id)、
+/// `keysets` = (keyset_id, bound_groups)。鍵素材は含めない。
+pub fn group_list_success(
+    fabric_index: u8,
+    groups: &[(u16, &str, Option<u16>)],
+    keysets: &[(u16, &[u16])],
+) -> Value {
+    json!({
+        "fabric_index": fabric_index,
+        "groups": groups.iter().map(|(id, name, ks)| json!({
+            "group_id": id, "name": name, "keyset_id": ks,
+        })).collect::<Vec<_>>(),
+        "keysets": keysets.iter().map(|(id, bound)| json!({
+            "keyset_id": id, "bound_groups": bound,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// `group grant` の成功 body。
 pub fn group_grant_success(
     group_id: u16,
@@ -633,6 +651,17 @@ mod tests {
         assert_eq!(body["manual_code"], "34970112332");
         assert_eq!(body["qr_payload"], "MT:ABC");
         assert!(body["expires_at"].is_string());
+    }
+
+    #[test]
+    fn group_list_success_shape() {
+        let body = group_list_success(2, &[(1, "desk", Some(42))], &[(42, &[1])]);
+        assert_eq!(
+            body,
+            json!({ "fabric_index": 2,
+                    "groups": [{ "group_id": 1, "name": "desk", "keyset_id": 42 }],
+                    "keysets": [{ "keyset_id": 42, "bound_groups": [1] }] })
+        );
     }
 
     #[test]

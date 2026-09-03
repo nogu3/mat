@@ -97,7 +97,9 @@ node を除去する新 API）→ `tracing::info!(node_id, "ledger rescan: node 
 mat group list
 ```
 
-ローカル KVS のみ（ネット不要）。直経路のみ（`--matd` 明示は exit 2）。
+ローカル KVS のみ（ネット不要）。`fabric init` と同じくローカルのみで完結し、
+`--matd` は無視される（iface 解決・route dispatch より前に main.rs が早期
+dispatch する）。
 `mat-controller::group_settings::read_groups(main_ini, fabric_index) -> Result<GroupTable, GroupSettingsError>`
 を新設: `f/<idx>/g` の FabricData から GroupData チェーン（`first_group` / `group_count`）、
 KeyMap チェーン（`scan_map` 流用）、KeySet チェーン（`first_keyset` / `keyset_count` / `keyset_next`）

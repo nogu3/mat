@@ -670,6 +670,44 @@ fn fabric_init_full_local_cycle() {
     assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
 }
 
+// ── group list（M8c-3 Task10: ローカル完結、iface/matd 不到達）────────────
+
+#[test]
+fn group_list_missing_store_exits_10() {
+    let dir = TempDir::new().unwrap();
+    mat(&dir.path().join("nope"))
+        .args(["group", "list"])
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn group_list_without_kvs_ini_exits_10_with_fabric_init_hint() {
+    // store ディレクトリはあるが chip_tool_config.ini が無い（fabric init 前）。
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "list"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("fabric init"));
+}
+
+#[test]
+fn group_list_on_fresh_fabric_emits_empty_arrays() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args(["fabric", "init"])
+        .assert()
+        .success();
+    mat(store.path())
+        .args(["group", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"groups\":[]"))
+        .stdout(predicate::str::contains("\"keysets\":[]"))
+        .stdout(predicate::str::contains("\"fabric_index\":1"));
+}
+
 // ── unpair（RemoveFabric + 台帳/alias 削除、直経路のみ）────────────────────
 
 #[test]
