@@ -4,7 +4,8 @@
 //! answered with `CONSTRAINT_ERROR` and leaves the store untouched (the
 //! admin can still read the ACL — its automatic Administer entry survived),
 //! and the entry shape `mat group grant` writes (Operate / Group auth mode
-//! / subject = group id / no targets) is accepted as a list append.
+//! / subject = group id / no targets) is accepted as part of a full
+//! replace next to the admin entry.
 //!
 //! Same direct-drive setup as `acl_enforce.rs` (`tests/support/mod.rs`).
 #![cfg(feature = "net")]
