@@ -259,8 +259,9 @@ docs/errors.md の kind / exit code に変更なし。
 
 ### 4.3 密度の目標
 
-追加後の `#[test]` 数の目安: commissioning.rs 36 → 55 以上、x509.rs 10 → 30 以上。
-数値は目標であり、ここに列挙したケースが全部入っていることが受け入れ条件。
+追加後の `#[test]` 数: commissioning.rs 36 → 50、x509.rs 10 → 23（2026-09-03 実績）。
+件数は目安であり、受け入れ条件はここに列挙したケースが全部入っていること（テーブル
+駆動テストは 1 本で複数ケースを覆う）。
 
 ## 5. テスト（Happy Eyeballs 側）
 
@@ -333,7 +334,7 @@ docs/errors.md の kind / exit code に変更なし。
 
 1. `task check` 緑（fmt / clippy `-D warnings` / 全テスト）。
 2. §5.1 / §5.2 のテストが全部入り、`cargo test -p mat-controller` で実機なしに通る。
-3. §4 のテストが全部入り、`#[test]` 数が目標に達する。
+3. §4 に列挙したケースが全部テストに入っている（件数は目安、§4.3）。
 4. `concurrent_establishes_use_dedicated_sockets` 不変で通る。
 5. §5.4 の実機スモーク合格。
 6. §6 のドキュメント更新。

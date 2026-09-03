@@ -83,14 +83,21 @@ async fn spawn_responder(fx: &Fixture) -> (SocketAddr, JoinHandle<SocketAddr>) {
     (addr, handle)
 }
 
-/// A loopback port with nobody listening: bind, read the address, drop.
-/// Datagrams sent there vanish (unconnected UDP gets no ICMP error), so
-/// the CASE attempt times out after the MRP budget of `fast_cfg()`.
-async fn dead_port() -> SocketAddr {
+/// A loopback address bound but never serviced: nobody reads from the
+/// socket, so datagrams sent there are accepted by the kernel and never
+/// answered (unconnected UDP gets no ICMP error either), which is the
+/// faithful "dead address" behaviour — the CASE attempt times out after
+/// the MRP budget of `fast_cfg()`. The socket is returned alongside the
+/// address and must be kept alive (bound) for as long as the address is
+/// used as "dead": dropping it early would free the ephemeral port for
+/// reuse, and a later `spawn_responder()` (in this or a parallel test)
+/// could then be handed the same port, turning "dead" into "alive".
+async fn dead_port() -> (SocketAddr, UdpTransport) {
     let t = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
         .await
         .unwrap();
-    t.local_addr().unwrap()
+    let addr = t.local_addr().unwrap();
+    (addr, t)
 }
 
 #[tokio::test]
@@ -135,7 +142,7 @@ const TEST_STAGGER: Duration = Duration::from_millis(50);
 #[tokio::test]
 async fn establish_any_dead_first_address_falls_through_to_live_second() {
     let fx = fixture();
-    let dead = dead_port().await;
+    let (dead, _dead_guard) = dead_port().await;
     let (live, responder) = spawn_responder(&fx).await;
     let cfg = fast_cfg();
 
@@ -169,8 +176,8 @@ async fn establish_any_dead_first_address_falls_through_to_live_second() {
 #[tokio::test]
 async fn establish_any_all_dead_reports_every_peer() {
     let fx = fixture();
-    let dead1 = dead_port().await;
-    let dead2 = dead_port().await;
+    let (dead1, _dead_guard) = dead_port().await;
+    let (dead2, _dead_guard2) = dead_port().await;
     let cfg = fast_cfg();
 
     let err = case::establish_any(
