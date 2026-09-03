@@ -314,6 +314,11 @@ pub fn open_window_success(
     })
 }
 
+/// `unpair` のデバイス側成功（出力 JSON の `device` オブジェクト）。
+pub fn unpair_device(fabric_index: u8) -> Value {
+    json!({ "removed": true, "fabric_index": fabric_index })
+}
+
 /// `group grant` の成功 body。
 pub fn group_grant_success(
     group_id: u16,

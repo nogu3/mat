@@ -6,15 +6,21 @@
 //! 規則はこのモジュールのコンストラクタだけが持つ。
 
 use crate::NodeConn;
+use mat_controller::commissioning;
 use mat_controller::im;
 use mat_core::body;
 use mat_core::color::ResolvedColor;
-use mat_core::error::MatError;
+use mat_core::error::{ErrorKind, MatError};
 use mat_core::ids::{self, InvokeClass, ScalarValue, WriteClass};
 use serde_json::Value;
 
 use crate::group::{self, BumpOutcome, GroupOutcome};
 use crate::Engine;
+
+/// OperationalCredentials / CurrentFabricIndex（属性 0x0005）。commissioning.rs は
+/// コマンド定数しか持たないのでここで局所定義する（im.rs はレーン C が触るため
+/// 足さない）。
+const ATTR_CURRENT_FABRIC_INDEX: u32 = 0x0005;
 
 /// 経路非依存の入力換算（CLI 入力 → Matter 生値）。旧 `mat/src/units.rs`。
 pub(crate) mod units {
@@ -109,6 +115,9 @@ pub enum NodeOpKind {
         iteration: u32,
         discriminator: u16,
     },
+    /// `mat unpair` のデバイス側: CurrentFabricIndex を読んでその index を
+    /// RemoveFabric する（直経路専用 — 台帳の書き手は mat だけ）。
+    RemoveFabric,
 }
 
 /// `classify_invoke` の結果を (cluster, command, fields_tlv, timed) に写す共通部。
@@ -247,6 +256,7 @@ impl NodeOpKind {
             NodeOpKind::Describe => "describe",
             NodeOpKind::DiagThread { .. } => "diag_thread",
             NodeOpKind::OpenWindow { .. } => "open_window",
+            NodeOpKind::RemoveFabric => "remove_fabric",
         }
     }
 }
@@ -498,6 +508,41 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
                 .open_window(timeout_u16, *discriminator, *iteration)
                 .await?;
             body::open_window_success(node_id, &manual_code, &qr_payload, *timeout)
+        }
+        NodeOpKind::RemoveFabric => {
+            let v = conn
+                .read_json(
+                    0,
+                    commissioning::CLUSTER_OPERATIONAL_CREDENTIALS,
+                    ATTR_CURRENT_FABRIC_INDEX,
+                )
+                .await?;
+            let idx = v
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| {
+                    MatError::parse_error(format!("current-fabric-index is not a u8: {v}"))
+                })?;
+            let resp = conn
+                .invoke_for_data(
+                    0,
+                    commissioning::CLUSTER_OPERATIONAL_CREDENTIALS,
+                    commissioning::CMD_REMOVE_FABRIC,
+                    Some(commissioning::encode_remove_fabric(idx)),
+                    false,
+                )
+                .await?;
+            let (status, _) = commissioning::decode_noc_response(&resp)
+                .map_err(|e| MatError::parse_error(format!("RemoveFabric response: {e}")))?;
+            if status != 0 {
+                return Err(MatError::new(
+                    ErrorKind::DeviceRejected,
+                    format!(
+                        "RemoveFabric rejected by node {node_id}: NOCResponse status {status:#04x} (fabric_index {idx})"
+                    ),
+                ));
+            }
+            body::unpair_device(idx)
         }
     };
     tracing::debug!(node_id, op = op.kind.name(), "node op executed");
@@ -1027,6 +1072,54 @@ mod tests {
         assert_eq!(body["manual_code"], "34970112332");
         assert!(body["qr_payload"].as_str().unwrap().starts_with("MT:"));
         assert!(body["expires_at"].is_string());
+    }
+
+    fn noc_response_tlv(status: u8, fabric_index: Option<u8>) -> Vec<u8> {
+        use mat_controller::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), u64::from(status));
+        if let Some(idx) = fabric_index {
+            w.put_uint(Tag::Context(1), u64::from(idx));
+        }
+        w.end_container();
+        w.finish()
+    }
+
+    #[tokio::test]
+    async fn remove_fabric_reads_current_index_then_invokes_and_reports_it() {
+        let mut conn = FakeConn::scripted()
+            .with_read(0, 0x003E, 0x0005, serde_json::json!(2))
+            .with_invoke_response(0, 0x003E, 0x0A, noc_response_tlv(0, Some(2)));
+        let body = run_node_op(&mut conn, &node(NodeOpKind::RemoveFabric))
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "removed": true, "fabric_index": 2 })
+        );
+        assert_eq!(
+            conn.calls(),
+            &["invoke_for_data(0,0x003E,0x000A)".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_fabric_non_zero_status_is_device_rejected() {
+        let mut conn = FakeConn::scripted()
+            .with_read(0, 0x003E, 0x0005, serde_json::json!(2))
+            .with_invoke_response(0, 0x003E, 0x0A, noc_response_tlv(0x0B, None));
+        let err = run_node_op(&mut conn, &node(NodeOpKind::RemoveFabric))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
+        assert!(err.detail.contains("0x0b"), "{}", err.detail);
+    }
+
+    #[test]
+    fn remove_fabric_name_and_budget() {
+        assert_eq!(NodeOpKind::RemoveFabric.name(), "remove_fabric");
+        assert!(NodeOpKind::RemoveFabric.budget_applies());
     }
 
     #[tokio::test]

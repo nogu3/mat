@@ -281,6 +281,7 @@ fn to_op(op: &DeviceOp) -> Result<Value, String> {
                 // matd は warm CASE セッション層。これらは直経路でしか実行できない。
                 NodeOpKind::DiagThread { .. } => return Err(unsupported_detail("diag")),
                 NodeOpKind::OpenWindow { .. } => return Err(unsupported_detail("open-window")),
+                NodeOpKind::RemoveFabric => return Err(unsupported_detail("unpair")),
             }
         }
         DeviceOp::Group(g) => {
