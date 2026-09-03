@@ -273,6 +273,18 @@ impl Device {
         ));
         comm_server.set_group_key_store(gk_store.clone());
 
+        // Groups（spec §1.3）の共有 membership 帳簿: 全 bridged endpoint の
+        // `GroupsHandler` がこの 1 つの store に委譲する（同じ group への
+        // AddGroup が endpoint 横断で見える — groupcast のディスパッチ先を
+        // 引くのに使う）。`RemoveFabric`・fail-safe rollback の purge も
+        // `AclStore`/`GroupKeyStore` と同じ配線。永続化は `<store_dir>/
+        // groups.json`。
+        let membership =
+            crate::core::group_membership::GroupMembershipStore::with_persist(Box::new(
+                crate::net::store::group_membership_in_dir(&config.store_dir),
+            ));
+        comm_server.set_group_membership_store(membership.clone());
+
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
         // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
         // 保存値（無ければ spec default の ("", "XX")）を初期値として渡し、
@@ -373,6 +385,8 @@ impl Device {
                 device.kind,
                 &device.name,
                 &bridged_unique_id(&unique_id, &device.id),
+                *endpoint,
+                &membership,
             );
             node.add_endpoint(*endpoint, built.clusters);
             onoff_states.push((device.id.clone(), built.onoff_state));

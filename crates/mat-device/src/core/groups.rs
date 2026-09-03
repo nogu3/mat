@@ -3,17 +3,14 @@
 //! Apple Home の interview 対策で、グループ束縛の実配線（groupcast 受信は
 //! net 層の別機構）ではなく fabric スコープの membership 帳簿を持つ。
 //! FeatureMap GN=0（グループ名は保存しない — NameSupport も 0）。
-//! 永続化は M3 送り: テーブルは in-memory で、再起動で消える。
+//! membership は `GroupMembershipStore`（`groups.json` に永続化）を全
+//! endpoint で共有する。
 use mat_controller::im;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::group_membership::{GroupMembershipStore, GROUP_TABLE_CAPACITY};
 use crate::core::identify::IdentifyState;
-
-/// Group table capacity (spec §1.3.4 leaves the size implementation-
-/// defined). Shared across fabrics; `GetGroupMembership` reports the
-/// remaining headroom as its `Capacity`.
-const GROUP_TABLE_CAPACITY: usize = 16;
 
 const RESP_ADD_GROUP: u32 = 0x00;
 const RESP_VIEW_GROUP: u32 = 0x01;
@@ -22,21 +19,23 @@ const RESP_REMOVE_GROUP: u32 = 0x03;
 
 pub struct GroupsHandler {
     identify: IdentifyState,
-    /// `(fabric_index, group_id)` memberships, insertion-ordered (spec
-    /// §1.3.6: entries are fabric-scoped).
-    members: Vec<(u8, u16)>,
+    /// 全 bridged endpoint の `GroupsHandler` が共有する membership 帳簿
+    /// （`core::group_membership` のモジュール doc 参照）。
+    store: GroupMembershipStore,
+    endpoint: u16,
 }
 
 impl GroupsHandler {
-    pub fn new(identify: IdentifyState) -> Self {
+    pub fn new(identify: IdentifyState, store: GroupMembershipStore, endpoint: u16) -> Self {
         Self {
             identify,
-            members: Vec::new(),
+            store,
+            endpoint,
         }
     }
 
     fn contains(&self, fabric: u8, group_id: u16) -> bool {
-        self.members.contains(&(fabric, group_id))
+        self.store.contains(fabric, group_id, self.endpoint)
     }
 
     /// AddGroup 本体 (spec §1.3.7.1): 返す status は response struct 用。
@@ -44,14 +43,10 @@ impl GroupsHandler {
         if group_id == 0 {
             return im::STATUS_CONSTRAINT_ERROR;
         }
-        if self.contains(fabric, group_id) {
-            return im::STATUS_SUCCESS;
+        match self.store.add(fabric, group_id, self.endpoint) {
+            Ok(()) => im::STATUS_SUCCESS,
+            Err(status) => status,
         }
-        if self.members.len() >= GROUP_TABLE_CAPACITY {
-            return im::STATUS_RESOURCE_EXHAUSTED;
-        }
-        self.members.push((fabric, group_id));
-        im::STATUS_SUCCESS
     }
 
     fn status_response(response_command: u32, status: u8, group_id: u16) -> InvokeReply {
@@ -125,19 +120,17 @@ impl ClusterHandler for GroupsHandler {
                 let Some(requested) = decode_group_list(fields_tlv) else {
                     return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
                 };
-                let matching: Vec<u16> = self
-                    .members
+                let mine = self.store.groups_for(fabric, self.endpoint);
+                let matching: Vec<u16> = mine
                     .iter()
-                    .filter(|(f, g)| {
-                        *f == fabric && (requested.is_empty() || requested.contains(g))
-                    })
-                    .map(|(_, g)| *g)
+                    .copied()
+                    .filter(|g| requested.is_empty() || requested.contains(g))
                     .collect();
                 let mut w = Writer::new();
                 w.start_struct(Tag::Anonymous);
                 w.put_uint(
                     Tag::Context(0),
-                    (GROUP_TABLE_CAPACITY - self.members.len()) as u64,
+                    (GROUP_TABLE_CAPACITY - self.store.count_for_endpoint(self.endpoint)) as u64,
                 );
                 w.start_array(Tag::Context(1));
                 for g in matching {
@@ -156,8 +149,7 @@ impl ClusterHandler for GroupsHandler {
                 };
                 let status = if group_id == 0 {
                     im::STATUS_CONSTRAINT_ERROR
-                } else if self.contains(fabric, group_id) {
-                    self.members.retain(|entry| *entry != (fabric, group_id));
+                } else if self.store.remove(fabric, group_id, self.endpoint) {
                     im::STATUS_SUCCESS
                 } else {
                     im::STATUS_NOT_FOUND
@@ -165,7 +157,7 @@ impl ClusterHandler for GroupsHandler {
                 Self::status_response(RESP_REMOVE_GROUP, status, group_id)
             }
             im::CMD_REMOVE_ALL_GROUPS => {
-                self.members.retain(|(f, _)| *f != fabric);
+                self.store.remove_all(fabric, self.endpoint);
                 InvokeReply::Status(im::STATUS_SUCCESS)
             }
             im::CMD_ADD_GROUP_IF_IDENTIFYING => {
@@ -288,7 +280,7 @@ mod tests {
 
     fn handler() -> GroupsHandler {
         let (_identify, state) = IdentifyHandler::new();
-        GroupsHandler::new(state)
+        GroupsHandler::new(state, GroupMembershipStore::new(), 1)
     }
 
     fn fabric_ctx(fabric_index: u8) -> InvokeCtx {
@@ -485,7 +477,7 @@ mod tests {
     #[test]
     fn add_group_if_identifying_requires_identify_in_progress() {
         let (mut identify, state) = IdentifyHandler::new();
-        let mut h = GroupsHandler::new(state);
+        let mut h = GroupsHandler::new(state, GroupMembershipStore::new(), 1);
 
         // identify していない間は成功扱いで何も追加しない (spec §1.3.7.6)。
         assert_eq!(
@@ -562,5 +554,27 @@ mod tests {
                 RESP_REMOVE_GROUP
             ]
         );
+    }
+
+    /// 2 つの endpoint の handler が同じ store を共有すると、同じ group への
+    /// AddGroup が endpoint 横断の membership（groupcast のディスパッチ先）
+    /// として見える。
+    #[test]
+    fn two_endpoints_sharing_a_store_are_both_members_of_the_group() {
+        let store = GroupMembershipStore::new();
+        let (_i1, s1) = IdentifyHandler::new();
+        let (_i2, s2) = IdentifyHandler::new();
+        let mut ep2 = GroupsHandler::new(s1, store.clone(), 2);
+        let mut ep3 = GroupsHandler::new(s2, store.clone(), 3);
+        assert_eq!(add_group(&mut ep2, 1, 10), im::STATUS_SUCCESS);
+        assert_eq!(add_group(&mut ep3, 1, 10), im::STATUS_SUCCESS);
+        assert_eq!(store.endpoints_for(1, 10), vec![2, 3]);
+        // ep2 の RemoveGroup は ep3 の membership に影響しない
+        let reply = ep2.invoke(im::CMD_REMOVE_GROUP, &group_fields(10), &mut fabric_ctx(1));
+        assert_eq!(
+            decode_status_response(&reply, RESP_REMOVE_GROUP).0,
+            im::STATUS_SUCCESS
+        );
+        assert_eq!(store.endpoints_for(1, 10), vec![3]);
     }
 }

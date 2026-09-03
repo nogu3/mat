@@ -3301,7 +3301,14 @@ mod tests {
             let mut node = node_with_acl(privilege, 7);
             let (identify, state) = crate::core::identify::IdentifyHandler::new();
             node.add_cluster(1, Box::new(identify));
-            node.add_cluster(1, Box::new(crate::core::groups::GroupsHandler::new(state)));
+            node.add_cluster(
+                1,
+                Box::new(crate::core::groups::GroupsHandler::new(
+                    state,
+                    crate::core::group_membership::GroupMembershipStore::new(),
+                    1,
+                )),
+            );
             node
         };
 

@@ -13,6 +13,7 @@ use crate::core::access_control::{AclDeviceEntry, AclPersist};
 use crate::core::datamodel::BasicInfoPersist;
 use crate::core::fabric_store::{FabricEntry, FabricPersist};
 use crate::core::group_key_management::{GroupKeyMapEntry, GroupKeyPersist, GroupKeySet};
+use crate::core::group_membership::{GroupMember, GroupMembershipPersist};
 
 /// Persists the fabric table as one JSON file at a fixed path.
 pub struct FileFabricStore {
@@ -200,6 +201,45 @@ impl GroupKeyPersist for FileGroupKeyStore {
 /// (`group_keys.json`) — mirrors [`acl_store_in_dir`] above.
 pub fn group_key_store_in_dir(dir: &Path) -> FileGroupKeyStore {
     FileGroupKeyStore::new(dir.join("group_keys.json"))
+}
+
+/// File-backed [`GroupMembershipPersist`]
+/// (`crate::core::group_membership::GroupMembershipPersist`)
+/// implementation — same JSON-via-`serde_json` +
+/// `mat_core::fsatomic::write_atomic` discipline as [`FileAclStore`] above.
+/// Unlike `group_keys.json`, `groups.json` holds no key material (just
+/// fabric/group/endpoint bookkeeping), so it doesn't get the owner-only
+/// permission restriction `FileFabricStore::save`/`FileGroupKeyStore::save`
+/// apply.
+pub struct FileGroupMembershipStore {
+    path: PathBuf,
+}
+
+impl FileGroupMembershipStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl GroupMembershipPersist for FileGroupMembershipStore {
+    fn save(&self, members: &[GroupMember]) -> Result<(), String> {
+        let bytes = serde_json::to_vec(members).map_err(|e| e.to_string())?;
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
+    }
+
+    fn load(&self) -> Result<Vec<GroupMember>, String> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Convenience: builds a [`FileGroupMembershipStore`] rooted at `dir`
+/// (`groups.json`) — mirrors [`acl_store_in_dir`] above.
+pub fn group_membership_in_dir(dir: &Path) -> FileGroupMembershipStore {
+    FileGroupMembershipStore::new(dir.join("groups.json"))
 }
 
 #[cfg(test)]
@@ -393,5 +433,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (k, m) = group_key_store_in_dir(dir.path()).load().unwrap();
         assert!(k.is_empty() && m.is_empty());
+    }
+
+    #[test]
+    fn group_membership_with_persist_reloads_across_instances() {
+        use crate::core::group_membership::GroupMembershipStore;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s =
+                GroupMembershipStore::with_persist(Box::new(group_membership_in_dir(dir.path())));
+            s.add(1, 10, 2).unwrap();
+        }
+        let s2 = GroupMembershipStore::with_persist(Box::new(group_membership_in_dir(dir.path())));
+        assert_eq!(s2.endpoints_for(1, 10), vec![2]);
+    }
+
+    #[test]
+    fn group_membership_load_with_no_file_yet_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(group_membership_in_dir(dir.path())
+            .load()
+            .unwrap()
+            .is_empty());
     }
 }

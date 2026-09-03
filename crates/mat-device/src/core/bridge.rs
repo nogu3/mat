@@ -12,6 +12,7 @@ use mat_controller::im;
 
 use crate::core::bridged_device_basic_information::BridgedDeviceBasicInformationHandler;
 use crate::core::datamodel::{ClusterHandler, DescriptorHandler};
+use crate::core::group_membership::GroupMembershipStore;
 use crate::core::groups::GroupsHandler;
 use crate::core::identify::IdentifyHandler;
 use crate::core::onoff::OnOffHandler;
@@ -36,7 +37,13 @@ pub struct BridgedEndpoint {
 /// を組み立てる。`name` は Bridged Device Basic Information の NodeLabel
 /// （設定ファイルの device name が正本 — 同ハンドラのモジュールコメント
 /// 参照）、`unique_id` はその UniqueID。
-pub fn build_bridged_endpoint(kind: DeviceKind, name: &str, unique_id: &str) -> BridgedEndpoint {
+pub fn build_bridged_endpoint(
+    kind: DeviceKind,
+    name: &str,
+    unique_id: &str,
+    endpoint: u16,
+    membership: &GroupMembershipStore,
+) -> BridgedEndpoint {
     match kind {
         DeviceKind::OnOffLight => {
             let (identify, identify_state) = IdentifyHandler::new();
@@ -49,7 +56,11 @@ pub fn build_bridged_endpoint(kind: DeviceKind, name: &str, unique_id: &str) -> 
                     ])),
                     Box::new(BridgedDeviceBasicInformationHandler::new(name, unique_id)),
                     Box::new(identify),
-                    Box::new(GroupsHandler::new(identify_state)),
+                    Box::new(GroupsHandler::new(
+                        identify_state,
+                        membership.clone(),
+                        endpoint,
+                    )),
                     Box::new(onoff),
                 ],
                 onoff_state,
@@ -64,7 +75,13 @@ mod tests {
 
     #[test]
     fn onoff_light_yields_the_m2_ep1_cluster_set_plus_bdbi() {
-        let endpoint = build_bridged_endpoint(DeviceKind::OnOffLight, "Living", "uid-1");
+        let endpoint = build_bridged_endpoint(
+            DeviceKind::OnOffLight,
+            "Living",
+            "uid-1",
+            2,
+            &GroupMembershipStore::new(),
+        );
         let ids: std::collections::BTreeSet<u32> =
             endpoint.clusters.iter().map(|c| c.cluster_id()).collect();
         assert_eq!(
@@ -81,7 +98,13 @@ mod tests {
 
     #[test]
     fn onoff_light_registers_clusters_in_spec_order() {
-        let endpoint = build_bridged_endpoint(DeviceKind::OnOffLight, "Living", "uid-1");
+        let endpoint = build_bridged_endpoint(
+            DeviceKind::OnOffLight,
+            "Living",
+            "uid-1",
+            2,
+            &GroupMembershipStore::new(),
+        );
         let ids: Vec<u32> = endpoint.clusters.iter().map(|c| c.cluster_id()).collect();
         assert_eq!(
             ids,
@@ -101,7 +124,13 @@ mod tests {
 
         use crate::core::datamodel::InvokeCtx;
 
-        let mut endpoint = build_bridged_endpoint(DeviceKind::OnOffLight, "Living", "uid-1");
+        let mut endpoint = build_bridged_endpoint(
+            DeviceKind::OnOffLight,
+            "Living",
+            "uid-1",
+            2,
+            &GroupMembershipStore::new(),
+        );
         assert!(!endpoint
             .onoff_state
             .load(std::sync::atomic::Ordering::SeqCst));

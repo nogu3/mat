@@ -12,6 +12,7 @@ pub mod datamodel;
 pub mod fabric_store;
 pub mod general_diagnostics;
 pub mod group_key_management;
+pub mod group_membership;
 pub mod groups;
 pub mod identify;
 pub mod mdns_records;

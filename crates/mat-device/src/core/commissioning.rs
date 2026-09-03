@@ -53,6 +53,7 @@ use crate::core::access_control::AclStore;
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::fabric_store::{FabricEntry, FabricStore};
 use crate::core::group_key_management::GroupKeyStore;
+use crate::core::group_membership::GroupMembershipStore;
 
 /// Response command ids (spec §11.10.6 / §11.17.6 — the comments next to
 /// each `CMD_*` request const in `mat_controller::commissioning` record
@@ -281,6 +282,12 @@ struct Inner {
     /// shape as `acl_store` (doc above), including the `None`-is-a-no-op
     /// discipline for pre-existing tests.
     group_key_store: Option<GroupKeyStore>,
+    /// The shared Groups membership store every bridged endpoint's
+    /// `GroupsHandler` also holds, if a runtime has wired one in via
+    /// `CommissioningServer::set_group_membership_store` — same
+    /// `Option`/purge shape as `acl_store`/`group_key_store` (doc above),
+    /// including the `None`-is-a-no-op discipline for pre-existing tests.
+    group_membership_store: Option<GroupMembershipStore>,
 }
 
 /// Device-side commissioning server. Construct with `new`, then either call
@@ -304,6 +311,7 @@ impl CommissioningServer {
                 removed_fabric: None,
                 acl_store: None,
                 group_key_store: None,
+                group_membership_store: None,
             })),
         }
     }
@@ -333,6 +341,16 @@ impl CommissioningServer {
             .lock()
             .expect("commissioning server mutex poisoned")
             .group_key_store = Some(store);
+    }
+
+    /// Wires a shared `GroupMembershipStore` in — the same store every
+    /// bridged endpoint's `GroupsHandler` delegates to (`device.rs`), so
+    /// `handle_remove_fabric`/the fail-safe rollback purge the removed
+    /// fabric's memberships out of the store the handlers actually read
+    /// back (`AclStore`'s `set_acl_store` doc above — same purpose, same
+    /// "call before any fabric-touching command" requirement).
+    pub fn set_group_membership_store(&mut self, store: GroupMembershipStore) {
+        locked(&self.inner).group_membership_store = Some(store);
     }
 
     /// Fabrics installed so far (cloned out of the shared state — this
@@ -927,6 +945,9 @@ impl Inner {
         if let Some(store) = &self.group_key_store {
             store.purge_fabric(fabric_index);
         }
+        if let Some(store) = &self.group_membership_store {
+            store.purge_fabric(fabric_index);
+        }
         removed
     }
 
@@ -1270,6 +1291,9 @@ impl Inner {
                 if let Some(store) = &self.group_key_store {
                     store.purge_fabric(fabric_index);
                 }
+                if let Some(store) = &self.group_membership_store {
+                    store.purge_fabric(fabric_index);
+                }
                 InvokeReply::Data {
                     response_command: RESP_NOC,
                     fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
@@ -1312,6 +1336,9 @@ impl Inner {
                     store.purge_fabric(fabric_index);
                 }
                 if let Some(store) = &self.group_key_store {
+                    store.purge_fabric(fabric_index);
+                }
+                if let Some(store) = &self.group_membership_store {
                     store.purge_fabric(fabric_index);
                 }
                 InvokeReply::Status(im::STATUS_FAILURE)
@@ -1863,7 +1890,9 @@ mod tests {
     /// （Task 3 rulings）。あわせて `set_group_key_store` で配線した
     /// `GroupKeyStore` の KeySet/GroupKeyMap も同じ RemoveFabric で
     /// purge されることを確認する（Task 2、`handle_remove_fabric`の
-    /// 成功径路 = purge 3箇所のうちの1つ）。
+    /// 成功径路 = purge 3箇所のうちの1つ）。`set_group_membership_store`
+    /// で配線した `GroupMembershipStore` の membership も同じ経路で purge
+    /// される（groupcast レーン A フェーズ 2 Task 2）。
     #[test]
     fn add_noc_installs_case_admin_acl_and_remove_fabric_purges_it() {
         use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
@@ -1874,6 +1903,8 @@ mod tests {
         server.set_acl_store(acl_store.clone());
         let gk_store = GroupKeyStore::new();
         server.set_group_key_store(gk_store.clone());
+        let membership = GroupMembershipStore::new();
+        server.set_group_membership_store(membership.clone());
 
         // install_fabric drives ArmFailSafe/CSR/AddTrustedRoot/AddNOC with
         // admin subject fixed at 0xAA (see its doc comment).
@@ -1889,6 +1920,9 @@ mod tests {
         gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
         assert!(gk_store.keyset_exists(1, 7));
         assert_eq!(gk_store.map_entries_for(1), vec![(0x000A, 7)]);
+
+        // GroupMembershipStore side of the same fabric.
+        membership.add(1, 10, 2).unwrap();
 
         let ctx = InvokeCtx {
             fabric_index: 1,
@@ -1907,6 +1941,10 @@ mod tests {
         assert!(entries.is_empty());
         assert!(!gk_store.keyset_exists(1, 7));
         assert!(gk_store.map_entries_for(1).is_empty());
+        assert!(
+            membership.groups_by_fabric().is_empty(),
+            "purge must drop the fabric's memberships"
+        );
     }
 
     /// 存在しない index は InvalidFabricIndex(0x0A)。
@@ -1972,7 +2010,8 @@ mod tests {
     /// index as `max(existing)+1` — an unpurged entry here would let a
     /// later `AddNOC` at that same index inherit the previous occupant's
     /// ACL (cross-fabric leak). Same reasoning applies to `GroupKeyStore`
-    /// (Task 2's purge site, `handle_remove_fabric`'s error branch).
+    /// (Task 2's purge site, `handle_remove_fabric`'s error branch) and to
+    /// `GroupMembershipStore` (groupcast レーン A フェーズ 2 Task 2).
     #[test]
     fn remove_fabric_persist_failure_still_purges_acl() {
         use crate::core::access_control::{decode_entries_for_test, AccessControlHandler};
@@ -1987,6 +2026,8 @@ mod tests {
         server.set_acl_store(acl_store.clone());
         let gk_store = GroupKeyStore::new();
         server.set_group_key_store(gk_store.clone());
+        let membership = GroupMembershipStore::new();
+        server.set_group_membership_store(membership.clone());
         install_fabric(&mut server, 0x1122, 0x5001);
 
         let handler = AccessControlHandler::new(acl_store.clone());
@@ -1996,6 +2037,7 @@ mod tests {
         );
         gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
         gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
+        membership.add(1, 10, 2).unwrap();
 
         fail_save.store(true, std::sync::atomic::Ordering::SeqCst);
         let ctx = InvokeCtx {
@@ -2014,6 +2056,10 @@ mod tests {
         );
         assert!(!gk_store.keyset_exists(1, 7));
         assert!(gk_store.map_entries_for(1).is_empty());
+        assert!(
+            membership.groups_by_fabric().is_empty(),
+            "purge must drop the fabric's memberships"
+        );
     }
 
     #[test]
