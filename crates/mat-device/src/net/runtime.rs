@@ -1684,10 +1684,12 @@ async fn send_subscription_report(
     // report carries the attribute's current value (spec §8.10.2), so two
     // changes between reports collapse into one entry with the latest
     // value — which is also why `dirty` holds paths, not values.
+    // `retain_reportable` drops the status entries a wildcard subscription
+    // would otherwise get for attributes it may not read (see its doc).
     let entries = if paths.is_empty() {
         Vec::new()
     } else {
-        node.read_entries(&paths, &read_ctx)
+        crate::net::subscription::retain_reportable(sub, node.read_entries(&paths, &read_ctx))
     };
     // `more_chunks=false`, one message: a dirty set is a handful of
     // scalar attributes, orders of magnitude below `REPORT_CHUNK_BUDGET`
