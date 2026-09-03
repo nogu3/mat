@@ -4,9 +4,10 @@
 //!
 //! `KeySetWrite`（spec §11.2.7.1）と `ATTR_GROUP_KEY_MAP` の write/read
 //! （spec §11.2.7.6、全置換 + `ListIndex` null append の両径路）を実装し、
-//! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は空 array のまま
-//! （`GroupTable` は Groups クラスタ側のエンドポイント紐付けが要る派生
-//! ビューで、groupcast タスク送り）。`KeySetRead`/`KeySetRemove`/
+//! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は
+//! `core::group_membership::GroupMembershipStore`（Groups クラスタ側の
+//! エンドポイント紐付け帳簿）から派生する読み取り専用ビュー。
+//! `KeySetRead`/`KeySetRemove`/
 //! `KeySetReadAllIndices` コマンドは未実装（既知ギャップ、groupcast タスク
 //! 送り）。永続化は `with_persist` で `<store_dir>/group_keys.json`
 //! （`net::store::FileGroupKeyStore`）に行う。
@@ -18,6 +19,7 @@ use mat_controller::tlv::{Reader, Tag, Value, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::group_membership::GroupMembershipStore;
 
 /// `MaxGroupsPerFabric`/`MaxGroupKeysPerFabric` (spec §11.2.7.5) — 固定値を
 /// 返すのみで実容量は追跡しない（`AccessControlHandler`の容量属性と同じ
@@ -233,11 +235,12 @@ impl GroupKeyStore {
 #[derive(Default)]
 pub struct GroupKeyManagementHandler {
     store: GroupKeyStore,
+    membership: GroupMembershipStore,
 }
 
 impl GroupKeyManagementHandler {
-    pub fn new(store: GroupKeyStore) -> Self {
-        Self { store }
+    pub fn new(store: GroupKeyStore, membership: GroupMembershipStore) -> Self {
+        Self { store, membership }
     }
 
     /// `write` の共通制約チェック（設計メモ参照）: `group_id == 0`（無効
@@ -272,11 +275,12 @@ impl ClusterHandler for GroupKeyManagementHandler {
         ]
     }
 
-    /// `ATTR_GROUP_KEY_MAP`（spec §11.2.7.6）は `ctx.fabric_filtered` を
-    /// 尊重する fabric-scoped list（`AccessControlHandler::read`の
-    /// `ATTR_ACL`と同じ扱い）: filtered なら `ctx.fabric_index` 分のみ、
-    /// unfiltered なら全 fabric 分。`ATTR_GROUP_TABLE` はエンドポイント
-    /// 紐付けの派生ビューで未実装につき常に空 array（モジュール doc）。
+    /// `ATTR_GROUP_KEY_MAP`（spec §11.2.7.6）と `ATTR_GROUP_TABLE`（spec
+    /// §11.2.7.7）はどちらも `ctx.fabric_filtered` を尊重する fabric-scoped
+    /// list（`AccessControlHandler::read`の `ATTR_ACL`と同じ扱い）: filtered
+    /// なら `ctx.fabric_index` 分のみ、unfiltered なら全 fabric 分。
+    /// `ATTR_GROUP_TABLE` は `self.membership` から派生する（モジュール
+    /// doc）。
     fn read(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
             im::ATTR_GROUP_KEY_MAP => {
@@ -292,8 +296,24 @@ impl ClusterHandler for GroupKeyManagementHandler {
                 Some(encode_group_key_map(&entries))
             }
             im::ATTR_GROUP_TABLE => {
+                // spec §11.2.7.7 GroupInfoMapStruct {1: GroupId, 2: Endpoints,
+                // 254: FabricIndex} — GroupName(3) は NameSupport=0 なので省略。
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
+                for (fabric_index, group_id) in self.membership.groups_by_fabric() {
+                    if ctx.fabric_filtered && fabric_index != ctx.fabric_index {
+                        continue;
+                    }
+                    w.start_struct(Tag::Anonymous);
+                    w.put_uint(Tag::Context(1), u64::from(group_id));
+                    w.start_array(Tag::Context(2));
+                    for endpoint in self.membership.endpoints_for(fabric_index, group_id) {
+                        w.put_uint(Tag::Anonymous, u64::from(endpoint));
+                    }
+                    w.end_container();
+                    w.put_uint(Tag::Context(254), u64::from(fabric_index));
+                    w.end_container();
+                }
                 w.end_container();
                 Some(w.finish())
             }
@@ -573,9 +593,72 @@ mod tests {
             .expect("attribute implemented")
     }
 
+    /// `GroupTable` の array を `(fabric_index, group_id, endpoints)` に戻す。
+    fn decode_group_table(tlv: &[u8]) -> Vec<(u8, u16, Vec<u16>)> {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let mut out = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            match el.value {
+                Value::ContainerEnd => break,
+                Value::StructStart => {
+                    let (mut fabric, mut group, mut eps) = (0u8, 0u16, Vec::new());
+                    loop {
+                        let e = r.next().unwrap().unwrap();
+                        match (e.tag, e.value) {
+                            (_, Value::ContainerEnd) => break,
+                            (Tag::Context(1), Value::Uint(v)) => group = v as u16,
+                            (Tag::Context(2), Value::ArrayStart) => loop {
+                                let x = r.next().unwrap().unwrap();
+                                match x.value {
+                                    Value::ContainerEnd => break,
+                                    Value::Uint(v) => eps.push(v as u16),
+                                    other => panic!("unexpected {other:?}"),
+                                }
+                            },
+                            (Tag::Context(254), Value::Uint(v)) => fabric = v as u8,
+                            _ => {}
+                        }
+                    }
+                    out.push((fabric, group, eps));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn group_table_is_derived_from_membership_and_fabric_filtered() {
+        let membership = crate::core::group_membership::GroupMembershipStore::new();
+        membership.add(1, 10, 2).unwrap();
+        membership.add(1, 10, 3).unwrap();
+        membership.add(2, 20, 2).unwrap();
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), membership);
+        let filtered = h
+            .read(
+                im::ATTR_GROUP_TABLE,
+                &ReadCtx {
+                    fabric_index: 1,
+                    fabric_filtered: true,
+                    ..ReadCtx::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_group_table(&filtered), vec![(1, 10, vec![2, 3])]);
+        let all = h
+            .read(im::ATTR_GROUP_TABLE, &ReadCtx::unfiltered(1))
+            .unwrap();
+        assert_eq!(
+            decode_group_table(&all),
+            vec![(1, 10, vec![2, 3]), (2, 20, vec![2])]
+        );
+    }
+
     #[test]
     fn declares_attributes_and_key_set_write_command() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         assert_eq!(
             h.attributes(),
             vec![
@@ -592,7 +675,7 @@ mod tests {
 
     #[test]
     fn group_key_map_and_group_table_are_empty_arrays() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         for attr in [im::ATTR_GROUP_KEY_MAP, im::ATTR_GROUP_TABLE] {
             let tlv = read(&h, attr);
             let mut r = Reader::new(&tlv);
@@ -603,7 +686,7 @@ mod tests {
 
     #[test]
     fn capacity_attributes_report_fixed_values() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         // Literal brief values (not `MAX_GROUPS_PER_FABRIC`/
         // `MAX_GROUP_KEYS_PER_FABRIC`) so this test still catches a wrong
         // constant value.
@@ -618,7 +701,8 @@ mod tests {
 
     #[test]
     fn unknown_attribute_and_unknown_command_are_rejected() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         assert!(h.read(0x7777, &ReadCtx::default()).is_none());
         // 0x01 (KeySetRead, spec §11.2.7.2) is a real command id but not one
         // this implementation accepts — a CASE session (fabric_index != 0)
@@ -637,7 +721,7 @@ mod tests {
     #[test]
     fn key_set_write_stores_keyset_and_enforces_capacity() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let fields = mat_controller::im::encode_key_set_write_fields(0x01AA, &[0x11; 16]);
         let mut ctx = InvokeCtx {
             fabric_index: 1,
@@ -672,7 +756,8 @@ mod tests {
 
     #[test]
     fn key_set_write_rejects_pase_and_malformed() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         let fields = mat_controller::im::encode_key_set_write_fields(1, &[0u8; 16]);
         let mut pase = InvokeCtx::default(); // fabric_index 0 = PASE
         assert_eq!(
@@ -705,7 +790,7 @@ mod tests {
     #[test]
     fn group_key_map_write_replace_append_and_fabric_filtered_read() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -761,7 +846,7 @@ mod tests {
     #[test]
     fn group_key_map_write_list_append_adds_one_entry() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -786,7 +871,7 @@ mod tests {
     #[test]
     fn group_key_map_write_rejects_group_id_zero() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -808,7 +893,7 @@ mod tests {
     #[test]
     fn group_key_map_write_rejects_other_fabrics_keyset() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx1 = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -834,7 +919,8 @@ mod tests {
     /// `STATUS_UNSUPPORTED_ACCESS`。
     #[test]
     fn write_rejects_unsupported_attribute_and_pase() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         let data = mat_controller::im::encode_group_key_map_tlv(&[]);
         let mut ctx = InvokeCtx {
             fabric_index: 1,
@@ -857,7 +943,7 @@ mod tests {
     #[test]
     fn group_key_map_read_unfiltered_returns_all_fabrics() {
         let store = GroupKeyStore::new();
-        let h = GroupKeyManagementHandler::new(store.clone());
+        let h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         store.upsert_keyset(1, 7, [0u8; 16]).unwrap();
         store.upsert_keyset(2, 8, [0u8; 16]).unwrap();
         store.replace_fabric_map(1, vec![(0x000A, 7)]);

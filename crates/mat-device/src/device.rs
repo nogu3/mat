@@ -347,7 +347,12 @@ impl Device {
         );
         node.add_cluster(
             0,
-            Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new(gk_store)),
+            Box::new(
+                crate::core::group_key_management::GroupKeyManagementHandler::new(
+                    gk_store,
+                    membership.clone(),
+                ),
+            ),
         );
 
         // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
