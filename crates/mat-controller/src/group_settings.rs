@@ -200,6 +200,7 @@ pub(crate) fn parse_fabric_data(blob: &[u8]) -> Option<FabricData> {
 }
 
 /// `f/<idx>/g/<gid>` — group name / endpoint 情報 / チェーン内 next。
+#[derive(Clone)]
 struct GroupData {
     name: String,
     first_endpoint: u16,
@@ -518,6 +519,103 @@ fn scan_map(
         entries.push((id, km));
     }
     Ok(entries)
+}
+
+/// GroupData チェーンを `first_group` から `group_count` 回歩く。
+fn scan_groups(
+    txn: &KvsTxn,
+    fabric_index: u8,
+    fabric: &FabricData,
+) -> Result<Vec<(u16, GroupData)>, GroupSettingsError> {
+    let mut cur = fabric.first_group;
+    let mut out = Vec::with_capacity(fabric.group_count as usize);
+    for _ in 0..fabric.group_count {
+        let key = format!("f/{fabric_index}/g/{cur:x}");
+        let blob = txn
+            .get(&key)?
+            .ok_or_else(|| corrupt(&key, "missing group record"))?;
+        let gd = parse_group_data(&blob).ok_or_else(|| corrupt(&key, "unparseable GroupData"))?;
+        let next = gd.next;
+        out.push((cur, gd));
+        cur = next;
+    }
+    Ok(out)
+}
+
+/// KeySetData チェーンを `first_keyset` から `keyset_count` 回歩き、(id, 生 blob) を返す。
+fn scan_keysets(
+    txn: &KvsTxn,
+    fabric_index: u8,
+    fabric: &FabricData,
+) -> Result<Vec<(u16, Vec<u8>)>, GroupSettingsError> {
+    let mut cur = fabric.first_keyset;
+    let mut out = Vec::with_capacity(fabric.keyset_count as usize);
+    for _ in 0..fabric.keyset_count {
+        let key = format!("f/{fabric_index}/k/{cur:x}");
+        let blob = txn
+            .get(&key)?
+            .ok_or_else(|| corrupt(&key, "missing keyset record"))?;
+        let next = keyset_next(&blob).ok_or_else(|| corrupt(&key, "unparseable KeySetData"))?;
+        out.push((cur, blob));
+        cur = next;
+    }
+    Ok(out)
+}
+
+/// `mat group list` の読み出し結果。鍵素材は載せない。
+#[derive(Debug)]
+pub struct GroupTable {
+    pub groups: Vec<GroupRow>,
+    pub keysets: Vec<KeysetRow>,
+}
+#[derive(Debug)]
+pub struct GroupRow {
+    pub group_id: u16,
+    pub name: String,
+    pub keyset_id: Option<u16>,
+}
+#[derive(Debug)]
+pub struct KeysetRow {
+    pub keyset_id: u16,
+    pub bound_groups: Vec<u16>,
+}
+
+/// コントローラ側 group state を読む（`KvsTxn::open` の flock 区間で読み切り、
+/// 書かずに drop）。`f/<idx>/g` が無い = 未 provision = 空。
+pub fn read_groups(main_ini: &Path, fabric_index: u8) -> Result<GroupTable, GroupSettingsError> {
+    let txn = KvsTxn::open(main_ini)?;
+    let fkey = format!("f/{fabric_index}/g");
+    let Some(fb) = txn.get(&fkey)? else {
+        return Ok(GroupTable {
+            groups: Vec::new(),
+            keysets: Vec::new(),
+        });
+    };
+    let fabric = parse_fabric_data(&fb).ok_or_else(|| corrupt(&fkey, "unparseable FabricData"))?;
+    let maps = scan_map(&txn, fabric_index, &fabric)?;
+    let groups = scan_groups(&txn, fabric_index, &fabric)?
+        .into_iter()
+        .map(|(id, gd)| GroupRow {
+            group_id: id,
+            name: gd.name,
+            keyset_id: maps
+                .iter()
+                .find(|(_, m)| m.group_id == id)
+                .map(|(_, m)| m.keyset_id),
+        })
+        .collect();
+    let keysets = scan_keysets(&txn, fabric_index, &fabric)?
+        .into_iter()
+        .map(|(id, _)| KeysetRow {
+            keyset_id: id,
+            bound_groups: maps
+                .iter()
+                .filter(|(_, m)| m.keyset_id == id)
+                .map(|(_, m)| m.group_id)
+                .collect(),
+        })
+        .collect();
+    Ok(GroupTable { groups, keysets })
 }
 
 /// rebind の unbind（best-effort、chip-tool 経路と同じ: 見つからなくても
@@ -968,5 +1066,39 @@ mod tests {
         let txn = crate::kvs::KvsTxn::open(&p).unwrap();
         let g = parse_group_data(&txn.get("f/2/g/5").unwrap().unwrap()).unwrap();
         assert_eq!(g.name, "0123456789abcdef");
+    }
+
+    #[test]
+    fn read_groups_empty_when_never_provisioned() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        let t = read_groups(&p, 2).unwrap();
+        assert!(t.groups.is_empty() && t.keysets.is_empty());
+    }
+
+    #[test]
+    fn read_groups_lists_chain_with_shared_keyset() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 42, false);
+        provision(&p, 2, 42, false);
+        provision(&p, 3, 7, false);
+        let t = read_groups(&p, 2).unwrap();
+        let ids: Vec<(u16, Option<u16>)> =
+            t.groups.iter().map(|g| (g.group_id, g.keyset_id)).collect();
+        assert_eq!(ids, vec![(1, Some(42)), (2, Some(42)), (3, Some(7))]);
+        assert!(t.groups.iter().all(|g| g.name == "e2e"));
+        let mut ks: Vec<(u16, Vec<u16>)> = t
+            .keysets
+            .iter()
+            .map(|k| (k.keyset_id, k.bound_groups.clone()))
+            .collect();
+        ks.sort();
+        assert_eq!(ks, vec![(7, vec![3]), (42, vec![1, 2])]);
+    }
+
+    #[test]
+    fn read_groups_missing_ini_is_kvs_io_error() {
+        let d = tempfile::tempdir().unwrap();
+        let err = read_groups(&d.path().join("chip_tool_config.ini"), 2).unwrap_err();
+        assert!(matches!(err, GroupSettingsError::Kvs(KvsError::Io(_))));
     }
 }

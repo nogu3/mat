@@ -16,6 +16,9 @@ use base64ct::{Base64, Encoding};
 
 use crate::tlv::{Element, Reader, Tag, Value};
 
+/// chip-tool 互換 main KVS のファイル名（store ルート直下）。
+pub const MAIN_INI_FILE: &str = "chip_tool_config.ini";
+
 /// Fabric credentials read from chip-tool's ini KVS, still in raw form
 /// (opaque certs, unparsed keys) as CASE needs them.
 #[derive(Clone)]
@@ -344,7 +347,7 @@ fn parse_key_struct(r: &mut Reader, fabric_index: u8) -> Result<([u8; 16], Optio
 /// hash is `Option` — see [`parse_key_struct`] for why; callers that need the
 /// hash (group send) must check for `None` themselves, callers that don't
 /// (IPK read, via [`parse_keyset`]) ignore it entirely.
-fn parse_keyset_first_entry(
+pub(crate) fn parse_keyset_first_entry(
     blob: &[u8],
     fabric_index: u8,
 ) -> Result<([u8; 16], Option<u16>), KvsError> {
