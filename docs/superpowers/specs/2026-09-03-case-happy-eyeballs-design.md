@@ -249,7 +249,8 @@ docs/errors.md の kind / exit code に変更なし。
 6. `check_ecdsa_sha256_alg`: sha256WithRSAEncryption → `UnsupportedAlg`。
 7. `parse_key_usage`: 正常 / 空 BIT STRING → `Der` / タグ違い / 3 バイト超。
 8. `parse_basic_constraints`: 空 SEQUENCE → `false` / 先頭が BOOLEAN でない →
-   `false` / BOOLEAN 空内容 → Err。
+   `false` / BOOLEAN 空内容 → `false`（DEFAULT FALSE、実装の `unwrap_or(0)`）/
+   値が SEQUENCE でない → Err。
 9. `parse_validity` / `parse_time_value`: UTCTime / GeneralizedTime / 非 Time タグ →
    `None`。
 10. `DerReader::read`: 短形式 / 0x81 / 0x82 / 0x83 以上 → Err / 不定長 0x80 → Err /
