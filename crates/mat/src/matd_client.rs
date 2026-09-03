@@ -226,21 +226,35 @@ fn to_op(op: &DeviceOp) -> Result<Value, String> {
                     cluster_in,
                     attribute_in,
                     value_in,
+                    timed,
                     ..
-                } => json!({
-                    "op": "write", "node_id": node_id, "endpoint": endpoint,
-                    "cluster": cluster_in, "attribute": attribute_in, "value": value_in,
-                }),
+                } => {
+                    let mut op = json!({
+                        "op": "write", "node_id": node_id, "endpoint": endpoint,
+                        "cluster": cluster_in, "attribute": attribute_in, "value": value_in,
+                    });
+                    if *timed {
+                        op["timed"] = json!(true);
+                    }
+                    op
+                }
                 NodeOpKind::Invoke {
                     endpoint,
                     cluster_in,
                     command_in,
                     args_in,
+                    timed,
                     ..
-                } => json!({
-                    "op": "invoke", "node_id": node_id, "endpoint": endpoint,
-                    "cluster": cluster_in, "command": command_in, "args": args_in,
-                }),
+                } => {
+                    let mut op = json!({
+                        "op": "invoke", "node_id": node_id, "endpoint": endpoint,
+                        "cluster": cluster_in, "command": command_in, "args": args_in,
+                    });
+                    if *timed {
+                        op["timed"] = json!(true);
+                    }
+                    op
+                }
                 NodeOpKind::Describe => json!({ "op": "describe", "node_id": node_id }),
                 NodeOpKind::On { endpoint } => {
                     json!({ "op": "on", "node_id": node_id, "endpoint": endpoint })
@@ -800,7 +814,7 @@ mod tests {
     fn write_invoke_and_group_invoke_keep_names_and_args_on_the_wire() {
         let w = node(
             1,
-            NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap(),
+            NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap(),
         );
         assert_eq!(
             to_op(&w).unwrap(),
@@ -809,7 +823,7 @@ mod tests {
         let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
         let i = node(
             1,
-            NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args).unwrap(),
+            NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args, false).unwrap(),
         );
         assert_eq!(
             to_op(&i).unwrap(),
@@ -824,6 +838,19 @@ mod tests {
             to_op(&node(1, NodeOpKind::Describe)).unwrap(),
             json!({"op":"describe","node_id":1})
         );
+    }
+
+    #[test]
+    fn timed_true_is_sent_on_wire_and_false_is_omitted() {
+        let op = node(1, NodeOpKind::invoke(1, "onoff", "on", &[], true).unwrap());
+        assert_eq!(to_op(&op).unwrap()["timed"], json!(true));
+        let op = node(1, NodeOpKind::invoke(1, "onoff", "on", &[], false).unwrap());
+        assert!(to_op(&op).unwrap().get("timed").is_none());
+        let op = node(
+            1,
+            NodeOpKind::write(1, "levelcontrol", "on-level", "128", true).unwrap(),
+        );
+        assert_eq!(to_op(&op).unwrap()["timed"], json!(true));
     }
 
     #[test]

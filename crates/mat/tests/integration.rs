@@ -705,3 +705,39 @@ fn unpair_unknown_node_exits_11_even_with_force() {
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
 }
+
+// ── --timed（invoke / write の timed 上書き）─────────────────────────────
+
+#[test]
+fn timed_flag_is_accepted_by_invoke_and_write() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("nope");
+    mat(&missing)
+        .args([
+            "invoke",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--command",
+            "on",
+            "--timed",
+        ])
+        .assert()
+        .code(10);
+    mat(&missing)
+        .args([
+            "write",
+            "--node",
+            "5",
+            "--cluster",
+            "levelcontrol",
+            "--attribute",
+            "on-level",
+            "--value",
+            "128",
+            "--timed",
+        ])
+        .assert()
+        .code(10);
+}

@@ -106,9 +106,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             cluster,
             attribute,
             value,
+            timed,
         } => node(
             node_id,
-            NodeOpKind::write(endpoint.id()?, cluster, attribute, value)?,
+            NodeOpKind::write(endpoint.id()?, cluster, attribute, value, *timed)?,
         ),
         Command::Invoke {
             node_id,
@@ -116,9 +117,10 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             cluster,
             command,
             args,
+            timed,
         } => node(
             node_id,
-            NodeOpKind::invoke(endpoint.id()?, cluster, command, args)?,
+            NodeOpKind::invoke(endpoint.id()?, cluster, command, args, *timed)?,
         ),
         Command::Describe { node_id } => node(node_id, NodeOpKind::Describe),
         Command::On { node_id, endpoint } => node(
@@ -433,6 +435,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         };
         assert!(matches!(node_op(&w).kind, NodeOpKind::Write { .. }));
         let acl = Command::Write {
@@ -441,6 +444,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         };
         let err = classify(&acl).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -455,6 +459,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         };
         assert!(matches!(
             node_op(&inv).kind,
@@ -469,6 +474,7 @@ mod tests {
             cluster: "groupkeymanagement".into(),
             command: "key-set-write".into(),
             args: vec!["{}".into()],
+            timed: false,
         };
         assert_eq!(classify(&ks).unwrap_err().kind, ErrorKind::ParseError);
     }

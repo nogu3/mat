@@ -672,9 +672,10 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             cluster,
             attribute,
             value,
+            timed,
         } => node(
             *node_id,
-            NodeOpKind::write(*endpoint, cluster, attribute, value)?,
+            NodeOpKind::write(*endpoint, cluster, attribute, value, *timed)?,
         ),
         Op::Invoke {
             node_id,
@@ -682,9 +683,10 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             cluster,
             command,
             args,
+            timed,
         } => node(
             *node_id,
-            NodeOpKind::invoke(*endpoint, cluster, command, args)?,
+            NodeOpKind::invoke(*endpoint, cluster, command, args, *timed)?,
         ),
         Op::On { node_id, endpoint } => node(
             *node_id,
@@ -1168,6 +1170,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         })
         .unwrap();
         assert!(matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Write { .. })));
@@ -1177,6 +1180,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         })
         .unwrap();
         assert!(
@@ -1184,6 +1188,22 @@ mod tests {
         );
         assert!(
             matches!(to_device_op(&Op::Describe { node_id: 5 }).unwrap(), MatdOp::Node(ref n) if n.kind == NodeOpKind::Describe)
+        );
+    }
+
+    #[test]
+    fn to_device_op_applies_timed_override() {
+        let m = to_device_op(&Op::Invoke {
+            node_id: 1,
+            endpoint: 1,
+            cluster: "onoff".into(),
+            command: "on".into(),
+            args: vec![],
+            timed: true,
+        })
+        .unwrap();
+        assert!(
+            matches!(m, MatdOp::Node(ref n) if matches!(n.kind, NodeOpKind::Invoke { timed: true, .. }))
         );
     }
 
@@ -1209,6 +1229,7 @@ mod tests {
             cluster: "nosuchcluster".into(),
             command: "x".into(),
             args: vec![],
+            timed: false,
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1219,6 +1240,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
@@ -1413,6 +1435,7 @@ mod tests {
             cluster: "accesscontrol".into(),
             attribute: "acl".into(),
             value: "{}".into(),
+            timed: false,
         };
         let err = run_op(&op, &state, store_with_node_5().path(), &health, None)
             .await
@@ -1438,6 +1461,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             command: "move-to-level".into(),
             args: vec!["128".into(), "0".into(), "0".into(), "0".into()],
+            timed: false,
         };
         let body = run_op(&invoke, &state, dir.path(), &health, None)
             .await
@@ -1921,6 +1945,7 @@ mod tests {
             cluster: "onoff".into(),
             command: "toggle".into(),
             args: vec![],
+            timed: false,
         };
         assert_eq!(op_report_expectation(&invoke, Some(&t), Some(&l128)), None);
         let write = Op::Write {
@@ -1929,6 +1954,7 @@ mod tests {
             cluster: "levelcontrol".into(),
             attribute: "on-level".into(),
             value: "128".into(),
+            timed: false,
         };
         assert_eq!(op_report_expectation(&write, Some(&t), Some(&l128)), None);
         // Read は元から対象外。

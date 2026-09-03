@@ -66,6 +66,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             cluster,
             attribute,
             value,
+            timed,
         } => {
             let node = book.resolve_node(&node_id)?;
             let ep = book.resolve_endpoint(node, &endpoint)?;
@@ -75,6 +76,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 cluster,
                 attribute,
                 value,
+                timed,
             }
         }
         Command::Invoke {
@@ -83,6 +85,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             cluster,
             command,
             args,
+            timed,
         } => {
             let node = book.resolve_node(&node_id)?;
             let ep = book.resolve_endpoint(node, &endpoint)?;
@@ -92,6 +95,7 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 cluster,
                 command,
                 args,
+                timed,
             }
         }
         Command::Describe { node_id } => Command::Describe {

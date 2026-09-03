@@ -41,6 +41,9 @@ pub enum Op {
         cluster: String,
         attribute: String,
         value: String,
+        /// true への上書きのみ（省略 = 表の値）。
+        #[serde(default)]
+        timed: bool,
     },
     /// クラスタコマンドを実行する。
     Invoke {
@@ -50,6 +53,9 @@ pub enum Op {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        /// true への上書きのみ（省略 = 表の値）。
+        #[serde(default)]
+        timed: bool,
     },
     /// OnOff On のショートカット。
     On { node_id: u64, endpoint: u16 },
@@ -387,6 +393,20 @@ mod tests {
             r.op,
             Op::Write { ref value, .. } if value == "128"
         ));
+    }
+
+    #[test]
+    fn invoke_and_write_timed_defaults_false() {
+        let req: Request = serde_json::from_str(
+            r#"{"op":"invoke","node_id":1,"endpoint":1,"cluster":"onoff","command":"on"}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.op, Op::Invoke { timed: false, .. }));
+        let req: Request = serde_json::from_str(
+            r#"{"op":"write","node_id":1,"endpoint":1,"cluster":"levelcontrol","attribute":"on-level","value":"128","timed":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.op, Op::Write { timed: true, .. }));
     }
 
     #[test]

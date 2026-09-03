@@ -178,11 +178,14 @@ impl NodeOpKind {
     }
 
     /// 名前解決 + 値のスカラー化。`NotNative` = 未解決、`Reject` = 符号化不能。
+    ///
+    /// `timed_override` は true への上書きのみ（表が true なら常に true）。
     pub fn write(
         endpoint: u16,
         cluster_in: &str,
         attribute_in: &str,
         value_in: &str,
+        timed_override: bool,
     ) -> Result<Self, MatError> {
         match ids::classify_write(cluster_in, attribute_in, value_in) {
             WriteClass::NotNative => Err(MatError::unresolved_op()),
@@ -200,17 +203,20 @@ impl NodeOpKind {
                 attribute,
                 value_in: value_in.to_string(),
                 value,
-                timed,
+                timed: timed || timed_override,
             }),
         }
     }
 
     /// 名前解決 + 引数のスカラー化 → CommandFields TLV。
+    ///
+    /// `timed_override` は true への上書きのみ（表が true なら常に true）。
     pub fn invoke(
         endpoint: u16,
         cluster_in: &str,
         command_in: &str,
         args: &[String],
+        timed_override: bool,
     ) -> Result<Self, MatError> {
         let (cluster, command, fields_tlv, timed) = resolve_invoke(cluster_in, command_in, args)?;
         Ok(NodeOpKind::Invoke {
@@ -221,7 +227,7 @@ impl NodeOpKind {
             cluster,
             command,
             fields_tlv,
-            timed,
+            timed: timed || timed_override,
         })
     }
 
@@ -756,7 +762,7 @@ mod tests {
 
     #[test]
     fn write_scalar_ok_bad_json_shape_rejected_unknown_unresolved() {
-        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap();
+        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap();
         assert!(matches!(
             k,
             NodeOpKind::Write {
@@ -766,14 +772,14 @@ mod tests {
                 ..
             }
         ));
-        let err = NodeOpKind::write(1, "accesscontrol", "acl", "{}").unwrap_err();
+        let err = NodeOpKind::write(1, "accesscontrol", "acl", "{}", false).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
         assert!(
             err.detail.contains("expected a JSON array"),
             "{}",
             err.detail
         );
-        let err = NodeOpKind::write(1, "nosuch", "x", "1").unwrap_err();
+        let err = NodeOpKind::write(1, "nosuch", "x", "1", false).unwrap_err();
         assert!(
             err.detail.contains("numeric IDs are accepted"),
             "{}",
@@ -784,7 +790,7 @@ mod tests {
     #[test]
     fn invoke_scalar_args_ok_struct_args_rejected() {
         let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
-        let k = NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args).unwrap();
+        let k = NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args, false).unwrap();
         assert!(matches!(
             k,
             NodeOpKind::Invoke {
@@ -793,7 +799,7 @@ mod tests {
                 ..
             }
         ));
-        let k = NodeOpKind::invoke(1, "onoff", "on", &[]).unwrap();
+        let k = NodeOpKind::invoke(1, "onoff", "on", &[], false).unwrap();
         assert!(matches!(
             k,
             NodeOpKind::Invoke {
@@ -803,9 +809,40 @@ mod tests {
                 ..
             }
         ));
-        let err = NodeOpKind::invoke(1, "groupkeymanagement", "key-set-write", &["{}".into()])
-            .unwrap_err();
+        let err = NodeOpKind::invoke(
+            1,
+            "groupkeymanagement",
+            "key-set-write",
+            &["{}".into()],
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
+    }
+
+    #[test]
+    fn timed_override_forces_true_but_never_false() {
+        // 表 false + override → true。
+        let k = NodeOpKind::invoke(1, "onoff", "on", &[], true).unwrap();
+        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
+        // 数値 ID（表なし）+ override → true。
+        let k = NodeOpKind::invoke(1, "6", "1", &[], true).unwrap();
+        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
+        // 表 true は override false でも true のまま。
+        let k = NodeOpKind::invoke(
+            0,
+            "administratorcommissioning",
+            "revoke-commissioning",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
+        // write も同じ。
+        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", true).unwrap();
+        assert!(matches!(k, NodeOpKind::Write { timed: true, .. }));
+        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap();
+        assert!(matches!(k, NodeOpKind::Write { timed: false, .. }));
     }
 
     #[test]
@@ -877,10 +914,10 @@ mod tests {
         assert!(NodeOpKind::read(1, "onoff", "on-off")
             .unwrap()
             .budget_applies());
-        assert!(NodeOpKind::write(1, "onoff", "on-off", "true")
+        assert!(NodeOpKind::write(1, "onoff", "on-off", "true", false)
             .unwrap()
             .budget_applies());
-        assert!(NodeOpKind::invoke(1, "onoff", "on", &[])
+        assert!(NodeOpKind::invoke(1, "onoff", "on", &[], false)
             .unwrap()
             .budget_applies());
         assert!(NodeOpKind::Describe.budget_applies());
@@ -1034,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn write_encodes_scalar_tlv_and_echoes_normalized_value() {
         let mut conn = FakeConn::default();
-        let op = node(NodeOpKind::write(1, "levelcontrol", "on-level", "128").unwrap());
+        let op = node(NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap());
         let body = run_node_op(&mut conn, &op).await.unwrap();
         assert_eq!(
             body,
@@ -1049,7 +1086,8 @@ mod tests {
     async fn invoke_generic_forwards_ids_and_builds_body() {
         let mut conn = FakeConn::default();
         let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
-        let op = node(NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args).unwrap());
+        let op =
+            node(NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args, false).unwrap());
         let body = run_node_op(&mut conn, &op).await.unwrap();
         assert_eq!(
             body,

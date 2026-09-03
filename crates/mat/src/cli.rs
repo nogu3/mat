@@ -179,6 +179,11 @@ pub enum Command {
         /// 書き込む値（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(long, value_name = "VALUE")]
         value: String,
+        /// Timed Request を先行送信して timed 実行にする（true への上書きのみ。
+        /// 表が timed のコマンド/属性は本フラグ無しでも常に timed）。数値 ID 指定
+        /// や表に無いコマンドを timed にしたいときに使う。
+        #[arg(long)]
+        timed: bool,
     },
 
     /// コマンドを実行する。照明 ON/OFF 等の「制御」はここ（属性 write ではない）。
@@ -198,6 +203,11 @@ pub enum Command {
         /// コマンド引数（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+        /// Timed Request を先行送信して timed 実行にする（true への上書きのみ。
+        /// 表が timed のコマンド/属性は本フラグ無しでも常に timed）。数値 ID 指定
+        /// や表に無いコマンドを timed にしたいときに使う。
+        #[arg(long)]
+        timed: bool,
     },
 
     /// ノードのエンドポイント / クラスタを introspect する。
