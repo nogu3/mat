@@ -175,6 +175,9 @@ mat read -n 5 -c onoff -a on-off                 # same, short aliases
 # Set a writable attribute
 mat write --node 5 --cluster levelcontrol --attribute on-level --value 128
 
+# List / struct values are JSON (see "Generic write / invoke value encoding")
+mat write --node 5 --cluster accesscontrol --attribute acl --value '[{"privilege":5,"auth-mode":2,"subjects":[112233],"targets":null}]'
+
 # Run a command: --command plus trailing command args
 mat invoke --node 5 --cluster levelcontrol --command move-to-level 128 0 0 0
 
@@ -1020,19 +1023,42 @@ the event stream's receive wait, not a single op).
   error. A fabric created by `mat fabric init` starts at case (1) with a random
   epoch. Adoption happens on the first native commission — no separate step.
 
-#### Scalar-only generic write / invoke
+#### Generic write / invoke value encoding
 
-Generic `write` / `invoke` (and `group invoke`) encode **scalar** JSON→TLV types
-only: bool / int / uint / enum / bitmap / string / octstr (bytes as a
-`hex:`-prefixed string) / float (single/double, decimal literal like 1.5). An
-attribute or command field the name table knows to be `list` / `struct` is
-rejected up front with `parse_error` (the detail names the type). This is a
-deliberate, documented limitation — the practical
-cases (onoff / level / color, and the ACL entry `group grant` appends) are all
-covered, and the numeric-ID escape hatch remains for names the generated table
-does not resolve (an unknown name is also a `parse_error`; pass the numeric id).
+Generic `write` / `invoke` (and `group invoke`) encode the value from the type
+the generated name table (`mat-core::ids`, connectedhomeip v1.4.2.0) knows for
+the attribute / command field:
+
+- **Scalars** use plain literals: `true` / `false` / `1` / `0` (bool), decimal
+  or `0x..` (uint / enum / bitmap), decimal (int), `1.5` / `2e-3` (float —
+  `single` / `double` pick TLV f32 / f64), any text (string), `hex:aabb`
+  (octstr). `null` writes a null (nullability is checked by the device).
+- **Lists and structs** take **JSON**. A struct is an object whose keys are the
+  field names in kebab-case (`privilege`, `auth-mode`, `group-key-set-id`) **or**
+  the numeric field ids as strings (`"1"`, `"254"`) — the shape `read` prints —
+  so a `read` result can be written back verbatim. Inside JSON, uint fields also
+  accept `"0x.."` strings (64-bit subjects), octstr fields accept `"aabb"` or
+  `"hex:aabb"`, and fabric-scoped structs accept the implicit `fabric-index`
+  (254; the server ignores / replaces it). Unknown keys, a field given both by
+  name and by id, a missing non-optional field, or a JSON shape that does not
+  match the type are `parse_error` with the offending path in `detail`.
+- **Numeric ids** (a cluster / attribute / command the table does not know)
+  carry no schema: scalars are inferred from the literal (`true`, `42`, `-1`,
+  `1.5`, `hex:..`, else string); a list / struct JSON is a `parse_error` —
+  use a name the table knows.
+
 The `group provision` / `grant` list/struct writes (KeySetWrite, GroupKeyMap,
-binding, ACL read-modify-write) use dedicated encoders, not the generic path.
+ACL read-modify-write) keep their dedicated encoders; unit tests pin that the
+generic encoder produces byte-identical TLV for the same entries.
+
+```bash
+# Write back a list-of-struct attribute exactly as read prints it (numeric keys)
+mat write --node 5 --cluster groupkeymanagement --attribute group-key-map \
+  --value '[{"1":257,"2":1,"254":1}]'
+# ... or with field names
+mat write --node 5 --cluster groupkeymanagement --attribute group-key-map \
+  --value '[{"group-id":257,"group-key-set-id":1}]'
+```
 
 #### Groupcast counter (shared between `mat` and `matd`)
 
