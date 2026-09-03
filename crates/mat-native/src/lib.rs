@@ -1028,6 +1028,10 @@ mod tests {
         ));
 
         assert_eq!(scalar_to_im(&S::List(vec![])), None);
+
+        // write 経路の float 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte のみ）。
+        assert_eq!(scalar_to_tlv(&S::F32(1.5))[0] & 0x1F, 0x0A);
+        assert_eq!(scalar_to_tlv(&S::F64(1.5))[0] & 0x1F, 0x0B);
     }
 
     #[test]

@@ -1052,6 +1052,18 @@ the attribute / command field:
   `1.5`, `hex:..`, else string); a list / struct JSON is a `parse_error` —
   use a name the table knows.
 
+The value is encoded by whichever process runs the op. When a `write` /
+`invoke` is routed through a running `matd`, the daemon does the encoding, so
+a `matd` older than this release rejects list / struct (and float) values with
+`parse_error` (`... supports scalars only`). Upgrade `matd`, or force the
+direct path with `MAT_MATD=0` for that call.
+
+A list value must fit in a single WriteRequest; `mat` does not chunk list
+writes (`ListIndex: null` append trains), which is ample for the writable
+lists in practice (ACL, group-key-map, binding, labels). The `value` echoed
+in the `write` result is the parsed input (JSON for list / struct, the
+normalized literal otherwise), not a read-back from the device.
+
 The `group provision` / `grant` list/struct writes (KeySetWrite, GroupKeyMap,
 ACL read-modify-write) keep their dedicated encoders; unit tests pin that the
 generic encoder produces byte-identical TLV for the same entries.

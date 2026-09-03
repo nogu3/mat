@@ -160,7 +160,7 @@ pub enum Command {
         /// 属性名（chip-tool 表記）。
         #[arg(short = 'a', long, value_name = "NAME")]
         attribute: String,
-        /// 書き込む値（native で JSON→TLV エンコード。scalar のみ、README 参照）。
+        /// 書き込む値（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(long, value_name = "VALUE")]
         value: String,
     },
@@ -179,7 +179,7 @@ pub enum Command {
         /// コマンド名（chip-tool 表記、例: `on` / `off` / `move-to-level`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
+        /// コマンド引数（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -468,7 +468,7 @@ pub enum GroupCommand {
         /// コマンド名（chip-tool 表記、例: `on` / `off`）。
         #[arg(long, value_name = "NAME")]
         command: String,
-        /// コマンド引数（native で JSON→TLV エンコード。scalar のみ、README 参照）。
+        /// コマンド引数（scalar はリテラル、list/struct は JSON。docs/commands.md「Generic write / invoke value encoding」参照）。
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
         /// 宛先エンドポイント（既定 1、数値のみ — ノード文脈が無いため alias 不可）。

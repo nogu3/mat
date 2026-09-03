@@ -196,6 +196,19 @@ fn parse_finite_f64(s: &str) -> Result<f64, String> {
     }
 }
 
+/// f64 → f32。f32 の範囲を超える値（`1e300` 等）は inf に飽和するので拒否する
+/// （spec §2.2: nan / inf は送らない）。
+fn to_finite_f32(f: f64) -> Result<f32, String> {
+    let x = f as f32;
+    if x.is_finite() {
+        Ok(x)
+    } else {
+        Err(format!(
+            "float value {f} is out of range for a single-precision (f32) attribute"
+        ))
+    }
+}
+
 /// 型記述に従って CLI 入力文字列を値へ。Err は人間可読の理由（そのまま
 /// parse_error detail に使える）。スカラーはリテラル構文、list / struct は
 /// JSON（名前キー・番号キーの両方を受け付ける）。
@@ -263,10 +276,12 @@ fn json_scalar(j: &serde_json::Value, tag: TypeTag, at: &str) -> Result<ScalarVa
             _ => None,
         }
         .ok_or_else(|| bad("an integer")),
-        TypeTag::F32 => j
-            .as_f64()
-            .map(|f| ScalarValue::F32(f as f32))
-            .ok_or_else(|| bad("a number")),
+        TypeTag::F32 => match j.as_f64() {
+            Some(f) => to_finite_f32(f)
+                .map(ScalarValue::F32)
+                .map_err(|e| format!("{at}: {e}")),
+            None => Err(bad("a number")),
+        },
         TypeTag::F64 => j
             .as_f64()
             .map(ScalarValue::F64)
@@ -350,7 +365,7 @@ fn parse_scalar_literal(s: &str, ty: TypeTag) -> Result<ScalarValue, String> {
             .parse::<i64>()
             .map(ScalarValue::Int)
             .map_err(|_| format!("not an integer: {s:?}")),
-        TypeTag::F32 => parse_finite_f64(s).map(|f| ScalarValue::F32(f as f32)),
+        TypeTag::F32 => parse_finite_f64(s).and_then(|f| to_finite_f32(f).map(ScalarValue::F32)),
         TypeTag::F64 => parse_finite_f64(s).map(ScalarValue::F64),
         TypeTag::Str => Ok(ScalarValue::Str(s.to_string())),
         TypeTag::Bytes => parse_hex_bytes(s).map(ScalarValue::Bytes),
@@ -390,8 +405,8 @@ pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
 /// `mat_native::op::NodeOpKind::write`）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteClass {
-    /// native で実行可能。`cluster` / `attribute` は数値 ID、`value` は型に沿って
-    /// 符号化済みのスカラー。cluster ID を含めるのは、呼び手に resolve_cluster の
+    /// native で実行可能。`cluster` / `attribute` は数値 ID、`value` は型記述に沿って
+    /// 値ツリー化済み（scalar / list / struct）。cluster ID を含めるのは、呼び手に resolve_cluster の
     /// 再解決(classifier との drift で panic し得る)をさせないため。
     Native {
         cluster: u32,
@@ -399,7 +414,8 @@ pub enum WriteClass {
         value: ScalarValue,
         timed: bool,
     },
-    /// cluster/attribute 名は解決できたが値が符号化不能（list/struct/float 等）。
+    /// cluster/attribute 名は解決できたが値が型記述に合わない（不正なリテラル /
+    /// JSON 形不一致 / 未知・欠落フィールド、数値 ID 直指定での list/struct 等）。
     /// 呼び出し側は chip-tool へフォールバックせず即 parse_error を返すこと
     /// （spec 決定: opt-in 下の意図した縮小）。
     Reject(String),
@@ -723,6 +739,13 @@ mod tests {
         assert!(parse_value_typed("nan", &Ty::Scalar(TypeTag::F64)).is_err());
         assert!(parse_value_typed("inf", &Ty::Scalar(TypeTag::F32)).is_err());
         assert!(parse_value_typed("abc", &Ty::Scalar(TypeTag::F64)).is_err());
+        // f64 としては有限でも f32 の範囲を超える値は inf に飽和するので拒否
+        // （f64 はそのまま通る）。
+        assert!(parse_value_typed("1e300", &Ty::Scalar(TypeTag::F32)).is_err());
+        assert!(parse_value_typed("1e300", &Ty::Scalar(TypeTag::F64)).is_ok());
+        // JSON 経路（list of f32）でも同じ範囲検査がかかる。
+        assert!(parse_value_typed("[1e300]", &Ty::List(TypeTag::F32)).is_err());
+        assert!(parse_value_typed("[1.5]", &Ty::List(TypeTag::F32)).is_ok());
     }
 
     #[test]
