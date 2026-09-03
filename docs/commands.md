@@ -205,7 +205,10 @@ Outputs:
   to `max(ledger) + 1` on first load and then start tracking it.
 - With `matd` running, its resident subscription for the removed node goes away
   by itself at the next ledger rescan (≤ 60 s): the subscription loop is
-  aborted and the node drops out of `matd status`. No restart needed.
+  aborted and the node drops out of `matd status`. No restart needed. `unpair`
+  is also the one direct-path op that does **not** send the `node_touched`
+  hint — nudging `matd` to re-establish a session with a node that just left
+  the fabric would only produce CASE-failure backoff until that rescan.
 
 #### Attestation / PAA trust store
 

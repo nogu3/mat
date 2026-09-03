@@ -14,6 +14,8 @@ use mat_core::store::Store;
 use mat_native::runner::OneShotRunner;
 use mat_native::{Engine, NativeConfig};
 
+use mat_native::op::{NodeOp, NodeOpKind};
+
 use crate::device_op::DeviceOp;
 
 pub(crate) struct Config<'a> {
@@ -26,6 +28,32 @@ pub(crate) struct Config<'a> {
 /// 直経路 provision の note（KVS を直接書いたので matd の warm 状態は古い）。
 const PROVISION_NOTE: &str =
     "controller group state written natively to kvs; if matd is running, restart it to reload group state";
+
+/// `node_touched` ヒントを撃ってはいけない op か。
+///
+/// `unpair`（`RemoveFabric`）だけが該当する。ヒントは matd に「このノードを
+/// 今触ったので warm セッションを張り直せ」と伝えるものだが、fabric から
+/// 外した直後のノードに対して撃つと matd が再購読 → CASE 失敗 → backoff を
+/// 台帳 rescan（最大 `LEDGER_RESCAN_INTERVAL` = 60s）まで回し続ける。
+/// 消えるノードなので黙って落とすのが正しい。
+fn suppresses_node_touched_hint(op: &DeviceOp) -> bool {
+    matches!(
+        op,
+        DeviceOp::Node(NodeOp {
+            kind: NodeOpKind::RemoveFabric,
+            ..
+        })
+    )
+}
+
+/// この op に使う `node_touched` ヒント（抑止対象なら no-op）。
+fn hint_for(op: &DeviceOp) -> fn(u64) {
+    if suppresses_node_touched_hint(op) {
+        |_| {}
+    } else {
+        crate::matd_client::hint_node_touched
+    }
+}
 
 /// 直経路 native の入口。`execute` で成功 body を得て stdout へ emit する。
 pub(crate) fn run(
@@ -104,7 +132,7 @@ pub(crate) fn execute(
                 run_with_engine(&engine, op),
                 op_timeout_ms,
                 node_id,
-                crate::matd_client::hint_node_touched,
+                hint_for(op),
             )
             .await
         } else {
@@ -134,7 +162,7 @@ pub(crate) fn execute(
 async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::Value, MatError> {
     // ヒント送信はブロッキング std I/O だが、ここは one-shot CLI の `block_on`
     // 直下で他に走る非同期タスクが無いため async 化する価値が無い（旧 `finish_conn` の doc を継承）。
-    let runner = OneShotRunner::new(engine, crate::matd_client::hint_node_touched);
+    let runner = OneShotRunner::new(engine, hint_for(op));
     match op {
         DeviceOp::Node(n) => mat_native::runner::run_node(&runner, n, None).await,
         DeviceOp::Group(g) => mat_native::op::run_group_op(engine, g).await,
@@ -450,6 +478,29 @@ mod tests {
     }
 
     /// Issue #22: deadline 超過で future ごと drop されると `OneShotRunner` の
+    /// F6: `unpair`（RemoveFabric）だけは node_touched ヒントを撃たない。
+    /// 撃つと matd が外したばかりのノードへ再購読し、次の台帳 rescan（最大
+    /// 60s）まで CASE 失敗の backoff ノイズを出す。
+    #[test]
+    fn remove_fabric_suppresses_the_node_touched_hint() {
+        let unpair = DeviceOp::Node(NodeOp {
+            node_id: 24,
+            kind: NodeOpKind::RemoveFabric,
+        });
+        assert!(suppresses_node_touched_hint(&unpair));
+        // no-op であること（生きたヒントなら env 依存の socket 接続を試みる）。
+        let hint = hint_for(&unpair);
+        hint(24);
+
+        // 他の op はヒントを撃つ（= 抑止対象ではない）。
+        let read = DeviceOp::Node(NodeOp {
+            node_id: 24,
+            kind: NodeOpKind::read(1, "onoff", "on-off").unwrap(),
+        });
+        assert!(!suppresses_node_touched_hint(&read));
+        assert!(!suppresses_node_touched_hint(&DeviceOp::GroupBump));
+    }
+
     /// close+hint が走らない。Err 腕で node_touched ヒントだけは撃つこと
     /// （close はセッション所有権が drop 済みで送れない）。
     #[test]
