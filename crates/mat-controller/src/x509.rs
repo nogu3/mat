@@ -1043,4 +1043,321 @@ mod tests {
         let leaf = parse_x509(&leaf_der).unwrap();
         assert_eq!(leaf.key_usage, Some(0x0001));
     }
+
+    // ---- 監査レーン D: 各パーサの負系・境界（実機不要） ----
+
+    #[test]
+    fn extract_hex_tag_edge_cases() {
+        assert_eq!(
+            extract_hex_tag("Mvid:FFF1 Mpid:8000", "Mvid:"),
+            Some(0xFFF1)
+        );
+        assert_eq!(
+            extract_hex_tag("Mvid:FFF1 Mpid:8000", "Mpid:"),
+            Some(0x8000)
+        );
+        assert_eq!(extract_hex_tag("Mpid:8000", "Mvid:"), None, "prefix 無し");
+        assert_eq!(extract_hex_tag("Mvid:FF", "Mvid:"), None, "4 桁未満");
+        assert_eq!(extract_hex_tag("Mvid:ZZZZ", "Mvid:"), None, "非 hex");
+        assert_eq!(extract_hex_tag("abc Mvid:", "Mvid:"), None, "末尾 prefix");
+        assert_eq!(
+            extract_hex_tag("Mvid:あい", "Mvid:"),
+            None,
+            "マルチバイト境界で str::get が None"
+        );
+        assert_eq!(extract_hex_tag("Mvid:0000", "Mvid:"), Some(0));
+    }
+
+    /// `SET OF { SEQ { oid, value } }` 1 個を組む。
+    fn rdn(oid_bytes: &[u8], value: Vec<u8>) -> Vec<u8> {
+        asn1::set_of(&[&asn1::seq(&[&asn1::oid(oid_bytes), &value])])
+    }
+
+    #[test]
+    fn parse_vid_pid_prefers_oid_rdns_and_accepts_printable_string() {
+        let name = [
+            rdn(OID_CN, asn1::utf8_string("Mvid:1111 Mpid:2222")),
+            rdn(OID_MATTER_VID, asn1::utf8_string("FFF1")),
+            rdn(OID_MATTER_PID, asn1::printable_string("8001")),
+        ]
+        .concat();
+        assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF1), Some(0x8001)));
+    }
+
+    #[test]
+    fn parse_vid_pid_falls_back_to_cn_tags() {
+        let name = rdn(OID_CN, asn1::utf8_string("ACME Mvid:FFF2 Mpid:8002"));
+        assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF2), Some(0x8002)));
+        // CN に片方だけ → 片方だけ。
+        let name = rdn(OID_CN, asn1::utf8_string("Mvid:FFF3"));
+        assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF3), None));
+    }
+
+    #[test]
+    fn parse_vid_pid_ignores_unusable_values() {
+        // 非 UTF-8 の UTF8String → skip
+        let name = rdn(OID_MATTER_VID, asn1::tlv(0x0C, &[0xFF, 0xFE]));
+        assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
+        // 文字列以外の値タグ（OCTET STRING）→ skip
+        let name = rdn(OID_MATTER_VID, asn1::octet_string(b"FFF1"));
+        assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
+        // OID RDN の hex 不正 → None（CN フォールバックも無い）
+        let name = rdn(OID_MATTER_VID, asn1::utf8_string("XYZ1"));
+        assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
+        // 空 Name → (None, None)
+        assert_eq!(parse_vid_pid(&[]).unwrap(), (None, None));
+        // 壊れた構造（SET でなく SEQ が来る）→ Err
+        let bad = asn1::seq(&[&asn1::oid(OID_CN)]);
+        assert!(parse_vid_pid(&bad).is_err());
+    }
+
+    #[test]
+    fn int_to_32_normalizes_der_integers() {
+        assert_eq!(int_to_32(&[0x01; 32]).unwrap(), [0x01; 32]);
+        let mut with_pad = vec![0x00];
+        with_pad.extend_from_slice(&[0x80; 32]);
+        assert_eq!(
+            int_to_32(&with_pad).unwrap(),
+            [0x80; 32],
+            "先頭 0x00 を剥がす"
+        );
+        let mut short = [0u8; 32];
+        short[31] = 0x7F;
+        assert_eq!(int_to_32(&[0x7F]).unwrap(), short, "左ゼロ詰め");
+        assert_eq!(int_to_32(&[0x00]).unwrap(), [0u8; 32], "単独 0x00 は 0");
+        assert_eq!(
+            int_to_32(&[0x01; 33]),
+            Err(X509Error::Der("integer out of range"))
+        );
+        assert_eq!(int_to_32(&[]), Err(X509Error::Der("integer out of range")));
+    }
+
+    /// BIT STRING の中身（unused byte + DER）を組む。
+    fn sig_bits(unused: u8, der: &[u8]) -> Vec<u8> {
+        let mut v = vec![unused];
+        v.extend_from_slice(der);
+        v
+    }
+
+    #[test]
+    fn parse_ecdsa_signature_roundtrips_and_rejects_malformed() {
+        let mut raw = [0u8; 64];
+        raw[..32].copy_from_slice(&[0x11; 32]);
+        raw[32..].copy_from_slice(&[0x22; 32]);
+        let ok = sig_bits(0, &asn1::ecdsa_signature(&raw));
+        assert_eq!(parse_ecdsa_signature(&ok).unwrap(), raw);
+
+        assert_eq!(
+            parse_ecdsa_signature(&[]),
+            Err(X509Error::Der("empty signature bit string"))
+        );
+        assert_eq!(
+            parse_ecdsa_signature(&sig_bits(1, &asn1::ecdsa_signature(&raw))),
+            Err(X509Error::Der("unexpected unused bits in signature"))
+        );
+        let wrong_inner = asn1::seq(&[
+            &asn1::octet_string(&[0x11; 32]),
+            &asn1::integer(&[0x22; 32]),
+        ]);
+        assert_eq!(
+            parse_ecdsa_signature(&sig_bits(0, &wrong_inner)),
+            Err(X509Error::Der("unexpected der tag"))
+        );
+        let too_long = asn1::seq(&[&asn1::integer(&[0x01; 33]), &asn1::integer(&[0x22; 32])]);
+        assert_eq!(
+            parse_ecdsa_signature(&sig_bits(0, &too_long)),
+            Err(X509Error::Der("integer out of range"))
+        );
+    }
+
+    /// SPKI SEQ の中身を組む。
+    fn spki_content(alg: &[u8], curve: &[u8], unused: u8, key: &[u8]) -> Vec<u8> {
+        [
+            asn1::seq(&[&asn1::oid(alg), &asn1::oid(curve)]),
+            asn1::bit_string(unused, key),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn parse_spki_accepts_p256_and_rejects_other_shapes() {
+        let key = [0x04u8; 65];
+        assert_eq!(
+            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_PRIME256V1, 0, &key)).unwrap(),
+            key
+        );
+        const OID_SECP384R1: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+        const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+        assert_eq!(
+            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_SECP384R1, 0, &key)),
+            Err(X509Error::UnsupportedAlg)
+        );
+        assert_eq!(
+            parse_spki(&spki_content(OID_RSA_ENCRYPTION, OID_PRIME256V1, 0, &key)),
+            Err(X509Error::UnsupportedAlg)
+        );
+        assert_eq!(
+            parse_spki(&spki_content(
+                OID_EC_PUBLIC_KEY,
+                OID_PRIME256V1,
+                0,
+                &[0x02; 33]
+            )),
+            Err(X509Error::BadPublicKey),
+            "圧縮点は拒否"
+        );
+        assert_eq!(
+            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_PRIME256V1, 1, &key)),
+            Err(X509Error::BadPublicKey),
+            "unused bits ≠ 0"
+        );
+    }
+
+    #[test]
+    fn check_ecdsa_sha256_alg_rejects_other_algorithms() {
+        assert!(check_ecdsa_sha256_alg(&asn1::oid(OID_ECDSA_SHA256)).is_ok());
+        const OID_SHA256_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+        assert_eq!(
+            check_ecdsa_sha256_alg(&asn1::oid(OID_SHA256_WITH_RSA)),
+            Err(X509Error::UnsupportedAlg)
+        );
+        assert_eq!(
+            check_ecdsa_sha256_alg(&asn1::integer(&[1])),
+            Err(X509Error::Der("unexpected der tag"))
+        );
+    }
+
+    #[test]
+    fn parse_key_usage_roundtrips_cert_bits_and_rejects_empty() {
+        for bits in [0x0001u16, 0x0060, 0x0021] {
+            let (unused, bytes) = crate::cert::key_usage_bits(bits);
+            let value = asn1::bit_string(unused, &bytes);
+            assert_eq!(parse_key_usage(&value).unwrap(), bits, "bits {bits:#06x}");
+        }
+        assert_eq!(
+            parse_key_usage(&asn1::tlv(0x03, &[])),
+            Err(X509Error::Der("empty keyUsage bit string"))
+        );
+        assert_eq!(
+            parse_key_usage(&asn1::octet_string(&[0])),
+            Err(X509Error::Der("unexpected der tag"))
+        );
+        // 余分なバイトは無視される（named-bit は 9 本まで見る）。
+        assert_eq!(
+            parse_key_usage(&asn1::bit_string(0, &[0x80, 0x00, 0x00])).unwrap(),
+            0x0001
+        );
+    }
+
+    #[test]
+    fn parse_basic_constraints_defaults_to_false() {
+        assert!(
+            !parse_basic_constraints(&asn1::seq(&[])).unwrap(),
+            "空 SEQUENCE"
+        );
+        assert!(
+            !parse_basic_constraints(&asn1::seq(&[&asn1::integer(&[0])])).unwrap(),
+            "先頭が BOOLEAN でない"
+        );
+        assert!(parse_basic_constraints(&asn1::seq(&[&asn1::boolean(true)])).unwrap());
+        assert!(!parse_basic_constraints(&asn1::seq(&[&asn1::boolean(false)])).unwrap());
+        assert!(
+            !parse_basic_constraints(&asn1::seq(&[&asn1::tlv(0x01, &[])])).unwrap(),
+            "BOOLEAN 空内容は DEFAULT FALSE"
+        );
+        assert_eq!(
+            parse_basic_constraints(&asn1::octet_string(&[])),
+            Err(X509Error::Der("unexpected der tag"))
+        );
+    }
+
+    #[test]
+    fn parse_validity_handles_time_choice_and_unknown_tags() {
+        let both = [
+            asn1::utc_time("260101000000Z"),
+            asn1::generalized_time("20300101000000Z"),
+        ]
+        .concat();
+        assert_eq!(
+            parse_validity(&both).unwrap(),
+            (
+                Some("260101000000Z".to_string()),
+                Some("20300101000000Z".to_string())
+            )
+        );
+        let odd = [asn1::utc_time("260101000000Z"), asn1::integer(&[1])].concat();
+        assert_eq!(
+            parse_validity(&odd).unwrap(),
+            (Some("260101000000Z".to_string()), None),
+            "Time 以外のタグは None"
+        );
+        let non_ascii = [asn1::tlv(0x17, &[0xFF]), asn1::utc_time("260101000000Z")].concat();
+        assert_eq!(
+            parse_validity(&non_ascii).unwrap().0,
+            None,
+            "非 UTF-8 は None"
+        );
+        assert!(parse_validity(&[0x17]).is_err(), "構造が壊れていれば Err");
+    }
+
+    #[test]
+    fn der_reader_length_forms() {
+        let mut r = DerReader::new(&[0x04, 0x01, 0xAB]);
+        assert_eq!(
+            r.read().unwrap(),
+            (0x04, &[0xAB][..], &[0x04, 0x01, 0xAB][..])
+        );
+        assert!(r.is_empty());
+
+        let mut r = DerReader::new(&[0x04, 0x81, 0x01, 0xAB]);
+        assert_eq!(r.read().unwrap().1, &[0xAB]);
+
+        let mut r = DerReader::new(&[0x04, 0x82, 0x00, 0x01, 0xAB]);
+        assert_eq!(r.read().unwrap().1, &[0xAB]);
+
+        let mut r = DerReader::new(&[0x04, 0x83, 0x00, 0x00, 0x01, 0xAB]);
+        assert_eq!(r.read(), Err(X509Error::Der("unsupported der length form")));
+
+        let mut r = DerReader::new(&[0x04, 0x80, 0xAB, 0x00, 0x00]);
+        assert_eq!(
+            r.read(),
+            Err(X509Error::Der("unsupported der length form")),
+            "不定長"
+        );
+
+        let mut r = DerReader::new(&[0x04, 0x05, 0xAB]);
+        assert_eq!(r.read(), Err(X509Error::Der("truncated content")));
+
+        let mut r = DerReader::new(&[0x04]);
+        assert_eq!(r.read(), Err(X509Error::Der("truncated length")));
+
+        let mut r = DerReader::new(&[]);
+        assert_eq!(r.read(), Err(X509Error::Der("truncated tag")));
+
+        let mut r = DerReader::new(&[0x04, 0x01, 0xAB]);
+        assert_eq!(r.expect(0x30), Err(X509Error::Der("unexpected der tag")));
+    }
+
+    #[test]
+    fn verify_signed_by_rejects_tampered_signature_and_tbs() {
+        let key = crate::case::random_p256_secret();
+        let der = make_test_cert(b"self", b"self", &key, &key, true, None);
+        let good = parse_x509(&der).unwrap();
+        good.verify_signed_by(&good).unwrap();
+
+        let mut bad_sig = good.clone();
+        bad_sig.signature[0] ^= 0x01;
+        assert_eq!(
+            bad_sig.verify_signed_by(&good),
+            Err(X509Error::BadSignature)
+        );
+
+        let mut bad_tbs = good.clone();
+        let last = bad_tbs.tbs.len() - 1;
+        bad_tbs.tbs[last] ^= 0x01;
+        assert_eq!(
+            bad_tbs.verify_signed_by(&good),
+            Err(X509Error::BadSignature)
+        );
+    }
 }

@@ -85,6 +85,10 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   controller subprocess (`chip-tool` is fully retired).
 - Route selection is per-op: matd auto-discovery (if a `matd` answers the probed
   socket) -> `mat`'s own native direct path. There is no third fallback tier.
+- Multi-address CASE goes through `mat-controller::case::establish_any`
+  (staggered race, 500 ms, one UDP socket per candidate). Never reintroduce
+  a sequential `for peer in peers { case::establish }` loop in `mat-native`
+  or the live tests.
 - The interface is **auto-detected** every run (up/multicast/non-loopback/
   non-point-to-point with an IPv6 link-local address; exactly one candidate or a
   hard `other` error). `MAT_IFACE` / `MAT_MATD_IFACE` override it; `matd` refuses

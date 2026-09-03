@@ -2504,4 +2504,423 @@ mod tests {
         let err = decode_remove_fabric(&w.finish()).unwrap_err();
         assert!(matches!(err, CommissionError::Malformed { .. }));
     }
+
+    // ---- 監査レーン D: デコーダの負系・境界（実機不要） ----
+
+    /// `{0: u16, 1: bytes(97), 2: u16, 3: u32, 4: bytes}` を組む小ヘルパ。
+    /// `skip` に入れたタグは省略する（欠損分岐のテスト用）。
+    fn open_window_fields(skip: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        if !skip.contains(&0) {
+            w.put_uint(Tag::Context(0), 180);
+        }
+        if !skip.contains(&1) {
+            w.put_bytes(Tag::Context(1), &[7u8; 97]);
+        }
+        if !skip.contains(&2) {
+            w.put_uint(Tag::Context(2), 0xABC);
+        }
+        if !skip.contains(&3) {
+            w.put_uint(Tag::Context(3), 1000);
+        }
+        if !skip.contains(&4) {
+            w.put_bytes(Tag::Context(4), &[9u8; 16]);
+        }
+        w.end_container();
+        w.finish()
+    }
+
+    #[test]
+    fn decode_open_commissioning_window_roundtrips_with_encoder() {
+        let fields = encode_open_commissioning_window(180, &[7u8; 97], 0xABC, 1000, &[9u8; 16]);
+        let (timeout_s, verifier, disc, iters, salt) =
+            decode_open_commissioning_window(&fields).expect("decode");
+        assert_eq!(timeout_s, 180);
+        assert_eq!(verifier, vec![7u8; 97]);
+        assert_eq!(disc, 0xABC);
+        assert_eq!(iters, 1000);
+        assert_eq!(salt, vec![9u8; 16]);
+    }
+
+    #[test]
+    fn decode_open_commissioning_window_reports_each_missing_field() {
+        let expected = [
+            (0u8, "missing timeout"),
+            (1, "missing verifier"),
+            (2, "missing discriminator"),
+            (3, "missing iterations"),
+            (4, "missing salt"),
+        ];
+        for (tag, detail) in expected {
+            match decode_open_commissioning_window(&open_window_fields(&[tag])) {
+                Err(CommissionError::Malformed { detail: d, .. }) => {
+                    assert_eq!(d, detail, "tag {tag}")
+                }
+                other => panic!("tag {tag}: expected Malformed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_open_commissioning_window_rejects_iterations_over_u32() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 180);
+        w.put_bytes(Tag::Context(1), &[7u8; 97]);
+        w.put_uint(Tag::Context(2), 0xABC);
+        w.put_uint(Tag::Context(3), 1u64 << 32);
+        w.put_bytes(Tag::Context(4), &[9u8; 16]);
+        w.end_container();
+        match decode_open_commissioning_window(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => {
+                assert_eq!(detail, "iterations out of range")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    /// 全デコーダ共通の「構造が壊れた入力」— 空 / 先頭が struct でない /
+    /// ContainerEnd が無い / 制御バイトが不正。どれも `Malformed` になること
+    /// （panic しない・Ok にならない）を代表デコーダ 5 本で確認する。
+    #[test]
+    fn decoders_reject_structurally_broken_input() {
+        type Decoder = Box<dyn Fn(&[u8]) -> Result<(), CommissionError>>;
+        let decoders: Vec<(&str, Decoder)> = vec![
+            (
+                "noc_response",
+                Box::new(|b: &[u8]| decode_noc_response(b).map(|_| ())),
+            ),
+            (
+                "attestation_response",
+                Box::new(|b: &[u8]| decode_attestation_response(b).map(|_| ())),
+            ),
+            (
+                "add_noc",
+                Box::new(|b: &[u8]| decode_add_noc(b).map(|_| ())),
+            ),
+            (
+                "arm_fail_safe",
+                Box::new(|b: &[u8]| decode_arm_fail_safe(b).map(|_| ())),
+            ),
+            (
+                "commissioning_status_response",
+                Box::new(|b: &[u8]| decode_commissioning_status_response(b).map(|_| ())),
+            ),
+        ];
+
+        let not_struct = {
+            let mut w = Writer::new();
+            w.put_uint(Tag::Anonymous, 1);
+            w.finish()
+        };
+        let unterminated = {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(0), 0);
+            w.end_container();
+            let mut b = w.finish();
+            b.pop(); // ContainerEnd (0x18) を落とす
+            b
+        };
+        let inputs: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("not-struct", not_struct),
+            ("unterminated", unterminated),
+            ("garbage", vec![0xFF, 0xFF, 0xFF]),
+        ];
+
+        for (dname, dec) in &decoders {
+            for (iname, input) in &inputs {
+                match dec(input) {
+                    Err(CommissionError::Malformed { .. }) => {}
+                    other => panic!("{dname} on {iname}: expected Malformed, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoders_treat_wrong_field_type_as_missing() {
+        // Bytes 期待のタグに Utf8 → 「無い」扱いで missing。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_str(Tag::Context(0), "not bytes");
+        w.put_bytes(Tag::Context(1), &[0u8; 64]);
+        w.end_container();
+        match decode_attestation_response(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => {
+                assert_eq!(detail, "missing elements")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // Uint 期待のタグに Bytes → missing statusCode。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(0), &[0]);
+        w.end_container();
+        match decode_noc_response(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => {
+                assert_eq!(detail, "missing statusCode")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_helpers_reject_out_of_range_uints() {
+        // take_u8 経由: statusCode = 256
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 256);
+        w.end_container();
+        match decode_noc_response(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => {
+                assert_eq!(detail, "statusCode out of range")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // take_u16 経由: expiry = 65536
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 65_536);
+        w.end_container();
+        match decode_arm_fail_safe(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => {
+                assert_eq!(detail, "expiry out of range")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // 上限ぴったりは通る。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 65_535);
+        w.end_container();
+        assert_eq!(decode_arm_fail_safe(&w.finish()).unwrap(), (65_535, 0));
+    }
+
+    #[test]
+    fn scan_skips_nested_containers_under_unknown_tags() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 7);
+        w.start_struct(Tag::Context(9)); // 未知タグのネスト
+        w.start_array(Tag::Context(1));
+        w.start_list(Tag::Anonymous);
+        w.put_uint(Tag::Anonymous, 1);
+        w.end_container();
+        w.end_container();
+        w.put_str(Tag::Context(2), "inner");
+        w.end_container();
+        w.put_str(Tag::Context(1), "x");
+        w.end_container();
+        let fields = w.finish();
+        assert_eq!(
+            decode_commissioning_status_response(&fields).unwrap(),
+            (7, "x".to_string())
+        );
+
+        // 入れ子の閉じが無い → truncated。内側 struct の直後で切れるよう、
+        // leaf 1 個だけの入れ子を作り末尾の ContainerEnd 2 個（内・外）を落とす。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 7);
+        w.start_struct(Tag::Context(9));
+        w.put_uint(Tag::Context(1), 1);
+        w.end_container();
+        w.end_container();
+        let mut cut = w.finish();
+        cut.truncate(cut.len() - 2);
+        match decode_commissioning_status_response(&cut) {
+            Err(CommissionError::Malformed { detail, .. }) => assert_eq!(detail, "truncated"),
+            other => panic!("expected Malformed(truncated), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_struct_fields_duplicate_tag_last_wins() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 1);
+        w.put_uint(Tag::Context(0), 5);
+        w.end_container();
+        assert_eq!(
+            decode_commissioning_status_response(&w.finish()).unwrap().0,
+            5
+        );
+    }
+
+    #[test]
+    fn decode_add_noc_accepts_icac_and_rejects_bad_ipk_length() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(0), b"noc");
+        w.put_bytes(Tag::Context(1), b"icac");
+        w.put_bytes(Tag::Context(2), &[0xAA; 16]);
+        w.put_uint(Tag::Context(3), 0x1122);
+        w.put_uint(Tag::Context(4), 0xFFF1);
+        w.end_container();
+        let (noc, icac, ipk, subject, vid) = decode_add_noc(&w.finish()).unwrap();
+        assert_eq!(noc, b"noc");
+        assert_eq!(icac.as_deref(), Some(&b"icac"[..]));
+        assert_eq!(ipk, [0xAA; 16]);
+        assert_eq!((subject, vid), (0x1122, 0xFFF1));
+
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bytes(Tag::Context(0), b"noc");
+        w.put_bytes(Tag::Context(2), &[0xAA; 15]);
+        w.put_uint(Tag::Context(3), 1);
+        w.put_uint(Tag::Context(4), 1);
+        w.end_container();
+        match decode_add_noc(&w.finish()) {
+            Err(CommissionError::Malformed { detail, .. }) => assert_eq!(detail, "ipk length"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_carrying_responses_reject_wrong_signature_length() {
+        for (name, dec) in [
+            (
+                "attestation",
+                decode_attestation_response
+                    as fn(&[u8]) -> Result<(Vec<u8>, [u8; 64]), CommissionError>,
+            ),
+            ("csr", decode_csr_response),
+        ] {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(0), b"elements");
+            w.put_bytes(Tag::Context(1), &[0u8; 63]);
+            w.end_container();
+            match dec(&w.finish()) {
+                Err(CommissionError::Malformed { detail, .. }) => {
+                    assert_eq!(detail, "signature length", "{name}")
+                }
+                other => panic!("{name}: expected Malformed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fields_of_maps_status_and_missing_fields() {
+        let bad_status = im::InvokeResponseData {
+            status: 0x85,
+            cluster_status: None,
+            fields_tlv: None,
+        };
+        match fields_of("step-a", &bad_status) {
+            Err(CommissionError::CommandStatus { step, code }) => {
+                assert_eq!((step, code), ("step-a", 0x85))
+            }
+            other => panic!("expected CommandStatus, got {other:?}"),
+        }
+        let no_fields = im::InvokeResponseData {
+            status: 0,
+            cluster_status: None,
+            fields_tlv: None,
+        };
+        match fields_of("step-b", &no_fields) {
+            Err(CommissionError::Malformed { step, detail }) => {
+                assert_eq!((step, detail), ("step-b", "no command fields"))
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        let ok = im::InvokeResponseData {
+            status: 0,
+            cluster_status: None,
+            fields_tlv: Some(vec![0x15, 0x18]),
+        };
+        assert_eq!(fields_of("step-c", &ok).unwrap(), &[0x15, 0x18]);
+    }
+
+    #[test]
+    fn check_commissioning_response_rejects_nonzero_error_code() {
+        let resp = im::InvokeResponseData {
+            status: 0,
+            cluster_status: None,
+            fields_tlv: Some(encode_commissioning_status_response(3, "busy")),
+        };
+        match check_commissioning_response("arm", &resp) {
+            Err(CommissionError::CommandStatus { step, code }) => {
+                assert_eq!((step, code), ("arm", 3))
+            }
+            other => panic!("expected CommandStatus, got {other:?}"),
+        }
+        let ok = im::InvokeResponseData {
+            status: 0,
+            cluster_status: None,
+            fields_tlv: Some(encode_commissioning_status_response(0, "")),
+        };
+        assert!(check_commissioning_response("arm", &ok).is_ok());
+    }
+
+    #[test]
+    fn random_discriminator_fits_12_bits() {
+        for _ in 0..64 {
+            assert!(random_discriminator() <= 0x0FFF);
+        }
+    }
+
+    #[test]
+    fn commission_error_display_names_each_variant() {
+        let cases: Vec<(CommissionError, &str)> = vec![
+            (CommissionError::Csr("bad csr"), "csr error: bad csr"),
+            (CommissionError::Noc(0x0B), "NOCResponse status 0x0B"),
+            (
+                CommissionError::CommandStatus {
+                    step: "arm",
+                    code: 2,
+                },
+                "arm errorCode 0x02",
+            ),
+            (
+                CommissionError::Malformed {
+                    step: "s",
+                    detail: "d",
+                },
+                "s: malformed (d)",
+            ),
+            (CommissionError::Timeout("resolve"), "timeout (resolve)"),
+            (
+                CommissionError::Ble {
+                    step: "scan",
+                    detail: "no adapter".into(),
+                },
+                "ble scan: no adapter",
+            ),
+            (
+                CommissionError::NetworkConfig {
+                    step: "connect",
+                    status: 4,
+                    debug_text: None,
+                },
+                "connect NetworkingStatus 0x04",
+            ),
+            (
+                CommissionError::NetworkConfig {
+                    step: "connect",
+                    status: 4,
+                    debug_text: Some("no route".into()),
+                },
+                "connect NetworkingStatus 0x04 (no route)",
+            ),
+            (
+                CommissionError::InvalidArgument {
+                    what: "discriminator",
+                },
+                "invalid argument: discriminator",
+            ),
+            (
+                CommissionError::Case(crate::case::CaseError::Sigma2NotAcked),
+                "case error:",
+            ),
+        ];
+        for (err, needle) in cases {
+            let text = err.to_string();
+            assert!(text.starts_with("commissioning: "), "{text}");
+            assert!(text.contains(needle), "{text} should contain {needle}");
+        }
+    }
 }

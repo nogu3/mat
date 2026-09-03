@@ -19,7 +19,6 @@ use mat_controller::im::{
     CMD_ON_OFF_OFF, CMD_ON_OFF_ON, CMD_ON_OFF_TOGGLE,
 };
 use mat_controller::session::SecureSession;
-use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, dnssd, kvs};
 
 fn env_u64(name: &str) -> u64 {
@@ -114,30 +113,12 @@ async fn fabric_ride_along_onoff_and_color() {
         }
     };
 
-    // 受け入れ 4: CASE 確立（解決したアドレスを順に試す）
-    let transport = std::sync::Arc::new(Transport::Udp(std::sync::Arc::new(
-        UdpTransport::bind().await.unwrap(),
-    )));
-    let mut session = None;
-    for peer in &peers {
-        match case::establish(
-            std::sync::Arc::clone(&transport),
-            *peer,
-            &creds,
-            device_node_id,
-            &mrp,
-        )
+    // 受け入れ 4: CASE 確立（候補アドレスは Happy Eyeballs レース）
+    let est = case::establish_any(&peers, &creds, device_node_id, &mrp, case::RACE_STAGGER)
         .await
-        {
-            Ok(s) => {
-                eprintln!("CASE established via {peer}");
-                session = Some(s);
-                break;
-            }
-            Err(e) => eprintln!("CASE via {peer} failed: {e}"),
-        }
-    }
-    let mut session = session.expect("CASE establishment failed on all resolved addresses");
+        .expect("CASE establishment failed on all resolved addresses");
+    eprintln!("CASE established via {}", est.peer);
+    let mut session = est.session;
 
     // 受け入れ 5/6 の前提状態を先に読み切る（読みのみ、失敗しても実機は無傷）
     let before = read_bool(&mut session, endpoint, &mrp)

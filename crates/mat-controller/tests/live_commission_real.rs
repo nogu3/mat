@@ -20,7 +20,7 @@ use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::{compressed_fabric_id, FabricCredentials};
 use mat_controller::im::{ImValue, ATTR_ON_OFF, CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE};
 use mat_controller::session::SecureSession;
-use mat_controller::transport::{Transport, UdpTransport};
+use mat_controller::transport::UdpTransport;
 use mat_controller::{case, dnssd, kvs};
 
 fn env(name: &str) -> String {
@@ -62,12 +62,10 @@ async fn commission_second_fabric_and_remove() {
     let issuer_index = env_u8("MAT_E2E_ISSUER_INDEX");
     let paa_dir = PathBuf::from(env("MAT_E2E_PAA_DIR"));
     let endpoint: u16 = 1;
-    let transport = Arc::new(UdpTransport::bind().await.unwrap());
-    // case::establish (直接呼び出し、2/7) は Arc<Transport> を取る一方、
     // commission_on_network (4/7) の公開シグネチャは Arc<UdpTransport> のまま
-    // （M6a 呼び出し側互換）— 同じ UDP ソケットを両方から使うため、Transport
-    // 側は clone を wrap するだけ。
-    let session_transport = Arc::new(Transport::Udp(Arc::clone(&transport)));
+    // （M6a 呼び出し側互換）。2/7 の CASE 確立は `case::establish_any` が
+    // 候補ごとに専用ソケットを bind するので、ここでは 4/7 用の 1 本だけ。
+    let transport = Arc::new(UdpTransport::bind().await.unwrap());
 
     // 1/7: 本番 fabric credentials（live_remote.rs と同じ読み方 — 相乗り
     // identity の自己発行のみ、KVS への書き込みは一切しない）。
@@ -94,27 +92,17 @@ async fn commission_second_fabric_and_remove() {
         .expect("mDNS resolve (cross-check: avahi-browse -rtp _matter._tcp)");
     let peers = node.socket_addrs(scope);
     let mrp = node.mrp_config();
-    let mut prod_session = None;
-    for peer in &peers {
-        match case::establish(
-            Arc::clone(&session_transport),
-            *peer,
-            &prod_creds,
-            device_node_id,
-            &mrp,
-        )
-        .await
-        {
-            Ok(s) => {
-                eprintln!("CASE established via {peer}");
-                prod_session = Some(s);
-                break;
-            }
-            Err(e) => eprintln!("CASE via {peer} failed: {e}"),
-        }
-    }
-    let mut prod_session =
-        prod_session.expect("CASE establishment failed on all resolved addresses");
+    let est = case::establish_any(
+        &peers,
+        &prod_creds,
+        device_node_id,
+        &mrp,
+        case::RACE_STAGGER,
+    )
+    .await
+    .expect("CASE establishment failed on all resolved addresses");
+    eprintln!("CASE established via {}", est.peer);
+    let mut prod_session = est.session;
     let before = read_onoff(&mut prod_session, endpoint, &mrp)
         .await
         .expect("read on-off (pre-commissioning)");

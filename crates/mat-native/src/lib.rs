@@ -14,7 +14,7 @@ use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::{compressed_fabric_id, FabricCredentials};
 use mat_controller::im::{ImValue, ATTR_ON_OFF, CLUSTER_ON_OFF};
 use mat_controller::message::MATTER_PORT;
-use mat_controller::transport::{Transport, UdpTransport};
+use mat_controller::transport::UdpTransport;
 use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
 
@@ -498,15 +498,9 @@ struct CaseEstablisher {
 impl Establisher for CaseEstablisher {
     async fn establish(&self, node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
         // op 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を
-        // recv して screen で捨てる（監査#3）。購読側と同じ規律で
-        // ノードごとに専用 UdpTransport + 専用 CASE を確立する。
-        let transport = UdpTransport::bind()
-            .await
-            .map_err(|e| MatError::new(ErrorKind::Other, format!("native: bind op udp: {e}")))?;
-        // local port は実機切り分け（ss -uanp / tcpdump 突合)の鍵なので
-        // 確立ごとに可視化する（購読側の同名ログと対）。
-        let local = transport.local_addr().ok();
-        let transport = Arc::new(Transport::Udp(Arc::new(transport)));
+        // recv して screen で捨てる（監査#3）。試行ごとの専用 UdpTransport の
+        // bind と候補アドレスの staggered race（Happy Eyeballs）は
+        // `case::establish_any` が一括して行う。
         let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
         let resolved = self
             .resolver
@@ -515,31 +509,20 @@ impl Establisher for CaseEstablisher {
             .map_err(|e| map_resolve_err(node_id, e))?;
         let mrp = resolved.mrp_config();
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let mut last: Option<MatError> = None;
-        for peer in peers {
-            match case::establish(Arc::clone(&transport), peer, &self.creds, node_id, &mrp).await {
-                Ok(session) => {
-                    tracing::info!(
-                        node_id,
-                        local = %local.map(|a| a.to_string()).unwrap_or_default(),
-                        %peer,
-                        "op transport bound (dedicated socket + CASE)"
-                    );
-                    return Ok(Box::new(SessionConn { session, mrp }));
-                }
-                Err(e) => {
-                    last = Some(MatError::new(
-                        ErrorKind::SessionFailed,
-                        format!("native: CASE via {peer}: {e}"),
-                    ));
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            MatError::new(
-                ErrorKind::Unreachable,
-                format!("native: no addresses resolved for node {node_id}"),
-            )
+        let est = case::establish_any(&peers, &self.creds, node_id, &mrp, case::RACE_STAGGER)
+            .await
+            .map_err(|e| map_establish_err(node_id, EstablishRole::Op, e))?;
+        // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
+        // 確立ごとに可視化する（購読側の同名ログと対）。
+        tracing::info!(
+            node_id,
+            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
+            peer = %est.peer,
+            "op transport bound (dedicated socket + CASE)"
+        );
+        Ok(Box::new(SessionConn {
+            session: est.session,
+            mrp,
         }))
     }
 
@@ -547,18 +530,9 @@ impl Establisher for CaseEstablisher {
         &self,
         node_id: u64,
     ) -> Result<Box<dyn SubscribeConn>, MatError> {
-        // 購読専用ソケット: op 用の共有 transport と recv を奪い合わないよう、
-        // ノードごとに専用 UdpTransport + 専用 CASE を確立する（spec 構造判断）。
-        let transport = UdpTransport::bind().await.map_err(|e| {
-            MatError::new(
-                ErrorKind::Other,
-                format!("native: bind subscription udp: {e}"),
-            )
-        })?;
-        // 購読 socket の実ポートは実機切り分け（tcpdump / ss との突合）の鍵なので
-        // 確立ごとに可視化する。
-        let local = transport.local_addr().ok();
-        let transport = Arc::new(Transport::Udp(Arc::new(transport)));
+        // 購読専用ソケット: op 用の transport と recv を奪い合わないよう、
+        // ノードごとに専用 UdpTransport + 専用 CASE（spec 構造判断）。bind と
+        // 候補レースは op 側と同じく `case::establish_any`。
         let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
         let resolved = self
             .resolver
@@ -567,32 +541,53 @@ impl Establisher for CaseEstablisher {
             .map_err(|e| map_resolve_err(node_id, e))?;
         let mrp = resolved.mrp_config();
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let mut last: Option<MatError> = None;
-        for peer in peers {
-            match case::establish(Arc::clone(&transport), peer, &self.creds, node_id, &mrp).await {
-                Ok(session) => {
-                    tracing::info!(
-                        node_id,
-                        local = %local.map(|a| a.to_string()).unwrap_or_default(),
-                        %peer,
-                        "subscription transport bound (dedicated socket + CASE)"
-                    );
-                    return Ok(Box::new(SubscriptionSession { session, mrp }));
-                }
-                Err(e) => {
-                    last = Some(MatError::new(
-                        ErrorKind::SessionFailed,
-                        format!("native: subscription CASE via {peer}: {e}"),
-                    ));
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            MatError::new(
-                ErrorKind::Unreachable,
-                format!("native: no addresses resolved for node {node_id}"),
-            )
+        let est = case::establish_any(&peers, &self.creds, node_id, &mrp, case::RACE_STAGGER)
+            .await
+            .map_err(|e| map_establish_err(node_id, EstablishRole::Subscription, e))?;
+        tracing::info!(
+            node_id,
+            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
+            peer = %est.peer,
+            "subscription transport bound (dedicated socket + CASE)"
+        );
+        Ok(Box::new(SubscriptionSession {
+            session: est.session,
+            mrp,
         }))
+    }
+}
+
+/// `map_establish_err` の detail 前置き分岐（op / 購読でログ・detail の
+/// 文言を従来どおり出し分ける）。
+#[derive(Clone, Copy)]
+enum EstablishRole {
+    Op,
+    Subscription,
+}
+
+/// `case::establish_any` の失敗を mat のエラー種別へ写す。種別の対応は
+/// 逐次ループ時代と同じ: 候補ゼロ = unreachable、CASE 全滅 = session_failed、
+/// bind 失敗 = other。detail は全候補のエラーを列挙する（旧実装は最後の
+/// 1 本だけだった）。
+fn map_establish_err(node_id: u64, role: EstablishRole, e: case::EstablishAnyError) -> MatError {
+    use case::EstablishAnyError as E;
+    let (bind_role, fail_prefix) = match role {
+        EstablishRole::Op => ("op", ""),
+        EstablishRole::Subscription => ("subscription", "subscription "),
+    };
+    match &e {
+        E::NoAddresses => MatError::new(
+            ErrorKind::Unreachable,
+            format!("native: no addresses resolved for node {node_id}"),
+        ),
+        E::Bind(err) => MatError::new(
+            ErrorKind::Other,
+            format!("native: bind {bind_role} udp: {err}"),
+        ),
+        E::AllFailed(_) => MatError::new(
+            ErrorKind::SessionFailed,
+            format!("native: {fail_prefix}{e}"),
+        ),
     }
 }
 

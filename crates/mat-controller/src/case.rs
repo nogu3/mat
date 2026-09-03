@@ -17,9 +17,10 @@ use crate::cert::{verify_noc_chain, MatterCert};
 use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::fabric::{case_destination_id, FabricCredentials};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
+use crate::race::race_staggered;
 use crate::session::{SecureSession, SessionKeys};
 use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
-use crate::transport::Transport;
+use crate::transport::{Transport, UdpTransport};
 
 const OPCODE_CASE_SIGMA1: u8 = 0x30;
 const OPCODE_CASE_SIGMA2: u8 = 0x31;
@@ -602,6 +603,107 @@ pub async fn establish(
         creds.node_id,
         peer_node_id,
     ))
+}
+
+/// 候補アドレスを順に起動する間隔（Happy Eyeballs の stagger）。RFC 8305 の
+/// 250ms より長めに取り、健全な先頭アドレスの Sigma2 が返る前に 2 本目の
+/// Sigma1 を撃って chip SDK デバイスの BUSY 応答を誘発しにくくしている。
+/// 死んだ先頭アドレス 1 本の損失はこの値（従来は MRP 予算いっぱい、
+/// SII=5000ms なら ~80 秒）。
+pub const RACE_STAGGER: Duration = Duration::from_millis(500);
+
+/// [`establish_any`] の成功結果。
+pub struct Established {
+    pub session: SecureSession,
+    /// 勝った候補アドレス。
+    pub peer: SocketAddr,
+    /// 勝った試行の専用ソケットの bind アドレス（wildcard bind なら `[::]:port`）。
+    /// `ss -uanp` 等とのポート突合用 — IP 部分は bind アドレスそのもので、
+    /// 実際の発信元 IP（OS が経路で選ぶもの）とは限らない。
+    pub local: Option<SocketAddr>,
+}
+
+/// [`establish_any`] のエラー。
+#[derive(Debug)]
+pub enum EstablishAnyError {
+    /// 候補が空（resolve は成功したが AAAA が 1 本も無い）。
+    NoAddresses,
+    /// 全候補が失敗。候補順。
+    AllFailed(Vec<(SocketAddr, CaseError)>),
+    /// 試行用ソケットの bind 失敗（1 本でも失敗したらその場で全体エラー）。
+    Bind(std::io::Error),
+}
+
+impl std::fmt::Display for EstablishAnyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EstablishAnyError::NoAddresses => write!(f, "no addresses"),
+            EstablishAnyError::AllFailed(list) => {
+                write!(f, "CASE failed on all {} address(es): ", list.len())?;
+                for (i, (peer, err)) in list.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{peer}: {err}")?;
+                }
+                Ok(())
+            }
+            EstablishAnyError::Bind(e) => write!(f, "bind udp: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for EstablishAnyError {}
+
+/// 複数の候補アドレスへ CASE を Happy Eyeballs 方式で確立する: 候補ごとに
+/// **専用の** UDP ソケットを bind し、`stagger` 間隔で [`establish`] を起動、
+/// 最初に成功した試行を採用して残りを drop する（[`crate::race`]）。
+///
+/// 専用ソケットが必須なのは、`UnsecuredExchange::screen` が自分の exchange
+/// 以外のデータグラムを捨てるため — 1 ソケットを共有すると並行試行が互いの
+/// 応答を吸って落とす。同一ノードへの並行 Sigma1 自体は安全（local session
+/// id / exchange id / source node id は試行ごとにランダム）。
+///
+/// 所要時間の上限は設けない（MRP 予算は仕様どおり使い切らせる）。全体は
+/// 呼び出し側の op deadline が縛る。
+pub async fn establish_any(
+    peers: &[SocketAddr],
+    creds: &FabricCredentials,
+    peer_node_id: u64,
+    cfg: &MrpConfig,
+    stagger: Duration,
+) -> Result<Established, EstablishAnyError> {
+    if peers.is_empty() {
+        return Err(EstablishAnyError::NoAddresses);
+    }
+    let mut attempts: Vec<(SocketAddr, Arc<Transport>)> = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let udp = UdpTransport::bind()
+            .await
+            .map_err(EstablishAnyError::Bind)?;
+        attempts.push((*peer, Arc::new(Transport::Udp(Arc::new(udp)))));
+    }
+
+    let outcome = race_staggered(attempts, stagger, |(peer, transport)| async move {
+        let local = transport.local_addr().ok();
+        match establish(transport, peer, creds, peer_node_id, cfg).await {
+            Ok(session) => Ok((session, local)),
+            Err(e) => {
+                tracing::debug!(%peer, error = %e, "CASE attempt failed");
+                Err((peer, e))
+            }
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok((idx, (session, local))) => Ok(Established {
+            session,
+            peer: peers[idx],
+            local,
+        }),
+        Err(list) => Err(EstablishAnyError::AllFailed(list)),
+    }
 }
 
 #[cfg(test)]

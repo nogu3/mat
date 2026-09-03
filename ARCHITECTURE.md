@@ -1022,8 +1022,17 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       resolve 回帰（0.23.0/0.23.1 で修正）への誤帰属とみられる。残余の未実装
       は 2 点のみで実害未観測: (a) resolve は SRV+AAAA が揃った最初の応答で
       早期 return するため、複数応答に分かれた後着 AAAA は取りこぼし得る、
-      (b) 死んだアドレス 1 本あたりの CASE 失敗待ちは MRP 予算依存
-      （SII=5000ms なら最大 ~80 秒）で、上限キャップ・並行試行は無い】。
+      (b) ~~死んだアドレス 1 本あたりの CASE 失敗待ちは MRP 予算依存（SII=5000ms なら
+      最大 ~80 秒）で、上限キャップ・並行試行は無い~~【解消 2026-09-03: 候補
+      アドレスは `mat-controller::case::establish_any` が Happy Eyeballs 方式で
+      確立する — 候補ごとに専用 UDP ソケットを bind し、500ms stagger
+      （`case::RACE_STAGGER`）で `case::establish` を起動、最初の成功を採用して
+      残りを drop（`mat-controller::race::race_staggered`）。死んだ先頭アドレスの
+      損失は ~80 秒 → 0.5 秒。試行ごとの MRP 上限キャップは設けず、全体は従来
+      どおり op deadline（`--op-timeout-ms`）が縛る。候補 1 本の完全到達不能
+      ノードの所要は不変。Sigma3 まで進んだ敗者はデバイス側の idle 期限で消える。
+      mat / matd / 常駐 Subscribe は `mat-native::CaseEstablisher` 経由で同じ
+      関数を呼ぶので全経路に効く。(a) は未解消のまま】。
   - **M8a 実装済み**: (1) **name→ID 全クラスタ生成テーブル**
     （`mat-core::ids` / `ids_gen.rs`、connectedhomeip v1.4.2.0 data-model
     XML から `scripts/gen-ids.py` で生成しチェックイン — ビルド時に XML・

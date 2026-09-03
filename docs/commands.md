@@ -976,6 +976,15 @@ the event stream's receive wait, not a single op).
 - **Direct path**: the same budget wraps the whole op in a
   `tokio::time::timeout`; exceeding it is `timeout` (exit `3`) too, so the
   flag behaves the same regardless of which path answers.
+- **Multiple resolved addresses** (either path): CASE is raced across the
+  candidates Happy-Eyeballs style — each candidate gets its own UDP socket,
+  attempts start 500 ms apart (non-link-local addresses first), the first
+  successful handshake wins and the rest are dropped. A dead first address
+  therefore costs ~0.5 s instead of the full MRP budget (~80 s at
+  `SII=5000`). The race as a whole still runs under the op budget; a node
+  whose only address is unreachable still ends in `timeout` when the budget
+  is spent. On total failure the `session_failed` detail lists every
+  address tried.
 - A request that omits `deadline_ms` (an old `mat` talking to a new `matd`)
   gets `matd`'s own default budget of 60s applied — the same number
   `--op-timeout-ms` defaults to, so old and new clients see the same
