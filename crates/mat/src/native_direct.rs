@@ -27,15 +27,28 @@ pub(crate) struct Config<'a> {
 const PROVISION_NOTE: &str =
     "controller group state written natively to kvs; if matd is running, restart it to reload group state";
 
-/// 直経路 native の入口。store / commission チェック → engine 構築 →
-/// `OneShotRunner`（確立 → 1 op → close → matd へ node_touched ヒント）で実行し、
-/// 成功 body を stdout へ emit する。
+/// 直経路 native の入口。`execute` で成功 body を得て stdout へ emit する。
 pub(crate) fn run(
     op: &DeviceOp,
     store_path: &Path,
     cfg: &Config,
     op_timeout_ms: u64,
 ) -> Result<(), MatError> {
+    let body = execute(op, store_path, cfg, op_timeout_ms)?;
+    output::emit(body);
+    Ok(())
+}
+
+/// store / commission チェック → engine 構築 → `OneShotRunner`（確立 → 1 op →
+/// close → matd へ node_touched ヒント）で 1 op を実行し、成功 body（timestamp
+/// 抜き）を返す。emit しない — `unpair` のように body を別の JSON へ合成する
+/// 呼び手のための単位。
+pub(crate) fn execute(
+    op: &DeviceOp,
+    store_path: &Path,
+    cfg: &Config,
+    op_timeout_ms: u64,
+) -> Result<serde_json::Value, MatError> {
     let store = Store::open(store_path)?;
     // group 送信 / bump は特定ノード宛ではないため require_node をしない。
     // provision / grant は「1 つでも未 commission なら exit 11」。
@@ -112,8 +125,7 @@ pub(crate) fn run(
         group_id,
         "op executed (native direct)"
     );
-    output::emit(body);
-    Ok(())
+    Ok(body)
 }
 
 /// engine 上で 1 op を実行し成功 body を返す（emit しない — テスト可能な単位）。

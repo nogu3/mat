@@ -211,6 +211,15 @@ fn main() -> ExitCode {
             thread_dataset.as_deref(),
             *transport,
         ),
+        Command::Unpair { node_id, force } => node_id.id().and_then(|node| {
+            commands::unpair::run(
+                &store_path,
+                node,
+                *force,
+                native_cfg.as_ref(),
+                args.op_timeout_ms,
+            )
+        }),
         Command::Diag {
             action:
                 DiagCommand::Node {

@@ -669,3 +669,39 @@ fn fabric_init_full_local_cycle() {
     assert_eq!(out2.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
 }
+
+// ── unpair（RemoveFabric + 台帳/alias 削除、直経路のみ）────────────────────
+
+#[test]
+fn unpair_with_forced_matd_exits_2() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env_remove("MAT_MATD")
+        .args(["unpair", "--node", "5", "--matd"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "does not support the `unpair` subcommand",
+        ));
+}
+
+#[test]
+fn unpair_missing_store_exits_10() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("nope");
+    mat(&missing)
+        .args(["unpair", "--node", "5"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("store_missing"));
+}
+
+#[test]
+fn unpair_unknown_node_exits_11_even_with_force() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["unpair", "--node", "6", "--force"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}

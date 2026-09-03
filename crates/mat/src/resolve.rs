@@ -41,6 +41,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 transport,
             }
         }
+        Command::Unpair { node_id, force } => Command::Unpair {
+            node_id: NodeRef::Id(book.resolve_node(&node_id)?),
+            force,
+        },
         Command::Read {
             node_id,
             endpoint,

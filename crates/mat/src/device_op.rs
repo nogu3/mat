@@ -82,6 +82,7 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
     match command {
         Command::Discover { .. } => Ok(Dispatch::Dedicated("discover")),
         Command::Commission { .. } => Ok(Dispatch::Dedicated("commission")),
+        Command::Unpair { .. } => Ok(Dispatch::Dedicated("unpair")),
         Command::Fabric { .. } => Ok(Dispatch::Dedicated("fabric")),
         Command::Listen { .. } => Ok(Dispatch::Dedicated("listen")),
         Command::Diag {

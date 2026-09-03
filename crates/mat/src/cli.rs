@@ -130,6 +130,19 @@ pub enum Command {
         transport: TransportArg,
     },
 
+    /// ノードを fabric から外す: デバイスへ RemoveFabric（自 fabric の index）を
+    /// 送り、成功したら台帳 `nodes.json` と aliases.toml の当該 alias を削除する。
+    /// 直経路のみ（`--matd` 明示は exit 2）。node_id は再利用しない。
+    Unpair {
+        /// commission 済みノードの node_id、または aliases.toml の node alias。
+        #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
+        node_id: NodeRef,
+        /// デバイス側が失敗（到達不能・拒否）しても台帳と alias を削除する
+        /// （実体の無い台帳エントリの掃除用）。出力の `device.removed` が false になる。
+        #[arg(long)]
+        force: bool,
+    },
+
     /// 属性を読む。`{ node_id, endpoint, cluster, attribute, value, timestamp }`。
     Read {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
