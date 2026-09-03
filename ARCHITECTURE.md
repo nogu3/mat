@@ -1195,7 +1195,9 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
 2026-08-31 監査「足りない機能 3: CLI の欠け」を一括で埋めた。新しい Matter
 プロトコル機能は増やしていない（欠けていたのは CLI / op 配管とローカル台帳の
 削除経路だけ）。追加は 6 件: `mat unpair`（RemoveFabric + 台帳 `nodes.json` /
-aliases.toml の削除、`--force` は台帳のみ、直経路専用）、`mat group list` /
+aliases.toml の削除、`--force` はデバイス側の到達不能／拒否だけを畳んで台帳のみ、
+直経路専用。台帳は `next_node_id` high-water mark を持ち、外した node_id は
+再利用しない）、`mat group list` /
 `mat group remove`（provision の逆順 4 ステップ + コントローラ KVS の撤収、
 `--nodes` 必須）、`mat fabric list`（KVS の fabric identity 一覧、鍵素材なし）、
 cluster wildcard read（`mat read` の `--attribute` 省略 = `attributes`

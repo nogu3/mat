@@ -28,7 +28,7 @@ pub fn run(
 ) -> Result<(), MatError> {
     // commission はストアを bootstrap してよい経路（node_id 採番のため）。
     let mut store = Store::open_or_init(store_path)?;
-    let node_id = node_id.unwrap_or_else(|| next_node_id(&store));
+    let node_id = node_id.unwrap_or_else(|| store.next_node_id());
 
     // native commission（M8c-1; M8c-3 で唯一の経路）。発見空振り = unreachable、
     // KVS/資材/epoch 系 = store_missing/store_parse、PASE 開始後の失敗も含め
@@ -126,11 +126,6 @@ fn cd_signer_store_path(store_root: &Path) -> Option<PathBuf> {
     }
     let default = store_root.join("cd-signer-store");
     default.is_dir().then_some(default)
-}
-
-/// 台帳の最大 node_id + 1。空なら 1。
-fn next_node_id(store: &Store) -> u64 {
-    store.nodes().map(|n| n.node_id).max().map_or(1, |m| m + 1)
 }
 
 /// PAA（Product Attestation Authority）ルート証明書ディレクトリを解決する。

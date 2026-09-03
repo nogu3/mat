@@ -32,6 +32,12 @@ struct Ledger {
     version: u32,
     #[serde(default)]
     nodes: BTreeMap<u64, NodeRecord>,
+    /// 払い出し済み node_id の high-water mark（次に配る id）。`unpair` で
+    /// 台帳から消えた id を再利用しないための単調増加カウンタ。0 = 未設定
+    /// （このフィールドを持たない旧形式台帳）で、その場合は `nodes` の最大値
+    /// から復元する。
+    #[serde(default)]
+    next_node_id: u64,
 }
 
 fn ledger_version() -> u32 {
@@ -107,6 +113,7 @@ impl Store {
             return Ok(Ledger {
                 version: ledger_version(),
                 nodes: BTreeMap::new(),
+                next_node_id: 0,
             });
         }
         let text = std::fs::read_to_string(&path)
@@ -147,8 +154,19 @@ impl Store {
             .ok_or_else(|| MatError::node_not_commissioned(node_id))
     }
 
-    /// ノードを台帳に追加し、ディスクへ永続化する。
+    /// 次に払い出す node_id。台帳の high-water mark と現在の最大 id の大きい方
+    /// （どちらも無ければ 1）。`unpair` で消えた id は再利用しない — stale な
+    /// SRP レコードが残ったまま同じ id で再 commission すると CASE が必ず失敗
+    /// するため（docs/commands.md の unpair 節）。
+    pub fn next_node_id(&self) -> u64 {
+        let from_nodes = self.ledger.nodes.keys().max().map_or(1, |m| m + 1);
+        self.ledger.next_node_id.max(from_nodes).max(1)
+    }
+
+    /// ノードを台帳に追加し、ディスクへ永続化する。high-water mark も前進させる
+    /// （同じ save で永続化されるので `remove_node` 側は触らなくてよい）。
     pub fn upsert_node(&mut self, record: NodeRecord) -> Result<(), MatError> {
+        self.ledger.next_node_id = self.ledger.next_node_id.max(record.node_id + 1);
         self.ledger.nodes.insert(record.node_id, record);
         self.save_ledger()
     }
@@ -234,6 +252,41 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(dir.path().join("nodes.json")).unwrap();
         assert!(!text.contains("address"));
+    }
+
+    #[test]
+    fn next_node_id_never_recycles_removed_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = Store::open_or_init(dir.path()).unwrap();
+            assert_eq!(store.next_node_id(), 1, "空台帳は 1 から");
+            for id in [5u64, 6u64] {
+                store
+                    .upsert_node(NodeRecord {
+                        node_id: id,
+                        commissioned_at: "2026-01-01T00:00:00+09:00".into(),
+                    })
+                    .unwrap();
+            }
+            assert_eq!(store.next_node_id(), 7);
+            assert!(store.remove_node(6).unwrap());
+            assert_eq!(store.next_node_id(), 7, "削除しても払い出し済み id は戻らない");
+        }
+        // high-water mark はディスクに残る。
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.next_node_id(), 7);
+    }
+
+    #[test]
+    fn next_node_id_tolerates_old_ledger_without_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.json"),
+            r#"{"version":1,"nodes":{"9":{"node_id":9,"commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
+        )
+        .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.next_node_id(), 10);
     }
 
     #[test]

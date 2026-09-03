@@ -192,11 +192,12 @@ Outputs:
   endpoint aliases go with them); it is `[]` when no `aliases.toml` exists.
 - A node that is not in the ledger is `node_not_commissioned` (exit `11`),
   `--force` included: the ledger is what says a node can be unpaired at all.
-- **Do not re-commission a device under the id you just unpaired.** A stale SRP
-  record for that id keeps being advertised, and CASE to it fails forever. `mat`
-  never recycles ids on purpose, but `commission` without `--node` picks
-  `max(ledger) + 1`, which lands back on the id you just removed if it was the
-  highest one — pass an explicit `--node` with a fresh number after an unpair.
+- **node_id は再利用されない。** A stale SRP record for an unpaired id keeps
+  being advertised and CASE to it fails forever, so the ledger keeps a
+  high-water mark (`next_node_id` in `nodes.json`): `commission` without
+  `--node` always hands out an id above every id ever issued, even after the
+  highest one was unpaired. Ledgers written before this field existed fall back
+  to `max(ledger) + 1` on first load and then start tracking it.
 - With `matd` running, its resident subscription for the removed node goes away
   by itself at the next ledger rescan (≤ 60 s): the subscription loop is
   aborted and the node drops out of `matd status`. No restart needed.
