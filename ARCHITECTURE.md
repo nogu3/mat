@@ -1127,7 +1127,10 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   (`{"error":{"kind":"other","detail":"event stream lagged"}}`) を送って切断。
   イベント形式は `mat` スキーマ（`timestamp`/`node_id`/`endpoint`/`cluster`/
   `attribute`/`value`/`priming`/`recovered`）。scalar 値のみイベント化（list/struct は
-  generic read と同じ既知の制限で debug ログのみに捨てる）。`priming: true`
+  listen だけの制限 — Subscribe 経路は ReportData を 1 通ずつ処理しチャンク
+  再組み立てを持たないため途中 list しか作れず、list-diff recovery も誤爆する。
+  generic read/write は list/struct を JSON で扱う。docs/commands.md「Listen」
+  参照）。`priming: true`
   は購読(再)確立直後の初回全量 report 由来であることを示すフラグ — casa が
   matd 再起動直後の残留状態を新規トリガと誤認しないために存在する。
 - **matd は状態を持たない**: イベントのリングバッファ/リプレイはやらない（

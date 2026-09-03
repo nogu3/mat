@@ -496,8 +496,12 @@ impl Event {
 }
 
 /// ReportDataMessage をイベント列へ。scalar 値のみイベント化し、list/struct
-/// （ACL・server-list 等 wildcard priming に混ざるもの）は debug ログで捨てる
-/// （generic read と同じ既知の制限）。path が欠けた report・status-only も捨てる。
+/// （ACL・server-list 等 wildcard priming に混ざるもの）は debug ログで捨てる。
+/// これは **listen だけの制限**（generic read/write は list/struct を JSON で
+/// 扱う）: この経路は ReportData を 1 通ずつ処理しチャンク再組み立て
+/// （MoreChunkedMessages + ListIndex:null 追記列）を持たないので途中 list しか
+/// 作れず、list-diff priming recovery も要素追記を遷移と誤認する。path が欠けた
+/// report・status-only も捨てる。
 pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) -> Vec<Event> {
     let mut out = Vec::new();
     // 1 report から生まれる全イベントで同じ受信時刻を共有する（listener ごと・

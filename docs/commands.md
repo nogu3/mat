@@ -546,9 +546,14 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   matd (re)establishes a subscription, so a consumer does not mistake
   matd-restart residual state (e.g. `occupancy` still `1` from before a
   restart) for a fresh trigger. Only **scalar** values become events —
-  `list`/`struct` attributes (ACL, server-list, etc., which show up in a
-  wildcard priming burst) are dropped, the same known limitation as generic
-  `read` (see [Scalar-only generic write / invoke](#scalar-only-generic-write--invoke)).
+  `list` / `struct` attributes (ACL, server-list, etc., which show up in a
+  wildcard priming burst) are dropped with a debug log. This is a
+  **listen-only** limitation (generic `read` and `write` handle lists and
+  structs as JSON): the resident Subscribe processes each ReportData message on
+  its own and does not reassemble chunked lists (`MoreChunkedMessages` plus
+  per-element `ListIndex: null` appends), so a list event could only ever carry
+  a partial value, and the priming-diff recovery would misread per-element
+  appends as transitions. Consumers that need a list value read it on demand.
 - `recovered: true` marks an event `matd` reconstructed from a priming
   report: the attribute's value in the new subscription's priming burst
   differs from the last value `matd` saw, so the transition happened while
