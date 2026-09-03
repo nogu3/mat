@@ -726,6 +726,44 @@ impl Node {
         out
     }
 
+    /// Whether a SubscribeRequest's `paths` may be accepted at all (spec
+    /// §8.10; chip `InteractionModelEngine::ParseAttributePaths`): a path
+    /// with any wildcard field counts only if it expands to at least one
+    /// attribute this session may read (ACL included — `read_allowed`,
+    /// the same gate `read_entries` applies), while a fully concrete path
+    /// always counts (a missing or refused attribute is answered by a
+    /// status entry in the priming report instead). No values are read.
+    /// `false` for an empty `paths`; the caller answers `INVALID_ACTION`.
+    pub fn has_readable_path(&self, paths: &[AttrPathIn], read_ctx: &ReadCtx) -> bool {
+        paths.iter().any(|path| {
+            if path.endpoint.is_some() && path.cluster.is_some() && path.attribute.is_some() {
+                return true;
+            }
+            self.endpoints
+                .iter()
+                .filter(|(ep, _)| path.endpoint.is_none_or(|e| e == *ep))
+                .any(|(endpoint, clusters)| {
+                    let ectx = ExpandCtx {
+                        endpoint: *endpoint,
+                        clusters,
+                        read_ctx,
+                    };
+                    clusters
+                        .iter()
+                        .filter(|h| path.cluster.is_none_or(|c| c == h.cluster_id()))
+                        .any(|handler| match path.attribute {
+                            Some(attribute) => {
+                                self.read_allowed(&ectx, handler.as_ref(), attribute)
+                            }
+                            None => handler
+                                .attributes()
+                                .into_iter()
+                                .any(|a| self.read_allowed(&ectx, handler.as_ref(), a)),
+                        })
+                })
+        })
+    }
+
     fn expand_endpoint(
         &self,
         path: &AttrPathIn,
@@ -3127,6 +3165,48 @@ mod tests {
         let entries = node.read_entries(&wildcard, &case_read_ctx(1, 7));
         assert!(!entries.is_empty());
         assert!(entries.iter().all(|e| matches!(e, ReportEntryOut::Data(_))));
+    }
+
+    /// spec §8.10 / chip `ParseAttributePaths`: 購読の受理判定。wildcard
+    /// パスは ACL 込みで 1 つでも読める属性に展開されれば有効、具体パスは
+    /// （存在・権限に関わらず）常に有効 — その拒否は priming の status
+    /// entry として伝わる。paths 空は無効。
+    #[test]
+    fn has_readable_path_follows_the_subscription_validity_rule() {
+        let node = node_with_acl(PRIVILEGE_OPERATE, 7);
+        let allowed = case_read_ctx(1, 7);
+        let denied = case_read_ctx(1, 8);
+        let full_wildcard = AttrPathIn {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+        };
+        let onoff_wildcard = AttrPathIn {
+            endpoint: None,
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: None,
+        };
+        let concrete = AttrPathIn {
+            endpoint: Some(1),
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: Some(im::ATTR_ON_OFF),
+        };
+        let missing_cluster_wildcard = AttrPathIn {
+            endpoint: None,
+            cluster: Some(0x7FFF),
+            attribute: None,
+        };
+
+        assert!(node.has_readable_path(&[full_wildcard], &allowed));
+        assert!(node.has_readable_path(&[onoff_wildcard], &allowed));
+        assert!(!node.has_readable_path(&[full_wildcard], &denied));
+        assert!(!node.has_readable_path(&[onoff_wildcard], &denied));
+        assert!(!node.has_readable_path(&[missing_cluster_wildcard], &allowed));
+        // 具体パスは拒否 subject でも「有効」（status entry で答える経路）。
+        assert!(node.has_readable_path(&[concrete], &denied));
+        // 1 つでも有効なら全体は有効。
+        assert!(node.has_readable_path(&[full_wildcard, concrete], &denied));
+        assert!(!node.has_readable_path(&[], &allowed));
     }
 
     /// Groups の **mutating** コマンド（AddGroup / RemoveGroup /
