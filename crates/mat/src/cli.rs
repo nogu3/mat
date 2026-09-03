@@ -387,6 +387,8 @@ pub enum FabricAction {
         #[arg(long, default_value_t = 112_233)]
         admin_node_id: u64,
     },
+    /// KVS にある fabric（`f/<idx>/n` を持つ index）を一覧する。ローカルのみ。
+    List,
 }
 
 /// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/

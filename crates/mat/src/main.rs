@@ -63,17 +63,20 @@ fn main() -> ExitCode {
     // なので、iface 自動検出（下のブロック）にも matd 経路にも巻き込まない —
     // ここで最優先 dispatch する。
     if let Command::Fabric { action } = &command {
-        let FabricAction::Init {
-            fabric_id,
-            admin_node_id,
-        } = action;
-        return match commands::fabric::run_init(
-            &store_path,
-            *fabric_id,
-            *admin_node_id,
-            args.fabric_index,
-            args.issuer_index,
-        ) {
+        let result = match action {
+            FabricAction::Init {
+                fabric_id,
+                admin_node_id,
+            } => commands::fabric::run_init(
+                &store_path,
+                *fabric_id,
+                *admin_node_id,
+                args.fabric_index,
+                args.issuer_index,
+            ),
+            FabricAction::List => commands::fabric::run_list(&store_path, args.fabric_index),
+        };
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 e.emit();

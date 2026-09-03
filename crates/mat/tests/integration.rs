@@ -670,6 +670,36 @@ fn fabric_init_full_local_cycle() {
     assert!(String::from_utf8_lossy(&out2.stderr).contains("\"other\""));
 }
 
+// ── fabric list（Task11: ローカル完結、iface/matd 不到達）──────────────────
+
+#[test]
+fn fabric_list_after_init_reports_current_fabric() {
+    let store = TempDir::new().unwrap();
+    mat(store.path())
+        .args(["fabric", "init", "--fabric-id", "7"])
+        .assert()
+        .success();
+    mat(store.path())
+        .args(["fabric", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"fabric_index\":1"))
+        .stdout(predicate::str::contains("\"fabric_id\":7"))
+        .stdout(predicate::str::contains("\"admin_node_id\":112233"))
+        .stdout(predicate::str::contains("\"ipk_epoch\":\"mat\""))
+        .stdout(predicate::str::contains("\"current\":true"));
+}
+
+#[test]
+fn fabric_list_without_kvs_exits_10() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["fabric", "list"])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("fabric init"));
+}
+
 // ── group list（M8c-3 Task10: ローカル完結、iface/matd 不到達）────────────
 
 #[test]

@@ -2023,6 +2023,20 @@ mod tests {
         ));
     }
 
+    /// Task 11 (`mat fabric list`): bootstrap 直後の main KVS から index / NOC
+    /// identity / RCAC 公開鍵が読めること。
+    #[test]
+    fn bootstrap_kvs_exposes_noc_identity_and_rcac_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let fab = CommissioningFabric::generate(7, 112233).unwrap();
+        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        assert_eq!(crate::kvs::list_fabric_indices(&ini).unwrap(), vec![1]);
+        assert_eq!(crate::kvs::read_noc_identity(&ini, 1).unwrap(), (112233, 7));
+        let pk = crate::kvs::read_rcac_pubkey(&ini, 1).unwrap();
+        assert_eq!(pk[0], 0x04, "SEC1 uncompressed");
+    }
+
     /// 監査 Tier 3: bootstrap が `g/gdc` を書かないと、fabric init 由来の
     /// ストアでは `mat-native::group::init_sender` が「counter を低く始め
     /// られない」と groupcast / bump を永久拒否する。初期値は spec 4.5.1 の

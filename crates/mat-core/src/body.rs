@@ -365,6 +365,12 @@ pub fn group_list_success(
     })
 }
 
+/// `fabric list` の成功 body。`fabrics` の各要素は呼び手が組む
+/// （fabric_index / fabric_id / admin_node_id / compressed_fabric_id / ipk_epoch / current）。
+pub fn fabric_list_success(store: &str, fabrics: Vec<Value>) -> Value {
+    json!({ "store": store, "fabrics": fabrics })
+}
+
 /// `group grant` の成功 body。
 pub fn group_grant_success(
     group_id: u16,
