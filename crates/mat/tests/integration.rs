@@ -431,6 +431,31 @@ fn group_grant_unknown_node_exits_11() {
 }
 
 #[test]
+fn group_remove_requires_nodes_and_rejects_forced_matd() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "remove", "--group", "1"])
+        .assert()
+        .code(2);
+    mat(store.path())
+        .env_remove("MAT_MATD")
+        .args(["group", "remove", "--group", "1", "--nodes", "5", "--matd"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("group remove"));
+}
+
+#[test]
+fn group_remove_unknown_node_exits_11() {
+    let store = store_with_node5();
+    mat(store.path())
+        .args(["group", "remove", "--group", "1", "--nodes", "5", "6"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
 fn group_provision_rejects_bad_epoch_key() {
     // require_node(5) はここでは通る（台帳にある）。epoch key の検証は
     // controller state 書込（KVS/chip-tool）より前に走るので、この失敗は

@@ -51,7 +51,7 @@ pub(crate) fn execute(
 ) -> Result<serde_json::Value, MatError> {
     let store = Store::open(store_path)?;
     // group 送信 / bump は特定ノード宛ではないため require_node をしない。
-    // provision / grant は「1 つでも未 commission なら exit 11」。
+    // provision / grant / remove は「1 つでも未 commission なら exit 11」。
     let node_id = match op {
         DeviceOp::Node(n) => Some(n.node_id),
         DeviceOp::GroupProvision(p) => {
@@ -60,7 +60,7 @@ pub(crate) fn execute(
             }
             None
         }
-        DeviceOp::GroupGrant { node_ids, .. } => {
+        DeviceOp::GroupGrant { node_ids, .. } | DeviceOp::GroupRemove { node_ids, .. } => {
             for &id in node_ids {
                 store.require_node(id)?;
             }
@@ -111,12 +111,14 @@ pub(crate) fn execute(
             run_with_engine(&engine, op).await
         }
     })?;
-    // group_id は Group/GroupProvision/GroupGrant のみ Some（GroupBump は
+    // group_id は Group/GroupProvision/GroupGrant/GroupRemove のみ Some（GroupBump は
     // 特定 group 宛ではない）。node_id は上で計算済みの値をそのまま使う。
     let group_id: Option<u16> = match op {
         DeviceOp::Group(g) => Some(g.group_id),
         DeviceOp::GroupProvision(p) => Some(p.group_id),
-        DeviceOp::GroupGrant { group_id, .. } => Some(*group_id),
+        DeviceOp::GroupGrant { group_id, .. } | DeviceOp::GroupRemove { group_id, .. } => {
+            Some(*group_id)
+        }
         DeviceOp::Node(_) | DeviceOp::GroupBump => None,
     };
     tracing::info!(
@@ -141,6 +143,13 @@ async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::V
         }
         DeviceOp::GroupGrant { group_id, node_ids } => {
             mat_native::runner::grant(&runner, *group_id, node_ids).await
+        }
+        DeviceOp::GroupRemove {
+            group_id,
+            endpoint,
+            node_ids,
+        } => {
+            mat_native::runner::remove_group(&runner, engine, *group_id, *endpoint, node_ids).await
         }
         DeviceOp::GroupBump => mat_native::op::run_group_bump(engine).await,
     }

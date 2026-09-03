@@ -387,6 +387,26 @@ pub fn group_grant_success(
     })
 }
 
+/// `group remove` の成功 body。`nodes` = (node_id, acl_removed, group_removed, keymap_removed, keyset_removed)。
+pub fn group_remove_success(
+    group_id: u16,
+    endpoint: u16,
+    nodes: &[(u64, bool, bool, bool, bool)],
+    controller_group_removed: bool,
+    controller_keyset_removed: bool,
+) -> Value {
+    json!({
+        "group_id": group_id,
+        "endpoint": endpoint,
+        "nodes": nodes.iter().map(|(id, acl, grp, map, ks)| json!({
+            "node_id": id, "acl_removed": acl, "group_removed": grp,
+            "keymap_removed": map, "keyset_removed": ks,
+        })).collect::<Vec<_>>(),
+        "controller": { "group_removed": controller_group_removed, "keyset_removed": controller_keyset_removed },
+        "status": "removed",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +698,18 @@ mod tests {
                 "group_id": 10, "nodes": [5, 6], "updated": [5],
                 "unchanged": [6], "status": "granted",
             })
+        );
+    }
+
+    #[test]
+    fn group_remove_success_shape() {
+        let body = group_remove_success(1, 1, &[(5, true, true, true, false)], true, false);
+        assert_eq!(
+            body,
+            json!({ "group_id": 1, "endpoint": 1,
+                    "nodes": [{ "node_id": 5, "acl_removed": true, "group_removed": true, "keymap_removed": true, "keyset_removed": false }],
+                    "controller": { "group_removed": true, "keyset_removed": false },
+                    "status": "removed" })
         );
     }
 

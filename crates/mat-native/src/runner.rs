@@ -178,6 +178,47 @@ pub async fn grant(
     ))
 }
 
+/// `group remove`: 各ノードでデバイス側 4 ステップ（最初の失敗で停止、
+/// コントローラ KVS は触らない）→ 全ノード成功後にコントローラ KVS から撤収。
+pub async fn remove_group(
+    r: &impl NodeRunner,
+    engine: &Engine,
+    group_id: u16,
+    endpoint: u16,
+    node_ids: &[u64],
+) -> Result<Value, MatError> {
+    let Some(gs) = &engine.group_settings else {
+        return Err(MatError::group_ctx_unconfigured());
+    };
+    let mut nodes = Vec::with_capacity(node_ids.len());
+    for &node_id in node_ids {
+        let p = crate::ops::RemoveGroupNodeParams { group_id, endpoint };
+        let rep = r
+            .with_node(node_id, None, move |c| {
+                let p = p.clone();
+                Box::pin(async move { crate::ops::remove_group_node(c.as_mut(), &p).await })
+            })
+            .await
+            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+        nodes.push((
+            node_id,
+            rep.acl_removed,
+            rep.group_removed,
+            rep.keymap_removed,
+            rep.keyset_removed,
+        ));
+    }
+    let keyset_removed = crate::group_settings::remove_group(gs, group_id)?;
+    tracing::info!(group_id, nodes = node_ids.len(), "group remove executed");
+    Ok(body::group_remove_success(
+        group_id,
+        endpoint,
+        &nodes,
+        true,
+        keyset_removed,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +395,124 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
         assert!(err.detail.starts_with("node 5: "), "{}", err.detail);
+    }
+
+    /// `remove_group` 用フィクスチャ: group 1 / keyset 42 を書いた
+    /// コントローラ KVS を持つ Engine と、その INI パス。
+    fn engine_with_provisioned_group(
+        est: impl crate::Establisher + 'static,
+        dir: &tempfile::TempDir,
+    ) -> (Engine, std::path::PathBuf) {
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let gs = crate::group_settings::GroupSettingsCtx {
+            main_ini: ini.clone(),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        };
+        crate::group_settings::write_group_provision(&gs, 1, 42, "grp1", &[0x42; 16], false)
+            .unwrap();
+        let mut engine = Engine::with_parts(Box::new(est), None);
+        engine.group_settings = Some(gs);
+        (engine, ini)
+    }
+
+    /// ACL に group 1 の Group エントリを返し、最初の `write_tlv`（= ACL
+    /// 全置換）を `Unreachable` で落とす establisher。
+    struct RemoveFailingEstablisher;
+    #[async_trait::async_trait]
+    impl crate::Establisher for RemoveFailingEstablisher {
+        async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
+            let mut conn = FakeConn::scripted().with_read(
+                0,
+                0x001F,
+                0x0000,
+                serde_json::json!([
+                    {"1": 5, "2": 2, "3": [112233], "4": null, "254": 1},
+                    {"1": 3, "2": 3, "3": [1], "4": null, "254": 1}
+                ]),
+            );
+            conn.fail_first_send = true;
+            conn.fail_kind = ErrorKind::Unreachable;
+            Ok(Box::new(conn))
+        }
+    }
+
+    /// 撤収 4 ステップが全部通る establisher（ACL に group 1、group-key-map に
+    /// (1, 42)、RemoveGroupResponse は status 0）。
+    struct RemoveOkEstablisher;
+    #[async_trait::async_trait]
+    impl crate::Establisher for RemoveOkEstablisher {
+        async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
+            let mut w = mat_controller::tlv::Writer::new();
+            w.start_struct(mat_controller::tlv::Tag::Anonymous);
+            w.put_uint(mat_controller::tlv::Tag::Context(0), 0); // status = SUCCESS
+            w.put_uint(mat_controller::tlv::Tag::Context(1), 1); // groupID
+            w.end_container();
+            Ok(Box::new(
+                FakeConn::scripted()
+                    .with_read(
+                        0,
+                        0x001F,
+                        0x0000,
+                        serde_json::json!([
+                            {"1": 5, "2": 2, "3": [112233], "4": null, "254": 1},
+                            {"1": 3, "2": 3, "3": [1], "4": null, "254": 1}
+                        ]),
+                    )
+                    .with_read(
+                        0,
+                        0x003F,
+                        0x0000,
+                        serde_json::json!([{"1": 1, "2": 42, "254": 1}]),
+                    )
+                    .with_invoke_response(1, 0x0004, 0x0003, w.finish()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_group_stops_at_first_node_failure_and_leaves_controller_kvs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, ini) = engine_with_provisioned_group(RemoveFailingEstablisher, &dir);
+        let runner = OneShotRunner::new(&engine, |_| {});
+        let err = remove_group(&runner, &engine, 1, 1, &[5])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Unreachable);
+        assert!(err.detail.starts_with("node 5: "), "{}", err.detail);
+        let t = mat_controller::group_settings::read_groups(&ini, 2).unwrap();
+        assert_eq!(t.groups.len(), 1, "KVS は無変更");
+    }
+
+    #[tokio::test]
+    async fn remove_group_reports_per_node_steps_and_drops_controller_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, ini) = engine_with_provisioned_group(RemoveOkEstablisher, &dir);
+        let runner = OneShotRunner::new(&engine, |_| {});
+        let body = remove_group(&runner, &engine, 1, 1, &[5]).await.unwrap();
+        assert_eq!(body["status"], "removed");
+        assert_eq!(
+            body["nodes"],
+            serde_json::json!([{ "node_id": 5, "acl_removed": true, "group_removed": true,
+                                 "keymap_removed": true, "keyset_removed": true }])
+        );
+        assert_eq!(
+            body["controller"],
+            serde_json::json!({ "group_removed": true, "keyset_removed": true })
+        );
+        let t = mat_controller::group_settings::read_groups(&ini, 2).unwrap();
+        assert!(t.groups.is_empty(), "コントローラ KVS から撤収済み");
+    }
+
+    #[tokio::test]
+    async fn remove_group_hard_errors_when_group_settings_ctx_missing() {
+        let engine = Engine::with_parts(Box::new(RemoveOkEstablisher), None);
+        let runner = OneShotRunner::new(&engine, |_| {});
+        let err = remove_group(&runner, &engine, 1, 1, &[5])
+            .await
+            .expect_err("missing group_settings ctx must hard-error");
+        assert_eq!(err.kind, ErrorKind::Other);
     }
 
     #[tokio::test]

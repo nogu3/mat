@@ -24,6 +24,12 @@ pub(crate) enum DeviceOp {
         group_id: u16,
         node_ids: Vec<u64>,
     },
+    /// 直経路専用（grant と同じ理由）。
+    GroupRemove {
+        group_id: u16,
+        endpoint: u16,
+        node_ids: Vec<u64>,
+    },
     GroupBump,
 }
 
@@ -35,6 +41,7 @@ impl DeviceOp {
             DeviceOp::Group(g) => g.kind.name(),
             DeviceOp::GroupProvision(_) => "group_provision",
             DeviceOp::GroupGrant { .. } => "group_grant",
+            DeviceOp::GroupRemove { .. } => "group_remove",
             DeviceOp::GroupBump => "group_bump",
         }
     }
@@ -269,6 +276,15 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             }),
             GroupCommand::Grant { group_id, node_ids } => DeviceOp::GroupGrant {
                 group_id: group_id.id()?,
+                node_ids: nodes(node_ids)?,
+            },
+            GroupCommand::Remove {
+                group_id,
+                node_ids,
+                endpoint,
+            } => DeviceOp::GroupRemove {
+                group_id: group_id.id()?,
+                endpoint: *endpoint,
                 node_ids: nodes(node_ids)?,
             },
             GroupCommand::Bump => DeviceOp::GroupBump,

@@ -362,6 +362,8 @@ fn to_op(op: &DeviceOp) -> Result<Value, String> {
         // grant は稀な修復操作で warm session の恩恵が小さく、mat/matd の
         // バージョンスキューにも安全なため直経路のみ。
         DeviceOp::GroupGrant { .. } => return Err(unsupported_detail("group grant")),
+        // remove も同じ理由（稀な撤収操作 + コントローラ KVS の所有者は mat）。
+        DeviceOp::GroupRemove { .. } => return Err(unsupported_detail("group remove")),
     })
 }
 

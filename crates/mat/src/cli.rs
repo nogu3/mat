@@ -589,6 +589,22 @@ pub enum GroupCommand {
         node_ids: Vec<NodeRef>,
     },
 
+    /// provision の逆: 各ノードから ACL の Group エントリ / RemoveGroup /
+    /// group-key-map の行 / （未参照なら）KeySet を外し、全ノード成功後に
+    /// コントローラ KVS の group state も削除する。KVS はメンバー一覧を持たない
+    /// ので --nodes は必須。常に直経路（--matd 明示時は exit 2）。
+    Remove {
+        /// Matter GroupId、または aliases.toml の group alias。
+        #[arg(short = 'g', long = "group", value_name = "ID|ALIAS")]
+        group_id: GroupRef,
+        /// 撤収対象の commission 済み node_id または node alias（1つ以上）。
+        #[arg(long = "nodes", required = true, num_args = 1..)]
+        node_ids: Vec<NodeRef>,
+        /// RemoveGroup を送るエンドポイント（既定 1、数値のみ）。
+        #[arg(short = 'e', long, value_name = "EP", default_value_t = 1)]
+        endpoint: u16,
+    },
+
     /// コントローラ KVS の group テーブル（group / keymap / keyset チェーン）を
     /// 一覧する。ローカル読み取りのみ（ネットワーク・matd に触れない）。
     List,
