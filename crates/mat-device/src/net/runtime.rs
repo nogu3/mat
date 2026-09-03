@@ -38,6 +38,27 @@
 //! checks `is_armed()` on every gated command itself (`core::commissioning`)
 //! and answers `STATUS_FAILSAFE_REQUIRED` once it lapses — this runtime just
 //! forwards whatever `Node::handle_im` returns.
+//!
+//! ## Groupcast (spec §4.15, Task 7)
+//!
+//! A second, independent UDP socket (`net::group_rx::GroupSocket`) receives
+//! group-session datagrams — Matter's fixed multicast port 5540, bound
+//! `SO_REUSEPORT` alongside the unicast socket rather than shared with it,
+//! since multicast join/leave is per-socket state the unicast path has no
+//! business carrying. `sync_group_joins` runs at the top of every loop
+//! iteration (desired = each fabric's own `GroupMembershipStore` groups, via
+//! `group_rx::desired_group_addrs`) so an `AddGroup`, `RemoveFabric`, or
+//! fail-safe rollback that changes membership is picked up on the very next
+//! spin, with no dedicated event plumbing. The `select!` grows a `grecv`
+//! branch reading that socket (`group_rx::group_recv`, which is
+//! `std::future::pending` when the socket never bound); a decoded datagram
+//! is classified by `group_rx::classify_group_datagram` and, on success,
+//! applied via `Node::handle_group_invoke` under a `Subject::group(..)` —
+//! never a response, per spec §4.15's fire-and-forget contract. The unicast
+//! socket, in turn, drops any datagram whose `security_flags` says group
+//! session right after header decode (`SESSION_TYPE_MASK`) — group traffic
+//! is the group socket's job even if it happens to also reach the unicast
+//! one.
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -66,6 +87,10 @@ use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
 use crate::core::pase::{PaseSecret, PaseVerifierConfig};
 use crate::device::{DeviceConfig, DeviceError};
+use crate::net::group_rx::{
+    classify_group_datagram, desired_group_addrs, group_recv, GroupReplayGuard, GroupRx,
+    GroupRxDeps, SESSION_TYPE_MASK,
+};
 use crate::net::mdns::MdnsAdvertiser;
 use crate::net::subscription::ActiveSubscription;
 
@@ -687,6 +712,7 @@ pub(crate) async fn run(
     config: DeviceConfig,
     mut node: Node,
     comm_server: CommissioningServer,
+    mut group: GroupRx,
 ) -> Result<(), DeviceError> {
     let port = local_addr.port();
     // A fresh random PASE salt each boot (spec §3.9 permits any salt; a
@@ -738,7 +764,10 @@ pub(crate) async fn run(
     // subscribed on.
     let mut subscription: Option<ActiveSubscription> = None;
     let mut buf = [0u8; MAX_DATAGRAM];
+    let mut replay = GroupReplayGuard::new();
+    let mut gbuf = [0u8; MAX_DATAGRAM];
     loop {
+        sync_group_joins(&mut group, &comm_server);
         tokio::select! {
             recv = transport.recv_from(&mut buf) => {
                 let (n, peer) = match recv {
@@ -749,6 +778,10 @@ pub(crate) async fn run(
                     tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
                     continue;
                 };
+                if header.security_flags & SESSION_TYPE_MASK != 0 {
+                    tracing::debug!(peer = %peer, security_flags = header.security_flags, "group-session datagram on the unicast socket dropped (the group socket serves those)");
+                    continue;
+                }
                 if header.session_id == 0 && header.security_flags == 0 {
                     let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
                         tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
@@ -1050,7 +1083,44 @@ pub(crate) async fn run(
                     }
                 }
             }
+            grecv = group_recv(&group.socket, &mut gbuf) => {
+                let Ok((n, from)) = grecv else { continue };
+                let fabrics = comm_server.fabrics();
+                let deps = GroupRxDeps { fabrics: &fabrics, gk_store: &group.gk_store, membership: &group.membership };
+                match classify_group_datagram(&gbuf[..n], &deps, &mut replay) {
+                    Ok(batch) => {
+                        let mut ctx = InvokeCtx {
+                            fabric_index: batch.fabric_index,
+                            subject: Subject::group(batch.group_id),
+                            ..InvokeCtx::default()
+                        };
+                        let changed = node.handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
+                        tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
+                        if let Some(sub) = subscription.as_mut() {
+                            sub.note_changed(&changed);
+                        }
+                    }
+                    Err(reason) => tracing::debug!(peer = %from, len = n, ?reason, "groupcast datagram dropped"),
+                }
+            }
         }
+    }
+}
+
+/// Multicast join/leave against `group.socket`, differenced from the last
+/// call by `GroupSocket::sync_joins` itself — a no-op when membership hasn't
+/// changed since the previous iteration. Run at the top of every `run` loop
+/// iteration (before `select!`) so an `AddGroup`, `RemoveFabric`, or
+/// fail-safe rollback that changed the set of joined groups is picked up on
+/// the very next spin, without any dedicated event plumbing from those call
+/// sites back into this loop. A `None` socket (bind failed at `Device::new`
+/// time) makes this a no-op.
+fn sync_group_joins(group: &mut GroupRx, comm_server: &CommissioningServer) {
+    if let Some(sock) = group.socket.as_mut() {
+        sock.sync_joins(&desired_group_addrs(
+            &comm_server.fabrics(),
+            &group.membership,
+        ));
     }
 }
 
@@ -2029,6 +2099,7 @@ mod tests {
             store_dir: std::path::PathBuf::new(),
             iface: String::new(),
             attestation: Default::default(),
+            group_port: 0,
             devices: vec![],
         }
     }

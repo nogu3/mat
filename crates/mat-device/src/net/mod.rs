@@ -3,6 +3,7 @@
 
 pub mod case;
 pub mod endpoint_ledger;
+pub mod group_rx;
 pub mod mdns;
 pub mod pase;
 pub(crate) mod runtime;

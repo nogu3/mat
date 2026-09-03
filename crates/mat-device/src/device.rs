@@ -104,6 +104,25 @@ pub struct DeviceConfig {
     /// to [`AttestationMode::Self_`] — existing chip-tool e2e behavior is
     /// unchanged unless a caller opts into `ChipTest` explicitly.
     pub attestation: AttestationMode,
+    /// groupcast 受信ソケットの UDP ポート。Matter の multicast 宛先は
+    /// 5540 固定なので本番は 5540。`mat`/`matd` はこのポートに一切 bind
+    /// しない（groupcast 宛には送るだけ）ので、同一ポートを名乗る複数の
+    /// `matv` プロセス間の共存だけが SO_REUSEPORT の対象——`group_port` 自体
+    /// を unicast の `port` と同じ値にするのは NG（下記）。
+    ///
+    /// **`port` は（`group_port == 0` の場合を除き）`group_port` と一致
+    /// させてはならない。** 一致すると group ソケットの bind が
+    /// `EADDRINUSE` で失敗し、groupcast が黙って無効化される
+    /// （`Device::new` が検出して warn を出し、bind そのものを試みない）。
+    /// unicast ソケット側に SO_REUSEPORT を付けて共存させる、という対策は
+    /// **採れない**——Linux の SO_REUSEPORT グループはカーネルが送信元の
+    /// ハッシュで振り分けるため、同じポートに reuseport で 2 ソケットを
+    /// 積むと CASE 等の unicast トラフィックの一部が group ソケット側に
+    /// 誤配送されうる（unicast ソケットは常にただ一つ・reuseport なしの
+    /// まま）。
+    ///
+    /// `0` = エフェメラル（統合テストが `group_local_addr` で知る）。
+    pub group_port: u16,
     /// M3: Aggregator (EP1) 配下に載せる bridged device 群、設定ファイルの
     /// `[[device]]` 宣言順。空でも `Device::new` は通る（EP1 の PartsList が
     /// 空の Aggregator になるだけ）— 「1 台以上必要」の判断は
@@ -198,6 +217,7 @@ pub struct Device {
     local_addr: SocketAddr,
     node: Node,
     comm_server: CommissioningServer,
+    group: crate::net::group_rx::GroupRx,
     /// 各 bridged device の `(設定ファイルの id, OnOff 状態ハンドル)` —
     /// 宣言順。`Device` 自身はまだ読まない（M4 で mando への転送/状態
     /// ログが消費する）。
@@ -265,11 +285,25 @@ impl Device {
         // GroupKeyManagement（spec §11.2）の共有ストア: `AclStore` と同じ
         // 「RemoveFabric・fail-safe rollback の purge は
         // `CommissioningServer` が書き、EP0 のクラスタハンドラが読み書き
-        // する」配線（`set_acl_store`の doc 参照）。`GroupKeyStore` は
-        // Task 1 時点で非永続（`with_persist` 相当は無い、モジュール doc
-        // 参照）— 再起動で KeySet/GroupKeyMap が消えるのは既知ギャップ。
-        let gk_store = crate::core::group_key_management::GroupKeyStore::new();
+        // する」配線（`set_acl_store`の doc 参照）。`<store_dir>/
+        // group_keys.json` に永続化（`AclStore` と同じ file-backed persist
+        // 注入）。
+        let gk_store = crate::core::group_key_management::GroupKeyStore::with_persist(Box::new(
+            crate::net::store::group_key_store_in_dir(&config.store_dir),
+        ));
         comm_server.set_group_key_store(gk_store.clone());
+
+        // Groups（spec §1.3）の共有 membership 帳簿: 全 bridged endpoint の
+        // `GroupsHandler` がこの 1 つの store に委譲する（同じ group への
+        // AddGroup が endpoint 横断で見える — groupcast のディスパッチ先を
+        // 引くのに使う）。`RemoveFabric`・fail-safe rollback の purge も
+        // `AclStore`/`GroupKeyStore` と同じ配線。永続化は `<store_dir>/
+        // groups.json`。
+        let membership =
+            crate::core::group_membership::GroupMembershipStore::with_persist(Box::new(
+                crate::net::store::group_membership_in_dir(&config.store_dir),
+            ));
+        comm_server.set_group_membership_store(membership.clone());
 
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
         // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
@@ -333,7 +367,12 @@ impl Device {
         );
         node.add_cluster(
             0,
-            Box::new(crate::core::group_key_management::GroupKeyManagementHandler::new(gk_store)),
+            Box::new(
+                crate::core::group_key_management::GroupKeyManagementHandler::new(
+                    gk_store.clone(),
+                    membership.clone(),
+                ),
+            ),
         );
 
         // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
@@ -371,6 +410,8 @@ impl Device {
                 device.kind,
                 &device.name,
                 &bridged_unique_id(&unique_id, &device.id),
+                *endpoint,
+                &membership,
             );
             node.add_endpoint(*endpoint, built.clusters);
             onoff_states.push((device.id.clone(), built.onoff_state));
@@ -384,12 +425,46 @@ impl Device {
         let local_addr = udp.local_addr().map_err(DeviceError::Io)?;
         let transport = Arc::new(Transport::Udp(Arc::new(udp)));
 
+        let iface_index = mat_controller::dnssd::iface_index(&config.iface).unwrap_or_else(|e| {
+            tracing::warn!(iface = %config.iface, error = %e, "groupcast: interface index unknown; joining on the kernel default");
+            0
+        });
+        // `port == group_port` (both nonzero) would make the group bind
+        // race the unicast one for the exact same `[::]:port` — and giving
+        // the *unicast* socket SO_REUSEPORT to dodge that is not a fix
+        // (`DeviceConfig::group_port`'s doc): the kernel would then be free
+        // to hash some unicast (CASE/IM) traffic onto the group socket
+        // instead. So this is refused up front rather than attempting the
+        // bind and letting it fail with a bare `EADDRINUSE`.
+        let group_socket = if config.port != 0 && config.port == config.group_port {
+            tracing::warn!(
+                port = config.port,
+                group_port = config.group_port,
+                "unicast port equals group_port; groupcast disabled — set port to 0 or another value"
+            );
+            None
+        } else {
+            match crate::net::group_rx::GroupSocket::bind(config.group_port, iface_index) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
+                    None
+                }
+            }
+        };
+        let group = crate::net::group_rx::GroupRx {
+            socket: group_socket,
+            gk_store: gk_store.clone(),
+            membership: membership.clone(),
+        };
+
         Ok(Self {
             config,
             transport,
             local_addr,
             node,
             comm_server,
+            group,
             onoff_states,
         })
     }
@@ -399,6 +474,15 @@ impl Device {
     /// mDNS) uses this to reach the device without discovery.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The groupcast receive socket's actual bound address, if it bound
+    /// (`None` when it didn't — the device still serves unicast only; see
+    /// `new`'s doc comment). Resolves `DeviceConfig::group_port == 0` to the
+    /// ephemeral port the OS picked, same as `local_addr` for the unicast
+    /// socket.
+    pub fn group_local_addr(&self) -> Option<SocketAddr> {
+        self.group.socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
     /// QR onboarding payload (`MT:...`, spec §5.1.4) — `mat commission
@@ -457,6 +541,7 @@ impl Device {
             self.config,
             self.node,
             self.comm_server,
+            self.group,
         )
         .await
     }
@@ -521,6 +606,7 @@ mod tests {
             store_dir: dir.path().to_path_buf(),
             iface: "lo".into(),
             attestation: AttestationMode::default(),
+            group_port: 0,
             devices,
         };
         let dev = |id: &str, name: &str| VirtualDeviceConfig {
@@ -660,6 +746,7 @@ mod tests {
             store_dir: dir.path().to_path_buf(),
             iface: "lo".into(),
             attestation: AttestationMode::default(),
+            group_port: 0,
             devices: vec![
                 VirtualDeviceConfig {
                     id: "e2e-light".into(),
@@ -713,6 +800,29 @@ mod tests {
         assert_eq!(unique_id_at(&mut d2.node, 2), first);
         assert_eq!(unique_id_at(&mut d2.node, 3), second);
         drop(d2);
+    }
+
+    /// `Device::new` binds the groupcast receive socket alongside the
+    /// unicast one — `group_local_addr` resolves `group_port == 0` to
+    /// whatever ephemeral port the OS picked, just like `local_addr` does
+    /// for the unicast socket.
+    #[tokio::test]
+    async fn group_socket_is_bound_on_the_configured_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = DeviceConfig {
+            passcode: 20202021,
+            discriminator: 0xF00,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            port: 0,
+            store_dir: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            attestation: AttestationMode::default(),
+            group_port: 0,
+            devices: vec![],
+        };
+        let d = Device::new(cfg).unwrap();
+        assert!(d.group_local_addr().unwrap().port() != 0);
     }
 
     /// First call with an empty `store_dir` generates a fresh UniqueID and

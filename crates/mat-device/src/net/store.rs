@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::access_control::{AclDeviceEntry, AclPersist};
 use crate::core::datamodel::BasicInfoPersist;
 use crate::core::fabric_store::{FabricEntry, FabricPersist};
+use crate::core::group_key_management::{GroupKeyMapEntry, GroupKeyPersist, GroupKeySet};
+use crate::core::group_membership::{GroupMember, GroupMembershipPersist};
 
 /// Persists the fabric table as one JSON file at a fixed path.
 pub struct FileFabricStore {
@@ -147,6 +149,97 @@ pub fn load_basic_info(dir: &Path) -> (String, String) {
         },
         Err(_) => (String::new(), "XX".to_string()),
     }
+}
+
+/// `group_keys.json` の 1 ファイル分（keyset と map を一緒に保存 —
+/// 片方だけ新しい状態は意味を持たないので whole-table を 1 write にする）。
+#[derive(Serialize, Deserialize, Default)]
+struct GroupKeyFile {
+    keysets: Vec<GroupKeySet>,
+    map: Vec<GroupKeyMapEntry>,
+}
+
+/// File-backed [`GroupKeyPersist`] — epoch key を平文で持つので
+/// `FileFabricStore` と同じく owner-only (0600)。
+pub struct FileGroupKeyStore {
+    path: PathBuf,
+}
+
+impl FileGroupKeyStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl GroupKeyPersist for FileGroupKeyStore {
+    fn save(&self, keysets: &[GroupKeySet], map: &[GroupKeyMapEntry]) -> Result<(), String> {
+        let file = GroupKeyFile {
+            keysets: keysets.to_vec(),
+            map: map.to_vec(),
+        };
+        let bytes = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())
+    }
+
+    fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => {
+                let file: GroupKeyFile =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                Ok((file.keysets, file.map))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), Vec::new())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Convenience: builds a [`FileGroupKeyStore`] rooted at `dir`
+/// (`group_keys.json`) — mirrors [`acl_store_in_dir`] above.
+pub fn group_key_store_in_dir(dir: &Path) -> FileGroupKeyStore {
+    FileGroupKeyStore::new(dir.join("group_keys.json"))
+}
+
+/// File-backed [`GroupMembershipPersist`]
+/// (`crate::core::group_membership::GroupMembershipPersist`)
+/// implementation — same JSON-via-`serde_json` +
+/// `mat_core::fsatomic::write_atomic` discipline as [`FileAclStore`] above.
+/// Unlike `group_keys.json`, `groups.json` holds no key material (just
+/// fabric/group/endpoint bookkeeping), so it doesn't get the owner-only
+/// permission restriction `FileFabricStore::save`/`FileGroupKeyStore::save`
+/// apply.
+pub struct FileGroupMembershipStore {
+    path: PathBuf,
+}
+
+impl FileGroupMembershipStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl GroupMembershipPersist for FileGroupMembershipStore {
+    fn save(&self, members: &[GroupMember]) -> Result<(), String> {
+        let bytes = serde_json::to_vec(members).map_err(|e| e.to_string())?;
+        mat_core::fsatomic::write_atomic(&self.path, &bytes).map_err(|e| e.to_string())
+    }
+
+    fn load(&self) -> Result<Vec<GroupMember>, String> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Convenience: builds a [`FileGroupMembershipStore`] rooted at `dir`
+/// (`groups.json`) — mirrors [`acl_store_in_dir`] above.
+pub fn group_membership_in_dir(dir: &Path) -> FileGroupMembershipStore {
+    FileGroupMembershipStore::new(dir.join("groups.json"))
 }
 
 #[cfg(test)]
@@ -306,5 +399,61 @@ mod tests {
             load_basic_info(dir.path()),
             (String::new(), "XX".to_string())
         );
+    }
+
+    #[test]
+    fn group_key_store_with_persist_reloads_across_instances_and_is_owner_only() {
+        use crate::core::group_key_management::{GroupKeySet, GroupKeyStore};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = GroupKeyStore::with_persist(Box::new(group_key_store_in_dir(dir.path())));
+            store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+            store.replace_fabric_map(1, vec![(10, 42)]);
+        }
+        let mode = std::fs::metadata(dir.path().join("group_keys.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let store2 = GroupKeyStore::with_persist(Box::new(group_key_store_in_dir(dir.path())));
+        assert_eq!(
+            store2.keysets(),
+            vec![GroupKeySet {
+                fabric_index: 1,
+                keyset_id: 42,
+                epoch_key0: [7u8; 16]
+            }]
+        );
+        assert_eq!(store2.map_entries_for(1), vec![(10, 42)]);
+    }
+
+    #[test]
+    fn group_key_load_with_no_file_yet_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, m) = group_key_store_in_dir(dir.path()).load().unwrap();
+        assert!(k.is_empty() && m.is_empty());
+    }
+
+    #[test]
+    fn group_membership_with_persist_reloads_across_instances() {
+        use crate::core::group_membership::GroupMembershipStore;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s =
+                GroupMembershipStore::with_persist(Box::new(group_membership_in_dir(dir.path())));
+            s.add(1, 10, 2).unwrap();
+        }
+        let s2 = GroupMembershipStore::with_persist(Box::new(group_membership_in_dir(dir.path())));
+        assert_eq!(s2.endpoints_for(1, 10), vec![2]);
+    }
+
+    #[test]
+    fn group_membership_load_with_no_file_yet_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(group_membership_in_dir(dir.path())
+            .load()
+            .unwrap()
+            .is_empty());
     }
 }

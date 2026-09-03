@@ -4,18 +4,22 @@
 //!
 //! `KeySetWrite`（spec §11.2.7.1）と `ATTR_GROUP_KEY_MAP` の write/read
 //! （spec §11.2.7.6、全置換 + `ListIndex` null append の両径路）を実装し、
-//! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は空 array のまま
-//! （`GroupTable` は Groups クラスタ側のエンドポイント紐付けが要る派生
-//! ビューで、groupcast タスク送り）。`KeySetRead`/`KeySetRemove`/
-//! `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ、
-//! groupcast タスク送り）。
+//! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は
+//! `core::group_membership::GroupMembershipStore`（Groups クラスタ側の
+//! エンドポイント紐付け帳簿）から派生する読み取り専用ビュー。
+//! `KeySetRead`/`KeySetRemove`/
+//! `KeySetReadAllIndices` コマンドは未実装（既知ギャップ、groupcast タスク
+//! 送り）。永続化は `with_persist` で `<store_dir>/group_keys.json`
+//! （`net::store::FileGroupKeyStore`）に行う。
 use std::sync::{Arc, Mutex};
 
 use mat_controller::im;
 use mat_controller::sync::locked;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
+use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::group_membership::GroupMembershipStore;
 
 /// `MaxGroupsPerFabric`/`MaxGroupKeysPerFabric` (spec §11.2.7.5) — 固定値を
 /// 返すのみで実容量は追跡しない（`AccessControlHandler`の容量属性と同じ
@@ -26,22 +30,39 @@ use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 const MAX_GROUPS_PER_FABRIC: u64 = 16;
 const MAX_GROUP_KEYS_PER_FABRIC: usize = 1;
 
-/// デバイス上の 1 KeySet（`GroupKeySetStruct` の epoch key 0 のみ保持 —
-/// epoch 1/2 は spec 上 optional でこの実装では未対応、モジュール doc
-/// 参照）。
-#[derive(Debug, Clone)]
-struct GroupKeySet {
-    fabric_index: u8,
-    keyset_id: u16,
-    epoch_key0: [u8; 16],
+/// デバイス上の 1 KeySet（epoch key 0 のみ保持 — epoch 1/2 は spec 上
+/// optional でこの実装では未対応、モジュール doc 参照）。`Debug` は鍵を
+/// 伏せる（`FabricEntry`/`GroupCredentials` と同じ方針）。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupKeySet {
+    pub fabric_index: u8,
+    pub keyset_id: u16,
+    pub epoch_key0: [u8; 16],
+}
+
+impl std::fmt::Debug for GroupKeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupKeySet")
+            .field("fabric_index", &self.fabric_index)
+            .field("keyset_id", &self.keyset_id)
+            .field("epoch_key0", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// `GroupKeyMapStruct` 1 件（spec §11.2.7.6: GroupId → KeySetID）。
-#[derive(Debug, Clone)]
-struct GroupKeyMapEntry {
-    fabric_index: u8,
-    group_id: u16,
-    keyset_id: u16,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupKeyMapEntry {
+    pub fabric_index: u8,
+    pub group_id: u16,
+    pub keyset_id: u16,
+}
+
+/// 永続化境界（`core::access_control::AclPersist` と同型: whole-table
+/// save/load、具象は `net::store::FileGroupKeyStore`）。
+pub trait GroupKeyPersist: Send {
+    fn save(&self, keysets: &[GroupKeySet], map: &[GroupKeyMapEntry]) -> Result<(), String>;
+    fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String>;
 }
 
 /// `GroupKeyStore`'s guarded state — `AclStore`/`AclInner`（
@@ -50,13 +71,15 @@ struct GroupKeyMapEntry {
 struct GroupKeyInner {
     keysets: Vec<GroupKeySet>,
     map: Vec<GroupKeyMapEntry>,
+    persist: Option<Box<dyn GroupKeyPersist>>,
 }
 
 /// GroupKeyManagement の共有 state。`GroupKeyManagementHandler`（EP0 の
 /// クラスタハンドラ）と、`CommissioningServer`（fabric 撤去の purge、
 /// `core::commissioning::set_group_key_store`）・将来の groupcast 配線の
 /// 両方から触られる想定で `Arc<Mutex<..>>` + `Clone`（`AclStore` と同じ
-/// パターン、モジュール doc 参照）。永続化なし（M3 送り）。
+/// パターン、モジュール doc 参照）。永続化は任意（`new` は非永続、
+/// `with_persist` で `<store_dir>/group_keys.json` に永続化）。
 #[derive(Clone, Default)]
 pub struct GroupKeyStore(Arc<Mutex<GroupKeyInner>>);
 
@@ -66,11 +89,43 @@ impl GroupKeyStore {
         Self::default()
     }
 
+    /// `persist` から復元して開始する。load 失敗（壊れた JSON 等）は warn
+    /// して空から始める — 起動を止めない。
+    pub fn with_persist(persist: Box<dyn GroupKeyPersist>) -> Self {
+        let (keysets, map) = match persist.load() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(error = %e, "group key store: load failed; starting empty");
+                (Vec::new(), Vec::new())
+            }
+        };
+        Self(Arc::new(Mutex::new(GroupKeyInner {
+            keysets,
+            map,
+            persist: Some(persist),
+        })))
+    }
+
+    /// 全 fabric の KeySet（groupcast 受信の復号候補列挙用）。
+    pub fn keysets(&self) -> Vec<GroupKeySet> {
+        self.lock().keysets.clone()
+    }
+
     /// poison 耐性 lock（`mat_controller::sync::locked` — `AclStore` と同じ
     /// 全クレート共通ヘルパ）— 1 パニックでストア全体が触れなくなるのを
     /// 避ける。
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupKeyInner> {
         locked(&self.0)
+    }
+
+    /// save 失敗は warn して in-memory を進める（`AclStore::save` と同じ理由:
+    /// 直前の正当な状態が残るだけで安全性は落ちない）。
+    fn save(guard: &GroupKeyInner) {
+        if let Some(persist) = &guard.persist {
+            if let Err(e) = persist.save(&guard.keysets, &guard.map) {
+                tracing::warn!(error = %e, "group key store: save failed; keeping in-memory state");
+            }
+        }
     }
 
     /// KeySetWrite (spec §11.2.7.1) の実処理: 同 `(fabric_index,
@@ -90,6 +145,7 @@ impl GroupKeyStore {
             .find(|k| k.fabric_index == fabric_index && k.keyset_id == keyset_id)
         {
             existing.epoch_key0 = epoch_key0;
+            Self::save(&guard);
             return Ok(());
         }
         let count = guard
@@ -105,6 +161,7 @@ impl GroupKeyStore {
             keyset_id,
             epoch_key0,
         });
+        Self::save(&guard);
         Ok(())
     }
 
@@ -122,6 +179,7 @@ impl GroupKeyStore {
         let mut guard = self.lock();
         guard.keysets.retain(|k| k.fabric_index != fabric_index);
         guard.map.retain(|m| m.fabric_index != fabric_index);
+        Self::save(&guard);
     }
 
     /// 書き込み fabric の GroupKeyMap エントリを丸ごと入れ替える
@@ -138,16 +196,19 @@ impl GroupKeyStore {
                     keyset_id,
                 }),
         );
+        Self::save(&guard);
     }
 
     /// 書き込み fabric の GroupKeyMap 末尾に 1 件足す（write の
     /// ListIndex null append 径路）。
     pub fn append_map_entry(&self, fabric_index: u8, group_id: u16, keyset_id: u16) {
-        self.lock().map.push(GroupKeyMapEntry {
+        let mut guard = self.lock();
+        guard.map.push(GroupKeyMapEntry {
             fabric_index,
             group_id,
             keyset_id,
         });
+        Self::save(&guard);
     }
 
     pub fn map_entries_for(&self, fabric_index: u8) -> Vec<(u16, u16)> {
@@ -174,11 +235,12 @@ impl GroupKeyStore {
 #[derive(Default)]
 pub struct GroupKeyManagementHandler {
     store: GroupKeyStore,
+    membership: GroupMembershipStore,
 }
 
 impl GroupKeyManagementHandler {
-    pub fn new(store: GroupKeyStore) -> Self {
-        Self { store }
+    pub fn new(store: GroupKeyStore, membership: GroupMembershipStore) -> Self {
+        Self { store, membership }
     }
 
     /// `write` の共通制約チェック（設計メモ参照）: `group_id == 0`（無効
@@ -213,11 +275,12 @@ impl ClusterHandler for GroupKeyManagementHandler {
         ]
     }
 
-    /// `ATTR_GROUP_KEY_MAP`（spec §11.2.7.6）は `ctx.fabric_filtered` を
-    /// 尊重する fabric-scoped list（`AccessControlHandler::read`の
-    /// `ATTR_ACL`と同じ扱い）: filtered なら `ctx.fabric_index` 分のみ、
-    /// unfiltered なら全 fabric 分。`ATTR_GROUP_TABLE` はエンドポイント
-    /// 紐付けの派生ビューで未実装につき常に空 array（モジュール doc）。
+    /// `ATTR_GROUP_KEY_MAP`（spec §11.2.7.6）と `ATTR_GROUP_TABLE`（spec
+    /// §11.2.7.7）はどちらも `ctx.fabric_filtered` を尊重する fabric-scoped
+    /// list（`AccessControlHandler::read`の `ATTR_ACL`と同じ扱い）: filtered
+    /// なら `ctx.fabric_index` 分のみ、unfiltered なら全 fabric 分。
+    /// `ATTR_GROUP_TABLE` は `self.membership` から派生する（モジュール
+    /// doc）。
     fn read(&self, attribute: u32, ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
             im::ATTR_GROUP_KEY_MAP => {
@@ -233,8 +296,24 @@ impl ClusterHandler for GroupKeyManagementHandler {
                 Some(encode_group_key_map(&entries))
             }
             im::ATTR_GROUP_TABLE => {
+                // spec §11.2.7.7 GroupInfoMapStruct {1: GroupId, 2: Endpoints,
+                // 254: FabricIndex} — GroupName(3) は NameSupport=0 なので省略。
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
+                for (fabric_index, group_id) in self.membership.groups_by_fabric() {
+                    if ctx.fabric_filtered && fabric_index != ctx.fabric_index {
+                        continue;
+                    }
+                    w.start_struct(Tag::Anonymous);
+                    w.put_uint(Tag::Context(1), u64::from(group_id));
+                    w.start_array(Tag::Context(2));
+                    for endpoint in self.membership.endpoints_for(fabric_index, group_id) {
+                        w.put_uint(Tag::Anonymous, u64::from(endpoint));
+                    }
+                    w.end_container();
+                    w.put_uint(Tag::Context(254), u64::from(fabric_index));
+                    w.end_container();
+                }
                 w.end_container();
                 Some(w.finish())
             }
@@ -514,9 +593,72 @@ mod tests {
             .expect("attribute implemented")
     }
 
+    /// `GroupTable` の array を `(fabric_index, group_id, endpoints)` に戻す。
+    fn decode_group_table(tlv: &[u8]) -> Vec<(u8, u16, Vec<u16>)> {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::ArrayStart);
+        let mut out = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            match el.value {
+                Value::ContainerEnd => break,
+                Value::StructStart => {
+                    let (mut fabric, mut group, mut eps) = (0u8, 0u16, Vec::new());
+                    loop {
+                        let e = r.next().unwrap().unwrap();
+                        match (e.tag, e.value) {
+                            (_, Value::ContainerEnd) => break,
+                            (Tag::Context(1), Value::Uint(v)) => group = v as u16,
+                            (Tag::Context(2), Value::ArrayStart) => loop {
+                                let x = r.next().unwrap().unwrap();
+                                match x.value {
+                                    Value::ContainerEnd => break,
+                                    Value::Uint(v) => eps.push(v as u16),
+                                    other => panic!("unexpected {other:?}"),
+                                }
+                            },
+                            (Tag::Context(254), Value::Uint(v)) => fabric = v as u8,
+                            _ => {}
+                        }
+                    }
+                    out.push((fabric, group, eps));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn group_table_is_derived_from_membership_and_fabric_filtered() {
+        let membership = crate::core::group_membership::GroupMembershipStore::new();
+        membership.add(1, 10, 2).unwrap();
+        membership.add(1, 10, 3).unwrap();
+        membership.add(2, 20, 2).unwrap();
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), membership);
+        let filtered = h
+            .read(
+                im::ATTR_GROUP_TABLE,
+                &ReadCtx {
+                    fabric_index: 1,
+                    fabric_filtered: true,
+                    ..ReadCtx::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_group_table(&filtered), vec![(1, 10, vec![2, 3])]);
+        let all = h
+            .read(im::ATTR_GROUP_TABLE, &ReadCtx::unfiltered(1))
+            .unwrap();
+        assert_eq!(
+            decode_group_table(&all),
+            vec![(1, 10, vec![2, 3]), (2, 20, vec![2])]
+        );
+    }
+
     #[test]
     fn declares_attributes_and_key_set_write_command() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         assert_eq!(
             h.attributes(),
             vec![
@@ -533,7 +675,7 @@ mod tests {
 
     #[test]
     fn group_key_map_and_group_table_are_empty_arrays() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         for attr in [im::ATTR_GROUP_KEY_MAP, im::ATTR_GROUP_TABLE] {
             let tlv = read(&h, attr);
             let mut r = Reader::new(&tlv);
@@ -544,7 +686,7 @@ mod tests {
 
     #[test]
     fn capacity_attributes_report_fixed_values() {
-        let h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         // Literal brief values (not `MAX_GROUPS_PER_FABRIC`/
         // `MAX_GROUP_KEYS_PER_FABRIC`) so this test still catches a wrong
         // constant value.
@@ -559,7 +701,8 @@ mod tests {
 
     #[test]
     fn unknown_attribute_and_unknown_command_are_rejected() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         assert!(h.read(0x7777, &ReadCtx::default()).is_none());
         // 0x01 (KeySetRead, spec §11.2.7.2) is a real command id but not one
         // this implementation accepts — a CASE session (fabric_index != 0)
@@ -578,7 +721,7 @@ mod tests {
     #[test]
     fn key_set_write_stores_keyset_and_enforces_capacity() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let fields = mat_controller::im::encode_key_set_write_fields(0x01AA, &[0x11; 16]);
         let mut ctx = InvokeCtx {
             fabric_index: 1,
@@ -613,7 +756,8 @@ mod tests {
 
     #[test]
     fn key_set_write_rejects_pase_and_malformed() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         let fields = mat_controller::im::encode_key_set_write_fields(1, &[0u8; 16]);
         let mut pase = InvokeCtx::default(); // fabric_index 0 = PASE
         assert_eq!(
@@ -646,7 +790,7 @@ mod tests {
     #[test]
     fn group_key_map_write_replace_append_and_fabric_filtered_read() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -702,7 +846,7 @@ mod tests {
     #[test]
     fn group_key_map_write_list_append_adds_one_entry() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -727,7 +871,7 @@ mod tests {
     #[test]
     fn group_key_map_write_rejects_group_id_zero() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -749,7 +893,7 @@ mod tests {
     #[test]
     fn group_key_map_write_rejects_other_fabrics_keyset() {
         let store = GroupKeyStore::new();
-        let mut h = GroupKeyManagementHandler::new(store.clone());
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         let mut ctx1 = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
@@ -775,7 +919,8 @@ mod tests {
     /// `STATUS_UNSUPPORTED_ACCESS`。
     #[test]
     fn write_rejects_unsupported_attribute_and_pase() {
-        let mut h = GroupKeyManagementHandler::new(GroupKeyStore::new());
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         let data = mat_controller::im::encode_group_key_map_tlv(&[]);
         let mut ctx = InvokeCtx {
             fabric_index: 1,
@@ -798,7 +943,7 @@ mod tests {
     #[test]
     fn group_key_map_read_unfiltered_returns_all_fabrics() {
         let store = GroupKeyStore::new();
-        let h = GroupKeyManagementHandler::new(store.clone());
+        let h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
         store.upsert_keyset(1, 7, [0u8; 16]).unwrap();
         store.upsert_keyset(2, 8, [0u8; 16]).unwrap();
         store.replace_fabric_map(1, vec![(0x000A, 7)]);
@@ -833,5 +978,79 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, vec![(1, 0x000A, 7), (2, 0x000B, 8)]);
+    }
+
+    struct MemPersist(std::sync::Arc<std::sync::Mutex<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>)>>);
+    impl GroupKeyPersist for MemPersist {
+        fn save(&self, keysets: &[GroupKeySet], map: &[GroupKeyMapEntry]) -> Result<(), String> {
+            *self.0.lock().unwrap() = (keysets.to_vec(), map.to_vec());
+            Ok(())
+        }
+        fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    /// 変異 4 種（upsert / replace map / append map / purge）が毎回 save され、
+    /// 別インスタンスが load で同じ状態に戻る。
+    #[test]
+    fn mutations_persist_and_reload_in_a_new_instance() {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+        {
+            let store = GroupKeyStore::with_persist(Box::new(MemPersist(cell.clone())));
+            store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+            store.replace_fabric_map(1, vec![(10, 42)]);
+            store.append_map_entry(1, 11, 42);
+            store.upsert_keyset(2, 9, [1u8; 16]).unwrap();
+            store.purge_fabric(2);
+        }
+        let store2 = GroupKeyStore::with_persist(Box::new(MemPersist(cell)));
+        assert_eq!(
+            store2.keysets(),
+            vec![GroupKeySet {
+                fabric_index: 1,
+                keyset_id: 42,
+                epoch_key0: [7u8; 16]
+            }]
+        );
+        assert_eq!(store2.map_entries_for(1), vec![(10, 42), (11, 42)]);
+        assert!(store2.map_entries_for(2).is_empty());
+    }
+
+    struct FailingPersist;
+    impl GroupKeyPersist for FailingPersist {
+        fn save(&self, _: &[GroupKeySet], _: &[GroupKeyMapEntry]) -> Result<(), String> {
+            Err("disk full".into())
+        }
+        fn load(&self) -> Result<(Vec<GroupKeySet>, Vec<GroupKeyMapEntry>), String> {
+            Err("corrupt".into())
+        }
+    }
+
+    /// load 失敗は空から開始、save 失敗は in-memory を進める（AclStore と同じ）。
+    #[test]
+    fn persist_failures_do_not_block_the_store() {
+        let store = GroupKeyStore::with_persist(Box::new(FailingPersist));
+        assert!(store.keysets().is_empty());
+        store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+        assert!(store.keyset_exists(1, 42));
+    }
+
+    #[test]
+    fn keyset_debug_redacts_the_epoch_key() {
+        let s = format!(
+            "{:?}",
+            GroupKeySet {
+                fabric_index: 1,
+                keyset_id: 42,
+                epoch_key0: [0xAB; 16]
+            }
+        );
+        // Note: a plain `!s.contains("ab")` would false-positive on the
+        // `fabric_index` field label itself (unrelated to the redacted
+        // key), so this checks only for a decimal leak of the 0xAB byte
+        // value (171) — the epoch key is fully redacted either way (no
+        // digits of it appear in `s` at all).
+        assert!(s.contains("REDACTED") && !s.contains("171"), "{s}");
     }
 }

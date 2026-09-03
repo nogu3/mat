@@ -38,11 +38,11 @@ pub(crate) const PRIVILEGE_MANAGE: u8 = 4;
 pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
 
 /// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が
-/// 照合に使う唯一の値 — CASE。PASE は fabric を持たないので ACL の対象外
-/// （`write` は PASE エントリを `CONSTRAINT_ERROR` で拒否する）。Group
-/// エントリは `write` が受理・検査して保持するが、`check` は CASE
-/// セッションに対して Group エントリを一致させない（groupcast 受信の
-/// 配線 = `Subject` に group 形を足すのは別フェーズ）。
+/// 照合に使う値の 1 つ — CASE。PASE は fabric を持たないので ACL の対象外
+/// （`write` は PASE エントリを `CONSTRAINT_ERROR` で拒否する）。`check` は
+/// auth mode ごとに排他: CASE エントリは CASE session（`Subject::node`/
+/// `Subject::new`、`group_id == None`）にしか一致しない — group session
+/// （`Subject::group`）には決して一致しない（`subject_matches_entry`）。
 pub(crate) const AUTH_MODE_CASE: u8 = 2;
 /// `AccessControlEntryAuthModeEnum::Group` — `mat group grant` が書く
 /// エントリの auth mode。`write` の妥当性検査（`validate_entry`）が
@@ -119,16 +119,33 @@ pub(crate) fn is_group_subject(subject: u64) -> bool {
 pub struct Subject {
     pub node_id: u64,
     pub cats: CaseAuthTags,
+    /// `Some(group_id)` = group session の subject（spec §6.6.2.1.3、
+    /// groupcast 受信）。`None` = CASE/PASE。ACL の照合は auth mode ごとに
+    /// 排他: Group エントリは `Some` にだけ、CASE エントリは `None` にだけ。
+    pub group_id: Option<u16>,
 }
 
 impl Subject {
     pub fn new(node_id: u64, cats: CaseAuthTags) -> Self {
-        Self { node_id, cats }
+        Self {
+            node_id,
+            cats,
+            group_id: None,
+        }
     }
 
     /// A subject identified by node id only (a NOC without CATs).
     pub fn node(node_id: u64) -> Self {
         Self::new(node_id, CaseAuthTags::default())
+    }
+
+    /// group session の subject（node id 0、CAT なし）。
+    pub fn group(group_id: u16) -> Self {
+        Self {
+            node_id: 0,
+            cats: CaseAuthTags::default(),
+            group_id: Some(group_id),
+        }
     }
 
     /// Whether one ACL entry subject (`AccessControlEntryStruct.Subjects`
@@ -259,12 +276,10 @@ impl AclStore {
     /// 5 つ組を、fabric スコープのエントリ群のうち **いずれか 1 件でも**
     /// 満たせば許可する。エントリごとの条件は AND:
     /// - `fabric_index` が一致する
-    /// - `auth_mode` が CASE（`AUTH_MODE_CASE` = 2）— この実装が持つ唯一の
-    ///   auth mode で、Group/PASE の subject は扱わない
-    /// - `subjects` が空（wildcard）か、いずれかの要素が `subject` に
-    ///   マッチする（`Subject::matches`: node id は完全一致、CAT subject
-    ///   `0xFFFF_FFFD_hhhh_vvvv` は NOC の CAT と identifier 一致かつ
-    ///   version が vvvv 以上。vvvv = 0 は spec 上無効で誰にもマッチしない）
+    /// - `subject` が `e.auth_mode`（CASE/Group）の subject に一致する
+    ///   （`subject_matches_entry`、下記 — auth mode ごとに排他: CASE
+    ///   エントリは CASE session にしか、Group エントリは group session に
+    ///   しか一致しない）
     /// - `privilege_grants(e.privilege, required_privilege)` が true
     /// - target が一致する（`targets_match`、下記）
     ///
@@ -286,8 +301,7 @@ impl AclStore {
         }
         self.lock().entries.iter().any(|e| {
             e.fabric_index == fabric_index
-                && e.auth_mode == AUTH_MODE_CASE
-                && (e.subjects.is_empty() || e.subjects.iter().any(|&s| subject.matches(s)))
+                && subject_matches_entry(subject, e)
                 && privilege_grants(e.privilege, required_privilege)
                 && targets_match(&e.targets_raw, endpoint, cluster)
         })
@@ -584,6 +598,20 @@ fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
         targets_raw,
         fabric_index,
     })
+}
+
+/// auth mode 別の subject 照合（`check` の 1 条件）。空 `subjects` はどちらの
+/// auth mode でも wildcard。
+fn subject_matches_entry(subject: Subject, e: &AclDeviceEntry) -> bool {
+    match (e.auth_mode, subject.group_id) {
+        (AUTH_MODE_CASE, None) => {
+            e.subjects.is_empty() || e.subjects.iter().any(|&s| subject.matches(s))
+        }
+        (AUTH_MODE_GROUP, Some(group_id)) => {
+            e.subjects.is_empty() || e.subjects.contains(&u64::from(group_id))
+        }
+        _ => false,
+    }
 }
 
 /// privilege lattice (spec §11.1.7.1 Table "Privilege Semantics"): エントリ
@@ -1567,5 +1595,51 @@ mod tests {
             decode_entries_for_test(&h.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             2
         );
+    }
+
+    /// spec §6.6.2.1.3 Group auth mode: subject は GroupId。Group エントリは
+    /// group session（`Subject::group`）だけに、CASE エントリは CASE session
+    /// だけに効く。
+    #[test]
+    fn check_matches_group_entries_only_for_group_subjects() {
+        let store = AclStore::new();
+        store.set_entries_for_test(
+            1,
+            vec![
+                AclDeviceEntry {
+                    privilege: PRIVILEGE_ADMINISTER,
+                    auth_mode: AUTH_MODE_CASE,
+                    subjects: vec![112233],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+                AclDeviceEntry {
+                    privilege: PRIVILEGE_OPERATE,
+                    auth_mode: AUTH_MODE_GROUP,
+                    subjects: vec![10],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+                AclDeviceEntry {
+                    privilege: PRIVILEGE_VIEW,
+                    auth_mode: AUTH_MODE_GROUP,
+                    subjects: vec![],
+                    targets_raw: None,
+                    fabric_index: 1,
+                },
+            ],
+        );
+        // group 10 は Operate まで、group 11 は wildcard 経由で View のみ
+        assert!(store.check(1, Subject::group(10), PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(!store.check(1, Subject::group(10), PRIVILEGE_MANAGE, 2, 0x0006));
+        assert!(store.check(1, Subject::group(11), PRIVILEGE_VIEW, 2, 0x0006));
+        assert!(!store.check(1, Subject::group(11), PRIVILEGE_OPERATE, 2, 0x0006));
+        // group subject は CASE の Administer エントリに乗れない
+        assert!(!store.check(1, Subject::group(10), PRIVILEGE_ADMINISTER, 0, 0x001F));
+        // CASE subject は Group エントリに乗れない（subject 値 10 の node id でも）
+        assert!(!store.check(1, Subject::node(10), PRIVILEGE_OPERATE, 2, 0x0006));
+        assert!(store.check(1, Subject::node(112233), PRIVILEGE_ADMINISTER, 0, 0x001F));
+        // 他 fabric には効かない
+        assert!(!store.check(2, Subject::group(10), PRIVILEGE_VIEW, 2, 0x0006));
     }
 }
