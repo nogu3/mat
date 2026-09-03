@@ -73,8 +73,8 @@ Write/Read（spec 上 Invoke のみ）、EventRequests、複数 keyset/fabric（
   group_id: u16, endpoint: u16 }`（`Serialize/Deserialize`）。
 - API: `new()` / `with_persist(Box<dyn GroupMembershipPersist>)` /
   `contains(fabric, group, endpoint) -> bool` / `add(fabric, group, endpoint) -> Result<(), u8>`
-  （同 endpoint の (fabric) 件数が `GROUP_TABLE_CAPACITY`(16) 以上なら
-  `STATUS_RESOURCE_EXHAUSTED`、既存なら Ok no-op）/ `remove(fabric, group, endpoint) -> bool` /
+  （同 endpoint の件数（fabric 横断、従来の `GroupsHandler` と同じ数え方）が
+  `GROUP_TABLE_CAPACITY`(16) 以上なら `STATUS_RESOURCE_EXHAUSTED`、既存なら Ok no-op）/ `remove(fabric, group, endpoint) -> bool` /
   `remove_all(fabric, endpoint)` / `groups_for(fabric, endpoint) -> Vec<u16>`（挿入順）/
   `endpoints_for(fabric, group) -> Vec<u16>`（挿入順）/ `groups_by_fabric() -> Vec<(u8, u16)>`
   （重複なし、join 集合と GroupTable 用）/ `purge_fabric(fabric)`。
