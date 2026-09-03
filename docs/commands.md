@@ -192,6 +192,11 @@ Outputs:
   endpoint aliases go with them); it is `[]` when no `aliases.toml` exists.
 - A node that is not in the ledger is `node_not_commissioned` (exit `11`),
   `--force` included: the ledger is what says a node can be unpaired at all.
+- `--force` only folds **device-side** failures — the transport / IM outcomes
+  `timeout` / `device_rejected` / `unreachable` / `session_failed` (exit
+  `3`/`4`/`5`/`6`). Local failures (`store_missing`, `store_parse`,
+  `parse_error`, interface-autodetect `other`) still exit with their own code
+  and leave the ledger alone: nothing there is evidence the device is gone.
 - **node_id は再利用されない。** A stale SRP record for an unpaired id keeps
   being advertised and CASE to it fails forever, so the ledger keeps a
   high-water mark (`next_node_id` in `nodes.json`): `commission` without

@@ -137,8 +137,10 @@ pub enum Command {
         /// commission 済みノードの node_id、または aliases.toml の node alias。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
         node_id: NodeRef,
-        /// デバイス側が失敗（到達不能・拒否）しても台帳と alias を削除する
-        /// （実体の無い台帳エントリの掃除用）。出力の `device.removed` が false になる。
+        /// デバイス側が失敗（到達不能・拒否・タイムアウト・セッション失敗）しても
+        /// 台帳と alias を削除する（実体の無い台帳エントリの掃除用）。出力の
+        /// `device.removed` が false になる。ローカル側の失敗（store 不在・
+        /// parse_error・iface 自動検出失敗）はそのままエラー終了する。
         #[arg(long)]
         force: bool,
     },
