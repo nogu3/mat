@@ -47,17 +47,33 @@ pub fn write_group_provision(
     Ok(())
 }
 
-/// `mat group remove` のコントローラ側。戻り値 = KeySet も外したか。
-pub fn remove_group(ctx: &GroupSettingsCtx, group_id: u16) -> Result<bool, MatError> {
-    let out =
-        mat_controller::group_settings::remove_group(&ctx.main_ini, ctx.fabric_index, group_id)
-            .map_err(map_gs_err)?;
-    tracing::info!(
-        group_id,
-        keyset_removed = out.keyset_removed,
-        "group controller state removed (native kvs)"
-    );
-    Ok(out.keyset_removed)
+/// `mat group remove` のコントローラ側。
+///
+/// 戻り値 `Some(keyset_removed)` = 撤収した（bool は KeySet も外したか）、
+/// `None` = その group がコントローラ KVS に無かった。呼び出し側（`runner::
+/// remove_group`）はデバイス側 4 ステップを済ませた**後**にここへ来るので、
+/// 「KVS に無い」でハードエラーにすると片付いていないように見えるだけで
+/// 復旧の役に立たない。`controller.group_removed: false` として body に載せる。
+/// それ以外の失敗（locked / corrupt など）は従来どおりハードエラー。
+pub fn remove_group(ctx: &GroupSettingsCtx, group_id: u16) -> Result<Option<bool>, MatError> {
+    match mat_controller::group_settings::remove_group(&ctx.main_ini, ctx.fabric_index, group_id) {
+        Ok(out) => {
+            tracing::info!(
+                group_id,
+                keyset_removed = out.keyset_removed,
+                "group controller state removed (native kvs)"
+            );
+            Ok(Some(out.keyset_removed))
+        }
+        Err(GroupSettingsError::NotFound { .. }) => {
+            tracing::warn!(
+                group_id,
+                "group not present in controller kvs; nothing to remove there"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(map_gs_err(e)),
+    }
 }
 
 /// GroupSettingsError → ErrorKind。全て hard error（ワイヤ未接触だが KVS は
@@ -125,11 +141,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         write_group_provision(&c, 99, 99, "e2e", &[0x42; 16], false).unwrap();
-        assert!(remove_group(&c, 99).unwrap(), "keyset 99 も参照が消える");
+        assert_eq!(
+            remove_group(&c, 99).unwrap(),
+            Some(true),
+            "keyset 99 も参照が消える"
+        );
         assert!(mat_controller::kvs::read_group_credentials(&c.main_ini, 2, 99).is_err());
-        // 未知の group は Other + `mat group list` 誘導の detail。
-        let err = remove_group(&c, 99).unwrap_err();
-        assert_eq!(err.kind, mat_core::error::ErrorKind::Other);
-        assert!(err.detail.contains("mat group list"), "{}", err.detail);
+        // 未知の group はエラーではなく None（呼び出し側が false として載せる）。
+        assert_eq!(remove_group(&c, 99).unwrap(), None);
     }
 }

@@ -208,13 +208,20 @@ pub async fn remove_group(
             rep.keyset_removed,
         ));
     }
-    let keyset_removed = crate::group_settings::remove_group(gs, group_id)?;
+    // デバイス側は既に外れている。コントローラ KVS にその group が無い
+    // （= None）のは撤収済み / 別プロセスが先に消した状態で、ここでエラーに
+    // しても復旧の役には立たない — `controller.group_removed: false` で載せる。
+    let (controller_removed, keyset_removed) =
+        match crate::group_settings::remove_group(gs, group_id)? {
+            Some(keyset_removed) => (true, keyset_removed),
+            None => (false, false),
+        };
     tracing::info!(group_id, nodes = node_ids.len(), "group remove executed");
     Ok(body::group_remove_success(
         group_id,
         endpoint,
         &nodes,
-        true,
+        controller_removed,
         keyset_removed,
     ))
 }
@@ -503,6 +510,33 @@ mod tests {
         );
         let t = mat_controller::group_settings::read_groups(&ini, 2).unwrap();
         assert!(t.groups.is_empty(), "コントローラ KVS から撤収済み");
+    }
+
+    /// F4: デバイス側 4 ステップが済んだ後にコントローラ KVS がその group を
+    /// 持っていなくてもハードエラーにしない（デバイスはもう外れているので、
+    /// エラーで落とすと「片付いていないように見える」だけで復旧の役に立たない）。
+    /// `controller.group_removed: false` として body に載せる。
+    #[tokio::test]
+    async fn remove_group_reports_false_when_controller_kvs_lacks_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let mut engine = Engine::with_parts(Box::new(RemoveOkEstablisher), None);
+        // provision せずに ctx だけ持たせる = KVS にその group が無い状態。
+        engine.group_settings = Some(crate::group_settings::GroupSettingsCtx {
+            main_ini: ini,
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        });
+        let runner = OneShotRunner::new(&engine, |_| {});
+        let body = remove_group(&runner, &engine, 1, 1, &[5]).await.unwrap();
+        assert_eq!(body["status"], "removed");
+        assert_eq!(
+            body["controller"],
+            serde_json::json!({ "group_removed": false, "keyset_removed": false })
+        );
+        // デバイス側の 4 ステップは通っている。
+        assert_eq!(body["nodes"][0]["group_removed"], true);
     }
 
     #[tokio::test]

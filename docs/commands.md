@@ -900,6 +900,14 @@ Outputs:
     teardown, so the recovery is to fix that node and re-run with the nodes
     that are left (each step is idempotent: an already-removed group comes back
     as `NOT_FOUND` and is reported as `group_removed: false`, not an error).
+  - If the controller KVS no longer holds the group when the devices are
+    already torn down (a re-run after a partial failure, or a teardown someone
+    else finished), that is **not** an error: `controller.group_removed` comes
+    back `false` and the exit code stays `0`. Failing there would only make a
+    finished teardown look unfinished.
+  - The IPK keyset (`keyset-id 0`) is never unlinked from the controller KVS,
+    even if the removed group was the only thing bound to it — it carries the
+    fabric's operational key material, not group-only state.
   - The ACL step never writes when the read cannot be parsed — same safety rule
     as provision (a blind ACL write could drop the admin entry).
   - `mat group list` afterwards is the check that the controller side is clean.
