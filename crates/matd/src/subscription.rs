@@ -647,7 +647,14 @@ pub fn spawn_subscription_manager(
                         .collect();
                     for node_id in removed {
                         if let Some(handle) = subscribed.remove(&node_id) {
+                            // abort() は「次の await 点で落とす」予約でしかない。
+                            // join せずに forget すると、走行中のループが await 間で
+                            // 書く health（mark_establishing / record_*）が forget の
+                            // 後に着地し、matd 再起動まで status / values に幽霊行が
+                            // 残る。ループは spawn_blocking / block_in_place を持たず
+                            // await 点しか無いので、この join は即座に返る。
                             handle.abort();
+                            let _ = handle.await;
                         }
                         health.forget(node_id);
                         tracing::info!(node_id, "ledger rescan: node removed; unsubscribed");
@@ -949,6 +956,7 @@ mod tests {
     use super::*;
     use mat_native::test_support::{onoff_report, FakeEstablisher};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// node 5 だけの台帳と fake establisher で購読マネージャを起動する共通足場。
     ///
@@ -1978,6 +1986,65 @@ mod tests {
         assert!(
             !health.status_nodes().iter().any(|n| n["node_id"] == 5),
             "removed node must vanish from status: {:?}",
+            health.status_nodes()
+        );
+    }
+
+    /// レーン B 最終レビュー F2: 台帳から消えたノードの購読ループは `abort()`
+    /// を「投げっぱなし」にせず join してから health から外す。abort が実際に
+    /// 効いたこと（= ループが以後 1 回も establish を試みないこと）を
+    /// establisher の呼び出し回数が横ばいであることで主張する。
+    #[tokio::test(start_paused = true)]
+    async fn manager_stops_the_loop_of_a_removed_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                commissioned_at: "2026-09-03T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        // 常に購読確立を失敗させ、ループを backoff リトライで回し続ける
+        // （= 生きている限り calls が増え続ける観測可能な状態にする）。
+        let est = FakeEstablisher {
+            fail_subscription: Arc::new(AtomicUsize::new(usize::MAX)),
+            ..Default::default()
+        };
+        let calls = Arc::clone(&est.calls);
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, _rx) = broadcast::channel(64);
+        let health = Arc::new(SubHealth::new(None));
+        let _handle = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            Arc::clone(&health),
+        );
+        // リトライが実際に回っていることを先に確かめる。
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let before = calls.load(Ordering::SeqCst);
+        assert!(before >= 2, "loop should be retrying, calls={before}");
+        // 稼働中に unpair（= 台帳から削除）。
+        store.remove_node(5).unwrap();
+        tokio::time::sleep(LEDGER_RESCAN_INTERVAL + std::time::Duration::from_secs(1)).await;
+        assert!(
+            !health.status_nodes().iter().any(|n| n["node_id"] == 5),
+            "removed node must vanish from status: {:?}",
+            health.status_nodes()
+        );
+        let at_removal = calls.load(Ordering::SeqCst);
+        // さらに BACKOFF_MAX を数回跨いでも呼び出しは増えない = ループは死んだ。
+        tokio::time::sleep(BACKOFF_MAX * 4).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            at_removal,
+            "aborted loop must not attempt any further establish"
+        );
+        assert!(
+            !health.status_nodes().iter().any(|n| n["node_id"] == 5),
+            "and must not resurrect the health row: {:?}",
             health.status_nodes()
         );
     }

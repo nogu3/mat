@@ -270,7 +270,11 @@ mod tests {
             }
             assert_eq!(store.next_node_id(), 7);
             assert!(store.remove_node(6).unwrap());
-            assert_eq!(store.next_node_id(), 7, "削除しても払い出し済み id は戻らない");
+            assert_eq!(
+                store.next_node_id(),
+                7,
+                "削除しても払い出し済み id は戻らない"
+            );
         }
         // high-water mark はディスクに残る。
         let reopened = Store::open(dir.path()).unwrap();
