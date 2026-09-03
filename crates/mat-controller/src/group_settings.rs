@@ -820,6 +820,12 @@ fn unlink_keyset(
     fabric: &mut FabricData,
     keyset_id: u16,
 ) -> Result<bool, GroupSettingsError> {
+    // keyset 0 は IPK（`f/<idx>/k/0`）。fabric の運用鍵そのもので、group の
+    // KeyMap から参照が消えたからといって外してよいものではない — 外すと CASE /
+    // group メッセージの鍵素材ごと失われ、fabric を張り直すまで復旧しない。
+    if keyset_id == 0 {
+        return Ok(false);
+    }
     let chain = scan_keysets(txn, fabric_index, fabric)?;
     let Some(pos) = chain.iter().position(|(id, _)| *id == keyset_id) else {
         return Ok(false);
@@ -1279,6 +1285,34 @@ mod tests {
             remove_group(&p2, 2, 1).unwrap_err(),
             GroupSettingsError::NotFound { .. }
         ));
+    }
+
+    /// F5: keyset 0 = IPK。group を `--keyset-id 0` で bind してから
+    /// `remove_group` しても IPK レコード（`f/<idx>/k/0`）は残さねばならない
+    /// （外すと fabric の運用鍵ごと失われ、張り直すまで復旧しない）。
+    #[test]
+    fn remove_group_never_unlinks_the_ipk_keyset_zero() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 0, false);
+        let before = read_groups(&p, 2).unwrap();
+        assert!(
+            before.keysets.iter().any(|k| k.keyset_id == 0),
+            "前提: keyset 0 が居る {before:?}"
+        );
+        let out = remove_group(&p, 2, 1).unwrap();
+        assert!(!out.keyset_removed, "IPK keyset は外さない");
+        let after = read_groups(&p, 2).unwrap();
+        assert!(after.groups.is_empty(), "group 自体は外れる");
+        assert!(
+            after.keysets.iter().any(|k| k.keyset_id == 0),
+            "keyset 0 (IPK) はチェーンに残る: {after:?}"
+        );
+        // 鍵素材そのものも読める（チェーンが壊れていない）。
+        let txn = KvsTxn::open(&p).unwrap();
+        assert!(
+            txn.get("f/2/k/0").unwrap().is_some(),
+            "f/2/k/0 レコードが残っている"
+        );
     }
 
     #[test]
