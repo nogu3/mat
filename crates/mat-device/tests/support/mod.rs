@@ -116,23 +116,20 @@ pub async fn commission_directly(
     commission_directly_as(addr, paa_der, fabric, fabric.admin_node_id, &creds).await
 }
 
-/// [`commission_directly`] with the admin identity spelled out: the
-/// `CaseAdminSubject` AddNOC installs as the automatic Administer ACL
-/// entry's subject (a node id, or a CAT subject as Apple Home sends), and
-/// the operational credentials the post-AddNOC CASE presents (whose NOC
-/// may carry CATs). `commission_directly` is the node-id-only special
-/// case: `fabric.admin_node_id` + `fabric.admin_credentials()`.
+/// [`commission_directly_as`] の前半: PASE → ArmFailSafe → attestation
+/// （`verify_device_attestation` で strict 検証）→ CSR → NOC 発行 →
+/// AddTrustedRootCertificate。AddNOC の直前で止め、PASE セッションと
+/// 発行済みデバイス NOC を返す — AddNOC の応答そのものを検査したい
+/// テスト（`add_noc_invalid_admin_subject.rs`）のための切り出し。
 ///
-/// `allow(dead_code)`: see `BRIDGED_EP` — only the CAT-subject test calls
-/// this directly.
+/// `allow(dead_code)`: see `BRIDGED_EP` — only the AddNOC-rejection test
+/// calls this directly.
 #[allow(dead_code)]
-pub async fn commission_directly_as(
+pub async fn pase_until_add_noc(
     addr: SocketAddr,
     paa_der: &[u8],
     fabric: &CommissioningFabric,
-    case_admin_subject: u64,
-    creds: &FabricCredentials,
-) -> SecureSession {
+) -> (SecureSession, Vec<u8>) {
     let cfg = fast_cfg();
     let transport = Arc::new(Transport::Udp(Arc::new(
         UdpTransport::bind().await.unwrap(),
@@ -250,13 +247,29 @@ pub async fn commission_directly_as(
         .expect("add trusted root");
     assert_eq!(resp.status, 0);
 
+    (pase, noc_tlv)
+}
+
+/// [`commission_directly_as`] の AddNOC 1 発分: `(NOCResponse status,
+/// fabric_index)` を返す。成功判定は呼び側（拒否を期待するテストもある）。
+///
+/// `allow(dead_code)`: see `BRIDGED_EP` — only the AddNOC-rejection test
+/// calls this directly.
+#[allow(dead_code)]
+pub async fn add_noc(
+    pase: &mut SecureSession,
+    noc_tlv: &[u8],
+    fabric: &CommissioningFabric,
+    case_admin_subject: u64,
+) -> (u8, Option<u8>) {
+    let cfg = fast_cfg();
     let resp = pase
         .invoke_for_data(
             0,
             CLUSTER_OPERATIONAL_CREDENTIALS,
             CMD_ADD_NOC,
             Some(&encode_add_noc(
-                &noc_tlv,
+                noc_tlv,
                 &fabric.ipk_epoch,
                 case_admin_subject,
                 ADMIN_VENDOR_ID,
@@ -266,10 +279,17 @@ pub async fn commission_directly_as(
         )
         .await
         .expect("add noc");
-    let (noc_status, fabric_index) =
-        decode_noc_response(resp.fields_tlv.as_deref().unwrap()).expect("decode noc response");
-    assert_eq!(noc_status, 0, "AddNOC should succeed");
-    assert_eq!(fabric_index, Some(1));
+    decode_noc_response(resp.fields_tlv.as_deref().unwrap()).expect("decode noc response")
+}
+
+/// [`commission_directly_as`] の後半: 新 fabric への CASE（リトライ付き）
+/// + CommissioningComplete。
+///
+/// `allow(dead_code)`: see `BRIDGED_EP` — only the AddNOC-rejection test
+/// calls this directly.
+#[allow(dead_code)]
+pub async fn case_and_complete(addr: SocketAddr, creds: &FabricCredentials) -> SecureSession {
+    let cfg = fast_cfg();
 
     // 8. CASE on the new fabric (retry: AddNOC just completed, the runtime
     // needs no warm-up in-process but real hardware/timing might).
@@ -315,4 +335,29 @@ pub async fn commission_directly_as(
     assert_eq!(resp.status, 0);
 
     session
+}
+
+/// [`commission_directly`] with the admin identity spelled out: the
+/// `CaseAdminSubject` AddNOC installs as the automatic Administer ACL
+/// entry's subject (a node id, or a CAT subject as Apple Home sends), and
+/// the operational credentials the post-AddNOC CASE presents (whose NOC
+/// may carry CATs). `commission_directly` is the node-id-only special
+/// case: `fabric.admin_node_id` + `fabric.admin_credentials()`.
+///
+/// `allow(dead_code)`: see `BRIDGED_EP` — only the CAT-subject test calls
+/// this directly.
+#[allow(dead_code)]
+pub async fn commission_directly_as(
+    addr: SocketAddr,
+    paa_der: &[u8],
+    fabric: &CommissioningFabric,
+    case_admin_subject: u64,
+    creds: &FabricCredentials,
+) -> SecureSession {
+    let (mut pase, noc_tlv) = pase_until_add_noc(addr, paa_der, fabric).await;
+    let (noc_status, fabric_index) = add_noc(&mut pase, &noc_tlv, fabric, case_admin_subject).await;
+    assert_eq!(noc_status, 0, "AddNOC should succeed");
+    assert_eq!(fabric_index, Some(1));
+
+    case_and_complete(addr, creds).await
 }

@@ -1207,9 +1207,17 @@ async fn serve_secured_message(
         // one reply through `Node::handle_im`. Success installs the node's one
         // active subscription; failure anywhere in the flow leaves it with
         // none — including tearing down whatever was subscribed before, since
-        // this same peer just asked to start over.
+        // this same peer just asked to start over. An up-front `INVALID_ACTION`
+        // refusal leaves the existing subscription alone only when the request
+        // asked `KeepSubscriptions=true` (`SubscribeOutcome::Rejected`); with
+        // `KeepSubscriptions=false` the old subscription is torn down first,
+        // as chip does (`SubscribeOutcome::TornDown`).
         if msg.proto.opcode == im::OPCODE_SUBSCRIBE_REQUEST {
-            **subscription = serve_subscribe_request(&msg, session, fabric_index, node).await;
+            match serve_subscribe_request(&msg, session, fabric_index, node).await {
+                SubscribeOutcome::Installed(sub) => **subscription = Some(sub),
+                SubscribeOutcome::TornDown => **subscription = None,
+                SubscribeOutcome::Rejected => {}
+            }
             return ServeOutcome::Continue;
         }
 
@@ -1453,14 +1461,39 @@ async fn subscription_deadline(subscription: &Option<ActiveSubscription>) {
     }
 }
 
+/// What `serve_subscribe_request` did to the node's single subscription slot.
+enum SubscribeOutcome {
+    /// A new subscription is live (replaces whatever was there).
+    Installed(ActiveSubscription),
+    /// The request was accepted but the interaction failed partway
+    /// (undecodable request, priming send failure, missing ack) — the peer
+    /// asked to start over and the flow broke, so nothing is subscribed.
+    TornDown,
+    /// The request was refused up front with `StatusResponse(INVALID_ACTION)`
+    /// (spec §8.10: no readable path) *and* it asked `KeepSubscriptions=true`
+    /// — a refusal, not a restart, so the existing subscription (if any) is
+    /// left alone, as chip does. A refusal with `KeepSubscriptions=false`
+    /// tears the existing subscription down instead (`TornDown`) — chip
+    /// applies that teardown *before* path validation, so it happens
+    /// regardless of why the request was ultimately refused.
+    Rejected,
+}
+
 /// Serves one `SubscribeRequest` end to end (spec §8.10): priming
 /// ReportData (chunked, each chunk acknowledged with `StatusResponse(0)`
 /// by the initiator) followed by a `SubscribeResponse`, all on the
-/// requesting exchange, and returns the resulting `ActiveSubscription` —
-/// or `None` if any step failed, in which case this device simply has no
-/// subscription and the initiator is free to retry from scratch (same
+/// requesting exchange, and returns a `SubscribeOutcome`: `Installed` with
+/// the resulting `ActiveSubscription` on success; `TornDown` if any step
+/// failed mid-flow, in which case this device simply has no subscription
+/// and the initiator is free to retry from scratch (same
 /// abort-and-let-the-initiator-retry policy `serve_read_request_chunked`
-/// uses for chunked reads).
+/// uses for chunked reads); or, if the request was refused up front with
+/// `StatusResponse(INVALID_ACTION)` before any of that flow started,
+/// `Rejected` when the request asked `KeepSubscriptions=true` (leaves any
+/// existing subscription on this node untouched) or `TornDown` when it
+/// asked `KeepSubscriptions=false` — chip tears down the subscriber's
+/// existing subscriptions *before* path validation, so a refused request
+/// with `KeepSubscriptions=false` still discards them.
 ///
 /// Two ways this differs from a chunked read (both are why priming needs
 /// its own flow rather than reusing `serve_read_request_chunked`): every
@@ -1477,13 +1510,13 @@ async fn serve_subscribe_request(
     session: &mut SecureSession,
     fabric_index: u8,
     node: &mut Node,
-) -> Option<ActiveSubscription> {
+) -> SubscribeOutcome {
     let Ok(req) = im::decode_subscribe_request(&msg.payload) else {
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             "SubscribeRequest dropped: undecodable"
         );
-        return None;
+        return SubscribeOutcome::TornDown;
     };
     let subscription_id = random_subscription_id();
     // The device picks the MaxInterval it can actually honor, at or below
@@ -1503,6 +1536,57 @@ async fn serve_subscribe_request(
         fabric_filtered: req.fabric_filtered,
         subject: session_subject(session),
     };
+
+    // spec §8.10 / chip `ParseAttributePaths`: a request none of whose
+    // paths can yield anything this subject may read is refused outright
+    // rather than answered with an empty priming report and a dead
+    // subscription. (Concrete paths always count — their refusal shows up
+    // as a status entry in the priming report; see
+    // `Node::has_readable_path`.)
+    if !node.has_readable_path(&req.paths, &read_ctx) {
+        tracing::debug!(
+            exchange_id = msg.proto.exchange_id,
+            paths = ?req.paths,
+            subject = ?read_ctx.subject,
+            fabric_index,
+            "SubscribeRequest rejected: no readable attribute path (INVALID_ACTION)"
+        );
+        let reply_result = session
+            .reply_reliable(
+                msg,
+                PROTOCOL_ID_INTERACTION_MODEL,
+                im::OPCODE_STATUS_RESPONSE,
+                &im::encode_status_response(im::STATUS_INVALID_ACTION),
+                &reply_cfg(),
+            )
+            .await;
+        match &reply_result {
+            Err(e) => {
+                tracing::debug!(exchange_id = msg.proto.exchange_id, error = %e, "INVALID_ACTION StatusResponse not delivered");
+            }
+            Ok(Some(piggybacked)) => {
+                // A peer message piggybacked on the ack — not consumed here
+                // (this refusal has nothing more to do with it), but logged
+                // so it's visibly dropped rather than silently ack-then-lost.
+                tracing::debug!(
+                    exchange_id = piggybacked.proto.exchange_id,
+                    opcode = format_args!("0x{:02X}", piggybacked.proto.opcode),
+                    "INVALID_ACTION StatusResponse ack carried a piggybacked peer message, discarded"
+                );
+            }
+            Ok(None) => {}
+        }
+        // chip tears down the subscriber's existing subscriptions *before*
+        // path validation, so a refusal only leaves them alone when the
+        // request asked KeepSubscriptions=true; KeepSubscriptions=false
+        // discards them here too, as chip does.
+        return if req.keep_subscriptions {
+            SubscribeOutcome::Rejected
+        } else {
+            SubscribeOutcome::TornDown
+        };
+    }
+
     let chunks = node.read_chunks(
         &req.paths,
         &read_ctx,
@@ -1541,10 +1625,10 @@ async fn serve_subscribe_request(
             "priming ReportData chunk sent"
         );
         let Ok(piggybacked) = reply_result else {
-            return None; // ack never came — exchange is dead, give up
+            return SubscribeOutcome::TornDown; // ack never came — exchange is dead, give up
         };
         if !await_peer_status_ok(session, piggybacked, msg.proto.exchange_id).await {
-            return None;
+            return SubscribeOutcome::TornDown;
         }
     }
 
@@ -1566,10 +1650,10 @@ async fn serve_subscribe_request(
         "SubscribeResponse sent"
     );
     if reply_result.is_err() {
-        return None;
+        return SubscribeOutcome::TornDown;
     }
 
-    Some(ActiveSubscription {
+    SubscribeOutcome::Installed(ActiveSubscription {
         id: subscription_id,
         paths: req.paths,
         fabric_filtered: req.fabric_filtered,
@@ -1630,10 +1714,12 @@ async fn send_subscription_report(
     // report carries the attribute's current value (spec §8.10.2), so two
     // changes between reports collapse into one entry with the latest
     // value — which is also why `dirty` holds paths, not values.
+    // `retain_reportable` drops the status entries a wildcard subscription
+    // would otherwise get for attributes it may not read (see its doc).
     let entries = if paths.is_empty() {
         Vec::new()
     } else {
-        node.read_entries(&paths, &read_ctx)
+        crate::net::subscription::retain_reportable(sub, node.read_entries(&paths, &read_ctx))
     };
     // `more_chunks=false`, one message: a dirty set is a handful of
     // scalar attributes, orders of magnitude below `REPORT_CHUNK_BUDGET`

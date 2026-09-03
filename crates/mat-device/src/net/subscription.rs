@@ -5,7 +5,11 @@
 //! alive at a time — same sequential, one-peer-at-a-time posture as the
 //! session handling it rides on (see `net::runtime`'s module doc). A new
 //! `SubscribeRequest`, or a new PASE/CASE session, replaces whatever was
-//! there.
+//! there — except a `SubscribeRequest` with no readable path (spec §8.10),
+//! rejected with `INVALID_ACTION`, which leaves any existing subscription
+//! untouched *only* when the request asked `KeepSubscriptions=true`; with
+//! `KeepSubscriptions=false` the existing subscription is torn down before
+//! the refusal, as chip does (see `net::runtime`'s `SubscribeOutcome`).
 //!
 //! Everything here is deliberately I/O-free: `ActiveSubscription` is state
 //! plus arithmetic, so the interval policy (`next_report_deadline`) and the
@@ -16,7 +20,7 @@
 
 use std::time::Duration;
 
-use mat_controller::im::AttrPathIn;
+use mat_controller::im::{AttrPathIn, ReportEntryOut};
 use tokio::time::Instant;
 
 /// How far *before* `max_interval` a keep-alive report is sent. The spec
@@ -100,6 +104,21 @@ impl ActiveSubscription {
     pub fn covers(&self, path: (u16, u32, u32)) -> bool {
         self.paths.iter().any(|p| path_matches(p, path))
     }
+
+    /// Whether some subscribed path names `path` with **all three fields
+    /// concrete** — i.e. the subscriber asked for exactly this attribute,
+    /// not for a wildcard that happens to expand to it. Decides whether a
+    /// refused attribute in a dirty report is answered with a status entry
+    /// (concrete: yes) or dropped (wildcard: silent, the same asymmetry
+    /// `Node::read_entries` applies to the priming report — spec §8.4.2.2).
+    pub fn covered_concretely(&self, path: (u16, u32, u32)) -> bool {
+        self.paths.iter().any(|p| {
+            p.endpoint.is_some()
+                && p.cluster.is_some()
+                && p.attribute.is_some()
+                && path_matches(p, path)
+        })
+    }
 }
 
 /// Whether a (possibly wildcard) subscribed `AttrPathIn` matches one
@@ -116,6 +135,32 @@ pub fn path_matches(
     subscribed.endpoint.is_none_or(|e| e == endpoint)
         && subscribed.cluster.is_none_or(|c| c == cluster)
         && subscribed.attribute.is_none_or(|a| a == attribute)
+}
+
+/// Filters one dirty report's entries the way `Node::read_entries` already
+/// filters a priming report: `Data` always stays; a `Status` entry stays
+/// only when the subscriber named that attribute concretely
+/// (`covered_concretely`). The dirty set is read back through *concrete*
+/// paths (`send_subscription_report` builds them from `dirty`), so without
+/// this every attribute a wildcard subscription is not allowed to read
+/// would resurface as an `UNSUPPORTED_ACCESS` status entry on every
+/// change — the asymmetry the priming report avoids.
+pub fn retain_reportable(
+    sub: &ActiveSubscription,
+    entries: Vec<ReportEntryOut>,
+) -> Vec<ReportEntryOut> {
+    entries
+        .into_iter()
+        .filter(|e| match e {
+            ReportEntryOut::Data(_) => true,
+            ReportEntryOut::Status {
+                endpoint,
+                cluster,
+                attribute,
+                ..
+            } => sub.covered_concretely((*endpoint, *cluster, *attribute)),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -253,5 +298,83 @@ mod tests {
             ..exact
         };
         assert!(!path_matches(&other_attribute, concrete));
+    }
+
+    fn sub_with_paths(paths: Vec<AttrPathIn>) -> ActiveSubscription {
+        ActiveSubscription {
+            id: 1,
+            paths,
+            fabric_filtered: true,
+            min_interval: Duration::from_secs(0),
+            max_interval: Duration::from_secs(5),
+            last_report_at: Instant::now(),
+            dirty: Vec::new(),
+        }
+    }
+
+    fn status_entry(endpoint: u16, cluster: u32, attribute: u32) -> ReportEntryOut {
+        ReportEntryOut::Status {
+            endpoint,
+            cluster,
+            attribute,
+            status: im::STATUS_UNSUPPORTED_ACCESS,
+        }
+    }
+
+    #[test]
+    fn covered_concretely_is_true_only_for_a_fully_concrete_subscribed_path() {
+        let concrete = AttrPathIn {
+            endpoint: Some(1),
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: Some(im::ATTR_ON_OFF),
+        };
+        let wildcard = AttrPathIn {
+            endpoint: None,
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: None,
+        };
+        let path = (1, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF);
+        assert!(sub_with_paths(vec![concrete]).covered_concretely(path));
+        assert!(!sub_with_paths(vec![wildcard]).covered_concretely(path));
+        // 両方 cover していれば「具体的に頼まれた」側が勝つ。
+        assert!(sub_with_paths(vec![wildcard, concrete]).covered_concretely(path));
+    }
+
+    /// spec §8.4.2.2 の非対称を dirty report にも適用: wildcard 購読が
+    /// 拾った不許可属性の status entry は落とし（priming と同じ「黙る」）、
+    /// 具体パス購読の status entry と Data は残す。
+    #[test]
+    fn retain_reportable_drops_status_entries_only_under_wildcard_paths() {
+        let onoff_wildcard = AttrPathIn {
+            endpoint: None,
+            cluster: Some(im::CLUSTER_ON_OFF),
+            attribute: None,
+        };
+        let acl_concrete = AttrPathIn {
+            endpoint: Some(0),
+            cluster: Some(im::CLUSTER_ACCESS_CONTROL),
+            attribute: Some(im::ATTR_ACL),
+        };
+        let sub = sub_with_paths(vec![onoff_wildcard, acl_concrete]);
+        let data = ReportEntryOut::Data(im::AttrReportOut {
+            endpoint: 1,
+            cluster: im::CLUSTER_ON_OFF,
+            attribute: im::ATTR_ON_OFF,
+            data_version: 0,
+            value_tlv: vec![0x09], // TLV true
+        });
+        let entries = vec![
+            data.clone(),
+            status_entry(1, im::CLUSTER_ON_OFF, im::ATTR_ON_OFF), // wildcard → 落ちる
+            status_entry(0, im::CLUSTER_ACCESS_CONTROL, im::ATTR_ACL), // 具体 → 残る
+        ];
+        let kept = retain_reportable(&sub, entries);
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(&kept[0], ReportEntryOut::Data(d) if d.attribute == im::ATTR_ON_OFF));
+        assert!(matches!(
+            &kept[1],
+            ReportEntryOut::Status { cluster, attribute, .. }
+                if *cluster == im::CLUSTER_ACCESS_CONTROL && *attribute == im::ATTR_ACL
+        ));
     }
 }
