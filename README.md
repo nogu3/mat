@@ -64,6 +64,9 @@ mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 # control and read it
 mat on --node 5
 mat read --node 5 --cluster onoff --attribute on-off
+
+# when you are done with it: remove it from the fabric and the ledger
+mat unpair --node 5
 ```
 
 Every command prints exactly one JSON object on stdout:

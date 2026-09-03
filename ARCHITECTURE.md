@@ -1190,6 +1190,28 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
     `node N: ` を前置するようになった（matd と同一化。kind / exit code 不変）。
 - spec: `docs/superpowers/specs/2026-09-02-op-single-source-design.md`。
 
+### Phase 5 拡張 — CLI 欠けの補完（監査バックログ レーン B、2026-09-03）
+
+2026-08-31 監査「足りない機能 3: CLI の欠け」を一括で埋めた。新しい Matter
+プロトコル機能は増やしていない（欠けていたのは CLI / op 配管とローカル台帳の
+削除経路だけ）。追加は 6 件: `mat unpair`（RemoveFabric + 台帳 `nodes.json` /
+aliases.toml の削除、`--force` は台帳のみ、直経路専用）、`mat group list` /
+`mat group remove`（provision の逆順 4 ステップ + コントローラ KVS の撤収、
+`--nodes` 必須）、`mat fabric list`（KVS の fabric identity 一覧、鍵素材なし）、
+cluster wildcard read（`mat read` の `--attribute` 省略 = `attributes`
+オブジェクト。単一属性 read のチャンク拒否の回避策でもある）、
+`mat listen --reconnect`（backoff 1s→30s、`--count` は再接続を跨いで累積、
+deadline は 1 本）、`--timed`（`invoke` / `write` の timed を true へ上書き。
+`ids.rs` は不変で `mat-native::op` が `def.timed || override`）。台帳から
+消えたノードの常駐購読は `matd` が `LEDGER_RESCAN_INTERVAL`（60s）の rescan で
+abort し `status` からも外すので、unpair 後の matd 再起動は要らない。
+`fabric list` / `group list` はローカル KVS 読み取りのみで route dispatch より
+前に処理する（`--matd` は無視）。wire は `Op::Read.attribute` を optional に、
+`Op::{Write,Invoke}` に `timed`（default false）を追加 — 新 mat → 旧 matd
+（1.30.0 以前）は wildcard read が matd 側 `parse_error`、`--timed` は無視
+（`MAT_MATD=0` で直経路）。
+- spec: `docs/superpowers/specs/2026-09-03-cli-gaps-design.md`。
+
 ---
 
 ## Things we never do

@@ -530,7 +530,8 @@ pub fn classify_invoke(cluster: &str, command: &str, args: &[String]) -> InvokeC
         }
         // 数値直指定（def なし）: 引数は write の数値直指定と同じく値リテラル
         // から型推定してスカラー化する（推定は失敗しない）。timed は定義が
-        // 無いので false 固定 — 上書きしたい場合の CLI フラグは未提供。
+        // 無いので false 既定 — CLI の --timed（mat-native::op で
+        // def.timed || override）で true へ上書きできる。
         None => {
             for (i, a) in args.iter().enumerate() {
                 let what = format!("invoke {cluster}/{command} arg {i}");
