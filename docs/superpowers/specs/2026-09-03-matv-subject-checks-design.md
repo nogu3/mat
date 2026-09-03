@@ -108,6 +108,13 @@ Group、subjects=[group_id]、targets=[{cluster, endpoint}]）はこの規則で
 pub fn has_readable_path(&self, paths: &[AttrPathIn], read_ctx: &ReadCtx) -> bool
 ```
 
+規則は chip `ParseAttributePaths` と同じ: **具体パス（endpoint / cluster /
+attribute の 3 フィールド全部 Some）は存在・権限に関わらず有効**（拒否や不在は
+priming の status entry で伝える）。wildcard を含むパスは、ACL 込みで読める
+属性に 1 つ以上展開されるときだけ有効（wildcard-endpoint/cluster + 具体
+attribute の組み合わせでは、その attribute が実在することも確認する — 1 件
+値読みして existence check とする）。paths が空のリクエストは無効。
+
 実装は `expand_endpoint/expand_cluster/expand_attribute` と同じ展開を「1 件見つけ
 次第 true」で回す。既存の展開 3 関数に「値を読まずに可否だけ見る」モードを足す
 より、`read_entries` を呼んで `ReportEntryOut::Data` の有無を見る方が単純だが、

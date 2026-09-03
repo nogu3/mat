@@ -5,7 +5,9 @@
 //! alive at a time — same sequential, one-peer-at-a-time posture as the
 //! session handling it rides on (see `net::runtime`'s module doc). A new
 //! `SubscribeRequest`, or a new PASE/CASE session, replaces whatever was
-//! there.
+//! there — except a `SubscribeRequest` with no readable path (spec §8.10),
+//! rejected with `INVALID_ACTION`, which leaves any existing subscription
+//! untouched (see `net::runtime`'s `SubscribeOutcome`).
 //!
 //! Everything here is deliberately I/O-free: `ActiveSubscription` is state
 //! plus arithmetic, so the interval policy (`next_report_deadline`) and the
