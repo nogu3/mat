@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="88" align="right">
+
 # mat
 
 `mat` is a command-line Matter controller built for scripts and AI agents:

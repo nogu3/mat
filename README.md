@@ -1,4 +1,6 @@
-# mat
+<p align="center">
+  <img src="docs/assets/logo-wordmark.svg" alt="mat" width="260">
+</p>
 
 [![CI](https://github.com/nogu3/mat/actions/workflows/ci.yml/badge.svg)](https://github.com/nogu3/mat/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/matterctl.svg)](https://crates.io/crates/matterctl)
