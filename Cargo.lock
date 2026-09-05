@@ -893,7 +893,7 @@ checksum = "baee0bbc17ce759db233beb01648088061bf678383130602a298e6998eedb2d8"
 
 [[package]]
 name = "mat-controller"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "aes",
  "base64ct",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "mat-core"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "mat-device"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "getrandom 0.2.17",
  "hkdf",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "mat-native"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "matd"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "matterctl"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "matv"
-version = "1.31.0"
+version = "1.32.0"
 dependencies = [
  "assert_cmd",
  "clap",
