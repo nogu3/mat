@@ -1538,122 +1538,20 @@ async fn serve_secured_message(
             "IM reply sent"
         );
 
-        // AddNOC success: a fabric appeared that wasn't there before this call.
-        let fabrics_after = comm_server.fabrics();
-        if fabrics_after.len() > fabrics_before {
-            if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
-                ctx.mdns
-                    .add_operational(operational_advert(
-                        entry,
-                        &ctx.hostname,
-                        ctx.port,
-                        ctx.addr_v6,
-                    ))
-                    .await;
-            }
-        }
-
-        // ECM window reconciliation (Task 4), per dispatch iteration — same
-        // spot the AddNOC fabric-diff check above lives, so a timed
-        // `OpenCommissioningWindow`/`RevokeCommissioning` invoke (piggybacked
-        // on this same exchange, per the timed-invoke loop this function
-        // runs) is handled without waiting for the next datagram. The
-        // ordering invariant this depends on (take the staged request
-        // *before* reading `admin_open`) and the resulting decision table
-        // are `admin_window_action`'s doc comment/unit tests, not repeated
-        // here — this block only performs the side effects.
-        let pending_request = comm_server.take_pending_window_request();
-        let admin_open = comm_server.admin_window_is_open();
-        match admin_window_action(pending_request, admin_open, window) {
-            AdminWindowAction::Apply(request) => {
-                **window = apply_window_request(request);
-                if let (Some(ctx), Some((discriminator, cm))) =
-                    (mdns, advert_params_for_window(window, config.discriminator))
-                {
-                    ctx.mdns
-                        .set_commissionable(Some(CommissionableAdvert {
-                            instance: random_hex_name(),
-                            hostname: ctx.hostname.clone(),
-                            discriminator,
-                            vendor_id: config.vendor_id,
-                            product_id: config.product_id,
-                            port: ctx.port,
-                            addr_v6: ctx.addr_v6,
-                            cm,
-                        }))
-                        .await;
-                }
-            }
-            AdminWindowAction::Close => {
-                tracing::info!("administrator commissioning window revoked — closing");
-                **window = CommissioningWindow::Closed;
-                if let Some(ctx) = mdns {
-                    ctx.mdns.set_commissionable(None).await;
-                }
-            }
-            AdminWindowAction::None => {}
-        }
-
-        // CommissioningComplete success: stop advertising commissionable.
-        if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
-            if let Some((cluster, command)) = req_cluster_command {
-                if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
-                    && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
-                {
-                    if let Ok(outcome) = im::decode_invoke_response(&resp_payload) {
-                        if outcome.status == im::STATUS_SUCCESS {
-                            if let Some(ctx) = mdns {
-                                ctx.mdns.set_commissionable(None).await;
-                            }
-                            // Task 14: CommissioningComplete is the other event
-                            // (besides the 15-minute/`CommissioningTimeout`
-                            // deadline in `on_commissioning_window_expired`) that closes the
-                            // commissioning window — a controller that just
-                            // finished commissioning has no reason to PASE in
-                            // again, and refusing it stops a second
-                            // commissioner from racing in during whatever's
-                            // left of the window.
-                            **window = CommissioningWindow::Closed;
-                            // Task 4: this close is runtime-initiated (General
-                            // Commissioning's CommissioningComplete doesn't
-                            // touch the AC cluster's admin_window itself), so
-                            // tell core explicitly — keeps `WindowStatus`
-                            // honest for an ECM window that just got
-                            // committed by completion rather than expiry/
-                            // revoke. A no-op for the boot window.
-                            comm_server.close_admin_window();
-                        }
-                    }
-                }
-            }
-        }
-
-        // RemoveFabric (Task 6): the store may have shed a fabric this
-        // dispatch — either the invoking session's own (the motivating
-        // case: an Android phone removing its ephemeral fabric right after
-        // handing the device off to Home Assistant via
-        // `OpenCommissioningWindow`) or a different one named explicitly in
-        // the command fields. Either way its mDNS operational advert must
-        // go. Checked *after* `reply_reliable` above, per the brief: the
-        // `RemoveFabric` response itself has already been sent (and, along
-        // `reply_reliable`'s normal path, acked) by this point, so dropping
-        // the session below never races the response that announces the
-        // removal.
-        if let Some(entry) = comm_server.take_removed_fabric() {
-            if let Some(ctx) = mdns {
-                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-                ctx.mdns
-                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                    .await;
-            }
-            if remove_fabric_drops_session(entry.fabric_index, fabric_index) {
-                tracing::info!(
-                    fabric_index,
-                    node_id = entry.node_id,
-                    "RemoveFabric removed the invoking session's own fabric — dropping session"
-                );
-                return ServeOutcome::DropSession;
-            }
+        advertise_added_fabric(comm_server, mdns, fabrics_before).await;
+        reconcile_admin_window(comm_server, mdns, window, config).await;
+        close_window_on_commissioning_complete(
+            resp_opcode,
+            req_cluster_command,
+            &resp_payload,
+            comm_server,
+            mdns,
+            window,
+        )
+        .await;
+        if retire_removed_fabric(comm_server, mdns, fabric_index).await == ServeOutcome::DropSession
+        {
+            return ServeOutcome::DropSession;
         }
 
         // `reply_reliable` が実メッセージ（同一 exchange の後続リクエスト —
@@ -1665,6 +1563,158 @@ async fn serve_secured_message(
             _ => return ServeOutcome::Continue,
         }
     }
+}
+
+/// AddNOC success: a fabric appeared that wasn't there before the dispatch
+/// (`fabrics_before` = the count read just before `Node::handle_im`) —
+/// publish its operational mDNS advert.
+async fn advertise_added_fabric(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    fabrics_before: usize,
+) {
+    let fabrics_after = comm_server.fabrics();
+    if fabrics_after.len() > fabrics_before {
+        if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
+            ctx.mdns
+                .add_operational(operational_advert(
+                    entry,
+                    &ctx.hostname,
+                    ctx.port,
+                    ctx.addr_v6,
+                ))
+                .await;
+        }
+    }
+}
+
+/// ECM window reconciliation (Task 4), per dispatch iteration — same
+/// spot the AddNOC fabric-diff check (`advertise_added_fabric`) lives,
+/// so a timed `OpenCommissioningWindow`/`RevokeCommissioning` invoke
+/// (piggybacked on this same exchange, per the timed-invoke loop
+/// `serve_secured_message` runs) is handled without waiting for the next
+/// datagram. The
+/// ordering invariant this depends on (take the staged request
+/// *before* reading `admin_open`) and the resulting decision table
+/// are `admin_window_action`'s doc comment/unit tests, not repeated
+/// here — this function only performs the side effects.
+async fn reconcile_admin_window(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    window: &mut CommissioningWindow,
+    config: &DeviceConfig,
+) {
+    let pending_request = comm_server.take_pending_window_request();
+    let admin_open = comm_server.admin_window_is_open();
+    match admin_window_action(pending_request, admin_open, window) {
+        AdminWindowAction::Apply(request) => {
+            *window = apply_window_request(request);
+            if let (Some(ctx), Some((discriminator, cm))) =
+                (mdns, advert_params_for_window(window, config.discriminator))
+            {
+                ctx.mdns
+                    .set_commissionable(Some(CommissionableAdvert {
+                        instance: random_hex_name(),
+                        hostname: ctx.hostname.clone(),
+                        discriminator,
+                        vendor_id: config.vendor_id,
+                        product_id: config.product_id,
+                        port: ctx.port,
+                        addr_v6: ctx.addr_v6,
+                        cm,
+                    }))
+                    .await;
+            }
+        }
+        AdminWindowAction::Close => {
+            tracing::info!("administrator commissioning window revoked — closing");
+            *window = CommissioningWindow::Closed;
+            if let Some(ctx) = mdns {
+                ctx.mdns.set_commissionable(None).await;
+            }
+        }
+        AdminWindowAction::None => {}
+    }
+}
+
+/// CommissioningComplete success: stop advertising commissionable. Decided
+/// from the request already decoded (`req_cluster_command`) and the reply
+/// just sent (`resp_opcode` / `resp_payload`).
+async fn close_window_on_commissioning_complete(
+    resp_opcode: u8,
+    req_cluster_command: Option<(u32, u32)>,
+    resp_payload: &[u8],
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    window: &mut CommissioningWindow,
+) {
+    if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
+        if let Some((cluster, command)) = req_cluster_command {
+            if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
+                && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
+            {
+                if let Ok(outcome) = im::decode_invoke_response(resp_payload) {
+                    if outcome.status == im::STATUS_SUCCESS {
+                        if let Some(ctx) = mdns {
+                            ctx.mdns.set_commissionable(None).await;
+                        }
+                        // Task 14: CommissioningComplete is the other event
+                        // (besides the 15-minute/`CommissioningTimeout`
+                        // deadline in `on_commissioning_window_expired`) that closes the
+                        // commissioning window — a controller that just
+                        // finished commissioning has no reason to PASE in
+                        // again, and refusing it stops a second
+                        // commissioner from racing in during whatever's
+                        // left of the window.
+                        *window = CommissioningWindow::Closed;
+                        // Task 4: this close is runtime-initiated (General
+                        // Commissioning's CommissioningComplete doesn't
+                        // touch the AC cluster's admin_window itself), so
+                        // tell core explicitly — keeps `WindowStatus`
+                        // honest for an ECM window that just got
+                        // committed by completion rather than expiry/
+                        // revoke. A no-op for the boot window.
+                        comm_server.close_admin_window();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// RemoveFabric (Task 6): the store may have shed a fabric this
+/// dispatch — either the invoking session's own (the motivating
+/// case: an Android phone removing its ephemeral fabric right after
+/// handing the device off to Home Assistant via
+/// `OpenCommissioningWindow`) or a different one named explicitly in
+/// the command fields. Either way its mDNS operational advert must
+/// go. Called *after* `reply_reliable` in `serve_secured_message`, per
+/// the brief: the `RemoveFabric` response itself has already been sent
+/// (and, along `reply_reliable`'s normal path, acked) by this point, so
+/// dropping the session (`ServeOutcome::DropSession`) never races the
+/// response that announces the removal.
+async fn retire_removed_fabric(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    session_fabric_index: u8,
+) -> ServeOutcome {
+    if let Some(entry) = comm_server.take_removed_fabric() {
+        if let Some(ctx) = mdns {
+            let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+            ctx.mdns
+                .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                .await;
+        }
+        if remove_fabric_drops_session(entry.fabric_index, session_fabric_index) {
+            tracing::info!(
+                fabric_index = session_fabric_index,
+                node_id = entry.node_id,
+                "RemoveFabric removed the invoking session's own fabric — dropping session"
+            );
+            return ServeOutcome::DropSession;
+        }
+    }
+    ServeOutcome::Continue
 }
 
 /// Everything one secured message is allowed to touch, bundled so
