@@ -11,14 +11,14 @@ use mat_controller::im;
 use mat_core::body;
 use mat_core::color::ResolvedColor;
 use mat_core::error::{ErrorKind, MatError};
-use mat_core::ids::{self, InvokeClass, ScalarValue, WriteClass};
+use mat_core::ids::{self, ArgValue, InvokeClass, WriteClass};
 use serde_json::Value;
 
 use crate::group::{self, BumpOutcome, GroupOutcome};
 use crate::Engine;
 
 /// OperationalCredentials / CurrentFabricIndex（属性 0x0005）。commissioning.rs は
-/// コマンド定数しか持たないのでここで局所定義する（im.rs はレーン C が触るため
+/// コマンド定数しか持たないのでここで局所定義する（`mat_controller::im` には
 /// 足さない）。
 const ATTR_CURRENT_FABRIC_INDEX: u32 = 0x0005;
 
@@ -98,7 +98,7 @@ pub enum NodeOpKind {
         cluster: u32,
         attribute: u32,
         value_in: String,
-        value: ScalarValue,
+        value: ArgValue,
         timed: bool,
     },
     Invoke {
@@ -767,7 +767,7 @@ mod tests {
             k,
             NodeOpKind::Write {
                 cluster: 0x0008,
-                value: ScalarValue::UInt(128),
+                value: ArgValue::UInt(128),
                 timed: false,
                 ..
             }
@@ -1079,7 +1079,7 @@ mod tests {
         );
         let (ep, cluster, attr, tlv) = &conn.written_tlv()[0];
         assert_eq!((*ep, *cluster, *attr), (1, 0x0008, 0x0011));
-        assert_eq!(tlv, &crate::scalar_to_tlv(&ScalarValue::UInt(128)));
+        assert_eq!(tlv, &crate::scalar_to_tlv(&ArgValue::UInt(128)));
     }
 
     #[tokio::test]
