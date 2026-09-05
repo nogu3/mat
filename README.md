@@ -126,9 +126,14 @@ or set it to `0` for an ephemeral port in tests; `port` must differ from
 KeySetWrite / GroupKeyMap / AddGroup / ACL on the device (`mat group
 provision` sets all four up), a `mat group invoke` sent to that group
 multicasts to the member endpoints. Keys and membership persist under
-`<store>/group_keys.json` / `groups.json`; replay protection is a
-monotonic (fabric, source) counter. Group-addressed Read/Write and
-privacy-flagged groupcast are not implemented yet.
+`<store>/group_keys.json` / `groups.json`; replay protection is the spec's
+32-wide (fabric, source) counter window. Privacy-flagged groupcast (the form
+the chip SDK, chip-tool and Apple Home send) is decrypted the same way, and
+`KeySetRead` / `KeySetRemove` / `KeySetReadAllIndices` are served, so
+`mat group remove` fully tears a group down on `matv`. Membership rows of a
+`[[device]]` removed from `matv.toml` are pruned at startup (re-adding the
+device restores its endpoint, not its groups). Group-addressed Read/Write
+is not implemented.
 
 ## Requirements
 

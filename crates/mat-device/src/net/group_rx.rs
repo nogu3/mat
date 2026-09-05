@@ -3,6 +3,7 @@
 //! GroupKeyMap / membership / リプレイ検査 → group InvokeRequest デコード。
 //! P ビット（privacy）付きの datagram は候補 keyset ごとに
 //! `core::group_privacy` で header を復号してから同じ経路を通す。
+//! リプレイ防止は spec §4.5.4.2 の 32 幅 bitmap 窓（`GroupReplayGuard`）。
 //! ソケットと join は `GroupSocket`（同ファイル、Task 7）、Node への適用は
 //! `runtime`。応答は送らない（全 drop は `GroupDrop` で理由を返し、runtime が
 //! debug ログにする）。
@@ -670,6 +671,29 @@ mod tests {
         assert!(
             !g.accept(1, 7, 50),
             "51 へ 1 進んだ窓では 50 は受理済み bit"
+        );
+    }
+
+    #[test]
+    fn replay_guard_jump_of_exactly_window_clears_and_of_one_less_keeps_a_bit() {
+        // ahead == REPLAY_WINDOW (32) は「窓をクリア」の閾値そのもの: 旧 max
+        // (100) はどのビットにも残らないので、32 前へ戻った 100 は再受理できる。
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(g.accept(1, 7, 132), "32 進んだジャンプは窓をクリアする");
+        assert!(
+            g.accept(1, 7, 100),
+            "32 前（クリアされた窓の外）は未受理として通る"
+        );
+
+        // ahead == REPLAY_WINDOW - 1 (31) はクリア閾値の 1 手前: 旧 max (100)
+        // は新しい窓の bit 30 として残るので、31 前へ戻った 100 は拒否される。
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(g.accept(1, 7, 131), "31 進んだジャンプは窓をシフトするだけ");
+        assert!(
+            !g.accept(1, 7, 100),
+            "31 前（旧 max として窓内に残っている）は拒否される"
         );
     }
 
