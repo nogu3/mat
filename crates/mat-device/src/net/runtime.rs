@@ -1025,32 +1025,7 @@ impl Runtime {
                         self.current_session = None;
                     }
                 }
-                () = mdns_retry_deadline(&self.mdns_retry) => {
-                    // `window.is_open()` read *now*, not whatever it was when
-                    // this retry was scheduled (fix round 1, review item 1):
-                    // the window may have closed (15-minute expiry or
-                    // `CommissioningComplete`) while mDNS was still down, and a
-                    // stale "was open when scheduled" read would let this retry
-                    // revive a commissionable advert for a window that already
-                    // sent its goodbye.
-                    match bring_up_mdns(&self.state.config, self.port, &self.state.comm_server, &self.state.window).await {
-                        Ok(ctx) => {
-                            tracing::info!("mDNS advertiser came up on retry");
-                            self.state.mdns = Some(ctx);
-                            self.mdns_retry = None;
-                        }
-                        Err(e) => {
-                            // Warned once already (either at startup, above, or
-                            // on the very first retry — from here on this is
-                            // expected/repetitive noise for a device on a
-                            // genuinely bad interface, hence debug not warn.
-                            tracing::debug!(error = %e, "mDNS retry attempt failed, will retry again");
-                            if let Some(state) = self.mdns_retry.as_mut() {
-                                state.schedule_next();
-                            }
-                        }
-                    }
-                }
+                () = mdns_retry_deadline(&self.mdns_retry) => self.on_mdns_retry().await,
                 () = subscription_deadline(&self.state.subscription) => {
                     // The active subscription is due for a report: the dirty
                     // attributes' current values, or an empty keep-alive. Both
@@ -1099,83 +1074,147 @@ impl Runtime {
                     }
                 }
                 () = commissioning_window_deadline(&self.state.window) => {
-                    // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
-                    // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
-                    // window, Task 4) has elapsed: close the window (no more
-                    // PASE admitted — see `admit_unsecured`) and send the same
-                    // commissionable-advert goodbye `CommissioningComplete`
-                    // sends on success (`set_commissionable(None)`, goodbye
-                    // wired since Task 8). No fabric rollback here — unlike
-                    // fail-safe expiry, an already-*established* PASE session
-                    // (if one happened to be mid-flight right at the deadline)
-                    // is left alone; this branch only stops *new* PASE attempts
-                    // from being admitted going forward.
-                    tracing::info!("commissioning window expired — closing");
-                    self.state.window = CommissioningWindow::Closed;
-                    if let Some(ctx) = self.state.mdns.as_ref() {
-                        ctx.mdns.set_commissionable(None).await;
-                    }
-                    // Task 4: this timer-driven close is the runtime noticing
-                    // on its own — unlike `CommissioningComplete`/`Revoke`
-                    // (dispatched IM commands the core cluster handler already
-                    // reacts to), nothing on the core side knows the deadline
-                    // just passed, so the runtime must tell it explicitly to
-                    // keep the AC cluster's `WindowStatus` attribute honest. A
-                    // no-op if this was the boot window (never opened an admin
-                    // window in the first place).
-                    self.state.comm_server.close_admin_window();
+                    self.on_commissioning_window_expired().await
                 }
                 () = fail_safe_expiry_deadline(&self.state.comm_server) => {
-                    // `expire_fail_safe` is the one primitive that both decides
-                    // "was there actually something to roll back" and does the
-                    // rollback — `Some(entry)` only for the fabric an
-                    // uncommitted `AddNOC` installed within this now-lapsed
-                    // window (see its doc comment). Nothing to do here beyond
-                    // that if it returns `None` (e.g. a plain `ArmFailSafe`
-                    // that never called `AddNOC`, or this branch racing another
-                    // caller that already consumed the same expiry) — the
-                    // `select!` loop simply comes back around, and
-                    // `fail_safe_expiry_deadline` reads as "no window open"
-                    // (`std::future::pending`) on the next iteration.
-                    let expired = self.state.comm_server.expire_fail_safe();
-                    tracing::debug!(
-                        rolled_back_fabric_index = ?expired.as_ref().map(|e| e.fabric_index),
-                        "fail-safe expiry deadline fired"
-                    );
-                    if let Some(entry) = expired {
-                        tracing::info!(
-                            fabric_id = entry.fabric_id,
-                            node_id = entry.node_id,
-                            "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
-                        );
-                        if let Some(ctx) = self.state.mdns.as_ref() {
-                            let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-                            ctx.mdns
-                                .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                                .await;
-                        }
-                    }
+                    self.on_fail_safe_expired().await
                 }
                 grecv = group_recv(&self.group.socket, &mut gbuf) => {
                     let Ok((n, from)) = grecv else { continue };
-                    let fabrics = self.state.comm_server.fabrics();
-                    let deps = GroupRxDeps { fabrics: &fabrics, gk_store: &self.group.gk_store, membership: &self.group.membership };
-                    match classify_group_datagram(&gbuf[..n], &deps, &mut self.replay) {
-                        Ok(batch) => {
-                            let mut ctx = InvokeCtx {
-                                fabric_index: batch.fabric_index,
-                                subject: Subject::group(batch.group_id),
-                                ..InvokeCtx::default()
-                            };
-                            let changed = self.state.node.handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
-                            tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
-                            if let Some(sub) = self.state.subscription.as_mut() {
-                                sub.note_changed(&changed);
-                            }
-                        }
-                        Err(reason) => tracing::debug!(peer = %from, len = n, ?reason, "groupcast datagram dropped"),
-                    }
+                    self.on_group_datagram(&gbuf[..n], from);
                 }
+            }
+        }
+    }
+
+    /// The mDNS retry timer fired (`MdnsRetry`): try `bring_up_mdns` again.
+    async fn on_mdns_retry(&mut self) {
+        // `window.is_open()` read *now*, not whatever it was when
+        // this retry was scheduled (fix round 1, review item 1):
+        // the window may have closed (15-minute expiry or
+        // `CommissioningComplete`) while mDNS was still down, and a
+        // stale "was open when scheduled" read would let this retry
+        // revive a commissionable advert for a window that already
+        // sent its goodbye.
+        match bring_up_mdns(
+            &self.state.config,
+            self.port,
+            &self.state.comm_server,
+            &self.state.window,
+        )
+        .await
+        {
+            Ok(ctx) => {
+                tracing::info!("mDNS advertiser came up on retry");
+                self.state.mdns = Some(ctx);
+                self.mdns_retry = None;
+            }
+            Err(e) => {
+                // Warned once already (either at startup, above, or
+                // on the very first retry — from here on this is
+                // expected/repetitive noise for a device on a
+                // genuinely bad interface, hence debug not warn.
+                tracing::debug!(error = %e, "mDNS retry attempt failed, will retry again");
+                if let Some(state) = self.mdns_retry.as_mut() {
+                    state.schedule_next();
+                }
+            }
+        }
+    }
+
+    /// The boot window's 15-minute bound or an ECM window's
+    /// `CommissioningTimeout` elapsed: close the window and pull the
+    /// commissionable advert.
+    async fn on_commissioning_window_expired(&mut self) {
+        // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
+        // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
+        // window, Task 4) has elapsed: close the window (no more
+        // PASE admitted — see `admit_unsecured`) and send the same
+        // commissionable-advert goodbye `CommissioningComplete`
+        // sends on success (`set_commissionable(None)`, goodbye
+        // wired since Task 8). No fabric rollback here — unlike
+        // fail-safe expiry, an already-*established* PASE session
+        // (if one happened to be mid-flight right at the deadline)
+        // is left alone; this branch only stops *new* PASE attempts
+        // from being admitted going forward.
+        tracing::info!("commissioning window expired — closing");
+        self.state.window = CommissioningWindow::Closed;
+        if let Some(ctx) = self.state.mdns.as_ref() {
+            ctx.mdns.set_commissionable(None).await;
+        }
+        // Task 4: this timer-driven close is the runtime noticing
+        // on its own — unlike `CommissioningComplete`/`Revoke`
+        // (dispatched IM commands the core cluster handler already
+        // reacts to), nothing on the core side knows the deadline
+        // just passed, so the runtime must tell it explicitly to
+        // keep the AC cluster's `WindowStatus` attribute honest. A
+        // no-op if this was the boot window (never opened an admin
+        // window in the first place).
+        self.state.comm_server.close_admin_window();
+    }
+
+    /// The fail-safe timer lapsed without `CommissioningComplete`: roll
+    /// back the uncommitted fabric (if any) and its operational advert.
+    async fn on_fail_safe_expired(&mut self) {
+        // `expire_fail_safe` is the one primitive that both decides
+        // "was there actually something to roll back" and does the
+        // rollback — `Some(entry)` only for the fabric an
+        // uncommitted `AddNOC` installed within this now-lapsed
+        // window (see its doc comment). Nothing to do here beyond
+        // that if it returns `None` (e.g. a plain `ArmFailSafe`
+        // that never called `AddNOC`, or this branch racing another
+        // caller that already consumed the same expiry) — the
+        // `select!` loop simply comes back around, and
+        // `fail_safe_expiry_deadline` reads as "no window open"
+        // (`std::future::pending`) on the next iteration.
+        let expired = self.state.comm_server.expire_fail_safe();
+        tracing::debug!(
+            rolled_back_fabric_index = ?expired.as_ref().map(|e| e.fabric_index),
+            "fail-safe expiry deadline fired"
+        );
+        if let Some(entry) = expired {
+            tracing::info!(
+                fabric_id = entry.fabric_id,
+                node_id = entry.node_id,
+                "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
+            );
+            if let Some(ctx) = self.state.mdns.as_ref() {
+                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+                ctx.mdns
+                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                    .await;
+            }
+        }
+    }
+
+    /// One datagram off the group socket: authenticate/classify it
+    /// (`classify_group_datagram`), apply the invokes, and mark what changed
+    /// for the active subscription.
+    fn on_group_datagram(&mut self, datagram: &[u8], from: SocketAddr) {
+        let fabrics = self.state.comm_server.fabrics();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &self.group.gk_store,
+            membership: &self.group.membership,
+        };
+        match classify_group_datagram(datagram, &deps, &mut self.replay) {
+            Ok(batch) => {
+                let mut ctx = InvokeCtx {
+                    fabric_index: batch.fabric_index,
+                    subject: Subject::group(batch.group_id),
+                    ..InvokeCtx::default()
+                };
+                let changed =
+                    self.state
+                        .node
+                        .handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
+                tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
+                if let Some(sub) = self.state.subscription.as_mut() {
+                    sub.note_changed(&changed);
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(peer = %from, len = datagram.len(), ?reason, "groupcast datagram dropped")
             }
         }
     }
