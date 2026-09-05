@@ -363,6 +363,37 @@ fn keyset_next(blob: &[u8]) -> Option<u16> {
     next
 }
 
+/// KeySetData の ctx7（チェーン内 next）だけを `next` に差し替えた blob を返す。
+/// それ以外の要素（policy / keys_count / 3 スロットの epoch key）は TLV 要素単位で
+/// そのまま写す — chip-tool `add-keysets` 由来の複数 epoch keyset を、mat 自身の
+/// 1 スロット形（[`serialize_keyset`]）に潰さずにリンクだけ更新するため。
+/// 外側が struct でない / ctx7 が無い / 途中で切れている blob は `None`。
+fn keyset_with_next(blob: &[u8], next: u16) -> Option<Vec<u8>> {
+    let mut r = Reader::new(blob);
+    if r.next().ok()??.value != Value::StructStart {
+        return None;
+    }
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    let mut seen_next = false;
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(7), Value::Uint(_)) => {
+                w.put_uint(Tag::Context(7), u64::from(next));
+                seen_next = true;
+            }
+            (tag, value) => crate::tlv::copy_value(&mut w, &mut r, tag, value).ok()?,
+        }
+    }
+    if !seen_next {
+        return None;
+    }
+    w.end_container();
+    Some(w.finish())
+}
+
 /// `g/gfl` — FabricList（ctx1 first_entry, ctx2 entry_count）。
 struct FabricList {
     first_entry: u16,
@@ -812,8 +843,9 @@ fn unlink_keymaps_in(
     Ok(removed)
 }
 
-/// KeySetData チェーンから `keyset_id` を外す（前ノードは hash / key を保ったまま
-/// next だけ差し替えて再 serialize）。見つからなければ何もしない。
+/// KeySetData チェーンから `keyset_id` を外す（前ノードは生 blob の ctx7 だけ
+/// 差し替える — chip-tool 由来の policy / 複数 epoch key を落とさない）。
+/// 見つからなければ何もしない。
 fn unlink_keyset(
     txn: &mut KvsTxn,
     fabric_index: u8,
@@ -839,20 +871,9 @@ fn unlink_keyset(
     } else {
         let (prev_id, prev_blob) = &chain[pos - 1];
         let prev_key = format!("f/{fabric_index}/k/{prev_id:x}");
-        let (prev_key_bytes, prev_hash) =
-            crate::kvs::parse_keyset_first_entry(prev_blob, fabric_index)
-                .map_err(GroupSettingsError::Kvs)?;
-        let prev_hash = prev_hash.ok_or_else(|| corrupt(&prev_key, "KeySetData missing hash"))?;
-        txn.set(
-            &prev_key,
-            &serialize_keyset(
-                0,
-                EPOCH_START_TIME,
-                prev_hash,
-                &prev_key_bytes,
-                removed_next,
-            ),
-        );
+        let relinked = keyset_with_next(prev_blob, removed_next)
+            .ok_or_else(|| corrupt(&prev_key, "unparseable KeySetData"))?;
+        txn.set(&prev_key, &relinked);
     }
     fabric.keyset_count -= 1;
     Ok(true)
@@ -1352,5 +1373,105 @@ mod tests {
         assert_eq!(creds.encryption_key, op);
         assert_eq!(creds.session_id, derive_group_session_id(&op));
         assert!(crate::kvs::read_group_credentials(&p, 2, 1).is_ok());
+    }
+
+    /// chip-tool `groupsettings add-keysets` が書く形の KeySetData: policy /
+    /// keys_count / 3 スロットとも実値（mat の serialize_keyset はスロット 1 のみ）。
+    fn multi_epoch_keyset(policy: u16, slots: &[(u64, u16, [u8; 16])], next: u16) -> Vec<u8> {
+        assert_eq!(slots.len(), KEYSET_SLOTS);
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), u64::from(policy));
+        w.put_uint(Tag::Context(2), slots.len() as u64);
+        w.start_array(Tag::Context(3));
+        for (start, hash, key) in slots {
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(4), *start);
+            w.put_uint(Tag::Context(5), u64::from(*hash));
+            w.put_bytes(Tag::Context(6), key);
+            w.end_container();
+        }
+        w.end_container();
+        w.put_uint(Tag::Context(7), u64::from(next));
+        w.end_container();
+        w.finish()
+    }
+
+    #[test]
+    fn remove_group_unlinks_after_chiptool_multi_epoch_keyset_without_losing_epochs() {
+        // chip-tool 由来の前ノード（policy=CacheAndSync、epoch 3 本）の直後の
+        // keyset を外す。前ノードは ctx7（next）だけ差し替わり、policy / keys_count /
+        // 3 スロット全部が無傷で残ること（旧実装はスロット 1 だけ残して再 serialize
+        // していた）。
+        let (_d, p) = tmp_ini("[Default]\n");
+        for (g, ks, epoch) in [(1u16, 10u16, 0x11u8), (2, 20, 0x22), (3, 30, 0x33)] {
+            write_group_provision(
+                &p,
+                2,
+                &CFID,
+                &GroupProvisionWrite {
+                    group_id: g,
+                    keyset_id: ks,
+                    name: "e2e",
+                    epoch_key: [epoch; 16],
+                    rebind: false,
+                },
+            )
+            .unwrap();
+        }
+        // チェーンは 30 → 20 → 10。head の 30 を chip-tool 風 3 epoch 版に差し替える。
+        let slots = [
+            (1u64, 0x1111u16, [0x31u8; 16]),
+            (2_000_000, 0x2222, [0x32; 16]),
+            (3_000_000, 0x3333, [0x33; 16]),
+        ];
+        {
+            let mut txn = crate::kvs::KvsTxn::open(&p).unwrap();
+            assert_eq!(
+                keyset_next(&txn.get("f/2/k/1e").unwrap().unwrap()),
+                Some(20)
+            );
+            txn.set("f/2/k/1e", &multi_epoch_keyset(1, &slots, 20));
+            txn.commit().unwrap();
+        }
+
+        assert!(remove_group(&p, 2, 2).unwrap().keyset_removed);
+
+        let txn = crate::kvs::KvsTxn::open(&p).unwrap();
+        assert!(txn.get("f/2/k/14").unwrap().is_none(), "keyset 20 must go");
+        let fabric = parse_fabric_data(&txn.get("f/2/g").unwrap().unwrap()).unwrap();
+        assert_eq!((fabric.first_keyset, fabric.keyset_count), (30, 2));
+        let prev = txn.get("f/2/k/1e").unwrap().unwrap();
+        assert_eq!(
+            prev,
+            multi_epoch_keyset(1, &slots, 10),
+            "prev node must change only ctx7 (next 20 -> 10)"
+        );
+        // 読み側も第 1 エントリを従来どおり解決できる。
+        let (key, hash) = crate::kvs::parse_keyset_first_entry(&prev, 2).unwrap();
+        assert_eq!((key, hash), ([0x31; 16], Some(0x1111)));
+    }
+
+    #[test]
+    fn keyset_with_next_rewrites_only_ctx7() {
+        let slots = [
+            (1u64, 0xAAAAu16, [0xA0u8; 16]),
+            (2, 0xBBBB, [0xB0; 16]),
+            (3, 0xCCCC, [0xC0; 16]),
+        ];
+        let blob = multi_epoch_keyset(1, &slots, 0x0BAD);
+        assert_eq!(
+            keyset_with_next(&blob, INVALID_KEYSET_ID).unwrap(),
+            multi_epoch_keyset(1, &slots, INVALID_KEYSET_ID)
+        );
+        // mat 自身が書く 1 スロット形も同じ経路で無損失。
+        let mine = serialize_keyset(0, EPOCH_START_TIME, 7, &[0x42; 16], 5);
+        assert_eq!(
+            keyset_with_next(&mine, 9).unwrap(),
+            serialize_keyset(0, EPOCH_START_TIME, 7, &[0x42; 16], 9)
+        );
+        // ctx7 が無い / 壊れた blob は None（呼び手が Corrupt にする）。
+        assert!(keyset_with_next(&[0x15, 0x18], 1).is_none());
+        assert!(keyset_with_next(&blob[..blob.len() - 3], 1).is_none());
     }
 }
