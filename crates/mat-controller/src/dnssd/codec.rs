@@ -36,7 +36,7 @@ pub(super) fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
 
 /// Byte budget per packet for [`encode_ptr_query_with_known`] (comfortably
 /// under a typical path MTU; real responders truncated at ~1428B — see the
-/// module doc's known-answer-suppression note).
+/// `browse`'s module doc's known-answer-suppression note).
 const KNOWN_ANSWER_PACKET_BUDGET: usize = 1400;
 
 /// PTR クエリ + Known-Answer リストを 1..N 個のパケットに符号化する
@@ -213,7 +213,7 @@ const MIN_RECORD_LEN: usize = 11;
 /// Cap on folded AAAA candidates while the SRV target is still unknown —
 /// a flooder must not grow memory; the real address always fits once the
 /// SRV answer arrives and non-matching entries are pruned.
-pub(super) const MAX_AAAA: usize = 16;
+const MAX_AAAA: usize = 16;
 
 /// Capacity to pre-reserve for `claimed` records in a `msg_len`-byte
 /// message: never more than could physically fit (header counts are

@@ -136,7 +136,8 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad ifindex"))
 }
 
-/// Binds the one-shot mDNS query socket used by the resolvers below.
+/// Binds the one-shot mDNS query socket used by the `resolve` / `browse` /
+/// `cache` submodules (and `test_util`'s responders).
 ///
 /// It binds `[::]:5353` (the mDNS port) with address/port reuse and joins the
 /// `ff02::fb` group on the query interface. This is the crucial difference
