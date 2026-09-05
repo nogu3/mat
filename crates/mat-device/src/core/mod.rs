@@ -14,6 +14,7 @@ pub mod general_diagnostics;
 pub mod group_invoke;
 pub mod group_key_management;
 pub mod group_membership;
+pub mod group_privacy;
 pub mod groups;
 pub mod identify;
 pub mod mdns_records;
