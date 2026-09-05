@@ -374,7 +374,7 @@ pub enum Command {
         action: DiagCommand,
     },
 
-    /// fabric 管理（初回 bootstrap）。
+    /// fabric 管理（初回 bootstrap / 一覧 / IPK ローテーション）。
     Fabric {
         #[command(subcommand)]
         action: FabricAction,
@@ -395,6 +395,23 @@ pub enum FabricAction {
     },
     /// KVS にある fabric（`f/<idx>/n` を持つ index）を一覧する。ローカルのみ。
     List,
+    /// IPK（keyset 0）の epoch をローテーションする: 新 epoch を生成し、各ノードへ
+    /// KeySetWrite {現行, 新} を配布・新 IPK で CASE を張って受理を実証、全ノード
+    /// ok なら controller KVS を新 epoch へ切替。途中失敗は pending（再実行で同じ
+    /// 新鍵から再開）。直経路専用（ネットワークに出る）。
+    RotateIpk {
+        /// 対象ノード（省略 = 台帳の全ノード）。pending の再実行で絞ると、その部分
+        /// 集合が全部成功した時点で commit する（除外ノードは後で --catch-up）。
+        #[arg(long = "nodes", num_args = 1.., value_name = "N|ALIAS")]
+        nodes: Vec<NodeRef>,
+        /// commit 済みローテーションに取り残されたノードへ旧 epoch で CASE して
+        /// {旧, 現行} を配る
+        #[arg(long, conflicts_with = "abort")]
+        catch_up: bool,
+        /// pending のローテーションを取り消す（デバイスは触らない）
+        #[arg(long, conflicts_with = "catch_up")]
+        abort: bool,
+    },
 }
 
 /// 色の指定（3 系統から 1 つ、排他）: `--name`（色名）/ `--rgb`（HEX or R,G,B）/

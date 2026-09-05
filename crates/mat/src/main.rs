@@ -67,22 +67,26 @@ fn main() -> ExitCode {
             FabricAction::Init {
                 fabric_id,
                 admin_node_id,
-            } => commands::fabric::run_init(
+            } => Some(commands::fabric::run_init(
                 &store_path,
                 *fabric_id,
                 *admin_node_id,
                 args.fabric_index,
                 args.issuer_index,
-            ),
-            FabricAction::List => commands::fabric::run_list(&store_path, args.fabric_index),
+            )),
+            FabricAction::List => Some(commands::fabric::run_list(&store_path, args.fabric_index)),
+            // rotate-ipk はネットワークに出るので直経路 dispatch（下）へ落とす。
+            FabricAction::RotateIpk { .. } => None,
         };
-        return match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                e.emit();
-                ExitCode::from(e.kind.exit_code())
-            }
-        };
+        if let Some(result) = result {
+            return match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    e.emit();
+                    ExitCode::from(e.kind.exit_code())
+                }
+            };
+        }
     }
 
     // group list もローカル完結（KVS 読み取りのみ）— fabric と同じ扱いで
@@ -257,9 +261,31 @@ fn main() -> ExitCode {
             .map(mat_core::alias::NodeRef::id)
             .collect::<Result<Vec<u64>, MatError>>()
             .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
+        Command::Fabric {
+            action:
+                FabricAction::RotateIpk {
+                    nodes,
+                    catch_up,
+                    abort,
+                },
+        } => nodes
+            .iter()
+            .map(mat_core::alias::NodeRef::id)
+            .collect::<Result<Vec<u64>, MatError>>()
+            .and_then(|ids| {
+                commands::fabric::run_rotate_ipk(
+                    &store_path,
+                    &ids,
+                    *catch_up,
+                    *abort,
+                    native_cfg.as_ref(),
+                    args.op_timeout_ms,
+                )
+            }),
         // 他の全 op（`Dispatch::Device`）は上の native_direct::run 早期 return で
-        // 処理済み。Command::Fabric は route dispatch より前の早期 return で処理済み。
-        // 不変条件が破れても panic せず typed error（v1 Task6 と同じ規律）。
+        // 処理済み。Command::Fabric の Init / List は早期 return、RotateIpk は
+        // 上の腕で処理済み。不変条件が破れても panic せず typed error（v1 Task6
+        // と同じ規律）。
         _ => Err(MatError::parse_error(
             "internal: op not handled by native_direct::run (route dispatch invariant violated)",
         )),

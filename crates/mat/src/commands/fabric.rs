@@ -1,6 +1,8 @@
-//! `mat fabric init` — 初回 fabric bootstrap（M8c-3）。直経路のみ・
-//! ネットワーク未接触（KVS ローカル生成だけ）。iface 解決より前に
-//! dispatch される（main.rs 参照）。
+//! `mat fabric init` / `list` / `rotate-ipk`。`init` / `list` は直経路のみ・
+//! ネットワーク未接触（KVS ローカル生成/読取だけ）で iface 解決より前に
+//! dispatch される（main.rs 参照）。`rotate-ipk` はネットワークに出るため
+//! iface 解決後の直経路 dispatch を通る — 状態機械の実体は
+//! `mat_native::rotate_ipk`、ここは台帳でのノード解決と body の emit だけ。
 
 use std::path::Path;
 
@@ -9,6 +11,8 @@ use serde_json::json;
 use mat_controller::commissioning::CommissioningFabric;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
+use mat_native::rotate_ipk::{self, RotateIpkParams, RotateMode};
+use mat_native::NativeConfig;
 
 /// 初回 fabric bootstrap: root CA + ランダム epoch IPK を生成し、chip-tool
 /// INI 互換 KVS を新規作成する。store ディレクトリが無ければ作る（init は
@@ -84,12 +88,16 @@ pub fn run_list(store_path: &Path, current_fabric_index: u8) -> Result<(), MatEr
             Some(_) => "mat",
             None => "chip-tool",
         };
+        let pending = kvs::read_mat_ipk_epoch_slot(&main_ini, idx, kvs::IpkEpochSlot::Next)
+            .map_err(map_err)?
+            .is_some();
         fabrics.push(json!({
             "fabric_index": idx,
             "fabric_id": fabric_id,
             "admin_node_id": admin_node_id,
             "compressed_fabric_id": format!("{:016X}", u64::from_be_bytes(cfid)),
             "ipk_epoch": ipk_epoch,
+            "ipk_rotation_pending": pending,
             "current": idx == current_fabric_index,
         }));
     }
@@ -99,4 +107,69 @@ pub fn run_list(store_path: &Path, current_fabric_index: u8) -> Result<(), MatEr
         fabrics,
     ));
     Ok(())
+}
+
+/// `mat fabric rotate-ipk`: 状態機械は `mat_native::rotate_ipk`、ここは台帳での
+/// ノード解決（省略 = 全ノード）と body の emit だけ。部分失敗（pending /
+/// catch_up_incomplete）は stdout に body を出したうえで stderr error を返す
+/// （終了コードは最初に失敗したノードの kind）。
+pub fn run_rotate_ipk(
+    store_path: &Path,
+    nodes: &[u64],
+    catch_up: bool,
+    abort: bool,
+    native: Option<&crate::native_direct::Config<'_>>,
+    op_timeout_ms: u64,
+) -> Result<(), MatError> {
+    let cfg = native.ok_or_else(|| {
+        MatError::new(
+            ErrorKind::Other,
+            "rotate-ipk: native backend not configured (internal)",
+        )
+    })?;
+    let store = mat_core::store::Store::open(store_path)?;
+    let node_ids: Vec<u64> = if nodes.is_empty() {
+        store.nodes().map(|n| n.node_id).collect()
+    } else {
+        for &id in nodes {
+            store.require_node(id)?;
+        }
+        nodes.to_vec()
+    };
+    let mode = if abort {
+        RotateMode::Abort
+    } else if catch_up {
+        RotateMode::CatchUp
+    } else {
+        RotateMode::Rotate
+    };
+    let params = RotateIpkParams {
+        node_ids,
+        mode,
+        per_node_timeout_ms: op_timeout_ms,
+    };
+    let native_cfg = NativeConfig {
+        store: store.root().to_path_buf(),
+        iface: cfg.iface.to_string(),
+        thread_iface: cfg.thread_iface.clone(),
+        fabric_index: cfg.fabric_index,
+        issuer_index: cfg.issuer_index,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("tokio runtime: {e}")))?;
+    let outcome = rt
+        .block_on(rotate_ipk::run(&native_cfg, &params))
+        .map_err(crate::native_direct::map_engine_build_error)?;
+    tracing::info!(
+        status = outcome.status.as_str(),
+        nodes = outcome.nodes.len(),
+        "fabric rotate-ipk executed"
+    );
+    output::emit(outcome.body(cfg.fabric_index));
+    match outcome.partial_error() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
