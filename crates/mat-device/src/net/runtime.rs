@@ -224,8 +224,8 @@ const COMMISSIONING_WINDOW_DURATION: Duration = Duration::from_secs(15 * 60);
 /// Whether new PASE attempts are currently admitted (Task 14), and — once
 /// opened by the Administrator Commissioning cluster (Task 4) — what
 /// verifier material/discriminator that admission should use instead of the
-/// boot passcode. Boot-time policy (decided once in `run`, before the loop
-/// starts): `Open` if `comm_server.fabrics()` is empty (a never-
+/// boot passcode. Boot-time policy (decided once in `boot`, before
+/// `serve_forever`'s loop starts): `Open` if `comm_server.fabrics()` is empty (a never-
 /// commissioned, or freshly wiped, device), `Closed` if any fabric is
 /// already installed (this device was commissioned in a previous run; a
 /// fresh commissioner has no business PASE-ing into it again *until* an
@@ -418,8 +418,8 @@ fn admin_window_action(
 /// or `DropSession` (Task 6: a `RemoveFabric` this dispatch removed the
 /// invoking session's own fabric — spec §2.5.11, removing a fabric SHALL
 /// terminate any session associated with it). Propagated back up through
-/// `drain_buffered_requests`/`serve_secured` to `run`'s loop, which is the
-/// only place that actually owns `current_session` and can set it to
+/// `drain_buffered_requests`/`serve_secured` to `on_secured_datagram`, which
+/// is the only place that actually owns `current_session` and can set it to
 /// `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeOutcome {
@@ -430,7 +430,7 @@ enum ServeOutcome {
 /// Whether a `RemoveFabric` that just removed `removed_fabric_index` from
 /// the store should end the current secured session — true iff the
 /// removed fabric is the one `session_fabric_index` (this session's own,
-/// carried alongside `SecureSession` in `run`'s `current_session`)
+/// carried alongside `SecureSession` in `Runtime`'s `current_session`)
 /// authenticated against. Extracted as a pure function (mirrors
 /// `admin_window_action` above) so this one-line decision has a unit test
 /// that doesn't need a socket harness — `serve_secured_message`'s
@@ -757,7 +757,7 @@ impl NodeState {
     }
 }
 
-/// Everything `run`'s loop carries between iterations, so the per-branch
+/// Everything `serve_forever`'s loop carries between iterations, so the per-branch
 /// handlers (`on_*`) can be plain methods instead of one 400-line
 /// `select!` body. Built once by `boot`, driven forever by `serve_forever`.
 struct Runtime {
@@ -890,7 +890,7 @@ impl Runtime {
         // be acknowledged — anything else drops the subscription
         // (`send_subscription_report`'s doc comment).
         //
-        // No reentrancy hazard against the datagram branch above:
+        // No reentrancy hazard against the datagram path (`on_secured_datagram`):
         // `select!` runs exactly one branch to completion per
         // iteration, so while this one awaits its StatusResponse it
         // is `SecureSession`'s own socket read — not the loop's —
@@ -922,7 +922,7 @@ impl Runtime {
                     .await
                     == ServeOutcome::DropSession;
         }
-        // Task 6: same reasoning as the datagram branch above — a
+        // Task 6: same reasoning as the datagram path (`on_secured_datagram`) — a
         // buffered `RemoveFabric` piggybacked on this session's own
         // fabric ends the session too, not just one arriving as a
         // fresh datagram.
@@ -1317,7 +1317,7 @@ fn sync_group_joins(group: &mut GroupRx, comm_server: &CommissioningServer) {
 /// Returns `ServeOutcome::DropSession` (Task 6) if this datagram's dispatch
 /// — or, when it wasn't, one of the buffered requests drained afterward —
 /// contained a `RemoveFabric` that removed the invoking session's own
-/// fabric (`remove_fabric_drops_session`); `run`'s caller then sets
+/// fabric (`remove_fabric_drops_session`); `on_secured_datagram` then sets
 /// `current_session = None`. `DropSession` skips the buffered-request drain
 /// below entirely (rather than draining what's left first): the session is
 /// about to be torn down, so there is no longer anywhere to route replies
@@ -1512,7 +1512,7 @@ async fn serve_secured_message(
             changed,
         } = outcome;
         // Anything this request changed that the active subscription covers
-        // becomes dirty — the `select!` report branch (`run`) picks it up at
+        // becomes dirty — the `select!` report branch (`on_subscription_due`) picks it up at
         // the subscription's next deadline. Recorded *before* the reply is
         // sent so a change is never lost to a failing reply.
         if let Some(sub) = subscription.as_mut() {
@@ -1605,7 +1605,7 @@ async fn serve_secured_message(
                             }
                             // Task 14: CommissioningComplete is the other event
                             // (besides the 15-minute/`CommissioningTimeout`
-                            // deadline in `run`'s `select!`) that closes the
+                            // deadline in `on_commissioning_window_expired`) that closes the
                             // commissioning window — a controller that just
                             // finished commissioning has no reason to PASE in
                             // again, and refusing it stops a second
@@ -1668,7 +1668,7 @@ async fn serve_secured_message(
 /// Everything one secured message is allowed to touch, bundled so
 /// `serve_secured`/`serve_secured_message` keep a readable arity as the
 /// runtime grows state (Task 12 added the subscription). Borrowed as a
-/// whole from `run`'s loop locals; the fields are destructured inside
+/// whole from `serve_forever`'s loop locals; the fields are destructured inside
 /// `serve_secured_message` so they stay independent borrows.
 struct ServeState<'a> {
     node: &'a mut Node,
@@ -1684,16 +1684,16 @@ struct ServeState<'a> {
     /// `RevokeCommissioning` having cleared the core's admin window out from
     /// under an `EnhancedOpen` runtime window — all three detected per
     /// dispatch iteration, same place as the AddNOC fabric-diff check. The
-    /// 15-minute/`CommissioningTimeout`-elapsed close happens in `run`'s own
-    /// `select!` branch, outside any `ServeState`.
+    /// 15-minute/`CommissioningTimeout`-elapsed close happens in
+    /// `on_commissioning_window_expired`, outside any `ServeState`.
     window: &'a mut CommissioningWindow,
     /// Boot-time identity (passcode/discriminator/vendor+product id) — Task
     /// 4 needs `config.discriminator`/`vendor_id`/`product_id` to rebuild
     /// the commissionable advert when a `WindowRequest` reopens the window,
-    /// and `config.passcode` was already reachable via `run`'s closure but
-    /// not through `ServeState` until now (`pase_config_for_window` is
-    /// called directly in `run`, not from here — this is only for the
-    /// mDNS-side advert rebuild).
+    /// and `config.passcode` was already reachable via `establish_session`
+    /// but not through `ServeState` until now (`pase_config_for_window` is
+    /// called directly in `establish_session`, not from here — this is
+    /// only for the mDNS-side advert rebuild).
     config: &'a DeviceConfig,
 }
 
@@ -1929,7 +1929,7 @@ async fn serve_subscribe_request(
 /// subscription, and a real controller re-subscribes on its own.
 ///
 /// Takes `&mut Node` even though it only reads: this future is held across
-/// `await` points inside `run`'s `select!`, and `Device::run`'s task is
+/// `await` points inside `serve_forever`'s `select!`, and `Device::run`'s task is
 /// `tokio::spawn`ed — a shared `&Node` living across an await would make
 /// the whole runtime future require `Node: Sync`, which `Box<dyn
 /// ClusterHandler>` (declared `: Send`, not `: Sync`) is not.
@@ -2706,7 +2706,7 @@ mod tests {
     /// `Node::handle_im` and replies, exactly like a datagram read fresh off
     /// the socket. No mDNS, no commissioning — a bare `Node`/
     /// `CommissioningServer` pair driven directly, `serve_secured` called by
-    /// hand the same way `run`'s loop calls it.
+    /// hand the same way `on_secured_datagram` calls it.
     #[tokio::test]
     async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() {
         use mat_controller::crypto::{open_message, seal_message};
