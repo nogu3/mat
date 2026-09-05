@@ -657,24 +657,30 @@ fn encode_key_set_remove_fields(keyset_id: u16) -> Vec<u8> {
     w.finish()
 }
 
-/// `{0: status, ...}` 形の応答から status（ctx0 の uint）だけを読む。
+/// `{0: status, ...}` 形の応答から status（ctx0 の uint）だけを読む。外側 struct
+/// 直下の ctx0 のみを見る — 途中の nested container（struct / array / list）は
+/// 丸ごと飛ばし、その中の ctx0 や ContainerEnd を誤読しない。
 fn decode_response_status(fields: &[u8]) -> Result<u8, MatError> {
-    use mat_controller::tlv::{Reader, Value as Tlv};
-    let mut r = Reader::new(fields);
+    use mat_controller::tlv::{skip_container, Reader, TlvError, Value as Tlv};
     let bad = |what: &str| MatError::parse_error(format!("RemoveGroupResponse: {what}"));
-    match r.next().map_err(|_| bad("tlv decode error"))? {
+    let tlv_err = |e: TlvError| match e {
+        TlvError::Truncated => bad("truncated"),
+        _ => bad("tlv decode error"),
+    };
+    let mut r = Reader::new(fields);
+    match r.next().map_err(tlv_err)? {
         Some(el) if el.value == Tlv::StructStart => {}
         _ => return Err(bad("missing struct")),
     }
     loop {
-        let el = r
-            .next()
-            .map_err(|_| bad("tlv decode error"))?
-            .ok_or_else(|| bad("truncated"))?;
+        let el = r.next().map_err(tlv_err)?.ok_or_else(|| bad("truncated"))?;
         match (el.tag, el.value) {
             (_, Tlv::ContainerEnd) => return Err(bad("missing status")),
             (Tag::Context(0), Tlv::Uint(v)) => {
                 return u8::try_from(v).map_err(|_| bad("status out of range"))
+            }
+            (_, Tlv::StructStart | Tlv::ArrayStart | Tlv::ListStart) => {
+                skip_container(&mut r).map_err(tlv_err)?
             }
             _ => {}
         }
@@ -685,6 +691,54 @@ fn decode_response_status(fields: &[u8]) -> Result<u8, MatError> {
 mod tests {
     use super::*;
     use crate::test_support::FakeConn;
+
+    #[test]
+    fn decode_response_status_flat_and_nested() {
+        use mat_controller::tlv::Tag;
+        // 平坦な RemoveGroupResponse `{0: status, 1: groupID}`。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), 0x8B); // NOT_FOUND
+        w.put_uint(Tag::Context(1), 7);
+        w.end_container();
+        assert_eq!(decode_response_status(&w.finish()).unwrap(), 0x8B);
+
+        // status より前に nested container（struct 内に ctx0、array）が来ても、
+        // その中の ctx0 を status と誤読せず、内側の ContainerEnd で
+        // 「missing status」に早落ちしない。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(2));
+        w.put_uint(Tag::Context(0), 0x55); // ← これは status ではない
+        w.end_container();
+        w.start_array(Tag::Context(3));
+        w.put_uint(Tag::Anonymous, 1);
+        w.end_container();
+        w.put_uint(Tag::Context(0), 0);
+        w.end_container();
+        assert_eq!(decode_response_status(&w.finish()).unwrap(), 0);
+
+        // nested container だけで status が無い → missing status（truncated ではない）。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(2));
+        w.put_uint(Tag::Context(0), 0x55);
+        w.end_container();
+        w.end_container();
+        let err = decode_response_status(&w.finish()).unwrap_err();
+        assert!(err.detail.contains("missing status"), "{}", err.detail);
+
+        // nested container が途中で切れている → truncated。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(2));
+        w.put_uint(Tag::Context(0), 0x55);
+        w.end_container();
+        w.end_container();
+        let bytes = w.finish();
+        let err = decode_response_status(&bytes[..bytes.len() - 2]).unwrap_err();
+        assert!(err.detail.contains("truncated"), "{}", err.detail);
+    }
 
     #[tokio::test]
     async fn thread_identity_picks_thread_interface() {
