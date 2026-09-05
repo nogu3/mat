@@ -37,6 +37,7 @@ pub enum ThreadIfaceChoice {
 }
 
 /// native バックエンドの起動設定。
+#[derive(Clone)]
 pub struct NativeConfig {
     /// chip-tool KVS のあるディレクトリ（chip-tool の --storage-directory と同一）。
     pub store: std::path::PathBuf,
@@ -369,6 +370,53 @@ impl Resolver for CachingResolver {
     }
 }
 
+/// KVS から fabric 資格情報を組み立てる（`Engine::build` の前半）。`fabric
+/// rotate-ipk` も同じ経路で読む（epoch を差し替えた別 IPK の確立器を作るため）。
+/// KVS 読み取り失敗は一律 `store_missing`、NOC 自己発行の失敗は `store_parse`。
+pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, MatError> {
+    let alpha_ini = cfg.store.join("chip_tool_config.alpha.ini");
+    let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
+    let materials = mat_controller::kvs::read_self_issue_materials(
+        &alpha_ini,
+        &main_ini,
+        cfg.fabric_index,
+        cfg.issuer_index,
+    )
+    .map_err(|e| {
+        MatError::new(
+            ErrorKind::StoreMissing,
+            format!("native: read KVS credentials: {e}"),
+        )
+    })?;
+    FabricCredentials::from_self_issued(materials).map_err(|e| {
+        MatError::new(
+            ErrorKind::StoreParse,
+            format!("native: self-issue NOC: {e}"),
+        )
+    })
+}
+
+/// 資格情報から実確立器（mDNS 解決 → CASE）を作る（`Engine::build` の後半）。
+/// `creds.ipk_operational` を差し替えて渡せば別 epoch の IPK で CASE を張る
+/// 確立器になる（rotate-ipk の受理実証）。
+pub fn case_establisher(
+    cfg: &NativeConfig,
+    creds: FabricCredentials,
+    resolver: Arc<dyn Resolver>,
+) -> Result<Box<dyn Establisher>, MatError> {
+    let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("native: resolve iface {:?} index: {e}", cfg.iface),
+        )
+    })?;
+    Ok(Box::new(CaseEstablisher {
+        creds: Arc::new(creds),
+        scope_id,
+        resolver,
+    }))
+}
+
 impl Engine {
     /// KVS から資格情報を1回読み、NOC を自己発行し、UDP transport を bind、
     /// iface の scope_id を解決して実確立器を構築する。op (unicast) 側の
@@ -384,27 +432,8 @@ impl Engine {
         cfg: &NativeConfig,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self, MatError> {
-        let alpha_ini = cfg.store.join("chip_tool_config.alpha.ini");
-        let main_ini = cfg.store.join("chip_tool_config.ini");
-        let materials = mat_controller::kvs::read_self_issue_materials(
-            &alpha_ini,
-            &main_ini,
-            cfg.fabric_index,
-            cfg.issuer_index,
-        )
-        .map_err(|e| {
-            // KVS 読み取り失敗は一律 store_missing に写像（細分化は将来）。
-            MatError::new(
-                ErrorKind::StoreMissing,
-                format!("native: read KVS credentials: {e}"),
-            )
-        })?;
-        let creds = FabricCredentials::from_self_issued(materials).map_err(|e| {
-            MatError::new(
-                ErrorKind::StoreParse,
-                format!("native: self-issue NOC: {e}"),
-            )
-        })?;
+        let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
+        let creds = load_fabric_credentials(cfg)?;
         let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
             MatError::new(
                 ErrorKind::Other,
@@ -478,13 +507,9 @@ impl Engine {
         // build が bind する共有 UdpTransport は group multicast 送信専用。
         // op / 購読の unicast セッションはノードごとに専用ソケットを bind する
         // （監査#3 / 購読 spec）。
-        let establisher = CaseEstablisher {
-            creds: Arc::new(creds),
-            scope_id,
-            resolver,
-        };
+        let establisher = case_establisher(cfg, creds, resolver)?;
         Ok(Self {
-            establisher: Box::new(establisher),
+            establisher,
             group: Some(group),
             group_settings: Some(group_settings),
         })
@@ -1176,6 +1201,22 @@ mod tests {
             "unexpected kind: {:?}",
             err.kind
         );
+    }
+
+    #[test]
+    fn load_fabric_credentials_maps_missing_store_to_store_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NativeConfig {
+            store: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        let err = load_fabric_credentials(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        // Clone できる（rotate-ipk が確立器生成クロージャへ move する）。
+        let _ = cfg.clone();
     }
 
     /// resolve が実際に multicast 送受信できる iface の index を1つ探す。
