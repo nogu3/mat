@@ -281,11 +281,11 @@ them)`。stdout の body は pure JSON のまま（設計ルール 2）で、機
 ## 7. テスト
 
 - **ユニット（mat-controller）**: §2.1 (a)〜(e)、§2.3、§2.4（1 本形が既存
-  エンコーダとバイト一致、2 本形の TLV 形、3 本超は呼び手のバグとして debug_assert
-  ではなく `Result` で拒む）。chip-tool INI 互換の既存テストは全部残す。
-- **ユニット（mat-native）**: fake `Establisher` / `NodeConn`（`test_support` の
-  既存 fake を利用、mat-native 側の test_support は触ってよい範囲外なので
-  `rotate_ipk.rs` 内 test mod に閉じる）で: 全 ok → commit・KVS 3 キー・k/0
+  エンコーダとバイト一致、2 本形の TLV 形。4 本以上は呼び手のバグなので
+  `debug_assert!` + doc で禁じ、release では先頭 3 本だけ書く）。chip-tool INI 互換の既存テストは全部残す。
+- **ユニット（mat-native）**: fake `Establisher` / `NodeConn`（`mat-native/src/
+  test_support.rs` の既存 fake を利用 — 触ってはいけないのは `mat-controller`
+  側の `test_support.rs`。足りない fake は `rotate_ipk.rs` の test mod に閉じる）で: 全 ok → commit・KVS 3 キー・k/0
   slot0 が derive(next)、1 ノード失敗 → pending・KVS は next だけ・k/0 不変、
   resume が同じ next を使う、verify-CASE 失敗は failed 扱い、catch-up が prev で
   確立し {prev, cur} を書く、abort、ノード 0 件で即 commit、per-node timeout。
