@@ -1493,6 +1493,7 @@ mod tests {
         encode_open_commissioning_window, encode_remove_fabric, encode_update_fabric_label,
         parse_nocsr_elements, CommissioningFabric,
     };
+    use mat_controller::im;
     use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_controller::x509::{generate_dev_attestation, parse_csr};
 
@@ -1642,6 +1643,57 @@ mod tests {
                 )
             }
         }
+    }
+
+    /// rollback / RemoveFabric の purge 対象 3 store を配線した server。
+    fn server_with_stores() -> (
+        CommissioningServer,
+        crate::core::access_control::AclStore,
+        GroupKeyStore,
+        GroupMembershipStore,
+    ) {
+        let mut server = test_server();
+        let acl = crate::core::access_control::AclStore::new();
+        let gk = GroupKeyStore::new();
+        let membership = GroupMembershipStore::new();
+        server.set_acl_store(acl.clone());
+        server.set_group_key_store(gk.clone());
+        server.set_group_membership_store(membership.clone());
+        (server, acl, gk, membership)
+    }
+
+    /// fabric 1 の admin (subject 0xAA) が ACL 上 Administer を持つか —
+    /// AddNOC の自動 admin エントリの有無を表す。
+    fn admin_allowed(acl: &crate::core::access_control::AclStore) -> bool {
+        acl.check(
+            1,
+            crate::core::access_control::Subject::node(0xAA),
+            crate::core::access_control::PRIVILEGE_ADMINISTER,
+            0,
+            im::CLUSTER_ACCESS_CONTROL,
+        )
+    }
+
+    /// install 直後に 3 store へ fabric 1 の状態を仕込む（admin ACL は AddNOC が
+    /// 自動で入れる）。
+    fn seed_fabric_state(gk: &GroupKeyStore, membership: &GroupMembershipStore) {
+        gk.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
+        gk.replace_fabric_map(1, vec![(0x000A, 7)]);
+        membership.add(1, 0x000A, 2).unwrap();
+    }
+
+    fn assert_fabric_state_purged(
+        acl: &crate::core::access_control::AclStore,
+        gk: &GroupKeyStore,
+        membership: &GroupMembershipStore,
+    ) {
+        assert!(!admin_allowed(acl), "ACL admin entry must be purged");
+        assert!(!gk.keyset_exists(1, 7));
+        assert!(gk.map_entries_for(1).is_empty());
+        assert!(
+            membership.groups_by_fabric().is_empty(),
+            "membership must be purged"
+        );
     }
 
     #[test]
@@ -2858,29 +2910,40 @@ mod tests {
 
     #[test]
     fn fail_safe_expiry_rolls_back_uncommitted_fabric() {
-        let mut server = test_server();
-        let gk_store = GroupKeyStore::new();
-        server.set_group_key_store(gk_store.clone());
+        let (mut server, acl, gk, membership) = server_with_stores();
         install_fabric(&mut server, 0x1122, 0x5001);
         assert_eq!(server.fabrics().len(), 1);
-
-        // `rollback_uncommitted_fabric` (Task 2 purge site) must purge the
-        // uncommitted fabric's GroupKeyStore state exactly like the
-        // RemoveFabric path does.
-        gk_store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
-        gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
+        assert!(admin_allowed(&acl), "AddNOC installs the admin ACL entry");
+        seed_fabric_state(&gk, &membership);
 
         server.force_expire_fail_safe();
-
         let removed = server.expire_fail_safe();
         assert_eq!(removed.map(|e| e.fabric_index), Some(1));
         assert!(server.fabrics().is_empty());
         assert!(server.fail_safe_deadline().is_none());
-        assert!(!gk_store.keyset_exists(1, 7));
-        assert!(gk_store.map_entries_for(1).is_empty());
+        assert_fabric_state_purged(&acl, &gk, &membership);
 
         // Idempotent: the marker and the timer are both already cleared.
         assert!(server.expire_fail_safe().is_none());
+    }
+
+    /// 早期 disarm（`ArmFailSafe(0)`）も満了と同じ rollback 経路: 未確定
+    /// fabric と 3 store の状態が消える。
+    #[test]
+    fn arm_fail_safe_zero_rolls_back_uncommitted_fabric_and_purges_stores() {
+        let (mut server, acl, gk, membership) = server_with_stores();
+        install_fabric(&mut server, 0x1122, 0x5001);
+        seed_fabric_state(&gk, &membership);
+
+        drive_invoke(
+            &mut server,
+            CLUSTER_GENERAL_COMMISSIONING,
+            CMD_ARM_FAIL_SAFE,
+            &encode_arm_fail_safe(0, 3),
+        );
+        assert!(server.fabrics().is_empty());
+        assert!(server.fail_safe_deadline().is_none());
+        assert_fabric_state_purged(&acl, &gk, &membership);
     }
 
     #[test]
@@ -2912,9 +2975,9 @@ mod tests {
     /// disarm 時の rollback が引き続き担保する。
     #[test]
     fn rearm_keeps_uncommitted_fabric_and_complete_commits_it() {
-        let mut server = test_server();
+        let (mut server, acl, gk, membership) = server_with_stores();
         install_fabric(&mut server, 0x1122, 0x5001);
-        assert_eq!(server.fabrics().len(), 1);
+        seed_fabric_state(&gk, &membership);
 
         // AddNOC 後の再アーム（matter.js の Reconnect ステップ相当）
         drive_invoke(
@@ -2928,6 +2991,9 @@ mod tests {
             1,
             "re-arm while armed must not roll back the pending fabric"
         );
+        assert!(admin_allowed(&acl));
+        assert!(gk.keyset_exists(1, 7));
+        assert_eq!(membership.endpoints_for(1, 0x000A), vec![2]);
 
         // CASE 再接続後の CommissioningComplete で確定する
         drive_invoke(
