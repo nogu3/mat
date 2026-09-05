@@ -865,7 +865,7 @@ mod tests {
             protocol_id: crate::im::PROTOCOL_ID_IM,
             vendor_id: None,
         };
-        // screen_with の buffer push (session.rs 内 push_back) と同じ形の
+        // screen_with の buffer push（session/mrp.rs の push_back）と同じ形の
         // IncomingMessage を、フィルタ落ちで待避済みだった体で直接 peer_initiated
         // に積む（`tests` は `session` のサブモジュールなので private field に届く）。
         s.peer_initiated.push_back(IncomingMessage {

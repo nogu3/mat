@@ -18,7 +18,7 @@ use crate::group::{self, BumpOutcome, GroupOutcome};
 use crate::Engine;
 
 /// OperationalCredentials / CurrentFabricIndex（属性 0x0005）。commissioning.rs は
-/// コマンド定数しか持たないのでここで局所定義する（im.rs はレーン C が触るため
+/// コマンド定数しか持たないのでここで局所定義する（`mat_controller::im` には
 /// 足さない）。
 const ATTR_CURRENT_FABRIC_INDEX: u32 = 0x0005;
 

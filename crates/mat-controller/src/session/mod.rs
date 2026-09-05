@@ -4,6 +4,13 @@
 //! RxWindow dedup — but seals every datagram with the session keys. Message
 //! counters and the replay window are session-scoped (not per exchange), so
 //! this type owns them and exchanges are just an `exchange_id` argument.
+//!
+//! Layout: this file holds the session type, its keys / error types and the
+//! constructors + accessors. The behaviour lives in one submodule per role:
+//! `mrp` (seal / open, dedup, acks, reliable send / recv), `client` (the
+//! controller-side IM ops: read / invoke / write), `responder` (device-side
+//! request intake and reliable replies, plus StatusResponse) and `subscribe`
+//! (the resident Subscribe handshake and report pump).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

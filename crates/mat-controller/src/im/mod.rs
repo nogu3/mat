@@ -340,7 +340,7 @@ pub use write::*;
 
 /// Reads the next element and requires it to be a struct start (every IM
 /// message is a top-level anonymous struct).
-pub(super) fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
+fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
     match r.next()?.ok_or(ImError::Malformed("empty payload"))?.value {
         Value::StructStart => Ok(()),
         _ => Err(ImError::Malformed("expected struct")),
@@ -352,14 +352,14 @@ pub(super) fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
 /// unknown tags/containers and additional report/response entries beyond
 /// the first (M2 only interprets a single attribute/command per message).
 /// Delegates to `tlv::skip_container`, restoring this module's error wording.
-pub(super) fn skip_container(r: &mut Reader) -> Result<(), ImError> {
+fn skip_container(r: &mut Reader) -> Result<(), ImError> {
     crate::tlv::skip_container(r).map_err(|e| match e {
         TlvError::Truncated => ImError::Malformed("truncated container"),
         other => ImError::from(other),
     })
 }
 
-pub(super) fn value_to_im(v: Value) -> Result<ImValue, ImError> {
+fn value_to_im(v: Value) -> Result<ImValue, ImError> {
     match v {
         Value::Bool(b) => Ok(ImValue::Bool(b)),
         Value::Uint(u) => Ok(ImValue::Uint(u)),
@@ -377,7 +377,7 @@ pub(super) fn value_to_im(v: Value) -> Result<ImValue, ImError> {
 /// Encodes an `ImValue` scalar as one standalone, well-formed TLV element
 /// (tag is discarded by the caller — `encode_write_request` immediately
 /// splices it via `Writer::put_raw_element`).
-pub(super) fn encode_im_value(value: &ImValue) -> Vec<u8> {
+fn encode_im_value(value: &ImValue) -> Vec<u8> {
     let mut w = Writer::new();
     match value {
         ImValue::Bool(b) => w.put_bool(Tag::Anonymous, *b),

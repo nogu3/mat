@@ -501,6 +501,13 @@ fn write_group(
 /// `add-keysets`（`SetKeySet` 相当）。既存 keyset_id があれば既存の
 /// チェーン内 next を保ったまま上書き、無ければ head 挿入（`first_keyset`
 /// を新 id に差し替え、旧 `first_keyset` を新エントリの next にする）。
+///
+/// 既存 keyset id への上書き（re-provision）は mat の 1 スロット形
+/// （policy 0 / slot 1 のみ）で作り直す — chip-tool `add-keysets` 由来の
+/// 複数 epoch keyset を同じ id で上書きすると残りスロットと policy は失われる
+/// （`unlink_keyset` はリンクだけ差し替えるので無損失）。鍵の「置換」として
+/// 意図的だが、無損失化するなら `keyset_with_next` と同型の slot-0 差し替え
+/// ヘルパを足すこと。
 fn write_keyset(
     txn: &mut KvsTxn,
     fabric_index: u8,
@@ -1473,5 +1480,44 @@ mod tests {
         // ctx7 が無い / 壊れた blob は None（呼び手が Corrupt にする）。
         assert!(keyset_with_next(&[0x15, 0x18], 1).is_none());
         assert!(keyset_with_next(&blob[..blob.len() - 3], 1).is_none());
+    }
+
+    #[test]
+    fn keyset_with_next_preserves_unknown_tags_order_and_nested_slots() {
+        // 外側 ctx7（チェーンの next）が先頭、ctx9 は未知の追加タグ、そして
+        // スロット内部にも ctx7（uint）と ctx8（struct）を紛れ込ませる —
+        // どちらも外側の chain-next ctx7 と取り違えてはいけない。
+        // `build` を両側で共有し、keyset_with_next の出力が「他の要素は
+        // 一切いじらず ctx7 だけを差し替えた」ことをバイト単位で確認する。
+        fn build(next: u16) -> Vec<u8> {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(7), u64::from(next)); // chain next（先頭）
+            w.put_uint(Tag::Context(9), 42); // 未知の追加タグ
+            w.put_uint(Tag::Context(1), 1); // policy
+            w.put_uint(Tag::Context(2), 1); // keys_count
+            w.start_array(Tag::Context(3));
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(4), 1);
+            w.put_uint(Tag::Context(5), 0x1111);
+            w.put_bytes(Tag::Context(6), &[0x31; 16]);
+            w.put_uint(Tag::Context(7), 99); // スロット内 ctx7（chain link ではない）
+            w.start_struct(Tag::Context(8)); // スロット内のネストしたコンテナ
+            w.put_uint(Tag::Context(0), 7);
+            w.end_container();
+            w.end_container(); // スロット struct
+            w.end_container(); // ctx3 array
+            w.end_container(); // outer struct
+            w.finish()
+        }
+
+        let blob = build(0x0BAD);
+        let result = keyset_with_next(&blob, 10).unwrap();
+        assert_eq!(result, build(10), "only outer ctx7 may change");
+        assert_eq!(keyset_next(&result), Some(10));
+        assert_eq!(
+            crate::kvs::parse_keyset_first_entry(&result, 2).unwrap(),
+            ([0x31; 16], Some(0x1111))
+        );
     }
 }

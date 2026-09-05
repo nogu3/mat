@@ -76,7 +76,7 @@ pub(super) fn open_from_controller(buf: &[u8]) -> (MessageHeader, ProtocolHeader
     crate::crypto::open_message(&I2R, buf, OUR_NODE).unwrap()
 }
 
-/// ReportData shaped like Task 8's `im.rs` test fixture: a single
+/// ReportData shaped like Task 8's `im/read.rs` test fixture: a single
 /// AttributeReportIB for onoff's `OnOff` bool attribute.
 pub(super) fn report_data_payload(value: bool, suppress: bool) -> Vec<u8> {
     use crate::tlv::{Tag, Writer};
@@ -103,7 +103,7 @@ pub(super) fn report_data_payload(value: bool, suppress: bool) -> Vec<u8> {
     w.finish()
 }
 
-/// InvokeResponse shaped like Task 8's `im.rs` test fixture: a single
+/// InvokeResponse shaped like Task 8's `im/invoke.rs` test fixture: a single
 /// successful InvokeResponseIB (status 0, no cluster status).
 pub(super) fn invoke_response_success_payload() -> Vec<u8> {
     use crate::tlv::{Tag, Writer};
@@ -126,7 +126,7 @@ pub(super) fn invoke_response_success_payload() -> Vec<u8> {
     w.finish()
 }
 
-/// InvokeResponse (error) shaped like Task 8's `im.rs` test fixture:
+/// InvokeResponse (error) shaped like Task 8's `im/invoke.rs` test fixture:
 /// CommandStatusIB carrying `StatusIB{0: status, 1: cluster_status}`.
 pub(super) fn invoke_response_error_payload(status: u8, cluster_status: Option<u8>) -> Vec<u8> {
     use crate::tlv::{Tag, Writer};
@@ -153,7 +153,7 @@ pub(super) fn invoke_response_error_payload(status: u8, cluster_status: Option<u
 }
 
 /// InvokeResponse carrying CommandFields (a data-returning command),
-/// shaped like Task 7's `im.rs` fixture: a single successful
+/// shaped like Task 7's `im/invoke.rs` fixture: a single successful
 /// InvokeResponseIB whose Command is a CommandDataIB with fields.
 pub(super) fn invoke_response_with_fields_payload() -> Vec<u8> {
     use crate::tlv::{Tag, Writer};
@@ -179,7 +179,7 @@ pub(super) fn invoke_response_with_fields_payload() -> Vec<u8> {
     w.finish()
 }
 
-/// WriteResponse shaped like Task 5's `im.rs` fixture
+/// WriteResponse shaped like Task 5's `im/write.rs` fixture
 /// (`decode_write_response_returns_first_status`): a single
 /// AttributeStatusIB with the given status.
 pub(super) fn write_response_payload(status: u8) -> Vec<u8> {

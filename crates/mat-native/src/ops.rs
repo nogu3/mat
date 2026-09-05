@@ -499,7 +499,7 @@ pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<
 }
 
 /// Groups cluster RemoveGroup（spec §1.3.7.4）/ GroupKeyManagement KeySetRemove
-/// （§11.2.8.3）。im.rs はレーン C が触るためここで局所定義する。
+/// （§11.2.8.3）。`mat_controller::im` には足さずここで局所定義する。
 pub const CMD_REMOVE_GROUP: u32 = 0x03;
 pub const CMD_KEY_SET_REMOVE: u32 = 0x03;
 /// RemoveGroupResponse.status の NOT_FOUND（グループ未登録 — 冪等に続行）。
