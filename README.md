@@ -128,8 +128,11 @@ provision` sets all four up), a `mat group invoke` sent to that group
 multicasts to the member endpoints. Keys and membership persist under
 `<store>/group_keys.json` / `groups.json`; replay protection is the spec's
 32-wide (fabric, source) counter window. Privacy-flagged groupcast (the form
-the chip SDK, chip-tool and Apple Home send) is decrypted the same way, and
-`KeySetRead` / `KeySetRemove` / `KeySetReadAllIndices` are served, so
+the chip SDK, chip-tool and Apple Home send) is decrypted the same way
+(derived from the SDK's `DeriveGroupPrivacyKey` / `BuildPrivacyNonce` /
+`AES_CTR_crypt` definitions; not yet verified against a real chip-SDK
+controller), and `KeySetRead` / `KeySetRemove` / `KeySetReadAllIndices` are
+served, so
 `mat group remove` fully tears a group down on `matv`. Membership rows of a
 `[[device]]` removed from `matv.toml` are pruned at startup (re-adding the
 device restores its endpoint, not its groups). Group-addressed Read/Write

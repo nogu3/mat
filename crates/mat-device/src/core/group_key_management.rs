@@ -11,7 +11,10 @@
 //! GroupKeyMap の参照行もカスケード削除）/ `KeySetReadAllIndices`（§11.2.8.5）も
 //! 実装済み。IPK = keyset 0 は `GroupKeyStore` には持たず（`FabricEntry` 側）、
 //! Read/ReadAllIndices では常在の仮想 keyset として応答し、Remove は
-//! INVALID_COMMAND で拒む。永続化は `with_persist` で `<store_dir>/group_keys.json`
+//! INVALID_COMMAND で拒む。keyset 0 は書き込みでも `GroupKeyStore` に入らない
+//! — `KeySetWrite(0)`（IPK rotation）は同じく INVALID_COMMAND で拒むので、
+//! `GroupKeyStore` が keyset 0 を保持している状態はこの実装ではサポート外。
+//! 永続化は `with_persist` で `<store_dir>/group_keys.json`
 //! （`net::store::FileGroupKeyStore`）に行う。
 use std::sync::{Arc, Mutex};
 
@@ -406,10 +409,12 @@ impl ClusterHandler for GroupKeyManagementHandler {
     /// `STATUS_UNSUPPORTED_ACCESS`。KeySetWrite のフィールドデコードは
     /// `decode_key_set_write_fields` — 構造的な TLV 破損は
     /// `STATUS_INVALID_COMMAND`、フィールド欠落・policy 不正・鍵長不正は
-    /// `STATUS_CONSTRAINT_ERROR`（設計メモ参照）。成功時は response
-    /// command なしの `STATUS_SUCCESS`。KeySetRead/Remove のフィールド
-    /// デコードは `decode_key_set_id` — 形不正・id 欠落は
-    /// `STATUS_INVALID_COMMAND`。
+    /// `STATUS_CONSTRAINT_ERROR`（設計メモ参照）。`keyset_id ==
+    /// IPK_KEY_SET_ID`（IPK rotation、この実装では未対応）も
+    /// `STATUS_INVALID_COMMAND`（`KeySetRemove(0)` と同じ裁定、モジュール
+    /// doc 参照）。成功時は response command なしの `STATUS_SUCCESS`。
+    /// KeySetRead/Remove のフィールドデコードは `decode_key_set_id` —
+    /// 形不正・id 欠落は `STATUS_INVALID_COMMAND`。
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
         if !matches!(
             command,
@@ -435,6 +440,9 @@ impl ClusterHandler for GroupKeyManagementHandler {
                             return InvokeReply::Status(im::STATUS_CONSTRAINT_ERROR);
                         }
                     };
+                if keyset_id == IPK_KEY_SET_ID {
+                    return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+                }
                 match self.store.upsert_keyset(
                     ctx.fabric_index,
                     keyset_id,
@@ -478,8 +486,8 @@ impl ClusterHandler for GroupKeyManagementHandler {
                     Err(status) => InvokeReply::Status(status),
                 }
             }
-            _ => {
-                // KeySetReadAllIndices: 引数は空 struct（読まない）。
+            CMD_KEY_SET_READ_ALL_INDICES => {
+                // 引数は空 struct（読まない）。
                 let mut ids = vec![IPK_KEY_SET_ID];
                 ids.extend(self.store.keyset_ids_for(ctx.fabric_index));
                 let mut w = Writer::new();
@@ -495,6 +503,7 @@ impl ClusterHandler for GroupKeyManagementHandler {
                     fields_tlv: w.finish(),
                 }
             }
+            _ => unreachable!("guarded by the matches! above"),
         }
     }
 
@@ -1073,6 +1082,23 @@ mod tests {
         assert!(store.keyset_exists(1, 42));
     }
 
+    #[test]
+    fn key_set_write_rejects_ipk_keyset_zero() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let fields = mat_controller::im::encode_key_set_write_fields(0, &[9u8; 16]);
+        assert_eq!(
+            h.invoke(im::CMD_KEY_SET_WRITE, &fields, &mut ctx),
+            InvokeReply::Status(im::STATUS_INVALID_COMMAND)
+        );
+        assert!(!store.keyset_exists(1, 0));
+        assert!(store.keyset_ids_for(1).is_empty());
+    }
+
     fn decode_u16_list_response(fields: &[u8]) -> Vec<u16> {
         let mut r = Reader::new(fields);
         assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
@@ -1438,6 +1464,9 @@ mod tests {
             store.append_map_entry(1, 11, 42);
             store.upsert_keyset(2, 9, [1u8; 16], 0).unwrap();
             store.purge_fabric(2);
+            store.upsert_keyset(3, 5, [2u8; 16], 0).unwrap();
+            store.replace_fabric_map(3, vec![(30, 5)]);
+            store.remove_keyset(3, 5).unwrap();
         }
         let store2 = GroupKeyStore::with_persist(Box::new(MemPersist(cell)));
         assert_eq!(
@@ -1451,6 +1480,8 @@ mod tests {
         );
         assert_eq!(store2.map_entries_for(1), vec![(10, 42), (11, 42)]);
         assert!(store2.map_entries_for(2).is_empty());
+        assert!(!store2.keyset_exists(3, 5));
+        assert!(store2.map_entries_for(3).is_empty());
     }
 
     struct FailingPersist;
