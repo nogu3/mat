@@ -12,7 +12,8 @@
 # group-key-map write + AddGroup + ACL write sequence actually lands on
 # matv) -> `mat group list`, asserting the provisioned group shows up in the
 # controller kvs -> `mat group remove` (asserting all four removal steps
-# landed on matv and the controller kvs is back to the IPK keyset only) ->
+# landed on matv and no groups or non-IPK keysets remain in the controller
+# kvs — keyset 0 itself may or may not be visible in that chain) ->
 # `mat group provision` again -> start `matd` against the same store, poll
 # `matd status` until its
 # resident wildcard Subscribe to node 1 reaches `state:"established"` ->
@@ -253,7 +254,7 @@ assert d["controller"]["group_removed"] is True, d
 '
 echo "==> PASS: mat group remove reached status=removed (ACL / RemoveGroup / group-key-map / KeySetRemove all landed on matv)" >&2
 
-echo "==> mat group list after remove (controller kvs: no groups, only the IPK keyset 0)" >&2
+echo "==> mat group list after remove (controller kvs: no groups, no non-IPK keysets remain (the IPK itself may or may not be visible in this chain))" >&2
 LIST_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat group list)"
 echo "$LIST_JSON" >&2
 printf '%s' "$LIST_JSON" | python3 -c '
