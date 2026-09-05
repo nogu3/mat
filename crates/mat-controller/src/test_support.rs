@@ -1,56 +1,45 @@
-//! Test-only CASE responder scaffold (mandatory quality gate, plan Task 6;
-//! extracted to a shared module by the warm-session-per-node-socket plan,
-//! Task 1). **Test-only**: gated behind the `test-responder` feature, never
-//! compiled into a production build — consumed only via `dev-dependencies`
-//! self-reference from this crate's own integration tests.
+//! Test-only CASE / PASE responders for the initiator-side handshake tests.
+//! **Test-only**: gated behind the `test-responder` feature, never compiled
+//! into a production build — consumed via the `dev-dependencies`
+//! self-reference from this crate's own integration tests and by the sibling
+//! crates' test builds.
+//!
+//! `responder_task` (CASE) drives `case_responder::CaseResponderCore` — the
+//! same pure state machine `mat-device`'s production responder wraps — so
+//! protocol/crypto correctness lives there (proven by its own unit tests and
+//! by `mat-device`'s `tests/case_establish.rs`). What stays hand-rolled here
+//! is only the raw-socket loop: unsecured framing, opcode filtering, MRP
+//! piggyback acks, and one secured IM read served after establishment. The
+//! value of the test is that the production *initiator* (`case::establish`)
+//! is exercised against that responder over a real socket
+//! (`tests/case_self_handshake.rs`).
 //!
 //! Its identity is fixture `node01_01` (NOC + private key) chaining through
 //! `ica01` to `root01`; the initiator is a fresh self-issued NOC that trusts
 //! the same `root01`. IPK and fabric id are shared across both sides (a CASE
 //! requirement) by parsing them from `node01_01`.
 //!
-//! **Migrated onto `case_responder::CaseResponderCore` (Task 10)**: this
-//! responder used to hand-roll the entire CASE protocol independently of
-//! `case::establish` (see git history for the prior doc comment's residual-
-//! risk analysis of that design). It now drives the same pure state machine
-//! `mat-device`'s production CASE responder wraps
-//! (`mat_device::core::case::CaseResponderCore`) — only the raw-socket
-//! transport loop below (recv/send framing, MRP piggyback acks) and the
-//! post-establishment secured IM read are still hand-rolled here;
-//! protocol/crypto correctness now lives in `case_responder`, proven by that
-//! module's own unit tests and by `mat-device`'s
-//! `tests/case_establish.rs` against the production initiator. What this
-//! test still independently exercises: raw datagram framing, and —
-//! critically — the production *initiator*'s (`case::establish`) agreement
-//! with `case_responder`, since this file is compiled into `mat-controller`
-//! itself and driven against that same crate's `case::establish` in
-//! `case_self_handshake.rs`.
-//!
-//! `pase_responder_task` (below) is the PASE counterpart and follows a
-//! narrower version of the pre-migration doctrine — see its own doc comment
-//! for why it reuses `spake2p`'s primitives directly instead of re-defining
-//! them.
+//! `pase_responder_task` (PASE) is the narrower counterpart — see its doc
+//! comment for the residual-risk note on reusing `spake2p`'s verifier.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use sha2::Sha256;
 
-use crate::case_responder::{CaseFabric, CaseOutput, CaseResponderCore};
+use crate::case_responder::{
+    CaseFabric, CaseOutput, CaseResponderCore, OPCODE_SIGMA1, OPCODE_SIGMA3,
+};
 use crate::cert::MatterCert;
 use crate::crypto::{open_message, seal_message};
 use crate::exchange::MrpConfig;
 use crate::im;
-use crate::message::{Destination, MessageHeader, ProtocolHeader};
+use crate::message::{Destination, MessageHeader, ProtocolHeader, OPCODE_STATUS_REPORT};
 use crate::tlv::{Tag, Writer};
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
 
-// CASE constants — mirror of the (crate-private) ones in `case.rs` /
-// `case_responder.rs`.
-const OPCODE_SIGMA1: u8 = 0x30;
-const OPCODE_SIGMA3: u8 = 0x32;
-const OPCODE_STATUS_REPORT: u8 = 0x40;
 const PROTO_SECURE_CHANNEL: u16 = 0x0000;
+/// spec §4.13.2.3 — mirror of the crate-private one in `pase.rs`.
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
 // Shared fabric material. IPK must be identical on both sides.
@@ -139,6 +128,94 @@ fn decode_unsecured(buf: &[u8]) -> Option<(ProtocolHeader, Vec<u8>)> {
     Some((p, buf[off + boff..].to_vec()))
 }
 
+/// Waits for the initiator's next *unsecured* message with `opcode` (skipping
+/// MRP retransmits, standalone acks, and anything else on the socket).
+/// Returns the protocol header, the app payload, the message counter (for
+/// the piggyback ack) and the source address.
+async fn recv_unsecured(
+    transport: &UdpTransport,
+    opcode: u8,
+) -> (ProtocolHeader, Vec<u8>, u32, SocketAddr) {
+    loop {
+        let (buf, from) = recv_dg(transport).await;
+        let Some((p, payload)) = decode_unsecured(&buf) else {
+            continue;
+        };
+        if p.opcode != opcode || !p.initiator {
+            continue;
+        }
+        let (h, _) = MessageHeader::decode(&buf).unwrap();
+        return (p, payload, h.message_counter, from);
+    }
+}
+
+/// The established session as seen from the responder, for
+/// [`serve_one_read`]. Nonce node ids differ per protocol: CASE opens the
+/// initiator's messages with the initiator's node id and seals replies with
+/// the responder's; PASE uses 0 for both (spec §4.13, unauthenticated).
+struct EstablishedSession<'a> {
+    our_session_id: u16,
+    peer_session_id: u16,
+    i2r: &'a [u8; 16],
+    r2i: &'a [u8; 16],
+    open_node_id: u64,
+    seal_node_id: u64,
+    message_counter: u32,
+}
+
+/// Serves exactly one secured IM ReadRequest on the established session with
+/// ReportData(on-off=false), piggybacking the ack for the request. Datagrams
+/// on other sessions (unsecured acks etc.) and anything that fails to open
+/// are skipped.
+async fn serve_one_read(
+    transport: &UdpTransport,
+    initiator_addr: SocketAddr,
+    s: EstablishedSession<'_>,
+) {
+    let (read_exchange, read_counter) = loop {
+        let (buf, _from) = recv_dg(transport).await;
+        let (mh, _) = match MessageHeader::decode(&buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if mh.session_id != s.our_session_id {
+            continue;
+        }
+        let (h, p, _payload) = match open_message(s.i2r, &buf, s.open_node_id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if p.protocol_id != im::PROTOCOL_ID_IM || p.opcode != im::OPCODE_READ_REQUEST {
+            continue;
+        }
+        break (p.exchange_id, h.message_counter);
+    };
+
+    let report = report_data_false_suppressed();
+    let header = MessageHeader {
+        session_id: s.peer_session_id, // seal toward the initiator's session
+        security_flags: 0,
+        message_counter: s.message_counter,
+        source_node_id: None,
+        destination: Destination::None,
+    };
+    let proto = ProtocolHeader {
+        initiator: false, // initiator opened this exchange; we are the responder of it
+        needs_ack: true,
+        acked_counter: Some(read_counter), // piggyback ack for the ReadRequest
+        opcode: im::OPCODE_REPORT_DATA,
+        exchange_id: read_exchange,
+        protocol_id: im::PROTOCOL_ID_IM,
+        vendor_id: None,
+    };
+    let report_dg =
+        seal_message(s.r2i, &header, &proto, &report, s.seal_node_id).expect("seal report data");
+    transport
+        .send_to(&report_dg, initiator_addr)
+        .await
+        .expect("send report data");
+}
+
 /// ReportData for onoff `OnOff` = false, `SuppressResponse` = true (so the
 /// initiator's `read_attribute` won't send a closing StatusResponse).
 fn report_data_false_suppressed() -> Vec<u8> {
@@ -204,126 +281,66 @@ pub async fn responder_task(
     let mut core = CaseResponderCore::new(vec![fabric], resp_session_id);
 
     // --- Sigma1 -> Sigma2 ---
-    let (sigma2_dg, initiator_addr) = loop {
-        let (buf, from) = recv_dg(&transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
-            continue;
-        };
-        if p.opcode != OPCODE_SIGMA1 || !p.initiator {
-            continue;
-        }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let CaseOutput::Reply(sigma2_payload, opcode) = core
-            .on_message(OPCODE_SIGMA1, &payload)
-            .expect("sigma1 handling failed")
-        else {
-            panic!("expected Reply after Sigma1");
-        };
-        break (
-            build_unsecured(
-                100,
-                opcode,
-                p.exchange_id,
-                Some(h.message_counter),
-                false,
-                &sigma2_payload,
-            ),
-            from,
-        );
+    let (p, payload, counter, initiator_addr) = recv_unsecured(&transport, OPCODE_SIGMA1).await;
+    let CaseOutput::Reply(sigma2_payload, opcode) = core
+        .on_message(OPCODE_SIGMA1, &payload)
+        .expect("sigma1 handling failed")
+    else {
+        panic!("expected Reply after Sigma1");
     };
+    let sigma2_dg = build_unsecured(
+        100,
+        opcode,
+        p.exchange_id,
+        Some(counter),
+        false,
+        &sigma2_payload,
+    );
     transport
         .send_to(&sigma2_dg, initiator_addr)
         .await
         .expect("send sigma2");
 
     // --- Sigma3 --- (skip retransmitted Sigma1 / standalone acks)
-    let (status_dg, keys, peer_session_id) = loop {
-        let (buf, _from) = recv_dg(&transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
-            continue;
-        };
-        if p.opcode != OPCODE_SIGMA3 {
-            continue;
-        }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let CaseOutput::Established {
-            reply,
-            opcode,
-            keys,
-            peer_session_id,
-            peer_node_id: _,
-            peer_cats: _,
-            fabric_index: _,
-        } = core
-            .on_message(OPCODE_SIGMA3, &payload)
-            .expect("sigma3 handling failed (S3K derivation / transcript / chain verification)")
-        else {
-            panic!("expected Established after Sigma3");
-        };
-        break (
-            build_unsecured(
-                101,
-                opcode,
-                p.exchange_id,
-                Some(h.message_counter),
-                false,
-                &reply,
-            ),
-            keys,
-            peer_session_id,
-        );
+    let (p, payload, counter, _) = recv_unsecured(&transport, OPCODE_SIGMA3).await;
+    let CaseOutput::Established {
+        reply,
+        opcode,
+        keys,
+        peer_session_id,
+        peer_node_id: _,
+        peer_cats: _,
+        fabric_index: _,
+    } = core
+        .on_message(OPCODE_SIGMA3, &payload)
+        .expect("sigma3 handling failed (S3K derivation / transcript / chain verification)")
+    else {
+        panic!("expected Established after Sigma3");
     };
+    let status_dg = build_unsecured(101, opcode, p.exchange_id, Some(counter), false, &reply);
     transport
         .send_to(&status_dg, initiator_addr)
         .await
         .expect("send status report");
 
     // --- Serve one secured IM ReadRequest with ReportData(on-off=false) ---
-    let (read_exchange, read_counter) = loop {
-        let (buf, _from) = recv_dg(&transport).await;
-        let (mh, _) = match MessageHeader::decode(&buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if mh.session_id != resp_session_id {
-            continue; // unsecured acks (session id 0) etc.
-        }
-        // Initiator sealed with i2r; nonce uses the initiator's node id.
-        let (h, p, _payload) = match open_message(&keys.i2r, &buf, initiator_node_id) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if p.protocol_id != im::PROTOCOL_ID_IM || p.opcode != im::OPCODE_READ_REQUEST {
-            continue;
-        }
-        break (p.exchange_id, h.message_counter);
-    };
-
-    let report = report_data_false_suppressed();
-    let header = MessageHeader {
-        session_id: peer_session_id, // seal toward the initiator's session
-        security_flags: 0,
-        message_counter: 1000,
-        source_node_id: None,
-        destination: Destination::None,
-    };
-    let proto = ProtocolHeader {
-        initiator: false, // initiator opened this exchange; we are the responder of it
-        needs_ack: true,
-        acked_counter: Some(read_counter), // piggyback ack for the ReadRequest
-        opcode: im::OPCODE_REPORT_DATA,
-        exchange_id: read_exchange,
-        protocol_id: im::PROTOCOL_ID_IM,
-        vendor_id: None,
-    };
+    // Initiator sealed with i2r; nonce uses the initiator's node id.
     // Responder→initiator messages are sealed with r2i; the nonce uses the
     // responder's node id (which the initiator passed to `establish`).
-    let report_dg = seal_message(&keys.r2i, &header, &proto, &report, responder_node_id)
-        .expect("seal report data");
-    transport
-        .send_to(&report_dg, initiator_addr)
-        .await
-        .expect("send report data");
+    serve_one_read(
+        &transport,
+        initiator_addr,
+        EstablishedSession {
+            our_session_id: resp_session_id,
+            peer_session_id,
+            i2r: &keys.i2r,
+            r2i: &keys.r2i,
+            open_node_id: initiator_node_id,
+            seal_node_id: responder_node_id,
+            message_counter: 1000,
+        },
+    )
+    .await;
     initiator_addr
 }
 
@@ -339,19 +356,17 @@ pub async fn responder_task(
 /// ReadRequest with ReportData(on-off=false). PASE sessions are
 /// unauthenticated: both nonce node ids are 0 (spec §4.13).
 ///
-/// RESIDUAL RISK — narrower than the CASE `responder_task` above: unlike
-/// that responder (which re-implements HKDF/ECDH by hand so both sides are
-/// fully independent), this one calls `spake2p::Spake2pVerifier` — the same
+/// RESIDUAL RISK: this responder calls `spake2p::Spake2pVerifier` — the same
 /// production verifier-role type the initiator's `Spake2pProver` is proven
-/// to agree with in `prover_and_verifier_agree` (`spake2p.rs`). So a defect
-/// *inside* `Spake2pVerifier`/`Spake2pProver`'s shared math or key schedule
-/// would affect both roles identically and stay invisible here. What this
-/// test DOES catch is PASE wire-protocol bugs: opcode/tag framing,
-/// PBKDFParamRequest/Response and Pake1/2/3 message layout, confirmation-
-/// direction (cA vs cB) wiring, and the session-key handoff into the
-/// secured IM exchange (those are asymmetric between initiator and
-/// responder) — it is not a substitute for the RFC 9383 test vectors
-/// (`rfc9383_p256_vector`) or on-wire interop for math-level bugs.
+/// to agree with in `prover_and_verifier_agree` (`spake2p.rs`) — so a defect
+/// *inside* their shared math or key schedule would affect both roles
+/// identically and stay invisible here (the CASE responder has the same
+/// shape via `CaseResponderCore`). What this test DOES catch is PASE
+/// wire-protocol bugs: opcode/tag framing, PBKDFParamRequest/Response and
+/// Pake1/2/3 message layout, confirmation-direction (cA vs cB) wiring, and
+/// the session-key handoff into the secured IM exchange — it is not a
+/// substitute for the RFC 9383 test vectors (`rfc9383_p256_vector`) or
+/// on-wire interop for math-level bugs.
 ///
 /// Returns the initiator's observed source `SocketAddr` (same contract as
 /// `responder_task`).
@@ -366,24 +381,12 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     const SALT: &[u8; 16] = b"SPAKE2P Key Salt";
 
     // --- PBKDFParamRequest ---
-    let (req_payload, req_exchange, req_counter, initiator_session_id, initiator_addr) = loop {
-        let (buf, from) = recv_dg(&transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
-            continue;
-        };
-        if p.opcode != OPCODE_PBKDF_PARAM_REQUEST || !p.initiator {
-            continue;
-        }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let req = pase::decode_pbkdf_param_request(&payload).expect("pbkdf request malformed");
-        break (
-            payload,
-            p.exchange_id,
-            h.message_counter,
-            req.initiator_session_id,
-            from,
-        );
-    };
+    let (p, req_payload, req_counter, initiator_addr) =
+        recv_unsecured(&transport, OPCODE_PBKDF_PARAM_REQUEST).await;
+    let req_exchange = p.exchange_id;
+    let initiator_session_id = pase::decode_pbkdf_param_request(&req_payload)
+        .expect("pbkdf request malformed")
+        .initiator_session_id;
 
     // Fixed (not randomized like CASE's `responder_task`): this responder
     // serves exactly one self-contained test run, so a collision-checked
@@ -414,19 +417,10 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     // --- PAKE context（spec §4.13.1.2、pase.rs と同じ構成）---
     let context = pase::pake_context(&req_payload, &resp_payload);
 
-    // --- Pake1 ---
-    let (p_a, pake1_exchange, pake1_counter) = loop {
-        let (buf, _from) = recv_dg(&transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
-            continue;
-        };
-        if p.opcode != OPCODE_PASE_PAKE1 {
-            continue; // PBKDFParamRequest の MRP 再送などは無視
-        }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let pa = pase::decode_pake1(&payload).expect("pake1 malformed");
-        break (pa, p.exchange_id, h.message_counter);
-    };
+    // --- Pake1 ---（PBKDFParamRequest の MRP 再送などは recv_unsecured が無視）
+    let (p, payload, pake1_counter, _) = recv_unsecured(&transport, OPCODE_PASE_PAKE1).await;
+    let pake1_exchange = p.exchange_id;
+    let p_a = pase::decode_pake1(&payload).expect("pake1 malformed");
 
     // --- SPAKE2+ verifier 計算 ---
     let verifier = spake2p::Spake2pVerifier::from_passcode(passcode, SALT, ITERATIONS);
@@ -454,18 +448,9 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         .expect("send pake2");
 
     // --- Pake3（cA 検証）---
-    let (c_a, pake3_exchange, pake3_counter) = loop {
-        let (buf, _from) = recv_dg(&transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
-            continue;
-        };
-        if p.opcode != OPCODE_PASE_PAKE3 {
-            continue;
-        }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
-        let ca = pase::decode_pake3(&payload).expect("pake3 malformed");
-        break (ca, p.exchange_id, h.message_counter);
-    };
+    let (p, payload, pake3_counter, _) = recv_unsecured(&transport, OPCODE_PASE_PAKE3).await;
+    let pake3_exchange = p.exchange_id;
+    let c_a = pase::decode_pake3(&payload).expect("pake3 malformed");
     assert_eq!(c_a, expected_c_a, "initiator cA mismatch (transcript bug?)");
 
     // --- StatusReport(success) ---
@@ -489,46 +474,19 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     let r2i: [u8; 16] = okm[16..32].try_into().unwrap();
 
     // --- Serve one secured IM ReadRequest（PASE は両側 node id 0）---
-    let (read_exchange, read_counter) = loop {
-        let (buf, _from) = recv_dg(&transport).await;
-        let (mh, _) = match MessageHeader::decode(&buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if mh.session_id != resp_session_id {
-            continue;
-        }
-        let (h, p, _payload) = match open_message(&i2r, &buf, 0) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if p.protocol_id != im::PROTOCOL_ID_IM || p.opcode != im::OPCODE_READ_REQUEST {
-            continue;
-        }
-        break (p.exchange_id, h.message_counter);
-    };
-
-    let report = report_data_false_suppressed();
-    let header = MessageHeader {
-        session_id: initiator_session_id,
-        security_flags: 0,
-        message_counter: 2000,
-        source_node_id: None,
-        destination: Destination::None,
-    };
-    let proto = ProtocolHeader {
-        initiator: false,
-        needs_ack: true,
-        acked_counter: Some(read_counter),
-        opcode: im::OPCODE_REPORT_DATA,
-        exchange_id: read_exchange,
-        protocol_id: im::PROTOCOL_ID_IM,
-        vendor_id: None,
-    };
-    let report_dg = seal_message(&r2i, &header, &proto, &report, 0).expect("seal report data");
-    transport
-        .send_to(&report_dg, initiator_addr)
-        .await
-        .expect("send report data");
+    serve_one_read(
+        &transport,
+        initiator_addr,
+        EstablishedSession {
+            our_session_id: resp_session_id,
+            peer_session_id: initiator_session_id,
+            i2r: &i2r,
+            r2i: &r2i,
+            open_node_id: 0,
+            seal_node_id: 0,
+            message_counter: 2000,
+        },
+    )
+    .await;
     initiator_addr
 }
