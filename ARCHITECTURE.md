@@ -689,7 +689,7 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
   - **M8a（本節、0.18.0）— 汎用 IM native 化**。
   - **M8b（0.19.0）— discover native 化**: mDNS browse
     （`_matter._tcp` operational + `_matterc._udp` commissionable）+ probe
-    reachability。既存 `dnssd.rs`（operational 解決）の browse 拡張。
+    reachability。既存 `dnssd/`（operational 解決）の browse 拡張。
     **実装済み**: (1) **dnssd browse**（`mat-controller::dnssd`）: one-shot
     legacy unicast mDNS で `_matterc._udp`（commissionable）/ `_matter._tcp`
     （operational）の PTR を列挙し、instance ごとに SRV/TXT/AAAA を畳み込む。
@@ -1140,7 +1140,7 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   メモリ上のみで、matd 再起動で消え、起動時に commissioned 全ノードへの
   wildcard 再購読からやり直す。
 - **v1 スコープ外（将来）**: EventReport 受信（Generic Switch 等のボタン、
-  im.rs の EventRequests/EventReportIB デコード追加で載る設計余地は確保
+  `im/read.rs` の EventRequests/EventReportIB デコード追加で載る設計余地は確保
   済み）、`DataVersionFilter`、LIT ICD 対応（ICDManagement register-client +
   check-in 受信、対象は常時給電 + SIT sleepy まで）、`<store>/subscriptions.toml`
   （対象ノード/パスの絞り込み — 無ければ v1 既定どおり全ノード、aliases.toml

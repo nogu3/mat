@@ -808,3 +808,13 @@ EOF
 - **Spec coverage**: im → read / write / invoke / subscribe / cmdfields / json（Task 1・2）、session 4 役（Task 3）、dnssd cache（Task 4）、pub API 最小変更 + `task semver` 棚卸し（Task 5）。実機スモーク（hogar-matd）は plan 外で親セッションが行う。
 - **Placeholder scan**: 各ステップは切り出し範囲（関数名・行番号）・先頭 `use`・検証コマンド・期待値を持つ。行番号は「タスク開始時点」のものであり、切り出し後にずれるので **関数名を正**とする旨を各所に明記。
 - **Type consistency**: `pub(super)` に上げる名前（`expect_struct_start` / `skip_container` / `value_to_im` / `encode_im_value` / `decode_attribute_path_ib` / `AttributePathFields` / `decode_attribute_requests`）は Task 1 の Produces と Task 2 の Consumes で一致。session の行き先メソッド一覧は Step 2 と各ファイルのコメントで一致。
+
+## 実測記録（2026-09-05）
+
+- im: `im.rs` 3,743 行 → `mod.rs` 461 / `json.rs` 128 / `read.rs` 1,354 / `subscribe.rs` 350 / `cmdfields.rs` 220 / `invoke.rs` 973 / `write.rs` 357（合計 3,843 行）
+- session: `session.rs` 4,228 行 → `mod.rs` 253 / `mrp.rs` 657 / `client.rs` 1,233 / `responder.rs` 835 / `subscribe.rs` 1,017 / `test_util.rs` 351（合計 4,346 行）
+- dnssd: `dnssd.rs` 3,059 行 → `mod.rs` 2,362 / `cache.rs` 727（合計 3,089 行）
+- テスト名多重集合: 475 = 475（SAME）— `cargo test -p mat-controller --lib -- --list` の関数名を抽出・`sort` した現在値と `tests-before.txt`（分割開始前に採取、475 行）を `diff` して差分ゼロを確認
+- `task check`: `exit=0`、`FAILED|^error|^warning|task: Failed` の grep 出力なし
+- `cargo semver-checks check-release -p mat-controller --baseline-rev 6ba0aab --default-features`: `Summary no semver update required`（223 checks: 223 pass, 31 skip）— 分割前後で mat-controller の公開 API は不変
+- `task semver`（crates.io 1.31.0 基準、棚卸し）: mat-controller = no semver update required／mat-core = **1 major break**（`enum_missing`: pub enum removed or renamed、Task 1 より前のコミットでの `ScalarValue` → `ArgValue` 改名によるもの、想定内）／mat-device = no semver update required／mat-native = **1 major break**（`function_missing`: pub fn removed or renamed、`scalar_to_im` 削除によるもの、想定内）／matd = no semver update required（`mat` / `matv` はバイナリのみで semver-checks の対象外）
