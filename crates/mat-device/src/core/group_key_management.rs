@@ -36,7 +36,7 @@ const MAX_GROUPS_PER_FABRIC: u64 = 16;
 const MAX_GROUP_KEYS_PER_FABRIC: usize = 1;
 
 /// GroupKeyManagement のコマンド id（spec §11.2.8）。`mat_controller::im` は
-/// `CMD_KEY_SET_WRITE` しか持たず、im.rs は他レーンの編集領域なのでここで
+/// `CMD_KEY_SET_WRITE` しか持たず、`mat_controller::im` は他レーンの編集領域なのでここで
 /// 局所定義する（`mat-native/src/ops.rs` の `CMD_KEY_SET_REMOVE` と同じ裁定）。
 pub const CMD_KEY_SET_READ: u32 = 0x01;
 pub const RESP_KEY_SET_READ: u32 = 0x02;
@@ -531,7 +531,8 @@ impl ClusterHandler for GroupKeyManagementHandler {
     /// `STATUS_CONSTRAINT_ERROR` — 存在しない keyset への参照を弾く。wire
     /// 形の `fabricIndex`（254）は無視し、常に `ctx.fabric_index` を使う
     /// （`decode_group_key_map_entries`/`decode_single_group_key_map_entry`
-    /// はそもそも 254 を読まない — クライアント実装 `im.rs:1373` の
+    /// はそもそも 254 を読まない — クライアント実装
+    /// `mat_controller::im::cmdfields::encode_group_key_map_tlv` の
     /// コメントどおり、書く側もこのフィールドを送らない）。
     fn write(
         &mut self,

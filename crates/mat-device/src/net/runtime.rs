@@ -1983,7 +1983,7 @@ fn is_status_response_ok(msg: &mat_controller::exchange::IncomingMessage) -> boo
 /// (Task 6), bypassing `Node::handle_im`/`handle_read` (which only ever
 /// return a single message) entirely. Mirrors `SecureSession::
 /// subscribe_wildcard`'s priming-report chunk loop on the *initiator* side
-/// (`crates/mat-controller/src/session.rs`, around line 1329): every chunk
+/// (`mat_controller::session::subscribe::subscribe_wildcard`): every chunk
 /// but the last is sent `more_chunks=true, suppress_response=false` and
 /// this side then waits for the peer's `StatusResponse(0)` on the same
 /// exchange before sending the next one; the last chunk is sent
@@ -2715,8 +2715,8 @@ mod tests {
     /// job is only proving the runtime's send-chunk/await-StatusResponse
     /// loop actually round-trips over real sockets — the initiator-side
     /// counterpart to what `SecureSession::subscribe_wildcard`'s priming
-    /// loop already exercises from the other end (`session.rs`, around
-    /// line 1329).
+    /// loop already exercises from the other end
+    /// (`mat_controller::session::subscribe::subscribe_wildcard`).
     #[tokio::test]
     async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
         use mat_controller::crypto::{open_message, seal_message};
