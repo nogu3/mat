@@ -229,11 +229,13 @@ mat fabric rotate-ipk [--nodes <N>...] [--catch-up | --abort]
   （既存の `--nodes` と同じ `resolve` 経路）。省略時は台帳 `Store::nodes()` の
   全ノード（node_id 昇順）。指定時は各 id を `require_node`（exit 11）。
 - `fabric init` / `list` と違いネットワークに触るので、main.rs の早期 dispatch
-  には入れず、iface 解決後の**直経路専用**（`commission` / `unpair` と同じ位置、
-  `--matd` は無視して warn — matd プロトコルには載せない）。
+  には入れず、iface 解決後の**直経路専用**（`commission` / `unpair` と同じ位置:
+  自動検出は黙って直経路、明示 `--matd` は exit 2 — matd プロトコルには載せない）。
 - `--op-timeout-ms` は per-node 予算として渡す。
 - `commands/fabric.rs::run_rotate_ipk(store_path, native_cfg, params)` が
   `mat_native::rotate_ipk::run` を tokio current_thread で回し、body を emit。
+  body の組み立ては `rotate_ipk::RotateOutcome::body`（mat-native 側、
+  `mat-core::body` は触らない）。
 - `fabric list` の各行に `"ipk_rotation_pending": bool` を追加（`ipk-epoch-next`
   の有無）。
 
