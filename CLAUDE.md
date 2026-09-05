@@ -116,10 +116,10 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
 - `matd`-only ops vs direct-only ops: `discover` / `commission` / `unpair` /
   `fabric init` / `open-window` / `diag` / `group grant` / `group remove` /
   `fabric rotate-ipk` are never part of the `matd` socket protocol — they
-  always run on `mat`'s own one-shot direct path. `fabric list` / `group
-  list` are local-only KVS reads
-  dispatched before route selection (no network, no daemon), so `--matd` is
-  ignored there rather than exit `2`. `listen` is the opposite case and the
+  always run on `mat`'s own one-shot direct path. `fabric list` /
+  `group list` are local-only KVS reads dispatched before route selection
+  (no network, no daemon), so `--matd` is ignored there rather than exit
+  `2`. `listen` is the opposite case and the
   first of its kind: it is **matd-only**, with no direct-path fallback at all
   (subscriptions need a resident daemon). See docs/commands.md ("Routing
   through matd") for the exact op list.

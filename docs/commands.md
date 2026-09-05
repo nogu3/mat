@@ -143,7 +143,8 @@ mat fabric list
   "store": "/home/you/.config/mat",
   "fabrics": [
     { "fabric_index": 1, "fabric_id": 1, "admin_node_id": 112233,
-      "compressed_fabric_id": "AAAAAAAAAAAAAAAA", "ipk_epoch": "mat", "current": true }
+      "compressed_fabric_id": "AAAAAAAAAAAAAAAA", "ipk_epoch": "mat",
+      "ipk_rotation_pending": false, "current": true }
   ]
 }
 ```
@@ -152,6 +153,9 @@ mat fabric list
   bootstrapped by `fabric init` (random epoch, recorded as
   `mat/f/<idx>/ipk-epoch`), `"chip-tool"` for a fabric created by `chip-tool`
   whose fixed epoch `mat` verified and adopted.
+- `ipk_rotation_pending` is `true` while a `fabric rotate-ipk` is pending (new
+  epoch persisted, controller not yet switched — see IPK rotation below);
+  `rotate-ipk --abort` clears it.
 - `current` marks the index this invocation would use for device ops
   (`--fabric-index` / `MAT_FABRIC_INDEX`, default `1`).
 - Local only, like `fabric init`: it is dispatched before route selection, so
@@ -1148,12 +1152,11 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   `discover` / `commission` / `unpair` / `fabric init` / `open-window` / `diag`
   / `fabric rotate-ipk` are direct-only: auto-detection skips them silently;
   explicit `--matd` exits `2`. `fabric list` and `group list` are neither:
-  they are pure local KVS reads
-  dispatched **before** route selection, so no daemon is contacted and `--matd`
-  is simply ignored (not exit `2`). `listen` (below) is the opposite case — it
-  is **matd-only**, with no direct-path fallback at all (not even auto-detect
-  skip-and-run-direct); without a reachable `matd` it is `matd_unavailable`
-  (exit `13`).
+  they are pure local KVS reads dispatched **before** route selection, so no
+  daemon is contacted and `--matd` is simply ignored (not exit `2`). `listen`
+  (below) is the opposite case — it is **matd-only**, with no direct-path
+  fallback at all (not even auto-detect skip-and-run-direct); without a
+  reachable `matd` it is `matd_unavailable` (exit `13`).
 - **Version skew: a new `mat` against an older `matd` (≤ 1.30.0).** Two of the
   additions extend the socket protocol, so an older daemon does not understand
   them. A cluster-wildcard `read` (`--attribute` omitted) is rejected by the old
