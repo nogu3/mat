@@ -12,9 +12,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use super::codec::{encode_query, parse_message, txt_u32, RData, Record};
 use super::{
-    bind_mdns_socket, encode_query, is_link_local, parse_message, txt_u32, RData, Record,
-    ResolvedNode, MDNS_GROUP, MDNS_PORT, TYPE_SRV, TYPE_TXT,
+    bind_mdns_socket, is_link_local, ResolvedNode, MDNS_GROUP, MDNS_PORT, TYPE_SRV, TYPE_TXT,
 };
 
 /// キャッシュ上限（偽装 flood でメモリを伸ばさない — MAX_INSTANCES と同思想）。
@@ -306,8 +306,11 @@ pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCach
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssd::tests::{synth_aaaa_class, synth_commissionable_response, synth_response};
-    use crate::dnssd::{iface_index, push_name, CLASS_IN};
+    use crate::dnssd::codec::push_name;
+    use crate::dnssd::test_util::{
+        synth_aaaa_class, synth_commissionable_response, synth_response,
+    };
+    use crate::dnssd::{iface_index, CLASS_IN};
     use std::net::Ipv6Addr;
     use std::time::Duration;
 
