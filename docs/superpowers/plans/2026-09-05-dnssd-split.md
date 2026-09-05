@@ -451,3 +451,16 @@ Claude-Session: https://claude.ai/code/session_01YVMF7oEDFkVZcQQSRNgxLQ"
 - **Spec coverage**: コーデック（Task 1）/ one-shot 解決（Task 2）/ browse（Task 3）の 3 分割、挙動不変（Global Constraints + 各タスクの「そのまま移す」）、pub API 不変（`pub use` glob + Task 4 の semver-checks と名前一覧比較）、unit テスト全維持（テスト名多重集合 476 / dnssd 47 を各タスクで比較）。実機テスト（hogar-matd コンテナ内の直経路 read = mDNS resolve 経路、matd 経由 read = cache 経路）は plan 外で親セッションが行う。
 - **Placeholder scan**: 行番号は分割前の実測。各タスクは「内容で切る」と明記してあるので、前タスクで行番号がずれても成立する。
 - **Type consistency**: `codec` の `pub(super)` 項目名は Task 1 の Produces と Task 2/3 の `use super::codec::{...}` で一致。`test_util` の 6 ヘルパ名は Task 1 Produces と Task 2/3/cache.rs の `use` で一致。
+
+## 実測記録（2026-09-05）
+
+- `dnssd/mod.rs` 2,362 行 → `mod.rs` 332 / `codec.rs` 721 / `resolve.rs` 569 / `browse.rs` 609 / `test_util.rs` 220（`cache.rs` は 727→730、import 差し替えのみで内容は不変、合計 3,181 行）
+- mat-controller lib テスト 476（うち dnssd 47）不変
+- `cargo semver-checks -p mat-controller --baseline-rev 324fb10 --default-features`:
+  ```
+  Checked [   0.018s] 223 checks: 223 pass, 31 skip
+  Summary no semver update required
+  Finished [  15.123s] mat-controller
+  ```
+- 公開項目名一覧（`^pub (async fn|fn|struct|enum|const) `）: 分割前後で `diff` = 差分なし（`SAME`、11 件）
+- `task check`（fmt:check + clippy -D warnings + test）: 緑（476 lib tests 含め全 green、doc-tests 含む）
