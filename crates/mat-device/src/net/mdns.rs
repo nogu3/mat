@@ -42,8 +42,8 @@ const RECV_BUF: usize = 9000;
 ///
 /// Mirrors `mat_controller::dnssd::bind_mdns_socket` exactly on the
 /// reuse-flag choice: `SO_REUSEADDR` only, deliberately **not**
-/// `SO_REUSEPORT`. `dnssd.rs`'s doc comment (lines 135-148) records the
-/// reason, and it applies here just as much as to the querier: on Linux,
+/// `SO_REUSEPORT`. That function's doc comment records the reason, and it
+/// applies here just as much as to the querier: on Linux,
 /// `SO_REUSEPORT` puts same-port sockets into a load-balancing group that
 /// hashes *each* incoming datagram — multicast included — to a single
 /// member. A responder sharing port 5353 with a system mDNS daemon (avahi,

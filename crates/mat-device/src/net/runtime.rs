@@ -224,8 +224,8 @@ const COMMISSIONING_WINDOW_DURATION: Duration = Duration::from_secs(15 * 60);
 /// Whether new PASE attempts are currently admitted (Task 14), and — once
 /// opened by the Administrator Commissioning cluster (Task 4) — what
 /// verifier material/discriminator that admission should use instead of the
-/// boot passcode. Boot-time policy (decided once in `run`, before the loop
-/// starts): `Open` if `comm_server.fabrics()` is empty (a never-
+/// boot passcode. Boot-time policy (decided once in `boot`, before
+/// `serve_forever`'s loop starts): `Open` if `comm_server.fabrics()` is empty (a never-
 /// commissioned, or freshly wiped, device), `Closed` if any fabric is
 /// already installed (this device was commissioned in a previous run; a
 /// fresh commissioner has no business PASE-ing into it again *until* an
@@ -418,8 +418,8 @@ fn admin_window_action(
 /// or `DropSession` (Task 6: a `RemoveFabric` this dispatch removed the
 /// invoking session's own fabric — spec §2.5.11, removing a fabric SHALL
 /// terminate any session associated with it). Propagated back up through
-/// `drain_buffered_requests`/`serve_secured` to `run`'s loop, which is the
-/// only place that actually owns `current_session` and can set it to
+/// `drain_buffered_requests`/`serve_secured` to `on_secured_datagram`, which
+/// is the only place that actually owns `current_session` and can set it to
 /// `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeOutcome {
@@ -430,7 +430,7 @@ enum ServeOutcome {
 /// Whether a `RemoveFabric` that just removed `removed_fabric_index` from
 /// the store should end the current secured session — true iff the
 /// removed fabric is the one `session_fabric_index` (this session's own,
-/// carried alongside `SecureSession` in `run`'s `current_session`)
+/// carried alongside `SecureSession` in `Runtime`'s `current_session`)
 /// authenticated against. Extracted as a pure function (mirrors
 /// `admin_window_action` above) so this one-line decision has a unit test
 /// that doesn't need a socket harness — `serve_secured_message`'s
@@ -710,398 +710,578 @@ pub(crate) async fn run(
     transport: Arc<Transport>,
     local_addr: SocketAddr,
     config: DeviceConfig,
-    mut node: Node,
+    node: Node,
     comm_server: CommissioningServer,
-    mut group: GroupRx,
+    group: GroupRx,
 ) -> Result<(), DeviceError> {
-    let port = local_addr.port();
-    // A fresh random PASE salt each boot (spec §3.9 permits any salt; a
-    // fixed one is weak against a precomputed rainbow table across every
-    // device running this firmware). Generated once here and reused for
-    // every PASE attempt this run serves — it only needs to be consistent
-    // within one handshake (it round-trips to the peer in
-    // PBKDFParamResponse), not secret or per-attempt.
-    let mut pase_salt = [0u8; 16];
-    getrandom::getrandom(&mut pase_salt).expect("os rng");
-    // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
-    // doc comment): open only for a device with no fabric yet — one already
-    // on disk means this device was commissioned in an earlier run, so a
-    // fresh PASE attempt now has no business succeeding. Decided *before*
-    // the first `bring_up_mdns` call (fix round 1, review item 1) — that
-    // call needs `window.is_open()` to know whether to publish a
-    // commissionable advert at all.
-    let mut window = if comm_server.fabrics().is_empty() {
-        CommissioningWindow::Open {
-            until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+    Runtime::boot(transport, local_addr, config, node, comm_server, group)
+        .await
+        .serve_forever()
+        .await
+}
+
+/// The node-side state every secured message may touch, owned here and
+/// lent out as a `ServeState` (the borrowed view `serve_secured`/
+/// `serve_secured_message` take) via `serve_state`. Kept as its own struct
+/// rather than flattened into `Runtime` so a `Runtime` method can borrow
+/// `self.current_session` mutably *and* build a `ServeState` from
+/// `self.state` in the same expression — disjoint fields, so the borrow
+/// checker allows it; a `serve_state(&mut self)` on `Runtime` itself would
+/// borrow all of `Runtime` and conflict with the session borrow.
+struct NodeState {
+    node: Node,
+    comm_server: CommissioningServer,
+    /// `None` while `bring_up_mdns` hasn't succeeded (see `run`'s doc).
+    mdns: Option<MdnsCtx>,
+    /// The node's single active subscription (spec §8.10, Task 12). Tied to
+    /// the session that created it: a new PASE/CASE session drops it
+    /// (`Runtime::install_session`), since its reports could only ever go
+    /// out over the session it was subscribed on.
+    subscription: Option<ActiveSubscription>,
+    window: CommissioningWindow,
+    config: DeviceConfig,
+}
+
+impl NodeState {
+    /// The `ServeState` view of this state — what one secured message (or
+    /// one drained buffered request) is allowed to touch.
+    fn serve_state(&mut self) -> ServeState<'_> {
+        ServeState {
+            node: &mut self.node,
+            comm_server: &self.comm_server,
+            mdns: self.mdns.as_ref(),
+            subscription: &mut self.subscription,
+            window: &mut self.window,
+            config: &self.config,
         }
-    } else {
-        CommissioningWindow::Closed
-    };
-    let mut mdns_ctx: Option<MdnsCtx> = None;
-    let mut mdns_retry: Option<MdnsRetry> = None;
-    match bring_up_mdns(&config, port, &comm_server, &window).await {
-        Ok(ctx) => mdns_ctx = Some(ctx),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                iface = %config.iface,
-                "mDNS advertiser did not come up — device still serves PASE/CASE/IM to peers that already have its address; retrying in the background"
-            );
-            mdns_retry = Some(MdnsRetry::new());
+    }
+}
+
+/// Everything `serve_forever`'s loop carries between iterations, so the
+/// per-branch handlers (`on_*`) can be plain methods instead of one
+/// 400-line `select!` body. Built once by `boot`, driven forever by
+/// `serve_forever`.
+struct Runtime {
+    transport: Arc<Transport>,
+    port: u16,
+    /// A fresh random PASE salt each boot — see `boot`.
+    pase_salt: [u8; 16],
+    mdns_retry: Option<MdnsRetry>,
+    /// The current secured session: `(local_session_id, session,
+    /// fabric_index)`. Third element: the session's fabric index (spec
+    /// §7.9) — `0` for PASE (no fabric yet), the CASE-selected fabric
+    /// otherwise. Carried through to every `ReadRequest` this session
+    /// serves via `ReadCtx` (`serve_secured`/`serve_secured_message`), so
+    /// e.g. Operational Credentials' `CurrentFabricIndex` reflects the
+    /// reading session, not a hardcoded value.
+    current_session: Option<(u16, SecureSession, u8)>,
+    replay: GroupReplayGuard,
+    group: GroupRx,
+    state: NodeState,
+}
+
+impl Runtime {
+    /// Boot-time setup: the PASE salt, the commissioning window's boot
+    /// policy, and the first (best-effort) `bring_up_mdns` attempt.
+    async fn boot(
+        transport: Arc<Transport>,
+        local_addr: SocketAddr,
+        config: DeviceConfig,
+        node: Node,
+        comm_server: CommissioningServer,
+        group: GroupRx,
+    ) -> Self {
+        let port = local_addr.port();
+        // A fresh random PASE salt each boot (spec §3.9 permits any salt; a
+        // fixed one is weak against a precomputed rainbow table across every
+        // device running this firmware). Generated once here and reused for
+        // every PASE attempt this run serves — it only needs to be consistent
+        // within one handshake (it round-trips to the peer in
+        // PBKDFParamResponse), not secret or per-attempt.
+        let mut pase_salt = [0u8; 16];
+        getrandom::getrandom(&mut pase_salt).expect("os rng");
+        // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
+        // doc comment): open only for a device with no fabric yet — one already
+        // on disk means this device was commissioned in an earlier run, so a
+        // fresh PASE attempt now has no business succeeding. Decided *before*
+        // the first `bring_up_mdns` call (fix round 1, review item 1) — that
+        // call needs `window.is_open()` to know whether to publish a
+        // commissionable advert at all.
+        let window = if comm_server.fabrics().is_empty() {
+            CommissioningWindow::Open {
+                until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
+            }
+        } else {
+            CommissioningWindow::Closed
+        };
+        let mut mdns_ctx: Option<MdnsCtx> = None;
+        let mut mdns_retry: Option<MdnsRetry> = None;
+        match bring_up_mdns(&config, port, &comm_server, &window).await {
+            Ok(ctx) => mdns_ctx = Some(ctx),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    iface = %config.iface,
+                    "mDNS advertiser did not come up — device still serves PASE/CASE/IM to peers that already have its address; retrying in the background"
+                );
+                mdns_retry = Some(MdnsRetry::new());
+            }
+        }
+        Self {
+            transport,
+            port,
+            pase_salt,
+            mdns_retry,
+            current_session: None,
+            replay: GroupReplayGuard::new(),
+            group,
+            state: NodeState {
+                node,
+                comm_server,
+                mdns: mdns_ctx,
+                subscription: None,
+                window,
+                config,
+            },
         }
     }
 
-    // Third tuple element: the session's fabric index (spec §7.9) — `0` for
-    // PASE (no fabric yet), the CASE-selected fabric otherwise. Carried
-    // through to every `ReadRequest` this session serves via `ReadCtx`
-    // (`serve_secured`/`serve_secured_message`), so e.g. Operational
-    // Credentials' `CurrentFabricIndex` reflects the reading session, not a
-    // hardcoded value.
-    let mut current_session: Option<(u16, SecureSession, u8)> = None;
-    // The node's single active subscription (spec §8.10, Task 12). Tied to
-    // the session that created it: a new PASE/CASE session below drops it,
-    // since its reports could only ever go out over the session it was
-    // subscribed on.
-    let mut subscription: Option<ActiveSubscription> = None;
-    let mut buf = [0u8; MAX_DATAGRAM];
-    let mut replay = GroupReplayGuard::new();
-    let mut gbuf = [0u8; MAX_DATAGRAM];
-    loop {
-        sync_group_joins(&mut group, &comm_server);
-        tokio::select! {
-            recv = transport.recv_from(&mut buf) => {
-                let (n, peer) = match recv {
-                    Ok(v) => v,
-                    Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
-                };
-                let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-                    tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
-                    continue;
-                };
-                if header.security_flags & SESSION_TYPE_MASK != 0 {
-                    tracing::debug!(peer = %peer, security_flags = header.security_flags, "group-session datagram on the unicast socket dropped (the group socket serves those)");
-                    continue;
+    /// The receive loop: `sync_group_joins` then one `select!` over the
+    /// unicast socket, the mDNS retry timer, the subscription report
+    /// deadline, the commissioning-window deadline, the fail-safe deadline,
+    /// and the group socket. Never returns on its own (`run`'s doc).
+    async fn serve_forever(&mut self) -> Result<(), DeviceError> {
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let mut gbuf = [0u8; MAX_DATAGRAM];
+        loop {
+            sync_group_joins(&mut self.group, &self.state.comm_server);
+            tokio::select! {
+                recv = self.transport.recv_from(&mut buf) => {
+                    let (n, peer) = match recv {
+                        Ok(v) => v,
+                        Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
+                    };
+                    self.on_unicast_datagram(&buf[..n], peer).await;
                 }
-                if header.session_id == 0 && header.security_flags == 0 {
-                    let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-                        tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
-                        continue;
-                    };
-                    if !proto.initiator {
-                        tracing::debug!(
-                            peer = %peer,
-                            exchange_id = proto.exchange_id,
-                            opcode = format_args!("0x{:02X}", proto.opcode),
-                            "unsecured datagram dropped: not an initiator message"
-                        );
-                        continue;
-                    }
-                    if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                        && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-                    {
-                        tracing::debug!(
-                            peer = %peer,
-                            exchange_id = proto.exchange_id,
-                            "unsecured datagram dropped: standalone MRP ack (no session to route it to)"
-                        );
-                        continue;
-                    }
-                    let first = mat_controller::exchange::IncomingMessage {
-                        header,
-                        proto,
-                        payload: buf[off + body_off..n].to_vec(),
-                    };
-                    let flow = classify_unsecured(proto.protocol_id, proto.opcode);
-                    tracing::debug!(
-                        opcode = format_args!("0x{:02X}", proto.opcode),
-                        protocol_id = format_args!("0x{:04X}", proto.protocol_id),
-                        exchange_id = proto.exchange_id,
-                        peer = %peer,
-                        peer_node_id = ?header.source_node_id,
-                        ?flow,
-                        "unsecured datagram received"
-                    );
-                    let Some(flow) = admit_unsecured(flow, window.is_open()) else {
-                        tracing::debug!(
-                            peer = %peer,
-                            exchange_id = proto.exchange_id,
-                            "PASE datagram dropped: commissioning window closed"
-                        );
-                        continue;
-                    };
-                    match flow {
-                        UnsecuredFlow::Pase => {
-                            let local_session_id = random_session_id();
-                            let outcome = crate::net::pase::drive_established(
-                                &transport,
-                                peer,
-                                first,
-                                pase_config_for_window(
-                                    &window,
-                                    config.passcode,
-                                    &pase_salt,
-                                    local_session_id,
-                                ),
-                            )
-                            .await;
-                            match outcome {
-                                Ok((keys, peer_session_id)) => {
-                                    tracing::debug!(
-                                        local_session_id,
-                                        peer_session_id,
-                                        peer = %peer,
-                                        "PASE established"
-                                    );
-                                    let session = SecureSession::new_device_role(
-                                        Arc::clone(&transport),
-                                        peer,
-                                        local_session_id,
-                                        peer_session_id,
-                                        keys,
-                                        0, // PASE: both sides are node id 0 (spec §4.13)
-                                        0,
-                                    );
-                                    current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
-                                    subscription = None; // belonged to the replaced session
-                                }
-                                // Established failure: best-effort responder, nothing
-                                // more to do — the initiator's own retry/StatusReport
-                                // handling covers it (logged so a failing
-                                // interop run says *where* it stopped).
-                                Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
-                            }
-                        }
-                        UnsecuredFlow::Case => {
-                            let local_session_id = random_session_id();
-                            let fabrics = comm_server.fabrics();
-                            let outcome = crate::net::case::drive_established(
-                                Arc::clone(&transport),
-                                peer,
-                                first,
-                                fabrics,
-                                local_session_id,
-                            )
-                            .await;
-                            match outcome {
-                                Ok((session, fabric_index)) => {
-                                    tracing::debug!(
-                                        local_session_id,
-                                        fabric_index,
-                                        peer = %peer,
-                                        "CASE established"
-                                    );
-                                    current_session =
-                                        Some((local_session_id, session, fabric_index));
-                                    subscription = None; // belonged to the replaced session
-                                }
-                                Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
-                            }
-                        }
-                        UnsecuredFlow::Ignore => {}
-                    }
-                    continue;
+                () = mdns_retry_deadline(&self.mdns_retry) => self.on_mdns_retry().await,
+                () = subscription_deadline(&self.state.subscription) => self.on_subscription_due().await,
+                () = commissioning_window_deadline(&self.state.window) => {
+                    self.on_commissioning_window_expired().await
                 }
+                () = fail_safe_expiry_deadline(&self.state.comm_server) => {
+                    self.on_fail_safe_expired().await
+                }
+                grecv = group_recv(&self.group.socket, &mut gbuf) => {
+                    let Ok((n, from)) = grecv else { continue };
+                    self.on_group_datagram(&gbuf[..n], from);
+                }
+            }
+        }
+    }
 
-                // Secured traffic: only ever the current session (sequential,
-                // one-at-a-time — see module doc).
-                let Some((sid, session, fabric_index)) = current_session.as_mut() else {
-                    tracing::debug!(
-                        session_id = header.session_id,
-                        peer = %peer,
-                        "secured datagram dropped: no session established"
-                    );
-                    continue;
-                };
-                if header.session_id != *sid {
-                    tracing::debug!(
-                        session_id = header.session_id,
-                        current_session_id = *sid,
-                        peer = %peer,
-                        "secured datagram dropped: session id does not match the current session"
-                    );
-                    continue;
-                }
-                let outcome = serve_secured(
-                    &buf[..n],
+    /// The active subscription's report deadline: send the dirty
+    /// attributes (or an empty keep-alive) on a device-initiated exchange,
+    /// drop the subscription if the report isn't acknowledged, then serve
+    /// whatever requests were buffered during that ack-wait.
+    async fn on_subscription_due(&mut self) {
+        // The active subscription is due for a report: the dirty
+        // attributes' current values, or an empty keep-alive. Both
+        // go out on a fresh device-initiated exchange and both must
+        // be acknowledged — anything else drops the subscription
+        // (`send_subscription_report`'s doc comment).
+        //
+        // No reentrancy hazard against the datagram path (`on_secured_datagram`):
+        // `select!` runs exactly one branch to completion per
+        // iteration, so while this one awaits its StatusResponse it
+        // is `SecureSession`'s own socket read — not the loop's —
+        // that consumes datagrams. Requests arriving meanwhile are
+        // buffered by `screen_with` and served by the drain below,
+        // exactly like the ones landing during a reply's ack-wait.
+        let delivered = match (
+            self.state.subscription.as_mut(),
+            self.current_session.as_mut(),
+        ) {
+            (Some(sub), Some((_, session, fabric_index))) => {
+                send_subscription_report(session, *fabric_index, &mut self.state.node, sub).await
+            }
+            // A subscription that outlived its session has nothing
+            // to report over — drop it.
+            _ => false,
+        };
+        if !delivered {
+            tracing::debug!(
+                subscription_id = self.state.subscription.as_ref().map(|s| s.id),
+                "subscription dropped: report was not acknowledged"
+            );
+            self.state.subscription = None;
+        }
+        let mut drop_session = false;
+        if let Some((_, session, fabric_index)) = self.current_session.as_mut() {
+            drop_session =
+                drain_buffered_requests(session, *fabric_index, &mut self.state.serve_state())
+                    .await
+                    == ServeOutcome::DropSession;
+        }
+        // Task 6: same reasoning as the datagram path (`on_secured_datagram`) — a
+        // buffered `RemoveFabric` piggybacked on this session's own
+        // fabric ends the session too, not just one arriving as a
+        // fresh datagram.
+        if drop_session {
+            self.current_session = None;
+        }
+    }
+
+    /// One datagram off the unicast socket: decode the message header,
+    /// drop group-session traffic (the group socket serves those), then
+    /// route unsecured traffic to `on_unsecured_datagram` and secured
+    /// traffic to the current session.
+    async fn on_unicast_datagram(&mut self, datagram: &[u8], peer: SocketAddr) {
+        let n = datagram.len();
+        let Ok((header, off)) = MessageHeader::decode(datagram) else {
+            tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
+            return;
+        };
+        if header.security_flags & SESSION_TYPE_MASK != 0 {
+            tracing::debug!(peer = %peer, security_flags = header.security_flags, "group-session datagram on the unicast socket dropped (the group socket serves those)");
+            return;
+        }
+        if header.session_id == 0 && header.security_flags == 0 {
+            self.on_unsecured_datagram(header, &datagram[off..], peer)
+                .await;
+            return;
+        }
+
+        self.on_secured_datagram(datagram, &header, peer).await;
+    }
+
+    /// IM dispatch for one secured datagram: it must belong to the current
+    /// session (sequential, one-at-a-time — see module doc), then
+    /// `serve_secured` decrypts/screens it, serves the Interaction Model
+    /// request, and drains any cross-exchange requests buffered meanwhile.
+    /// A `RemoveFabric` that removed this session's own fabric ends the
+    /// session (Task 6). Takes the raw datagram as well as the
+    /// already-decoded header because `serve_secured` re-decodes it from
+    /// the wire bytes.
+    async fn on_secured_datagram(
+        &mut self,
+        datagram: &[u8],
+        header: &MessageHeader,
+        peer: SocketAddr,
+    ) {
+        // Secured traffic: only ever the current session (sequential,
+        // one-at-a-time — see module doc).
+        let Some((sid, session, fabric_index)) = self.current_session.as_mut() else {
+            tracing::debug!(
+                session_id = header.session_id,
+                peer = %peer,
+                "secured datagram dropped: no session established"
+            );
+            return;
+        };
+        if header.session_id != *sid {
+            tracing::debug!(
+                session_id = header.session_id,
+                current_session_id = *sid,
+                peer = %peer,
+                "secured datagram dropped: session id does not match the current session"
+            );
+            return;
+        }
+        let outcome = serve_secured(
+            datagram,
+            peer,
+            session,
+            *fabric_index,
+            &mut self.state.serve_state(),
+        )
+        .await;
+        // Task 6: a `RemoveFabric` that removed this session's own
+        // fabric — `session`/`fabric_index` (borrowed out of
+        // `current_session` above) are no longer used past this
+        // point in this iteration, so this is the first place the
+        // borrow checker lets `current_session` be reassigned.
+        if outcome == ServeOutcome::DropSession {
+            self.current_session = None;
+        }
+    }
+
+    /// An unsecured (`session_id == 0`) datagram: decode the protocol
+    /// header, drop what can't start a session (non-initiator, standalone
+    /// ack), classify (`classify_unsecured`) and admit (`admit_unsecured`)
+    /// it, then hand a PASE/CASE opener to `establish_session`. `body` is
+    /// the datagram from the protocol header onward (`MessageHeader::
+    /// decode`'s `off`).
+    async fn on_unsecured_datagram(
+        &mut self,
+        header: MessageHeader,
+        body: &[u8],
+        peer: SocketAddr,
+    ) {
+        let Ok((proto, body_off)) = ProtocolHeader::decode(body) else {
+            tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
+            return;
+        };
+        if !proto.initiator {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                opcode = format_args!("0x{:02X}", proto.opcode),
+                "unsecured datagram dropped: not an initiator message"
+            );
+            return;
+        }
+        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
+        {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                "unsecured datagram dropped: standalone MRP ack (no session to route it to)"
+            );
+            return;
+        }
+        let first = mat_controller::exchange::IncomingMessage {
+            header,
+            proto,
+            payload: body[body_off..].to_vec(),
+        };
+        let flow = classify_unsecured(proto.protocol_id, proto.opcode);
+        tracing::debug!(
+            opcode = format_args!("0x{:02X}", proto.opcode),
+            protocol_id = format_args!("0x{:04X}", proto.protocol_id),
+            exchange_id = proto.exchange_id,
+            peer = %peer,
+            peer_node_id = ?header.source_node_id,
+            ?flow,
+            "unsecured datagram received"
+        );
+        let Some(flow) = admit_unsecured(flow, self.state.window.is_open()) else {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                "PASE datagram dropped: commissioning window closed"
+            );
+            return;
+        };
+        self.establish_session(flow, first, peer).await;
+    }
+
+    /// Session establishment: drive one PASE (`net::pase`) or CASE
+    /// (`net::case`) handshake to completion for `first`, the opener just
+    /// received, and on success make the result the current session
+    /// (`install_session`). `UnsecuredFlow::Ignore` is a no-op.
+    async fn establish_session(
+        &mut self,
+        flow: UnsecuredFlow,
+        first: mat_controller::exchange::IncomingMessage,
+        peer: SocketAddr,
+    ) {
+        match flow {
+            UnsecuredFlow::Pase => {
+                let local_session_id = random_session_id();
+                let outcome = crate::net::pase::drive_established(
+                    &self.transport,
                     peer,
-                    session,
-                    *fabric_index,
-                    &mut ServeState {
-                        node: &mut node,
-                        comm_server: &comm_server,
-                        mdns: mdns_ctx.as_ref(),
-                        subscription: &mut subscription,
-                        window: &mut window,
-                        config: &config,
-                    },
+                    first,
+                    pase_config_for_window(
+                        &self.state.window,
+                        self.state.config.passcode,
+                        &self.pase_salt,
+                        local_session_id,
+                    ),
                 )
                 .await;
-                // Task 6: a `RemoveFabric` that removed this session's own
-                // fabric — `session`/`fabric_index` (borrowed out of
-                // `current_session` above) are no longer used past this
-                // point in this iteration, so this is the first place the
-                // borrow checker lets `current_session` be reassigned.
-                if outcome == ServeOutcome::DropSession {
-                    current_session = None;
+                match outcome {
+                    Ok((keys, peer_session_id)) => {
+                        tracing::debug!(
+                            local_session_id,
+                            peer_session_id,
+                            peer = %peer,
+                            "PASE established"
+                        );
+                        let session = SecureSession::new_device_role(
+                            Arc::clone(&self.transport),
+                            peer,
+                            local_session_id,
+                            peer_session_id,
+                            keys,
+                            0, // PASE: both sides are node id 0 (spec §4.13)
+                            0,
+                        );
+                        self.install_session(local_session_id, session, 0); // PASE: no fabric yet
+                    }
+                    // Established failure: best-effort responder, nothing
+                    // more to do — the initiator's own retry/StatusReport
+                    // handling covers it (logged so a failing
+                    // interop run says *where* it stopped).
+                    Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
                 }
             }
-            () = mdns_retry_deadline(&mdns_retry) => {
-                // `window.is_open()` read *now*, not whatever it was when
-                // this retry was scheduled (fix round 1, review item 1):
-                // the window may have closed (15-minute expiry or
-                // `CommissioningComplete`) while mDNS was still down, and a
-                // stale "was open when scheduled" read would let this retry
-                // revive a commissionable advert for a window that already
-                // sent its goodbye.
-                match bring_up_mdns(&config, port, &comm_server, &window).await {
-                    Ok(ctx) => {
-                        tracing::info!("mDNS advertiser came up on retry");
-                        mdns_ctx = Some(ctx);
-                        mdns_retry = None;
+            UnsecuredFlow::Case => {
+                let local_session_id = random_session_id();
+                let fabrics = self.state.comm_server.fabrics();
+                let outcome = crate::net::case::drive_established(
+                    Arc::clone(&self.transport),
+                    peer,
+                    first,
+                    fabrics,
+                    local_session_id,
+                )
+                .await;
+                match outcome {
+                    Ok((session, fabric_index)) => {
+                        tracing::debug!(
+                            local_session_id,
+                            fabric_index,
+                            peer = %peer,
+                            "CASE established"
+                        );
+                        self.install_session(local_session_id, session, fabric_index);
                     }
-                    Err(e) => {
-                        // Warned once already (either at startup, above, or
-                        // on the very first retry — from here on this is
-                        // expected/repetitive noise for a device on a
-                        // genuinely bad interface, hence debug not warn.
-                        tracing::debug!(error = %e, "mDNS retry attempt failed, will retry again");
-                        if let Some(state) = mdns_retry.as_mut() {
-                            state.schedule_next();
-                        }
-                    }
+                    Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
                 }
             }
-            () = subscription_deadline(&subscription) => {
-                // The active subscription is due for a report: the dirty
-                // attributes' current values, or an empty keep-alive. Both
-                // go out on a fresh device-initiated exchange and both must
-                // be acknowledged — anything else drops the subscription
-                // (`send_subscription_report`'s doc comment).
-                //
-                // No reentrancy hazard against the datagram branch above:
-                // `select!` runs exactly one branch to completion per
-                // iteration, so while this one awaits its StatusResponse it
-                // is `SecureSession`'s own socket read — not the loop's —
-                // that consumes datagrams. Requests arriving meanwhile are
-                // buffered by `screen_with` and served by the drain below,
-                // exactly like the ones landing during a reply's ack-wait.
-                let delivered = match (subscription.as_mut(), current_session.as_mut()) {
-                    (Some(sub), Some((_, session, fabric_index))) => {
-                        send_subscription_report(session, *fabric_index, &mut node, sub).await
-                    }
-                    // A subscription that outlived its session has nothing
-                    // to report over — drop it.
-                    _ => false,
+            UnsecuredFlow::Ignore => {}
+        }
+    }
+
+    /// Makes `session` the current session, replacing whatever was there.
+    /// The active subscription (if any) belonged to the replaced session
+    /// and is dropped with it — its reports could only ever have gone out
+    /// over that session.
+    fn install_session(&mut self, local_session_id: u16, session: SecureSession, fabric_index: u8) {
+        self.current_session = Some((local_session_id, session, fabric_index));
+        self.state.subscription = None;
+    }
+
+    /// The mDNS retry timer fired (`MdnsRetry`): try `bring_up_mdns` again.
+    async fn on_mdns_retry(&mut self) {
+        // `window.is_open()` read *now*, not whatever it was when
+        // this retry was scheduled (fix round 1, review item 1):
+        // the window may have closed (15-minute expiry or
+        // `CommissioningComplete`) while mDNS was still down, and a
+        // stale "was open when scheduled" read would let this retry
+        // revive a commissionable advert for a window that already
+        // sent its goodbye.
+        match bring_up_mdns(
+            &self.state.config,
+            self.port,
+            &self.state.comm_server,
+            &self.state.window,
+        )
+        .await
+        {
+            Ok(ctx) => {
+                tracing::info!("mDNS advertiser came up on retry");
+                self.state.mdns = Some(ctx);
+                self.mdns_retry = None;
+            }
+            Err(e) => {
+                // Warned once already (either at startup, above, or
+                // on the very first retry — from here on this is
+                // expected/repetitive noise for a device on a
+                // genuinely bad interface, hence debug not warn.
+                tracing::debug!(error = %e, "mDNS retry attempt failed, will retry again");
+                if let Some(state) = self.mdns_retry.as_mut() {
+                    state.schedule_next();
+                }
+            }
+        }
+    }
+
+    /// The boot window's 15-minute bound or an ECM window's
+    /// `CommissioningTimeout` elapsed: close the window and pull the
+    /// commissionable advert.
+    async fn on_commissioning_window_expired(&mut self) {
+        // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
+        // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
+        // window, Task 4) has elapsed: close the window (no more
+        // PASE admitted — see `admit_unsecured`) and send the same
+        // commissionable-advert goodbye `CommissioningComplete`
+        // sends on success (`set_commissionable(None)`, goodbye
+        // wired since Task 8). No fabric rollback here — unlike
+        // fail-safe expiry, an already-*established* PASE session
+        // (if one happened to be mid-flight right at the deadline)
+        // is left alone; this branch only stops *new* PASE attempts
+        // from being admitted going forward.
+        tracing::info!("commissioning window expired — closing");
+        self.state.window = CommissioningWindow::Closed;
+        if let Some(ctx) = self.state.mdns.as_ref() {
+            ctx.mdns.set_commissionable(None).await;
+        }
+        // Task 4: this timer-driven close is the runtime noticing
+        // on its own — unlike `CommissioningComplete`/`Revoke`
+        // (dispatched IM commands the core cluster handler already
+        // reacts to), nothing on the core side knows the deadline
+        // just passed, so the runtime must tell it explicitly to
+        // keep the AC cluster's `WindowStatus` attribute honest. A
+        // no-op if this was the boot window (never opened an admin
+        // window in the first place).
+        self.state.comm_server.close_admin_window();
+    }
+
+    /// The fail-safe timer lapsed without `CommissioningComplete`: roll
+    /// back the uncommitted fabric (if any) and its operational advert.
+    async fn on_fail_safe_expired(&mut self) {
+        // `expire_fail_safe` is the one primitive that both decides
+        // "was there actually something to roll back" and does the
+        // rollback — `Some(entry)` only for the fabric an
+        // uncommitted `AddNOC` installed within this now-lapsed
+        // window (see its doc comment). Nothing to do here beyond
+        // that if it returns `None` (e.g. a plain `ArmFailSafe`
+        // that never called `AddNOC`, or this branch racing another
+        // caller that already consumed the same expiry) — the
+        // `select!` loop simply comes back around, and
+        // `fail_safe_expiry_deadline` reads as "no window open"
+        // (`std::future::pending`) on the next iteration.
+        let expired = self.state.comm_server.expire_fail_safe();
+        tracing::debug!(
+            rolled_back_fabric_index = ?expired.as_ref().map(|e| e.fabric_index),
+            "fail-safe expiry deadline fired"
+        );
+        if let Some(entry) = expired {
+            tracing::info!(
+                fabric_id = entry.fabric_id,
+                node_id = entry.node_id,
+                "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
+            );
+            if let Some(ctx) = self.state.mdns.as_ref() {
+                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+                ctx.mdns
+                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                    .await;
+            }
+        }
+    }
+
+    /// One datagram off the group socket: authenticate/classify it
+    /// (`classify_group_datagram`), apply the invokes, and mark what changed
+    /// for the active subscription.
+    fn on_group_datagram(&mut self, datagram: &[u8], from: SocketAddr) {
+        let fabrics = self.state.comm_server.fabrics();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &self.group.gk_store,
+            membership: &self.group.membership,
+        };
+        match classify_group_datagram(datagram, &deps, &mut self.replay) {
+            Ok(batch) => {
+                let mut ctx = InvokeCtx {
+                    fabric_index: batch.fabric_index,
+                    subject: Subject::group(batch.group_id),
+                    ..InvokeCtx::default()
                 };
-                if !delivered {
-                    tracing::debug!(
-                        subscription_id = subscription.as_ref().map(|s| s.id),
-                        "subscription dropped: report was not acknowledged"
-                    );
-                    subscription = None;
-                }
-                let mut drop_session = false;
-                if let Some((_, session, fabric_index)) = current_session.as_mut() {
-                    drop_session = drain_buffered_requests(
-                        session,
-                        *fabric_index,
-                        &mut ServeState {
-                            node: &mut node,
-                            comm_server: &comm_server,
-                            mdns: mdns_ctx.as_ref(),
-                            subscription: &mut subscription,
-                            window: &mut window,
-                            config: &config,
-                        },
-                    )
-                    .await
-                        == ServeOutcome::DropSession;
-                }
-                // Task 6: same reasoning as the datagram branch above — a
-                // buffered `RemoveFabric` piggybacked on this session's own
-                // fabric ends the session too, not just one arriving as a
-                // fresh datagram.
-                if drop_session {
-                    current_session = None;
+                let changed =
+                    self.state
+                        .node
+                        .handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
+                tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
+                if let Some(sub) = self.state.subscription.as_mut() {
+                    sub.note_changed(&changed);
                 }
             }
-            () = commissioning_window_deadline(&window) => {
-                // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
-                // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
-                // window, Task 4) has elapsed: close the window (no more
-                // PASE admitted — see `admit_unsecured`) and send the same
-                // commissionable-advert goodbye `CommissioningComplete`
-                // sends on success (`set_commissionable(None)`, goodbye
-                // wired since Task 8). No fabric rollback here — unlike
-                // fail-safe expiry, an already-*established* PASE session
-                // (if one happened to be mid-flight right at the deadline)
-                // is left alone; this branch only stops *new* PASE attempts
-                // from being admitted going forward.
-                tracing::info!("commissioning window expired — closing");
-                window = CommissioningWindow::Closed;
-                if let Some(ctx) = mdns_ctx.as_ref() {
-                    ctx.mdns.set_commissionable(None).await;
-                }
-                // Task 4: this timer-driven close is the runtime noticing
-                // on its own — unlike `CommissioningComplete`/`Revoke`
-                // (dispatched IM commands the core cluster handler already
-                // reacts to), nothing on the core side knows the deadline
-                // just passed, so the runtime must tell it explicitly to
-                // keep the AC cluster's `WindowStatus` attribute honest. A
-                // no-op if this was the boot window (never opened an admin
-                // window in the first place).
-                comm_server.close_admin_window();
-            }
-            () = fail_safe_expiry_deadline(&comm_server) => {
-                // `expire_fail_safe` is the one primitive that both decides
-                // "was there actually something to roll back" and does the
-                // rollback — `Some(entry)` only for the fabric an
-                // uncommitted `AddNOC` installed within this now-lapsed
-                // window (see its doc comment). Nothing to do here beyond
-                // that if it returns `None` (e.g. a plain `ArmFailSafe`
-                // that never called `AddNOC`, or this branch racing another
-                // caller that already consumed the same expiry) — the
-                // `select!` loop simply comes back around, and
-                // `fail_safe_expiry_deadline` reads as "no window open"
-                // (`std::future::pending`) on the next iteration.
-                let expired = comm_server.expire_fail_safe();
-                tracing::debug!(
-                    rolled_back_fabric_index = ?expired.as_ref().map(|e| e.fabric_index),
-                    "fail-safe expiry deadline fired"
-                );
-                if let Some(entry) = expired {
-                    tracing::info!(
-                        fabric_id = entry.fabric_id,
-                        node_id = entry.node_id,
-                        "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
-                    );
-                    if let Some(ctx) = mdns_ctx.as_ref() {
-                        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-                        ctx.mdns
-                            .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                            .await;
-                    }
-                }
-            }
-            grecv = group_recv(&group.socket, &mut gbuf) => {
-                let Ok((n, from)) = grecv else { continue };
-                let fabrics = comm_server.fabrics();
-                let deps = GroupRxDeps { fabrics: &fabrics, gk_store: &group.gk_store, membership: &group.membership };
-                match classify_group_datagram(&gbuf[..n], &deps, &mut replay) {
-                    Ok(batch) => {
-                        let mut ctx = InvokeCtx {
-                            fabric_index: batch.fabric_index,
-                            subject: Subject::group(batch.group_id),
-                            ..InvokeCtx::default()
-                        };
-                        let changed = node.handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
-                        tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
-                        if let Some(sub) = subscription.as_mut() {
-                            sub.note_changed(&changed);
-                        }
-                    }
-                    Err(reason) => tracing::debug!(peer = %from, len = n, ?reason, "groupcast datagram dropped"),
-                }
+            Err(reason) => {
+                tracing::debug!(peer = %from, len = datagram.len(), ?reason, "groupcast datagram dropped")
             }
         }
     }
@@ -1139,7 +1319,7 @@ fn sync_group_joins(group: &mut GroupRx, comm_server: &CommissioningServer) {
 /// Returns `ServeOutcome::DropSession` (Task 6) if this datagram's dispatch
 /// — or, when it wasn't, one of the buffered requests drained afterward —
 /// contained a `RemoveFabric` that removed the invoking session's own
-/// fabric (`remove_fabric_drops_session`); `run`'s caller then sets
+/// fabric (`remove_fabric_drops_session`); `on_secured_datagram` then sets
 /// `current_session = None`. `DropSession` skips the buffered-request drain
 /// below entirely (rather than draining what's left first): the session is
 /// about to be torn down, so there is no longer anywhere to route replies
@@ -1334,7 +1514,7 @@ async fn serve_secured_message(
             changed,
         } = outcome;
         // Anything this request changed that the active subscription covers
-        // becomes dirty — the `select!` report branch (`run`) picks it up at
+        // becomes dirty — the `select!` report branch (`on_subscription_due`) picks it up at
         // the subscription's next deadline. Recorded *before* the reply is
         // sent so a change is never lost to a failing reply.
         if let Some(sub) = subscription.as_mut() {
@@ -1358,122 +1538,20 @@ async fn serve_secured_message(
             "IM reply sent"
         );
 
-        // AddNOC success: a fabric appeared that wasn't there before this call.
-        let fabrics_after = comm_server.fabrics();
-        if fabrics_after.len() > fabrics_before {
-            if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
-                ctx.mdns
-                    .add_operational(operational_advert(
-                        entry,
-                        &ctx.hostname,
-                        ctx.port,
-                        ctx.addr_v6,
-                    ))
-                    .await;
-            }
-        }
-
-        // ECM window reconciliation (Task 4), per dispatch iteration — same
-        // spot the AddNOC fabric-diff check above lives, so a timed
-        // `OpenCommissioningWindow`/`RevokeCommissioning` invoke (piggybacked
-        // on this same exchange, per the timed-invoke loop this function
-        // runs) is handled without waiting for the next datagram. The
-        // ordering invariant this depends on (take the staged request
-        // *before* reading `admin_open`) and the resulting decision table
-        // are `admin_window_action`'s doc comment/unit tests, not repeated
-        // here — this block only performs the side effects.
-        let pending_request = comm_server.take_pending_window_request();
-        let admin_open = comm_server.admin_window_is_open();
-        match admin_window_action(pending_request, admin_open, window) {
-            AdminWindowAction::Apply(request) => {
-                **window = apply_window_request(request);
-                if let (Some(ctx), Some((discriminator, cm))) =
-                    (mdns, advert_params_for_window(window, config.discriminator))
-                {
-                    ctx.mdns
-                        .set_commissionable(Some(CommissionableAdvert {
-                            instance: random_hex_name(),
-                            hostname: ctx.hostname.clone(),
-                            discriminator,
-                            vendor_id: config.vendor_id,
-                            product_id: config.product_id,
-                            port: ctx.port,
-                            addr_v6: ctx.addr_v6,
-                            cm,
-                        }))
-                        .await;
-                }
-            }
-            AdminWindowAction::Close => {
-                tracing::info!("administrator commissioning window revoked — closing");
-                **window = CommissioningWindow::Closed;
-                if let Some(ctx) = mdns {
-                    ctx.mdns.set_commissionable(None).await;
-                }
-            }
-            AdminWindowAction::None => {}
-        }
-
-        // CommissioningComplete success: stop advertising commissionable.
-        if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
-            if let Some((cluster, command)) = req_cluster_command {
-                if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
-                    && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
-                {
-                    if let Ok(outcome) = im::decode_invoke_response(&resp_payload) {
-                        if outcome.status == im::STATUS_SUCCESS {
-                            if let Some(ctx) = mdns {
-                                ctx.mdns.set_commissionable(None).await;
-                            }
-                            // Task 14: CommissioningComplete is the other event
-                            // (besides the 15-minute/`CommissioningTimeout`
-                            // deadline in `run`'s `select!`) that closes the
-                            // commissioning window — a controller that just
-                            // finished commissioning has no reason to PASE in
-                            // again, and refusing it stops a second
-                            // commissioner from racing in during whatever's
-                            // left of the window.
-                            **window = CommissioningWindow::Closed;
-                            // Task 4: this close is runtime-initiated (General
-                            // Commissioning's CommissioningComplete doesn't
-                            // touch the AC cluster's admin_window itself), so
-                            // tell core explicitly — keeps `WindowStatus`
-                            // honest for an ECM window that just got
-                            // committed by completion rather than expiry/
-                            // revoke. A no-op for the boot window.
-                            comm_server.close_admin_window();
-                        }
-                    }
-                }
-            }
-        }
-
-        // RemoveFabric (Task 6): the store may have shed a fabric this
-        // dispatch — either the invoking session's own (the motivating
-        // case: an Android phone removing its ephemeral fabric right after
-        // handing the device off to Home Assistant via
-        // `OpenCommissioningWindow`) or a different one named explicitly in
-        // the command fields. Either way its mDNS operational advert must
-        // go. Checked *after* `reply_reliable` above, per the brief: the
-        // `RemoveFabric` response itself has already been sent (and, along
-        // `reply_reliable`'s normal path, acked) by this point, so dropping
-        // the session below never races the response that announces the
-        // removal.
-        if let Some(entry) = comm_server.take_removed_fabric() {
-            if let Some(ctx) = mdns {
-                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-                ctx.mdns
-                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                    .await;
-            }
-            if remove_fabric_drops_session(entry.fabric_index, fabric_index) {
-                tracing::info!(
-                    fabric_index,
-                    node_id = entry.node_id,
-                    "RemoveFabric removed the invoking session's own fabric — dropping session"
-                );
-                return ServeOutcome::DropSession;
-            }
+        advertise_added_fabric(comm_server, mdns, fabrics_before).await;
+        reconcile_admin_window(comm_server, mdns, window, config).await;
+        close_window_on_commissioning_complete(
+            resp_opcode,
+            req_cluster_command,
+            &resp_payload,
+            comm_server,
+            mdns,
+            window,
+        )
+        .await;
+        if retire_removed_fabric(comm_server, mdns, fabric_index).await == ServeOutcome::DropSession
+        {
+            return ServeOutcome::DropSession;
         }
 
         // `reply_reliable` が実メッセージ（同一 exchange の後続リクエスト —
@@ -1487,11 +1565,164 @@ async fn serve_secured_message(
     }
 }
 
+/// AddNOC success: a fabric appeared that wasn't there before the dispatch
+/// (`fabrics_before` = the count read just before `Node::handle_im`) —
+/// publish its operational mDNS advert.
+async fn advertise_added_fabric(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    fabrics_before: usize,
+) {
+    let fabrics_after = comm_server.fabrics();
+    if fabrics_after.len() > fabrics_before {
+        if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
+            ctx.mdns
+                .add_operational(operational_advert(
+                    entry,
+                    &ctx.hostname,
+                    ctx.port,
+                    ctx.addr_v6,
+                ))
+                .await;
+        }
+    }
+}
+
+/// ECM window reconciliation (Task 4), per dispatch iteration — same
+/// spot the AddNOC fabric-diff check (`advertise_added_fabric`) lives,
+/// so a timed `OpenCommissioningWindow`/`RevokeCommissioning` invoke
+/// (piggybacked on this same exchange, per the timed-invoke loop
+/// `serve_secured_message` runs) is handled without waiting for the next
+/// datagram. The
+/// ordering invariant this depends on (take the staged request
+/// *before* reading `admin_open`) and the resulting decision table
+/// are `admin_window_action`'s doc comment/unit tests, not repeated
+/// here — this function only performs the side effects.
+async fn reconcile_admin_window(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    window: &mut CommissioningWindow,
+    config: &DeviceConfig,
+) {
+    let pending_request = comm_server.take_pending_window_request();
+    let admin_open = comm_server.admin_window_is_open();
+    match admin_window_action(pending_request, admin_open, window) {
+        AdminWindowAction::Apply(request) => {
+            *window = apply_window_request(request);
+            if let (Some(ctx), Some((discriminator, cm))) =
+                (mdns, advert_params_for_window(window, config.discriminator))
+            {
+                ctx.mdns
+                    .set_commissionable(Some(CommissionableAdvert {
+                        instance: random_hex_name(),
+                        hostname: ctx.hostname.clone(),
+                        discriminator,
+                        vendor_id: config.vendor_id,
+                        product_id: config.product_id,
+                        port: ctx.port,
+                        addr_v6: ctx.addr_v6,
+                        cm,
+                    }))
+                    .await;
+            }
+        }
+        AdminWindowAction::Close => {
+            tracing::info!("administrator commissioning window revoked — closing");
+            *window = CommissioningWindow::Closed;
+            if let Some(ctx) = mdns {
+                ctx.mdns.set_commissionable(None).await;
+            }
+        }
+        AdminWindowAction::None => {}
+    }
+}
+
+/// CommissioningComplete success: stop advertising commissionable. Decided
+/// from the request already decoded (`req_cluster_command`) and the reply
+/// just sent (`resp_opcode` / `resp_payload`).
+async fn close_window_on_commissioning_complete(
+    resp_opcode: u8,
+    req_cluster_command: Option<(u32, u32)>,
+    resp_payload: &[u8],
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    window: &mut CommissioningWindow,
+) {
+    if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
+        if let Some((cluster, command)) = req_cluster_command {
+            if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
+                && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
+            {
+                if let Ok(outcome) = im::decode_invoke_response(resp_payload) {
+                    if outcome.status == im::STATUS_SUCCESS {
+                        if let Some(ctx) = mdns {
+                            ctx.mdns.set_commissionable(None).await;
+                        }
+                        // Task 14: CommissioningComplete is the other event
+                        // (besides the 15-minute/`CommissioningTimeout`
+                        // deadline in `on_commissioning_window_expired`) that closes the
+                        // commissioning window — a controller that just
+                        // finished commissioning has no reason to PASE in
+                        // again, and refusing it stops a second
+                        // commissioner from racing in during whatever's
+                        // left of the window.
+                        *window = CommissioningWindow::Closed;
+                        // Task 4: this close is runtime-initiated (General
+                        // Commissioning's CommissioningComplete doesn't
+                        // touch the AC cluster's admin_window itself), so
+                        // tell core explicitly — keeps `WindowStatus`
+                        // honest for an ECM window that just got
+                        // committed by completion rather than expiry/
+                        // revoke. A no-op for the boot window.
+                        comm_server.close_admin_window();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// RemoveFabric (Task 6): the store may have shed a fabric this
+/// dispatch — either the invoking session's own (the motivating
+/// case: an Android phone removing its ephemeral fabric right after
+/// handing the device off to Home Assistant via
+/// `OpenCommissioningWindow`) or a different one named explicitly in
+/// the command fields. Either way its mDNS operational advert must
+/// go. Called *after* `reply_reliable` in `serve_secured_message`, per
+/// the brief: the `RemoveFabric` response itself has already been sent
+/// (and, along `reply_reliable`'s normal path, acked) by this point, so
+/// dropping the session (`ServeOutcome::DropSession`) never races the
+/// response that announces the removal.
+async fn retire_removed_fabric(
+    comm_server: &CommissioningServer,
+    mdns: Option<&MdnsCtx>,
+    session_fabric_index: u8,
+) -> ServeOutcome {
+    if let Some(entry) = comm_server.take_removed_fabric() {
+        if let Some(ctx) = mdns {
+            let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+            ctx.mdns
+                .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+                .await;
+        }
+        if remove_fabric_drops_session(entry.fabric_index, session_fabric_index) {
+            tracing::info!(
+                fabric_index = session_fabric_index,
+                node_id = entry.node_id,
+                "RemoveFabric removed the invoking session's own fabric — dropping session"
+            );
+            return ServeOutcome::DropSession;
+        }
+    }
+    ServeOutcome::Continue
+}
+
 /// Everything one secured message is allowed to touch, bundled so
 /// `serve_secured`/`serve_secured_message` keep a readable arity as the
-/// runtime grows state (Task 12 added the subscription). Borrowed as a
-/// whole from `run`'s loop locals; the fields are destructured inside
-/// `serve_secured_message` so they stay independent borrows.
+/// runtime grows state (Task 12 added the subscription). Built by
+/// `NodeState::serve_state` from the runtime's owned `NodeState`; the
+/// fields are destructured inside `serve_secured_message` so they stay
+/// independent borrows.
 struct ServeState<'a> {
     node: &'a mut Node,
     comm_server: &'a CommissioningServer,
@@ -1506,16 +1737,16 @@ struct ServeState<'a> {
     /// `RevokeCommissioning` having cleared the core's admin window out from
     /// under an `EnhancedOpen` runtime window — all three detected per
     /// dispatch iteration, same place as the AddNOC fabric-diff check. The
-    /// 15-minute/`CommissioningTimeout`-elapsed close happens in `run`'s own
-    /// `select!` branch, outside any `ServeState`.
+    /// 15-minute/`CommissioningTimeout`-elapsed close happens in
+    /// `on_commissioning_window_expired`, outside any `ServeState`.
     window: &'a mut CommissioningWindow,
     /// Boot-time identity (passcode/discriminator/vendor+product id) — Task
     /// 4 needs `config.discriminator`/`vendor_id`/`product_id` to rebuild
     /// the commissionable advert when a `WindowRequest` reopens the window,
-    /// and `config.passcode` was already reachable via `run`'s closure but
-    /// not through `ServeState` until now (`pase_config_for_window` is
-    /// called directly in `run`, not from here — this is only for the
-    /// mDNS-side advert rebuild).
+    /// and `config.passcode` was already reachable via `establish_session`
+    /// but not through `ServeState` until now (`pase_config_for_window` is
+    /// called directly in `establish_session`, not from here — this is
+    /// only for the mDNS-side advert rebuild).
     config: &'a DeviceConfig,
 }
 
@@ -1751,7 +1982,7 @@ async fn serve_subscribe_request(
 /// subscription, and a real controller re-subscribes on its own.
 ///
 /// Takes `&mut Node` even though it only reads: this future is held across
-/// `await` points inside `run`'s `select!`, and `Device::run`'s task is
+/// `await` points inside `serve_forever`'s `select!`, and `Device::run`'s task is
 /// `tokio::spawn`ed — a shared `&Node` living across an await would make
 /// the whole runtime future require `Node: Sync`, which `Box<dyn
 /// ClusterHandler>` (declared `: Send`, not `: Sync`) is not.
@@ -1983,7 +2214,7 @@ fn is_status_response_ok(msg: &mat_controller::exchange::IncomingMessage) -> boo
 /// (Task 6), bypassing `Node::handle_im`/`handle_read` (which only ever
 /// return a single message) entirely. Mirrors `SecureSession::
 /// subscribe_wildcard`'s priming-report chunk loop on the *initiator* side
-/// (`crates/mat-controller/src/session.rs`, around line 1329): every chunk
+/// (`mat_controller::session::subscribe::subscribe_wildcard`): every chunk
 /// but the last is sent `more_chunks=true, suppress_response=false` and
 /// this side then waits for the peer's `StatusResponse(0)` on the same
 /// exchange before sending the next one; the last chunk is sent
@@ -2528,7 +2759,7 @@ mod tests {
     /// `Node::handle_im` and replies, exactly like a datagram read fresh off
     /// the socket. No mDNS, no commissioning — a bare `Node`/
     /// `CommissioningServer` pair driven directly, `serve_secured` called by
-    /// hand the same way `run`'s loop calls it.
+    /// hand the same way `on_secured_datagram` calls it.
     #[tokio::test]
     async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() {
         use mat_controller::crypto::{open_message, seal_message};
@@ -2715,8 +2946,8 @@ mod tests {
     /// job is only proving the runtime's send-chunk/await-StatusResponse
     /// loop actually round-trips over real sockets — the initiator-side
     /// counterpart to what `SecureSession::subscribe_wildcard`'s priming
-    /// loop already exercises from the other end (`session.rs`, around
-    /// line 1329).
+    /// loop already exercises from the other end
+    /// (`mat_controller::session::subscribe::subscribe_wildcard`).
     #[tokio::test]
     async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
         use mat_controller::crypto::{open_message, seal_message};

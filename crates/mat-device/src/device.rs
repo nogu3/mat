@@ -544,9 +544,9 @@ impl Device {
     /// so the only way to admit PASE again is a full restart, which
     /// re-evaluates this same policy against whatever's on disk at that
     /// point. The window's live state (open-until-deadline vs. closed) is
-    /// tracked entirely inside `net::runtime::run`'s loop
-    /// (`CommissioningWindow`) — this doc only describes the policy, not
-    /// where the state lives.
+    /// tracked entirely inside `net::runtime`'s `Runtime` as
+    /// `CommissioningWindow` (`serve_forever`'s loop) — this doc only
+    /// describes the policy, not where the state lives.
     pub async fn run(self) -> Result<(), DeviceError> {
         crate::net::runtime::run(
             self.transport,
