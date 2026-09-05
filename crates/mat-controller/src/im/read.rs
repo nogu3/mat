@@ -715,7 +715,7 @@ pub fn merge_reports(msgs: &[ReportDataMessage]) -> Vec<(u32, serde_json::Value)
 mod tests {
     use super::*;
     use crate::im::*;
-    use crate::tlv::{Reader, Tag, Value, Writer};
+    use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
 
     #[test]
     fn read_request_has_spec_structure() {
