@@ -7,9 +7,11 @@
 //! `GroupKeyStore` に保持する。`ATTR_GROUP_TABLE` は
 //! `core::group_membership::GroupMembershipStore`（Groups クラスタ側の
 //! エンドポイント紐付け帳簿）から派生する読み取り専用ビュー。
-//! `KeySetRead`/`KeySetRemove`/
-//! `KeySetReadAllIndices` コマンドは未実装（既知ギャップ、groupcast タスク
-//! 送り）。永続化は `with_persist` で `<store_dir>/group_keys.json`
+//! `KeySetRead`（§11.2.8.2、EpochKey は null で返す）/ `KeySetRemove`（§11.2.8.4、
+//! GroupKeyMap の参照行もカスケード削除）/ `KeySetReadAllIndices`（§11.2.8.5）も
+//! 実装済み。IPK = keyset 0 は `GroupKeyStore` には持たず（`FabricEntry` 側）、
+//! Read/ReadAllIndices では常在の仮想 keyset として応答し、Remove は
+//! INVALID_COMMAND で拒む。永続化は `with_persist` で `<store_dir>/group_keys.json`
 //! （`net::store::FileGroupKeyStore`）に行う。
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +31,19 @@ use crate::core::group_membership::GroupMembershipStore;
 /// 実装の食い違いを構造的にあり得なくする」パターン）。
 const MAX_GROUPS_PER_FABRIC: u64 = 16;
 const MAX_GROUP_KEYS_PER_FABRIC: usize = 1;
+
+/// GroupKeyManagement のコマンド id（spec §11.2.8）。`mat_controller::im` は
+/// `CMD_KEY_SET_WRITE` しか持たず、im.rs は他レーンの編集領域なのでここで
+/// 局所定義する（`mat-native/src/ops.rs` の `CMD_KEY_SET_REMOVE` と同じ裁定）。
+pub const CMD_KEY_SET_READ: u32 = 0x01;
+pub const RESP_KEY_SET_READ: u32 = 0x02;
+pub const CMD_KEY_SET_REMOVE: u32 = 0x03;
+pub const CMD_KEY_SET_READ_ALL_INDICES: u32 = 0x04;
+pub const RESP_KEY_SET_READ_ALL_INDICES: u32 = 0x05;
+/// IPK の KeySet id（spec §11.2.6.2）。`GroupKeyStore` には持たず
+/// （`FabricEntry.ipk_operational` 側）、KeySetRead/ReadAllIndices は仮想的に
+/// 常在として応答し、KeySetRemove は INVALID_COMMAND で拒む。
+pub const IPK_KEY_SET_ID: u16 = 0;
 
 /// デバイス上の 1 KeySet（epoch key 0 のみ保持 — epoch 1/2 は spec 上
 /// optional でこの実装では未対応、モジュール doc 参照）。`Debug` は鍵を
@@ -383,41 +398,117 @@ impl ClusterHandler for GroupKeyManagementHandler {
         }
     }
 
-    /// `CMD_KEY_SET_WRITE` (spec §11.2.7.1) のみ受理する。PASE セッション
-    /// （`ctx.fabric_index == 0`、`AccessControlHandler::write`と同じ
-    /// ガード）は `STATUS_UNSUPPORTED_ACCESS`。フィールドのデコードは
+    /// KeySet 系 4 コマンドを受理する: `CMD_KEY_SET_WRITE`（spec §11.2.7.1）/
+    /// `CMD_KEY_SET_READ`（§11.2.8.2）/ `CMD_KEY_SET_REMOVE`（§11.2.8.4）/
+    /// `CMD_KEY_SET_READ_ALL_INDICES`（§11.2.8.5）。それ以外は
+    /// `STATUS_UNSUPPORTED_COMMAND`。PASE セッション（`ctx.fabric_index ==
+    /// 0`、`AccessControlHandler::write`と同じガード）は
+    /// `STATUS_UNSUPPORTED_ACCESS`。KeySetWrite のフィールドデコードは
     /// `decode_key_set_write_fields` — 構造的な TLV 破損は
     /// `STATUS_INVALID_COMMAND`、フィールド欠落・policy 不正・鍵長不正は
     /// `STATUS_CONSTRAINT_ERROR`（設計メモ参照）。成功時は response
-    /// command なしの `STATUS_SUCCESS`。
+    /// command なしの `STATUS_SUCCESS`。KeySetRead/Remove のフィールド
+    /// デコードは `decode_key_set_id` — 形不正・id 欠落は
+    /// `STATUS_INVALID_COMMAND`。
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {
-        if command != im::CMD_KEY_SET_WRITE {
+        if !matches!(
+            command,
+            im::CMD_KEY_SET_WRITE
+                | CMD_KEY_SET_READ
+                | CMD_KEY_SET_REMOVE
+                | CMD_KEY_SET_READ_ALL_INDICES
+        ) {
             return InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND);
         }
         if ctx.fabric_index == 0 {
             return InvokeReply::Status(im::STATUS_UNSUPPORTED_ACCESS);
         }
-        let (keyset_id, epoch_key0, epoch_start_time0) =
-            match decode_key_set_write_fields(fields_tlv) {
-                Ok(fields) => fields,
-                Err(KeySetWriteError::Malformed) => {
+        match command {
+            im::CMD_KEY_SET_WRITE => {
+                let (keyset_id, epoch_key0, epoch_start_time0) =
+                    match decode_key_set_write_fields(fields_tlv) {
+                        Ok(fields) => fields,
+                        Err(KeySetWriteError::Malformed) => {
+                            return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+                        }
+                        Err(KeySetWriteError::Constraint) => {
+                            return InvokeReply::Status(im::STATUS_CONSTRAINT_ERROR);
+                        }
+                    };
+                match self.store.upsert_keyset(
+                    ctx.fabric_index,
+                    keyset_id,
+                    epoch_key0,
+                    epoch_start_time0,
+                ) {
+                    Ok(()) => InvokeReply::Status(im::STATUS_SUCCESS),
+                    Err(status) => InvokeReply::Status(status),
+                }
+            }
+            CMD_KEY_SET_READ => {
+                let Some(keyset_id) = decode_key_set_id(fields_tlv) else {
+                    return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+                };
+                let epoch_start_time0 = if keyset_id == IPK_KEY_SET_ID {
+                    0
+                } else {
+                    match self.store.find_keyset(ctx.fabric_index, keyset_id) {
+                        Some(ks) => ks.epoch_start_time0,
+                        None => return InvokeReply::Status(im::STATUS_NOT_FOUND),
+                    }
+                };
+                InvokeReply::Data {
+                    response_command: RESP_KEY_SET_READ,
+                    fields_tlv: encode_key_set_read_response(keyset_id, epoch_start_time0),
+                }
+            }
+            CMD_KEY_SET_REMOVE => {
+                let Some(keyset_id) = decode_key_set_id(fields_tlv) else {
+                    return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+                };
+                if keyset_id == IPK_KEY_SET_ID {
                     return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
                 }
-                Err(KeySetWriteError::Constraint) => {
-                    return InvokeReply::Status(im::STATUS_CONSTRAINT_ERROR);
+                match self.store.remove_keyset(ctx.fabric_index, keyset_id) {
+                    Ok(true) => {
+                        ctx.changed.push(im::ATTR_GROUP_KEY_MAP);
+                        InvokeReply::Status(im::STATUS_SUCCESS)
+                    }
+                    Ok(false) => InvokeReply::Status(im::STATUS_SUCCESS),
+                    Err(status) => InvokeReply::Status(status),
                 }
-            };
-        match self
-            .store
-            .upsert_keyset(ctx.fabric_index, keyset_id, epoch_key0, epoch_start_time0)
-        {
-            Ok(()) => InvokeReply::Status(im::STATUS_SUCCESS),
-            Err(status) => InvokeReply::Status(status),
+            }
+            _ => {
+                // KeySetReadAllIndices: 引数は空 struct（読まない）。
+                let mut ids = vec![IPK_KEY_SET_ID];
+                ids.extend(self.store.keyset_ids_for(ctx.fabric_index));
+                let mut w = Writer::new();
+                w.start_struct(Tag::Anonymous);
+                w.start_array(Tag::Context(0));
+                for id in ids {
+                    w.put_uint(Tag::Anonymous, u64::from(id));
+                }
+                w.end_container();
+                w.end_container();
+                InvokeReply::Data {
+                    response_command: RESP_KEY_SET_READ_ALL_INDICES,
+                    fields_tlv: w.finish(),
+                }
+            }
         }
     }
 
     fn accepted_commands(&self) -> Vec<u32> {
-        vec![im::CMD_KEY_SET_WRITE]
+        vec![
+            im::CMD_KEY_SET_WRITE,
+            CMD_KEY_SET_READ,
+            CMD_KEY_SET_REMOVE,
+            CMD_KEY_SET_READ_ALL_INDICES,
+        ]
+    }
+
+    fn generated_commands(&self) -> Vec<u32> {
+        vec![RESP_KEY_SET_READ, RESP_KEY_SET_READ_ALL_INDICES]
     }
 
     /// write の対象は `ATTR_GROUP_KEY_MAP` のみ（`ATTR_GROUP_TABLE` は
@@ -466,9 +557,11 @@ impl ClusterHandler for GroupKeyManagementHandler {
         Ok(())
     }
 
-    /// spec §11.2.5 のアクセス表: KeySet 系コマンド（この実装が受理するの
-    /// は `CMD_KEY_SET_WRITE` だけ）は Administer — group key は fabric の
-    /// 共有秘密そのものなので、Operate 権限の controller には書かせない。
+    /// spec §11.2.5 のアクセス表: KeySet 系コマンド（この実装が受理する
+    /// `CMD_KEY_SET_WRITE`/`CMD_KEY_SET_READ`/`CMD_KEY_SET_REMOVE`/
+    /// `CMD_KEY_SET_READ_ALL_INDICES` の 4 つ全部）は Administer — group key
+    /// は fabric の共有秘密そのものなので、Operate 権限の controller には
+    /// 書かせない（Read も同様: 鍵は返さないが keyset の存在自体を隠す）。
     fn invoke_privilege(&self, _command: u32) -> u8 {
         crate::core::access_control::PRIVILEGE_ADMINISTER
     }
@@ -640,6 +733,52 @@ fn decode_group_key_map_entry_body(r: &mut Reader) -> Option<(u16, u16)> {
     Some((group_id?, keyset_id?))
 }
 
+/// KeySetRead / KeySetRemove の `{0: GroupKeySetID}`。`groups.rs::decode_group_id`
+/// と同じ形（先頭 struct の Context(0) uint、ネストは読み飛ばす）。形不正・
+/// id 欠落は `None` → 呼び出し側は `STATUS_INVALID_COMMAND`。
+fn decode_key_set_id(fields_tlv: &[u8]) -> Option<u16> {
+    let mut r = Reader::new(fields_tlv);
+    match r.next() {
+        Ok(Some(el)) if el.value == Value::StructStart => {}
+        _ => return None,
+    }
+    let mut keyset_id = None;
+    loop {
+        match r.next() {
+            Ok(Some(el)) => match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(0), Value::Uint(v)) => keyset_id = u16::try_from(v).ok(),
+                (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                    mat_controller::tlv::skip_container(&mut r).ok()?;
+                }
+                _ => {}
+            },
+            _ => return None,
+        }
+    }
+    keyset_id
+}
+
+/// `KeySetReadResponse {0: GroupKeySetStruct}`（spec §11.2.8.3）。EpochKey0/1/2
+/// は**必ず null**（鍵素材は返さない）、policy は TrustFirst(0) 固定（他は
+/// KeySetWrite で拒む）、epoch 1/2 の StartTime も null（未対応）。
+fn encode_key_set_read_response(keyset_id: u16, epoch_start_time0: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_struct(Tag::Context(0));
+    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.put_uint(Tag::Context(1), 0);
+    w.put_null(Tag::Context(2));
+    w.put_uint(Tag::Context(3), epoch_start_time0);
+    w.put_null(Tag::Context(4));
+    w.put_null(Tag::Context(5));
+    w.put_null(Tag::Context(6));
+    w.put_null(Tag::Context(7));
+    w.end_container();
+    w.end_container();
+    w.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,9 +864,257 @@ mod tests {
                 im::ATTR_MAX_GROUP_KEYS_PER_FABRIC,
             ]
         );
-        assert_eq!(h.accepted_commands(), vec![im::CMD_KEY_SET_WRITE]);
-        assert_eq!(h.generated_commands(), Vec::<u32>::new());
         assert_eq!(h.feature_map(), 0);
+    }
+
+    #[test]
+    fn declares_all_key_set_commands() {
+        let h = GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
+        assert_eq!(
+            h.accepted_commands(),
+            vec![
+                im::CMD_KEY_SET_WRITE,
+                CMD_KEY_SET_READ,
+                CMD_KEY_SET_REMOVE,
+                CMD_KEY_SET_READ_ALL_INDICES
+            ]
+        );
+        assert_eq!(
+            h.generated_commands(),
+            vec![RESP_KEY_SET_READ, RESP_KEY_SET_READ_ALL_INDICES]
+        );
+    }
+
+    fn write_keyset(h: &mut GroupKeyManagementHandler, fabric: u8, id: u16) -> InvokeCtx {
+        let mut ctx = InvokeCtx {
+            fabric_index: fabric,
+            ..Default::default()
+        };
+        let ks = mat_controller::im::encode_key_set_write_fields(id, &[9u8; 16]);
+        assert_eq!(
+            h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+        ctx
+    }
+
+    fn key_set_id_fields(id: u16) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), u64::from(id));
+        w.end_container();
+        w.finish()
+    }
+
+    /// `KeySetReadResponse {0: GroupKeySetStruct}` を `(id, policy,
+    /// start_time0)` に戻す。EpochKey0/1/2 (2/4/6) が null 以外なら `None`
+    /// — 鍵素材が漏れたら失敗させる。
+    fn decode_key_set_read_response(fields: &[u8]) -> Option<(u16, u8, Option<u64>)> {
+        let mut r = Reader::new(fields);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let el = r.next().unwrap().unwrap();
+        assert_eq!((el.tag, el.value), (Tag::Context(0), Value::StructStart));
+        let (mut id, mut policy, mut start) = (None, None, None);
+        loop {
+            let el = r.next().unwrap().unwrap();
+            match (el.tag, el.value) {
+                (_, Value::ContainerEnd) => break,
+                (Tag::Context(0), Value::Uint(v)) => id = Some(v as u16),
+                (Tag::Context(1), Value::Uint(v)) => policy = Some(v as u8),
+                (Tag::Context(3), Value::Uint(v)) => start = Some(v),
+                (Tag::Context(2 | 4 | 6), Value::Null) => {}
+                (Tag::Context(5 | 7), Value::Null) => {}
+                (Tag::Context(2 | 4 | 6), _) => return None,
+                other => panic!("unexpected field {other:?}"),
+            }
+        }
+        Some((id?, policy?, start))
+    }
+
+    #[test]
+    fn key_set_read_returns_metadata_but_never_the_key() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
+        let mut ctx = write_keyset(&mut h, 1, 42);
+        let reply = h.invoke(CMD_KEY_SET_READ, &key_set_id_fields(42), &mut ctx);
+        let InvokeReply::Data {
+            response_command,
+            fields_tlv,
+        } = reply
+        else {
+            panic!("expected data reply, got {reply:?}");
+        };
+        assert_eq!(response_command, RESP_KEY_SET_READ);
+        let start = store.find_keyset(1, 42).unwrap().epoch_start_time0;
+        assert_eq!(
+            decode_key_set_read_response(&fields_tlv),
+            Some((42, 0, Some(start)))
+        );
+        // 鍵バイト列が応答に一切含まれない
+        assert!(!fields_tlv.windows(16).any(|w| w == [9u8; 16]));
+    }
+
+    #[test]
+    fn key_set_read_of_ipk_is_virtual_and_unknown_is_not_found() {
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let InvokeReply::Data { fields_tlv, .. } =
+            h.invoke(CMD_KEY_SET_READ, &key_set_id_fields(0), &mut ctx)
+        else {
+            panic!("IPK keyset 0 must always be readable");
+        };
+        assert_eq!(
+            decode_key_set_read_response(&fields_tlv),
+            Some((0, 0, Some(0)))
+        );
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_READ, &key_set_id_fields(42), &mut ctx),
+            InvokeReply::Status(im::STATUS_NOT_FOUND)
+        );
+        // 他 fabric の keyset は見えない
+        write_keyset(&mut h, 2, 42);
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_READ, &key_set_id_fields(42), &mut ctx),
+            InvokeReply::Status(im::STATUS_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn key_set_commands_reject_pase_and_malformed_fields() {
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
+        let mut pase = InvokeCtx::default();
+        for cmd in [
+            CMD_KEY_SET_READ,
+            CMD_KEY_SET_REMOVE,
+            CMD_KEY_SET_READ_ALL_INDICES,
+        ] {
+            assert_eq!(
+                h.invoke(cmd, &key_set_id_fields(1), &mut pase),
+                InvokeReply::Status(im::STATUS_UNSUPPORTED_ACCESS),
+                "cmd {cmd:#x}"
+            );
+        }
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        for cmd in [CMD_KEY_SET_READ, CMD_KEY_SET_REMOVE] {
+            assert_eq!(
+                h.invoke(cmd, &[0xFF, 0x00], &mut ctx),
+                InvokeReply::Status(im::STATUS_INVALID_COMMAND),
+                "cmd {cmd:#x}"
+            );
+            // id 欠落（空 struct）
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.end_container();
+            assert_eq!(
+                h.invoke(cmd, &w.finish(), &mut ctx),
+                InvokeReply::Status(im::STATUS_INVALID_COMMAND),
+                "cmd {cmd:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_set_remove_cascades_to_map_and_marks_the_attribute_changed() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
+        let mut ctx = write_keyset(&mut h, 1, 42);
+        let map = mat_controller::im::encode_group_key_map_tlv(&[(0x000A, 42)]);
+        h.write(im::ATTR_GROUP_KEY_MAP, &map, false, &mut ctx)
+            .unwrap();
+        ctx.changed.clear();
+
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_REMOVE, &key_set_id_fields(42), &mut ctx),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+        assert!(!store.keyset_exists(1, 42));
+        assert!(store.map_entries_for(1).is_empty());
+        assert_eq!(ctx.changed, vec![im::ATTR_GROUP_KEY_MAP]);
+
+        // 参照の無い keyset の削除は changed を積まない
+        let mut ctx = write_keyset(&mut h, 1, 43);
+        ctx.changed.clear();
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_REMOVE, &key_set_id_fields(43), &mut ctx),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+        assert!(ctx.changed.is_empty());
+    }
+
+    #[test]
+    fn key_set_remove_rejects_ipk_unknown_and_other_fabric() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
+        let mut ctx = write_keyset(&mut h, 1, 42);
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_REMOVE, &key_set_id_fields(0), &mut ctx),
+            InvokeReply::Status(im::STATUS_INVALID_COMMAND)
+        );
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_REMOVE, &key_set_id_fields(99), &mut ctx),
+            InvokeReply::Status(im::STATUS_NOT_FOUND)
+        );
+        let mut ctx2 = InvokeCtx {
+            fabric_index: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            h.invoke(CMD_KEY_SET_REMOVE, &key_set_id_fields(42), &mut ctx2),
+            InvokeReply::Status(im::STATUS_NOT_FOUND)
+        );
+        assert!(store.keyset_exists(1, 42));
+    }
+
+    fn decode_u16_list_response(fields: &[u8]) -> Vec<u16> {
+        let mut r = Reader::new(fields);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let el = r.next().unwrap().unwrap();
+        assert_eq!((el.tag, el.value), (Tag::Context(0), Value::ArrayStart));
+        let mut out = Vec::new();
+        loop {
+            match r.next().unwrap().unwrap().value {
+                Value::ContainerEnd => break,
+                Value::Uint(v) => out.push(v as u16),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn key_set_read_all_indices_lists_ipk_plus_this_fabrics_keysets() {
+        let mut h =
+            GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        let InvokeReply::Data {
+            response_command,
+            fields_tlv,
+        } = h.invoke(CMD_KEY_SET_READ_ALL_INDICES, &[], &mut ctx)
+        else {
+            panic!("expected data reply");
+        };
+        assert_eq!(response_command, RESP_KEY_SET_READ_ALL_INDICES);
+        assert_eq!(decode_u16_list_response(&fields_tlv), vec![0]);
+
+        write_keyset(&mut h, 1, 42);
+        write_keyset(&mut h, 2, 43);
+        let InvokeReply::Data { fields_tlv, .. } =
+            h.invoke(CMD_KEY_SET_READ_ALL_INDICES, &[], &mut ctx)
+        else {
+            panic!("expected data reply");
+        };
+        assert_eq!(decode_u16_list_response(&fields_tlv), vec![0, 42]);
     }
 
     #[test]
@@ -761,16 +1148,15 @@ mod tests {
         let mut h =
             GroupKeyManagementHandler::new(GroupKeyStore::new(), GroupMembershipStore::new());
         assert!(h.read(0x7777, &ReadCtx::default()).is_none());
-        // 0x01 (KeySetRead, spec §11.2.7.2) is a real command id but not one
-        // this implementation accepts — a CASE session (fabric_index != 0)
-        // to make sure the rejection is `accepted_commands`, not the PASE
-        // guard.
+        // 0x77 is a command id with no assignment in this cluster — a CASE
+        // session (fabric_index != 0) to make sure the rejection is
+        // `accepted_commands`, not the PASE guard.
         let mut ctx = InvokeCtx {
             fabric_index: 1,
             ..Default::default()
         };
         assert_eq!(
-            h.invoke(0x01, &[], &mut ctx),
+            h.invoke(0x77, &[], &mut ctx),
             InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
         );
     }
