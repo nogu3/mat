@@ -8,6 +8,11 @@ use std::time::Duration;
 use super::codec::push_name;
 use super::{bind_mdns_socket, MDNS_GROUP, MDNS_PORT, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
 
+/// `_matterc._udp.local` の browse / known-answer テスト共通の service 名
+/// （`codec` の known-answer テストと、Task 3 で `browse.rs` へ移る browse
+/// テストの両方が使う — cross-submodule test 定数なのでここに置く）。
+pub(super) const MC: &str = "_matterc._udp.local";
+
 /// SRV + TXT + AAAA を 1 メッセージに合成。AAAA のレコード名は SRV rdata
 /// 内の target 名への圧縮ポインタで書き、クラスには cache-flush bit を
 /// 立てて実 mDNS 応答の形に寄せる。

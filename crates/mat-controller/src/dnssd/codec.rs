@@ -388,7 +388,7 @@ pub(super) fn txt_str<'a>(strings: &'a [Vec<u8>], key: &str) -> Option<&'a str> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::{synth_aaaa_class, synth_response};
+    use super::super::test_util::{synth_aaaa_class, synth_response, MC};
     use super::super::CLASS_IN;
     use super::*;
 
@@ -642,10 +642,6 @@ mod tests {
             .expect("should have PTR record");
         assert!(matches!(ptr.rdata, RData::Other));
     }
-
-    // `mod.rs` の `tests` にある同名 const と同じ値（挙動不変の split で
-    // モジュールを跨げなくなったため、この 3 本のためだけに複製）。
-    const MC: &str = "_matterc._udp.local";
 
     #[test]
     fn known_answer_query_degenerates_without_known() {

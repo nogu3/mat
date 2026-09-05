@@ -895,7 +895,7 @@ mod tests {
     use super::codec::push_name;
     use super::test_util::{
         multicast_ifaces, spawn_multicast_announcer, spawn_unicast_responder,
-        synth_commissionable_response, synth_response,
+        synth_commissionable_response, synth_response, MC,
     };
     use super::*;
 
@@ -1277,8 +1277,6 @@ mod tests {
         }
         msg
     }
-
-    const MC: &str = "_matterc._udp.local";
 
     #[test]
     fn browse_fold_collects_two_instances_from_bundled_responses() {
