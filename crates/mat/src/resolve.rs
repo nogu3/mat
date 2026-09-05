@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::cli::{ColorSpecArgs, Command, DiagCommand, GroupCommand};
+use crate::cli::{ColorSpecArgs, Command, DiagCommand, FabricAction, GroupCommand};
 use mat_core::alias::{AliasBook, EndpointRef, GroupRef, NodeRef};
 use mat_core::color;
 use mat_core::error::{ErrorKind, MatError};
@@ -337,7 +337,24 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
                 },
             },
         },
-        // fabric_id / admin_node_id は数値のみ（alias 対象フィールドが無い）— パススルー。
+        Command::Fabric {
+            action:
+                FabricAction::RotateIpk {
+                    nodes,
+                    catch_up,
+                    abort,
+                },
+        } => Command::Fabric {
+            action: FabricAction::RotateIpk {
+                nodes: nodes
+                    .into_iter()
+                    .map(|n| book.resolve_node(&n).map(NodeRef::Id))
+                    .collect::<Result<_, MatError>>()?,
+                catch_up,
+                abort,
+            },
+        },
+        // fabric_id / admin_node_id は数値のみ — パススルー。
         Command::Fabric { action } => Command::Fabric { action },
     })
 }

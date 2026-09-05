@@ -89,6 +89,11 @@ tasks:
     cmds:
       - bash scripts/e2e-device-m3.sh
 
+  e2e:device:m4:
+    desc: "M4 IPK ローテーション E2E（matv 相手・失敗経路）: rotate-ipk が device_rejected で pending → 旧 IPK で on/group invoke が通る → --abort（要: 実 NIC、既定 eth1 / MAT_E2E_IFACE で変更）"
+    cmds:
+      - bash scripts/e2e-device-m4.sh
+
   chip-tool:
     desc: "chip-tool (Docker, host network)。例: task chip-tool -- pairing --help"
     cmds:

@@ -177,7 +177,11 @@ subprocess.
 - **First-fabric bootstrap** is `mat fabric init` (random-epoch IPK). A fabric
   first created by `chip-tool` is handled by verifying its fixed epoch
   against the KVS materials and adopting it (persisted to
-  `mat/f/<idx>/ipk-epoch`), so pre-M8c-3 fabrics keep working.
+  `mat/f/<idx>/ipk-epoch`), so pre-M8c-3 fabrics keep working. IPK rotation
+  (`mat fabric rotate-ipk`) keeps its state in the same namespace
+  (`ipk-epoch-next` while pending, `ipk-epoch-prev` after commit) and
+  distributes `{current, new}` to every node before switching the controller
+  in one transaction.
 - `mat` is the sole owner/writer of the persistent Matter KVS (chip-tool INI
   compatible form: keysets, operational credentials, group tables, the
   group-send counter) — see [Credential store](#credential-store-kvs) below.
@@ -1014,9 +1018,10 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
       挙動を実機なしで回帰させる）。(2) ~~汎用 list/struct TLV エンコード（現状
       scalar のみが仕様、汎用 write/invoke の後退を受容）~~【訂正 2026-09-03:
       実装済み — float/list/struct を生成テーブルの struct スキーマで符号化、
-      docs/superpowers/specs/2026-09-03-write-types-design.md】。(3) IPK ローテーション
+      docs/superpowers/specs/2026-09-03-write-types-design.md】。(3) ~~IPK ローテーション
       （全ノード KeySetWrite での epoch 完全移行 — 現状は既存 fabric の定数 epoch を
-      検証して採用永続するのみ）。(4) ~~CASE の多アドレス試行~~【訂正
+      検証して採用永続するのみ）~~【訂正 2026-09-05: 実装済み — `mat fabric rotate-ipk`、
+      docs/superpowers/specs/2026-09-05-ipk-rotation-design.md】。(4) ~~CASE の多アドレス試行~~【訂正
       2026-07-20: これは記録が不正確だった。resolve は SRV target に一致する
       全 AAAA を返し（重複排除・非 link-local 優先）、establish は M7 以来
       全アドレスへ順次 CASE 試行する（`for peer in peers`）。ゲート 1 の

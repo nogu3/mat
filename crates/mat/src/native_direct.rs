@@ -218,7 +218,7 @@ where
 /// `Engine::build` は KVS 資材の読取失敗を `store_missing` に写す（`mat-native`
 /// 参照 — Io/NotFound と parse の細分化は将来）。ここでは store_missing に
 /// 「`mat fabric init` で資材を作れ」の誘導を足して返す。他 kind はそのまま伝播。
-fn map_engine_build_error(mut e: MatError) -> MatError {
+pub(crate) fn map_engine_build_error(mut e: MatError) -> MatError {
     if e.kind == mat_core::error::ErrorKind::StoreMissing && !e.detail.contains("mat fabric init") {
         e.detail = format!(
             "{} — run `mat fabric init` to bootstrap the credential store",

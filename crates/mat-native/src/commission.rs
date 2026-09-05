@@ -326,7 +326,7 @@ fn pick_by_short(
 ///
 /// ネットワークに触れないため（KVS の読み書きのみ）ユニットテスト可能 —
 /// `commission()` 全体を走らせると mDNS に出てしまうのでここへ切り出した。
-fn resolve_ipk_epoch(
+pub(crate) fn resolve_ipk_epoch(
     main_ini: &std::path::Path,
     fabric_index: u8,
     creds: &fabric::FabricCredentials,

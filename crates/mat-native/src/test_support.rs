@@ -142,19 +142,25 @@ impl crate::SubscribeConn for FakeSubConn {
 pub struct FakeConn {
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
+    /// `fail_first_send`（常に 0 回目）より汎用: `sent` カウンタが指す送信系
+    /// 呼び出し（read_onoff/invoke/write_tlv 共通、0-indexed）のうち、この
+    /// 番号の呼び出しだけを `fail_kind` で失敗させる。特定ステップだけ落として
+    /// 前段は成功させたいテスト向け（例: KeySetWrite は通し group-key-map
+    /// write だけ失敗させる）。
+    pub fail_at: Option<usize>,
     pub sent: usize,
-    reads: HashMap<(u16, u32, u32), serde_json::Value>,
-    clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
+    pub reads: HashMap<(u16, u32, u32), serde_json::Value>,
+    pub clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
     /// `invoke_for_data(endpoint, cluster, command)` の応答 CommandFields TLV
     /// プリセット（`with_invoke_response` で流し込む）。未登録は空 Vec。
-    invoke_responses: HashMap<(u16, u32, u32), Vec<u8>>,
+    pub invoke_responses: HashMap<(u16, u32, u32), Vec<u8>>,
     /// `invoke`/`write_tlv` の呼び出し記録（M8a Task9）。順序・宛先の検証用
     /// — `"invoke(ep,0xCCCC,0xCCCC)"` / `"write_tlv(ep,0xCCCC,0xCCCC)"` 形
     /// （cluster/command/attribute は `{:#06X}` — 4桁ゼロ埋め大文字 hex）。
-    calls: Vec<String>,
+    pub calls: Vec<String>,
     /// `write_tlv` の TLV ペイロード記録（M8a Task9）: (endpoint, cluster, attribute, tlv_bytes)。
     /// group-key-map マージ検証用。
-    written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
+    pub written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
     /// 送信系メソッド冒頭の遅延（deadline 執行テスト用、Issue #16）。None = 遅延なし。
     pub delay: Option<std::time::Duration>,
     /// `close()` の呼び出し回数。establisher へ渡してしまい conn 自体への参照が
@@ -168,6 +174,7 @@ impl Default for FakeConn {
         Self {
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
+            fail_at: None,
             sent: 0,
             reads: HashMap::new(),
             clusters: HashMap::new(),
@@ -245,7 +252,7 @@ impl NodeConn for FakeConn {
         }
         let n = self.sent;
         self.sent += 1;
-        if self.fail_first_send && n == 0 {
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         Ok(true)
@@ -260,6 +267,11 @@ impl NodeConn for FakeConn {
     ) -> Result<(), MatError> {
         if let Some(d) = self.delay {
             tokio::time::sleep(d).await;
+        }
+        let n = self.sent;
+        self.sent += 1;
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
+            return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         self.calls
             .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
@@ -329,7 +341,7 @@ impl NodeConn for FakeConn {
         }
         let n = self.sent;
         self.sent += 1;
-        if self.fail_first_send && n == 0 {
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         self.calls.push(format!(

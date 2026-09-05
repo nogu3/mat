@@ -725,6 +725,90 @@ fn fabric_list_without_kvs_exits_10() {
         .stderr(predicate::str::contains("fabric init"));
 }
 
+// ── fabric rotate-ipk（Task6）─────────────────────────────────────────────
+
+#[test]
+fn fabric_rotate_ipk_rejects_catch_up_with_abort() {
+    // clap の conflicts_with レベル（バックエンド不到達）— store は使わない。
+    let dir = TempDir::new().unwrap();
+    mat(dir.path())
+        .args(["fabric", "rotate-ipk", "--catch-up", "--abort"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn fabric_rotate_ipk_unknown_node_is_exit_11() {
+    // fabric init 済みだが台帳に無い node id → node_not_commissioned（exit 11）。
+    let dir = TempDir::new().unwrap();
+    mat(dir.path()).args(["fabric", "init"]).assert().success();
+    mat(dir.path())
+        .args(["fabric", "rotate-ipk", "--nodes", "99"])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+#[test]
+fn fabric_rotate_ipk_with_no_nodes_rotates_locally_and_list_shows_state() {
+    let dir = TempDir::new().unwrap();
+    mat(dir.path()).args(["fabric", "init"]).assert().success();
+    // 台帳が空 → 配布相手無しで即 commit。
+    let out = mat(dir.path())
+        .args(["fabric", "rotate-ipk"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["status"], "rotated");
+    assert_eq!(body["nodes"], serde_json::json!([]));
+    assert!(body["timestamp"].is_string());
+    // --catch-up は prev があるので通る（ノード 0 件）。
+    let out = mat(dir.path())
+        .args(["fabric", "rotate-ipk", "--catch-up"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["status"], "caught_up");
+    // --abort は pending 無し → idle。
+    let out = mat(dir.path())
+        .args(["fabric", "rotate-ipk", "--abort"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["status"], "idle");
+    // fabric list に pending フラグ。
+    let out = mat(dir.path()).args(["fabric", "list"]).output().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["fabrics"][0]["ipk_rotation_pending"], false);
+    assert_eq!(body["fabrics"][0]["ipk_epoch"], "mat");
+}
+
+#[test]
+fn fabric_rotate_ipk_forced_matd_is_exit_2() {
+    // `--matd` は末尾に置く（値省略の 0..=1 num_args のため、subcommand の前だと
+    // 次のトークンを値として食ってしまう — 既存の unpair テストと同じ配置）。
+    let dir = TempDir::new().unwrap();
+    mat(dir.path())
+        .env_remove("MAT_MATD")
+        .args(["fabric", "rotate-ipk", "--matd"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "does not support the `fabric` subcommand",
+        ));
+}
+
 // ── group list（M8c-3 Task10: ローカル完結、iface/matd 不到達）────────────
 
 #[test]
