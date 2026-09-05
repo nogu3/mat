@@ -861,169 +861,7 @@ impl Runtime {
                         Ok(v) => v,
                         Err(_) => continue, // best-effort responder — a transient recv error isn't fatal
                     };
-                    let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-                        tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
-                        continue;
-                    };
-                    if header.security_flags & SESSION_TYPE_MASK != 0 {
-                        tracing::debug!(peer = %peer, security_flags = header.security_flags, "group-session datagram on the unicast socket dropped (the group socket serves those)");
-                        continue;
-                    }
-                    if header.session_id == 0 && header.security_flags == 0 {
-                        let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-                            tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
-                            continue;
-                        };
-                        if !proto.initiator {
-                            tracing::debug!(
-                                peer = %peer,
-                                exchange_id = proto.exchange_id,
-                                opcode = format_args!("0x{:02X}", proto.opcode),
-                                "unsecured datagram dropped: not an initiator message"
-                            );
-                            continue;
-                        }
-                        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-                        {
-                            tracing::debug!(
-                                peer = %peer,
-                                exchange_id = proto.exchange_id,
-                                "unsecured datagram dropped: standalone MRP ack (no session to route it to)"
-                            );
-                            continue;
-                        }
-                        let first = mat_controller::exchange::IncomingMessage {
-                            header,
-                            proto,
-                            payload: buf[off + body_off..n].to_vec(),
-                        };
-                        let flow = classify_unsecured(proto.protocol_id, proto.opcode);
-                        tracing::debug!(
-                            opcode = format_args!("0x{:02X}", proto.opcode),
-                            protocol_id = format_args!("0x{:04X}", proto.protocol_id),
-                            exchange_id = proto.exchange_id,
-                            peer = %peer,
-                            peer_node_id = ?header.source_node_id,
-                            ?flow,
-                            "unsecured datagram received"
-                        );
-                        let Some(flow) = admit_unsecured(flow, self.state.window.is_open()) else {
-                            tracing::debug!(
-                                peer = %peer,
-                                exchange_id = proto.exchange_id,
-                                "PASE datagram dropped: commissioning window closed"
-                            );
-                            continue;
-                        };
-                        match flow {
-                            UnsecuredFlow::Pase => {
-                                let local_session_id = random_session_id();
-                                let outcome = crate::net::pase::drive_established(
-                                    &self.transport,
-                                    peer,
-                                    first,
-                                    pase_config_for_window(
-                                        &self.state.window,
-                                        self.state.config.passcode,
-                                        &self.pase_salt,
-                                        local_session_id,
-                                    ),
-                                )
-                                .await;
-                                match outcome {
-                                    Ok((keys, peer_session_id)) => {
-                                        tracing::debug!(
-                                            local_session_id,
-                                            peer_session_id,
-                                            peer = %peer,
-                                            "PASE established"
-                                        );
-                                        let session = SecureSession::new_device_role(
-                                            Arc::clone(&self.transport),
-                                            peer,
-                                            local_session_id,
-                                            peer_session_id,
-                                            keys,
-                                            0, // PASE: both sides are node id 0 (spec §4.13)
-                                            0,
-                                        );
-                                        self.current_session = Some((local_session_id, session, 0)); // PASE: no fabric yet
-                                        self.state.subscription = None; // belonged to the replaced session
-                                    }
-                                    // Established failure: best-effort responder, nothing
-                                    // more to do — the initiator's own retry/StatusReport
-                                    // handling covers it (logged so a failing
-                                    // interop run says *where* it stopped).
-                                    Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
-                                }
-                            }
-                            UnsecuredFlow::Case => {
-                                let local_session_id = random_session_id();
-                                let fabrics = self.state.comm_server.fabrics();
-                                let outcome = crate::net::case::drive_established(
-                                    Arc::clone(&self.transport),
-                                    peer,
-                                    first,
-                                    fabrics,
-                                    local_session_id,
-                                )
-                                .await;
-                                match outcome {
-                                    Ok((session, fabric_index)) => {
-                                        tracing::debug!(
-                                            local_session_id,
-                                            fabric_index,
-                                            peer = %peer,
-                                            "CASE established"
-                                        );
-                                        self.current_session =
-                                            Some((local_session_id, session, fabric_index));
-                                        self.state.subscription = None; // belonged to the replaced session
-                                    }
-                                    Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
-                                }
-                            }
-                            UnsecuredFlow::Ignore => {}
-                        }
-                        continue;
-                    }
-
-                    // Secured traffic: only ever the current session (sequential,
-                    // one-at-a-time — see module doc).
-                    let Some((sid, session, fabric_index)) = self.current_session.as_mut() else {
-                        tracing::debug!(
-                            session_id = header.session_id,
-                            peer = %peer,
-                            "secured datagram dropped: no session established"
-                        );
-                        continue;
-                    };
-                    if header.session_id != *sid {
-                        tracing::debug!(
-                            session_id = header.session_id,
-                            current_session_id = *sid,
-                            peer = %peer,
-                            "secured datagram dropped: session id does not match the current session"
-                        );
-                        continue;
-                    }
-                    let outcome = serve_secured(
-                        &buf[..n],
-                        peer,
-                        session,
-                        *fabric_index,
-                        &mut self.state.serve_state(),
-                    )
-                    .await;
-                    // Task 6: a `RemoveFabric` that removed this session's own
-                    // fabric — `session`/`fabric_index` (borrowed out of
-                    // `current_session` above) are no longer used past this
-                    // point in this iteration, so this is the first place the
-                    // borrow checker lets `current_session` be reassigned.
-                    if outcome == ServeOutcome::DropSession {
-                        self.current_session = None;
-                    }
+                    self.on_unicast_datagram(&buf[..n], peer).await;
                 }
                 () = mdns_retry_deadline(&self.mdns_retry) => self.on_mdns_retry().await,
                 () = subscription_deadline(&self.state.subscription) => {
@@ -1085,6 +923,212 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// One datagram off the unicast socket: decode the message header,
+    /// drop group-session traffic (the group socket serves those), then
+    /// route unsecured traffic to `on_unsecured_datagram` and secured
+    /// traffic to the current session.
+    async fn on_unicast_datagram(&mut self, datagram: &[u8], peer: SocketAddr) {
+        let n = datagram.len();
+        let Ok((header, off)) = MessageHeader::decode(datagram) else {
+            tracing::debug!(peer = %peer, len = n, "datagram dropped: header decode failed");
+            return;
+        };
+        if header.security_flags & SESSION_TYPE_MASK != 0 {
+            tracing::debug!(peer = %peer, security_flags = header.security_flags, "group-session datagram on the unicast socket dropped (the group socket serves those)");
+            return;
+        }
+        if header.session_id == 0 && header.security_flags == 0 {
+            self.on_unsecured_datagram(header, &datagram[off..], peer)
+                .await;
+            return;
+        }
+
+        // Secured traffic: only ever the current session (sequential,
+        // one-at-a-time — see module doc).
+        let Some((sid, session, fabric_index)) = self.current_session.as_mut() else {
+            tracing::debug!(
+                session_id = header.session_id,
+                peer = %peer,
+                "secured datagram dropped: no session established"
+            );
+            return;
+        };
+        if header.session_id != *sid {
+            tracing::debug!(
+                session_id = header.session_id,
+                current_session_id = *sid,
+                peer = %peer,
+                "secured datagram dropped: session id does not match the current session"
+            );
+            return;
+        }
+        let outcome = serve_secured(
+            datagram,
+            peer,
+            session,
+            *fabric_index,
+            &mut self.state.serve_state(),
+        )
+        .await;
+        // Task 6: a `RemoveFabric` that removed this session's own
+        // fabric — `session`/`fabric_index` (borrowed out of
+        // `current_session` above) are no longer used past this
+        // point in this iteration, so this is the first place the
+        // borrow checker lets `current_session` be reassigned.
+        if outcome == ServeOutcome::DropSession {
+            self.current_session = None;
+        }
+    }
+
+    /// An unsecured (`session_id == 0`) datagram: decode the protocol
+    /// header, drop what can't start a session (non-initiator, standalone
+    /// ack), classify (`classify_unsecured`) and admit (`admit_unsecured`)
+    /// it, then hand a PASE/CASE opener to `establish_session`. `body` is
+    /// the datagram from the protocol header onward (`MessageHeader::
+    /// decode`'s `off`).
+    async fn on_unsecured_datagram(
+        &mut self,
+        header: MessageHeader,
+        body: &[u8],
+        peer: SocketAddr,
+    ) {
+        let Ok((proto, body_off)) = ProtocolHeader::decode(body) else {
+            tracing::debug!(peer = %peer, "unsecured datagram dropped: protocol header decode failed");
+            return;
+        };
+        if !proto.initiator {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                opcode = format_args!("0x{:02X}", proto.opcode),
+                "unsecured datagram dropped: not an initiator message"
+            );
+            return;
+        }
+        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
+            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
+        {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                "unsecured datagram dropped: standalone MRP ack (no session to route it to)"
+            );
+            return;
+        }
+        let first = mat_controller::exchange::IncomingMessage {
+            header,
+            proto,
+            payload: body[body_off..].to_vec(),
+        };
+        let flow = classify_unsecured(proto.protocol_id, proto.opcode);
+        tracing::debug!(
+            opcode = format_args!("0x{:02X}", proto.opcode),
+            protocol_id = format_args!("0x{:04X}", proto.protocol_id),
+            exchange_id = proto.exchange_id,
+            peer = %peer,
+            peer_node_id = ?header.source_node_id,
+            ?flow,
+            "unsecured datagram received"
+        );
+        let Some(flow) = admit_unsecured(flow, self.state.window.is_open()) else {
+            tracing::debug!(
+                peer = %peer,
+                exchange_id = proto.exchange_id,
+                "PASE datagram dropped: commissioning window closed"
+            );
+            return;
+        };
+        self.establish_session(flow, first, peer).await;
+    }
+
+    /// Session establishment: drive one PASE (`net::pase`) or CASE
+    /// (`net::case`) handshake to completion for `first`, the opener just
+    /// received, and on success make the result the current session
+    /// (`install_session`). `UnsecuredFlow::Ignore` is a no-op.
+    async fn establish_session(
+        &mut self,
+        flow: UnsecuredFlow,
+        first: mat_controller::exchange::IncomingMessage,
+        peer: SocketAddr,
+    ) {
+        match flow {
+            UnsecuredFlow::Pase => {
+                let local_session_id = random_session_id();
+                let outcome = crate::net::pase::drive_established(
+                    &self.transport,
+                    peer,
+                    first,
+                    pase_config_for_window(
+                        &self.state.window,
+                        self.state.config.passcode,
+                        &self.pase_salt,
+                        local_session_id,
+                    ),
+                )
+                .await;
+                match outcome {
+                    Ok((keys, peer_session_id)) => {
+                        tracing::debug!(
+                            local_session_id,
+                            peer_session_id,
+                            peer = %peer,
+                            "PASE established"
+                        );
+                        let session = SecureSession::new_device_role(
+                            Arc::clone(&self.transport),
+                            peer,
+                            local_session_id,
+                            peer_session_id,
+                            keys,
+                            0, // PASE: both sides are node id 0 (spec §4.13)
+                            0,
+                        );
+                        self.install_session(local_session_id, session, 0); // PASE: no fabric yet
+                    }
+                    // Established failure: best-effort responder, nothing
+                    // more to do — the initiator's own retry/StatusReport
+                    // handling covers it (logged so a failing
+                    // interop run says *where* it stopped).
+                    Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
+                }
+            }
+            UnsecuredFlow::Case => {
+                let local_session_id = random_session_id();
+                let fabrics = self.state.comm_server.fabrics();
+                let outcome = crate::net::case::drive_established(
+                    Arc::clone(&self.transport),
+                    peer,
+                    first,
+                    fabrics,
+                    local_session_id,
+                )
+                .await;
+                match outcome {
+                    Ok((session, fabric_index)) => {
+                        tracing::debug!(
+                            local_session_id,
+                            fabric_index,
+                            peer = %peer,
+                            "CASE established"
+                        );
+                        self.install_session(local_session_id, session, fabric_index);
+                    }
+                    Err(e) => tracing::debug!(error = %e, peer = %peer, "CASE failed"),
+                }
+            }
+            UnsecuredFlow::Ignore => {}
+        }
+    }
+
+    /// Makes `session` the current session, replacing whatever was there.
+    /// The active subscription (if any) belonged to the replaced session
+    /// and is dropped with it — its reports could only ever have gone out
+    /// over that session.
+    fn install_session(&mut self, local_session_id: u16, session: SecureSession, fabric_index: u8) {
+        self.current_session = Some((local_session_id, session, fabric_index));
+        self.state.subscription = None;
     }
 
     /// The mDNS retry timer fired (`MdnsRetry`): try `bring_up_mdns` again.
