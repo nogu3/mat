@@ -198,12 +198,13 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         .strip_prefix("hex:")
         .ok_or("bytes value must use hex: prefix")?;
     if h.len() % 2 != 0 {
-        return Err(format!("odd-length hex literal: {s:?}"));
+        return Err(format!("odd-length hex literal: {}", short_literal(s)));
     }
     (0..h.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| format!("invalid hex literal: {s:?}"))
+            u8::from_str_radix(&h[i..i + 2], 16)
+                .map_err(|_| format!("invalid hex literal: {}", short_literal(s)))
         })
         .collect()
 }
@@ -213,7 +214,7 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 fn parse_finite_f64(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(f) if f.is_finite() => Ok(f),
-        _ => Err(format!("not a finite float literal: {s:?}")),
+        _ => Err(format!("not a finite float literal: {}", short_literal(s))),
     }
 }
 
@@ -245,17 +246,38 @@ pub fn parse_value_typed(input: &str, ty: &Ty) -> Result<ArgValue, String> {
     }
 }
 
-/// parse_error detail に埋める JSON の短縮形。巨大な list / struct 入力を丸ごと
-/// 写すと stderr が膨らむので、先頭 `MAX` 文字 + 全長だけ残す。
-fn short_json(j: &serde_json::Value) -> String {
-    const MAX: usize = 80;
-    let s = j.to_string();
-    let len = s.chars().count();
-    if len <= MAX {
-        return s;
+/// parse_error detail に写す入力の上限（bytes）。巨大な list / struct や
+/// 長いリテラルを丸ごと写すと stderr が膨らむので、先頭だけ + 全長を残す。
+const DETAIL_ECHO_MAX_BYTES: usize = 80;
+
+/// `s` が上限を超えていれば、文字境界に丸めた先頭部分を返す。
+fn echo_head(s: &str) -> Option<&str> {
+    if s.len() <= DETAIL_ECHO_MAX_BYTES {
+        return None;
     }
-    let head: String = s.chars().take(MAX).collect();
-    format!("{head}… ({len} chars)")
+    let mut cut = DETAIL_ECHO_MAX_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(&s[..cut])
+}
+
+/// detail に埋める JSON の短縮形（先頭 [`DETAIL_ECHO_MAX_BYTES`] + 全長）。
+fn short_json(j: &serde_json::Value) -> String {
+    let s = j.to_string();
+    match echo_head(&s) {
+        None => s,
+        Some(head) => format!("{head}… ({} bytes)", s.len()),
+    }
+}
+
+/// detail に埋めるスカラーリテラルの短縮形。短ければ従来どおり Debug 引用、
+/// 長ければ引用した先頭 + 全長。
+fn short_literal(s: &str) -> String {
+    match echo_head(s) {
+        None => format!("{s:?}"),
+        Some(head) => format!("{head:?}… ({} bytes)", s.len()),
+    }
 }
 
 /// JSON を型記述で検査しつつ値ツリーへ。`at` はエラー位置（`value[0].targets` 等）。
@@ -389,15 +411,15 @@ fn parse_scalar_literal(s: &str, ty: TypeTag) -> Result<ArgValue, String> {
         TypeTag::Bool => match s {
             "true" | "1" => Ok(ArgValue::Bool(true)),
             "false" | "0" => Ok(ArgValue::Bool(false)),
-            _ => Err(format!("not a bool literal: {s:?}")),
+            _ => Err(format!("not a bool literal: {}", short_literal(s))),
         },
         TypeTag::UInt => parse_num(s)
             .map(ArgValue::UInt)
-            .ok_or(format!("not an unsigned integer: {s:?}")),
+            .ok_or_else(|| format!("not an unsigned integer: {}", short_literal(s))),
         TypeTag::Int => s
             .parse::<i64>()
             .map(ArgValue::Int)
-            .map_err(|_| format!("not an integer: {s:?}")),
+            .map_err(|_| format!("not an integer: {}", short_literal(s))),
         TypeTag::F32 => parse_finite_f64(s).and_then(|f| to_finite_f32(f).map(ArgValue::F32)),
         TypeTag::F64 => parse_finite_f64(s).map(ArgValue::F64),
         TypeTag::Str => Ok(ArgValue::Str(s.to_string())),
@@ -1203,9 +1225,46 @@ mod tests {
         let err = parse_value_typed(&big, &acl.ty).unwrap_err();
         assert!(err.contains("expected a JSON array"), "{err}");
         assert!(err.len() < 200, "detail not truncated: {} chars", err.len());
-        assert!(err.contains("… (2008 chars)"), "{err}");
+        assert!(err.contains("… (2008 bytes)"), "{err}");
         // 短い入力はそのまま。
         let err = parse_value_typed("{}", &acl.ty).unwrap_err();
         assert!(err.ends_with("got {}"), "{err}");
+    }
+
+    #[test]
+    fn parse_value_typed_shape_errors_truncate_by_bytes_on_a_char_boundary() {
+        // 上限は bytes 基準（マルチバイトで detail が伸びない）、切断は文字境界。
+        let acl = resolve_attribute(0x001F, "acl").unwrap().def.unwrap();
+        // 3 バイト × 100。空白なしのコンパクト形 = detail に写される serde の出力と同じ。
+        let big = format!("{{\"x\":\"{}\"}}", "あ".repeat(100));
+        let err = parse_value_typed(&big, &acl.ty).unwrap_err();
+        let head = err.split("got ").nth(1).unwrap().split('…').next().unwrap();
+        assert!(head.len() <= 80, "head is {} bytes: {err}", head.len());
+        assert!(head.ends_with('あ'), "cut mid-char: {head:?}");
+        assert!(err.contains(&format!("… ({} bytes)", big.len())), "{err}");
+    }
+
+    #[test]
+    fn scalar_literal_errors_truncate_the_offending_literal() {
+        // リテラル echo（`not a bool literal: ...` 等）も同じ長さ制限。
+        let big = "x".repeat(2000);
+        for (ty, prefix) in [
+            (TypeTag::Bool, "not a bool literal: "),
+            (TypeTag::UInt, "not an unsigned integer: "),
+            (TypeTag::Int, "not an integer: "),
+            (TypeTag::F64, "not a finite float literal: "),
+        ] {
+            let err = parse_value_typed(&big, &Ty::Scalar(ty)).unwrap_err();
+            assert!(err.starts_with(prefix), "{err}");
+            assert!(err.len() < 200, "detail not truncated: {} bytes", err.len());
+            assert!(err.contains("… (2000 bytes)"), "{err}");
+        }
+        let hex = format!("hex:{}", "z".repeat(2000));
+        let err = parse_value_typed(&hex, &Ty::Scalar(TypeTag::Bytes)).unwrap_err();
+        assert!(err.starts_with("invalid hex literal: "), "{err}");
+        assert!(err.len() < 200, "{err}");
+        // 短い入力は従来どおり Debug 引用のまま。
+        let err = parse_value_typed("maybe", &Ty::Scalar(TypeTag::Bool)).unwrap_err();
+        assert_eq!(err, "not a bool literal: \"maybe\"");
     }
 }
