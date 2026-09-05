@@ -864,53 +864,7 @@ impl Runtime {
                     self.on_unicast_datagram(&buf[..n], peer).await;
                 }
                 () = mdns_retry_deadline(&self.mdns_retry) => self.on_mdns_retry().await,
-                () = subscription_deadline(&self.state.subscription) => {
-                    // The active subscription is due for a report: the dirty
-                    // attributes' current values, or an empty keep-alive. Both
-                    // go out on a fresh device-initiated exchange and both must
-                    // be acknowledged — anything else drops the subscription
-                    // (`send_subscription_report`'s doc comment).
-                    //
-                    // No reentrancy hazard against the datagram branch above:
-                    // `select!` runs exactly one branch to completion per
-                    // iteration, so while this one awaits its StatusResponse it
-                    // is `SecureSession`'s own socket read — not the loop's —
-                    // that consumes datagrams. Requests arriving meanwhile are
-                    // buffered by `screen_with` and served by the drain below,
-                    // exactly like the ones landing during a reply's ack-wait.
-                    let delivered = match (self.state.subscription.as_mut(), self.current_session.as_mut()) {
-                        (Some(sub), Some((_, session, fabric_index))) => {
-                            send_subscription_report(session, *fabric_index, &mut self.state.node, sub).await
-                        }
-                        // A subscription that outlived its session has nothing
-                        // to report over — drop it.
-                        _ => false,
-                    };
-                    if !delivered {
-                        tracing::debug!(
-                            subscription_id = self.state.subscription.as_ref().map(|s| s.id),
-                            "subscription dropped: report was not acknowledged"
-                        );
-                        self.state.subscription = None;
-                    }
-                    let mut drop_session = false;
-                    if let Some((_, session, fabric_index)) = self.current_session.as_mut() {
-                        drop_session = drain_buffered_requests(
-                            session,
-                            *fabric_index,
-                            &mut self.state.serve_state(),
-                        )
-                        .await
-                            == ServeOutcome::DropSession;
-                    }
-                    // Task 6: same reasoning as the datagram branch above — a
-                    // buffered `RemoveFabric` piggybacked on this session's own
-                    // fabric ends the session too, not just one arriving as a
-                    // fresh datagram.
-                    if drop_session {
-                        self.current_session = None;
-                    }
-                }
+                () = subscription_deadline(&self.state.subscription) => self.on_subscription_due().await,
                 () = commissioning_window_deadline(&self.state.window) => {
                     self.on_commissioning_window_expired().await
                 }
@@ -922,6 +876,58 @@ impl Runtime {
                     self.on_group_datagram(&gbuf[..n], from);
                 }
             }
+        }
+    }
+
+    /// The active subscription's report deadline: send the dirty
+    /// attributes (or an empty keep-alive) on a device-initiated exchange,
+    /// drop the subscription if the report isn't acknowledged, then serve
+    /// whatever requests were buffered during that ack-wait.
+    async fn on_subscription_due(&mut self) {
+        // The active subscription is due for a report: the dirty
+        // attributes' current values, or an empty keep-alive. Both
+        // go out on a fresh device-initiated exchange and both must
+        // be acknowledged — anything else drops the subscription
+        // (`send_subscription_report`'s doc comment).
+        //
+        // No reentrancy hazard against the datagram branch above:
+        // `select!` runs exactly one branch to completion per
+        // iteration, so while this one awaits its StatusResponse it
+        // is `SecureSession`'s own socket read — not the loop's —
+        // that consumes datagrams. Requests arriving meanwhile are
+        // buffered by `screen_with` and served by the drain below,
+        // exactly like the ones landing during a reply's ack-wait.
+        let delivered = match (
+            self.state.subscription.as_mut(),
+            self.current_session.as_mut(),
+        ) {
+            (Some(sub), Some((_, session, fabric_index))) => {
+                send_subscription_report(session, *fabric_index, &mut self.state.node, sub).await
+            }
+            // A subscription that outlived its session has nothing
+            // to report over — drop it.
+            _ => false,
+        };
+        if !delivered {
+            tracing::debug!(
+                subscription_id = self.state.subscription.as_ref().map(|s| s.id),
+                "subscription dropped: report was not acknowledged"
+            );
+            self.state.subscription = None;
+        }
+        let mut drop_session = false;
+        if let Some((_, session, fabric_index)) = self.current_session.as_mut() {
+            drop_session =
+                drain_buffered_requests(session, *fabric_index, &mut self.state.serve_state())
+                    .await
+                    == ServeOutcome::DropSession;
+        }
+        // Task 6: same reasoning as the datagram branch above — a
+        // buffered `RemoveFabric` piggybacked on this session's own
+        // fabric ends the session too, not just one arriving as a
+        // fresh datagram.
+        if drop_session {
+            self.current_session = None;
         }
     }
 
@@ -945,6 +951,21 @@ impl Runtime {
             return;
         }
 
+        self.on_secured_datagram(datagram, &header, peer).await;
+    }
+
+    /// IM dispatch for one secured datagram: it must belong to the current
+    /// session (sequential, one-at-a-time — see module doc), then
+    /// `serve_secured` decrypts/screens it, serves the Interaction Model
+    /// request, and drains any cross-exchange requests buffered meanwhile.
+    /// A `RemoveFabric` that removed this session's own fabric ends the
+    /// session (Task 6).
+    async fn on_secured_datagram(
+        &mut self,
+        datagram: &[u8],
+        header: &MessageHeader,
+        peer: SocketAddr,
+    ) {
         // Secured traffic: only ever the current session (sequential,
         // one-at-a-time — see module doc).
         let Some((sid, session, fabric_index)) = self.current_session.as_mut() else {
