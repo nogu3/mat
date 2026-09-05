@@ -56,11 +56,14 @@ pub fn encode_move_to_level_fields(level: u8, transition_time_ds: u16) -> Vec<u8
     w.finish()
 }
 
-/// `KeySetWrite` CommandFields（spec §11.2.8.1）: `{0: GroupKeySet{0: id, 1: policy
-/// TrustFirst, 2/3: epochKey0/start0, 4/5: key1/start1, 6/7: key2/start2}}`。
-/// `epochs` は (epoch_key, start_time) を 1〜3 本 — start_time は呼び手が単調増加
-/// かつ非 0 を保証する（`EpochStartTime0 == 0` はデバイス側で INVALID_COMMAND）。
-/// 無い本数は null。4 本以上は呼び手のバグ（debug_assert、release は先頭 3 本）。
+/// CommandFields for GroupKeyManagement KeySetWrite (cluster spec §11.2.8.1):
+/// `{0: GroupKeySetStruct{0: GroupKeySetID(u16), 1: GroupKeySecurityPolicy(0
+/// = TrustFirst), 2: EpochKey0(16B octstr), 3: EpochStartTime0(u64, epoch-us),
+/// 4: EpochKey1(octstr or null), 5: EpochStartTime1(u64 or null), 6/7: key2/start2}}`.
+/// `epochs` contains (epoch_key, start_time) tuples; caller must ensure 1..=3 tuples with
+/// monotonic, non-zero start_time (EpochStartTime0 == 0 is INVALID_COMMAND on the device).
+/// Missing epochs are filled with null. 4+ epochs is a caller bug (debug_assert; release
+/// uses first 3).
 pub fn encode_key_set_write_fields_multi(keyset_id: u16, epochs: &[([u8; 16], u64)]) -> Vec<u8> {
     debug_assert!(
         (1..=3).contains(&epochs.len()),
@@ -90,8 +93,10 @@ pub fn encode_key_set_write_fields_multi(keyset_id: u16, epochs: &[([u8; 16], u6
     w.finish()
 }
 
-/// epoch key 1 本（EpochStartTime0 = 1）の `KeySetWrite`。`group provision` が使う
-/// 形で、[`encode_key_set_write_fields_multi`] の 1 本版。
+/// Single-epoch form of [`encode_key_set_write_fields_multi`] with EpochStartTime0 = 1.
+/// Used by `group provision`. **Important:** the value 1 must remain in sync with
+/// `mat_core::group::EPOCH_START_TIME`, which the controller-side
+/// `groupsettings add-keysets` validity time must also match.
 pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
     encode_key_set_write_fields_multi(keyset_id, &[(*epoch_key, 1)])
 }
