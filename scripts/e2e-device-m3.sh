@@ -11,8 +11,11 @@
 # commissioned node, asserting `status:"provisioned"` (the KeySetWrite +
 # group-key-map write + AddGroup + ACL write sequence actually lands on
 # matv) -> `mat group list`, asserting the provisioned group shows up in the
-# controller kvs (`mat group remove` is held back — see the comment at that
-# step: matv has no `KeySetRemove`) -> start `matd` against the same store, poll `matd status` until its
+# controller kvs -> `mat group remove` (asserting all four removal steps
+# landed on matv and no groups or non-IPK keysets remain in the controller
+# kvs — keyset 0 itself may or may not be visible in that chain) ->
+# `mat group provision` again -> start `matd` against the same store, poll
+# `matd status` until its
 # resident wildcard Subscribe to node 1 reaches `state:"established"` ->
 # start `mat listen --count 1` in the background -> `mat on` (routed through
 # matd) -> assert the backgrounded `mat listen` received an onoff on-off=true
@@ -229,21 +232,48 @@ d = json.load(sys.stdin)
 assert [g["group_id"] for g in d["groups"]] == ['"$GROUP_ID"'], d
 '
 
-# `mat group remove` はここでは撃てない: matv の GroupKeyManagement は
-# `KeySetWrite` しか実装しておらず（`crates/mat-device/src/core/
-# group_key_management.rs` のモジュール doc に「`KeySetRead`/`KeySetRemove`/
-# `KeySetReadAllIndices` コマンドと永続化は未実装（既知ギャップ）」と明記）、
-# 撤収 4 ステップの最後 `KeySetRemove` が IM status 0x81
-# (UNSUPPORTED_COMMAND) で弾かれる:
-#   {"error":{"detail":"node 1: remove step 'key-set-remove' failed: native:
-#    interaction model error: device rejected command: IM status 0x81",
-#    "kind":"device_rejected"}}
-# デバイス側の既知ギャップであってコントローラ側 `group remove` の不具合では
-# ないため、ここでアサーションを緩めるのではなくステップごと保留する。matv に
-# `KeySetRemove` が実装されたら `mat group remove --group $GROUP_ID --nodes
-# $NODE_ID --endpoint $DEVICE_EP` → `status:"removed"` → `group list` が
-# `groups`/`keysets` とも空、の順で足し直すこと（そのときは以降の matd/listen
-# 脚のために provision し直す必要がある）。
+# 撤収 4 ステップ（ACL Group エントリ除去 → RemoveGroup → group-key-map 除去 →
+# 未参照 keyset の KeySetRemove）が全部 matv に着地することを assert する。
+# matv の KeySetRemove は 2026-09-05 に実装（それ以前は IM 0x81 で保留していた）。
+echo "==> mat group remove (group=$GROUP_ID, node=$NODE_ID, endpoint=$DEVICE_EP)" >&2
+REMOVE_JSON="$(
+    MAT_STORE="$MAT_STORE_DIR" \
+        ./target/release/mat --iface "$IFACE" group remove \
+            --group "$GROUP_ID" --nodes "$NODE_ID" --endpoint "$DEVICE_EP"
+)"
+echo "$REMOVE_JSON"
+[[ "$(json_get status "$REMOVE_JSON")" == "removed" ]]
+printf '%s' "$REMOVE_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+n = d["nodes"][0]
+assert n["node_id"] == '"$NODE_ID"', d
+for k in ("acl_removed", "group_removed", "keymap_removed", "keyset_removed"):
+    assert n[k] is True, (k, d)
+assert d["controller"]["group_removed"] is True, d
+'
+echo "==> PASS: mat group remove reached status=removed (ACL / RemoveGroup / group-key-map / KeySetRemove all landed on matv)" >&2
+
+echo "==> mat group list after remove (controller kvs: no groups, no non-IPK keysets remain (the IPK itself may or may not be visible in this chain))" >&2
+LIST_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat group list)"
+echo "$LIST_JSON" >&2
+printf '%s' "$LIST_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["groups"] == [], d
+assert all(k["keyset_id"] == 0 for k in d["keysets"]), d
+'
+
+# 以降の groupcast / matd / listen 脚のために provision し直す。
+echo "==> mat group provision again (group=$GROUP_ID)" >&2
+GROUP_JSON="$(
+    MAT_STORE="$MAT_STORE_DIR" \
+        ./target/release/mat --iface "$IFACE" group provision \
+            --group "$GROUP_ID" --nodes "$NODE_ID" --endpoint "$DEVICE_EP" --name e2e-group
+)"
+echo "$GROUP_JSON"
+[[ "$(json_get status "$GROUP_JSON")" == "provisioned" ]]
+echo "==> PASS: re-provision after remove reached status=provisioned" >&2
 
 echo "==> mat group invoke (multicast) — group=$GROUP_ID cluster=onoff command=on endpoint=$DEVICE_EP" >&2
 MAT_STORE="$MAT_STORE_DIR" \

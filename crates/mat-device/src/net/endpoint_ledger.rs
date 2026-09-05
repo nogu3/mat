@@ -6,7 +6,10 @@
 //! removed from config are kept as tombstones: re-adding the same id
 //! restores its old endpoint (and the controller's existing pairing/scene
 //! data for that accessory keeps working) instead of colliding with a
-//! newly-issued one.
+//! newly-issued one. Group membership (`groups.json`) is *not* kept for a
+//! tombstoned id: `Device::new` prunes rows whose endpoint is no longer
+//! configured (`GroupMembershipStore::retain_endpoints`), so a re-added
+//! device needs `mat group provision` again.
 
 use std::collections::BTreeMap;
 use std::io;

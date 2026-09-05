@@ -172,6 +172,20 @@ impl GroupMembershipStore {
         guard.members.retain(|m| m.fabric_index != fabric_index);
         Self::save(&guard);
     }
+
+    /// 起動時の掃除: `live` に無い endpoint の行を全 fabric 横断で落とす
+    /// (設定から外した `[[device]]` の残骸 — `Device::new` が台帳の採番を
+    /// 確定した直後に呼ぶ)。返り値は落とした行数。変化があれば save。
+    pub fn retain_endpoints(&self, live: &[u16]) -> usize {
+        let mut guard = self.lock();
+        let before = guard.members.len();
+        guard.members.retain(|m| live.contains(&m.endpoint));
+        let removed = before - guard.members.len();
+        if removed > 0 {
+            Self::save(&guard);
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +308,51 @@ mod tests {
             1,
             "remove_all should save when members are removed"
         );
+    }
+
+    #[test]
+    fn retain_endpoints_drops_rows_of_endpoints_not_listed_across_fabrics() {
+        let s = GroupMembershipStore::new();
+        s.add(1, 10, 2).unwrap();
+        s.add(1, 10, 3).unwrap();
+        s.add(2, 20, 3).unwrap();
+        s.add(1, 11, 4).unwrap();
+        assert_eq!(s.retain_endpoints(&[2, 4]), 2);
+        assert_eq!(s.endpoints_for(1, 10), vec![2]);
+        assert!(s.endpoints_for(2, 20).is_empty());
+        assert_eq!(s.endpoints_for(1, 11), vec![4]);
+        assert_eq!(s.retain_endpoints(&[2, 4]), 0, "idempotent");
+    }
+
+    struct CountingPersist(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl GroupMembershipPersist for CountingPersist {
+        fn save(&self, _: &[GroupMember]) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn load(&self) -> Result<Vec<GroupMember>, String> {
+            Ok(vec![
+                GroupMember {
+                    fabric_index: 1,
+                    group_id: 10,
+                    endpoint: 2,
+                },
+                GroupMember {
+                    fabric_index: 1,
+                    group_id: 10,
+                    endpoint: 3,
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn retain_endpoints_saves_only_when_something_was_dropped() {
+        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = GroupMembershipStore::with_persist(Box::new(CountingPersist(saves.clone())));
+        assert_eq!(s.retain_endpoints(&[2, 3]), 0);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(s.retain_endpoints(&[2]), 1);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

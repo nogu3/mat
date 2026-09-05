@@ -408,7 +408,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = GroupKeyStore::with_persist(Box::new(group_key_store_in_dir(dir.path())));
-            store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+            store.upsert_keyset(1, 42, [7u8; 16], 0).unwrap();
             store.replace_fabric_map(1, vec![(10, 42)]);
         }
         let mode = std::fs::metadata(dir.path().join("group_keys.json"))
@@ -422,7 +422,8 @@ mod tests {
             vec![GroupKeySet {
                 fabric_index: 1,
                 keyset_id: 42,
-                epoch_key0: [7u8; 16]
+                epoch_key0: [7u8; 16],
+                epoch_start_time0: 0
             }]
         );
         assert_eq!(store2.map_entries_for(1), vec![(10, 42)]);

@@ -1,9 +1,13 @@
 //! groupcast 受信（spec §4.15 group session、§8.2.5 group 宛 Invoke）の
 //! 純関数側: header 分類 → 復号候補 (GKH 一致 keyset) の試行復号 →
 //! GroupKeyMap / membership / リプレイ検査 → group InvokeRequest デコード。
+//! P ビット（privacy）付きの datagram は候補 keyset ごとに
+//! `core::group_privacy` で header を復号してから同じ経路を通す。
+//! リプレイ防止は spec §4.5.4.2 の 32 幅 bitmap 窓（`GroupReplayGuard`）。
 //! ソケットと join は `GroupSocket`（同ファイル、Task 7）、Node への適用は
 //! `runtime`。応答は送らない（全 drop は `GroupDrop` で理由を返し、runtime が
 //! debug ログにする）。
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -22,21 +26,67 @@ use crate::core::fabric_store::FabricEntry;
 use crate::core::group_invoke::{decode_group_invoke_request, GroupInvokeIn};
 use crate::core::group_key_management::GroupKeyStore;
 use crate::core::group_membership::GroupMembershipStore;
+use crate::core::group_privacy::deobfuscate_header;
 
 /// security flags の session type（spec §4.4.1.4）: 下位 2 bit、0b01 = group。
 pub const SESSION_TYPE_MASK: u8 = 0x03;
 pub const SESSION_TYPE_GROUP: u8 = 0x01;
-/// P フラグ（privacy 処理済み）— 未対応で drop。
-pub const PRIVACY_FLAG: u8 = 0x80;
+/// P フラグ（privacy 処理済み、spec §4.4.1.4）。
+pub use crate::core::group_privacy::PRIVACY_FLAG;
 /// リプレイ表の上限 `(fabric, source)` 数。超えたら最古を退去。
 pub const REPLAY_TABLE_CAPACITY: usize = 64;
 
-/// spec §4.5.4.2 の group data message counter 検査の簡略版: `(fabric,
-/// source node)` ごとに最終 counter を持ち、それ以下は drop。bitmap window
-/// は持たず順序逆転は捨てる側に倒す（mat は各 egress に同一 datagram を
-/// 流すので、実用上の役目は重複排除）。初見の source は trust-first で受理。
+/// spec §4.5.4.2 の group data message counter 窓幅（SDK
+/// `PeerMessageCounter` の `kChallengeSize`/window と同じ 32）。
+pub const REPLAY_WINDOW: u32 = 32;
+
+/// spec §4.5.4.2 / SDK `PeerMessageCounter::VerifyOrTrustFirstGroup` と同じ
+/// 「最大値 + 直近 32 件の bitmap」: `(fabric, source node)` ごとに `max` と
+/// `window`（bit i = `max - (i + 1)` を受理済み）を持つ。初見の source は
+/// trust-first で受理。前方（`c - max mod 2^32 < 2^31`、rollover 込み）は
+/// 新規として窓をずらし、窓内（1..=32 後方）は bitmap で 1 回だけ受理、
+/// それより過去は拒否。32 以上の前方ジャンプは窓を丸ごとクリアする
+/// （spec §4.5.4.2 / SDK と同じ）ため、新しい窓の中にある未受理カウンタは
+/// 旧 max を含め 1 回だけ受理される。mat/matd は同一 datagram を複数
+/// egress から送る運用のため、窓が 32 以上前方にジャンプした後に届いた
+/// 重複はこの再受理で通ってしまう（spec/SDK と同じ挙動で許容するトレード
+/// オフ、実運用では重複はミリ秒オーダーで届くので実害は薄い）。
 pub struct GroupReplayGuard {
-    seen: VecDeque<((u8, u64), u32)>,
+    seen: VecDeque<((u8, u64), ReplayWindow)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayWindow {
+    max: u32,
+    window: u32,
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, counter: u32) -> bool {
+        if counter == self.max {
+            return false;
+        }
+        let ahead = counter.wrapping_sub(self.max);
+        if ahead < 1 << 31 {
+            self.window = if ahead >= REPLAY_WINDOW {
+                0
+            } else {
+                (self.window << ahead) | (1 << (ahead - 1))
+            };
+            self.max = counter;
+            return true;
+        }
+        let behind = self.max.wrapping_sub(counter);
+        if behind > REPLAY_WINDOW {
+            return false;
+        }
+        let bit = 1u32 << (behind - 1);
+        if self.window & bit != 0 {
+            return false;
+        }
+        self.window |= bit;
+        true
+    }
 }
 
 impl GroupReplayGuard {
@@ -49,16 +99,18 @@ impl GroupReplayGuard {
     pub fn accept(&mut self, fabric_index: u8, source_node_id: u64, counter: u32) -> bool {
         let key = (fabric_index, source_node_id);
         if let Some(pos) = self.seen.iter().position(|(k, _)| *k == key) {
-            if counter <= self.seen[pos].1 {
-                return false;
-            }
-            self.seen[pos].1 = counter;
-            return true;
+            return self.seen[pos].1.accept(counter);
         }
         if self.seen.len() >= REPLAY_TABLE_CAPACITY {
             self.seen.pop_front();
         }
-        self.seen.push_back((key, counter));
+        self.seen.push_back((
+            key,
+            ReplayWindow {
+                max: counter,
+                window: 0,
+            },
+        ));
         true
     }
 }
@@ -79,7 +131,6 @@ pub struct GroupRxDeps<'a> {
 pub enum GroupDrop {
     HeaderDecode,
     NotGroupSession,
-    Privacy,
     NoSource,
     NotGroupDestination,
     NoKeyset { candidates: usize },
@@ -104,19 +155,22 @@ pub fn classify_group_datagram(
     deps: &GroupRxDeps<'_>,
     replay: &mut GroupReplayGuard,
 ) -> Result<GroupInvokeBatch, GroupDrop> {
-    let (header, _) = MessageHeader::decode(buf).map_err(|_| GroupDrop::HeaderDecode)?;
-    if header.security_flags & SESSION_TYPE_MASK != SESSION_TYPE_GROUP {
+    let (wire_header, _) = MessageHeader::decode(buf).map_err(|_| GroupDrop::HeaderDecode)?;
+    if wire_header.security_flags & SESSION_TYPE_MASK != SESSION_TYPE_GROUP {
         return Err(GroupDrop::NotGroupSession);
     }
-    if header.security_flags & PRIVACY_FLAG != 0 {
-        return Err(GroupDrop::Privacy);
+    let privacy = wire_header.security_flags & PRIVACY_FLAG != 0;
+    if !privacy {
+        // 平文 header なら復号前に形を検査できる（drop 理由の順序は従来どおり）。
+        wire_header.source_node_id.ok_or(GroupDrop::NoSource)?;
+        if !matches!(wire_header.destination, Destination::Group(_)) {
+            return Err(GroupDrop::NotGroupDestination);
+        }
     }
-    let source = header.source_node_id.ok_or(GroupDrop::NoSource)?;
-    let Destination::Group(group_id) = header.destination else {
-        return Err(GroupDrop::NotGroupDestination);
-    };
 
     // spec §4.15.3: GKH が一致する keyset を全 fabric から集めて順に試す。
+    // P ビット付き（chip SDK の送信形）は候補ごとに privacy key で header を
+    // 復号してから open_message に渡す（source / destination は復号後の値）。
     let mut candidates = 0usize;
     let mut opened = None;
     for ks in deps.gk_store.keysets() {
@@ -131,16 +185,40 @@ pub fn classify_group_datagram(
             &ks.epoch_key0,
             &compressed_fabric_id(&f.root_public_key, f.fabric_id),
         );
-        if derive_group_session_id(&operational) != header.session_id {
+        if derive_group_session_id(&operational) != wire_header.session_id {
             continue;
         }
         candidates += 1;
-        if let Ok((_, proto, payload)) = open_message(&operational, buf, source) {
-            opened = Some((ks.fabric_index, ks.keyset_id, proto, payload));
+        let dg: Cow<'_, [u8]> = if privacy {
+            match deobfuscate_header(buf, &operational) {
+                Some(plain) => Cow::Owned(plain),
+                None => continue,
+            }
+        } else {
+            Cow::Borrowed(buf)
+        };
+        let Ok((header, _)) = MessageHeader::decode(&dg) else {
+            continue;
+        };
+        let (Some(source), Destination::Group(group_id)) =
+            (header.source_node_id, header.destination)
+        else {
+            continue;
+        };
+        if let Ok((_, proto, payload)) = open_message(&operational, &dg, source) {
+            opened = Some((
+                ks.fabric_index,
+                ks.keyset_id,
+                source,
+                group_id,
+                header.message_counter,
+                proto,
+                payload,
+            ));
             break;
         }
     }
-    let Some((fabric_index, keyset_id, proto, payload)) = opened else {
+    let Some((fabric_index, keyset_id, source, group_id, counter, proto, payload)) = opened else {
         return Err(GroupDrop::NoKeyset { candidates });
     };
     if !deps
@@ -154,7 +232,8 @@ pub fn classify_group_datagram(
     if endpoints.is_empty() {
         return Err(GroupDrop::NoMembers);
     }
-    if !replay.accept(fabric_index, source, header.message_counter) {
+    // 復号後（= 認証後）にリプレイ検査: 偽 datagram で窓を進められないように。
+    if !replay.accept(fabric_index, source, counter) {
         return Err(GroupDrop::Replay);
     }
     if proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL
@@ -351,7 +430,7 @@ mod tests {
 
     fn provisioned() -> (Vec<FabricEntry>, GroupKeyStore, GroupMembershipStore) {
         let gk = GroupKeyStore::new();
-        gk.upsert_keyset(1, 42, EPOCH).unwrap();
+        gk.upsert_keyset(1, 42, EPOCH, 0).unwrap();
         gk.replace_fabric_map(1, vec![(10, 42)]);
         let m = GroupMembershipStore::new();
         m.add(1, 10, 2).unwrap();
@@ -371,6 +450,107 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// P ビット付き datagram を作る（chip SDK と同じ送信形）: security flags
+    /// に PRIVACY_FLAG を立てて封じ、header を難読化する。
+    fn privacy_datagram(f: &FabricEntry, epoch: &[u8; 16], counter: u32, group: u16) -> Vec<u8> {
+        use mat_controller::message::{MessageHeader, ProtocolHeader};
+        let c = creds(f, epoch);
+        let header = MessageHeader {
+            session_id: c.session_id,
+            security_flags: SESSION_TYPE_GROUP | PRIVACY_FLAG,
+            message_counter: counter,
+            source_node_id: Some(SOURCE),
+            destination: Destination::Group(group),
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: im::OPCODE_INVOKE_REQUEST,
+            exchange_id: 0x42,
+            protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+            vendor_id: None,
+        };
+        let payload =
+            im::encode_group_invoke_request(im::CLUSTER_ON_OFF, im::CMD_ON_OFF_TOGGLE, None);
+        let mut dg = mat_controller::crypto::seal_message(
+            &c.encryption_key,
+            &header,
+            &proto,
+            &payload,
+            SOURCE,
+        )
+        .unwrap();
+        assert!(crate::core::group_privacy::obfuscate_header(
+            &mut dg,
+            &c.encryption_key
+        ));
+        dg
+    }
+
+    #[test]
+    fn privacy_flagged_datagram_is_deobfuscated_and_classified_like_plain() {
+        let (fabrics, gk, m) = provisioned();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &gk,
+            membership: &m,
+        };
+        let mut replay = GroupReplayGuard::new();
+        let dg = privacy_datagram(&fabrics[0], &EPOCH, 100, 10);
+        let batch = classify_group_datagram(&dg, &deps, &mut replay).unwrap();
+        assert_eq!(
+            (batch.fabric_index, batch.group_id, batch.source_node_id),
+            (1, 10, SOURCE)
+        );
+        assert_eq!(batch.endpoints, vec![2, 3]);
+        assert_eq!(
+            (batch.invokes[0].cluster, batch.invokes[0].command),
+            (im::CLUSTER_ON_OFF, im::CMD_ON_OFF_TOGGLE)
+        );
+        // 同じ counter の再送は復号後のリプレイ検査で落ちる
+        assert_eq!(
+            classify_group_datagram(&dg, &deps, &mut replay).unwrap_err(),
+            GroupDrop::Replay
+        );
+    }
+
+    #[test]
+    fn privacy_flagged_datagram_with_wrong_or_missing_key_is_no_keyset() {
+        let (fabrics, gk, m) = provisioned();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &gk,
+            membership: &m,
+        };
+        let mut replay = GroupReplayGuard::new();
+        // GKH 不一致（別 epoch）→ 候補ゼロ
+        let other = privacy_datagram(&fabrics[0], &[3u8; 16], 1, 10);
+        assert_eq!(
+            classify_group_datagram(&other, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 0 }
+        );
+        // P を立てたが難読化していない（= 受信側が復号すると header が壊れる）:
+        // 難読化をもう一度当てて平文 header に戻す（CTR は対称）
+        let c = creds(&fabrics[0], &EPOCH);
+        let mut raw = privacy_datagram(&fabrics[0], &EPOCH, 2, 10);
+        assert!(crate::core::group_privacy::obfuscate_header(
+            &mut raw,
+            &c.encryption_key
+        ));
+        assert_eq!(
+            classify_group_datagram(&raw, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 1 }
+        );
+        // 難読化区間を 1 バイト改竄 → 復号後の header/nonce が変わり MIC 不一致
+        raw = privacy_datagram(&fabrics[0], &EPOCH, 3, 10);
+        raw[5] ^= 0x01;
+        assert_eq!(
+            classify_group_datagram(&raw, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 1 }
+        );
     }
 
     #[test]
@@ -442,13 +622,6 @@ mod tests {
             classify_group_datagram(&uni, &deps, &mut replay).unwrap_err(),
             GroupDrop::NotGroupSession
         );
-        // privacy ビット
-        let mut priv_dg = datagram(&fabrics[0], &EPOCH, 51, 10);
-        priv_dg[3] |= PRIVACY_FLAG;
-        assert_eq!(
-            classify_group_datagram(&priv_dg, &deps, &mut replay).unwrap_err(),
-            GroupDrop::Privacy
-        );
         // ゴミ
         assert_eq!(
             classify_group_datagram(&[0u8; 3], &deps, &mut replay).unwrap_err(),
@@ -457,18 +630,98 @@ mod tests {
     }
 
     #[test]
-    fn replay_guard_is_strictly_increasing_per_source_and_bounded() {
+    fn replay_guard_accepts_out_of_order_within_the_window_once() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 10)); // trust-first
+        assert!(g.accept(1, 7, 12));
+        assert!(g.accept(1, 7, 11), "順序逆転は窓内なら通る");
+        assert!(!g.accept(1, 7, 11), "同じ counter の 2 回目は拒否");
+        assert!(!g.accept(1, 7, 12));
+        assert!(!g.accept(1, 7, 10), "trust-first で受理した値もマーク済み");
+        assert!(g.accept(1, 7, 13));
+        assert!(g.accept(2, 7, 1), "another fabric is another window");
+    }
+
+    #[test]
+    fn replay_guard_rejects_counters_older_than_the_window() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(
+            !g.accept(1, 7, 100 - REPLAY_WINDOW - 1),
+            "窓外（33 前）は拒否"
+        );
+        assert!(g.accept(1, 7, 100 - REPLAY_WINDOW), "窓の端（32 前）は通る");
+        assert!(!g.accept(1, 7, 100 - REPLAY_WINDOW), "…が 2 回目は拒否");
+    }
+
+    #[test]
+    fn replay_guard_forward_jump_clears_the_window() {
         let mut g = GroupReplayGuard::new();
         assert!(g.accept(1, 7, 10));
-        assert!(!g.accept(1, 7, 10));
-        assert!(!g.accept(1, 7, 9));
-        assert!(g.accept(1, 7, 11));
-        assert!(g.accept(2, 7, 1), "another fabric is another window");
+        assert!(g.accept(1, 7, 10 + 40)); // max = 50, window cleared
+                                          // 32 より前（33..40 後方）は窓外
+        for c in 10..=17 {
+            assert!(!g.accept(1, 7, c), "counter {c} は新しい窓の外");
+        }
+        // 窓内（1..=32 後方）で未受理なら 1 回だけ通る — 10 は旧 max だったが
+        // ジャンプで窓が消えたので記憶されない（spec §4.5.4.2 / SDK と同じ）
+        for c in 18..=49 {
+            assert!(g.accept(1, 7, c), "counter {c} は窓内で未受理");
+            assert!(!g.accept(1, 7, c), "counter {c} の 2 回目は拒否");
+        }
+        assert!(!g.accept(1, 7, 50));
+        assert!(g.accept(1, 7, 51));
+        assert!(
+            !g.accept(1, 7, 50),
+            "51 へ 1 進んだ窓では 50 は受理済み bit"
+        );
+    }
+
+    #[test]
+    fn replay_guard_jump_of_exactly_window_clears_and_of_one_less_keeps_a_bit() {
+        // ahead == REPLAY_WINDOW (32) は「窓をクリア」の閾値そのもの: 旧 max
+        // (100) はどのビットにも残らないので、32 前へ戻った 100 は再受理できる。
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(g.accept(1, 7, 132), "32 進んだジャンプは窓をクリアする");
+        assert!(
+            g.accept(1, 7, 100),
+            "32 前（クリアされた窓の外）は未受理として通る"
+        );
+
+        // ahead == REPLAY_WINDOW - 1 (31) はクリア閾値の 1 手前: 旧 max (100)
+        // は新しい窓の bit 30 として残るので、31 前へ戻った 100 は拒否される。
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(g.accept(1, 7, 131), "31 進んだジャンプは窓をシフトするだけ");
+        assert!(
+            !g.accept(1, 7, 100),
+            "31 前（旧 max として窓内に残っている）は拒否される"
+        );
+    }
+
+    #[test]
+    fn replay_guard_handles_rollover_as_forward_motion() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 0xFFFF_FFF0));
+        assert!(g.accept(1, 7, 5), "2^31 未満の前進は rollover でも新規");
+        assert!(!g.accept(1, 7, 0xFFFF_FFF0), "旧 max は窓内でマーク済み");
+        assert!(g.accept(1, 7, 0xFFFF_FFF1), "窓内の未受理値は通る");
+        assert!(
+            !g.accept(1, 7, 0x8000_0006),
+            "2^31 以上離れた値は過去扱い → 窓外"
+        );
+    }
+
+    #[test]
+    fn replay_guard_table_is_bounded_and_evicts_the_oldest_source() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 10));
         for src in 100..(100 + REPLAY_TABLE_CAPACITY as u64) {
             assert!(g.accept(1, src, 1));
         }
         // 最古（fabric 1, source 7）が退去 → 同じ counter がまた通る
-        assert!(g.accept(1, 7, 11));
+        assert!(g.accept(1, 7, 10));
     }
 
     #[tokio::test]

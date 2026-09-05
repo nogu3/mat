@@ -114,6 +114,44 @@ async fn send_group_toggle(creds: &GroupCredentials, to: SocketAddr, counter: u3
     sock.send_to(&dg, to).await.unwrap();
 }
 
+/// chip SDK の送信形（security flags P ビット + header 難読化）で toggle を送る。
+async fn send_private_group_toggle(creds: &GroupCredentials, to: SocketAddr, counter: u32) {
+    use mat_controller::message::{
+        Destination, MessageHeader, ProtocolHeader, PROTOCOL_ID_INTERACTION_MODEL,
+    };
+    let header = MessageHeader {
+        session_id: creds.session_id,
+        security_flags: 0x01 | mat_device::core::group_privacy::PRIVACY_FLAG,
+        message_counter: counter,
+        source_node_id: Some(ADMIN_NODE_ID),
+        destination: Destination::Group(GROUP_ID),
+    };
+    let proto = ProtocolHeader {
+        initiator: true,
+        needs_ack: false,
+        acked_counter: None,
+        opcode: im::OPCODE_INVOKE_REQUEST,
+        exchange_id: 0x1235,
+        protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+        vendor_id: None,
+    };
+    let payload = im::encode_group_invoke_request(im::CLUSTER_ON_OFF, im::CMD_ON_OFF_TOGGLE, None);
+    let mut dg = mat_controller::crypto::seal_message(
+        &creds.encryption_key,
+        &header,
+        &proto,
+        &payload,
+        ADMIN_NODE_ID,
+    )
+    .unwrap();
+    assert!(mat_device::core::group_privacy::obfuscate_header(
+        &mut dg,
+        &creds.encryption_key
+    ));
+    let sock = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    sock.send_to(&dg, to).await.unwrap();
+}
+
 async fn read_onoff(session: &mut SecureSession) -> bool {
     let cfg = support::fast_cfg();
     session
@@ -224,6 +262,12 @@ async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_pers
     send_group_toggle(&creds, group_addr, 101).await;
     expect_onoff(&mut session, false, "second group toggle").await;
 
+    // 3b. P ビット付き（chip SDK の送信形）も適用される: off -> on -> off。
+    send_private_group_toggle(&creds, group_addr, 150).await;
+    expect_onoff(&mut session, true, "privacy-flagged group toggle").await;
+    send_private_group_toggle(&creds, group_addr, 151).await;
+    expect_onoff(&mut session, false, "second privacy-flagged group toggle").await;
+
     // 4. Without the Group ACL entry the datagram is dropped.
     let cfg = support::fast_cfg();
     session
@@ -237,7 +281,7 @@ async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_pers
         )
         .await
         .expect("ACL write without the group entry");
-    send_group_toggle(&creds, group_addr, 102).await;
+    send_group_toggle(&creds, group_addr, 152).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !read_onoff(&mut session).await,

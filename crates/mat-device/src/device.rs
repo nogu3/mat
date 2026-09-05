@@ -393,6 +393,19 @@ impl Device {
             .collect();
         ledger.save().map_err(DeviceError::Io)?;
 
+        // 設定から外した `[[device]]` の membership 残骸を掃除する。台帳は
+        // tombstone で endpoint を保持する（再追加で同じ endpoint が戻る）が、
+        // membership は戻さない — 存在しない endpoint を GroupTable / multicast
+        // join / group dispatch に晒さない方を優先する（再追加後は
+        // `mat group provision` で登録し直す）。
+        let pruned = membership.retain_endpoints(&bridged_eps);
+        if pruned > 0 {
+            tracing::info!(
+                removed = pruned,
+                "group membership: pruned rows for endpoints no longer in config"
+            );
+        }
+
         // EP1 は bridged endpoint 群より先に登録する — EP0 の PartsList は
         // `Node` が登録順に registry から導出するので、この順序がそのまま
         // `[1, 2, 3, ...]` という昇順の composition tree になる。
@@ -724,6 +737,65 @@ mod tests {
             serde_json::json!("B Light")
         );
         drop(d3);
+    }
+
+    /// 設定から外した `[[device]]` の membership 行は起動時に掃除される
+    /// （`groups.json` に存在しない endpoint が残ると GroupTable / multicast
+    /// join / dispatch に化けて出る）。台帳の tombstone とは独立: 再追加で
+    /// endpoint は戻るが membership は戻らない（再 provision が要る）。
+    #[tokio::test]
+    async fn stale_group_membership_of_removed_devices_is_pruned_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |devices: Vec<VirtualDeviceConfig>| DeviceConfig {
+            passcode: 20202021,
+            discriminator: 0xF00,
+            vendor_id: 0xFFF1,
+            product_id: 0x8000,
+            port: 0,
+            store_dir: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            attestation: AttestationMode::default(),
+            group_port: 0,
+            devices,
+        };
+        let dev = |id: &str| VirtualDeviceConfig {
+            id: id.into(),
+            kind: DeviceKind::OnOffLight,
+            name: id.into(),
+        };
+        // a -> EP2, b -> EP3 を台帳に採番させる
+        drop(Device::new(cfg(vec![dev("a"), dev("b")])).unwrap());
+        // 両 endpoint に membership を書く（前回稼働中に AddGroup された想定）
+        let groups_json = dir.path().join("groups.json");
+        std::fs::write(
+            &groups_json,
+            serde_json::to_vec(&[
+                crate::core::group_membership::GroupMember {
+                    fabric_index: 1,
+                    group_id: 10,
+                    endpoint: 2,
+                },
+                crate::core::group_membership::GroupMember {
+                    fabric_index: 1,
+                    group_id: 10,
+                    endpoint: 3,
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        // b を外して起動 → EP3 の行だけ消える
+        drop(Device::new(cfg(vec![dev("a")])).unwrap());
+        let left: Vec<crate::core::group_membership::GroupMember> =
+            serde_json::from_slice(&std::fs::read(&groups_json).unwrap()).unwrap();
+        assert_eq!(
+            left,
+            vec![crate::core::group_membership::GroupMember {
+                fabric_index: 1,
+                group_id: 10,
+                endpoint: 2,
+            }]
+        );
     }
 
     /// BDBI の UniqueID (spec §9.13 / §11.1.6.15 の `string32`) を、実際に
