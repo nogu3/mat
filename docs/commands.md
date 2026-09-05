@@ -159,6 +159,79 @@ mat fabric list
   `store_missing` (exit `10`) with the `fabric init` hint. There is no
   `fabric show` — the one line per fabric carries everything.
 
+#### IPK rotation (`fabric rotate-ipk`)
+
+The fabric's IPK (Identity Protection Key, key set 0 — the key CASE uses to
+hide destination identifiers, and the one `AddNOC` installs on every new node)
+can be rotated to a fresh epoch. Direct path only (it talks to every node):
+
+```bash
+# fabric rotate-ipk [--nodes <N|ALIAS>...] [--catch-up | --abort]
+mat fabric rotate-ipk                 # every node in the ledger
+mat fabric rotate-ipk --nodes 5 6     # a subset (retry / commit without the rest)
+mat fabric rotate-ipk --catch-up --nodes 7   # a node that missed a committed rotation
+mat fabric rotate-ipk --abort         # drop a pending rotation
+```
+
+```json
+{
+  "timestamp": "2026-06-06T12:34:56+09:00",
+  "fabric_index": 1,
+  "status": "rotated",
+  "nodes": [ { "node_id": 5, "status": "ok" }, { "node_id": 6, "status": "ok" } ],
+  "note": "if matd is running, restart it before the next rotation to load the new IPK; nodes left out of --nodes need `mat fabric rotate-ipk --catch-up --nodes <N>`"
+}
+```
+
+How it works, and why it is safe to interrupt at any point:
+
+1. A new epoch key is generated and persisted as *pending*
+   (`mat/f/<idx>/ipk-epoch-next`) **before any node is touched**, so a re-run
+   after a crash resumes with the same key.
+2. Every node (in `--nodes` order, one at a time) gets `KeySetWrite` on key
+   set 0 carrying **both** epochs — the current one (epoch 0) and the new one
+   (epoch 1). `mat` then re-establishes CASE with the *new* IPK to prove the
+   node accepts it (`KeySetRead` never returns key material, so this is the
+   only proof). A failure on one node does not stop the others.
+3. Only when **every listed node** succeeded does the controller switch: key
+   set 0 in the store, `mat/f/<idx>/ipk-epoch` and `-prev` are rewritten in
+   one locked transaction (`status: "rotated"`). Otherwise nothing changes on
+   the controller (`status: "pending"`, see below) — the controller still uses
+   the old IPK and every node still accepts it.
+4. The old epoch is **not** removed from the nodes: they keep `{old, new}`
+   until the next rotation overwrites key set 0 with `{new, newer}`. Devices
+   check every epoch of the IPK key set when answering CASE, so a controller on
+   either epoch keeps working, and the IPK is not a session key — one stale
+   epoch is an accepted trade-off for a rotation that can never strand a node.
+
+Partial failure: the stdout body lists each node (`"status": "failed"` with
+the usual `error` object), **and** `mat` exits with the kind / code of the
+first failed node (a stderr `error` names all failed nodes). Re-run with the
+same nodes to retry, or with `--nodes <subset>` to commit without the ones that
+stay unreachable — those are then one epoch behind, and once they are back:
+`mat fabric rotate-ipk --catch-up --nodes <N>` (CASE with the previous epoch,
+write `{previous, current}`, prove with the current one). A node that missed
+**two** rotations cannot be caught up (the previous epoch is gone) — it needs
+`unpair` + `commission`. `--abort` drops the pending key (nodes keep the extra
+epoch harmlessly).
+
+- `--nodes` defaults to every node in the ledger; explicit ids / aliases must
+  be commissioned (`node_not_commissioned`, exit `11`). `--op-timeout-ms`
+  budgets each node's step (write + proof CASE) — exceeding it is `timeout`
+  for that node, and the run continues.
+- **matd** loads the IPK at start-up and has no reload: it keeps working after
+  a rotation (the nodes accept both epochs) but **must be restarted before
+  the next rotation**, or its CASE attempts will fail once the nodes drop the
+  epoch it holds. `commission` picks the new epoch up immediately.
+- `fabric list` shows `"ipk_rotation_pending": true` while a rotation is
+  pending; `fabric rotate-ipk --abort` clears it.
+- The virtual device `matv` does not accept `KeySetWrite` on key set 0 yet, so
+  against `matv` a rotation always ends `pending` with `device_rejected`
+  (`scripts/e2e-device-m4.sh` pins exactly that behaviour). Real devices
+  follow the spec (§11.2.8.1).
+- Never part of the `matd` socket protocol (direct-only like `commission`);
+  explicit `--matd` exits `2`.
+
 #### Unpair (`unpair`)
 
 The reverse of `commission`: `mat` sends **RemoveFabric** (its own fabric
@@ -1073,8 +1146,9 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   `group` (`provision` / `invoke` / `color-temp` / `color` / `level` / `bump`;
   `group grant` and `group remove` are direct only — see Groupcast above).
   `discover` / `commission` / `unpair` / `fabric init` / `open-window` / `diag`
-  are direct-only: auto-detection skips them silently; explicit `--matd` exits
-  `2`. `fabric list` and `group list` are neither: they are pure local KVS reads
+  / `fabric rotate-ipk` are direct-only: auto-detection skips them silently;
+  explicit `--matd` exits `2`. `fabric list` and `group list` are neither:
+  they are pure local KVS reads
   dispatched **before** route selection, so no daemon is contacted and `--matd`
   is simply ignored (not exit `2`). `listen` (below) is the opposite case — it
   is **matd-only**, with no direct-path fallback at all (not even auto-detect

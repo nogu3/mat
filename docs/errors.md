@@ -26,6 +26,12 @@ recoverable by retrying, since Thread border routers advertise on a ~30s
 cycle) is `timeout` (exit `3`); any other resolve failure (socket I/O, etc.)
 is `unreachable` (exit `5`).
 
+`mat fabric rotate-ipk` is the one command that can **both** print a body on
+stdout and exit non-zero: a partial failure (`status: "pending"` /
+`"catch_up_incomplete"`) emits the per-node result as JSON on stdout, then
+reports the first failed node's `kind` on stderr (and exits with its code) so
+scripts that only check the exit status still notice. stdout stays pure JSON.
+
 `kind` values (stable; callers may branch on these strings):
 
 - `store_missing` / `store_parse` — credential store missing / corrupt (exit 10).

@@ -109,11 +109,15 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   a flock `WouldBlock`) is a hard error and never silently degrades. First-
   fabric bootstrap is `mat fabric init` (random-epoch IPK). A fabric first
   created by chip-tool is handled by verifying its fixed epoch against the KVS
-  materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`).
+  materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`). IPK
+  rotation is `mat fabric rotate-ipk` (direct-only; pending / prev epochs
+  live at `mat/f/<idx>/ipk-epoch-next` / `-prev`; the controller switches
+  only after every listed node holds both epochs).
 - `matd`-only ops vs direct-only ops: `discover` / `commission` / `unpair` /
-  `fabric init` / `open-window` / `diag` / `group grant` / `group remove` are
-  never part of the `matd` socket protocol — they always run on `mat`'s own
-  one-shot direct path. `fabric list` / `group list` are local-only KVS reads
+  `fabric init` / `open-window` / `diag` / `group grant` / `group remove` /
+  `fabric rotate-ipk` are never part of the `matd` socket protocol — they
+  always run on `mat`'s own one-shot direct path. `fabric list` / `group
+  list` are local-only KVS reads
   dispatched before route selection (no network, no daemon), so `--matd` is
   ignored there rather than exit `2`. `listen` is the opposite case and the
   first of its kind: it is **matd-only**, with no direct-path fallback at all
