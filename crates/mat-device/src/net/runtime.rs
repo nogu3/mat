@@ -757,9 +757,10 @@ impl NodeState {
     }
 }
 
-/// Everything `serve_forever`'s loop carries between iterations, so the per-branch
-/// handlers (`on_*`) can be plain methods instead of one 400-line
-/// `select!` body. Built once by `boot`, driven forever by `serve_forever`.
+/// Everything `serve_forever`'s loop carries between iterations, so the
+/// per-branch handlers (`on_*`) can be plain methods instead of one
+/// 400-line `select!` body. Built once by `boot`, driven forever by
+/// `serve_forever`.
 struct Runtime {
     transport: Arc<Transport>,
     port: u16,
@@ -780,9 +781,8 @@ struct Runtime {
 }
 
 impl Runtime {
-    /// Boot-time setup that used to open `run`: the PASE salt, the
-    /// commissioning window's boot policy, and the first (best-effort)
-    /// `bring_up_mdns` attempt.
+    /// Boot-time setup: the PASE salt, the commissioning window's boot
+    /// policy, and the first (best-effort) `bring_up_mdns` attempt.
     async fn boot(
         transport: Arc<Transport>,
         local_addr: SocketAddr,
@@ -959,7 +959,9 @@ impl Runtime {
     /// `serve_secured` decrypts/screens it, serves the Interaction Model
     /// request, and drains any cross-exchange requests buffered meanwhile.
     /// A `RemoveFabric` that removed this session's own fabric ends the
-    /// session (Task 6).
+    /// session (Task 6). Takes the raw datagram as well as the
+    /// already-decoded header because `serve_secured` re-decodes it from
+    /// the wire bytes.
     async fn on_secured_datagram(
         &mut self,
         datagram: &[u8],
@@ -1667,9 +1669,10 @@ async fn serve_secured_message(
 
 /// Everything one secured message is allowed to touch, bundled so
 /// `serve_secured`/`serve_secured_message` keep a readable arity as the
-/// runtime grows state (Task 12 added the subscription). Borrowed as a
-/// whole from `serve_forever`'s loop locals; the fields are destructured inside
-/// `serve_secured_message` so they stay independent borrows.
+/// runtime grows state (Task 12 added the subscription). Built by
+/// `NodeState::serve_state` from the runtime's owned `NodeState`; the
+/// fields are destructured inside `serve_secured_message` so they stay
+/// independent borrows.
 struct ServeState<'a> {
     node: &'a mut Node,
     comm_server: &'a CommissioningServer,
