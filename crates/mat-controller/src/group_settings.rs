@@ -394,6 +394,88 @@ fn keyset_with_next(blob: &[u8], next: u16) -> Option<Vec<u8>> {
     Some(w.finish())
 }
 
+/// KeySetData の ctx3 配列・先頭 struct（slot 0）の ctx4 start_time / ctx5 hash /
+/// ctx6 key だけを差し替えた blob を返す。policy / keys_count / 残スロット /
+/// 未知タグ / ctx7 next は TLV 要素単位でそのまま写す（[`keyset_with_next`] と
+/// 同型）— chip-tool `add-keysets` 由来の複数 epoch keyset を mat の 1 スロット形
+/// に潰さずに鍵だけ置き換えるため（re-provision と IPK ローテーションの commit）。
+/// 元の slot 0 に ctx4/5/6 のどれかが無ければ末尾に補う（mat / chip-tool どちらの
+/// 書き手も 3 つ揃えるので実運用では起きない）。外側が struct でない / ctx3 が無い /
+/// 先頭要素が struct でない / 途中で切れている blob は `None`。
+pub(crate) fn keyset_with_slot0(
+    blob: &[u8],
+    start_time: u64,
+    hash: u16,
+    key: &[u8; 16],
+) -> Option<Vec<u8>> {
+    let mut r = Reader::new(blob);
+    if r.next().ok()??.value != Value::StructStart {
+        return None;
+    }
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    let mut seen_slot0 = false;
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(3), Value::ArrayStart) if !seen_slot0 => {
+                w.start_array(Tag::Context(3));
+                if r.next().ok()??.value != Value::StructStart {
+                    return None;
+                }
+                w.start_struct(Tag::Anonymous);
+                let (mut put4, mut put5, mut put6) = (false, false, false);
+                loop {
+                    let e = r.next().ok()??;
+                    match (e.tag, e.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (Tag::Context(4), Value::Uint(_)) => {
+                            w.put_uint(Tag::Context(4), start_time);
+                            put4 = true;
+                        }
+                        (Tag::Context(5), Value::Uint(_)) => {
+                            w.put_uint(Tag::Context(5), u64::from(hash));
+                            put5 = true;
+                        }
+                        (Tag::Context(6), Value::Bytes(_)) => {
+                            w.put_bytes(Tag::Context(6), key);
+                            put6 = true;
+                        }
+                        (tag, value) => crate::tlv::copy_value(&mut w, &mut r, tag, value).ok()?,
+                    }
+                }
+                if !put4 {
+                    w.put_uint(Tag::Context(4), start_time);
+                }
+                if !put5 {
+                    w.put_uint(Tag::Context(5), u64::from(hash));
+                }
+                if !put6 {
+                    w.put_bytes(Tag::Context(6), key);
+                }
+                w.end_container();
+                // 残りスロット（slot 1..）はそのまま写す。
+                loop {
+                    let e = r.next().ok()??;
+                    match (e.tag, e.value) {
+                        (_, Value::ContainerEnd) => break,
+                        (tag, value) => crate::tlv::copy_value(&mut w, &mut r, tag, value).ok()?,
+                    }
+                }
+                w.end_container();
+                seen_slot0 = true;
+            }
+            (tag, value) => crate::tlv::copy_value(&mut w, &mut r, tag, value).ok()?,
+        }
+    }
+    if !seen_slot0 {
+        return None;
+    }
+    w.end_container();
+    Some(w.finish())
+}
+
 /// `g/gfl` — FabricList（ctx1 first_entry, ctx2 entry_count）。
 struct FabricList {
     first_entry: u16,
@@ -502,12 +584,9 @@ fn write_group(
 /// チェーン内 next を保ったまま上書き、無ければ head 挿入（`first_keyset`
 /// を新 id に差し替え、旧 `first_keyset` を新エントリの next にする）。
 ///
-/// 既存 keyset id への上書き（re-provision）は mat の 1 スロット形
-/// （policy 0 / slot 1 のみ）で作り直す — chip-tool `add-keysets` 由来の
-/// 複数 epoch keyset を同じ id で上書きすると残りスロットと policy は失われる
-/// （`unlink_keyset` はリンクだけ差し替えるので無損失）。鍵の「置換」として
-/// 意図的だが、無損失化するなら `keyset_with_next` と同型の slot-0 差し替え
-/// ヘルパを足すこと。
+/// 既存 keyset id への上書き（re-provision）は [`keyset_with_slot0`] で slot 0 の
+/// 鍵・hash だけ差し替える — chip-tool `add-keysets` 由来の policy / 残スロットは
+/// 落とさない（`unlink_keyset` のリンク差し替えと同じ無損失規律）。
 fn write_keyset(
     txn: &mut KvsTxn,
     fabric_index: u8,
@@ -523,11 +602,9 @@ fn write_keyset(
             .get(&key)?
             .ok_or_else(|| corrupt(&key, "missing keyset record"))?;
         if cur == keyset_id {
-            let next = keyset_next(&blob).ok_or_else(|| corrupt(&key, "unparseable KeySetData"))?;
-            txn.set(
-                &key,
-                &serialize_keyset(0, EPOCH_START_TIME, hash, operational, next),
-            );
+            let relinked = keyset_with_slot0(&blob, EPOCH_START_TIME, hash, operational)
+                .ok_or_else(|| corrupt(&key, "unparseable KeySetData"))?;
+            txn.set(&key, &relinked);
             return Ok(());
         }
         cur = keyset_next(&blob).ok_or_else(|| corrupt(&key, "unparseable KeySetData"))?;
@@ -1518,6 +1595,131 @@ mod tests {
         assert_eq!(
             crate::kvs::parse_keyset_first_entry(&result, 2).unwrap(),
             ([0x31; 16], Some(0x1111))
+        );
+    }
+
+    #[test]
+    fn keyset_with_slot0_matches_serialize_keyset_for_mat_form() {
+        // mat 1 スロット形の slot0 差し替えは serialize_keyset の作り直しとバイト一致。
+        let mine = serialize_keyset(0, EPOCH_START_TIME, 7, &[0x42; 16], 5);
+        assert_eq!(
+            keyset_with_slot0(&mine, EPOCH_START_TIME, 9, &[0x43; 16]).unwrap(),
+            serialize_keyset(0, EPOCH_START_TIME, 9, &[0x43; 16], 5)
+        );
+    }
+
+    #[test]
+    fn keyset_with_slot0_preserves_policy_other_slots_and_next() {
+        let slots = [
+            (1u64, 0xAAAAu16, [0xA0u8; 16]),
+            (2, 0xBBBB, [0xB0; 16]),
+            (3, 0xCCCC, [0xC0; 16]),
+        ];
+        let blob = multi_epoch_keyset(1, &slots, 0x0BAD);
+        let expected =
+            multi_epoch_keyset(1, &[(9, 0x1234, [0x11; 16]), slots[1], slots[2]], 0x0BAD);
+        assert_eq!(
+            keyset_with_slot0(&blob, 9, 0x1234, &[0x11; 16]).unwrap(),
+            expected
+        );
+        assert_eq!(keyset_next(&expected), Some(0x0BAD));
+        assert_eq!(
+            crate::kvs::parse_keyset_first_entry(&expected, 2).unwrap(),
+            ([0x11; 16], Some(0x1234))
+        );
+    }
+
+    #[test]
+    fn keyset_with_slot0_touches_only_slot0_ctx456() {
+        // keyset_with_next_preserves_unknown_tags_order_and_nested_slots と同じ
+        // 「未知タグ / スロット内 ctx7 / ネスト」fixture。slot 0 の ctx4/5/6 以外は
+        // 1 バイトも変わらない。
+        fn build(start: u64, hash: u16, key: &[u8; 16]) -> Vec<u8> {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(7), 0x0BAD); // chain next（先頭）
+            w.put_uint(Tag::Context(9), 42); // 未知の追加タグ
+            w.put_uint(Tag::Context(1), 1); // policy
+            w.put_uint(Tag::Context(2), 2); // keys_count
+            w.start_array(Tag::Context(3));
+            w.start_struct(Tag::Anonymous);
+            w.put_uint(Tag::Context(4), start);
+            w.put_uint(Tag::Context(5), u64::from(hash));
+            w.put_bytes(Tag::Context(6), key);
+            w.put_uint(Tag::Context(7), 99); // スロット内 ctx7
+            w.start_struct(Tag::Context(8));
+            w.put_uint(Tag::Context(0), 7);
+            w.end_container();
+            w.end_container();
+            w.start_struct(Tag::Anonymous); // slot 1（無傷で残る）
+            w.put_uint(Tag::Context(4), 2);
+            w.put_uint(Tag::Context(5), 0x2222);
+            w.put_bytes(Tag::Context(6), &[0x32; 16]);
+            w.end_container();
+            w.end_container(); // ctx3 array
+            w.end_container(); // outer struct
+            w.finish()
+        }
+        let blob = build(1, 0x1111, &[0x31; 16]);
+        assert_eq!(
+            keyset_with_slot0(&blob, 5, 0x5555, &[0x55; 16]).unwrap(),
+            build(5, 0x5555, &[0x55; 16])
+        );
+    }
+
+    #[test]
+    fn keyset_with_slot0_rejects_broken_blobs() {
+        assert!(keyset_with_slot0(&[0x15, 0x18], 1, 1, &[0; 16]).is_none());
+        let blob = serialize_keyset(0, 1, 7, &[0x42; 16], 5);
+        assert!(keyset_with_slot0(&blob[..blob.len() - 3], 1, 1, &[0; 16]).is_none());
+        // ctx3 配列が無い struct
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_uint(Tag::Context(7), 0xFFFF);
+        w.end_container();
+        assert!(keyset_with_slot0(&w.finish(), 1, 1, &[0; 16]).is_none());
+    }
+
+    #[test]
+    fn write_keyset_reprovision_keeps_chiptool_policy_and_epochs() {
+        // 同じ keyset id で 2 回 provision（re-provision）。間に chip-tool 形
+        // （policy 1、3 epoch）へ差し替えておくと、2 回目は slot 0 だけ差し替わる。
+        let (_d, p) = tmp_ini("[Default]\n");
+        provision(&p, 1, 10, false);
+        let slots = [
+            (1u64, 0x1111u16, [0x31u8; 16]),
+            (2_000_000, 0x2222, [0x32; 16]),
+            (3_000_000, 0x3333, [0x33; 16]),
+        ];
+        {
+            let mut txn = crate::kvs::KvsTxn::open(&p).unwrap();
+            txn.set("f/2/k/a", &multi_epoch_keyset(1, &slots, INVALID_KEYSET_ID));
+            txn.commit().unwrap();
+        }
+        write_group_provision(
+            &p,
+            2,
+            &CFID,
+            &GroupProvisionWrite {
+                group_id: 1,
+                keyset_id: 10,
+                name: "e2e",
+                epoch_key: [0x77; 16],
+                rebind: true,
+            },
+        )
+        .unwrap();
+        let txn = crate::kvs::KvsTxn::open(&p).unwrap();
+        let op = derive_ipk_operational(&[0x77; 16], &CFID);
+        let hash = derive_group_session_id(&op);
+        assert_eq!(
+            txn.get("f/2/k/a").unwrap().unwrap(),
+            multi_epoch_keyset(
+                1,
+                &[(EPOCH_START_TIME, hash, op), slots[1], slots[2]],
+                INVALID_KEYSET_ID
+            )
         );
     }
 }
