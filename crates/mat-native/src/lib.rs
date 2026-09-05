@@ -123,24 +123,24 @@ pub fn put_value(
     v: &mat_core::ids::ArgValue,
 ) {
     use mat_controller::tlv::Tag;
-    use mat_core::ids::ArgValue as S;
+    use mat_core::ids::ArgValue as V;
     match v {
-        S::Bool(b) => w.put_bool(tag, *b),
-        S::UInt(n) => w.put_uint(tag, *n),
-        S::Int(n) => w.put_int(tag, *n),
-        S::F32(f) => w.put_f32(tag, *f),
-        S::F64(f) => w.put_f64(tag, *f),
-        S::Str(s) => w.put_str(tag, s),
-        S::Bytes(b) => w.put_bytes(tag, b),
-        S::Null => w.put_null(tag),
-        S::List(items) => {
+        V::Bool(b) => w.put_bool(tag, *b),
+        V::UInt(n) => w.put_uint(tag, *n),
+        V::Int(n) => w.put_int(tag, *n),
+        V::F32(f) => w.put_f32(tag, *f),
+        V::F64(f) => w.put_f64(tag, *f),
+        V::Str(s) => w.put_str(tag, s),
+        V::Bytes(b) => w.put_bytes(tag, b),
+        V::Null => w.put_null(tag),
+        V::List(items) => {
             w.start_array(tag);
             for item in items {
                 put_value(w, Tag::Anonymous, item);
             }
             w.end_container();
         }
-        S::Struct(fields) => {
+        V::Struct(fields) => {
             w.start_struct(tag);
             for (id, val) in fields {
                 put_value(w, Tag::Context(*id), val);
@@ -152,7 +152,7 @@ pub fn put_value(
 
 /// `ArgValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
 /// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
-pub fn scalar_to_tlv(v: &mat_core::ids::ArgValue) -> Vec<u8> {
+pub fn arg_value_to_tlv(v: &mat_core::ids::ArgValue) -> Vec<u8> {
     let mut w = mat_controller::tlv::Writer::new();
     put_value(&mut w, mat_controller::tlv::Tag::Anonymous, v);
     w.finish()
@@ -940,7 +940,7 @@ mod tests {
             1,
             0x0008,
             0x0011,
-            scalar_to_tlv(&mat_core::ids::ArgValue::UInt(128)),
+            arg_value_to_tlv(&mat_core::ids::ArgValue::UInt(128)),
             false,
         )
         .await
@@ -1024,17 +1024,17 @@ mod tests {
     }
 
     #[test]
-    fn scalar_conversions() {
-        use mat_core::ids::ArgValue as S;
-        // scalar_to_tlv は Reader で読み戻して値一致を確認。
-        let b = scalar_to_tlv(&S::Str("x".into()));
+    fn arg_value_conversions() {
+        use mat_core::ids::ArgValue as V;
+        // arg_value_to_tlv は Reader で読み戻して値一致を確認。
+        let b = arg_value_to_tlv(&V::Str("x".into()));
         let mut r = mat_controller::tlv::Reader::new(&b);
         assert!(matches!(
             r.next().unwrap().unwrap().value,
             mat_controller::tlv::Value::Utf8("x")
         ));
 
-        let b = scalar_to_tlv(&S::F64(0.5));
+        let b = arg_value_to_tlv(&V::F64(0.5));
         let mut r = mat_controller::tlv::Reader::new(&b);
         assert!(matches!(
             r.next().unwrap().unwrap().value,
@@ -1042,8 +1042,8 @@ mod tests {
         ));
 
         // write 経路の float 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte のみ）。
-        assert_eq!(scalar_to_tlv(&S::F32(1.5))[0] & 0x1F, 0x0A);
-        assert_eq!(scalar_to_tlv(&S::F64(1.5))[0] & 0x1F, 0x0B);
+        assert_eq!(arg_value_to_tlv(&V::F32(1.5))[0] & 0x1F, 0x0A);
+        assert_eq!(arg_value_to_tlv(&V::F64(1.5))[0] & 0x1F, 0x0B);
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
             &ty,
         )
         .unwrap();
-        let tlv = scalar_to_tlv(&v);
+        let tlv = arg_value_to_tlv(&v);
         // 先頭要素は TLV Array（0x16、anonymous）。
         assert_eq!(tlv[0], 0x16);
         // read 側の JSON 化（番号キー）に戻ると同じ内容。
@@ -1092,7 +1092,7 @@ mod tests {
         ];
         let dedicated = crate::ops::encode_acl_entries_tlv(&entries);
         let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
-        let generic = scalar_to_tlv(
+        let generic = arg_value_to_tlv(
             &parse_value_typed(
                 r#"[
                   {"privilege":5,"auth-mode":2,"subjects":[112233,4386],"targets":null,"fabric-index":1},
@@ -1115,7 +1115,7 @@ mod tests {
             .def
             .unwrap()
             .ty;
-        let generic = scalar_to_tlv(
+        let generic = arg_value_to_tlv(
             &parse_value_typed(
                 r#"[{"group-id":1,"group-key-set-id":2},{"1":257,"2":7}]"#,
                 &ty,
@@ -1144,8 +1144,8 @@ mod tests {
 
     #[test]
     fn encode_command_fields_uses_positional_context_tags() {
-        use mat_core::ids::ArgValue as S;
-        let tlv = encode_command_fields(&[S::UInt(128), S::UInt(0)]);
+        use mat_core::ids::ArgValue as V;
+        let tlv = encode_command_fields(&[V::UInt(128), V::UInt(0)]);
         let mut r = mat_controller::tlv::Reader::new(&tlv);
         let el = r.next().unwrap().unwrap();
         assert!(matches!(el.value, mat_controller::tlv::Value::StructStart));

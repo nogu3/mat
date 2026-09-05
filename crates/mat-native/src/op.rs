@@ -500,7 +500,7 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
                 *endpoint,
                 *cluster,
                 *attribute,
-                crate::scalar_to_tlv(value),
+                crate::arg_value_to_tlv(value),
                 *timed,
             )
             .await?;
@@ -1079,7 +1079,7 @@ mod tests {
         );
         let (ep, cluster, attr, tlv) = &conn.written_tlv()[0];
         assert_eq!((*ep, *cluster, *attr), (1, 0x0008, 0x0011));
-        assert_eq!(tlv, &crate::scalar_to_tlv(&ArgValue::UInt(128)));
+        assert_eq!(tlv, &crate::arg_value_to_tlv(&ArgValue::UInt(128)));
     }
 
     #[tokio::test]
