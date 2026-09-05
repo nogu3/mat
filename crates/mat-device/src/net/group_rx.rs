@@ -1,9 +1,12 @@
 //! groupcast 受信（spec §4.15 group session、§8.2.5 group 宛 Invoke）の
 //! 純関数側: header 分類 → 復号候補 (GKH 一致 keyset) の試行復号 →
 //! GroupKeyMap / membership / リプレイ検査 → group InvokeRequest デコード。
+//! P ビット（privacy）付きの datagram は候補 keyset ごとに
+//! `core::group_privacy` で header を復号してから同じ経路を通す。
 //! ソケットと join は `GroupSocket`（同ファイル、Task 7）、Node への適用は
 //! `runtime`。応答は送らない（全 drop は `GroupDrop` で理由を返し、runtime が
 //! debug ログにする）。
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -22,12 +25,13 @@ use crate::core::fabric_store::FabricEntry;
 use crate::core::group_invoke::{decode_group_invoke_request, GroupInvokeIn};
 use crate::core::group_key_management::GroupKeyStore;
 use crate::core::group_membership::GroupMembershipStore;
+use crate::core::group_privacy::deobfuscate_header;
 
 /// security flags の session type（spec §4.4.1.4）: 下位 2 bit、0b01 = group。
 pub const SESSION_TYPE_MASK: u8 = 0x03;
 pub const SESSION_TYPE_GROUP: u8 = 0x01;
-/// P フラグ（privacy 処理済み）— 未対応で drop。
-pub const PRIVACY_FLAG: u8 = 0x80;
+/// P フラグ（privacy 処理済み、spec §4.4.1.4）。
+pub use crate::core::group_privacy::PRIVACY_FLAG;
 /// リプレイ表の上限 `(fabric, source)` 数。超えたら最古を退去。
 pub const REPLAY_TABLE_CAPACITY: usize = 64;
 
@@ -79,7 +83,6 @@ pub struct GroupRxDeps<'a> {
 pub enum GroupDrop {
     HeaderDecode,
     NotGroupSession,
-    Privacy,
     NoSource,
     NotGroupDestination,
     NoKeyset { candidates: usize },
@@ -104,19 +107,22 @@ pub fn classify_group_datagram(
     deps: &GroupRxDeps<'_>,
     replay: &mut GroupReplayGuard,
 ) -> Result<GroupInvokeBatch, GroupDrop> {
-    let (header, _) = MessageHeader::decode(buf).map_err(|_| GroupDrop::HeaderDecode)?;
-    if header.security_flags & SESSION_TYPE_MASK != SESSION_TYPE_GROUP {
+    let (wire_header, _) = MessageHeader::decode(buf).map_err(|_| GroupDrop::HeaderDecode)?;
+    if wire_header.security_flags & SESSION_TYPE_MASK != SESSION_TYPE_GROUP {
         return Err(GroupDrop::NotGroupSession);
     }
-    if header.security_flags & PRIVACY_FLAG != 0 {
-        return Err(GroupDrop::Privacy);
+    let privacy = wire_header.security_flags & PRIVACY_FLAG != 0;
+    if !privacy {
+        // 平文 header なら復号前に形を検査できる（drop 理由の順序は従来どおり）。
+        wire_header.source_node_id.ok_or(GroupDrop::NoSource)?;
+        if !matches!(wire_header.destination, Destination::Group(_)) {
+            return Err(GroupDrop::NotGroupDestination);
+        }
     }
-    let source = header.source_node_id.ok_or(GroupDrop::NoSource)?;
-    let Destination::Group(group_id) = header.destination else {
-        return Err(GroupDrop::NotGroupDestination);
-    };
 
     // spec §4.15.3: GKH が一致する keyset を全 fabric から集めて順に試す。
+    // P ビット付き（chip SDK の送信形）は候補ごとに privacy key で header を
+    // 復号してから open_message に渡す（source / destination は復号後の値）。
     let mut candidates = 0usize;
     let mut opened = None;
     for ks in deps.gk_store.keysets() {
@@ -131,16 +137,40 @@ pub fn classify_group_datagram(
             &ks.epoch_key0,
             &compressed_fabric_id(&f.root_public_key, f.fabric_id),
         );
-        if derive_group_session_id(&operational) != header.session_id {
+        if derive_group_session_id(&operational) != wire_header.session_id {
             continue;
         }
         candidates += 1;
-        if let Ok((_, proto, payload)) = open_message(&operational, buf, source) {
-            opened = Some((ks.fabric_index, ks.keyset_id, proto, payload));
+        let dg: Cow<'_, [u8]> = if privacy {
+            match deobfuscate_header(buf, &operational) {
+                Some(plain) => Cow::Owned(plain),
+                None => continue,
+            }
+        } else {
+            Cow::Borrowed(buf)
+        };
+        let Ok((header, _)) = MessageHeader::decode(&dg) else {
+            continue;
+        };
+        let (Some(source), Destination::Group(group_id)) =
+            (header.source_node_id, header.destination)
+        else {
+            continue;
+        };
+        if let Ok((_, proto, payload)) = open_message(&operational, &dg, source) {
+            opened = Some((
+                ks.fabric_index,
+                ks.keyset_id,
+                source,
+                group_id,
+                header.message_counter,
+                proto,
+                payload,
+            ));
             break;
         }
     }
-    let Some((fabric_index, keyset_id, proto, payload)) = opened else {
+    let Some((fabric_index, keyset_id, source, group_id, counter, proto, payload)) = opened else {
         return Err(GroupDrop::NoKeyset { candidates });
     };
     if !deps
@@ -154,7 +184,8 @@ pub fn classify_group_datagram(
     if endpoints.is_empty() {
         return Err(GroupDrop::NoMembers);
     }
-    if !replay.accept(fabric_index, source, header.message_counter) {
+    // 復号後（= 認証後）にリプレイ検査: 偽 datagram で窓を進められないように。
+    if !replay.accept(fabric_index, source, counter) {
         return Err(GroupDrop::Replay);
     }
     if proto.protocol_id != PROTOCOL_ID_INTERACTION_MODEL
@@ -373,6 +404,107 @@ mod tests {
         .unwrap()
     }
 
+    /// P ビット付き datagram を作る（chip SDK と同じ送信形）: security flags
+    /// に PRIVACY_FLAG を立てて封じ、header を難読化する。
+    fn privacy_datagram(f: &FabricEntry, epoch: &[u8; 16], counter: u32, group: u16) -> Vec<u8> {
+        use mat_controller::message::{MessageHeader, ProtocolHeader};
+        let c = creds(f, epoch);
+        let header = MessageHeader {
+            session_id: c.session_id,
+            security_flags: SESSION_TYPE_GROUP | PRIVACY_FLAG,
+            message_counter: counter,
+            source_node_id: Some(SOURCE),
+            destination: Destination::Group(group),
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: im::OPCODE_INVOKE_REQUEST,
+            exchange_id: 0x42,
+            protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
+            vendor_id: None,
+        };
+        let payload =
+            im::encode_group_invoke_request(im::CLUSTER_ON_OFF, im::CMD_ON_OFF_TOGGLE, None);
+        let mut dg = mat_controller::crypto::seal_message(
+            &c.encryption_key,
+            &header,
+            &proto,
+            &payload,
+            SOURCE,
+        )
+        .unwrap();
+        assert!(crate::core::group_privacy::obfuscate_header(
+            &mut dg,
+            &c.encryption_key
+        ));
+        dg
+    }
+
+    #[test]
+    fn privacy_flagged_datagram_is_deobfuscated_and_classified_like_plain() {
+        let (fabrics, gk, m) = provisioned();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &gk,
+            membership: &m,
+        };
+        let mut replay = GroupReplayGuard::new();
+        let dg = privacy_datagram(&fabrics[0], &EPOCH, 100, 10);
+        let batch = classify_group_datagram(&dg, &deps, &mut replay).unwrap();
+        assert_eq!(
+            (batch.fabric_index, batch.group_id, batch.source_node_id),
+            (1, 10, SOURCE)
+        );
+        assert_eq!(batch.endpoints, vec![2, 3]);
+        assert_eq!(
+            (batch.invokes[0].cluster, batch.invokes[0].command),
+            (im::CLUSTER_ON_OFF, im::CMD_ON_OFF_TOGGLE)
+        );
+        // 同じ counter の再送は復号後のリプレイ検査で落ちる
+        assert_eq!(
+            classify_group_datagram(&dg, &deps, &mut replay).unwrap_err(),
+            GroupDrop::Replay
+        );
+    }
+
+    #[test]
+    fn privacy_flagged_datagram_with_wrong_or_missing_key_is_no_keyset() {
+        let (fabrics, gk, m) = provisioned();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &gk,
+            membership: &m,
+        };
+        let mut replay = GroupReplayGuard::new();
+        // GKH 不一致（別 epoch）→ 候補ゼロ
+        let other = privacy_datagram(&fabrics[0], &[3u8; 16], 1, 10);
+        assert_eq!(
+            classify_group_datagram(&other, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 0 }
+        );
+        // P を立てたが難読化していない（= 受信側が復号すると header が壊れる）:
+        // 難読化をもう一度当てて平文 header に戻す（CTR は対称）
+        let c = creds(&fabrics[0], &EPOCH);
+        let mut raw = privacy_datagram(&fabrics[0], &EPOCH, 2, 10);
+        assert!(crate::core::group_privacy::obfuscate_header(
+            &mut raw,
+            &c.encryption_key
+        ));
+        assert_eq!(
+            classify_group_datagram(&raw, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 1 }
+        );
+        // 難読化区間を 1 バイト改竄 → 復号後の header/nonce が変わり MIC 不一致
+        raw = privacy_datagram(&fabrics[0], &EPOCH, 3, 10);
+        raw[5] ^= 0x01;
+        assert_eq!(
+            classify_group_datagram(&raw, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 1 }
+        );
+    }
+
     #[test]
     fn a_provisioned_group_datagram_yields_the_member_endpoints_and_invoke() {
         let (fabrics, gk, m) = provisioned();
@@ -441,13 +573,6 @@ mod tests {
         assert_eq!(
             classify_group_datagram(&uni, &deps, &mut replay).unwrap_err(),
             GroupDrop::NotGroupSession
-        );
-        // privacy ビット
-        let mut priv_dg = datagram(&fabrics[0], &EPOCH, 51, 10);
-        priv_dg[3] |= PRIVACY_FLAG;
-        assert_eq!(
-            classify_group_datagram(&priv_dg, &deps, &mut replay).unwrap_err(),
-            GroupDrop::Privacy
         );
         // ゴミ
         assert_eq!(
