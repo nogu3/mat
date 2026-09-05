@@ -1623,12 +1623,20 @@ git commit -m "test(mat-device): fail-safe rollback（満了 / 早期 disarm）�
     fn replay_guard_forward_jump_clears_the_window() {
         let mut g = GroupReplayGuard::new();
         assert!(g.accept(1, 7, 10));
-        assert!(g.accept(1, 7, 10 + 40));
-        for c in 10..=49 {
+        assert!(g.accept(1, 7, 10 + 40)); // max = 50, window cleared
+        // 32 より前（33..40 後方）は窓外
+        for c in 10..=17 {
             assert!(!g.accept(1, 7, c), "counter {c} は新しい窓の外");
         }
-        assert!(g.accept(1, 7, 51));
+        // 窓内（1..=32 後方）で未受理なら 1 回だけ通る — 10 は旧 max だったが
+        // ジャンプで窓が消えたので記憶されない（spec §4.5.4.2 / SDK と同じ）
+        for c in 18..=49 {
+            assert!(g.accept(1, 7, c), "counter {c} は窓内で未受理");
+            assert!(!g.accept(1, 7, c), "counter {c} の 2 回目は拒否");
+        }
         assert!(!g.accept(1, 7, 50));
+        assert!(g.accept(1, 7, 51));
+        assert!(!g.accept(1, 7, 50), "51 へ 1 進んだ窓では 50 は受理済み bit");
     }
 
     #[test]
