@@ -56,30 +56,44 @@ pub fn encode_move_to_level_fields(level: u8, transition_time_ds: u16) -> Vec<u8
     w.finish()
 }
 
-/// CommandFields for GroupKeyManagement KeySetWrite (cluster spec §11.2.8.4):
-/// `{0: GroupKeySetStruct{0: GroupKeySetID(u16), 1: GroupKeySecurityPolicy(0
-/// = TrustFirst), 2: EpochKey0(16B octstr), 3: EpochStartTime0(u64, epoch-us),
-/// 4: EpochKey1(null), 5: EpochStartTime1(null), 6: EpochKey2(null), 7:
-/// EpochStartTime2(null)}}`. Only a single active epoch (0) is provisioned —
-/// matches the chip-tool `groupkeymanagement key-set-write` JSON this mirrors
-/// (`commands/group.rs`'s `key_set` object). `epochStartTime0` is fixed to 1
-/// (matching `mat_core::group::EPOCH_START_TIME`, which the controller-side
-/// `groupsettings add-keysets` validityTime must also match).
-pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
+/// `KeySetWrite` CommandFields（spec §11.2.8.1）: `{0: GroupKeySet{0: id, 1: policy
+/// TrustFirst, 2/3: epochKey0/start0, 4/5: key1/start1, 6/7: key2/start2}}`。
+/// `epochs` は (epoch_key, start_time) を 1〜3 本 — start_time は呼び手が単調増加
+/// かつ非 0 を保証する（`EpochStartTime0 == 0` はデバイス側で INVALID_COMMAND）。
+/// 無い本数は null。4 本以上は呼び手のバグ（debug_assert、release は先頭 3 本）。
+pub fn encode_key_set_write_fields_multi(keyset_id: u16, epochs: &[([u8; 16], u64)]) -> Vec<u8> {
+    debug_assert!(
+        (1..=3).contains(&epochs.len()),
+        "KeySetWrite carries 1..=3 epoch keys"
+    );
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.start_struct(Tag::Context(0)); // GroupKeySet
     w.put_uint(Tag::Context(0), u64::from(keyset_id));
     w.put_uint(Tag::Context(1), 0); // GroupKeySecurityPolicy: TrustFirst
-    w.put_bytes(Tag::Context(2), epoch_key);
-    w.put_uint(Tag::Context(3), 1); // EpochStartTime0
-    w.put_null(Tag::Context(4));
-    w.put_null(Tag::Context(5));
-    w.put_null(Tag::Context(6));
-    w.put_null(Tag::Context(7));
+    for i in 0..3u8 {
+        let key_tag = Tag::Context(2 + 2 * i);
+        let start_tag = Tag::Context(3 + 2 * i);
+        match epochs.get(usize::from(i)) {
+            Some((key, start)) => {
+                w.put_bytes(key_tag, key);
+                w.put_uint(start_tag, *start);
+            }
+            None => {
+                w.put_null(key_tag);
+                w.put_null(start_tag);
+            }
+        }
+    }
     w.end_container();
     w.end_container();
     w.finish()
+}
+
+/// epoch key 1 本（EpochStartTime0 = 1）の `KeySetWrite`。`group provision` が使う
+/// 形で、[`encode_key_set_write_fields_multi`] の 1 本版。
+pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
+    encode_key_set_write_fields_multi(keyset_id, &[(*epoch_key, 1)])
 }
 
 /// `group-key-map` attribute Data TLV (list of `GroupKeyMapStruct{1: GroupId,
@@ -216,5 +230,44 @@ mod tests {
         let j = tlv_element_to_json(&mut r, first).unwrap();
         assert_eq!(j["0"], serde_json::json!(10));
         assert_eq!(j["1"], serde_json::json!("grp10"));
+    }
+
+    #[test]
+    fn key_set_write_single_epoch_is_the_multi_form_with_one_key() {
+        assert_eq!(
+            encode_key_set_write_fields(42, &[0xAB; 16]),
+            encode_key_set_write_fields_multi(42, &[([0xAB; 16], 1)])
+        );
+    }
+
+    #[test]
+    fn key_set_write_multi_fills_epoch_slots_in_order_and_nulls_the_rest() {
+        let tlv = encode_key_set_write_fields_multi(0, &[([0x0C; 16], 1), ([0x0E; 16], 2)]);
+        // {0: GroupKeySet{0: id, 1: policy, 2: key0, 3: start0, 4: key1, 5: start1, 6: null, 7: null}}
+        let mut r = Reader::new(&tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart);
+        let el = r.next().unwrap().unwrap();
+        assert_eq!((el.tag, el.value), (Tag::Context(0), Value::StructStart));
+        let mut seen = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            if el.value == Value::ContainerEnd {
+                break;
+            }
+            seen.push((el.tag, el.value));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (Tag::Context(0), Value::Uint(0)),
+                (Tag::Context(1), Value::Uint(0)),
+                (Tag::Context(2), Value::Bytes(&[0x0C; 16])),
+                (Tag::Context(3), Value::Uint(1)),
+                (Tag::Context(4), Value::Bytes(&[0x0E; 16])),
+                (Tag::Context(5), Value::Uint(2)),
+                (Tag::Context(6), Value::Null),
+                (Tag::Context(7), Value::Null),
+            ]
+        );
     }
 }

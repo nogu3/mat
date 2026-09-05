@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 use mat_controller::im::{
-    encode_add_group_fields, encode_group_key_map_tlv, encode_key_set_write_fields, ATTR_ACL,
-    ATTR_GROUP_KEY_MAP, CLUSTER_ACCESS_CONTROL, CLUSTER_GROUPS, CLUSTER_GROUP_KEY_MANAGEMENT,
-    CMD_ADD_GROUP, CMD_KEY_SET_WRITE,
+    encode_add_group_fields, encode_group_key_map_tlv, encode_key_set_write_fields,
+    encode_key_set_write_fields_multi, ATTR_ACL, ATTR_GROUP_KEY_MAP, CLUSTER_ACCESS_CONTROL,
+    CLUSTER_GROUPS, CLUSTER_GROUP_KEY_MANAGEMENT, CMD_ADD_GROUP, CMD_KEY_SET_WRITE,
 };
 use mat_controller::tlv::{Tag, Writer};
 use mat_core::acl::{entries_from_im_json, merge_group_entry, AclEntry};
@@ -406,6 +406,29 @@ pub(crate) fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
     }
     w.end_container();
     w.finish()
+}
+
+/// IPK の KeySet id（spec §11.2.6.2）。
+pub const IPK_KEYSET_ID: u16 = 0;
+
+/// IPK keyset（keyset 0）へ `KeySetWrite` を 1 回打つ — `fabric rotate-ipk` の
+/// 配布 / catch-up の 1 ステップ。`epochs` は (epoch_key, start_time) 1〜3 本、
+/// start_time は単調増加かつ非 0（spec §11.2.8.1）。ep0、timed 無し。失敗は
+/// detail に `key-set-write (ipk): ` を前置。
+pub async fn write_ipk_keyset(
+    conn: &mut dyn NodeConn,
+    epochs: &[([u8; 16], u64)],
+) -> Result<(), MatError> {
+    let fields = encode_key_set_write_fields_multi(IPK_KEYSET_ID, epochs);
+    conn.invoke(
+        0,
+        CLUSTER_GROUP_KEY_MANAGEMENT,
+        CMD_KEY_SET_WRITE,
+        Some(fields),
+        false,
+    )
+    .await
+    .map_err(|e| MatError::new(e.kind, format!("key-set-write (ipk): {}", e.detail)))
 }
 
 /// 1 ノード分のデバイス側 provision: KeySetWrite → group-key-map
@@ -1231,5 +1254,32 @@ mod tests {
         .unwrap_err();
         assert!(err.detail.contains("acl read"), "{}", err.detail);
         assert!(conn.calls().is_empty(), "read 失敗で一切 write しない");
+    }
+
+    #[tokio::test]
+    async fn write_ipk_keyset_invokes_key_set_write_on_ep0_with_keyset_0() {
+        let mut conn = FakeConn::scripted();
+        write_ipk_keyset(&mut conn, &[([0x0C; 16], 1), ([0x0E; 16], 2)])
+            .await
+            .unwrap();
+        assert_eq!(conn.calls(), &["invoke(0,0x003F,0x0000)".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn write_ipk_keyset_prefixes_error_with_step_name() {
+        let mut conn = FakeConn {
+            fail_first_send: true,
+            fail_kind: ErrorKind::DeviceRejected,
+            ..FakeConn::scripted()
+        };
+        let err = write_ipk_keyset(&mut conn, &[([0x0C; 16], 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::DeviceRejected);
+        assert!(
+            err.detail.starts_with("key-set-write (ipk): "),
+            "{}",
+            err.detail
+        );
     }
 }

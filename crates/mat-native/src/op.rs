@@ -1187,9 +1187,11 @@ mod tests {
 
     #[tokio::test]
     async fn conn_error_propagates_unchanged() {
-        let mut conn = FakeConn::default();
-        conn.fail_first_send = true;
-        conn.fail_kind = ErrorKind::Timeout;
+        let mut conn = FakeConn {
+            fail_first_send: true,
+            fail_kind: ErrorKind::Timeout,
+            ..FakeConn::default()
+        };
         let err = run_node_op(
             &mut conn,
             &node(NodeOpKind::read(1, "onoff", "on-off").unwrap()),

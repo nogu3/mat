@@ -143,18 +143,18 @@ pub struct FakeConn {
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
     pub sent: usize,
-    reads: HashMap<(u16, u32, u32), serde_json::Value>,
-    clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
+    pub reads: HashMap<(u16, u32, u32), serde_json::Value>,
+    pub clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
     /// `invoke_for_data(endpoint, cluster, command)` の応答 CommandFields TLV
     /// プリセット（`with_invoke_response` で流し込む）。未登録は空 Vec。
-    invoke_responses: HashMap<(u16, u32, u32), Vec<u8>>,
+    pub invoke_responses: HashMap<(u16, u32, u32), Vec<u8>>,
     /// `invoke`/`write_tlv` の呼び出し記録（M8a Task9）。順序・宛先の検証用
     /// — `"invoke(ep,0xCCCC,0xCCCC)"` / `"write_tlv(ep,0xCCCC,0xCCCC)"` 形
     /// （cluster/command/attribute は `{:#06X}` — 4桁ゼロ埋め大文字 hex）。
-    calls: Vec<String>,
+    pub calls: Vec<String>,
     /// `write_tlv` の TLV ペイロード記録（M8a Task9）: (endpoint, cluster, attribute, tlv_bytes)。
     /// group-key-map マージ検証用。
-    written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
+    pub written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
     /// 送信系メソッド冒頭の遅延（deadline 執行テスト用、Issue #16）。None = 遅延なし。
     pub delay: Option<std::time::Duration>,
     /// `close()` の呼び出し回数。establisher へ渡してしまい conn 自体への参照が
@@ -260,6 +260,11 @@ impl NodeConn for FakeConn {
     ) -> Result<(), MatError> {
         if let Some(d) = self.delay {
             tokio::time::sleep(d).await;
+        }
+        let n = self.sent;
+        self.sent += 1;
+        if self.fail_first_send && n == 0 {
+            return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         self.calls
             .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
