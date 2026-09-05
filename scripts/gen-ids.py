@@ -103,6 +103,10 @@ def ty_of(cluster_id, ty: str, is_array: bool, entry, enums, bitmaps, structs,
             else f"Ty::Struct({ref})"
     if "struct" in elem.lower():
         tag = "Unknown"          # 名前は struct 風だが定義が無い
+        where = "global" if cluster_id is None else f"cluster {cluster_id:#06x}"
+        print(f"warning: unresolved struct type {elem!r} ({where}) "
+              f"-> TypeTag::Unknown (write/invoke of this field will be "
+              f"parse_error)", file=sys.stderr)
     else:
         tag = scalar_tag(elem, enums, bitmaps)
     return f"Ty::List(TypeTag::{tag})" if (is_array or entry) \

@@ -45,10 +45,32 @@ impl std::fmt::Debug for Ty {
     }
 }
 
-impl Ty {
+impl TypeTag {
     /// 人間可読の型名（parse_error detail 用）。
+    pub fn describe(self) -> &'static str {
+        match self {
+            TypeTag::Bool => "bool",
+            TypeTag::UInt => "uint",
+            TypeTag::Int => "int",
+            TypeTag::F32 => "float (single)",
+            TypeTag::F64 => "float (double)",
+            TypeTag::Str => "string",
+            TypeTag::Bytes => "bytes",
+            TypeTag::Unknown => "unknown",
+        }
+    }
+}
+
+impl Ty {
+    /// 人間可読の型名（parse_error detail 用）。種別は小文字、struct 名は生成
+    /// テーブルの表記のまま（`list of struct AccessControlEntryStruct`）。
     pub fn describe(&self) -> String {
-        format!("{self:?}").to_lowercase()
+        match self {
+            Ty::Scalar(t) => t.describe().to_string(),
+            Ty::Struct(d) => format!("struct {}", d.name),
+            Ty::List(t) => format!("list of {}", t.describe()),
+            Ty::ListOfStruct(d) => format!("list of struct {}", d.name),
+        }
     }
 }
 
@@ -152,12 +174,11 @@ pub fn resolve_command(cluster: u32, input: &str) -> Option<CmdRef> {
     })
 }
 
-/// write / invoke 引数の値ツリー。名前は歴史的に `ScalarValue` だが list /
-/// struct も持つ（改名は mat-native::op と同時に行う — 直列後回しの可読性分割）。
-/// mat-controller の ImValue と同形のスカラー + container。mat-core は
-/// mat-controller に依存できないため別型で持ち、mat-native 側で TLV に写す。
+/// write / invoke 引数の値ツリー（スカラー + list / struct container）。
+/// mat-controller の ImValue と同形。mat-core は mat-controller に依存できない
+/// ため別型で持ち、mat-native 側で TLV に写す（旧名 `ArgValue`）。
 #[derive(Debug, Clone, PartialEq)]
-pub enum ScalarValue {
+pub enum ArgValue {
     Bool(bool),
     UInt(u64),
     Int(i64),
@@ -167,9 +188,9 @@ pub enum ScalarValue {
     Bytes(Vec<u8>),
     Null,
     /// TLV Array。要素は全て同じ型記述。
-    List(Vec<ScalarValue>),
+    List(Vec<ArgValue>),
     /// TLV Struct。(context tag = fieldId, 値)、id 昇順に整列済み。
-    Struct(Vec<(u8, ScalarValue)>),
+    Struct(Vec<(u8, ArgValue)>),
 }
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
@@ -212,7 +233,7 @@ fn to_finite_f32(f: f64) -> Result<f32, String> {
 /// 型記述に従って CLI 入力文字列を値へ。Err は人間可読の理由（そのまま
 /// parse_error detail に使える）。スカラーはリテラル構文、list / struct は
 /// JSON（名前キー・番号キーの両方を受け付ける）。
-pub fn parse_value_typed(input: &str, ty: &Ty) -> Result<ScalarValue, String> {
+pub fn parse_value_typed(input: &str, ty: &Ty) -> Result<ArgValue, String> {
     let s = input.trim();
     match ty {
         Ty::Scalar(tag) => parse_scalar_literal(s, *tag),
@@ -224,77 +245,89 @@ pub fn parse_value_typed(input: &str, ty: &Ty) -> Result<ScalarValue, String> {
     }
 }
 
+/// parse_error detail に埋める JSON の短縮形。巨大な list / struct 入力を丸ごと
+/// 写すと stderr が膨らむので、先頭 `MAX` 文字 + 全長だけ残す。
+fn short_json(j: &serde_json::Value) -> String {
+    const MAX: usize = 80;
+    let s = j.to_string();
+    let len = s.chars().count();
+    if len <= MAX {
+        return s;
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}… ({len} chars)")
+}
+
 /// JSON を型記述で検査しつつ値ツリーへ。`at` はエラー位置（`value[0].targets` 等）。
-fn json_to_value(j: &serde_json::Value, ty: &Ty, at: &str) -> Result<ScalarValue, String> {
+fn json_to_value(j: &serde_json::Value, ty: &Ty, at: &str) -> Result<ArgValue, String> {
     if j.is_null() {
-        return Ok(ScalarValue::Null); // nullable かどうかはデバイスが検証する。
+        return Ok(ArgValue::Null); // nullable かどうかはデバイスが検証する。
     }
     match *ty {
         Ty::Scalar(tag) => json_scalar(j, tag, at),
         Ty::List(elem) => json_list(j, &Ty::Scalar(elem), at),
         Ty::ListOfStruct(def) => json_list(j, &Ty::Struct(def), at),
         Ty::Struct(def) => {
-            let obj = j
-                .as_object()
-                .ok_or_else(|| format!("{at}: expected a JSON object ({}), got {j}", def.name))?;
+            let obj = j.as_object().ok_or_else(|| {
+                format!(
+                    "{at}: expected a JSON object ({}), got {}",
+                    def.name,
+                    short_json(j)
+                )
+            })?;
             json_struct(obj, def, at)
         }
     }
 }
 
-fn json_list(j: &serde_json::Value, elem: &Ty, at: &str) -> Result<ScalarValue, String> {
+fn json_list(j: &serde_json::Value, elem: &Ty, at: &str) -> Result<ArgValue, String> {
     let arr = j.as_array().ok_or_else(|| {
         format!(
-            "{at}: expected a JSON array (list of {}), got {j}",
-            elem.describe()
+            "{at}: expected a JSON array (list of {}), got {}",
+            elem.describe(),
+            short_json(j)
         )
     })?;
     arr.iter()
         .enumerate()
         .map(|(i, e)| json_to_value(e, elem, &format!("{at}[{i}]")))
         .collect::<Result<Vec<_>, _>>()
-        .map(ScalarValue::List)
+        .map(ArgValue::List)
 }
 
-fn json_scalar(j: &serde_json::Value, tag: TypeTag, at: &str) -> Result<ScalarValue, String> {
+fn json_scalar(j: &serde_json::Value, tag: TypeTag, at: &str) -> Result<ArgValue, String> {
     use serde_json::Value as J;
-    let bad = |want: &str| format!("{at}: expected {want}, got {j}");
+    let bad = |want: &str| format!("{at}: expected {want}, got {}", short_json(j));
     match tag {
-        TypeTag::Bool => j
-            .as_bool()
-            .map(ScalarValue::Bool)
-            .ok_or_else(|| bad("a bool")),
+        TypeTag::Bool => j.as_bool().map(ArgValue::Bool).ok_or_else(|| bad("a bool")),
         TypeTag::UInt => match j {
-            J::Number(n) => n.as_u64().map(ScalarValue::UInt),
-            J::String(s) => parse_num(s).map(ScalarValue::UInt),
+            J::Number(n) => n.as_u64().map(ArgValue::UInt),
+            J::String(s) => parse_num(s).map(ArgValue::UInt),
             _ => None,
         }
         .ok_or_else(|| bad("an unsigned integer (number or \"0x..\" string)")),
         TypeTag::Int => match j {
-            J::Number(n) => n.as_i64().map(ScalarValue::Int),
-            J::String(s) => s.trim().parse::<i64>().ok().map(ScalarValue::Int),
+            J::Number(n) => n.as_i64().map(ArgValue::Int),
+            J::String(s) => s.trim().parse::<i64>().ok().map(ArgValue::Int),
             _ => None,
         }
         .ok_or_else(|| bad("an integer")),
         TypeTag::F32 => match j.as_f64() {
             Some(f) => to_finite_f32(f)
-                .map(ScalarValue::F32)
+                .map(ArgValue::F32)
                 .map_err(|e| format!("{at}: {e}")),
             None => Err(bad("a number")),
         },
-        TypeTag::F64 => j
-            .as_f64()
-            .map(ScalarValue::F64)
-            .ok_or_else(|| bad("a number")),
+        TypeTag::F64 => j.as_f64().map(ArgValue::F64).ok_or_else(|| bad("a number")),
         TypeTag::Str => j
             .as_str()
-            .map(|s| ScalarValue::Str(s.to_string()))
+            .map(|s| ArgValue::Str(s.to_string()))
             .ok_or_else(|| bad("a string")),
         TypeTag::Bytes => {
             let s = j.as_str().ok_or_else(|| bad("a hex string"))?;
             let h = s.strip_prefix("hex:").unwrap_or(s);
             parse_hex_bytes(&format!("hex:{h}"))
-                .map(ScalarValue::Bytes)
+                .map(ArgValue::Bytes)
                 .map_err(|e| format!("{at}: {e}"))
         }
         TypeTag::Unknown => Err(format!("{at}: type unknown; cannot encode value")),
@@ -305,8 +338,8 @@ fn json_struct(
     obj: &serde_json::Map<String, serde_json::Value>,
     def: &StructDef,
     at: &str,
-) -> Result<ScalarValue, String> {
-    let mut out: Vec<(u8, ScalarValue)> = Vec::with_capacity(obj.len());
+) -> Result<ArgValue, String> {
+    let mut out: Vec<(u8, ArgValue)> = Vec::with_capacity(obj.len());
     for (k, v) in obj {
         let field = def
             .fields
@@ -345,59 +378,59 @@ fn json_struct(
         }
     }
     out.sort_by_key(|(id, _)| *id);
-    Ok(ScalarValue::Struct(out))
+    Ok(ArgValue::Struct(out))
 }
 
-fn parse_scalar_literal(s: &str, ty: TypeTag) -> Result<ScalarValue, String> {
+fn parse_scalar_literal(s: &str, ty: TypeTag) -> Result<ArgValue, String> {
     if s == "null" {
-        return Ok(ScalarValue::Null); // nullable 属性の消去 write。
+        return Ok(ArgValue::Null); // nullable 属性の消去 write。
     }
     match ty {
         TypeTag::Bool => match s {
-            "true" | "1" => Ok(ScalarValue::Bool(true)),
-            "false" | "0" => Ok(ScalarValue::Bool(false)),
+            "true" | "1" => Ok(ArgValue::Bool(true)),
+            "false" | "0" => Ok(ArgValue::Bool(false)),
             _ => Err(format!("not a bool literal: {s:?}")),
         },
         TypeTag::UInt => parse_num(s)
-            .map(ScalarValue::UInt)
+            .map(ArgValue::UInt)
             .ok_or(format!("not an unsigned integer: {s:?}")),
         TypeTag::Int => s
             .parse::<i64>()
-            .map(ScalarValue::Int)
+            .map(ArgValue::Int)
             .map_err(|_| format!("not an integer: {s:?}")),
-        TypeTag::F32 => parse_finite_f64(s).and_then(|f| to_finite_f32(f).map(ScalarValue::F32)),
-        TypeTag::F64 => parse_finite_f64(s).map(ScalarValue::F64),
-        TypeTag::Str => Ok(ScalarValue::Str(s.to_string())),
-        TypeTag::Bytes => parse_hex_bytes(s).map(ScalarValue::Bytes),
+        TypeTag::F32 => parse_finite_f64(s).and_then(|f| to_finite_f32(f).map(ArgValue::F32)),
+        TypeTag::F64 => parse_finite_f64(s).map(ArgValue::F64),
+        TypeTag::Str => Ok(ArgValue::Str(s.to_string())),
+        TypeTag::Bytes => parse_hex_bytes(s).map(ArgValue::Bytes),
         TypeTag::Unknown => Err("attribute type unknown; cannot encode value".into()),
     }
 }
 
 /// 数値 ID 直指定（def 無し）用: JSON リテラル風に型推定する。
 /// true/false→Bool, null→Null, 整数→UInt(負なら Int), "hex:AABB"→Bytes, その他→Str。
-pub fn parse_scalar_inferred(input: &str) -> ScalarValue {
+pub fn parse_scalar_inferred(input: &str) -> ArgValue {
     let s = input.trim();
     match s {
-        "true" => return ScalarValue::Bool(true),
-        "false" => return ScalarValue::Bool(false),
-        "null" => return ScalarValue::Null,
+        "true" => return ArgValue::Bool(true),
+        "false" => return ArgValue::Bool(false),
+        "null" => return ArgValue::Null,
         _ => {}
     }
     if let Ok(b) = parse_hex_bytes(s) {
-        return ScalarValue::Bytes(b);
+        return ArgValue::Bytes(b);
     }
     if let Some(u) = parse_num(s) {
-        return ScalarValue::UInt(u);
+        return ArgValue::UInt(u);
     }
     if let Ok(i) = s.parse::<i64>() {
-        return ScalarValue::Int(i);
+        return ArgValue::Int(i);
     }
     if (s.contains('.') || s.contains(['e', 'E'])) && !s.starts_with("0x") {
         if let Ok(f) = parse_finite_f64(s) {
-            return ScalarValue::F64(f);
+            return ArgValue::F64(f);
         }
     }
-    ScalarValue::Str(s.to_string())
+    ArgValue::Str(s.to_string())
 }
 
 /// 汎用 write の分類結果（旧 mat 直経路 `native_direct::classify_strict` の
@@ -411,7 +444,7 @@ pub enum WriteClass {
     Native {
         cluster: u32,
         attribute: u32,
-        value: ScalarValue,
+        value: ArgValue,
         timed: bool,
     },
     /// cluster/attribute 名は解決できたが値が型記述に合わない（不正なリテラル /
@@ -478,7 +511,7 @@ pub enum InvokeClass {
     Native {
         cluster: u32,
         command: u32,
-        fields: Vec<ScalarValue>,
+        fields: Vec<ArgValue>,
         timed: bool,
     },
     /// cluster/command 名は解決できたが引数が符号化不能（多すぎる/非スカラー型）。
@@ -656,7 +689,7 @@ mod tests {
 
     #[test]
     fn parse_value_typed_scalars() {
-        use ScalarValue as V;
+        use ArgValue as V;
         assert_eq!(
             parse_value_typed("true", &Ty::Scalar(TypeTag::Bool)),
             Ok(V::Bool(true))
@@ -719,7 +752,7 @@ mod tests {
 
     #[test]
     fn parse_value_typed_floats() {
-        use ScalarValue as V;
+        use ArgValue as V;
         assert_eq!(
             parse_value_typed("1.5", &Ty::Scalar(TypeTag::F64)),
             Ok(V::F64(1.5))
@@ -752,11 +785,11 @@ mod tests {
     #[test]
     fn parse_scalar_inferred_float_literal() {
         // 数値 ID 直指定: 小数点 / 指数を含む数値リテラルは F64 に推定する。
-        assert_eq!(parse_scalar_inferred("1.5"), ScalarValue::F64(1.5));
-        assert_eq!(parse_scalar_inferred("2e3"), ScalarValue::F64(2000.0));
+        assert_eq!(parse_scalar_inferred("1.5"), ArgValue::F64(1.5));
+        assert_eq!(parse_scalar_inferred("2e3"), ArgValue::F64(2000.0));
         // 整数はこれまでどおり UInt / Int。
-        assert_eq!(parse_scalar_inferred("42"), ScalarValue::UInt(42));
-        assert_eq!(parse_scalar_inferred("-1"), ScalarValue::Int(-1));
+        assert_eq!(parse_scalar_inferred("42"), ArgValue::UInt(42));
+        assert_eq!(parse_scalar_inferred("-1"), ArgValue::Int(-1));
     }
 
     #[test]
@@ -767,7 +800,7 @@ mod tests {
             WriteClass::Native {
                 cluster: 0x0008,
                 attribute: 0x0011,
-                value: ScalarValue::UInt(128),
+                value: ArgValue::UInt(128),
                 timed: false,
             }
         );
@@ -798,10 +831,10 @@ mod tests {
                 cluster: 0x0008,
                 command: 0x00,
                 fields: vec![
-                    ScalarValue::UInt(128),
-                    ScalarValue::UInt(0),
-                    ScalarValue::UInt(0),
-                    ScalarValue::UInt(0),
+                    ArgValue::UInt(128),
+                    ArgValue::UInt(0),
+                    ArgValue::UInt(0),
+                    ArgValue::UInt(0),
                 ],
                 timed: false,
             }
@@ -858,9 +891,9 @@ mod tests {
                 cluster: 8,
                 command: 0,
                 fields: vec![
-                    ScalarValue::UInt(128),
-                    ScalarValue::Bool(true),
-                    ScalarValue::Bytes(vec![0, 0xff]),
+                    ArgValue::UInt(128),
+                    ArgValue::Bool(true),
+                    ArgValue::Bytes(vec![0, 0xff]),
                 ],
                 timed: false,
             }
@@ -869,7 +902,7 @@ mod tests {
 
     #[test]
     fn parse_scalar_inferred_literals() {
-        use ScalarValue as V;
+        use ArgValue as V;
         assert_eq!(parse_scalar_inferred("true"), V::Bool(true));
         assert_eq!(parse_scalar_inferred("null"), V::Null);
         assert_eq!(parse_scalar_inferred("42"), V::UInt(42));
@@ -958,7 +991,7 @@ mod tests {
 
     #[test]
     fn parse_value_typed_struct_list_by_name_and_by_id() {
-        use ScalarValue as V;
+        use ArgValue as V;
         // 名前キー。
         let v = parse_value_typed(
             r#"[{"privilege":5,"auth-mode":2,"subjects":[112233,"0x1122"],"targets":null}]"#,
@@ -1006,7 +1039,7 @@ mod tests {
 
     #[test]
     fn parse_value_typed_bytes_accept_both_hex_forms_inside_json() {
-        use ScalarValue as V;
+        use ArgValue as V;
         let ks = resolve_command(0x003F, "key-set-write")
             .unwrap()
             .def
@@ -1029,7 +1062,7 @@ mod tests {
 
     #[test]
     fn parse_value_typed_scalar_list_and_top_level_null() {
-        use ScalarValue as V;
+        use ArgValue as V;
         let t = Ty::List(TypeTag::UInt);
         assert_eq!(
             parse_value_typed("[1, 2, 3]", &t),
@@ -1099,7 +1132,7 @@ mod tests {
             WriteClass::Native {
                 cluster: 0x001F,
                 attribute: 0,
-                value: ScalarValue::List(v),
+                value: ArgValue::List(v),
                 timed: false,
             } => assert!(v.is_empty()),
             other => panic!("{other:?}"),
@@ -1110,7 +1143,7 @@ mod tests {
             r#"[{"group-id":1,"group-key-set-id":2}]"#,
         ) {
             WriteClass::Native {
-                value: ScalarValue::List(v),
+                value: ArgValue::List(v),
                 ..
             } => assert_eq!(v.len(), 1),
             other => panic!("{other:?}"),
@@ -1131,7 +1164,7 @@ mod tests {
         let j = r#"{"group-key-set-id":1,"group-key-security-policy":0,"epoch-key0":"hex:00112233445566778899aabbccddeeff","epoch-start-time0":1,"epoch-key1":null,"epoch-start-time1":null,"epoch-key2":null,"epoch-start-time2":null}"#;
         match classify_invoke("groupkeymanagement", "key-set-write", &[j.into()]) {
             InvokeClass::Native { fields, .. } => {
-                assert!(matches!(fields[0], ScalarValue::Struct(_)))
+                assert!(matches!(fields[0], ArgValue::Struct(_)))
             }
             other => panic!("{other:?}"),
         }
@@ -1140,5 +1173,39 @@ mod tests {
             classify_invoke("groupkeymanagement", "key-set-write", &["{}".into()]),
             InvokeClass::Reject(_)
         ));
+    }
+
+    #[test]
+    fn ty_describe_is_human_readable() {
+        // parse_error detail に埋まる型名: 種別は小文字、struct 名は生成テーブルの
+        // 表記のまま（小文字化すると AccessControlEntryStruct が読めなくなる）。
+        assert_eq!(Ty::Scalar(TypeTag::UInt).describe(), "uint");
+        assert_eq!(Ty::Scalar(TypeTag::Str).describe(), "string");
+        assert_eq!(Ty::Scalar(TypeTag::F32).describe(), "float (single)");
+        assert_eq!(Ty::List(TypeTag::Bool).describe(), "list of bool");
+        let acl = resolve_attribute(0x001F, "acl").unwrap().def.unwrap();
+        let Ty::ListOfStruct(entry) = acl.ty else {
+            panic!("acl should be ListOfStruct");
+        };
+        assert_eq!(
+            Ty::Struct(entry).describe(),
+            "struct AccessControlEntryStruct"
+        );
+        assert_eq!(acl.ty.describe(), "list of struct AccessControlEntryStruct");
+    }
+
+    #[test]
+    fn parse_value_typed_shape_errors_truncate_the_offending_json() {
+        // 巨大な list/struct 入力を丸ごと detail に写すと stderr が膨らむので、
+        // 先頭だけ + 全長を添える。
+        let acl = resolve_attribute(0x001F, "acl").unwrap().def.unwrap();
+        let big = format!("{{\"x\": \"{}\"}}", "a".repeat(2000));
+        let err = parse_value_typed(&big, &acl.ty).unwrap_err();
+        assert!(err.contains("expected a JSON array"), "{err}");
+        assert!(err.len() < 200, "detail not truncated: {} chars", err.len());
+        assert!(err.contains("… (2008 chars)"), "{err}");
+        // 短い入力はそのまま。
+        let err = parse_value_typed("{}", &acl.ty).unwrap_err();
+        assert!(err.ends_with("got {}"), "{err}");
     }
 }
