@@ -13,11 +13,14 @@
 //! ②新規 GroupData の first_endpoint は常に kInvalidEndpointId（0xFFFF）
 //! —— 上流は直前に走査した他レコードの値が漏れ込むが、endpoint_count=0 の
 //! とき読者はこの欄を見ないため互換に影響しない。
+//!
+//! IPK ローテーション（`begin_ipk_rotation` / `commit_ipk_rotation` /
+//! `abort_ipk_rotation`）も同じ 1 KvsTxn 規律で書く。
 
 use std::path::Path;
 
 use crate::fabric::{derive_group_session_id, derive_ipk_operational};
-use crate::kvs::{KvsError, KvsTxn};
+use crate::kvs::{mat_ipk_epoch_slot_key, IpkEpochSlot, KvsError, KvsTxn};
 use crate::tlv::{Reader, Tag, Value, Writer};
 
 /// keyset リンクの終端（上流 kInvalidKeysetId — id 0 は IPK で有効値）。
@@ -1029,6 +1032,90 @@ pub fn remove_group(
     Ok(RemoveOutcome { keyset_removed })
 }
 
+/// IPK ローテーションの pending 開始: `mat/f/<idx>/ipk-epoch-next` を書く。既に
+/// 同じ値なら no-op、別の値なら `Corrupt`（呼び手は事前に read して resume 判定
+/// する前提なので、違う値に出会うのは並行実行の証拠）。
+pub fn begin_ipk_rotation(
+    main_ini: &Path,
+    fabric_index: u8,
+    next: &[u8; 16],
+) -> Result<(), GroupSettingsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    let key = mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Next);
+    match txn.get(&key)? {
+        Some(existing) if existing.as_slice() == next => return Ok(()),
+        Some(_) => {
+            return Err(corrupt(
+                &key,
+                "a different ipk rotation is already pending (concurrent rotate-ipk?)",
+            ))
+        }
+        None => {}
+    }
+    txn.set(&key, next);
+    txn.commit()?;
+    Ok(())
+}
+
+/// IPK ローテーションの commit（1 KvsTxn）: `f/<idx>/k/0` の slot 0 を
+/// `derive(next)` に差し替え（[`keyset_with_slot0`] — policy / 残スロット / next
+/// リンクは無傷）、`ipk-epoch := next`、`ipk-epoch-prev := cur`、`ipk-epoch-next`
+/// を削除。pending が無い / 値が `next` と違う / k/0 が無い・解釈不能は `Corrupt`
+/// で何も書かない。
+pub fn commit_ipk_rotation(
+    main_ini: &Path,
+    fabric_index: u8,
+    cfid: &[u8; 8],
+    cur: &[u8; 16],
+    next: &[u8; 16],
+) -> Result<(), GroupSettingsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    let next_key = mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Next);
+    match txn.get(&next_key)? {
+        Some(v) if v.as_slice() == next => {}
+        Some(_) => {
+            return Err(corrupt(
+                &next_key,
+                "pending ipk epoch differs from the one being committed (concurrent rotate-ipk?)",
+            ))
+        }
+        None => return Err(corrupt(&next_key, "no ipk rotation pending")),
+    }
+    let k0 = format!("f/{fabric_index}/k/0");
+    let blob = txn
+        .get(&k0)?
+        .ok_or_else(|| corrupt(&k0, "missing IPK keyset record"))?;
+    let operational = derive_ipk_operational(next, cfid);
+    let hash = derive_group_session_id(&operational);
+    let rewritten = keyset_with_slot0(&blob, EPOCH_START_TIME, hash, &operational)
+        .ok_or_else(|| corrupt(&k0, "unparseable KeySetData"))?;
+    txn.set(&k0, &rewritten);
+    txn.set(
+        &mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Current),
+        next,
+    );
+    txn.set(
+        &mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Prev),
+        cur,
+    );
+    txn.remove(&next_key);
+    txn.commit()?;
+    Ok(())
+}
+
+/// pending の IPK ローテーションを取り消す（`ipk-epoch-next` を消すだけ）。
+/// pending が無ければ `Ok(false)`（ファイルは触らない）。
+pub fn abort_ipk_rotation(main_ini: &Path, fabric_index: u8) -> Result<bool, GroupSettingsError> {
+    let mut txn = KvsTxn::open(main_ini)?;
+    let key = mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Next);
+    if txn.get(&key)?.is_none() {
+        return Ok(false);
+    }
+    txn.remove(&key);
+    txn.commit()?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1721,5 +1808,146 @@ mod tests {
                 INVALID_KEYSET_ID
             )
         );
+    }
+
+    /// rotation テスト用: chip-tool 3 epoch 形の k/0 と mat epoch キーを持つ INI。
+    #[allow(clippy::type_complexity)]
+    fn rotation_fixture(
+        cur: &[u8; 16],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        [(u64, u16, [u8; 16]); 3],
+    ) {
+        let (d, p) = tmp_ini("[Default]\n");
+        let op = derive_ipk_operational(cur, &CFID);
+        let slots = [
+            (EPOCH_START_TIME, derive_group_session_id(&op), op),
+            (2_000_000, 0x2222, [0x32; 16]),
+            (3_000_000, 0x3333, [0x33; 16]),
+        ];
+        let mut txn = crate::kvs::KvsTxn::open(&p).unwrap();
+        txn.set("f/2/k/0", &multi_epoch_keyset(0, &slots, INVALID_KEYSET_ID));
+        txn.set(&crate::kvs::mat_ipk_epoch_key(2), cur);
+        txn.commit().unwrap();
+        (d, p, slots)
+    }
+
+    #[test]
+    fn ipk_rotation_begin_commit_round_trip() {
+        use crate::kvs::{read_mat_ipk_epoch_slot, IpkEpochSlot};
+        let cur = [0x0C; 16];
+        let next = [0x0E; 16];
+        let (_d, p, slots) = rotation_fixture(&cur);
+
+        begin_ipk_rotation(&p, 2, &next).unwrap();
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Next).unwrap(),
+            Some(next)
+        );
+        // 同じ値での begin は冪等、違う値は Corrupt（並行実行）。
+        begin_ipk_rotation(&p, 2, &next).unwrap();
+        assert!(matches!(
+            begin_ipk_rotation(&p, 2, &[0x0F; 16]),
+            Err(GroupSettingsError::Corrupt { .. })
+        ));
+
+        commit_ipk_rotation(&p, 2, &CFID, &cur, &next).unwrap();
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Current).unwrap(),
+            Some(next)
+        );
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Prev).unwrap(),
+            Some(cur)
+        );
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Next).unwrap(),
+            None
+        );
+        let op_next = derive_ipk_operational(&next, &CFID);
+        let txn = crate::kvs::KvsTxn::open(&p).unwrap();
+        assert_eq!(
+            txn.get("f/2/k/0").unwrap().unwrap(),
+            multi_epoch_keyset(
+                0,
+                &[
+                    (EPOCH_START_TIME, derive_group_session_id(&op_next), op_next),
+                    slots[1],
+                    slots[2]
+                ],
+                INVALID_KEYSET_ID
+            ),
+            "k/0: slot 0 だけ新 operational、残りスロットと next リンクは無傷"
+        );
+        // 読み側（CASE 用）も新 operational を見る。
+        assert_eq!(
+            crate::kvs::parse_keyset_first_entry(&txn.get("f/2/k/0").unwrap().unwrap(), 2)
+                .unwrap()
+                .0,
+            op_next
+        );
+    }
+
+    #[test]
+    fn ipk_rotation_commit_refuses_mismatch_and_missing_state_without_writing() {
+        let cur = [0x0C; 16];
+        let next = [0x0E; 16];
+        let (_d, p, _) = rotation_fixture(&cur);
+        let before = std::fs::read(&p).unwrap();
+        // pending 無し
+        assert!(matches!(
+            commit_ipk_rotation(&p, 2, &CFID, &cur, &next),
+            Err(GroupSettingsError::Corrupt { .. })
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        // pending と違う next
+        begin_ipk_rotation(&p, 2, &next).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(matches!(
+            commit_ipk_rotation(&p, 2, &CFID, &cur, &[0x0F; 16]),
+            Err(GroupSettingsError::Corrupt { .. })
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        // k/0 欠落
+        {
+            let mut txn = crate::kvs::KvsTxn::open(&p).unwrap();
+            txn.remove("f/2/k/0");
+            txn.commit().unwrap();
+        }
+        let before = std::fs::read(&p).unwrap();
+        assert!(matches!(
+            commit_ipk_rotation(&p, 2, &CFID, &cur, &next),
+            Err(GroupSettingsError::Corrupt { .. })
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn ipk_rotation_abort_removes_pending_only() {
+        use crate::kvs::{read_mat_ipk_epoch_slot, IpkEpochSlot};
+        let cur = [0x0C; 16];
+        let (_d, p, _) = rotation_fixture(&cur);
+        assert!(!abort_ipk_rotation(&p, 2).unwrap(), "pending 無しは false");
+        begin_ipk_rotation(&p, 2, &[0x0E; 16]).unwrap();
+        assert!(abort_ipk_rotation(&p, 2).unwrap());
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Next).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&p, 2, IpkEpochSlot::Current).unwrap(),
+            Some(cur)
+        );
+    }
+
+    #[test]
+    fn ipk_rotation_locked_kvs_is_hard_error() {
+        let (_d, p, _) = rotation_fixture(&[0x0C; 16]);
+        let _held = crate::kvs::KvsTxn::open(&p).unwrap();
+        assert!(matches!(
+            begin_ipk_rotation(&p, 2, &[0x0E; 16]),
+            Err(GroupSettingsError::Kvs(KvsError::Locked))
+        ));
     }
 }

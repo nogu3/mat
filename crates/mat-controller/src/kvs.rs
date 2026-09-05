@@ -856,22 +856,47 @@ impl KvsTxn {
     }
 }
 
-/// mat 専用の epoch IPK 永続キー（M8c-3）。chip-tool の名前空間
-/// （`f/<idx>/...` / `g/...` / `ExampleOpCredsCAKey<n>` 等）と衝突しない
-/// `mat/` プレフィクスを使う。chip-tool は未知キーを無視するため、
-/// Stage 1（chip-tool 共存期）でも安全。値は 16 バイトの epoch 鍵の base64。
-pub fn mat_ipk_epoch_key(fabric_index: u8) -> String {
-    format!("mat/f/{fabric_index}/ipk-epoch")
+/// mat 専用の epoch IPK 永続キーのスロット（M8c-3 の `ipk-epoch` に、IPK
+/// ローテーション用の `-next`（配布中の新 epoch = pending）/ `-prev`（直前の
+/// epoch、取り残しノードの catch-up 用）を加えたもの）。chip-tool の名前空間
+/// （`f/<idx>/...` / `g/...`）と衝突しない `mat/` プレフィクス。値は 16 バイトの
+/// epoch 鍵の base64。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpkEpochSlot {
+    Current,
+    Next,
+    Prev,
 }
 
-/// mat が永続した epoch IPK を読む。キー無し = `Ok(None)`（未採用 —
-/// 呼び出し側は既定定数の検証採用にフォールバック）。16 バイト以外の値は
-/// 不正データとして `KvsError::BadKeyset`（既存の「不正データ」系バリアント
-/// を流用 — 新規バリアントは追加しない）。
-pub fn read_mat_ipk_epoch(main_ini: &Path, fabric_index: u8) -> Result<Option<[u8; 16]>, KvsError> {
+impl IpkEpochSlot {
+    fn suffix(self) -> &'static str {
+        match self {
+            IpkEpochSlot::Current => "ipk-epoch",
+            IpkEpochSlot::Next => "ipk-epoch-next",
+            IpkEpochSlot::Prev => "ipk-epoch-prev",
+        }
+    }
+}
+
+pub fn mat_ipk_epoch_slot_key(fabric_index: u8, slot: IpkEpochSlot) -> String {
+    format!("mat/f/{fabric_index}/{}", slot.suffix())
+}
+
+/// `mat_ipk_epoch_slot_key(fabric_index, Current)` の別名（既存呼び手用）。
+pub fn mat_ipk_epoch_key(fabric_index: u8) -> String {
+    mat_ipk_epoch_slot_key(fabric_index, IpkEpochSlot::Current)
+}
+
+/// 指定スロットの epoch を読む。キー無し = `Ok(None)`。16 バイト以外は
+/// `KvsError::BadKeyset`。
+pub fn read_mat_ipk_epoch_slot(
+    main_ini: &Path,
+    fabric_index: u8,
+    slot: IpkEpochSlot,
+) -> Result<Option<[u8; 16]>, KvsError> {
     let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
     let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    match decode_b64(sec, &mat_ipk_epoch_key(fabric_index))? {
+    match decode_b64(sec, &mat_ipk_epoch_slot_key(fabric_index, slot))? {
         None => Ok(None),
         Some(v) => {
             let arr: [u8; 16] = v.try_into().map_err(|_| KvsError::BadKeyset {
@@ -881,6 +906,14 @@ pub fn read_mat_ipk_epoch(main_ini: &Path, fabric_index: u8) -> Result<Option<[u
             Ok(Some(arr))
         }
     }
+}
+
+/// mat が永続した epoch IPK を読む。キー無し = `Ok(None)`（未採用 —
+/// 呼び出し側は既定定数の検証採用にフォールバック）。16 バイト以外の値は
+/// 不正データとして `KvsError::BadKeyset`（既存の「不正データ」系バリアント
+/// を流用 — 新規バリアントは追加しない）。
+pub fn read_mat_ipk_epoch(main_ini: &Path, fabric_index: u8) -> Result<Option<[u8; 16]>, KvsError> {
+    read_mat_ipk_epoch_slot(main_ini, fabric_index, IpkEpochSlot::Current)
 }
 
 /// mat の epoch IPK を KVS へ永続する（`KvsTxn` 経由、flock 排他・
@@ -1595,5 +1628,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list_fabric_indices(&p).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn ipk_epoch_slot_keys_and_reads() {
+        assert_eq!(
+            mat_ipk_epoch_slot_key(2, IpkEpochSlot::Current),
+            "mat/f/2/ipk-epoch"
+        );
+        assert_eq!(
+            mat_ipk_epoch_slot_key(2, IpkEpochSlot::Next),
+            "mat/f/2/ipk-epoch-next"
+        );
+        assert_eq!(
+            mat_ipk_epoch_slot_key(2, IpkEpochSlot::Prev),
+            "mat/f/2/ipk-epoch-prev"
+        );
+        // 既存の別名はそのまま。
+        assert_eq!(mat_ipk_epoch_key(2), "mat/f/2/ipk-epoch");
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&ini, 2, IpkEpochSlot::Next).unwrap(),
+            None
+        );
+        let mut txn = KvsTxn::open(&ini).unwrap();
+        txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Next), &[0x33; 16]);
+        txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Prev), &[1, 2, 3]);
+        txn.commit().unwrap();
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&ini, 2, IpkEpochSlot::Next).unwrap(),
+            Some([0x33; 16])
+        );
+        assert!(matches!(
+            read_mat_ipk_epoch_slot(&ini, 2, IpkEpochSlot::Prev),
+            Err(KvsError::BadKeyset { .. })
+        ));
+        assert_eq!(read_mat_ipk_epoch(&ini, 2).unwrap(), None);
     }
 }
