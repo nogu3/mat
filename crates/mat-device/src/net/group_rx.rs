@@ -35,12 +35,54 @@ pub use crate::core::group_privacy::PRIVACY_FLAG;
 /// リプレイ表の上限 `(fabric, source)` 数。超えたら最古を退去。
 pub const REPLAY_TABLE_CAPACITY: usize = 64;
 
-/// spec §4.5.4.2 の group data message counter 検査の簡略版: `(fabric,
-/// source node)` ごとに最終 counter を持ち、それ以下は drop。bitmap window
-/// は持たず順序逆転は捨てる側に倒す（mat は各 egress に同一 datagram を
-/// 流すので、実用上の役目は重複排除）。初見の source は trust-first で受理。
+/// spec §4.5.4.2 の group data message counter 窓幅（SDK
+/// `PeerMessageCounter` の `kChallengeSize`/window と同じ 32）。
+pub const REPLAY_WINDOW: u32 = 32;
+
+/// spec §4.5.4.2 / SDK `PeerMessageCounter::VerifyOrTrustFirstGroup` と同じ
+/// 「最大値 + 直近 32 件の bitmap」: `(fabric, source node)` ごとに `max` と
+/// `window`（bit i = `max - (i + 1)` を受理済み）を持つ。初見の source は
+/// trust-first で受理。前方（`c - max mod 2^32 < 2^31`、rollover 込み）は
+/// 新規として窓をずらし、窓内（1..=32 後方）は bitmap で 1 回だけ受理、
+/// それより過去は拒否。32 以上の前方ジャンプは窓を丸ごとクリアする
+/// （spec §4.5.4.2 / SDK と同じ）ため、新しい窓の中にある未受理カウンタは
+/// 旧 max を含め 1 回だけ受理される。
 pub struct GroupReplayGuard {
-    seen: VecDeque<((u8, u64), u32)>,
+    seen: VecDeque<((u8, u64), ReplayWindow)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayWindow {
+    max: u32,
+    window: u32,
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, counter: u32) -> bool {
+        if counter == self.max {
+            return false;
+        }
+        let ahead = counter.wrapping_sub(self.max);
+        if ahead < 1 << 31 {
+            self.window = if ahead >= REPLAY_WINDOW {
+                0
+            } else {
+                (self.window << ahead) | (1 << (ahead - 1))
+            };
+            self.max = counter;
+            return true;
+        }
+        let behind = self.max.wrapping_sub(counter);
+        if behind > REPLAY_WINDOW {
+            return false;
+        }
+        let bit = 1u32 << (behind - 1);
+        if self.window & bit != 0 {
+            return false;
+        }
+        self.window |= bit;
+        true
+    }
 }
 
 impl GroupReplayGuard {
@@ -53,16 +95,18 @@ impl GroupReplayGuard {
     pub fn accept(&mut self, fabric_index: u8, source_node_id: u64, counter: u32) -> bool {
         let key = (fabric_index, source_node_id);
         if let Some(pos) = self.seen.iter().position(|(k, _)| *k == key) {
-            if counter <= self.seen[pos].1 {
-                return false;
-            }
-            self.seen[pos].1 = counter;
-            return true;
+            return self.seen[pos].1.accept(counter);
         }
         if self.seen.len() >= REPLAY_TABLE_CAPACITY {
             self.seen.pop_front();
         }
-        self.seen.push_back((key, counter));
+        self.seen.push_back((
+            key,
+            ReplayWindow {
+                max: counter,
+                window: 0,
+            },
+        ));
         true
     }
 }
@@ -582,18 +626,75 @@ mod tests {
     }
 
     #[test]
-    fn replay_guard_is_strictly_increasing_per_source_and_bounded() {
+    fn replay_guard_accepts_out_of_order_within_the_window_once() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 10)); // trust-first
+        assert!(g.accept(1, 7, 12));
+        assert!(g.accept(1, 7, 11), "順序逆転は窓内なら通る");
+        assert!(!g.accept(1, 7, 11), "同じ counter の 2 回目は拒否");
+        assert!(!g.accept(1, 7, 12));
+        assert!(!g.accept(1, 7, 10), "trust-first で受理した値もマーク済み");
+        assert!(g.accept(1, 7, 13));
+        assert!(g.accept(2, 7, 1), "another fabric is another window");
+    }
+
+    #[test]
+    fn replay_guard_rejects_counters_older_than_the_window() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 100));
+        assert!(
+            !g.accept(1, 7, 100 - REPLAY_WINDOW - 1),
+            "窓外（33 前）は拒否"
+        );
+        assert!(g.accept(1, 7, 100 - REPLAY_WINDOW), "窓の端（32 前）は通る");
+        assert!(!g.accept(1, 7, 100 - REPLAY_WINDOW), "…が 2 回目は拒否");
+    }
+
+    #[test]
+    fn replay_guard_forward_jump_clears_the_window() {
         let mut g = GroupReplayGuard::new();
         assert!(g.accept(1, 7, 10));
-        assert!(!g.accept(1, 7, 10));
-        assert!(!g.accept(1, 7, 9));
-        assert!(g.accept(1, 7, 11));
-        assert!(g.accept(2, 7, 1), "another fabric is another window");
+        assert!(g.accept(1, 7, 10 + 40)); // max = 50, window cleared
+                                          // 32 より前（33..40 後方）は窓外
+        for c in 10..=17 {
+            assert!(!g.accept(1, 7, c), "counter {c} は新しい窓の外");
+        }
+        // 窓内（1..=32 後方）で未受理なら 1 回だけ通る — 10 は旧 max だったが
+        // ジャンプで窓が消えたので記憶されない（spec §4.5.4.2 / SDK と同じ）
+        for c in 18..=49 {
+            assert!(g.accept(1, 7, c), "counter {c} は窓内で未受理");
+            assert!(!g.accept(1, 7, c), "counter {c} の 2 回目は拒否");
+        }
+        assert!(!g.accept(1, 7, 50));
+        assert!(g.accept(1, 7, 51));
+        assert!(
+            !g.accept(1, 7, 50),
+            "51 へ 1 進んだ窓では 50 は受理済み bit"
+        );
+    }
+
+    #[test]
+    fn replay_guard_handles_rollover_as_forward_motion() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 0xFFFF_FFF0));
+        assert!(g.accept(1, 7, 5), "2^31 未満の前進は rollover でも新規");
+        assert!(!g.accept(1, 7, 0xFFFF_FFF0), "旧 max は窓内でマーク済み");
+        assert!(g.accept(1, 7, 0xFFFF_FFF1), "窓内の未受理値は通る");
+        assert!(
+            !g.accept(1, 7, 0x8000_0006),
+            "2^31 以上離れた値は過去扱い → 窓外"
+        );
+    }
+
+    #[test]
+    fn replay_guard_table_is_bounded_and_evicts_the_oldest_source() {
+        let mut g = GroupReplayGuard::new();
+        assert!(g.accept(1, 7, 10));
         for src in 100..(100 + REPLAY_TABLE_CAPACITY as u64) {
             assert!(g.accept(1, src, 1));
         }
         // 最古（fabric 1, source 7）が退去 → 同じ counter がまた通る
-        assert!(g.accept(1, 7, 11));
+        assert!(g.accept(1, 7, 10));
     }
 
     #[tokio::test]
