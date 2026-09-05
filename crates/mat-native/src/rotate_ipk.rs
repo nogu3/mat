@@ -183,6 +183,14 @@ pub struct RotateCtx {
 pub async fn run(cfg: &NativeConfig, p: &RotateIpkParams) -> Result<RotateOutcome, MatError> {
     let main_ini = cfg.store.join(kvs::MAIN_INI_FILE);
     let fabric_index = cfg.fabric_index;
+    // spec §3.6: --abort は pending epoch の削除だけで完結する。資格情報や
+    // ipk-epoch <-> k/0 の整合が壊れたストアでも pending を消せる必要がある
+    // （そういうストアを直すための第一手が --abort なことが多い）ため、
+    // 資格情報の読出しより前でこの分岐を処理し、abort_only 以外には一切
+    // 触れない。
+    if p.mode == RotateMode::Abort {
+        return abort_only(&main_ini, fabric_index);
+    }
     let creds = crate::load_fabric_credentials(cfg)?;
     let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
     let cur_epoch = crate::commission::resolve_ipk_epoch(&main_ini, fabric_index, &creds)?;
@@ -238,13 +246,34 @@ fn map_gs_err(e: GroupSettingsError) -> MatError {
 }
 
 /// CSPRNG の新 epoch（現行と一致したら引き直す）。
+///
+/// 鍵素材は format! に渡さない: `crate::ops::epoch_key_from_hex` のエラー経路
+/// は不正 hex をそのまま detail に埋め込む（呼び出し側のバグ検出用に鍵を
+/// 見せる設計）ため、生成直後の内部鍵の decode には使わず、ここで自前に
+/// decode して失敗時は固定文言のみを返す。
 fn fresh_epoch(cur: &[u8; 16]) -> Result<[u8; 16], MatError> {
     loop {
-        let e = crate::ops::epoch_key_from_hex(&mat_core::group::generate_epoch_key())?;
+        let e = decode_generated_epoch_hex(&mat_core::group::generate_epoch_key())?;
         if e != *cur {
             return Ok(e);
         }
     }
+}
+
+/// `generate_epoch_key` が返す 32 桁 hex を `[u8;16]` へ。壊れているのは
+/// 呼び出し側（mat-core 側の生成ロジック）のバグだが、鍵バイトそのものは
+/// 絶対に detail へ出さない（固定文言のみ）。
+fn decode_generated_epoch_hex(hex: &str) -> Result<[u8; 16], MatError> {
+    const BAD_HEX: &str = "generated epoch key is not 32 hex chars (internal)";
+    if hex.len() != 32 {
+        return Err(MatError::new(ErrorKind::Other, BAD_HEX));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| MatError::new(ErrorKind::Other, BAD_HEX))?;
+    }
+    Ok(out)
 }
 
 async fn rotate(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome, MatError> {
@@ -344,15 +373,22 @@ async fn catch_up(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome,
 }
 
 fn abort(ctx: &RotateCtx) -> Result<RotateOutcome, MatError> {
-    let removed =
-        group_settings::abort_ipk_rotation(&ctx.main_ini, ctx.fabric_index).map_err(map_gs_err)?;
+    abort_only(&ctx.main_ini, ctx.fabric_index)
+}
+
+/// `--abort` の本体: `main_ini` + `fabric_index` だけで完結する（資格情報にも
+/// `RotateCtx` の他のフィールドにも触れない）純粋な操作。`run()` はこれを
+/// 資格情報の読出しより前に直接呼ぶ — `run_with`/`abort` 経由（テストが
+/// `RotateCtx` を組み立てる経路）と同じ動作にするため、ロジックはここ 1 箇所。
+fn abort_only(main_ini: &std::path::Path, fabric_index: u8) -> Result<RotateOutcome, MatError> {
+    let removed = group_settings::abort_ipk_rotation(main_ini, fabric_index).map_err(map_gs_err)?;
     let status = if removed {
         RotateStatus::Aborted
     } else {
         RotateStatus::Idle
     };
     tracing::info!(
-        fabric_index = ctx.fabric_index,
+        fabric_index,
         status = status.as_str(),
         "ipk rotation abort executed"
     );
@@ -377,9 +413,16 @@ async fn distribute(
         let result = if timeout_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), step).await {
                 Ok(r) => r,
+                // タイムアウト時は in-flight の `step` future をここで drop
+                // する（tokio::time::timeout の仕様）ので、conn.close() は
+                // 呼ばれない。直経路は one-shot（次回 run で新規に確立し直す
+                // だけ）で、デバイス側も自分でセッションをタイムアウトさせる
+                // ため、close せずに手放すのはここでは許容している。
                 Err(_) => Err(MatError::new(
                     ErrorKind::Timeout,
-                    format!("node {node_id}: ipk key-set-write exceeded {timeout_ms} ms"),
+                    format!(
+                        "node {node_id}: ipk rotation step (key-set-write + verify-case) exceeded {timeout_ms} ms"
+                    ),
                 )),
             }
         } else {
@@ -903,5 +946,35 @@ mod tests {
         assert_eq!(out.status, RotateStatus::Aborted);
         assert_eq!(slot(&h, IpkEpochSlot::Next), None);
         assert_eq!(h.made.load(Ordering::SeqCst), 0, "abort は確立器を作らない");
+    }
+
+    /// `run()`（`NativeConfig` から組み立てる公開エントリ）の `--abort` が
+    /// 資格情報の読出しより前で分岐することを確認する。ストアには
+    /// `ipk-epoch-next` だけを置き、資格情報ファイルは一切作らない —
+    /// `load_fabric_credentials` が呼ばれていれば store_missing 等で失敗する
+    /// はずのところ、abort は成功する（= 資格情報に触っていない）。
+    #[tokio::test]
+    async fn run_abort_mode_does_not_require_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_ini = dir.path().join(MAIN_INI_FILE);
+        std::fs::write(&main_ini, "[Default]\n").unwrap();
+        {
+            let mut txn = KvsTxn::open(&main_ini).unwrap();
+            txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Next), &[0x0E; 16]);
+            txn.commit().unwrap();
+        }
+        let cfg = NativeConfig {
+            store: dir.path().to_path_buf(),
+            iface: "lo".to_string(),
+            thread_iface: None,
+            fabric_index: 2,
+            issuer_index: 0,
+        };
+        let out = run(&cfg, &params(&[], RotateMode::Abort)).await.unwrap();
+        assert_eq!(out.status, RotateStatus::Aborted);
+        assert_eq!(
+            read_mat_ipk_epoch_slot(&main_ini, 2, IpkEpochSlot::Next).unwrap(),
+            None
+        );
     }
 }

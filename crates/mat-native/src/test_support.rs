@@ -142,6 +142,12 @@ impl crate::SubscribeConn for FakeSubConn {
 pub struct FakeConn {
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
+    /// `fail_first_send`（常に 0 回目）より汎用: `sent` カウンタが指す送信系
+    /// 呼び出し（read_onoff/invoke/write_tlv 共通、0-indexed）のうち、この
+    /// 番号の呼び出しだけを `fail_kind` で失敗させる。特定ステップだけ落として
+    /// 前段は成功させたいテスト向け（例: KeySetWrite は通し group-key-map
+    /// write だけ失敗させる）。
+    pub fail_at: Option<usize>,
     pub sent: usize,
     pub reads: HashMap<(u16, u32, u32), serde_json::Value>,
     pub clusters: HashMap<(u16, u32), Vec<(u32, serde_json::Value)>>,
@@ -168,6 +174,7 @@ impl Default for FakeConn {
         Self {
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
+            fail_at: None,
             sent: 0,
             reads: HashMap::new(),
             clusters: HashMap::new(),
@@ -245,7 +252,7 @@ impl NodeConn for FakeConn {
         }
         let n = self.sent;
         self.sent += 1;
-        if self.fail_first_send && n == 0 {
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         Ok(true)
@@ -263,7 +270,7 @@ impl NodeConn for FakeConn {
         }
         let n = self.sent;
         self.sent += 1;
-        if self.fail_first_send && n == 0 {
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         self.calls
@@ -334,7 +341,7 @@ impl NodeConn for FakeConn {
         }
         let n = self.sent;
         self.sent += 1;
-        if self.fail_first_send && n == 0 {
+        if (self.fail_first_send && n == 0) || self.fail_at == Some(n) {
             return Err(MatError::new(self.fail_kind, "fake send failure"));
         }
         self.calls.push(format!(

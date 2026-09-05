@@ -215,14 +215,23 @@ same nodes to retry, or with `--nodes <subset>` to commit without the ones that
 stay unreachable — those are then one epoch behind, and once they are back:
 `mat fabric rotate-ipk --catch-up --nodes <N>` (CASE with the previous epoch,
 write `{previous, current}`, prove with the current one). A node that missed
-**two** rotations cannot be caught up (the previous epoch is gone) — it needs
-`unpair` + `commission`. `--abort` drops the pending key (nodes keep the extra
+**two** rotations cannot be caught up (the previous epoch is gone): it no
+longer accepts CASE at all, so its device side cannot be cleaned up remotely.
+Recovery is `unpair --force` (ledger-only removal — the device is unreachable,
+so the device-side `RemoveFabric` cannot happen), a factory reset of the
+device, then `commission`. Until it is recovered (or caught up in time), such a
+node is unreachable for **every** op against it — `on`, `read`, a plain
+`unpair`, all of it — and the `session_failed` a user sees on e.g. `mat on
+--node <N>` is this. `--abort` drops the pending key (nodes keep the extra
 epoch harmlessly).
 
 - `--nodes` defaults to every node in the ledger; explicit ids / aliases must
   be commissioned (`node_not_commissioned`, exit `11`). `--op-timeout-ms`
   budgets each node's step (write + proof CASE) — exceeding it is `timeout`
   for that node, and the run continues.
+- `--catch-up` is refused while a rotation is pending (`other`): finish it by
+  re-running `mat fabric rotate-ipk` (same nodes, or a `--nodes` subset), or
+  `--abort` it first.
 - **matd** loads the IPK at start-up and has no reload: it keeps working after
   a rotation (the nodes accept both epochs) but **must be restarted before
   the next rotation**, or its CASE attempts will fail once the nodes drop the

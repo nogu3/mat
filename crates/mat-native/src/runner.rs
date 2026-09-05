@@ -363,10 +363,12 @@ mod tests {
     }
 
     /// `ScriptedEstablisher` に加えて、group-key-map write（`provision_node`
-    /// で最初に `fail_first_send` を尊重する呼び出し — `read_json`/`invoke`
-    /// は尊重しない）を `fail_kind` で失敗させる establisher。素の
-    /// `FakeEstablisher` だと group-key-map read が非配列フォールバックで
-    /// 先に `ParseError` になり、意図した `fail_kind` まで到達できない。
+    /// の 2 番目の送信系呼び出し — `sent` カウンタで 1 回目の KeySetWrite
+    /// invoke は成功させ、`fail_at` でその次だけ狙って落とす）を `fail_kind`
+    /// で失敗させる establisher。`FakeConn::invoke` も `fail_first_send` を
+    /// 尊重するようになった（read_onoff/write_tlv と同じ）ため、単に
+    /// `fail_first_send` を立てるだけだと KeySetWrite（本当の 1 回目の送信）
+    /// が落ちてしまい、意図した group-key-map write まで到達できない。
     struct ScriptedFailingEstablisher;
     #[async_trait::async_trait]
     impl crate::Establisher for ScriptedFailingEstablisher {
@@ -379,7 +381,7 @@ mod tests {
                     0x0000,
                     serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
                 );
-            conn.fail_first_send = true;
+            conn.fail_at = Some(1);
             conn.fail_kind = ErrorKind::DeviceRejected;
             Ok(Box::new(conn))
         }
@@ -401,7 +403,13 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::DeviceRejected);
-        assert!(err.detail.starts_with("node 5: "), "{}", err.detail);
+        // KeySetWrite（1 回目の送信）は通り、group-key-map write（2 回目）で
+        // 落ちたことを step 名で確認する — key-set-write ではないこと。
+        assert_eq!(
+            err.detail,
+            "node 5: provision step 'group-key-map write' failed: fake send failure"
+        );
+        assert!(!err.detail.contains("key-set-write"), "{}", err.detail);
     }
 
     /// `remove_group` 用フィクスチャ: group 1 / keyset 42 を書いた
