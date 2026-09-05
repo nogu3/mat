@@ -351,7 +351,7 @@ mod tests {
 
     fn provisioned() -> (Vec<FabricEntry>, GroupKeyStore, GroupMembershipStore) {
         let gk = GroupKeyStore::new();
-        gk.upsert_keyset(1, 42, EPOCH).unwrap();
+        gk.upsert_keyset(1, 42, EPOCH, 0).unwrap();
         gk.replace_fabric_map(1, vec![(10, 42)]);
         let m = GroupMembershipStore::new();
         m.add(1, 10, 2).unwrap();

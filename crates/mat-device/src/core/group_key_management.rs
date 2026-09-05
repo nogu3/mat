@@ -38,6 +38,12 @@ pub struct GroupKeySet {
     pub fabric_index: u8,
     pub keyset_id: u16,
     pub epoch_key0: [u8; 16],
+    /// KeySetWrite の `EpochStartTime0`（spec §11.2.6.2、epoch-us）。
+    /// v1.31.0 以前の `group_keys.json` には無いので `default` = 0 で読む。
+    /// KeySetRead が返す以外の用途は無い（epoch 1/2 非対応なので鍵選択に
+    /// 使わない）。
+    #[serde(default)]
+    pub epoch_start_time0: u64,
 }
 
 impl std::fmt::Debug for GroupKeySet {
@@ -46,6 +52,7 @@ impl std::fmt::Debug for GroupKeySet {
             .field("fabric_index", &self.fabric_index)
             .field("keyset_id", &self.keyset_id)
             .field("epoch_key0", &"[REDACTED]")
+            .field("epoch_start_time0", &self.epoch_start_time0)
             .finish()
     }
 }
@@ -137,6 +144,7 @@ impl GroupKeyStore {
         fabric_index: u8,
         keyset_id: u16,
         epoch_key0: [u8; 16],
+        epoch_start_time0: u64,
     ) -> Result<(), u8> {
         let mut guard = self.lock();
         if let Some(existing) = guard
@@ -145,6 +153,7 @@ impl GroupKeyStore {
             .find(|k| k.fabric_index == fabric_index && k.keyset_id == keyset_id)
         {
             existing.epoch_key0 = epoch_key0;
+            existing.epoch_start_time0 = epoch_start_time0;
             Self::save(&guard);
             return Ok(());
         }
@@ -160,9 +169,52 @@ impl GroupKeyStore {
             fabric_index,
             keyset_id,
             epoch_key0,
+            epoch_start_time0,
         });
         Self::save(&guard);
         Ok(())
+    }
+
+    /// KeySetRemove (spec §11.2.8.4) の実処理: `(fabric_index, keyset_id)` の
+    /// KeySet を落とし、同 fabric の GroupKeyMap でその keyset を参照する行も
+    /// 落とす（手順 4 のカスケード）。返り値は map が変化したか。無ければ
+    /// `STATUS_NOT_FOUND`。lock 1 回・save 1 回。
+    pub fn remove_keyset(&self, fabric_index: u8, keyset_id: u16) -> Result<bool, u8> {
+        let mut guard = self.lock();
+        let before = guard.keysets.len();
+        guard
+            .keysets
+            .retain(|k| !(k.fabric_index == fabric_index && k.keyset_id == keyset_id));
+        if guard.keysets.len() == before {
+            return Err(im::STATUS_NOT_FOUND);
+        }
+        let map_before = guard.map.len();
+        guard
+            .map
+            .retain(|m| !(m.fabric_index == fabric_index && m.keyset_id == keyset_id));
+        let map_changed = guard.map.len() != map_before;
+        Self::save(&guard);
+        Ok(map_changed)
+    }
+
+    /// accessing fabric の KeySet id 一覧（挿入順）— KeySetReadAllIndices 用。
+    pub fn keyset_ids_for(&self, fabric_index: u8) -> Vec<u16> {
+        self.lock()
+            .keysets
+            .iter()
+            .filter(|k| k.fabric_index == fabric_index)
+            .map(|k| k.keyset_id)
+            .collect()
+    }
+
+    /// `(fabric_index, keyset_id)` の KeySet のコピー — KeySetRead 用
+    /// （応答は鍵を返さないので、呼び出し側は `epoch_start_time0` だけ使う）。
+    pub fn find_keyset(&self, fabric_index: u8, keyset_id: u16) -> Option<GroupKeySet> {
+        self.lock()
+            .keysets
+            .iter()
+            .find(|k| k.fabric_index == fabric_index && k.keyset_id == keyset_id)
+            .cloned()
     }
 
     pub fn keyset_exists(&self, fabric_index: u8, keyset_id: u16) -> bool {
@@ -345,18 +397,19 @@ impl ClusterHandler for GroupKeyManagementHandler {
         if ctx.fabric_index == 0 {
             return InvokeReply::Status(im::STATUS_UNSUPPORTED_ACCESS);
         }
-        let (keyset_id, epoch_key0) = match decode_key_set_write_fields(fields_tlv) {
-            Ok(fields) => fields,
-            Err(KeySetWriteError::Malformed) => {
-                return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
-            }
-            Err(KeySetWriteError::Constraint) => {
-                return InvokeReply::Status(im::STATUS_CONSTRAINT_ERROR);
-            }
-        };
+        let (keyset_id, epoch_key0, epoch_start_time0) =
+            match decode_key_set_write_fields(fields_tlv) {
+                Ok(fields) => fields,
+                Err(KeySetWriteError::Malformed) => {
+                    return InvokeReply::Status(im::STATUS_INVALID_COMMAND);
+                }
+                Err(KeySetWriteError::Constraint) => {
+                    return InvokeReply::Status(im::STATUS_CONSTRAINT_ERROR);
+                }
+            };
         match self
             .store
-            .upsert_keyset(ctx.fabric_index, keyset_id, epoch_key0)
+            .upsert_keyset(ctx.fabric_index, keyset_id, epoch_key0, epoch_start_time0)
         {
             Ok(()) => InvokeReply::Status(im::STATUS_SUCCESS),
             Err(status) => InvokeReply::Status(status),
@@ -441,9 +494,10 @@ enum KeySetWriteError {
 /// `mat_controller::im::encode_key_set_write_fields`が wire 形の正 —
 /// `struct{ Context(0): GroupKeySetStruct{ 0:GroupKeySetID(u16),
 /// 1:GroupKeySecurityPolicy(u8, TrustFirst=0), 2:EpochKey0(16B octstr),
-/// 3:EpochStartTime0(u64), 4..7:null } }`）をデコードする。epoch 1/2 と
-/// `EpochStartTime0` はこの実装では読み捨てる（モジュール doc 参照）。
-fn decode_key_set_write_fields(data: &[u8]) -> Result<(u16, [u8; 16]), KeySetWriteError> {
+/// 3:EpochStartTime0(u64), 4..7:null } }`）をデコードする。epoch 1/2 は
+/// この実装では未対応で読み捨てるが、`EpochStartTime0` は保存して
+/// KeySetRead が返す。無ければ 0（spec 上は必須だが互換のため緩く）。
+fn decode_key_set_write_fields(data: &[u8]) -> Result<(u16, [u8; 16], u64), KeySetWriteError> {
     let mut r = Reader::new(data);
     let el = next_element(&mut r)?;
     if el.value != Value::StructStart {
@@ -453,6 +507,7 @@ fn decode_key_set_write_fields(data: &[u8]) -> Result<(u16, [u8; 16]), KeySetWri
     let mut keyset_id = None;
     let mut policy = None;
     let mut epoch_key0: Option<Vec<u8>> = None;
+    let mut epoch_start_time0 = None;
 
     loop {
         let el = next_element(&mut r)?;
@@ -465,6 +520,7 @@ fn decode_key_set_write_fields(data: &[u8]) -> Result<(u16, [u8; 16]), KeySetWri
                     (Tag::Context(0), Value::Uint(v)) => keyset_id = u16::try_from(v).ok(),
                     (Tag::Context(1), Value::Uint(v)) => policy = u8::try_from(v).ok(),
                     (Tag::Context(2), Value::Bytes(b)) => epoch_key0 = Some(b.to_vec()),
+                    (Tag::Context(3), Value::Uint(v)) => epoch_start_time0 = Some(v),
                     (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                         mat_controller::tlv::skip_container(&mut r)
                             .map_err(|_| KeySetWriteError::Malformed)?;
@@ -489,7 +545,8 @@ fn decode_key_set_write_fields(data: &[u8]) -> Result<(u16, [u8; 16]), KeySetWri
     let epoch_key0: [u8; 16] = epoch_key0
         .try_into()
         .map_err(|_| KeySetWriteError::Constraint)?;
-    Ok((keyset_id, epoch_key0))
+    let epoch_start_time0 = epoch_start_time0.unwrap_or(0);
+    Ok((keyset_id, epoch_key0, epoch_start_time0))
 }
 
 /// `Reader::next()` の `Result<Option<Element>, TlvError>` を「読めない・
@@ -777,8 +834,8 @@ mod tests {
     #[test]
     fn purge_fabric_drops_that_fabrics_keysets_only() {
         let store = GroupKeyStore::new();
-        store.upsert_keyset(1, 10, [0u8; 16]).unwrap();
-        store.upsert_keyset(2, 20, [0u8; 16]).unwrap();
+        store.upsert_keyset(1, 10, [0u8; 16], 0).unwrap();
+        store.upsert_keyset(2, 20, [0u8; 16], 0).unwrap();
         store.purge_fabric(1);
         assert!(!store.keyset_exists(1, 10));
         assert!(store.keyset_exists(2, 20));
@@ -795,8 +852,7 @@ mod tests {
             fabric_index: 1,
             ..Default::default()
         };
-        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
-        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+        store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
 
         // 全置換 write
         let data = mat_controller::im::encode_group_key_map_tlv(&[(0x000A, 7)]);
@@ -851,8 +907,7 @@ mod tests {
             fabric_index: 1,
             ..Default::default()
         };
-        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
-        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+        store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
 
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
@@ -876,8 +931,7 @@ mod tests {
             fabric_index: 1,
             ..Default::default()
         };
-        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
-        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx);
+        store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
 
         let data = mat_controller::im::encode_group_key_map_tlv(&[(0, 7)]);
         assert_eq!(
@@ -894,12 +948,7 @@ mod tests {
     fn group_key_map_write_rejects_other_fabrics_keyset() {
         let store = GroupKeyStore::new();
         let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
-        let mut ctx1 = InvokeCtx {
-            fabric_index: 1,
-            ..Default::default()
-        };
-        let ks = mat_controller::im::encode_key_set_write_fields(7, &[9u8; 16]);
-        h.invoke(im::CMD_KEY_SET_WRITE, &ks, &mut ctx1);
+        store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
         assert!(store.keyset_exists(1, 7));
 
         let mut ctx2 = InvokeCtx {
@@ -944,8 +993,8 @@ mod tests {
     fn group_key_map_read_unfiltered_returns_all_fabrics() {
         let store = GroupKeyStore::new();
         let h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
-        store.upsert_keyset(1, 7, [0u8; 16]).unwrap();
-        store.upsert_keyset(2, 8, [0u8; 16]).unwrap();
+        store.upsert_keyset(1, 7, [0u8; 16], 0).unwrap();
+        store.upsert_keyset(2, 8, [0u8; 16], 0).unwrap();
         store.replace_fabric_map(1, vec![(0x000A, 7)]);
         store.replace_fabric_map(2, vec![(0x000B, 8)]);
 
@@ -998,10 +1047,10 @@ mod tests {
         let cell = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
         {
             let store = GroupKeyStore::with_persist(Box::new(MemPersist(cell.clone())));
-            store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+            store.upsert_keyset(1, 42, [7u8; 16], 0).unwrap();
             store.replace_fabric_map(1, vec![(10, 42)]);
             store.append_map_entry(1, 11, 42);
-            store.upsert_keyset(2, 9, [1u8; 16]).unwrap();
+            store.upsert_keyset(2, 9, [1u8; 16], 0).unwrap();
             store.purge_fabric(2);
         }
         let store2 = GroupKeyStore::with_persist(Box::new(MemPersist(cell)));
@@ -1010,7 +1059,8 @@ mod tests {
             vec![GroupKeySet {
                 fabric_index: 1,
                 keyset_id: 42,
-                epoch_key0: [7u8; 16]
+                epoch_key0: [7u8; 16],
+                epoch_start_time0: 0
             }]
         );
         assert_eq!(store2.map_entries_for(1), vec![(10, 42), (11, 42)]);
@@ -1032,7 +1082,7 @@ mod tests {
     fn persist_failures_do_not_block_the_store() {
         let store = GroupKeyStore::with_persist(Box::new(FailingPersist));
         assert!(store.keysets().is_empty());
-        store.upsert_keyset(1, 42, [7u8; 16]).unwrap();
+        store.upsert_keyset(1, 42, [7u8; 16], 0).unwrap();
         assert!(store.keyset_exists(1, 42));
     }
 
@@ -1043,7 +1093,8 @@ mod tests {
             GroupKeySet {
                 fabric_index: 1,
                 keyset_id: 42,
-                epoch_key0: [0xAB; 16]
+                epoch_key0: [0xAB; 16],
+                epoch_start_time0: 0
             }
         );
         // Note: a plain `!s.contains("ab")` would false-positive on the
@@ -1052,5 +1103,98 @@ mod tests {
         // value (171) — the epoch key is fully redacted either way (no
         // digits of it appear in `s` at all).
         assert!(s.contains("REDACTED") && !s.contains("171"), "{s}");
+    }
+
+    #[test]
+    fn remove_keyset_drops_keyset_and_referencing_map_rows_of_that_fabric_only() {
+        let store = GroupKeyStore::new();
+        store.upsert_keyset(1, 42, [7u8; 16], 0).unwrap();
+        store.replace_fabric_map(1, vec![(10, 42), (11, 42)]);
+        store.upsert_keyset(2, 42, [8u8; 16], 0).unwrap();
+        store.replace_fabric_map(2, vec![(20, 42)]);
+
+        assert_eq!(
+            store.remove_keyset(1, 42),
+            Ok(true),
+            "map rows referenced it"
+        );
+        assert!(!store.keyset_exists(1, 42));
+        assert!(store.map_entries_for(1).is_empty());
+        // 他 fabric は無傷
+        assert!(store.keyset_exists(2, 42));
+        assert_eq!(store.map_entries_for(2), vec![(20, 42)]);
+        // 2 回目は NOT_FOUND
+        assert_eq!(store.remove_keyset(1, 42), Err(im::STATUS_NOT_FOUND));
+    }
+
+    #[test]
+    fn remove_keyset_reports_no_map_change_when_unreferenced() {
+        let store = GroupKeyStore::new();
+        store.upsert_keyset(1, 42, [7u8; 16], 0).unwrap();
+        assert_eq!(store.remove_keyset(1, 42), Ok(false));
+        assert!(store.keysets().is_empty());
+    }
+
+    #[test]
+    fn keyset_ids_and_find_are_fabric_scoped_and_keep_start_time() {
+        let store = GroupKeyStore::new();
+        store
+            .upsert_keyset(1, 42, [7u8; 16], 1_700_000_000_000)
+            .unwrap();
+        store.upsert_keyset(2, 43, [8u8; 16], 5).unwrap();
+        assert_eq!(store.keyset_ids_for(1), vec![42]);
+        assert_eq!(store.keyset_ids_for(2), vec![43]);
+        assert!(store.keyset_ids_for(3).is_empty());
+        let ks = store.find_keyset(1, 42).unwrap();
+        assert_eq!(ks.epoch_start_time0, 1_700_000_000_000);
+        assert!(store.find_keyset(2, 42).is_none());
+        // upsert は start time も置換する
+        store.upsert_keyset(1, 42, [9u8; 16], 77).unwrap();
+        assert_eq!(store.find_keyset(1, 42).unwrap().epoch_start_time0, 77);
+    }
+
+    /// `epoch_start_time0` を持たない旧 `group_keys.json`（v1.31.0 以前）は
+    /// 0 として読める（`#[serde(default)]`）。
+    #[test]
+    fn keyset_json_without_start_time_loads_as_zero() {
+        let json =
+            r#"{"fabric_index":1,"keyset_id":42,"epoch_key0":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}"#;
+        let ks: GroupKeySet = serde_json::from_str(json).unwrap();
+        assert_eq!(ks.epoch_start_time0, 0);
+        assert_eq!(ks.keyset_id, 42);
+    }
+
+    #[test]
+    fn key_set_write_stores_epoch_start_time0() {
+        let store = GroupKeyStore::new();
+        let mut h = GroupKeyManagementHandler::new(store.clone(), GroupMembershipStore::new());
+        let mut ctx = InvokeCtx {
+            fabric_index: 1,
+            ..Default::default()
+        };
+        // encode_key_set_write_fields は Context(3)=EpochStartTime0 を書く
+        // （値はクライアント実装が決める）— ここでは「読み捨てず保存する」
+        // ことだけを、手組みの TLV で pin する。
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(0));
+        w.put_uint(Tag::Context(0), 0x01AA);
+        w.put_uint(Tag::Context(1), 0);
+        w.put_bytes(Tag::Context(2), &[0x11; 16]);
+        w.put_uint(Tag::Context(3), 123_456);
+        w.put_null(Tag::Context(4));
+        w.put_null(Tag::Context(5));
+        w.put_null(Tag::Context(6));
+        w.put_null(Tag::Context(7));
+        w.end_container();
+        w.end_container();
+        assert_eq!(
+            h.invoke(im::CMD_KEY_SET_WRITE, &w.finish(), &mut ctx),
+            InvokeReply::Status(im::STATUS_SUCCESS)
+        );
+        assert_eq!(
+            store.find_keyset(1, 0x01AA).unwrap().epoch_start_time0,
+            123_456
+        );
     }
 }

@@ -1916,7 +1916,7 @@ mod tests {
 
         // GroupKeyStore side of the same fabric: a KeySet and a GroupKeyMap
         // entry, both scoped to fabric_index 1.
-        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
         gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
         assert!(gk_store.keyset_exists(1, 7));
         assert_eq!(gk_store.map_entries_for(1), vec![(0x000A, 7)]);
@@ -2035,7 +2035,7 @@ mod tests {
             decode_entries_for_test(&handler.read(im::ATTR_ACL, &read_ctx(1)).unwrap()).len(),
             1
         );
-        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
         gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
         membership.add(1, 10, 2).unwrap();
 
@@ -2867,7 +2867,7 @@ mod tests {
         // `rollback_uncommitted_fabric` (Task 2 purge site) must purge the
         // uncommitted fabric's GroupKeyStore state exactly like the
         // RemoveFabric path does.
-        gk_store.upsert_keyset(1, 7, [9u8; 16]).unwrap();
+        gk_store.upsert_keyset(1, 7, [9u8; 16], 0).unwrap();
         gk_store.replace_fabric_map(1, vec![(0x000A, 7)]);
 
         server.force_expire_fail_safe();
