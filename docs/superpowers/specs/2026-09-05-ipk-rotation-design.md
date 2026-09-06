@@ -277,6 +277,7 @@ them)`。stdout の body は pure JSON のまま（設計ルール 2）で、機
   1 世代は動作する。**次回ローテーションの前に必ず restart** が必要 —
   `note` と docs に明記。既存の warm session / 購読は影響を受けない（session 鍵は
   確立時に導出済み）。
+  （2026-09-06 追記: `matd reload` で置き換え済み — `docs/superpowers/specs/2026-09-06-matd-reload-design.md`）
 - commit 後の新規 `commission` は `resolve_ipk_epoch` が E_next（= 新 E_cur）を
   返すので AddNOC の IPKValue も新鍵になる。
 

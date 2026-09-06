@@ -183,7 +183,8 @@ mat fabric rotate-ipk --abort         # drop a pending rotation
   "fabric_index": 1,
   "status": "rotated",
   "nodes": [ { "node_id": 5, "status": "ok" }, { "node_id": 6, "status": "ok" } ],
-  "note": "if matd is running, restart it before the next rotation to load the new IPK; nodes left out of --nodes need `mat fabric rotate-ipk --catch-up --nodes <N>`"
+  "matd_reload": "reloaded",
+  "note": "matd_reload says whether a running matd picked up the new IPK (reloaded / not_running / failed); on failed, run `matd reload` (or restart matd) before the next rotation; nodes left out of --nodes need `mat fabric rotate-ipk --catch-up --nodes <N>`"
 }
 ```
 
@@ -232,10 +233,18 @@ epoch harmlessly).
 - `--catch-up` is refused while a rotation is pending (`other`): finish it by
   re-running `mat fabric rotate-ipk` (same nodes, or a `--nodes` subset), or
   `--abort` it first.
-- **matd** loads the IPK at start-up and has no reload: it keeps working after
-  a rotation (the nodes accept both epochs) but **must be restarted before
-  the next rotation**, or its CASE attempts will fail once the nodes drop the
-  epoch it holds. `commission` picks the new epoch up immediately.
+- **matd** loads the IPK at start-up and keeps it in memory. A committed
+  rotation (`status: "rotated"`) asks a running `matd` to reload it over the
+  socket and reports the outcome as `matd_reload`: `reloaded` (the daemon now
+  holds the new IPK — no restart), `not_running` (no daemon answered the
+  probed socket), or `failed` (an old `matd` without the reload op, or the
+  reload itself failed — run `matd reload`, or restart it). The field is
+  informational: it never changes the exit code. Until it reloads, `matd`
+  keeps working on the previous epoch (the nodes accept both) but its CASE
+  attempts would fail after the *next* rotation drops that epoch. Existing
+  warm sessions and resident subscriptions are untouched by the reload; the
+  new IPK is used from the next CASE establishment on. `commission` picks the
+  new epoch up immediately.
 - `fabric list` shows `"ipk_rotation_pending": true` while a rotation is
   pending; `fabric rotate-ipk --abort` clears it.
 - The virtual device `matv` follows the spec here too (§11.2.8.1): it accepts
@@ -904,15 +913,11 @@ mat group remove --group 1 --nodes 5 6 7
 Outputs:
 
 ```json
-// provision — all listed nodes succeeded (provision stops at the first failure)
+// provision — all listed nodes succeeded (provision stops at the first failure).
+// The same shape on the direct path and through matd: matd re-reads the
+// group's credentials from the KVS on every send, so no note, reload or
+// restart follows a provision.
 { "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7], "status": "provisioned" }
-
-// provision --rebind via the direct path also notes the matd restart caveat
-{ "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7, 8], "status": "provisioned", "note": "rebound keyset binding; if matd is running, restart it to reload group state" }
-
-// provision when the controller-side write went native (MAT_IFACE/MAT_MATD_IFACE
-// set, M8c-2) always carries this note instead — regardless of --rebind
-{ "timestamp": "...", "group_id": 1, "keyset_id": 42, "name": "living", "endpoint": 1, "nodes": [5, 6, 7], "status": "provisioned", "note": "controller group state written natively to kvs; if matd is running, restart it to reload group state" }
 
 // invoke — multicast is fire-and-forget; only "sent" can be reported
 { "timestamp": "...", "group_id": 1, "cluster": "onoff", "command": "on", "endpoint": 1, "status": "sent", "note": "unacknowledged groupcast; per-device delivery not confirmed" }
@@ -967,10 +972,9 @@ Outputs:
   epoch key is generated, so nodes left out stop receiving groupcasts), keep the
   **same `--keyset-id`** (the device keyset table holds max 3 entries and the
   IPK uses one), and confirm membership per node with
-  `mat read -e 0 -c groupkeymanagement -a group-key-map`. After a direct-path
-  `--rebind`, restart `matd` if it is running (it may still hold the old group
-  state in memory; the KVS is already updated) — the output `note` says so
-  (see Outputs above).
+  `mat read -e 0 -c groupkeymanagement -a group-key-map`. A direct-path
+  `--rebind` needs no follow-up on `matd`: it re-reads the group's operational
+  credentials from the KVS on every send (see "Pick one group sender" below).
 - **`mat group list` shows the controller side only.** It walks the group /
   key-map / keyset chains in the credential KVS and prints them; it never talks
   to a device, never touches the network, and `--matd` is ignored (it is
@@ -1093,6 +1097,28 @@ matd stop                             # default socket
 matd stop --socket /run/mat/matd.sock
 ```
 
+Make a running daemon pick up a rotated IPK with `matd reload` (what
+`mat fabric rotate-ipk` sends automatically on commit — see `matd_reload`
+there). It re-reads the fabric credentials from the KVS and swaps them into
+the CASE establisher; warm sessions and resident subscriptions stay up, and
+the new IPK applies from the next establishment on. Group credentials are not
+part of it (they are read on every send). A store whose fabric identity
+changed (fabric id, node id or root key) is refused with `other` — restart
+instead:
+
+```bash
+matd reload                           # default socket
+matd reload --socket /run/mat/matd.sock
+```
+
+```json
+{"timestamp": "2026-06-03T12:34:56+09:00", "reloaded": true, "ipk": "changed", "reload_count": 1}
+```
+
+`ipk` is `changed` or `unchanged` (the key itself is never printed). If the
+native backend failed to build at startup, `reload` returns that error like
+every other op (the daemon must be restarted once the store is fixed).
+
 Ask the running daemon what it is doing with `matd status` — one JSON line on
 stdout with daemon basics and the per-node state of the resident subscriptions
 (the same lifecycle the logs narrate: `establishing` → `established` →
@@ -1116,6 +1142,7 @@ matd status --socket /run/mat/matd.sock
   "fabric_index": 1,
   "store": "/home/user/.config/mat",
   "subscribed_clusters": ["onoff", "occupancysensing"],
+  "reloads": {"count": 1, "last_at": "2026-06-03T12:00:00+09:00"},
   "listen_clients": 1,
   "nodes": [
     {"node_id": 5, "state": "established", "for_s": 3600,
@@ -1126,6 +1153,8 @@ matd status --socket /run/mat/matd.sock
   ]
 }
 ```
+
+`reloads` counts successful `matd reload`s since start-up (`last_at` is `null` before the first).
 
 If the native backend failed to build at startup, `native` carries that error
 (`{"kind": "store_missing", ...}`) and `nodes` is empty. If no daemon answers
