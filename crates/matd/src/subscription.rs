@@ -874,19 +874,66 @@ async fn node_subscription_loop(
     }
 }
 
+/// イベント行の `priming` フラグの決め方（`emit_event_lines` の入力）。
+enum PrimingRule {
+    /// 購読成立後の live report — 全て実イベント。
+    Live,
+    /// EventMin 無しの priming（起動直後）= デバイスのイベントログ全量。
+    PrimingAll,
+    /// EventMin 付き再購読の priming: 番号が `min` 以上のものだけが盲目窓中の
+    /// 実イベント。**未満は `priming: true` に落とす** — EventFilters を
+    /// 無視して全ログを返すデバイスがあると、再購読（pump 死 + backoff は
+    /// 日常）のたびに古いボタン押下が `priming: false` で流れ、消費者が
+    /// 再発火してしまう。捨てずに落とすのは、消費者が priming 行を無視する
+    /// 既存契約に乗せたまま、ワイヤに来た事実は隠さないため。
+    PrimingSince(u64),
+}
+
+impl PrimingRule {
+    fn for_priming(event_min: Option<u64>) -> Self {
+        match event_min {
+            None => Self::PrimingAll,
+            Some(min) => Self::PrimingSince(min),
+        }
+    }
+
+    /// この番号のイベントを `priming` として流すか。
+    fn priming_for(&self, node_id: u64, event_number: u64) -> bool {
+        match self {
+            Self::Live => false,
+            Self::PrimingAll => true,
+            Self::PrimingSince(min) => {
+                let below = event_number < *min;
+                if below {
+                    tracing::debug!(
+                        node_id,
+                        event_number,
+                        event_min = min,
+                        "priming event below EventMin; device ignored EventFilters, keeping priming"
+                    );
+                }
+                below
+            }
+        }
+    }
+}
+
 /// EventReport 群をイベント行にして listen へ流し、番号を health へ記録する
-/// （priming と live で同じ扱い — 違いは `priming` フラグだけ）。番号の記録は
-/// 送信前に行う: 受信者ゼロ（listen 接続なし）でも次の再購読の EventMin は
-/// 前へ進める必要がある。
+/// （priming と live の違いは `rule` が決める `priming` フラグだけ）。番号の
+/// 記録は送信前に行う: 受信者ゼロ（listen 接続なし）でも次の再購読の EventMin
+/// は前へ進める必要がある。
 fn emit_event_lines(
     node_id: u64,
     reports: &[mat_controller::im::EventReport],
-    priming: bool,
+    rule: &PrimingRule,
     ts: &str,
     events: &broadcast::Sender<Emitted>,
     health: &SubHealth,
 ) {
-    for item in events_from_event_reports(node_id, reports, priming, ts) {
+    // `priming` はいったん true で組み、番号が分かってから rule で決め直す
+    // （`events_from_event_reports` は 1 通ぶんに一律のフラグしか持てない）。
+    for mut item in events_from_event_reports(node_id, reports, true, ts) {
+        item.priming = rule.priming_for(node_id, item.event_number);
         health.note_event_number(node_id, item.event_number);
         let _ = events.send(Emitted::Event(item)); // 受信者ゼロは正常
     }
@@ -941,13 +988,15 @@ async fn run_subscription_once(
         }
     }
     // priming イベントは EventMin を載せられたときだけ「実イベント」:
-    // 番号が last より大きい = 盲目窓中に本当に起きた（属性の recovered 推定に
+    // 番号が EventMin 以上 = 盲目窓中に本当に起きた（属性の recovered 推定に
     // 相当するものを推定なしで得る）。起動直後（EventMin 無し）はデバイスの
     // ログ全量なので priming: true（消費者は無視する既存契約、spec §6.2）。
+    // 番号の検査は matd 側で行う — デバイスの EventFilters 尊重を信用しない
+    // （`PrimingRule::PrimingSince` のコメント）。
     emit_event_lines(
         node_id,
         &priming_events,
-        event_min.is_none(),
+        &PrimingRule::for_priming(event_min),
         &now_iso8601(),
         events,
         health,
@@ -1030,7 +1079,14 @@ async fn run_subscription_once(
                 for ev in events_from_report_at(node_id, &report.data, false, &ts) {
                     let _ = events.send(Emitted::Attribute(health.observe(ev)));
                 }
-                emit_event_lines(node_id, &report.events, false, &ts, events, health);
+                emit_event_lines(
+                    node_id,
+                    &report.events,
+                    &PrimingRule::Live,
+                    &ts,
+                    events,
+                    health,
+                );
                 // keep-alive（reports 空）も受信 = 経路生存の証明として扱う。
             }
             Ok(None) => {
@@ -2653,6 +2709,7 @@ mod tests {
         let est = FakeEstablisher::default();
         *est.sub_priming_events.lock().unwrap() =
             vec![switch_press_event(12, 1), switch_press_event(10, 1)];
+        let priming_events = Arc::clone(&est.sub_priming_events);
         let seen_min = Arc::clone(&est.sub_event_min);
         let seen_paths = Arc::clone(&est.sub_event_paths);
         let fail_next_report = Arc::clone(&est.fail_next_report);
@@ -2675,6 +2732,9 @@ mod tests {
         );
         assert_eq!(health.last_event_number(5), Some(12));
 
+        // 盲目窓中に起きた 2 件（EventMin = 13 以上）を次の priming に用意する。
+        *priming_events.lock().unwrap() =
+            vec![switch_press_event(13, 1), switch_press_event(15, 1)];
         // 確立の**あと**に注入して走っている pump を殺す = 再購読させる。
         fail_next_report.store(1, std::sync::atomic::Ordering::SeqCst);
         let second = collect_event_lines(&mut rx, 2).await;
@@ -2735,6 +2795,46 @@ mod tests {
             "同一 ReportData の属性行とイベント行は同じ受信時刻"
         );
         assert_eq!(health.last_event_number(5), Some(31));
+    }
+
+    /// デバイスが EventFilters を無視してイベントログ全量を priming で返しても、
+    /// 盲目窓の契約は matd 側で守る: EventMin **未満**の priming イベントは
+    /// `priming: true` に落とす（捨てない — 消費者は priming 行を無視する契約
+    /// なので、落とすとワイヤの事実を隠すことになる）。EventMin **以上**だけが
+    /// 盲目窓中の実イベント = `priming: false`。
+    #[tokio::test(start_paused = true)]
+    async fn priming_events_below_event_min_are_downgraded_to_priming() {
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        // 1 回目の priming は 12 だけ → last = 12 → 再購読の EventMin = 13。
+        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(12, 1)];
+        let priming_events = Arc::clone(&est.sub_priming_events);
+        let seen_min = Arc::clone(&est.sub_event_min);
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        let first = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(first[0].event_number, 12);
+        assert!(first[0].priming);
+        assert_eq!(health.last_event_number(5), Some(12));
+
+        // 2 回目の priming は 12（フィルタ無視の再送）と 13（盲目窓中の実イベント）。
+        *priming_events.lock().unwrap() =
+            vec![switch_press_event(12, 1), switch_press_event(13, 1)];
+        fail_next_report.store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let second = collect_event_lines(&mut rx, 2).await;
+        assert_eq!(*seen_min.lock().unwrap(), Some(13));
+        assert_eq!(
+            second
+                .iter()
+                .map(|e| (e.event_number, e.priming))
+                .collect::<Vec<_>>(),
+            vec![(12, true), (13, false)],
+            "EventMin 未満は priming: true のまま、以上だけ実イベント: {second:?}"
+        );
+        assert_eq!(health.last_event_number(5), Some(13));
     }
 
     /// `events = []`（`EventScope::Off`）は EventRequests / EventFilters を
