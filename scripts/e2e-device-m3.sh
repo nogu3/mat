@@ -117,6 +117,35 @@ for n in d.get('nodes') or []:
 "
 }
 
+# matd の node $NODE_ID への常駐 Subscribe が established になるまで待つ
+# （budget TIMEOUT_S 秒）。起動直後と、rotate-ipk の proof CASE が matv の唯一
+# session を奪った後の再確立の両方で使う。
+wait_matd_established() {
+    local why="$1"
+    echo "==> waiting for matd's resident Subscribe to node $NODE_ID ($why; established, budget ${TIMEOUT_S}s)" >&2
+    local established="" status_json="" state deadline=$((SECONDS + TIMEOUT_S))
+    while ((SECONDS < deadline)); do
+        if ! kill -0 "$MATD_PID" 2>/dev/null; then
+            echo "matd exited while waiting for the subscription:" >&2
+            cat "$MATD_STDERR" >&2
+            exit 1
+        fi
+        status_json="$(./target/release/matd status --socket "$MATD_SOCK" 2>/dev/null)" || true
+        state="$(matd_node_state "$status_json" "$NODE_ID")"
+        if [[ "$state" == "established" ]]; then
+            established=1
+            break
+        fi
+        sleep 0.3
+    done
+    if [[ -z "$established" ]]; then
+        echo "matd status (last seen): $status_json" >&2
+        echo "timed out waiting for matd's subscription to node $NODE_ID to reach established ($why)" >&2
+        exit 1
+    fi
+    echo "==> matd subscription to node $NODE_ID: established ($why)" >&2
+}
+
 DEVICE_PID=""
 MATD_PID=""
 LISTEN_PID=""
@@ -321,30 +350,51 @@ if [[ -z "$MATD_UP" ]]; then
     exit 1
 fi
 
-echo "==> waiting for matd's resident Subscribe to node $NODE_ID (established, budget ${TIMEOUT_S}s)" >&2
-ESTABLISHED=""
-STATUS_JSON=""
-DEADLINE=$((SECONDS + TIMEOUT_S))
-while ((SECONDS < DEADLINE)); do
-    if ! kill -0 "$MATD_PID" 2>/dev/null; then
-        echo "matd exited while waiting for the subscription:" >&2
-        cat "$MATD_STDERR" >&2
-        exit 1
-    fi
-    STATUS_JSON="$(./target/release/matd status --socket "$MATD_SOCK" 2>/dev/null)" || true
-    STATE="$(matd_node_state "$STATUS_JSON" "$NODE_ID")"
-    if [[ "$STATE" == "established" ]]; then
-        ESTABLISHED=1
-        break
-    fi
-    sleep 0.3
-done
-if [[ -z "$ESTABLISHED" ]]; then
-    echo "matd status (last seen): $STATUS_JSON" >&2
-    echo "timed out waiting for matd's subscription to node $NODE_ID to reach established" >&2
-    exit 1
-fi
-echo "==> matd subscription to node $NODE_ID: established" >&2
+wait_matd_established "start-up"
+
+# `reloads.count` を status JSON から取る（jq 無し環境向けに python3 でも）。
+matd_reload_count() {
+    printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print((d.get("reloads") or {}).get("count", ""))
+'
+}
+
+echo "==> matd reload (same store: expect ipk=unchanged, reload_count=1, subscription untouched)" >&2
+RELOAD_JSON="$(./target/release/matd reload --socket "$MATD_SOCK")"
+echo "$RELOAD_JSON"
+# json_get は jq なら `true`、python3 フォールバックなら `True` を出す — 両方を受ける。
+[[ "$(json_get reloaded "$RELOAD_JSON")" =~ ^[Tt]rue$ ]] || { echo "reload not acked: $RELOAD_JSON" >&2; exit 1; }
+[[ "$(json_get ipk "$RELOAD_JSON")" == "unchanged" ]] || { echo "ipk should be unchanged: $RELOAD_JSON" >&2; exit 1; }
+[[ "$(json_get reload_count "$RELOAD_JSON")" == "1" ]] || { echo "reload_count should be 1: $RELOAD_JSON" >&2; exit 1; }
+STATUS_JSON="$(./target/release/matd status --socket "$MATD_SOCK")"
+[[ "$(matd_reload_count "$STATUS_JSON")" == "1" ]] || { echo "status.reloads.count should be 1: $STATUS_JSON" >&2; exit 1; }
+[[ "$(matd_node_state "$STATUS_JSON" "$NODE_ID")" == "established" ]] || { echo "reload must not touch the subscription: $STATUS_JSON" >&2; exit 1; }
+echo "==> PASS: matd reload (unchanged) kept the subscription up" >&2
+
+echo "==> mat fabric rotate-ipk (direct path; matv accepts KeySetWrite(0)) — expect matd_reload=reloaded" >&2
+ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_MATD_SOCKET="$MATD_SOCK" ./target/release/mat --iface "$IFACE" fabric rotate-ipk)"
+echo "$ROTATE_JSON"
+[[ "$(json_get status "$ROTATE_JSON")" == "rotated" ]] || { echo "rotate-ipk did not commit: $ROTATE_JSON" >&2; exit 1; }
+[[ "$(json_get matd_reload "$ROTATE_JSON")" == "reloaded" ]] || { echo "matd_reload should be reloaded: $ROTATE_JSON" >&2; exit 1; }
+STATUS_JSON="$(./target/release/matd status --socket "$MATD_SOCK")"
+[[ "$(matd_reload_count "$STATUS_JSON")" == "2" ]] || { echo "status.reloads.count should be 2 after rotate: $STATUS_JSON" >&2; exit 1; }
+echo "==> PASS: rotate-ipk committed and matd reloaded the new IPK (count=2)" >&2
+
+# rotate の proof CASE が matv の唯一 session を奪うので購読は一度落ちる。
+# 再確立（= reload 後の新 IPK での cold establish）を待ってから先へ進む。
+wait_matd_established "after rotate-ipk"
+
+echo "==> mat on via matd after the rotation (matd must establish with the new IPK)" >&2
+ON_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat on --node "$NODE_ID" --endpoint "$DEVICE_EP" --matd "$MATD_SOCK")"
+echo "$ON_JSON" >&2
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat off --node "$NODE_ID" --endpoint "$DEVICE_EP" --matd "$MATD_SOCK" >&2
+echo "==> PASS: unicast through matd after the rotation" >&2
+wait_matd_established "after post-rotate ops"
 
 LISTEN_TIMEOUT_MS=$((TIMEOUT_S * 1000))
 echo "==> starting mat listen (matd=$MATD_SOCK, node=$NODE_ID, cluster=onoff, count=1, timeout=${LISTEN_TIMEOUT_MS}ms)" >&2
