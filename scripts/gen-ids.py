@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""mat-core/src/ids_gen.rs を connectedhomeip の data model XML から生成する。
+"""mat-core/src/ids_gen.rs を connectedhomeip の data model XML から cluster /
+attribute / command / event の名前テーブルを生成する。
 
 使い方:
     python3 scripts/gen-ids.py /path/to/connectedhomeip > crates/mat-core/src/ids_gen.rs
@@ -238,6 +239,23 @@ def main():
             cmds.append((kebab(cn), int(ccode, 0),
                          cmd.get("mustUseTimedInvoke", "false") == "true",
                          fields))
+        evs = []
+        for ev in c.iter("event"):
+            en, ecode = ev.get("name", ""), ev.get("code")
+            if not en or ecode is None:
+                continue
+            priority = ev.get("priority") or "info"
+            efields = []
+            for fld in ev.findall("field"):
+                fn, fty = fld.get("name", ""), fld.get("type", "")
+                fid = fld.get("id")
+                if fid is None:
+                    continue  # data-model の event field は id 明示前提
+                fexpr = ty_of(cid, fty, fld.get("array", "false") == "true",
+                              None, enums, bitmaps, structs, used)
+                efields.append((int(fid, 0), kebab(fn), fexpr,
+                                 fld.get("optional", "false") == "true"))
+            evs.append((kebab(en), int(ecode, 0), priority, tuple(efields)))
         key = cluster_key(name)
         # 同一クラスタが複数ファイルに現れる場合は先勝ち（chip 配下は一意のはず）。
         if key not in clusters:
@@ -245,7 +263,7 @@ def main():
             # 0xFFF8-0xFFFD は予約域なのでクラスタ固有属性と ID が衝突することはない。
             all_attrs = attrs + global_attrs
             clusters[key] = (cid, sorted(set(all_attrs)), sorted({
-                (n, i, t, tuple(f)) for (n, i, t, f) in cmds}))
+                (n, i, t, tuple(f)) for (n, i, t, f) in cmds}), sorted(set(evs)))
     # 到達閉包: 属性 / コマンド引数から届いた struct の items をたどり、
     # 新しい struct が現れなくなるまで回す。
     while True:
@@ -264,8 +282,8 @@ def emit(clusters, structs, enums, bitmaps, used):
     print("// scripts/gen-ids.py のヘッダ参照。")
     print("#![cfg_attr(rustfmt, rustfmt::skip)]")
     print("#![allow(clippy::unreadable_literal)]")
-    print("use super::ids::{AttrDef, ClusterDef, CmdDef, FieldDef, StructDef, "
-          "StructField, Ty, TypeTag};")
+    print("use super::ids::{AttrDef, ClusterDef, CmdDef, EventDef, EventFieldDef, "
+          "FieldDef, StructDef, StructField, Ty, TypeTag};")
     print()
     # struct 定義。static 同士の前方参照は Rust が許すので順序は名前順でよい。
     for key in sorted(used, key=static_name):
@@ -285,7 +303,7 @@ def emit(clusters, structs, enums, bitmaps, used):
     print()
     names = sorted(clusters.keys())
     for key in names:
-        cid, attrs, cmds = clusters[key]
+        cid, attrs, cmds, evs = clusters[key]
         up = key.upper()
         print(f"static ATTRS_{up}: &[AttrDef] = &[")
         for (n, i, t, w, tw) in attrs:
@@ -302,14 +320,23 @@ def emit(clusters, structs, enums, bitmaps, used):
             print(f'    CmdDef {{ name: "{n}", id: {i:#04x}, '
                   f"timed: {str(timed).lower()}, fields: &[{fl}] }},")
         print("];")
+        print(f"static EVENTS_{up}: &[EventDef] = &[")
+        for (n, i, priority, fields) in evs:
+            fl = ", ".join(
+                f'EventFieldDef {{ name: "{fn}", id: {fid}, ty: {ft}, '
+                f"optional: {str(fo).lower()} }}"
+                for (fid, fn, ft, fo) in fields)
+            print(f'    EventDef {{ name: "{n}", id: {i:#04x}, '
+                  f'priority: "{priority}", fields: &[{fl}] }},')
+        print("];")
     print()
     print("/// 名前昇順（binary search 用）。")
     print("pub(super) static CLUSTERS: &[ClusterDef] = &[")
     for key in names:
-        cid, _, _ = clusters[key]
+        cid, _, _, _ = clusters[key]
         up = key.upper()
         print(f'    ClusterDef {{ name: "{key}", id: {cid:#06x}, '
-              f"attrs: ATTRS_{up}, cmds: CMDS_{up} }},")
+              f"attrs: ATTRS_{up}, cmds: CMDS_{up}, events: EVENTS_{up} }},")
     print("];")
 
 
