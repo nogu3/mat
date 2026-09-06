@@ -77,7 +77,11 @@
 #   MAT_E2E_TIMEOUT_S  seconds budgeted for `mat commission`, for matd's
 #                      subscription to node 1 to reach `established`, and
 #                      (in ms) for `mat listen`'s receive window (default:
-#                      30).
+#                      30). Keep it well under ~90 s: leg C's blind window
+#                      only holds while it stays shorter than matd's silence
+#                      deadline (max_interval 60 s + slack), otherwise matd
+#                      re-subscribes on its own mid-window and the recovery
+#                      event is delivered to nobody.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -662,6 +666,19 @@ wait_listen_attached() {
     exit 1
 }
 
+# JSON 形状の assert が落ちたときの診断出力。cleanup が WORKDIR を無条件に
+# 消すので、ここで matd / matv のログ末尾を出しておかないとイベント購読が
+# 壊れたときの手がかりが永久に失われる（他の失敗経路と同じ扱いに揃える）。
+fail_leg() {
+    local leg="$1" out="$2" err="$3"
+    echo "==> FAIL: events $leg — JSON shape assertion failed (python traceback above)" >&2
+    echo "-- mat listen stdout --" >&2; cat "$out" >&2 || true
+    echo "-- mat listen stderr --" >&2; tail -n 40 "$err" >&2 || true
+    echo "-- matd stderr tail --" >&2; tail -n 40 "$MATD_STDERR" >&2 || true
+    echo "-- matv stderr tail --" >&2; tail -n 40 "$DEVICE_STDERR" >&2 || true
+    exit 1
+}
+
 # 背景の `mat listen`（$LISTEN_PID）の終了を待ち、stdout を出して 0 終了を確かめる。
 finish_listen() {
     local out="$1" err="$2" code=0
@@ -690,7 +707,7 @@ LISTEN_PID=$!
 wait_listen_attached "$ATTACH_BEFORE" "$LISTEN_PID" "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
 send_stimulus '{"device":"btn","press":"short"}'
 finish_listen "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
-python3 - "$LISTEN_A_STDOUT" "$NODE_ID" "$BTN_EP" <<'PY'
+if ! python3 - "$LISTEN_A_STDOUT" "$NODE_ID" "$BTN_EP" <<'PY'
 import json, sys
 path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 lines = [json.loads(l) for l in open(path) if l.strip()]
@@ -711,6 +728,9 @@ assert second["event"] == "short-release", second
 assert second["data"] == {"previous-position": 1}, second
 assert second["event_number"] > first["event_number"], lines
 PY
+then
+    fail_leg "leg A" "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
+fi
 echo "==> PASS: leg A — switch initial-press + short-release in ascending EventNumber (priming:false)" >&2
 
 echo "==> events leg B: mat listen --cluster booleanstate --count 2 (door closes, endpoint $DOOR_EP)" >&2
@@ -725,7 +745,7 @@ LISTEN_PID=$!
 wait_listen_attached "$ATTACH_BEFORE" "$LISTEN_PID" "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
 send_stimulus '{"device":"door","state":true}'
 finish_listen "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
-python3 - "$LISTEN_B_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
+if ! python3 - "$LISTEN_B_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
 import json, sys
 path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 lines = [json.loads(l) for l in open(path) if l.strip()]
@@ -745,6 +765,9 @@ assert ev["event"] == "state-change", ev
 assert ev["data"] == {"state-value": True}, ev
 assert ev["priming"] is False, ev
 PY
+then
+    fail_leg "leg B" "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
+fi
 echo "==> PASS: leg B — one booleanstate transition delivered as both an attribute line and a state-change event line" >&2
 
 # 脚 C: EventMin 回収。matd が「購読が死んだ」ことを知らないまま実イベントが
@@ -783,7 +806,7 @@ MAT_STORE="$MAT_STORE_DIR" MAT_MATD=0 MAT_MATD_SOCKET="$MATD_SOCK" \
     ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
 
 finish_listen "$LISTEN_C_STDOUT" "$LISTEN_C_STDERR"
-python3 - "$LISTEN_C_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
+if ! python3 - "$LISTEN_C_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
 import json, sys
 path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 lines = [json.loads(l) for l in open(path) if l.strip()]
@@ -798,6 +821,9 @@ assert ev["data"] == {"state-value": False}, ev
 assert ev["priming"] is False, ev
 assert "attribute" not in ev, ev
 PY
+then
+    fail_leg "leg C" "$LISTEN_C_STDOUT" "$LISTEN_C_STDERR"
+fi
 
 SUBS_AFTER=$(grep -c "subscription transport bound" "$MATD_STDERR" || true)
 if ! ((SUBS_AFTER > SUBS_BEFORE)); then
