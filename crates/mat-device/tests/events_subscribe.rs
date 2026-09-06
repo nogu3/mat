@@ -25,9 +25,11 @@ use support::{commission_directly, device_config_with};
 
 const ADMIN_NODE_ID: u64 = 778_900;
 
-/// デバイス発レポートの待ち時間。デバイスが約束する間隔（MaxInterval 上限
-/// 5 秒）に対して十分に緩く取る — 遅い CI で「動いている購読」が flake に
-/// ならないため。壊れた購読はそれでも（10 秒かけて）落ちる。
+/// デバイス発レポートの待ち時間。刺激で起きる urgent レポートは
+/// MinInterval（0 秒）で出るので 10 秒は十分に緩い — 遅い CI で「動いて
+/// いる購読」が flake にならないため。壊れた購読はそれでも（10 秒かけて）
+/// 落ちる。MaxInterval 上限は 60 秒にしてあるので（`spec`）、この待ちの
+/// 間に keep-alive が割り込んで判定対象のレポートをずらすことはない。
 const REPORT_WAIT: Duration = Duration::from_secs(10);
 
 /// bridged endpoint は宣言順に EP2 から（EP0 = root、EP1 = Aggregator）。
@@ -99,9 +101,13 @@ async fn button_press_and_contact_change_arrive_as_events() {
 
     // 1. イベント wildcard(urgent) + 属性は booleanstate だけ。priming に
     //    イベントは無い（まだ何も起きていない新品のデバイス）。
+    // MaxInterval は上限いっぱい（60 秒 = デバイス側 `MAX_MAX_INTERVAL_S`）:
+    // このテストは keep-alive を待たないので、判定対象のレポートの間に
+    // 無関係な空レポートが割り込む余地を消しておく。刺激由来のレポートは
+    // urgent = MinInterval(0) レジームなので待ち時間には影響しない。
     let spec = SubscribeSpec {
         min_interval_floor_s: 0,
-        max_interval_ceiling_s: 5,
+        max_interval_ceiling_s: 60,
         keep_subscriptions: false,
         clusters: vec![im::CLUSTER_BOOLEAN_STATE],
         event_paths: vec![EventPathIn::WILDCARD_URGENT],
@@ -267,6 +273,48 @@ async fn button_press_and_contact_change_arrive_as_events() {
         .await
         .expect("events-only subscribe");
     assert_eq!(o4.priming_events.len(), 2);
+
+    // 7. 1 レポートに載らない量（Multi(3) 押下 3 回 = 27 件）でも、欠番なく
+    //    連続したレポートに分かれて届く（`send_subscription_report` の
+    //    予算内キャップ + 積み残しがあるうちは urgent を維持する規則）。
+    //
+    //    刺激の注入は**別タスク**でないといけない: デバイスのループは
+    //    レポートの StatusResponse を待っている間 stimulus チャネルを
+    //    読まないので、「apply を 3 回直列に await してから受信」だと
+    //    apply#2 とレポート#1 が互いを待って詰まる（5 秒後にデバイスが
+    //    購読を落とす）。実運用の刺激は物理イベントで、受信側の都合と
+    //    同期しない — その形をテストでも守る。
+    let presser = tokio::spawn(async move {
+        for _ in 0..3 {
+            handle
+                .apply("btn", Stimulus::Press(PressKind::Multi(3)))
+                .await
+                .expect("multi press applied");
+        }
+    });
+    let mut numbers: Vec<u64> = Vec::new();
+    let mut reports = 0usize;
+    while numbers.len() < 27 {
+        let rep = session
+            .next_subscription_report_full(REPORT_WAIT, &cfg)
+            .await
+            .expect("multi press report");
+        reports += 1;
+        numbers.extend(rep.events.iter().filter_map(|e| match e {
+            EventReport::Data(d) => Some(d.event_number),
+            EventReport::Status { .. } => None,
+        }));
+    }
+    assert_eq!(numbers.len(), 27, "余計なイベントは来ない: {numbers:?}");
+    assert!(
+        reports >= 2,
+        "27 件は 1 レポートの予算に収まらないはず（キャップが効いていない）: {reports}"
+    );
+    assert!(
+        numbers.windows(2).all(|w| w[1] == w[0] + 1),
+        "EventNumber は昇順・欠番なし: {numbers:?}"
+    );
+    presser.await.expect("presser task");
 
     device_task.abort();
     let _ = device_task.await;

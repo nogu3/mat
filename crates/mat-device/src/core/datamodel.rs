@@ -4089,6 +4089,80 @@ mod tests {
         assert!(other.is_empty());
     }
 
+    /// `event_entries` の ACL ゲート（spec §9.10）。`ReadCtx::default()` は
+    /// fabric 0 = ACL 短絡なので、他のイベントテストはゲートを通っていない
+    /// — ここは CASE の ReadCtx（fabric 1 + subject）で見る。
+    /// `StimHandler` は `event_privilege` を既定（View）のままにしてある
+    /// ので、落としているのは ACL そのもの。
+    #[test]
+    fn event_entries_hides_events_the_acl_grants_no_view_on() {
+        // target を OnOff だけに絞った View エントリ: 発生クラスタ
+        // 0xFC01 には効かない（`targets_match`）。
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), u64::from(im::CLUSTER_ON_OFF));
+        w.end_container();
+        w.end_container();
+        let other_cluster_only = w.finish();
+
+        let view_entry = |targets_raw: Option<Vec<u8>>| AclDeviceEntry {
+            privilege: PRIVILEGE_VIEW,
+            auth_mode: AUTH_MODE_CASE,
+            subjects: vec![7],
+            targets_raw,
+            fabric_index: 1,
+        };
+        let node_with = |targets_raw: Option<Vec<u8>>| {
+            let mut node = node_with_stim();
+            let store = AclStore::new();
+            store.set_entries_for_test(1, vec![view_entry(targets_raw)]);
+            node.set_acl_store(store);
+            node.stimulate(2, &Stimulus::SetState(true), 1).unwrap();
+            node
+        };
+        let all = |node: &Node, ctx: &ReadCtx| {
+            node.event_entries(&[EventPathIn::WILDCARD_URGENT], 0, ctx)
+        };
+
+        let denied = node_with(Some(other_cluster_only));
+        assert!(all(&denied, &case_read_ctx(1, 7)).is_empty());
+        // fabric 0（PASE）は ACL を通らない既存の短絡: 同じログでも見える。
+        assert_eq!(all(&denied, &ReadCtx::default()).len(), 1);
+        // 別 subject も同様に落ちる（一致するエントリが無い）。
+        assert!(all(&denied, &case_read_ctx(1, 8)).is_empty());
+
+        // 制限なしの View なら出る。
+        let granted = node_with(None);
+        assert_eq!(all(&granted, &case_read_ctx(1, 7)).len(), 1);
+    }
+
+    /// 発生元 `(endpoint, cluster)` がもう解決できないログ項目は黙って
+    /// 落ちる — privilege を訊く相手が居ない以上 ACL を素通しさせられない
+    /// （`event_entries` の doc）。panic もせず Status も出さない。
+    /// `Node` にクラスタ削除 API は無いので、存在しない endpoint 9 の項目を
+    /// 持つログを `set_event_log` で直接差し込んで作る。
+    #[test]
+    fn event_entries_drops_entries_whose_emitting_cluster_is_gone() {
+        let ev = || EmittedEvent {
+            event: 0,
+            priority: EventPriority::Info,
+            data_tlv: None,
+        };
+        let mut log = EventLog::new(100, 8);
+        log.append(9, 0xFC01, ev(), 5); // #100: endpoint 9 は存在しない
+        log.append(2, 0xFC02, ev(), 6); // #101: endpoint 2 にこのクラスタは無い
+        log.append(2, 0xFC01, ev(), 7); // #102: 生きている
+        let mut node = node_with_stim();
+        node.set_event_log(log);
+
+        let out = node.event_entries(&[EventPathIn::WILDCARD_URGENT], 0, &ReadCtx::default());
+        assert!(
+            matches!(&out[..], [EventEntryOut::Data(d)] if d.event_number == 102 && d.endpoint == 2),
+            "解決できない 2 件は落ち、Status も出ない: {out:?}"
+        );
+    }
+
     #[test]
     fn concrete_unresolvable_event_paths_report_status() {
         let node = node_with_stim();
