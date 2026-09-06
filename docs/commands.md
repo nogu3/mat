@@ -800,6 +800,58 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   comes back as `recovered: true` (matd never observed the report either). A
   consumer whose rule is toggle-shaped should key off the value, not the
   event's arrival.
+- **Event lines** (from `--event [<name>]`, or a default `mat listen` with no
+  filter) carry an `event` key instead of `attribute` — that is the field an
+  existing consumer should switch on to tell the two kinds of line apart. A
+  `mat listen` with no `--attribute`/`--event` now emits **both** kinds of
+  line interleaved in receive order; an old `mat` client (pre-phase-B) and a
+  new default `mat listen` both keep working unchanged on the attribute side
+  and now also see event lines mixed in, so a consumer written against the
+  old attribute-only contract (e.g. casa) needs a one-line change: skip or
+  branch on lines that have no `attribute` key. Three examples — the first
+  two are Generic Switch presses (spec shape), the third is a real
+  `booleanstate` `state-change` captured during the phase B real-device
+  smoke:
+  ```json
+  {"timestamp":"2026-09-06T21:00:00+09:00","node_id":25,"endpoint":2,"cluster":"switch","event":"initial-press","event_number":1725600000123,"priority":"info","data":{"new-position":1},"priming":false}
+  {"timestamp":"2026-09-06T21:00:01+09:00","node_id":25,"endpoint":2,"cluster":"switch","event":"multi-press-complete","event_number":1725600000130,"priority":"info","data":{"previous-position":1,"total-number-of-presses-counted":2},"priming":false}
+  {"cluster":"booleanstate","data":{"state-value":false},"device_time":{"system_ms":577001426},"endpoint":1,"event":"state-change","event_number":590151,"node_id":19,"priority":"info","timestamp":"2026-09-07T00:37:33.672836671+09:00","priming":true}
+  ```
+  Keys: `timestamp` (receive time — same contract as attribute lines from the
+  same ReportData), `node_id`, `endpoint`, `cluster` (name from
+  `mat-core::ids`, numeric if the table doesn't know it), `event` (name,
+  numeric if unknown), `event_number`, `priority` (`"debug" | "info" |
+  "critical"`), `data` (object keyed by kebab event-field names from the ids
+  table; a field the table doesn't know is keyed by its decimal context tag;
+  the key is omitted entirely when the event carries no data), `device_time`
+  (`{"system_ms": N}` or `{"epoch_ms": N}`, omitted when the device sent a
+  Delta timestamp `matd` couldn't resolve), `priming`. **There is no
+  `recovered` key on event lines** — events are addressed by `EventNumber`,
+  so a transition missed during a blind window is retrieved exactly (see the
+  priming rule below), not inferred from a value diff the way attribute
+  `recovered` is.
+- Bare `--event` matches every event name; `--event <name>` needs `--cluster`
+  unless `<name>` is numeric — the same rule as `--attribute`. `--attribute`
+  and `--event` together is `parse_error` (exit `2`): a single `listen`
+  stream is either attribute-filtered, event-filtered, or (with neither
+  flag) unfiltered on both.
+- **Event priming rule.** `matd` keeps the last `EventNumber` it has seen per
+  node in **process memory only** (lost on a `matd` restart — design rule
+  4). At `matd` start there is no `EventFilter` yet, so the very first
+  Subscribe pulls the device's whole event log and every one of those
+  events arrives with `priming: true` (a consumer ignores them, same
+  discipline as attribute priming). On a later re-subscribe within the same
+  `matd` process (a dropped Thread link, eviction by another CASE session,
+  ...), `matd` sets `EventMin = last + 1` in the new subscription's
+  `EventFilters`: events at or above that number are real transitions that
+  happened during the blind window and arrive with `priming: false` — the
+  event-side replacement for the attribute side's `recovered` heuristic,
+  exact by EventNumber instead of inferred from a value diff. A
+  non-compliant device that replays events below `EventMin` anyway has those
+  downgraded back to `priming: true` (the blind-window contract holds even
+  if the device ignores the filter). Events within one ReportData fan out in
+  ascending `event_number` order, with the same `timestamp` as any attribute
+  lines from that same ReportData.
 - `matd` absent, refusing the connection, or dying mid-stream is
   `matd_unavailable` (exit **13**) — see
   [Errors and exit codes](errors.md#errors-and-exit-codes). Events already printed
@@ -1235,9 +1287,11 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
 
 At startup `matd` reads the commissioned-node ledger and opens one **wildcard**
 Subscribe per node (every endpoint/cluster/attribute — the same "all-paths
-omitted" shape as a wildcard `read`), so device-originated attribute changes
-(occupancy, open/close, temperature, on-off, ...) are captured continuously,
-not just when a `mat` caller happens to be polling.
+omitted" shape as a wildcard `read` — plus every cluster's events via
+`EventRequests`, see below), so device-originated attribute changes
+(occupancy, open/close, temperature, on-off, ...) and device-originated
+events (button presses, `booleanstate` state changes, ...) are captured
+continuously, not just when a `mat` caller happens to be polling.
 
 - Subscribe parameters: `MinIntervalFloor = 0` (no artificial delay on
   fast-changing sensors like occupancy), `MaxIntervalCeiling = 300s` (the
@@ -1267,12 +1321,25 @@ not just when a `mat` caller happens to be polling.
   response" rule of the `matd` socket protocol: it replies with one ack line
   (`{"timestamp":...,"listening":true}`), then keeps the connection open and
   streams matching event lines until the client disconnects.
-- v1 scope is attribute reports only. Not yet implemented (tracked as
-  future work): EventReport delivery (buttons / Generic Switch), a
-  `DataVersionFilter`, and LIT ICD check-in registration. Cluster-level
-  narrowing of what gets subscribed **is** implemented — see
+- **Events (phase B, landed):** the resident Subscribe's `EventRequests` are
+  always sent `IsUrgent = true` — non-urgent event paths would only report
+  at the next keep-alive (≤300s), which defeats a button's purpose, so
+  `matd` never offers that knob. Attribute and event paths narrow
+  independently via `subscriptions.toml`'s `clusters` / `events` keys — see
   [Subscriptions (`subscriptions.toml`, optional, matd
   only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only).
+  On the wire, `Op::Listen` gained one optional key, `"event"`: a name or
+  numeric id for `--event <name>`, the literal `"*"` for a bare `--event`
+  (every event), and the key omitted entirely for an attribute-only or
+  unfiltered `listen` — an old `mat` client never sends it and only ever
+  receives attribute lines, as before. Emitted lines fan out through the
+  same `tokio::sync::broadcast` channel as attribute events, carrying either
+  variant of `matd`'s internal `Emitted` enum (`Emitted::Attribute` /
+  `Emitted::Event`) — one channel, one lagged-consumer disconnect rule, for
+  both kinds of line. See [Listen](#listen-device-originated-events) above
+  for the event-line JSON shape and the `EventMin` priming rule. Not yet
+  implemented (tracked as future work): a `DataVersionFilter` and LIT ICD
+  check-in registration.
 
 ### Native backend internals
 

@@ -1193,7 +1193,88 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   一致が無くても黙る（spec §8.9 — `read_entries` の attribute path より狭い規則）。
 - 実機 E2E は未実施。matv 相手の e2e スクリプトと実機（Aqara 系のボタン / 開閉）はフェーズ B
   （`docs/superpowers/plans/2026-09-06-events-phase-b-matd-listen.md`、着手条件 = S2 の matd
-  reload op が main にマージ済み）で行う。
+  reload op が main にマージ済み）で行う → **フェーズ B で実施済み（下記）**。
+
+### Phase 5 拡張 — イベント購読 フェーズ B（matd / mat listen、2026-09-07）
+
+設計 spec: `docs/superpowers/specs/2026-09-06-events-subscribe-design.md` §6。実装計画は
+`docs/superpowers/plans/2026-09-06-events-phase-b-matd-listen.md`。フェーズ A が用意した
+controller のコーデック / セッション API と仮想デバイス側の発生源を、`matd` の常駐購読と
+`mat listen --event` まで配線する後半。
+
+- **設計判断**:
+  - `EventRequests` は**常に urgent 固定**（`IsUrgent = true`）。non-urgent を選べる
+    ノブは作らない — 落とすと次の keep-alive（≤300s）まで届かず、ボタンの用途に
+    間に合わない（spec §6.3、フェーズ A レビュー由来の注意でもある。下記「ロールアウト
+    注意」参照）。
+  - ノードごとの `last_event_number: Option<u64>` は**プロセスメモリのみ**（`matd`
+    再起動で失われる、設計ルール 4）。`matd` 起動直後（`last = None`）は
+    `EventFilters` 無しで購読するため、デバイスのイベントログ全量が
+    `priming: true` で届く。同一プロセス内の再購読では `EventMin = last + 1` を
+    `EventFilters` に載せ、それ以上の EventNumber は盲目窓中の実イベントとして
+    `priming: false` で届く — 属性側の `recovered` 推定に相当する仕組みを、
+    推定ではなく EventNumber の厳密な照合で実現する。デバイスがフィルタを無視して
+    `EventMin` 未満のイベントを再送してきた場合は `priming: true` に格下げする
+    （盲目窓の契約を守る是正、`d98e5da`）。
+  - ワイヤは `Op::Listen` に `event: Option<String>` を 1 個追加しただけ
+    （`#[serde(default)]`、enum に `deny_unknown_fields` 無し）。`--event <name>` は
+    その名前/数値、bare `--event` は `"*"`（全イベント名）、省略は `None` —
+    旧 `mat` クライアントはこのキーを送らないため属性行のみを受け続け、新しい
+    デフォルト `mat listen`（フィルタ無指定）は属性行・イベント行の両方を受ける
+    ようになる（判別点は行が `attribute` キーを持つか `event` キーを持つか。
+    casa 側の消費者改修は 1 行の追記で足りる想定）。
+  - `matd` 内部の配信物は `Emitted::{ Attribute(Event) | Event(EventItem) }`
+    （`crates/matd/src/subscription/events.rs`）。属性行・イベント行は同じ
+    `tokio::sync::broadcast` チャネルに相乗りし、`ListenFilter::matches` が
+    行ごとに振り分ける — 遅延切断（lagged consumer）の規律もチャネル 1 本で
+    両方に効く。
+  - `mat-native::SubscribeConn` トレイトの `subscribe` / `next_report_full` が
+    フェーズ A で用意したイベント対応 API を実際に呼ぶ経路になった
+    （`crates/mat-native/src/lib.rs`、fake 実装は `test_support.rs`）。
+  - `subscriptions.toml` の `events` キー（`clusters` と独立、`abc6422`）は
+    属性側の narrowing と完全に別の narrowing 軸 — 詳細は
+    `docs/configuration.md` の `events` 節。
+- **e2e**: `scripts/e2e-device-m3.sh` に 3 脚を追加（matv `--stdin-control` →
+  matd → `mat listen --event`）:
+  - **脚 A**: Generic Switch への短押し → `mat listen --cluster switch --event
+    --count 2` が `initial-press` → `short-release` を EventNumber 昇順・
+    `priming:false`・`attribute` キー無しで受ける。
+  - **脚 B**: `--cluster booleanstate --count 2` で接点センサーの閉塞 1 回から
+    属性行（`state-value` = true）とイベント行（`state-change` /
+    `data.state-value` = true）の両方を受ける（どちらが先でも可）。
+  - **脚 C**: EventMin 回収。`MAT_MATD_SOCKET` 無しの直経路 op が matd の
+    購読セッションを気付かれずに追い出す → 盲目窓中にセンサーが開状態になる →
+    `mat listen` クライアントが接続 → 今度は `MAT_MATD_SOCKET` 付きの直経路 op
+    が `node_touched` ヒントを送り matd が `EventMin = last + 1` で再購読
+    （実測 ~4.8 秒）→ 盲目窓中のイベントが priming ペイロードの中で
+    `priming:false` として戻る（matd がフィルタに頼らず自分で番号を再チェック
+    する契約）。
+- **実機スモーク（2026-09-07、hogar-matd コンテナ、本ブランチからビルドした
+  隔離 matd、store コピー、`events = ["switch","booleanstate"]`、本番 19 ノード）**:
+  全 19 ノードが ~2.5 分で established、全ノードが `EventRequests` を受理
+  （`INVALID_ACTION` 無し）、接点センサーの実 `booleanstate` `state-change` が
+  `mat listen --event` に届いた（実測ライン、node_id は掲載可: `{"cluster":
+  "booleanstate","data":{"state-value":false},"device_time":{"system_ms":
+  577001426},"endpoint":1,"event":"state-change","event_number":590151,
+  "node_id":19,"priority":"info","timestamp":
+  "2026-09-07T00:37:33.672836671+09:00","priming":true}`）、旧 1.35.0 の
+  `mat listen` クライアントは属性行を無改変のまま受け続けた、`--attribute` +
+  `--event` は exit `2`。
+  - **副次観測**: 同一ファブリックへの 2 つ目の controller セッション（このスモーク
+    自体）が、本番 matd が持っていた眠りがちなデバイスの購読セッションを何本か
+    追い出した（無音 deadline → 再購読、1 台は CASE BUSY を ~2 分応答）。本番は
+    無介入で 19/19 に自己回復した。**教訓**: 今後のスモークは隔離 matd をもう1本
+    立てるのではなく、本番 matd を再起動して行う方が安全。
+- **ロールアウト注意（フェーズ A レビュー由来）**: `IsUrgent` は必ず on のまま
+  にする。将来 non-urgent を選べる設定を足すと、報告は max-interval（≤300s）
+  まで待ち、溜まったイベントはデバイス側の 1 レポート予算
+  （`REPORT_CHUNK_BUDGET`）で分割配送になる — 欠落はしないが遅延が積む。
+  本番投入は `subscriptions.toml` に `events = ["switch","booleanstate"]` を
+  まず置いて priming 所要時間と拒否の有無を見てから wildcard（`events` キー
+  削除）へ広げる。`events = []` が即時の切り戻し（詳細は
+  `docs/configuration.md` の `events` 節）。
+- リリース（minor bump / crates.io publish）と本番デプロイは本フェーズの外
+  （別セッション）。
 
 ### Phase 5 保守 — op 単一ソース化（監査④、2026-09-02）
 
