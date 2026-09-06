@@ -75,7 +75,36 @@ pub fn fast_cfg() -> MrpConfig {
 /// does; it typically lacks an IPv6 link-local address, which is why this
 /// helper is only used by the direct-drive tests (which never touch mDNS)
 /// and not by a live-mDNS one.
+///
+/// `allow(dead_code)`: see [`BRIDGED_EP`] — `events_subscribe.rs` builds its
+/// own bridge with [`device_config_with`] and never calls this wrapper.
+#[allow(dead_code)]
 pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
+    // The standard e2e `[[device]]` block (same id/kind/name as `matv`'s
+    // own tests and `scripts/e2e-*`), landing on [`BRIDGED_EP`].
+    device_config_with(
+        store_dir,
+        vec![VirtualDeviceConfig {
+            id: "e2e-light".to_string(),
+            kind: DeviceKind::OnOffLight,
+            name: "E2E Light".to_string(),
+        }],
+    )
+}
+
+/// [`device_config`] with the bridged `[[device]]` list spelled out: same
+/// loopback-only setup, but the caller decides which virtual devices the
+/// bridge carries. Endpoint numbering follows declaration order from
+/// [`BRIDGED_EP`] (EP0 root, EP1 Aggregator), so `devices[0]` is EP2,
+/// `devices[1]` EP3, and so on.
+///
+/// `allow(dead_code)`: see [`BRIDGED_EP`] — only `events_subscribe.rs`
+/// needs a bridge that isn't the single default light.
+#[allow(dead_code)]
+pub fn device_config_with(
+    store_dir: std::path::PathBuf,
+    devices: Vec<VirtualDeviceConfig>,
+) -> DeviceConfig {
     DeviceConfig {
         passcode: PASSCODE,
         discriminator: DISCRIMINATOR,
@@ -86,14 +115,7 @@ pub fn device_config(store_dir: std::path::PathBuf) -> DeviceConfig {
         iface: "lo".to_string(),
         attestation: AttestationMode::default(),
         group_port: 0,
-        // The standard e2e `[[device]]` block (same id/kind/name as
-        // `matv`'s own tests and `scripts/e2e-*`), landing on
-        // [`BRIDGED_EP`].
-        devices: vec![VirtualDeviceConfig {
-            id: "e2e-light".to_string(),
-            kind: DeviceKind::OnOffLight,
-            name: "E2E Light".to_string(),
-        }],
+        devices,
     }
 }
 
