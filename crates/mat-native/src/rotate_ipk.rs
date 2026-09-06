@@ -513,8 +513,9 @@ mod tests {
 
     use async_trait::async_trait;
     use mat_controller::fabric::{derive_group_session_id, derive_ipk_operational};
+    use mat_controller::im::encode_key_set_write_fields_multi;
     use mat_controller::kvs::{mat_ipk_epoch_key, mat_ipk_epoch_slot_key, KvsTxn, MAIN_INI_FILE};
-    use mat_controller::tlv::{Tag, Writer};
+    use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_core::error::ErrorKind;
 
     use crate::NodeConn;
@@ -573,6 +574,9 @@ mod tests {
         /// 払い出す FakeConn 全体で共有する `close_calls`。None ならテストごとに
         /// 新規カウンタ（close 呼び出し回数を見ないテストの既定動作）。
         close_calls: Option<std::sync::Arc<AtomicUsize>>,
+        /// 払い出す FakeConn の `invoke_sink`（KeySetWrite の CommandFields TLV を
+        /// 記録する）。None なら記録しない（既存テストの挙動は不変）。
+        invoke_sink: Option<crate::test_support::InvokedFieldsLog>,
     }
 
     #[async_trait]
@@ -597,6 +601,7 @@ mod tests {
                     .close_calls
                     .clone()
                     .unwrap_or_else(|| std::sync::Arc::new(AtomicUsize::new(0))),
+                invoke_sink: self.invoke_sink.clone(),
                 ..FakeConn::scripted()
             }))
         }
@@ -607,6 +612,9 @@ mod tests {
         ctx: RotateCtx,
         log: std::sync::Arc<Mutex<Vec<String>>>,
         made: std::sync::Arc<AtomicUsize>,
+        /// 全確立器が払い出す FakeConn の `invoke` 成功記録（`(endpoint, cluster,
+        /// command, fields_tlv)`）。KeySetWrite の epoch 順序を pin するテスト用。
+        invoked: crate::test_support::InvokedFieldsLog,
     }
 
     /// k/0（mat 1 スロット形）+ ipk-epoch=CUR の INI を持つ RotateCtx。
@@ -629,7 +637,12 @@ mod tests {
 
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let made = std::sync::Arc::new(AtomicUsize::new(0));
-        let (log2, made2) = (std::sync::Arc::clone(&log), std::sync::Arc::clone(&made));
+        let invoked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (log2, made2, invoked2) = (
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&made),
+            std::sync::Arc::clone(&invoked),
+        );
         let ctx = RotateCtx {
             main_ini,
             fabric_index: 2,
@@ -646,6 +659,7 @@ mod tests {
                     log: std::sync::Arc::clone(&log2),
                     delay: None,
                     close_calls: None,
+                    invoke_sink: Some(std::sync::Arc::clone(&invoked2)),
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -654,6 +668,7 @@ mod tests {
             ctx,
             log,
             made,
+            invoked,
         }
     }
 
@@ -708,6 +723,70 @@ mod tests {
         assert!(!body.to_string().to_lowercase().contains(&next_hex));
     }
 
+    /// KeySetWrite の CommandFields TLV
+    /// (`{0: GroupKeySet{0: id, 1: policy, 2..7: key0/start0/key1/start1/key2/start2}}`)
+    /// を歩いて、内側の GroupKeySet struct の leaf 要素を出現順に返す
+    /// （`mat-controller::im::cmdfields` の同種テストと同じ手筋 — バイト一致
+    /// だけでは encoder の変更に追随してしまうため、デコードして直接主張する）。
+    fn key_set_write_leaf_fields(tlv: &[u8]) -> Vec<(Tag, Value<'_>)> {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart); // outer anonymous struct
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(
+            (el.tag, el.value),
+            (Tag::Context(0), Value::StructStart),
+            "field 0 = GroupKeySet struct"
+        );
+        let mut seen = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            if el.value == Value::ContainerEnd {
+                break;
+            }
+            seen.push((el.tag, el.value));
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn rotate_key_set_write_carries_current_at_1_and_next_at_2() {
+        let h = harness(HashMap::new(), HashMap::new());
+        let out = run_with(&h.ctx, &params(&[5], RotateMode::Rotate))
+            .await
+            .unwrap();
+        assert_eq!(out.status, RotateStatus::Rotated);
+        let next = slot(&h, IpkEpochSlot::Current).unwrap();
+
+        let invoked = h.invoked.lock().unwrap();
+        assert_eq!(invoked.len(), 1, "exactly one KeySetWrite: {invoked:?}");
+        let (endpoint, cluster, command, fields) = &invoked[0];
+        assert_eq!(*endpoint, 0);
+        assert_eq!(*cluster, 0x003F);
+        assert_eq!(*command, 0x0000);
+
+        // バイト一致で pin（現行@1、新@2）。
+        let expected = encode_key_set_write_fields_multi(0, &[(CUR, 1), (next, 2)]);
+        assert_eq!(
+            fields, &expected,
+            "KeySetWrite fields must carry current epoch at slot 1 and the new epoch at slot 2"
+        );
+
+        // デコードして ctx 2..7 を直接主張する。
+        assert_eq!(
+            key_set_write_leaf_fields(fields),
+            vec![
+                (Tag::Context(0), Value::Uint(0)), // GroupKeySetID = 0 (IPK)
+                (Tag::Context(1), Value::Uint(0)), // GroupKeySecurityPolicy = TrustFirst
+                (Tag::Context(2), Value::Bytes(&CUR)),
+                (Tag::Context(3), Value::Uint(1)),
+                (Tag::Context(4), Value::Bytes(&next)),
+                (Tag::Context(5), Value::Uint(2)),
+                (Tag::Context(6), Value::Null),
+                (Tag::Context(7), Value::Null),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn rotate_with_one_failure_stays_pending_and_is_resumable() {
         let h = harness(
@@ -752,12 +831,14 @@ mod tests {
             ctx,
             log,
             made,
+            invoked,
         } = h;
         let h2 = Harness {
             _dir,
             ctx: harness_ctx_reusing(&ctx),
             log,
             made,
+            invoked,
         };
         let out = run_with(&h2.ctx, &params(&[6], RotateMode::Rotate))
             .await
@@ -784,6 +865,7 @@ mod tests {
                     log: std::sync::Arc::clone(&log),
                     delay: None,
                     close_calls: None,
+                    invoke_sink: None,
                 }) as Box<dyn Establisher>)
             }),
         }
@@ -833,6 +915,7 @@ mod tests {
                     log: std::sync::Arc::clone(&log),
                     delay: None,
                     close_calls: None,
+                    invoke_sink: None,
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -929,6 +1012,7 @@ mod tests {
                     log: std::sync::Arc::clone(&log),
                     delay: Some(std::time::Duration::from_secs(1)),
                     close_calls: Some(std::sync::Arc::clone(&close_calls2)),
+                    invoke_sink: None,
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -973,6 +1057,50 @@ mod tests {
         assert_eq!(slot(&h, IpkEpochSlot::Prev), Some([0x0A; 16]));
         assert_eq!(slot(&h, IpkEpochSlot::Next), None);
         assert_eq!(out.body(2)["status"], "caught_up");
+    }
+
+    #[tokio::test]
+    async fn catch_up_key_set_write_carries_prev_at_1_and_current_at_2() {
+        let h = harness(HashMap::new(), HashMap::new());
+        const PREV: [u8; 16] = [0x0A; 16];
+        {
+            let mut txn = KvsTxn::open(&h.ctx.main_ini).unwrap();
+            txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Prev), &PREV);
+            txn.commit().unwrap();
+        }
+        let out = run_with(&h.ctx, &params(&[9], RotateMode::CatchUp))
+            .await
+            .unwrap();
+        assert_eq!(out.status, RotateStatus::CaughtUp);
+
+        let invoked = h.invoked.lock().unwrap();
+        assert_eq!(invoked.len(), 1, "exactly one KeySetWrite: {invoked:?}");
+        let (endpoint, cluster, command, fields) = &invoked[0];
+        assert_eq!(*endpoint, 0);
+        assert_eq!(*cluster, 0x003F);
+        assert_eq!(*command, 0x0000);
+
+        // バイト一致で pin（旧@1、現行@2）。
+        let expected = encode_key_set_write_fields_multi(0, &[(PREV, 1), (CUR, 2)]);
+        assert_eq!(
+            fields, &expected,
+            "catch-up KeySetWrite fields must carry the previous epoch at slot 1 and the current epoch at slot 2"
+        );
+
+        // デコードして ctx 2..7 を直接主張する。
+        assert_eq!(
+            key_set_write_leaf_fields(fields),
+            vec![
+                (Tag::Context(0), Value::Uint(0)),
+                (Tag::Context(1), Value::Uint(0)),
+                (Tag::Context(2), Value::Bytes(&PREV)),
+                (Tag::Context(3), Value::Uint(1)),
+                (Tag::Context(4), Value::Bytes(&CUR)),
+                (Tag::Context(5), Value::Uint(2)),
+                (Tag::Context(6), Value::Null),
+                (Tag::Context(7), Value::Null),
+            ]
+        );
     }
 
     #[tokio::test]
