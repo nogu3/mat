@@ -220,11 +220,21 @@ pub async fn run_with(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutc
 }
 
 fn read_slot(ctx: &RotateCtx, slot: IpkEpochSlot) -> Result<Option<[u8; 16]>, MatError> {
-    read_mat_ipk_epoch_slot(&ctx.main_ini, ctx.fabric_index, slot).map_err(|e| {
-        MatError::new(
+    read_mat_ipk_epoch_slot(&ctx.main_ini, ctx.fabric_index, slot).map_err(|e| match e {
+        KvsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => MatError::new(
+            ErrorKind::StoreMissing,
+            format!(
+                "{} not found — run `mat fabric init` to bootstrap the credential store",
+                ctx.main_ini.display()
+            ),
+        ),
+        KvsError::Io(io) => {
+            MatError::new(ErrorKind::Other, format!("kvs ipk epoch ({slot}): {io}"))
+        }
+        e => MatError::new(
             ErrorKind::StoreParse,
-            format!("kvs ipk epoch ({slot:?}): {e}"),
-        )
+            format!("kvs ipk epoch ({slot}): {e}"),
+        ),
     })
 }
 
@@ -976,5 +986,79 @@ mod tests {
             read_mat_ipk_epoch_slot(&main_ini, 2, IpkEpochSlot::Next).unwrap(),
             None
         );
+    }
+
+    /// `read_slot` の I/O エラー写像専用のテスト群。establisher は呼ばれない
+    /// 経路のみ使うため panic する fake を積む。
+    fn ctx_with_ini(main_ini: PathBuf) -> RotateCtx {
+        RotateCtx {
+            main_ini,
+            fabric_index: 2,
+            cfid: CFID,
+            cur_epoch: CUR,
+            make_establisher: Box::new(|_epoch: &[u8; 16]| {
+                panic!("read_slot が先に失敗するはずで、establisher は作られない")
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_slot_missing_ini_is_store_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_ini = dir.path().join(MAIN_INI_FILE); // 作らない = 不在
+        let ctx = ctx_with_ini(main_ini.clone());
+        let e = read_slot(&ctx, IpkEpochSlot::Next).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::StoreMissing);
+        assert!(
+            e.detail.contains(&main_ini.display().to_string()),
+            "{}",
+            e.detail
+        );
+        assert!(e.detail.contains("mat fabric init"), "{}", e.detail);
+
+        // run_with(Rotate) は abort 以外で read_slot(Next) を最初に呼ぶ —
+        // 同じ kind になることを確認する。
+        let e2 = run_with(&ctx, &params(&[5], RotateMode::Rotate))
+            .await
+            .unwrap_err();
+        assert_eq!(e2.kind, ErrorKind::StoreMissing);
+    }
+
+    #[test]
+    fn read_slot_bad_bytes_is_store_parse_with_slot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_ini = dir.path().join(MAIN_INI_FILE);
+        std::fs::write(&main_ini, "[Default]\n").unwrap();
+        let mut txn = KvsTxn::open(&main_ini).unwrap();
+        txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Next), &[1, 2, 3]); // 16 バイトでない
+        txn.commit().unwrap();
+        let ctx = ctx_with_ini(main_ini);
+        let e = read_slot(&ctx, IpkEpochSlot::Next).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::StoreParse);
+        assert!(e.detail.contains("ipk-epoch-next"), "{}", e.detail);
+        assert!(!e.detail.contains("Next)"), "{}", e.detail);
+    }
+
+    #[test]
+    fn read_slot_permission_denied_is_other() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let main_ini = dir.path().join(MAIN_INI_FILE);
+            std::fs::write(&main_ini, "[Default]\n").unwrap();
+            std::fs::set_permissions(&main_ini, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let ctx = ctx_with_ini(main_ini.clone());
+            let result = read_slot(&ctx, IpkEpochSlot::Next);
+            // tempdir の削除が失敗しないよう権限を戻す。
+            std::fs::set_permissions(&main_ini, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let e = match result {
+                // root 実行時などで読めてしまったら、権限エラーの検証対象外として pass。
+                Ok(_) => return,
+                Err(e) => e,
+            };
+            assert_eq!(e.kind, ErrorKind::Other);
+            assert!(e.detail.contains("ipk-epoch-next"), "{}", e.detail);
+        }
     }
 }

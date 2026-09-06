@@ -878,6 +878,12 @@ impl IpkEpochSlot {
     }
 }
 
+impl std::fmt::Display for IpkEpochSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.suffix())
+    }
+}
+
 pub fn mat_ipk_epoch_slot_key(fabric_index: u8, slot: IpkEpochSlot) -> String {
     format!("mat/f/{fabric_index}/{}", slot.suffix())
 }
@@ -1666,5 +1672,12 @@ mod tests {
             Err(KvsError::BadKeyset { .. })
         ));
         assert_eq!(read_mat_ipk_epoch(&ini, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn ipk_epoch_slot_display_matches_suffix() {
+        assert_eq!(IpkEpochSlot::Current.to_string(), "ipk-epoch");
+        assert_eq!(IpkEpochSlot::Next.to_string(), "ipk-epoch-next");
+        assert_eq!(IpkEpochSlot::Prev.to_string(), "ipk-epoch-prev");
     }
 }
