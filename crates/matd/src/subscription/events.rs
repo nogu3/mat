@@ -60,9 +60,12 @@ impl EventItem {
             Some(c) => serde_json::json!(c.name),
             None => serde_json::json!(self.cluster),
         };
+        // 未知 ID は属性行の cluster / attribute と同じく JSON 数値のまま
+        //（10 進文字列になるのは `data` のオブジェクトキーだけ — JSON の
+        // キーは文字列しか取れないため。spec §6.1）。
         let event = match def {
             Some(d) => serde_json::json!(d.name),
-            None => serde_json::json!(self.event.to_string()),
+            None => serde_json::json!(self.event),
         };
         let mut out = serde_json::json!({
             "timestamp": self.timestamp.clone(),
@@ -237,18 +240,25 @@ mod tests {
         assert_eq!(j["data"], json!({"state-value": true}));
     }
 
-    /// ids に無いクラスタ / イベント / フィールドは数値のまま出す
-    /// （read の struct 規約と同じ = キーは 10 進文字列）。
+    /// ids に無いクラスタ / イベント は属性行と同じく JSON **数値**のまま出す。
+    /// 10 進**文字列**になるのは `data` のオブジェクトキーだけ（read の struct
+    /// 規約と同じ — JSON のキーは文字列しか取れない）。
     #[test]
     fn event_json_falls_back_to_numbers_for_unknown_ids() {
         let j = item(0xFFF1_0001, 0x99, json!({"7": 5})).to_json();
-        assert_eq!(j["cluster"], 0xFFF1_0001u32);
-        assert_eq!(j["event"], "153");
-        assert_eq!(j["data"], json!({"7": 5}));
+        assert_eq!(j["cluster"], json!(0xFFF1_0001u32));
+        assert_eq!(j["event"], json!(0x99));
+        assert!(j["event"].is_number(), "文字列化しない: {}", j["event"]);
+        assert_eq!(
+            j["data"],
+            json!({"7": 5}),
+            "data のキーは 10 進文字列のまま"
+        );
         // 既知クラスタ・未知イベントも数値。
         let j = item(0x003B, 0x77, json!({"0": 1})).to_json();
         assert_eq!(j["cluster"], "switch");
-        assert_eq!(j["event"], "119");
+        assert_eq!(j["event"], json!(0x77));
+        assert!(j["event"].is_number());
         assert_eq!(j["data"], json!({"0": 1}));
     }
 
