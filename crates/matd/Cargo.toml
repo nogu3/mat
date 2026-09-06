@@ -34,6 +34,9 @@ tokio = { version = "1", features = [
 ] }
 rustix = { version = "1", features = ["fs"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 mat-native = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

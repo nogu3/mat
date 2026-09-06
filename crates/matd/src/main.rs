@@ -71,6 +71,16 @@ enum Command {
 }
 
 fn main() {
+    // `matd status | jq` のようにパイプ先が先に閉じると、Rust 既定の SIGPIPE
+    // 無視のままでは `println!` が EPIPE で panic する（"failed printing to
+    // stdout: Broken pipe"）。通常の CLI と同じく SIGPIPE で黙って終わる。
+    // 常駐 serve は stdout に書かないので影響しない。
+    #[cfg(unix)]
+    // SAFETY: SIG_DFL の設定はプロセス起動直後・スレッド生成前の 1 回だけで、
+    // 副作用は「EPIPE の代わりに SIGPIPE で終了する」に限られる。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
     // 既定は info（常駐デーモンなので状態遷移は既定で残す）。空文字は
     // 未設定扱い、パースできない指定は次の候補へ送る（`mat_core::log` 参照）。
