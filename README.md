@@ -120,6 +120,22 @@ mat on --node 1 --endpoint 2    # endpoint 2 = the bridged light
 mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
 ```
 
+`kind` is one of `onoff-light`, `switch` (a momentary Generic Switch — short /
+long / multi press events) or `contact-sensor` (Boolean State — `StateChange`
+events). Virtual buttons and sensors are driven from stdin with
+`matv --config matv.toml --stdin-control`, one JSON line per stimulus:
+
+```json
+{"device": "btn1", "press": "short"}
+{"device": "btn1", "press": "multi", "count": 2}
+{"device": "door", "state": true}
+```
+
+Each applied stimulus prints `{"device":..,"applied":..,"event_numbers":[..]}`
+on stdout; a bad line prints a `{"error":{"kind":..}}` line on stderr and the
+hook keeps reading. Events reach a subscriber through the subscription's
+EventReports (`mat listen` support lands in a later release).
+
 `matv` also receives groupcast: it binds a second UDP socket on `5540`
 (the Matter groupcast multicast destination port; SO_REUSEPORT so several
 `matv` processes can share it) — override with `group_port` in `matv.toml`,

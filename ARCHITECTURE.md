@@ -1146,7 +1146,8 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   wildcard 再購読からやり直す。
 - **v1 スコープ外（将来）**: EventReport 受信（Generic Switch 等のボタン、
   `im/read.rs` の EventRequests/EventReportIB デコード追加で載る設計余地は確保
-  済み）、`DataVersionFilter`、LIT ICD 対応（ICDManagement register-client +
+  済み）→ 2026-09-06 にスコープへ取り込み（下記「Phase 5 拡張 — イベント購読
+  フェーズ A」）。残る将来項目: `DataVersionFilter`、LIT ICD 対応（ICDManagement register-client +
   check-in 受信、対象は常時給電 + SIT sleepy まで）、`<store>/subscriptions.toml`
   （対象ノード/パスの絞り込み — 無ければ v1 既定どおり全ノード、aliases.toml
   と同じ「無ければ既定動作」規律）、状態スナップショット op / イベント
@@ -1158,6 +1159,37 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   実装・デプロイ後の別セッションで実施予定 — 本タスクの時点では未実施。
 
 ---
+
+### Phase 5 拡張 — イベント購読 フェーズ A（mat-controller / mat-device / matv、2026-09-06）
+
+設計 spec: `docs/superpowers/specs/2026-09-06-events-subscribe-design.md`。実装計画は
+`docs/superpowers/plans/2026-09-06-events-phase-a-controller-device.md`。上の「v1 スコープ外」に
+置いていた EventReport 受信を、controller のコーデック / セッション API と仮想デバイス側の
+発生源まで先に用意する 2 フェーズ構成の前半（matd と `mat listen` はフェーズ B）。
+
+- **`mat-controller::im`**: `EventPathIB` / `EventFilterIB` / `EventReportIB`（`EventDataIB` |
+  `EventStatusIB`）のコーデックと SubscribeRequest の `EventRequests` / `EventFilters`。
+  Delta タイムスタンプは復号時に解決する。
+- **`mat-controller::session`**: イベント付きの新 API `subscribe` /
+  `next_subscription_report_full`。既存 `subscribe_wildcard` / `next_subscription_report` は
+  **無改変のラッパ**として残す。
+- **`mat-device`**: `EventLog`（cap 64 の FIFO、初期 EventNumber は**起動時の Unix ms** —
+  永続 I/O なしに再起動を跨いだ単調増加を満たす）、外部刺激 `Stimulus`（`Device::stimulus_handle`）、
+  Generic Switch（momentary MS|MSR|MSL|MSM、bridged kind `switch`）と Boolean State
+  （kind `contact-sensor`）。報告規則は urgent = min-interval レジーム（最小間隔が来たら送る）、
+  non-urgent = 次の報告に相乗り。priming は EventFilters の EventMin を尊重する。
+- **`matv`**: `--stdin-control` — stdin の JSON 1 行 = 刺激 1 件（成功は stdout の JSON 行、
+  失敗は stderr の error 行）。フェーズ B の e2e とデモの入口。
+- **互換境界（matd を触らないための約束、spec §3.4）**: `ReportDataMessage` にフィールドを
+  足さない（`matd` / `mat-native::test_support` に struct literal がある）、既存の符号化 /
+  復号 API はシグネチャ・出力とも無改変、追加は全部新しい名前。`matd` / `mat-native::runner` /
+  `mat` は本フェーズで 1 行も触っていない。
+- **判断（イベント path の Status）**: `Node::event_entries` は**完全に具体的な path**
+  （endpoint + cluster + event が全部指定）にだけ Status を返し、wildcard を含む path は
+  一致が無くても黙る（spec §8.9 — `read_entries` の attribute path より狭い規則）。
+- 実機 E2E は未実施。matv 相手の e2e スクリプトと実機（Aqara 系のボタン / 開閉）はフェーズ B
+  （`docs/superpowers/plans/2026-09-06-events-phase-b-matd-listen.md`、着手条件 = S2 の matd
+  reload op が main にマージ済み）で行う。
 
 ### Phase 5 保守 — op 単一ソース化（監査④、2026-09-02）
 
