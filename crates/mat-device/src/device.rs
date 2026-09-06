@@ -7,9 +7,13 @@
 //! `net::runtime::run` (tokio, kept out of this file per the brief's file
 //! plan).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::mpsc;
 
 use mat_controller::setup_code::{self, SetupPayload};
 use mat_controller::transport::{Transport, UdpTransport};
@@ -17,8 +21,15 @@ use mat_controller::x509::{self, X509Error};
 
 use crate::core::commissioning::CommissioningServer;
 use crate::core::datamodel::{DescriptorHandler, Node};
+use crate::core::events::EventLog;
 use crate::core::fabric_store::FabricStore;
+use crate::net::stimulus::{StimulusHandle, StimulusIntake, StimulusRequest};
 use crate::net::store::{basic_info_in_dir, load_basic_info, store_in_dir};
+
+/// 刺激チャネル（`net::stimulus`）の深さ。ランタイムのループが 1 周
+/// する間に溜まりうる件数の目安で、超えれば送信側が待つ（落とさない）
+/// — 人がボタンを押す速さに対しては桁違いに余裕がある。
+const STIMULUS_CHANNEL_CAPACITY: usize = 16;
 
 /// spec §5.1.4.2 `DiscoveryCapabilitiesBitmask`: bit 2 = on-network. This
 /// device advertises no other discovery capability (no BLE/SoftAP) — same
@@ -222,6 +233,16 @@ pub struct Device {
     /// する）。
     #[allow(dead_code)]
     states: Vec<(String, crate::core::bridge::BridgedState)>,
+    /// 刺激（`net::stimulus`）の送信ハンドル。`stimulus_handle()` で複製
+    /// して配れる — `run(self)` でデバイスを渡した後も有効。
+    stimulus_handle: StimulusHandle,
+    /// 同じチャネルの受信側。`run(self)` が 1 度だけ取り出してランタイムへ
+    /// 渡す（`Option` なのはそのため — `run` は `self` を消費するが、
+    /// `Device` 全体を分解せずに move で抜き出す形にしている）。
+    stimuli: Option<mpsc::Receiver<StimulusRequest>>,
+    /// `[[device]]` の `id` → 台帳が採番した endpoint 番号。刺激の宛先
+    /// 解決（`net::runtime::Runtime::on_stimulus`）用。
+    endpoint_by_device: HashMap<String, u16>,
 }
 
 impl Device {
@@ -429,6 +450,28 @@ impl Device {
             states.push((device.id.clone(), built.state));
         }
 
+        // 刺激（`net::stimulus`）の宛先解決表: 設定の `id` → 台帳が
+        // 採番した endpoint。`states` と同じ zip なので順序も対応する。
+        let endpoint_by_device: HashMap<String, u16> = config
+            .devices
+            .iter()
+            .map(|d| d.id.clone())
+            .zip(bridged_eps.iter().copied())
+            .collect();
+
+        // イベントの採番はブート毎に「今の壁時計（ms）」から始める
+        // （`Node::set_event_log` の doc — 前回ブートの EventMin を
+        // 抱えた購読者が今回のイベントを黙って飲み込まないため）。
+        // 時計が UNIX epoch より前を指す異常系は 1 に落とす（0 は
+        // 「まだ 1 件も無い」を表す EventMin と紛れないよう避ける）。
+        let first_event_number = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        node.set_event_log(EventLog::new(first_event_number, EventLog::DEFAULT_CAP));
+
+        let (stimulus_handle, stimuli) = StimulusHandle::channel(STIMULUS_CHANNEL_CAPACITY);
+
         let bind_addr: SocketAddr = format!("[::]:{}", config.port)
             .parse()
             .expect("well-formed IPv6 wildcard address");
@@ -478,7 +521,16 @@ impl Device {
             comm_server,
             group,
             states,
+            stimulus_handle,
+            stimuli: Some(stimuli),
+            endpoint_by_device,
         })
+    }
+
+    /// 刺激の送信ハンドル（`net::stimulus`）。`run` へ渡す前に複製して
+    /// おけば、走っているデバイスへ外からボタン押下や開閉を加えられる。
+    pub fn stimulus_handle(&self) -> StimulusHandle {
+        self.stimulus_handle.clone()
     }
 
     /// The socket's actual bound address (resolves `DeviceConfig::port ==
@@ -546,7 +598,8 @@ impl Device {
     /// tracked entirely inside `net::runtime`'s `Runtime` as
     /// `CommissioningWindow` (`serve_forever`'s loop) — this doc only
     /// describes the policy, not where the state lives.
-    pub async fn run(self) -> Result<(), DeviceError> {
+    pub async fn run(mut self) -> Result<(), DeviceError> {
+        let requests = self.stimuli.take().expect("run is called once");
         crate::net::runtime::run(
             self.transport,
             self.local_addr,
@@ -554,6 +607,10 @@ impl Device {
             self.node,
             self.comm_server,
             self.group,
+            StimulusIntake {
+                requests,
+                endpoint_by_device: self.endpoint_by_device,
+            },
         )
         .await
     }

@@ -17,11 +17,21 @@
 //! sockets, timers, or a `Node`. The sending itself — priming chunks,
 //! dirty reports, keep-alives — lives in `net::runtime`, which owns the
 //! `SecureSession`.
+//!
+//! **Events** (spec §8.9.2 / §8.10.2, chip's `ReportScheduler`): a new
+//! event matching a subscribed `EventPathIB` whose `IsUrgent` is set is
+//! reported on the same schedule as a dirty attribute — as soon as
+//! `min_interval` since the last report has elapsed (`pending_urgent`).
+//! A new event matching only non-urgent paths rides along on whatever
+//! report goes out next (a dirty report, or the keep-alive at
+//! `max_interval`) and never pulls the deadline forward on its own.
 
 use std::time::Duration;
 
-use mat_controller::im::{AttrPathIn, ReportEntryOut};
+use mat_controller::im::{AttrPathIn, EventPathIn, ReportEntryOut};
 use tokio::time::Instant;
+
+use crate::core::events::StoredEvent;
 
 /// How far *before* `max_interval` a keep-alive report is sent. The spec
 /// contract is that the subscriber may consider the subscription dead once
@@ -55,6 +65,21 @@ pub struct ActiveSubscription {
     /// since the last report *and* that this subscription asked for.
     /// Drained into a report when the deadline fires.
     pub dirty: Vec<(u16, u32, u32)>,
+    /// The `EventRequests` of the `SubscribeRequest` that created this
+    /// subscription (spec §8.9.2.2). Empty for an attribute-only
+    /// subscription, which then never carries an event report.
+    pub event_paths: Vec<EventPathIn>,
+    /// The `EventMin` of the next report (spec §8.9.2.4): every event the
+    /// subscriber has already been sent has a number below this, so a
+    /// report only ever carries what happened since. Seeded from
+    /// `Node::next_event_number` when the subscription is installed (the
+    /// priming report is what decides what "already sent" means) and
+    /// advanced only when a report is actually acknowledged.
+    pub next_event: u64,
+    /// Whether an event matching an **urgent** subscribed path happened
+    /// since the last report — the event-side twin of a non-empty `dirty`,
+    /// and the only reason an event pulls `next_report_deadline` forward.
+    pub pending_urgent: bool,
 }
 
 impl ActiveSubscription {
@@ -72,8 +97,14 @@ impl ActiveSubscription {
     ///   a flat 2s margin would dominate (or invert) the interval, the
     ///   margin is halved instead: never later than `max_interval`, never
     ///   sooner than half of it.
+    ///
+    /// A pending **urgent** event (`pending_urgent`) counts as dirty for
+    /// this decision: chip's `ReportScheduler` treats an urgent event
+    /// exactly like a changed attribute — report it at the min-interval
+    /// floor. A non-urgent event doesn't move the deadline at all; it
+    /// simply rides on whatever report goes out next.
     pub fn next_report_deadline(&self) -> Instant {
-        if self.dirty.is_empty() {
+        if self.dirty.is_empty() && !self.pending_urgent {
             self.last_report_at + self.max_interval - self.keep_alive_margin()
         } else {
             self.last_report_at + self.min_interval
@@ -119,6 +150,48 @@ impl ActiveSubscription {
                 && path_matches(p, path)
         })
     }
+
+    /// Records the events that just happened, the event-side twin of
+    /// `note_changed`. Nothing is buffered — the report reads the log back
+    /// through `next_event` — so the only state this updates is
+    /// `pending_urgent`, i.e. whether the deadline moves to the
+    /// min-interval regime. Events this subscription doesn't cover, and
+    /// covered ones whose matching paths are all non-urgent, leave it
+    /// alone.
+    pub fn note_events(&mut self, events: &[StoredEvent]) {
+        for e in events {
+            if let Some(true) = self.covers_event(e.endpoint, e.cluster, e.event) {
+                self.pending_urgent = true;
+            }
+        }
+    }
+
+    /// Whether this subscription asked for a concrete `(endpoint, cluster,
+    /// event)`, and if so whether it asked *urgently*: `None` means no
+    /// subscribed path matches (the event is not this subscriber's
+    /// business), `Some(urgent)` means at least one does — `true` when any
+    /// matching path set `IsUrgent` (one urgent path is enough to make the
+    /// event urgent, spec §8.9.2.2).
+    pub fn covers_event(&self, endpoint: u16, cluster: u32, event: u32) -> Option<bool> {
+        let mut urgent = None;
+        for p in &self.event_paths {
+            if event_path_matches(p, endpoint, cluster, event) {
+                urgent = Some(urgent.unwrap_or(false) || p.urgent);
+            }
+        }
+        urgent
+    }
+}
+
+/// Whether a (possibly wildcard) subscribed `EventPathIn` matches one
+/// concrete `(endpoint, cluster, event)` — the event-side twin of
+/// `path_matches`, with the same `None`-is-a-wildcard rule. `urgent` is
+/// not part of matching: it says how the match is *reported*, not what it
+/// matches.
+pub fn event_path_matches(p: &EventPathIn, endpoint: u16, cluster: u32, event: u32) -> bool {
+    p.endpoint.is_none_or(|e| e == endpoint)
+        && p.cluster.is_none_or(|c| c == cluster)
+        && p.event.is_none_or(|ev| ev == event)
 }
 
 /// Whether a (possibly wildcard) subscribed `AttrPathIn` matches one
@@ -181,6 +254,9 @@ mod tests {
             max_interval: Duration::from_secs(max),
             last_report_at: now,
             dirty,
+            event_paths: Vec::new(),
+            next_event: 0,
+            pending_urgent: false,
         }
     }
 
@@ -300,6 +376,87 @@ mod tests {
         assert!(!path_matches(&other_attribute, concrete));
     }
 
+    fn stored(
+        endpoint: u16,
+        cluster: u32,
+        event: u32,
+        number: u64,
+    ) -> crate::core::events::StoredEvent {
+        crate::core::events::StoredEvent {
+            number,
+            endpoint,
+            cluster,
+            event,
+            priority: mat_controller::im::EventPriority::Info,
+            system_timestamp_ms: 0,
+            data_tlv: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_urgent_events_are_due_at_the_min_interval() {
+        let now = Instant::now();
+        let mut s = ActiveSubscription {
+            event_paths: vec![EventPathIn::WILDCARD_URGENT],
+            ..sub(2, 60, Vec::new(), now)
+        };
+        assert_eq!(
+            s.next_report_deadline(),
+            now + Duration::from_secs(60) - KEEP_ALIVE_MARGIN
+        );
+        s.note_events(&[stored(
+            2,
+            im::CLUSTER_SWITCH,
+            im::EVENT_SWITCH_INITIAL_PRESS,
+            1,
+        )]);
+        assert!(s.pending_urgent);
+        assert_eq!(s.next_report_deadline(), now + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn non_urgent_events_do_not_advance_the_deadline() {
+        let now = Instant::now();
+        let mut s = ActiveSubscription {
+            event_paths: vec![EventPathIn {
+                urgent: false,
+                ..EventPathIn::WILDCARD_URGENT
+            }],
+            ..sub(0, 60, Vec::new(), now)
+        };
+        s.note_events(&[stored(
+            2,
+            im::CLUSTER_SWITCH,
+            im::EVENT_SWITCH_INITIAL_PRESS,
+            1,
+        )]);
+        assert!(!s.pending_urgent);
+    }
+
+    #[test]
+    fn events_outside_the_subscribed_paths_are_ignored() {
+        let now = Instant::now();
+        let mut s = ActiveSubscription {
+            event_paths: vec![EventPathIn {
+                cluster: Some(im::CLUSTER_BOOLEAN_STATE),
+                ..EventPathIn::WILDCARD_URGENT
+            }],
+            ..sub(0, 60, Vec::new(), now)
+        };
+        s.note_events(&[stored(
+            2,
+            im::CLUSTER_SWITCH,
+            im::EVENT_SWITCH_INITIAL_PRESS,
+            1,
+        )]);
+        assert!(!s.pending_urgent);
+        assert_eq!(
+            s.covers_event(2, im::CLUSTER_BOOLEAN_STATE, im::EVENT_BS_STATE_CHANGE),
+            Some(true)
+        );
+        assert_eq!(s.covers_event(2, im::CLUSTER_SWITCH, 1), None);
+    }
+
     fn sub_with_paths(paths: Vec<AttrPathIn>) -> ActiveSubscription {
         ActiveSubscription {
             id: 1,
@@ -309,6 +466,9 @@ mod tests {
             max_interval: Duration::from_secs(5),
             last_report_at: Instant::now(),
             dirty: Vec::new(),
+            event_paths: Vec::new(),
+            next_event: 0,
+            pending_urgent: false,
         }
     }
 
