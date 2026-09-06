@@ -367,6 +367,82 @@ fn to_op(op: &DeviceOp) -> Result<Value, String> {
     })
 }
 
+/// `mat fabric rotate-ipk` が commit 後に matd へ送る `reload` ヒントの結果
+/// （body の `matd_reload`）。`node_touched` と同じ best-effort 送信路だが、
+/// こちらは応答を読んで状態語にする — 操作者が「稼働中の matd が新 IPK を
+/// 取り込んだか」を rotate の出力だけで判断できるようにするため。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatdReload {
+    /// matd が `{"reloaded":true}` を返した。
+    Reloaded,
+    /// 候補 socket のどれにも接続できない（matd 不在）。
+    NotRunning,
+    /// 接続はできたが ack が無い: エラー応答（旧 matd の `parse_error` を含む）、
+    /// timeout、非 JSON。
+    Failed,
+}
+
+impl MatdReload {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MatdReload::Reloaded => "reloaded",
+            MatdReload::NotRunning => "not_running",
+            MatdReload::Failed => "failed",
+        }
+    }
+}
+
+/// 稼働中の matd に資格情報（IPK）の読み直しを頼む（`mat fabric rotate-ipk` の
+/// commit 後）。socket 候補・接続失敗の扱い・300 ms の read 上限は
+/// [`hint_node_touched`] と同じ。結果は呼び出し側の exit code に影響しない。
+pub(crate) fn hint_reload() -> MatdReload {
+    let sockets = sockets_from_env_or_default(std::env::var_os("MAT_MATD_SOCKET"));
+    hint_reload_at(&sockets)
+}
+
+/// [`hint_reload`] の socket 候補注入版（テスト用に env 非依存の核）。
+fn hint_reload_at(sockets: &[PathBuf]) -> MatdReload {
+    let (stream, socket) = match connect_candidates(sockets) {
+        Ok(s) => s,
+        Err(detail) => {
+            tracing::debug!(error = %detail, "reload hint: matd unreachable");
+            return MatdReload::NotRunning;
+        }
+    };
+    match send_reload_line(stream) {
+        Ok(true) => MatdReload::Reloaded,
+        Ok(false) => {
+            tracing::warn!(socket = %socket.display(), "reload hint: matd did not acknowledge (old matd, or reload failed — run `matd reload`)");
+            MatdReload::Failed
+        }
+        Err(e) => {
+            tracing::warn!(socket = %socket.display(), error = %e, "reload hint: send/recv failed");
+            MatdReload::Failed
+        }
+    }
+}
+
+/// `{"op":"reload"}` を 1 行送り、応答 1 行が `reloaded: true` なら Ok(true)。
+/// 応答が JSON でない・`reloaded` が無い/false・timeout は Ok(false)（送受信
+/// 自体は成立した）、I/O エラーは Err。
+fn send_reload_line(mut stream: UnixStream) -> std::io::Result<bool> {
+    let mut line = serde_json::to_vec(&json!({ "op": "reload" }))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    if reader.read_line(&mut resp).is_err() {
+        return Ok(false); // timeout 等 = ack 無し
+    }
+    let acked = serde_json::from_str::<Value>(&resp)
+        .ok()
+        .and_then(|v| v.get("reloaded")?.as_bool())
+        .unwrap_or(false);
+    Ok(acked)
+}
+
 /// 直経路 op（native_direct）完了後、matd がいれば `node_touched` ヒントを送る
 /// fire-and-forget 通知（Issue #20）。常駐購読が古いセッションを掴んだままに
 /// なるのを防ぐための best-effort で、matd 不在・旧 matd（`parse_error` 応答）・
@@ -1213,6 +1289,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such.sock");
         hint_node_touched_at(&[missing], 1);
+    }
+
+    /// listener を 1 本立て、受けた要求行と固定応答を返すテスト用 matd。
+    fn one_shot_matd(
+        reply: &'static [u8],
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut req = String::new();
+            reader.read_line(&mut req).unwrap();
+            let mut conn = conn;
+            conn.write_all(reply).unwrap();
+            req
+        });
+        (dir, path, server)
+    }
+
+    #[test]
+    fn hint_reload_reports_reloaded_on_ack() {
+        let (_dir, path, server) =
+            one_shot_matd(b"{\"reloaded\":true,\"ipk\":\"changed\",\"reload_count\":1}\n");
+        assert_eq!(hint_reload_at(&[path]), MatdReload::Reloaded);
+        let req: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(req, json!({"op": "reload"}));
+    }
+
+    /// 旧 matd（reload 未対応）の parse_error、その他のエラー応答は failed。
+    #[test]
+    fn hint_reload_reports_failed_on_error_response() {
+        let (_dir, path, server) =
+            one_shot_matd(b"{\"error\":{\"kind\":\"parse_error\",\"detail\":\"unknown op\"}}\n");
+        assert_eq!(hint_reload_at(&[path]), MatdReload::Failed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hint_reload_reports_failed_on_non_json_response() {
+        let (_dir, path, server) = one_shot_matd(b"garbage\n");
+        assert_eq!(hint_reload_at(&[path]), MatdReload::Failed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hint_reload_reports_not_running_without_matd() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.sock");
+        assert_eq!(hint_reload_at(&[missing]), MatdReload::NotRunning);
+    }
+
+    #[test]
+    fn matd_reload_as_str_is_the_wire_vocabulary() {
+        assert_eq!(MatdReload::Reloaded.as_str(), "reloaded");
+        assert_eq!(MatdReload::NotRunning.as_str(), "not_running");
+        assert_eq!(MatdReload::Failed.as_str(), "failed");
     }
 
     #[test]

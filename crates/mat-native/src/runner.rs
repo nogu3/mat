@@ -338,14 +338,14 @@ mod tests {
             &runner,
             &engine,
             &params(Some("42".repeat(16))),
-            Some("restart matd"),
+            Some("note text"),
         )
         .await
         .unwrap();
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
         assert_eq!(body["status"], "provisioned");
         assert_eq!(body["nodes"], serde_json::json!([5]));
-        assert_eq!(body["note"], "restart matd");
+        assert_eq!(body["note"], "note text");
         // 2 回目は同一 group/keyset を再 provision する — rebind:false のままだと
         // `write_keymap` が `DuplicateBind` を返す（mat-controller
         // `duplicate_bind_without_rebind_is_error` と同じ規律）。note 無しの

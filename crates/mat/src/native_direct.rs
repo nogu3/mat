@@ -25,10 +25,6 @@ pub(crate) struct Config<'a> {
     pub issuer_index: u8,
 }
 
-/// 直経路 provision の note（KVS を直接書いたので matd の warm 状態は古い）。
-const PROVISION_NOTE: &str =
-    "controller group state written natively to kvs; if matd is running, restart it to reload group state";
-
 /// `node_touched` ヒントを撃ってはいけない op か。
 ///
 /// `unpair`（`RemoveFabric`）だけが該当する。ヒントは matd に「このノードを
@@ -167,7 +163,7 @@ async fn run_with_engine(engine: &Engine, op: &DeviceOp) -> Result<serde_json::V
         DeviceOp::Node(n) => mat_native::runner::run_node(&runner, n, None).await,
         DeviceOp::Group(g) => mat_native::op::run_group_op(engine, g).await,
         DeviceOp::GroupProvision(p) => {
-            mat_native::runner::provision(&runner, engine, p, Some(PROVISION_NOTE)).await
+            mat_native::runner::provision(&runner, engine, p, None).await
         }
         DeviceOp::GroupGrant { group_id, node_ids } => {
             mat_native::runner::grant(&runner, *group_id, node_ids).await
@@ -600,10 +596,10 @@ mod tests {
         );
     }
 
-    /// `group provision` の直経路成功 body には `PROVISION_NOTE`（KVS 直書き +
-    /// matd 再起動案内）が付く（matd 経路は `note: None`）。
+    /// 直経路 provision も note 無し（matd は送信ごとに KVS の group 資格情報を
+    /// 読むので、restart / reload は不要）。
     #[tokio::test]
-    async fn run_with_engine_provision_attaches_direct_path_note() {
+    async fn run_with_engine_provision_has_no_note() {
         use mat_native::group_settings::GroupSettingsCtx;
         use mat_native::op::ProvisionParams;
         use mat_native::test_support::FakeConn;
@@ -650,6 +646,6 @@ mod tests {
         });
         let body = run_with_engine(&engine, &op).await.unwrap();
         assert_eq!(body["status"], "provisioned");
-        assert_eq!(body["note"], PROVISION_NOTE);
+        assert!(body.get("note").is_none(), "body={body}");
     }
 }

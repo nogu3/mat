@@ -123,8 +123,10 @@ impl RotateOutcome {
     fn note(&self) -> Option<&'static str> {
         match self.status {
             RotateStatus::Rotated => Some(
-                "if matd is running, restart it before the next rotation to load the new IPK; \
-                 nodes left out of --nodes need `mat fabric rotate-ipk --catch-up --nodes <N>`",
+                "matd_reload says whether a running matd picked up the new IPK (reloaded / \
+                 not_running / failed); on failed, run `matd reload` (or restart matd) before \
+                 the next rotation; nodes left out of --nodes need \
+                 `mat fabric rotate-ipk --catch-up --nodes <N>`",
             ),
             RotateStatus::Pending => Some(
                 "no controller-side change yet; re-run `mat fabric rotate-ipk` with the same nodes \
@@ -716,7 +718,7 @@ mod tests {
             body["nodes"][0],
             serde_json::json!({"node_id": 5, "status": "ok"})
         );
-        assert!(body["note"].as_str().unwrap().contains("restart"));
+        assert!(body["note"].as_str().unwrap().contains("matd reload"));
         assert!(out.partial_error().is_none());
         // 鍵素材は body に出ない。
         let next_hex: String = next.iter().map(|b| format!("{b:02x}")).collect();
