@@ -570,6 +570,9 @@ impl CaseEstablisher {
     }
 
     /// 資格情報を差し替え、`ipk_operational` が変わったかを返す。
+    /// IPK が同じでも `FabricCredentials` は丸ごと入れ替わる（新しく自己発行
+    /// した運用鍵 + NOC になる）。mat はセッションを resume しない（毎回
+    /// CASE を張り直す）ので、これは無害。
     fn swap_credentials(&self, fresh: FabricCredentials) -> bool {
         let mut slot = self
             .creds
@@ -1637,6 +1640,105 @@ mod tests {
         let err = est.reload_credentials().unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
         assert_eq!(est.creds().ipk_operational, [0xCC; 16]);
+    }
+
+    /// 実 KVS のフィクスチャ: 新しい fabric を bootstrap した store（chip-tool
+    /// INI 互換の alpha + main）と、それを指す `NativeConfig`。TempDir は
+    /// 呼び手が生かし続ける（drop でストアごと消える）。
+    fn bootstrapped_store(fabric_id: u64, node_id: u64) -> (tempfile::TempDir, NativeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let fab = mat_controller::commissioning::CommissioningFabric::generate(fabric_id, node_id)
+            .unwrap();
+        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
+        let cfg = NativeConfig {
+            store: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        (dir, cfg)
+    }
+
+    /// `case_establisher` と同じ形の確立器を、iface 解決を挟まずに組む
+    /// （テストに実 iface は要らない — reload は KVS しか触らない）。
+    fn establisher_over_store(
+        creds_cfg: &NativeConfig,
+        reload_cfg: &NativeConfig,
+    ) -> CaseEstablisher {
+        let creds = load_fabric_credentials(creds_cfg).expect("bootstrapped store loads");
+        CaseEstablisher {
+            creds: std::sync::RwLock::new(Arc::new(creds)),
+            scope_id: 0,
+            resolver: Arc::new(OneShotResolver),
+            cfg: reload_cfg.clone(),
+        }
+    }
+
+    /// (a) ストアが変わっていなければ reload は `Ok(false)`、IPK も据え置き。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_is_false_when_unchanged() {
+        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
+        let est = establisher_over_store(&cfg, &cfg);
+        let before = est.creds().ipk_operational;
+        assert!(
+            !est.reload_credentials()
+                .expect("reload over an intact store"),
+            "unchanged store must report ipk unchanged"
+        );
+        assert_eq!(est.creds().ipk_operational, before);
+    }
+
+    /// (b) `f/<idx>/k/0` を別 epoch で書き換える（rotate-ipk の commit と同じ
+    /// 経路）と reload は `Ok(true)`、新 epoch の運用鍵が入る。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_picks_up_a_rotated_ipk() {
+        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
+        let est = establisher_over_store(&cfg, &cfg);
+        let before = est.creds();
+        let cfid = compressed_fabric_id(&before.root_public_key, before.fabric_id);
+        let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
+        let cur = mat_controller::kvs::read_mat_ipk_epoch(&main_ini, cfg.fabric_index)
+            .unwrap()
+            .expect("bootstrap persists the current epoch");
+        let next = [0x5A; 16];
+        assert_ne!(cur, next, "the fixture epoch must differ from the new one");
+        mat_controller::group_settings::begin_ipk_rotation(&main_ini, cfg.fabric_index, &next)
+            .unwrap();
+        mat_controller::group_settings::commit_ipk_rotation(
+            &main_ini,
+            cfg.fabric_index,
+            &cfid,
+            &cur,
+            &next,
+        )
+        .unwrap();
+
+        assert!(
+            est.reload_credentials().expect("reload after a commit"),
+            "a rotated IPK must report changed"
+        );
+        assert_eq!(
+            est.creds().ipk_operational,
+            mat_controller::fabric::derive_ipk_operational(&next, &cfid),
+            "the new epoch's operational key must be installed"
+        );
+    }
+
+    /// (c) 別 fabric の store を指した reload は `other` で拒否され、資格情報は
+    /// 一切差し替わらない（restart 案内）。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_rejects_a_different_fabric() {
+        let (_dir_a, cfg_a) = bootstrapped_store(0x1234, 112233);
+        let (_dir_b, cfg_b) = bootstrapped_store(0x9999, 112233);
+        // 起動時の資格情報は A、reload が読むのは B（= 取り違えた store）。
+        let est = establisher_over_store(&cfg_a, &cfg_b);
+        let before = est.creds().ipk_operational;
+
+        let err = est.reload_credentials().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("restart matd"), "detail={}", err.detail);
+        assert_eq!(est.creds().ipk_operational, before, "no swap on rejection");
     }
 }
 
