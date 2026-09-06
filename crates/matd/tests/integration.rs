@@ -111,6 +111,22 @@ fn occupancy_event(node_id: u64) -> matd::subscription::Emitted {
     })
 }
 
+/// switch クラスタの initial-press イベント行（`--event` フィルタ統合テスト用）。
+fn switch_event(node_id: u64) -> matd::subscription::Emitted {
+    matd::subscription::Emitted::Event(matd::subscription::EventItem {
+        timestamp: "2026-09-06T21:00:00+09:00".to_string(),
+        node_id,
+        endpoint: 1,
+        cluster: 0x003B, // switch
+        event: 0x01,     // initial-press
+        event_number: 7,
+        priority: mat_controller::im::EventPriority::Info,
+        data: None,
+        device_time: None,
+        priming: false,
+    })
+}
+
 /// matd の serve をバックグラウンドで起動し、socket path を返す。listen を使わない
 /// 既存テストの利便ラッパー（events 送信ハンドルは使い捨て）。
 async fn start_matd(
@@ -578,6 +594,84 @@ async fn listen_acks_then_streams_filtered_events() {
     assert_eq!(ev["value"], json!(1));
     assert_eq!(ev["priming"], json!(false));
     assert_eq!(ev["recovered"], json!(false));
+
+    handle.abort();
+}
+
+/// listen: `"event":"*"` を指定したクライアントはイベント行だけを受け取り、
+/// 属性行は流れてこない。
+#[tokio::test]
+async fn listen_with_event_wildcard_receives_only_event_lines() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, handle, tx, _health) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
+
+    let mut stream = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = stream.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(b"{\"op\":\"listen\",\"event\":\"*\"}\n")
+        .await
+        .unwrap();
+    let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ack["listening"], json!(true));
+
+    // 属性行を先に流す（届かないはず）、続けてイベント行（届くはず）。
+    tx.send(occupancy_event(21)).unwrap();
+    tx.send(switch_event(21)).unwrap();
+    let ev: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ev["node_id"], json!(21));
+    assert_eq!(ev["cluster"], "switch");
+    assert_eq!(ev["event"], "initial-press");
+    assert!(ev.get("attribute").is_none());
+
+    handle.abort();
+}
+
+/// listen: フィルタ無し（`--attribute` も `--event` も無し）のクライアントは
+/// 属性行・イベント行の両方を受け取る。
+#[tokio::test]
+async fn listen_with_no_filter_receives_both_attribute_and_event_lines() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, handle, tx, _health) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
+
+    let mut stream = None;
+    for _ in 0..250 {
+        if let Ok(s) = UnixStream::connect(&socket).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = stream.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(b"{\"op\":\"listen\"}\n")
+        .await
+        .unwrap();
+    let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ack["listening"], json!(true));
+
+    tx.send(occupancy_event(21)).unwrap();
+    tx.send(switch_event(21)).unwrap();
+
+    let attr: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(attr["attribute"], "occupancy");
+
+    let ev: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ev["event"], "initial-press");
 
     handle.abort();
 }

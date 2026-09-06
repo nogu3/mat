@@ -631,12 +631,14 @@ fn emit_response(resp: Value) -> ExitCode {
     }
 }
 
-/// listen リクエスト行を組む（None フィルタは省略）。
+/// listen リクエスト行を組む（None フィルタは省略 — `event` 省略は旧 matd
+/// 互換のため必須。bare `--event` は clap 側で `"*"` に落ちている）。
 fn listen_request_json(
     node: Option<u64>,
     endpoint: Option<u16>,
     cluster: &Option<String>,
     attribute: &Option<String>,
+    event: &Option<String>,
 ) -> Value {
     let mut op = json!({ "op": "listen" });
     if let Some(n) = node {
@@ -651,6 +653,9 @@ fn listen_request_json(
     if let Some(a) = attribute {
         op["attribute"] = json!(a);
     }
+    if let Some(e) = event {
+        op["event"] = json!(e);
+    }
     op
 }
 
@@ -664,6 +669,7 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
         endpoint,
         cluster,
         attribute,
+        event,
         count,
         timeout_ms,
         reconnect,
@@ -696,7 +702,7 @@ pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
             return ExitCode::from(e.kind.exit_code());
         }
     };
-    let op = listen_request_json(node_num, endpoint_num, cluster, attribute);
+    let op = listen_request_json(node_num, endpoint_num, cluster, attribute, event);
 
     if *reconnect {
         return run_listen_reconnecting(sockets, &op, *count, *timeout_ms);
@@ -1197,7 +1203,7 @@ mod tests {
     #[test]
     fn listen_request_json_omits_absent_filters() {
         assert_eq!(
-            listen_request_json(None, None, &None, &None),
+            listen_request_json(None, None, &None, &None, &None),
             json!({"op":"listen"})
         );
         assert_eq!(
@@ -1206,11 +1212,33 @@ mod tests {
                 Some(1),
                 &Some("occupancysensing".into()),
                 &Some("occupancy".into()),
+                &None,
             ),
             json!({
                 "op":"listen","node_id":21,"endpoint":1,
                 "cluster":"occupancysensing","attribute":"occupancy"
             })
+        );
+    }
+
+    /// `event` は指定時のみ載る（旧 matd 互換で省略時はキー自体を送らない）。
+    /// bare `--event` は clap の `default_missing_value` で `"*"` に落ちた
+    /// 状態で渡ってくる想定。
+    #[test]
+    fn listen_request_json_includes_event_only_when_set() {
+        assert_eq!(
+            listen_request_json(None, None, &None, &None, &Some("*".into())),
+            json!({"op":"listen","event":"*"})
+        );
+        assert_eq!(
+            listen_request_json(
+                None,
+                None,
+                &Some("switch".into()),
+                &None,
+                &Some("initial-press".into()),
+            ),
+            json!({"op":"listen","cluster":"switch","event":"initial-press"})
         );
     }
 

@@ -170,7 +170,13 @@ pub enum Op {
     /// コマンド）。counter は fabric 全体で 1 本 — 対象 group は取らない。
     GroupBump,
     /// イベントストリーム購読（matd 専用 op）。ack 1 行の後、フィルタ一致
-    /// イベントを同接続へ流し続ける（「1行=1往復」の唯一の例外）。全省略 = 全イベント。
+    /// イベントを同接続へ流し続ける（「1行=1往復」の唯一の例外）。全省略 = 全イベント
+    /// （属性行・イベント行の両方）。`attribute` = 属性行のみ、`event` = イベント行
+    /// のみ（`"*"` = 全イベント名、名前/数値 = その 1 件）。両方同時指定は
+    /// `parse_error`（`ListenFilter::from_op` が拒否 — 別クライアントが両方
+    /// 送ってくる可能性があるため CLI の `conflicts_with` だけに頼らない）。
+    /// `event` 省略（旧 mat クライアント）は `None` に落ちる — フィルタなし
+    /// 挙動は変わらず、イベント行も新たに受け取るようになる。
     Listen {
         #[serde(default)]
         node_id: Option<u64>,
@@ -180,6 +186,8 @@ pub enum Op {
         cluster: Option<String>,
         #[serde(default)]
         attribute: Option<String>,
+        #[serde(default)]
+        event: Option<String>,
     },
     /// デーモン死活確認（native backend には触れない）。
     Ping,
@@ -548,7 +556,8 @@ mod tests {
                 node_id: None,
                 endpoint: None,
                 cluster: None,
-                attribute: None
+                attribute: None,
+                event: None,
             }
         ));
         let r = parse(
@@ -562,6 +571,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn listen_parses_event_filter_omitted_wildcard_and_named() {
+        // 省略（旧 mat クライアント互換）= None。
+        let r = parse(r#"{"op":"listen"}"#);
+        assert!(matches!(r.op, Op::Listen { event: None, .. }));
+        // "*" = 全イベント名（bare --event）。
+        let r = parse(r#"{"op":"listen","event":"*"}"#);
+        assert!(matches!(r.op, Op::Listen { event: Some(ref e), .. } if e == "*"));
+        // 名前指定 1 件。
+        let r = parse(r#"{"op":"listen","cluster":"switch","event":"initial-press"}"#);
+        assert!(matches!(r.op, Op::Listen { event: Some(ref e), .. } if e == "initial-press"));
     }
 
     #[test]

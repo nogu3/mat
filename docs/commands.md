@@ -744,7 +744,7 @@ subscription needs a resident daemon to stay alive between calls (see
 
 ```bash
 mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute <name>]
-           [--count <N>] [--timeout-ms <T>] [--reconnect]
+           [--event [<name>]] [--count <N>] [--timeout-ms <T>] [--reconnect]
 ```
 
 - Filters (`--node` / `--endpoint` / `--cluster` / `--attribute`) narrow which
@@ -755,6 +755,9 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   place, so `--cluster` can narrow further within that set but never outside
   it — see [Subscriptions (`subscriptions.toml`, optional, matd
   only)](configuration.md#subscriptions-subscriptionstoml-optional-matd-only).
+  `--event [<name>]` selects device-originated event lines instead of
+  attribute-change lines (bare `--event` = every event name); `--attribute`
+  and `--event` are mutually exclusive.
 - `--count` (default `1`) is how many events to receive before exiting `0`;
   `0` means no count limit — keep streaming (symmetric with `--timeout-ms 0`).
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait

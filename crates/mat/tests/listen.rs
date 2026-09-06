@@ -159,6 +159,21 @@ fn listen_count_zero_timeout_without_events_exits_3() {
         .stderr(predicate::str::contains("timeout"));
 }
 
+/// `--attribute` と `--event` の同時指定は clap レベルで拒否される（バックエンド
+/// 不到達、exit 2 — `color-temp --kelvin --mireds` 等と同じ規律）。
+#[test]
+fn listen_attribute_and_event_together_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("matd.sock"); // bind しない（到達しないはず）
+
+    mat_listen(
+        &socket,
+        &["--attribute", "occupancy", "--event", "initial-press"],
+    )
+    .assert()
+    .code(2);
+}
+
 #[test]
 fn listen_without_matd_exits_13() {
     let dir = TempDir::new().unwrap();
