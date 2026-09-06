@@ -392,9 +392,16 @@ impl MatdReload {
     }
 }
 
+/// reload ヒントの応答 1 行を読む上限。`node_touched`（読み捨て 300 ms）と違い
+/// この応答は `matd_reload` として報告するので待つ価値がある。matd 側の reload は
+/// KVS の読み直し + NOC 自己発行（P-256 署名）を伴うため 300 ms では足りないことが
+/// ある。
+const RELOAD_ACK_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 /// 稼働中の matd に資格情報（IPK）の読み直しを頼む（`mat fabric rotate-ipk` の
-/// commit 後）。socket 候補・接続失敗の扱い・300 ms の read 上限は
-/// [`hint_node_touched`] と同じ。結果は呼び出し側の exit code に影響しない。
+/// commit 後）。socket 候補・接続失敗の扱いは [`hint_node_touched`] と同じ。
+/// read 上限だけは 1500 ms（[`RELOAD_ACK_TIMEOUT`]）。結果は呼び出し側の
+/// exit code に影響しない。
 pub(crate) fn hint_reload() -> MatdReload {
     let sockets = sockets_from_env_or_default(std::env::var_os("MAT_MATD_SOCKET"));
     hint_reload_at(&sockets)
@@ -410,8 +417,19 @@ fn hint_reload_at(sockets: &[PathBuf]) -> MatdReload {
         }
     };
     match send_reload_line(stream) {
-        Ok(true) => MatdReload::Reloaded,
-        Ok(false) => {
+        Ok(ReloadAck::Reloaded) => MatdReload::Reloaded,
+        Ok(ReloadAck::ReloadedIpkUnchanged) => {
+            // commit 済みローテーションの直後なのに IPK が動いていない = その
+            // matd は別の store / 別の fabric index を見ている疑いが濃い（同じ
+            // ものを見ていれば必ず changed になる）。語彙は 3 値のままなので
+            // body は `reloaded`、注意喚起は stderr のログで出す。
+            tracing::warn!(
+                socket = %socket.display(),
+                "matd reloaded but reports the IPK unchanged — is it serving the same store and fabric index as this rotation?"
+            );
+            MatdReload::Reloaded
+        }
+        Ok(ReloadAck::NoAck) => {
             tracing::warn!(socket = %socket.display(), "reload hint: matd did not acknowledge (old matd, or reload failed — run `matd reload`)");
             MatdReload::Failed
         }
@@ -422,25 +440,49 @@ fn hint_reload_at(sockets: &[PathBuf]) -> MatdReload {
     }
 }
 
-/// `{"op":"reload"}` を 1 行送り、応答 1 行が `reloaded: true` なら Ok(true)。
-/// 応答が JSON でない・`reloaded` が無い/false・timeout は Ok(false)（送受信
-/// 自体は成立した）、I/O エラーは Err。
-fn send_reload_line(mut stream: UnixStream) -> std::io::Result<bool> {
+/// matd の reload 応答 1 行の解釈。`MatdReload` の 3 値（wire 語彙）とは別で、
+/// 「ack はしたが IPK が変わっていない」を warn 用に切り分けるための内部型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadAck {
+    /// `reloaded: true`（`ipk` は `changed`、または欄が無い旧応答）。
+    Reloaded,
+    /// `reloaded: true` かつ `ipk: "unchanged"`。
+    ReloadedIpkUnchanged,
+    /// ack 無し: エラー応答（旧 matd の `parse_error` を含む）、`reloaded` が
+    /// 無い/false、非 JSON、timeout。
+    NoAck,
+}
+
+/// 応答 1 行を [`ReloadAck`] に写す（純関数 — テストはここを突く）。
+fn classify_reload_ack(resp: &str) -> ReloadAck {
+    let Ok(v) = serde_json::from_str::<Value>(resp) else {
+        return ReloadAck::NoAck;
+    };
+    if v.get("reloaded").and_then(Value::as_bool) != Some(true) {
+        return ReloadAck::NoAck;
+    }
+    // `unchanged` と明示されたときだけ切り分ける（欄が無い応答を推測しない）。
+    if v.get("ipk").and_then(Value::as_str) == Some("unchanged") {
+        ReloadAck::ReloadedIpkUnchanged
+    } else {
+        ReloadAck::Reloaded
+    }
+}
+
+/// `{"op":"reload"}` を 1 行送り、応答 1 行を [`classify_reload_ack`] で分類する。
+/// timeout は `NoAck`（送受信自体は成立した）、I/O エラーは Err。
+fn send_reload_line(mut stream: UnixStream) -> std::io::Result<ReloadAck> {
     let mut line = serde_json::to_vec(&json!({ "op": "reload" }))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
     stream.write_all(&line)?;
-    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    stream.set_read_timeout(Some(RELOAD_ACK_TIMEOUT))?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
     if reader.read_line(&mut resp).is_err() {
-        return Ok(false); // timeout 等 = ack 無し
+        return Ok(ReloadAck::NoAck); // timeout 等 = ack 無し
     }
-    let acked = serde_json::from_str::<Value>(&resp)
-        .ok()
-        .and_then(|v| v.get("reloaded")?.as_bool())
-        .unwrap_or(false);
-    Ok(acked)
+    Ok(classify_reload_ack(&resp))
 }
 
 /// 直経路 op（native_direct）完了後、matd がいれば `node_touched` ヒントを送る
@@ -1333,6 +1375,45 @@ mod tests {
         let (_dir, path, server) = one_shot_matd(b"garbage\n");
         assert_eq!(hint_reload_at(&[path]), MatdReload::Failed);
         server.join().unwrap();
+    }
+
+    /// 別 store / 別 fabric index を見ている matd は commit 済みローテーション
+    /// の後でも `ipk: "unchanged"` を返す。語彙は 3 値のままなので結果は
+    /// `Reloaded`（warn は stderr に出るだけ）。
+    #[test]
+    fn hint_reload_is_still_reloaded_when_matd_reports_ipk_unchanged() {
+        let (_dir, path, server) =
+            one_shot_matd(b"{\"reloaded\":true,\"ipk\":\"unchanged\",\"reload_count\":3}\n");
+        assert_eq!(hint_reload_at(&[path]), MatdReload::Reloaded);
+        server.join().unwrap();
+    }
+
+    /// 応答 1 行の分類（warn 判定の核）。
+    #[test]
+    fn classify_reload_ack_separates_the_unchanged_ipk_case() {
+        assert_eq!(
+            classify_reload_ack(r#"{"reloaded":true,"ipk":"changed","reload_count":1}"#),
+            ReloadAck::Reloaded
+        );
+        assert_eq!(
+            classify_reload_ack(r#"{"reloaded":true,"ipk":"unchanged"}"#),
+            ReloadAck::ReloadedIpkUnchanged
+        );
+        // ipk 欄が無い応答は warn しない（unchanged と断定できない）。
+        assert_eq!(
+            classify_reload_ack(r#"{"reloaded":true}"#),
+            ReloadAck::Reloaded
+        );
+        // ack 無し: エラー応答 / false / 非 JSON。
+        assert_eq!(
+            classify_reload_ack(r#"{"error":{"kind":"parse_error","detail":"unknown op"}}"#),
+            ReloadAck::NoAck
+        );
+        assert_eq!(
+            classify_reload_ack(r#"{"reloaded":false,"ipk":"unchanged"}"#),
+            ReloadAck::NoAck
+        );
+        assert_eq!(classify_reload_ack("garbage"), ReloadAck::NoAck);
     }
 
     #[test]
