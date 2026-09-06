@@ -29,7 +29,7 @@ use mat_controller::group_settings::{self, GroupSettingsError};
 use mat_controller::kvs::{self, read_mat_ipk_epoch_slot, IpkEpochSlot, KvsError};
 use mat_core::error::{ErrorKind, MatError};
 
-use crate::{Establisher, NativeConfig, OneShotResolver, Resolver};
+use crate::{Establisher, NativeConfig, NodeConn, OneShotResolver, Resolver};
 
 /// epoch 鍵 → その IPK で CASE を張る確立器を作る関数（`RotateCtx::make_establisher`
 /// の型。clippy::type_complexity 対策の別名）。
@@ -419,21 +419,32 @@ async fn distribute(
 ) -> Vec<NodeOutcome> {
     let mut out = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
-        let step = one_node(write_with, verify_with, epochs, node_id);
+        // `one_node` は確立した conn をここへ置く（establish 直後に格納、使う
+        // ときはロックしたまま invoke、close も held から take() して行う）。
+        // タイムアウトで `step` future が drop されても、確立済みの conn は
+        // held に残る（drop 時にロックは解放されるので下で取り出せる）ので、
+        // ここで拾って close する。
+        let held: Arc<tokio::sync::Mutex<Option<Box<dyn NodeConn>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let step = one_node(write_with, verify_with, epochs, node_id, Arc::clone(&held));
         let result = if timeout_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), step).await {
                 Ok(r) => r,
-                // タイムアウト時は in-flight の `step` future をここで drop
-                // する（tokio::time::timeout の仕様）ので、conn.close() は
-                // 呼ばれない。直経路は one-shot（次回 run で新規に確立し直す
-                // だけ）で、デバイス側も自分でセッションをタイムアウトさせる
-                // ため、close せずに手放すのはここでは許容している。
-                Err(_) => Err(MatError::new(
-                    ErrorKind::Timeout,
-                    format!(
-                        "node {node_id}: ipk rotation step (key-set-write + verify-case) exceeded {timeout_ms} ms"
-                    ),
-                )),
+                Err(_) => {
+                    // close 自体が hang して全体を止めないよう bounded（結果は
+                    // 無視 — 直経路は one-shot で、デバイス側も自分でセッション
+                    // をタイムアウトさせるため、ここで閉じ切れなくても致命では
+                    // ない）。
+                    if let Some(mut c) = held.lock().await.take() {
+                        let _ = tokio::time::timeout(Duration::from_millis(500), c.close()).await;
+                    }
+                    Err(MatError::new(
+                        ErrorKind::Timeout,
+                        format!(
+                            "node {node_id}: ipk rotation step (key-set-write + verify-case) exceeded {timeout_ms} ms"
+                        ),
+                    ))
+                }
             }
         } else {
             step.await
@@ -457,19 +468,30 @@ async fn one_node(
     verify_with: &dyn Establisher,
     epochs: &[([u8; 16], u64)],
     node_id: u64,
+    held: Arc<tokio::sync::Mutex<Option<Box<dyn NodeConn>>>>,
 ) -> Result<(), MatError> {
-    let mut conn = write_with
+    let conn = write_with
         .establish(node_id)
         .await
         .map_err(|e| step_err(node_id, "establish", e))?;
-    let written = crate::ops::write_ipk_keyset(conn.as_mut(), epochs).await;
-    conn.close().await;
+    *held.lock().await = Some(conn);
+    let written = {
+        let mut guard = held.lock().await;
+        let conn = guard.as_mut().expect("held just set above");
+        crate::ops::write_ipk_keyset(conn.as_mut(), epochs).await
+    };
+    if let Some(mut c) = held.lock().await.take() {
+        c.close().await;
+    }
     written.map_err(|e| step_err(node_id, "", e))?;
-    let mut conn = verify_with
+    let conn = verify_with
         .establish(node_id)
         .await
         .map_err(|e| step_err(node_id, "verify-case", e))?;
-    conn.close().await;
+    *held.lock().await = Some(conn);
+    if let Some(mut c) = held.lock().await.take() {
+        c.close().await;
+    }
     Ok(())
 }
 
@@ -545,6 +567,12 @@ mod tests {
         establish_fail: HashMap<u64, ErrorKind>,
         invoke_fail: HashMap<u64, ErrorKind>,
         log: std::sync::Arc<Mutex<Vec<String>>>,
+        /// 払い出す FakeConn の送信系呼び出し（invoke 等）の遅延。per-node
+        /// timeout 時の close 検証用（既定 None = 遅延なし）。
+        delay: Option<std::time::Duration>,
+        /// 払い出す FakeConn 全体で共有する `close_calls`。None ならテストごとに
+        /// 新規カウンタ（close 呼び出し回数を見ないテストの既定動作）。
+        close_calls: Option<std::sync::Arc<AtomicUsize>>,
     }
 
     #[async_trait]
@@ -564,6 +592,11 @@ mod tests {
             Ok(Box::new(FakeConn {
                 fail_first_send: fail.is_some(),
                 fail_kind: fail.unwrap_or(ErrorKind::Timeout),
+                delay: self.delay,
+                close_calls: self
+                    .close_calls
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::new(AtomicUsize::new(0))),
                 ..FakeConn::scripted()
             }))
         }
@@ -611,6 +644,8 @@ mod tests {
                     establish_fail: establish_fail.clone(),
                     invoke_fail: invoke_fail.clone(),
                     log: std::sync::Arc::clone(&log2),
+                    delay: None,
+                    close_calls: None,
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -747,6 +782,8 @@ mod tests {
                     establish_fail: HashMap::new(),
                     invoke_fail: HashMap::new(),
                     log: std::sync::Arc::clone(&log),
+                    delay: None,
+                    close_calls: None,
                 }) as Box<dyn Establisher>)
             }),
         }
@@ -794,6 +831,8 @@ mod tests {
                     },
                     invoke_fail: HashMap::new(),
                     log: std::sync::Arc::clone(&log),
+                    delay: None,
+                    close_calls: None,
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -865,6 +904,50 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(Box::new(FakeConn::scripted()))
         }
+    }
+
+    /// establish は即成功するが、確立済み conn の invoke（KeySetWrite）が per-node
+    /// timeout より遅い場合、タイムアウトで打ち切られても held conn は close
+    /// されなければならない（実装前は close_calls が 0 のまま赤になる）。
+    #[tokio::test]
+    async fn rotate_per_node_timeout_closes_established_conn() {
+        let h = harness(HashMap::new(), HashMap::new());
+        let log = std::sync::Arc::clone(&h.log);
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let close_calls2 = std::sync::Arc::clone(&close_calls);
+        let ctx = RotateCtx {
+            main_ini: h.ctx.main_ini.clone(),
+            fabric_index: 2,
+            cfid: CFID,
+            cur_epoch: CUR,
+            make_establisher: Box::new(move |epoch: &[u8; 16]| {
+                let label = if *epoch == CUR { "cur" } else { "other" };
+                Ok(Box::new(NodeFake {
+                    label,
+                    establish_fail: HashMap::new(),
+                    invoke_fail: HashMap::new(),
+                    log: std::sync::Arc::clone(&log),
+                    delay: Some(std::time::Duration::from_secs(1)),
+                    close_calls: Some(std::sync::Arc::clone(&close_calls2)),
+                }) as Box<dyn Establisher>)
+            }),
+        };
+        let p = RotateIpkParams {
+            node_ids: vec![5],
+            mode: RotateMode::Rotate,
+            per_node_timeout_ms: 50,
+        };
+        let out = run_with(&ctx, &p).await.unwrap();
+        assert_eq!(out.status, RotateStatus::Pending);
+        assert_eq!(
+            out.nodes[0].error.as_ref().unwrap().kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "established conn must be closed even though the step timed out"
+        );
     }
 
     #[tokio::test]
