@@ -1,6 +1,7 @@
-//! 購読（matd の常駐 Subscribe）: `subscribe_wildcard` のハンドシェイクと
-//! priming、`next_subscription_report` のデバイス発 ReportData / keepalive の
-//! pump。
+//! 購読（matd の常駐 Subscribe）: `subscribe` のハンドシェイクと priming、
+//! `next_subscription_report_full` のデバイス発 ReportData / keepalive の
+//! pump。属性のみを見る旧 API（`subscribe_wildcard` /
+//! `next_subscription_report`）は、この 2 つの薄いラッパ。
 
 use std::time::Duration;
 
@@ -24,12 +25,41 @@ fn payload_head_hex(payload: &[u8]) -> String {
         .collect()
 }
 
+/// 購読成立時に得られたもの: SubscribeResponse と priming の中身（属性
+/// チャンク列 + 全チャンクから集めたイベント）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscribeOutcome {
+    pub response: crate::im::SubscribeResponse,
+    pub priming: Vec<crate::im::ReportDataMessage>,
+    pub priming_events: Vec<crate::im::EventReport>,
+}
+
+/// 購読成立後の 1 レポート: 属性側（`ReportDataMessage`）と、同じ ReportData に
+/// 同居していたイベント（EventReports）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscriptionReport {
+    pub data: crate::im::ReportDataMessage,
+    pub events: Vec<crate::im::EventReport>,
+}
+
+/// ReportData payload からイベントだけを取り出す。属性側が読めているのに
+/// イベント側だけ壊れている場合に購読を殺さないため、失敗は debug ログして
+/// 「イベント無し」として扱う。
+fn decode_events_lossy(payload: &[u8], context: &'static str) -> Vec<crate::im::EventReport> {
+    crate::im::decode_event_reports(payload).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "{context}");
+        Vec::new()
+    })
+}
+
 impl SecureSession {
     /// Subscribe を張る（`clusters` 空 = full wildcard、非空 = クラスタ絞り込み）。
     /// spec §8.10、v1: attribute report のみ。
     /// priming ReportData（分割対応、各チャンクに StatusResponse(0) 応答）→
     /// SubscribeResponse 受信で成立。priming の中身も返す（matd が priming=true
     /// イベントとして流す）。
+    ///
+    /// `subscribe` の属性専用ラッパ（シグネチャ・挙動とも無改変）。
     pub async fn subscribe_wildcard(
         &mut self,
         min_interval_floor_s: u16,
@@ -44,14 +74,29 @@ impl SecureSession {
         ),
         SessionError,
     > {
-        use crate::im::{self, ImError};
-        let exchange_id = Self::new_exchange_id();
-        let req = im::encode_subscribe_request(
+        let spec = crate::im::SubscribeSpec {
             min_interval_floor_s,
             max_interval_ceiling_s,
             keep_subscriptions,
-            clusters,
-        );
+            clusters: clusters.to_vec(),
+            ..Default::default()
+        };
+        let o = self.subscribe(&spec, cfg).await?;
+        Ok((o.response, o.priming))
+    }
+
+    /// Subscribe を張る（属性 + イベント）。`spec` がそのままワイヤの
+    /// SubscribeRequest になる。priming ReportData（分割対応、各チャンクに
+    /// StatusResponse(0) 応答）→ SubscribeResponse 受信で成立。priming の
+    /// 属性チャンクと、全チャンクから集めたイベントを返す。
+    pub async fn subscribe(
+        &mut self,
+        spec: &crate::im::SubscribeSpec,
+        cfg: &MrpConfig,
+    ) -> Result<SubscribeOutcome, SessionError> {
+        use crate::im::{self, ImError};
+        let exchange_id = Self::new_exchange_id();
+        let req = im::encode_subscribe_request_full(spec);
         let resp = self
             .send_reliable(
                 exchange_id,
@@ -66,6 +111,7 @@ impl SecureSession {
             None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
         };
         let mut priming = Vec::new();
+        let mut priming_events = Vec::new();
         loop {
             match msg.proto.opcode {
                 im::OPCODE_REPORT_DATA => {
@@ -95,13 +141,19 @@ impl SecureSession {
                             }
                         }
                     };
+                    let events = decode_events_lossy(
+                        &msg.payload,
+                        "subscribe: undecodable priming event reports; collecting none",
+                    );
                     tracing::debug!(
                         exchange_id,
                         reports = rd.reports.len(),
+                        events = events.len(),
                         more_chunks = rd.more_chunks,
                         "subscribe: priming report chunk"
                     );
                     priming.push(rd);
+                    priming_events.extend(events);
                     if priming.len() > MAX_REPORT_CHUNKS {
                         return Err(SessionError::Im(ImError::Malformed(
                             "too many report chunks",
@@ -135,7 +187,11 @@ impl SecureSession {
                         counter = msg.header.message_counter,
                         "subscribe: SubscribeResponse received"
                     );
-                    return Ok((sr, priming));
+                    return Ok(SubscribeOutcome {
+                        response: sr,
+                        priming,
+                        priming_events,
+                    });
                 }
                 im::OPCODE_STATUS_RESPONSE => {
                     let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
@@ -149,11 +205,25 @@ impl SecureSession {
     /// 購読成立後のデバイス発 ReportData を 1 通受ける。keep-alive（空 report）も
     /// そのまま返す（deadline リセットは呼び出し側 = matd の責務）。`timeout` 無音は
     /// `SessionError::Silence`（上位が購読死亡として再購読する）。
+    ///
+    /// `next_subscription_report_full` の属性専用ラッパ（シグネチャ・挙動とも
+    /// 無改変）。
     pub async fn next_subscription_report(
         &mut self,
         timeout: Duration,
         cfg: &MrpConfig,
     ) -> Result<crate::im::ReportDataMessage, SessionError> {
+        Ok(self.next_subscription_report_full(timeout, cfg).await?.data)
+    }
+
+    /// 購読成立後のデバイス発 ReportData を 1 通受け、属性とイベントの両方を
+    /// 返す。無音・ack・StatusResponse(0) の扱いは
+    /// `next_subscription_report` と同一。
+    pub async fn next_subscription_report_full(
+        &mut self,
+        timeout: Duration,
+        cfg: &MrpConfig,
+    ) -> Result<SubscriptionReport, SessionError> {
         use crate::im;
         if let Some(e) = self.deferred_sub_err.take() {
             return Err(e);
@@ -221,10 +291,15 @@ impl SecureSession {
                 }
             }
         };
+        let events = decode_events_lossy(
+            &msg.payload,
+            "sub pump: undecodable event reports; delivering none",
+        );
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             subscription_id = rd.subscription_id,
             reports = rd.reports.len(),
+            events = events.len(),
             suppress_response = rd.suppress_response,
             "sub pump: report delivered"
         );
@@ -236,7 +311,7 @@ impl SecureSession {
                 self.deferred_sub_err = Some(e);
             }
         }
-        Ok(rd)
+        Ok(SubscriptionReport { data: rd, events })
     }
 }
 
@@ -322,6 +397,154 @@ mod tests {
         assert_eq!(priming.len(), 2);
         assert_eq!(priming[0].reports[0].data, Some(serde_json::json!(true)));
         dev_task.await.unwrap();
+    }
+
+    /// priming の 2 チャンク目が EventReports だけを運ぶハンドシェイク。
+    #[tokio::test]
+    async fn subscribe_with_events_collects_priming_events() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let dev_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p, body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_SUBSCRIBE_REQUEST);
+            // ワイヤに EventRequests が載っていること（server decode で確認）。
+            let req = crate::im::decode_subscribe_request(&body).unwrap();
+            assert_eq!(
+                req.event_paths,
+                vec![crate::im::EventPathIn::WILDCARD_URGENT]
+            );
+            assert_eq!(req.event_min, Some(10));
+            let ex = p.exchange_id;
+            // チャンク1: 属性のみ, more=true
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                9000,
+                &subscription_report_payload(42, true, true),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p2, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p2.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            // チャンク2: イベントのみ, more=false
+            let events = vec![crate::im::EventEntryOut::Data(crate::im::EventReportOut {
+                endpoint: 2,
+                cluster: crate::im::CLUSTER_SWITCH,
+                event: crate::im::EVENT_SWITCH_INITIAL_PRESS,
+                event_number: 11,
+                priority: crate::im::EventPriority::Info,
+                system_timestamp_ms: 1,
+                data_tlv: None,
+            })];
+            let payload = crate::im::encode_report_data_full(&[], &events, false, Some(42), false);
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                9001,
+                &payload,
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+            let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+            let (_, p3, _) = open_from_controller(&buf[..n]);
+            assert_eq!(p3.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+            let d = device_datagram(
+                ex,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_SUBSCRIBE_RESPONSE,
+                None,
+                false,
+                9002,
+                &subscribe_response_payload(42, 120),
+            );
+            dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+        });
+
+        let spec = crate::im::SubscribeSpec {
+            max_interval_ceiling_s: 3600,
+            event_paths: vec![crate::im::EventPathIn::WILDCARD_URGENT],
+            event_min: Some(10),
+            ..Default::default()
+        };
+        let o = s.subscribe(&spec, &fast_cfg()).await.unwrap();
+        assert_eq!(o.response.subscription_id, 42);
+        assert_eq!(o.priming.len(), 2);
+        assert_eq!(o.priming[0].reports[0].data, Some(serde_json::json!(true)));
+        assert_eq!(o.priming_events.len(), 1);
+        assert!(
+            matches!(&o.priming_events[0], crate::im::EventReport::Data(d) if d.event_number == 11)
+        );
+        dev_task.await.unwrap();
+    }
+
+    /// 購読後の 1 report に属性とイベントが同居 → `_full` は両方返し、旧 API は
+    /// 属性だけ返す。
+    #[tokio::test]
+    async fn next_subscription_report_full_returns_attributes_and_events() {
+        let (mut s, dev) = reliable_session_pair();
+
+        let attrs = vec![crate::im::ReportEntryOut::Data(crate::im::AttrReportOut {
+            endpoint: 2,
+            cluster: crate::im::CLUSTER_BOOLEAN_STATE,
+            attribute: crate::im::ATTR_BS_STATE_VALUE,
+            data_version: 1,
+            value_tlv: vec![0x09],
+        })];
+        let events = vec![crate::im::EventEntryOut::Data(crate::im::EventReportOut {
+            endpoint: 2,
+            cluster: crate::im::CLUSTER_BOOLEAN_STATE,
+            event: crate::im::EVENT_BS_STATE_CHANGE,
+            event_number: 5,
+            priority: crate::im::EventPriority::Info,
+            system_timestamp_ms: 9,
+            data_tlv: None,
+        })];
+        let payload = crate::im::encode_report_data_full(&attrs, &events, false, Some(42), false);
+        // device 発の新 exchange（initiator=true）。既存の
+        // `next_subscription_report_receives_device_initiated_reports_and_keepalive`
+        // と同じ組み立て（`device_datagram` は initiator=false 固定なので直接 seal）。
+        let header = MessageHeader {
+            session_id: LOCAL_SID,
+            security_flags: 0,
+            message_counter: 9100,
+            source_node_id: None,
+            destination: Destination::None,
+        };
+        let proto = ProtocolHeader {
+            initiator: true,
+            needs_ack: false,
+            acked_counter: None,
+            opcode: crate::im::OPCODE_REPORT_DATA,
+            exchange_id: 0x5001,
+            protocol_id: crate::im::PROTOCOL_ID_IM,
+            vendor_id: None,
+        };
+        let d = seal_message(&R2I, &header, &proto, &payload, DEV_NODE).unwrap();
+        dev.send_to(&d, RELIABLE_PEER).await.unwrap();
+
+        let rep = s
+            .next_subscription_report_full(Duration::from_secs(2), &fast_cfg())
+            .await
+            .unwrap();
+        assert_eq!(rep.data.reports.len(), 1);
+        assert_eq!(rep.data.subscription_id, Some(42));
+        assert_eq!(rep.events.len(), 1);
+        assert!(matches!(&rep.events[0], crate::im::EventReport::Data(d)
+            if d.event_number == 5 && d.cluster == crate::im::CLUSTER_BOOLEAN_STATE));
+        // StatusResponse(0) が返ること（既存契約）。
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _) = dev.recv_from(&mut buf).await.unwrap();
+        let (_, p, body) = open_from_controller(&buf[..n]);
+        assert_eq!(p.opcode, crate::im::OPCODE_STATUS_RESPONSE);
+        assert_eq!(p.exchange_id, 0x5001);
+        assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
     }
 
     /// 絞り込み購読: SubscribeRequest の AttributeRequests に指定クラスタの
