@@ -146,6 +146,10 @@ python3 scripts/gen-ids.py /tmp/chip > crates/mat-core/src/ids_gen.rs
   impl SubHealth { pub fn last_event_number(&self, node_id) -> Option<u64>; pub fn note_event_number(&self, node_id, n: u64); }
   ```
   broadcast の型は `broadcast::Sender<Emitted>`。`run_subscription_once` は `SubscribeSpec { clusters, event_paths: scope.to_paths(), event_min: health.last_event_number(node).map(|n| n + 1), .. }` で `conn.subscribe(&spec)` を呼び、priming events は「`event_min` 有り（= 前回番号を知っている）なら `priming: false`、無しなら `priming: true`」で流す（spec §6.2）。ポンプは `next_report_full` を受け、`data` は従来どおり `events_from_report` → `Emitted::Attribute`、`events` は `Emitted::Event`。受けた最大 EventNumber を `note_event_number`。
+- 属性なし（AttributeRequests 省略）の SubscribeRequest は**選択肢**として使える（server 側は
+  フェーズ A で既に受理する）。必要なら `SubscribeSpec.clusters: Option<Vec<u32>>` を足して
+  「イベントだけの購読」を表現する — 必須ではない（matd は常に属性も購読する既定でよい。
+  spec §1「フェーズ A に入らない」/ §2.1）。
 - `mat-native::test_support::{onoff_report, FakeEstablisher}` を使う既存テストは `Emitted::Attribute` を剥がして通す（`FakeEstablisher` がフェーズ A の新 API を返すよう `mat-native/src/test_support.rs` に `subscribe`/`next_report_full` の fake を足す — S2 マージ後の形に合わせる）。
 
 - [ ] Step 1: tests — `events_from_event_reports` の JSON 形（3 例）、`priming` フラグ規則（`event_min` 有/無）、`note_event_number` が最大値を保持、`Status` が捨てられる、既存 `events_from_report` テスト全通過。
@@ -191,6 +195,11 @@ python3 scripts/gen-ids.py /tmp/chip > crates/mat-core/src/ids_gen.rs
 - [ ] `ARCHITECTURE.md`: 「Phase 5 拡張 — イベント購読 フェーズ B」節（priming 所要時間の実測、canary の手順: `events = ["switch","booleanstate"]` → 24h 観察 → wildcard へ、戻しは `events = []`）。
 - [ ] リリース: minor bump（ユーザー規律どおり major は打たない）、`task semver` で破壊点を棚卸し（`ReportDataMessage` 無改変なので外部破壊は無い見込み）。
 - [ ] 本番デプロイ（despliegue skill）は canary 設定付きで。デプロイ後 `matd status` で established 19/19 と priming 所要時間を記録。
+- [ ] ロールアウト注意（フェーズ A レビュー由来）: `IsUrgent` を**必ず on のまま**にする。
+      `subscriptions.toml` が将来 urgent を落とせるようにした場合、報告は max-interval
+      （最大 300 秒）まで待つことになり、その間に溜まったイベントは 1 レポートあたりの
+      イベント上限（デバイス側の予算内キャップ、`send_subscription_report`）に当たって
+      分割配送になる — 欠落はしないが遅延が積む。urgent on ならこの窓は min-interval に縮む。
 
 ---
 

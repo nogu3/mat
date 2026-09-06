@@ -1084,12 +1084,11 @@ impl Node {
     /// (`read_attribute_value`, mirroring `expand_attribute`'s concrete-
     /// attribute branch) — otherwise a nonexistent attribute id would
     /// count as valid, since every handler's default `read_privilege` lets
-    /// `read_allowed` pass for any id. `false` for an empty `paths`; the
-    /// caller answers `INVALID_ACTION`. A request carrying only
-    /// EventRequests also decodes to an empty `paths` here (mat-controller's
-    /// `decode_subscribe_request` skips events, spec §8.10's attribute-only
-    /// scope for this device) and is therefore refused too — the same
-    /// answer a chip device with no events gives.
+    /// `read_allowed` pass for any id. `false` for an empty `paths` — but
+    /// that alone is not a refusal: an event-only request qualifies through
+    /// [`Node::has_readable_event_path`], and only a request readable on
+    /// *neither* side is answered with `INVALID_ACTION` (the two gates are
+    /// OR'd in `net::runtime::serve_subscribe_request`).
     pub fn has_readable_path(&self, paths: &[AttrPathIn], read_ctx: &ReadCtx) -> bool {
         paths.iter().any(|path| {
             if path.endpoint.is_some() && path.cluster.is_some() && path.attribute.is_some() {

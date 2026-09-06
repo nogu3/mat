@@ -43,6 +43,13 @@ ARCHITECTURE.md「Phase 5 拡張 — matd 常駐 Subscribe + `mat listen`」は 
   既存 attribute 購読の無退行（既存テスト全通過 + 「EventRequests 無しの SubscribeRequest の
   ワイヤが byte-equal」を釘打ち）。
 
+**フェーズ A に入らない**（フェーズ B で必要になれば足す）
+
+- 属性なし（AttributeRequests = tag 3 省略）の SubscribeRequest を**出す** client。
+  フェーズ A の client は AttributeRequests を常に出す（`SubscribeSpec.clusters` が空 =
+  full wildcard なので、属性なしは表現できない）。server 側の受理は入っている（§2.1 /
+  §4.2）。必要になったらフェーズ B で `SubscribeSpec.clusters: Option<Vec<u32>>` として足す。
+
 **フェーズ B（別ブランチ、§8）に入る**
 
 - `matd`: 常駐購読に EventRequests（wildcard, urgent）を載せ、EventReport を `mat listen`
@@ -87,8 +94,12 @@ EventFilterIB = struct{ 0: Node?, 1: EventMin uint64 }
 
 - 省略フィールドは wildcard。client は `Node` を出さない。
 - `IsUrgent` は path ごと。matd（フェーズ B）は全 path を urgent で購読する（§6.3）。
-- `AttributeRequests` が**空の配列**でも構わない（イベントだけの購読）。client は
-  attribute paths が空なら tag 3 を省略、event paths が空なら tag 4/5 を省略する。従来の
+- `AttributeRequests` が**空の配列**でも構わない（イベントだけの購読）— server 側は既に
+  受理する（§4.2 の `has_readable_path || has_readable_event_path`）。ただし
+  **フェーズ A の client は AttributeRequests を常に出す**（`SubscribeSpec.clusters` が空 =
+  full wildcard なので、属性なしの要求は表現できない）。属性なし（tag 3 省略）の
+  SubscribeRequest はフェーズ B で必要になったら `SubscribeSpec.clusters: Option<Vec<u32>>`
+  で足す。client は event paths が空なら tag 4/5 を省略する。従来の
   `encode_subscribe_request` は attribute wildcard 1 本を出す挙動を変えない。
 
 ### 2.2 ReportDataMessage
@@ -281,10 +292,12 @@ fn stimulate(&mut self, _stimulus: &Stimulus, _ctx: &mut InvokeCtx) -> StimulusR
 - `core/generic_switch.rs::GenericSwitchHandler`（cluster 0x003B）:
   属性 NumberOfPositions=2 / CurrentPosition（Arc<AtomicU8>、外部観測用）/ MultiPressMax=3。
   `stimulate(Press(kind))` が出すイベント列（spec §1.13.6 の MS|MSR|MSL|MSM シーケンス）:
-  - `Short`: InitialPress{1} → ShortRelease{0}
-  - `Long`: InitialPress{1} → LongPress{1} → LongRelease{0}
-  - `Multi(n)`: InitialPress{1} → ShortRelease{0} → (i=2..n: InitialPress{1} →
-    MultiPressOngoing{1, i} → ShortRelease{0}) → MultiPressComplete{1, n}
+  - `Short`: InitialPress{1} → ShortRelease{1}
+  - `Long`: InitialPress{1} → LongPress{1} → LongRelease{1}
+  - `Multi(n)`: InitialPress{1} → ShortRelease{1} → (i=2..n: InitialPress{1} →
+    MultiPressOngoing{1, i} → ShortRelease{1}) → MultiPressComplete{1, n}
+  - ShortRelease / LongRelease の値 1 は `PreviousPosition`（spec §1.13.6 =
+    直前の `CurrentPosition` = 押下位置 1）であって離した後の位置ではない。
   - `Multi(n)` で n<2 または n>MultiPressMax は `Rejected`。
   - CurrentPosition は各 Press 中 1→0 と動くが、1 刺激 = 1 まとまりなので `changed` には
     最終値（0、変化なし）だけ載る → 属性としては dirty にならない。イベントが本体。

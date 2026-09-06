@@ -49,8 +49,8 @@ fn one_field(v: u8) -> Vec<u8> {
 }
 
 /// A two-field event payload struct `{0: a, 1: b}` (MultiPressOngoing's
-/// `PreviousPosition`/`CurrentNumberOfPressesCounted`, MultiPressComplete's
-/// `PreviousPosition`/`TotalNumberOfPressesCounted`).
+/// `NewPosition`/`CurrentNumberOfPressesCounted`, MultiPressComplete's
+/// `PreviousPosition`/`TotalNumberOfPressesCounted` — spec §1.13.6).
 fn two_fields(a: u8, b: u8) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
