@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+mod control;
+
 use mat_controller::commissioning::INVALID_PASSCODES;
 use mat_device::core::bridge::DeviceKind;
 use mat_device::device::{AttestationMode, Device, DeviceConfig, VirtualDeviceConfig};
@@ -41,6 +43,11 @@ struct Cli {
     /// Device config TOML path (see `FileConfig` for the schema).
     #[arg(long)]
     config: PathBuf,
+    /// Read stimuli (button presses / contact state) as JSON lines on stdin
+    /// — a development hook, see `control`'s module doc. Off by default:
+    /// without it `matv` never touches stdin.
+    #[arg(long)]
+    stdin_control: bool,
 }
 
 /// `matv.toml` schema (M1: all fields required, no defaults). Mirrors
@@ -96,7 +103,11 @@ struct FileDeviceConfig {
     /// コントローラ側では別アクセサリの新規追加として見える）。
     id: String,
     /// デバイス種別。綴りは `mat_device::core::bridge::DeviceKind` の
-    /// serde rename が正本（未知の綴りは serde が弾く）。
+    /// serde rename が正本（未知の綴りは serde が弾く）: `"onoff-light"`、
+    /// `"switch"`（momentary な Generic Switch — 短押し / 長押し / 連打の
+    /// イベントを出す）、`"contact-sensor"`（Boolean State — `StateChange`
+    /// イベント）。後ろの 2 つは `--stdin-control` で刺激を注入して動かす
+    /// （`control` のモジュール doc）。
     kind: DeviceKind,
     /// Bridged Device Basic Information の NodeLabel。
     name: String,
@@ -140,7 +151,14 @@ fn main() {
         }
     };
 
-    if let Err(e) = runtime.block_on(run(file_cfg)) {
+    let result = runtime.block_on(run(file_cfg, cli.stdin_control));
+    // Ctrl-C で `run` が戻った後、ランタイムの暗黙 drop に任せてはいけない:
+    // `Runtime::Drop` は blocking プールの実行中タスクの完了を待つが、
+    // `--stdin-control` の読み手は `tokio::io::stdin()` の専用スレッドで
+    // **キャンセルできない** `read()` に入っているので、stdin が開いたまま
+    // （EOF が来ない）だとそこで永久に止まる。畳むのを待たずに抜ける。
+    runtime.shutdown_background();
+    if let Err(e) = result {
         eprintln!("matv: {e}");
         std::process::exit(1);
     }
@@ -210,8 +228,9 @@ fn load_config(path: &std::path::Path) -> Result<FileConfig, String> {
 }
 
 /// Builds the `Device`, prints the setup-payload JSON line, then serves
-/// until `Device::run` errors or Ctrl-C is received.
-async fn run(cfg: FileConfig) -> Result<(), String> {
+/// until `Device::run` errors or Ctrl-C is received. With `stdin_control`
+/// a background task also reads stimuli from stdin (see `control`).
+async fn run(cfg: FileConfig, stdin_control: bool) -> Result<(), String> {
     let store = cfg.store.clone();
     let devices = cfg
         .devices
@@ -250,6 +269,13 @@ async fn run(cfg: FileConfig) -> Result<(), String> {
         "store": store.display().to_string(),
     });
     println!("{payload}");
+
+    // 刺激の注入口（開発用フック）。`Device::run` は `device` を消費するので
+    // ハンドルはその前に複製しておく。フックは別タスクで stdin を読み続け、
+    // EOF で静かに終わる（デバイス本体は走り続ける）。
+    if stdin_control {
+        tokio::spawn(control::run_stdin_control(device.stimulus_handle()));
+    }
 
     tokio::select! {
         result = device.run() => {

@@ -7,5 +7,6 @@ pub mod group_rx;
 pub mod mdns;
 pub mod pase;
 pub(crate) mod runtime;
+pub mod stimulus;
 pub mod store;
 pub mod subscription;

@@ -236,6 +236,7 @@ mod client;
 mod mrp;
 mod responder;
 mod subscribe;
+pub use subscribe::{SubscribeOutcome, SubscriptionReport};
 #[cfg(test)]
 mod test_util;
 

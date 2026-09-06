@@ -60,10 +60,12 @@
 //! is the group socket's job even if it happens to also reach the unicast
 //! one.
 
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use mat_controller::exchange::MrpConfig;
@@ -92,6 +94,7 @@ use crate::net::group_rx::{
     GroupRxDeps, SESSION_TYPE_MASK,
 };
 use crate::net::mdns::MdnsAdvertiser;
+use crate::net::stimulus::{StimulusApplyError, StimulusIntake, StimulusRequest};
 use crate::net::subscription::ActiveSubscription;
 
 /// PBKDF iterations this runtime advertises for PASE (spec §3.9 legal
@@ -713,11 +716,20 @@ pub(crate) async fn run(
     node: Node,
     comm_server: CommissioningServer,
     group: GroupRx,
+    stimuli: StimulusIntake,
 ) -> Result<(), DeviceError> {
-    Runtime::boot(transport, local_addr, config, node, comm_server, group)
-        .await
-        .serve_forever()
-        .await
+    Runtime::boot(
+        transport,
+        local_addr,
+        config,
+        node,
+        comm_server,
+        group,
+        stimuli,
+    )
+    .await
+    .serve_forever()
+    .await
 }
 
 /// The node-side state every secured message may touch, owned here and
@@ -740,9 +752,23 @@ struct NodeState {
     subscription: Option<ActiveSubscription>,
     window: CommissioningWindow,
     config: DeviceConfig,
+    /// `[[device]]` の `id` → その device が生えている endpoint 番号
+    /// （`net::endpoint_ledger` の採番結果）。刺激は名前で来るので
+    /// （`net::stimulus`）、ここで番号へ落とす。
+    endpoint_by_device: HashMap<String, u16>,
+    /// このプロセスが `boot` した時刻。イベントの `SystemTimestamp`
+    /// （spec §8.9.2.6 — 「起動からの経過ミリ秒」）の基準で、`core` が
+    /// 時計を持てない（I/O-free）ぶんをここが埋める。
+    started_at: Instant,
 }
 
 impl NodeState {
+    /// イベントに刻む `SystemTimestamp`（spec §8.9.2.6）= 起動からの
+    /// 経過ミリ秒。`Node::stimulate` へ渡す唯一の時刻。
+    fn system_timestamp_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     /// The `ServeState` view of this state — what one secured message (or
     /// one drained buffered request) is allowed to touch.
     fn serve_state(&mut self) -> ServeState<'_> {
@@ -777,6 +803,13 @@ struct Runtime {
     current_session: Option<(u16, SecureSession, u8)>,
     replay: GroupReplayGuard,
     group: GroupRx,
+    /// 外から届く刺激（`net::stimulus`）の受信側。`select!` の 1 分岐。
+    stimuli: mpsc::Receiver<StimulusRequest>,
+    /// 送信ハンドルが全部 drop されて `stimuli.recv()` が `None` を
+    /// 返し続けるようになったか。`select!` の `Some(..)` パターンは
+    /// `None` では不成立 → そのままだと分岐が即座に再評価されて
+    /// ビジーループになるので、以後この分岐自体を落とす。
+    stimuli_closed: bool,
     state: NodeState,
 }
 
@@ -790,6 +823,7 @@ impl Runtime {
         node: Node,
         comm_server: CommissioningServer,
         group: GroupRx,
+        stimuli: StimulusIntake,
     ) -> Self {
         let port = local_addr.port();
         // A fresh random PASE salt each boot (spec §3.9 permits any salt; a
@@ -835,6 +869,8 @@ impl Runtime {
             current_session: None,
             replay: GroupReplayGuard::new(),
             group,
+            stimuli: stimuli.requests,
+            stimuli_closed: false,
             state: NodeState {
                 node,
                 comm_server,
@@ -842,6 +878,8 @@ impl Runtime {
                 subscription: None,
                 window,
                 config,
+                endpoint_by_device: stimuli.endpoint_by_device,
+                started_at: Instant::now(),
             },
         }
     }
@@ -874,6 +912,19 @@ impl Runtime {
                 grecv = group_recv(&self.group.socket, &mut gbuf) => {
                     let Ok((n, from)) = grecv else { continue };
                     self.on_group_datagram(&gbuf[..n], from);
+                }
+                // 外からの刺激（`net::stimulus`）。送信ハンドルが全部 drop
+                // されると `recv()` は `None` を返し続け、`Some(..)` パターンが
+                // 恒久的に不成立になる = この分岐が毎周回すぐ完了して
+                // ビジーループ化するので、そのとき `stimuli_closed` を立てて
+                // 分岐前条件で自分を外す（`Device::run` が受信側を握って
+                // いる限り起きないが、ハンドルを捨てた埋め込み利用でも
+                // CPU を焼かないため）。
+                req = self.stimuli.recv(), if !self.stimuli_closed => {
+                    match req {
+                        Some(req) => self.on_stimulus(req),
+                        None => self.stimuli_closed = true,
+                    }
                 }
             }
         }
@@ -1283,12 +1334,67 @@ impl Runtime {
                 tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
                 if let Some(sub) = self.state.subscription.as_mut() {
                     sub.note_changed(&changed);
+                    // No cluster emits from a groupcast invoke today (see
+                    // `Node::drain_events`), so this is a no-op — kept next
+                    // to `note_changed` so the day one does, its events get
+                    // the urgent regime instead of waiting for a keep-alive.
+                    sub.note_events(&self.state.node.recent_events(sub.next_event));
                 }
             }
             Err(reason) => {
                 tracing::debug!(peer = %from, len = datagram.len(), ?reason, "groupcast datagram dropped")
             }
         }
+    }
+
+    /// One external stimulus (`net::stimulus`): resolve the device id to an
+    /// endpoint, apply it to the node, and tell the active subscription
+    /// what it produced — attribute changes (`note_changed`) *and* new
+    /// events (`note_events`), the latter deciding whether the next report
+    /// is due at the min-interval floor. The `oneshot` reply carries the
+    /// outcome back to whoever sent the stimulus.
+    ///
+    /// Same shape as `on_group_datagram`: a change applied from a non-IM
+    /// source, followed by the subscription bookkeeping. `self.state.node`
+    /// and `self.state.subscription` are disjoint fields, so both can be
+    /// borrowed at once.
+    fn on_stimulus(&mut self, req: StimulusRequest) {
+        let result = match self.state.endpoint_by_device.get(&req.device_id).copied() {
+            None => Err(StimulusApplyError::UnknownDevice(req.device_id.clone())),
+            Some(endpoint) => {
+                let ts = self.state.system_timestamp_ms();
+                match self.state.node.stimulate(endpoint, &req.stimulus, ts) {
+                    Ok(out) => {
+                        tracing::debug!(
+                            device = %req.device_id,
+                            endpoint,
+                            stimulus = ?req.stimulus,
+                            changed = out.changed.len(),
+                            events = out.event_numbers.len(),
+                            "stimulus applied"
+                        );
+                        if let Some(sub) = self.state.subscription.as_mut() {
+                            sub.note_changed(&out.changed);
+                            sub.note_events(&self.state.node.recent_events(sub.next_event));
+                        }
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            device = %req.device_id,
+                            endpoint,
+                            stimulus = ?req.stimulus,
+                            error = %e,
+                            "stimulus refused"
+                        );
+                        Err(StimulusApplyError::Node(e))
+                    }
+                }
+            }
+        };
+        // The sender may have given up waiting (dropped its `oneshot`
+        // receiver) — the stimulus still happened, so this is not an error.
+        let _ = req.reply.send(result);
     }
 }
 
@@ -1522,8 +1628,14 @@ async fn serve_secured_message(
         // becomes dirty — the `select!` report branch (`on_subscription_due`) picks it up at
         // the subscription's next deadline. Recorded *before* the reply is
         // sent so a change is never lost to a failing reply.
+        //
+        // Same for anything it *emitted*: no cluster emits from an invoke or
+        // a write today (see `Node::drain_events`), so `note_events` is a
+        // no-op — kept here so the first one that does gets the urgent
+        // regime, exactly as a stimulus-driven event does (`on_stimulus`).
         if let Some(sub) = subscription.as_mut() {
             sub.note_changed(&changed);
+            sub.note_events(&node.recent_events(sub.next_event));
         }
         let reply_result = session
             .reply_reliable(
@@ -1848,14 +1960,21 @@ async fn serve_subscribe_request(
     // rather than answered with an empty priming report and a dead
     // subscription. (Concrete paths always count — their refusal shows up
     // as a status entry in the priming report; see
-    // `Node::has_readable_path`.)
-    if !node.has_readable_path(&req.paths, &read_ctx) {
+    // `Node::has_readable_path`.) An **event-only** request (empty
+    // AttributeRequests, a non-empty EventRequests this subject may
+    // receive) is just as legitimate a subscription, so either side
+    // qualifying is enough — a request has to be readable in *neither* to
+    // be refused.
+    if !node.has_readable_path(&req.paths, &read_ctx)
+        && !node.has_readable_event_path(&req.event_paths, &read_ctx)
+    {
         tracing::debug!(
             exchange_id = msg.proto.exchange_id,
             paths = ?req.paths,
+            event_paths = ?req.event_paths,
             subject = ?read_ctx.subject,
             fabric_index,
-            "SubscribeRequest rejected: no readable attribute path (INVALID_ACTION)"
+            "SubscribeRequest rejected: no readable attribute or event path (INVALID_ACTION)"
         );
         let reply_result = session
             .reply_reliable(
@@ -1893,16 +2012,36 @@ async fn serve_subscribe_request(
         };
     }
 
-    let chunks = node.read_chunks(
+    // The EventNumber the priming report starts from: `EventFilterIB::
+    // EventMin` if the request carried one, otherwise everything still in
+    // the log (spec §8.9.2.4 — a fresh subscriber with no history asks for
+    // 0 and gets whatever the device retained).
+    let event_min = req.event_min.unwrap_or(0);
+    let event_entries = node.event_entries(&req.event_paths, event_min, &read_ctx);
+    // The event chunks are appended *after* the attribute ones (spec
+    // §8.9.2.3's ReportData shape puts AttributeReports before
+    // EventReports), so the attribute side must be told a trailer follows —
+    // otherwise its last chunk would say `more_chunks=false` and the
+    // subscriber would stop reading before the events arrived.
+    let mut chunks = node.read_chunks(
         &req.paths,
         &read_ctx,
         REPORT_CHUNK_BUDGET,
         Some(subscription_id),
+        !event_entries.is_empty(),
     );
+    chunks.extend(chunk_events(
+        &event_entries,
+        REPORT_CHUNK_BUDGET,
+        subscription_id,
+    ));
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
         subscription_id,
         paths = ?req.paths,
+        event_paths = ?req.event_paths,
+        event_min,
+        events = event_entries.len(),
         fabric_filtered = req.fabric_filtered,
         min_interval_floor_s = req.min_interval_floor_s,
         max_interval_ceiling_s = req.max_interval_ceiling_s,
@@ -1970,15 +2109,110 @@ async fn serve_subscribe_request(
         // interaction, not before it.
         last_report_at: Instant::now(),
         dirty: Vec::new(),
+        event_paths: req.event_paths,
+        // Everything the priming report just delivered is behind us: the
+        // next report starts at the number the *next* event will get, so
+        // nothing is replayed and nothing is skipped.
+        next_event: node.next_event_number(),
+        pending_urgent: false,
     })
+}
+
+/// The priming report's event chunks, split under the same budget the
+/// attribute side (`Node::read_chunks`) uses, and probed the same way: each
+/// candidate batch is measured in its `more_chunks=true` shape (the larger
+/// one), so a batch that only fits when encoded as the final chunk is never
+/// let through.
+///
+/// The last chunk is `more_chunks=false, suppress_response=false` — the
+/// events are the end of the *report*, but not of the interaction: a
+/// `SubscribeResponse` still follows on the same exchange, so the
+/// subscriber must answer this chunk with `StatusResponse(0)` too.
+///
+/// Empty `entries` produces no chunks at all (unlike `read_chunks`, which
+/// always emits at least one): the attribute side has already sent the
+/// report, and an event-less subscription must not add a stray empty one.
+fn chunk_events(
+    entries: &[im::EventEntryOut],
+    budget: usize,
+    subscription_id: u32,
+) -> Vec<Vec<u8>> {
+    let mut batches: Vec<Vec<im::EventEntryOut>> = Vec::new();
+    let mut current: Vec<im::EventEntryOut> = Vec::new();
+    for e in entries {
+        let mut candidate = current.clone();
+        candidate.push(e.clone());
+        if im::encode_report_data_full(&[], &candidate, false, Some(subscription_id), true).len()
+            > budget
+            && !current.is_empty()
+        {
+            batches.push(std::mem::take(&mut current));
+            current.push(e.clone());
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    let last = batches.len().saturating_sub(1);
+    batches
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| im::encode_report_data_full(&[], &b, false, Some(subscription_id), i != last))
+        .collect()
+}
+
+/// How many of `all` (oldest first) still fit in one unchunked dirty
+/// report alongside `entries`, under `budget` — the prefix
+/// `send_subscription_report` actually carries. Measured in the shape the
+/// report is really sent in (`more_chunks=false`,
+/// `suppress_response=false`), so a prefix that fits here fits on the wire.
+///
+/// `0` means not even the first event fits (attributes alone are already
+/// at or over the budget): the caller sends what it has anyway and logs,
+/// which is exactly what it did before events existed — the attribute side
+/// of a dirty report has never been chunked.
+///
+/// Encoding is monotonic in the prefix length (each event only adds
+/// bytes), so the first prefix over budget ends the search.
+fn fit_events(
+    entries: &[im::ReportEntryOut],
+    all: &[im::EventEntryOut],
+    budget: usize,
+    subscription_id: u32,
+) -> usize {
+    let mut fitted = 0;
+    for n in 1..=all.len() {
+        let len =
+            im::encode_report_data_full(entries, &all[..n], false, Some(subscription_id), false)
+                .len();
+        if len > budget {
+            break;
+        }
+        fitted = n;
+    }
+    fitted
 }
 
 /// Sends one subscription ReportData on a **new**, device-initiated
 /// exchange (spec §8.10.3) and waits for the subscriber's
-/// `StatusResponse(0)`. Carries the dirty attributes' current values, or
-/// no reports at all when nothing changed — an empty ReportData is the
-/// keep-alive that tells the subscriber the subscription is still alive
+/// `StatusResponse(0)`. Carries the dirty attributes' current values plus
+/// the events logged since the last acknowledged report, or no reports at
+/// all when nothing changed — an empty ReportData is the keep-alive that
+/// tells the subscriber the subscription is still alive
 /// (`SecureSession::next_subscription_report` delivers it as such).
+///
+/// **Events are capped, not chunked** (`fit_events`): a dirty report is one
+/// message, and the log can hand out up to `EventLog::DEFAULT_CAP` entries
+/// at once (three multi-presses are 27 events — past the 1280B datagram
+/// ceiling, which would fail the send and drop the subscription). So only
+/// the longest prefix that fits `REPORT_CHUNK_BUDGET` goes out, oldest
+/// first; `sub.next_event` then advances to *what was actually sent* + 1,
+/// and `pending_urgent` is kept set whenever something was left out, so the
+/// remainder follows at the next min-interval instead of waiting for the
+/// max-interval keep-alive. Nothing is lost — the log holds it until it is
+/// reported (or until the FIFO overruns, which is the pre-existing cap).
 ///
 /// Returns `false` if the report couldn't be delivered or the subscriber
 /// answered anything other than SUCCESS; the caller then drops the
@@ -2027,20 +2261,44 @@ async fn send_subscription_report(
     } else {
         crate::net::subscription::retain_reportable(sub, node.read_entries(&paths, &read_ctx))
     };
-    // `more_chunks=false`, one message: a dirty set is a handful of
-    // scalar attributes, orders of magnitude below `REPORT_CHUNK_BUDGET`
-    // (unlike priming, which can pull in whole certificate attributes).
-    let payload = im::encode_report_data_entries(&entries, false, Some(sub.id), false);
+    // Everything logged since the last acknowledged report, filtered by the
+    // subscription's own EventRequests and the session's ACL
+    // (`Node::event_entries`). Empty `event_paths` (an attribute-only
+    // subscription) yields nothing, so this report is byte-identical to
+    // what it was before events existed.
+    let all_events = node.event_entries(&sub.event_paths, sub.next_event, &read_ctx);
+    // One message, `more_chunks=false`: the attribute side of a dirty
+    // report is a handful of scalars, orders of magnitude below
+    // `REPORT_CHUNK_BUDGET` (unlike priming, which can pull in whole
+    // certificate attributes), but the event side is not bounded that way —
+    // so it is capped to the prefix that fits (see this fn's doc).
+    let fitted = fit_events(&entries, &all_events, REPORT_CHUNK_BUDGET, sub.id);
+    let events = &all_events[..fitted];
+    let left_out = all_events.len() - fitted;
+    if left_out > 0 {
+        tracing::debug!(
+            subscription_id = sub.id,
+            sent = fitted,
+            left_out,
+            budget = REPORT_CHUNK_BUDGET,
+            "subscription report carries only the events that fit — the rest follow at the next min-interval"
+        );
+    }
+    let payload = im::encode_report_data_full(&entries, events, false, Some(sub.id), false);
     if payload.len() > REPORT_CHUNK_BUDGET {
         // Not a hard failure (MRP/`seal` will just fail to send it, and the
         // subscription gets dropped below) — but a silent oversized report
         // is exactly the failure mode a future non-scalar subscribed
         // attribute would hit, so say so loudly enough to find in a log.
+        // With `fit_events` in place the events can no longer be the cause
+        // on their own: past this point the attributes alone are over.
         tracing::debug!(
             subscription_id = sub.id,
             payload_len = payload.len(),
             budget = REPORT_CHUNK_BUDGET,
             reports = entries.len(),
+            events = events.len(),
+            left_out,
             "subscription report exceeds the chunk budget — dirty reports are not chunked (see send_subscription_report)"
         );
     }
@@ -2058,7 +2316,8 @@ async fn send_subscription_report(
         exchange_id,
         subscription_id = sub.id,
         reports = entries.len(),
-        keep_alive = entries.is_empty(),
+        events = events.len(),
+        keep_alive = entries.is_empty() && events.is_empty(),
         payload_len = payload.len(),
         ok = send_result.is_ok(),
         error = send_result.as_ref().err().map(|e| e.to_string()),
@@ -2086,6 +2345,29 @@ async fn send_subscription_report(
 
     sub.last_report_at = Instant::now();
     sub.dirty.clear();
+    // Only now — the report was acknowledged, so these events are the
+    // subscriber's. A failed/unacknowledged report leaves `next_event`
+    // where it was, but that is moot: the caller drops the subscription.
+    //
+    // Advance past *what was sent*, not to the node's current high-water
+    // mark: with the per-report cap the two differ, and jumping to the
+    // latter would silently skip everything left out. When nothing was
+    // selectable at all (`all_events` empty — an attribute-only
+    // subscription, or a log whose entries this session's ACL hides), read
+    // the node back instead: the subscriber has seen everything up to
+    // *now*, not just what it was allowed to receive. `EventEntryOut::
+    // Status` entries carry no number, so they never advance it.
+    sub.next_event = match events.iter().rev().find_map(|e| match e {
+        im::EventEntryOut::Data(d) => Some(d.event_number),
+        im::EventEntryOut::Status { .. } => None,
+    }) {
+        Some(number) => number + 1,
+        None if all_events.is_empty() => node.next_event_number(),
+        None => sub.next_event,
+    };
+    // Events were left behind: stay in the urgent regime so the remainder
+    // goes out at the min-interval rather than waiting for the keep-alive.
+    sub.pending_urgent = left_out > 0 && sub.pending_urgent;
     true
 }
 
@@ -2257,7 +2539,7 @@ async fn serve_read_request_chunked(
         fabric_filtered: req.fabric_filtered,
         subject: session_subject(session),
     };
-    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
+    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None, false);
     let last_index = chunks.len().saturating_sub(1);
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
@@ -2319,6 +2601,91 @@ fn session_subject(session: &SecureSession) -> Subject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_entry(number: u64) -> im::EventEntryOut {
+        im::EventEntryOut::Data(im::EventReportOut {
+            endpoint: 2,
+            cluster: im::CLUSTER_SWITCH,
+            event: im::EVENT_SWITCH_INITIAL_PRESS,
+            event_number: number,
+            priority: im::EventPriority::Info,
+            system_timestamp_ms: 1234,
+            data_tlv: None,
+        })
+    }
+
+    /// `chunk_events` の「最後だけ more_chunks=false、どれも
+    /// suppress_response=false（SubscribeResponse が続く）」と、
+    /// イベントが無ければチャンクを 1 つも足さない（属性側が既に
+    /// 送っている）ことを固定する。
+    #[test]
+    fn event_chunks_flag_only_the_last_one_as_final_and_never_suppress() {
+        assert!(chunk_events(&[], REPORT_CHUNK_BUDGET, 7).is_empty());
+
+        let one = chunk_events(&[event_entry(1)], REPORT_CHUNK_BUDGET, 7);
+        assert_eq!(one.len(), 1);
+        let m = im::decode_report_data_message(&one[0]).expect("decodable");
+        assert_eq!(m.subscription_id, Some(7));
+        assert!(!m.more_chunks);
+        assert!(!m.suppress_response);
+
+        // 予算を 1 件ぶんに満たない値まで絞れば必ず分割される。
+        let entries: Vec<im::EventEntryOut> = (1..=3).map(event_entry).collect();
+        let split = chunk_events(&entries, 1, 7);
+        assert_eq!(split.len(), 3);
+        for (i, chunk) in split.iter().enumerate() {
+            let m = im::decode_report_data_message(chunk).expect("decodable");
+            assert_eq!(m.more_chunks, i != split.len() - 1, "chunk {i}");
+            assert!(!m.suppress_response, "chunk {i}");
+        }
+    }
+
+    /// `fit_events` の 3 分岐: 全部入る / 一部だけ入る（最長 prefix）/
+    /// 1 件も入らない（0 = 呼び側は属性だけ送って警告する既存挙動）。
+    /// dirty レポートはチャンク分割しないので、ここが唯一の歯止め。
+    #[test]
+    fn fit_events_takes_the_longest_prefix_that_fits_the_budget() {
+        let all: Vec<im::EventEntryOut> = (1..=8).map(event_entry).collect();
+
+        // 予算たっぷり: 全件。
+        assert_eq!(fit_events(&[], &all, REPORT_CHUNK_BUDGET, 7), all.len());
+
+        // 3 件ちょうどの予算 → 3 件（4 件目で溢れる）。
+        let three = im::encode_report_data_full(&[], &all[..3], false, Some(7), false).len();
+        assert_eq!(fit_events(&[], &all, three, 7), 3);
+
+        // 1 件も入らない予算 → 0。
+        let one = im::encode_report_data_full(&[], &all[..1], false, Some(7), false).len();
+        assert_eq!(fit_events(&[], &all, one - 1, 7), 0);
+
+        // 空の候補列はいつでも 0。
+        assert_eq!(fit_events(&[], &[], REPORT_CHUNK_BUDGET, 7), 0);
+    }
+
+    /// 属性側の最終チャンクは、イベントが続くとき more_chunks=true に
+    /// なる（`trailer_follows`）— これを落とすと購読者はイベントを
+    /// 読まずに報告を終える。属性パスが空（イベントだけの購読）でも
+    /// 空の ReportData 1 つがこの形で出る。
+    #[test]
+    fn an_event_only_priming_report_still_opens_with_a_more_chunks_attribute_report() {
+        let node = Node::new();
+        let read_ctx = ReadCtx {
+            fabric_index: 1,
+            fabric_filtered: false,
+            subject: Subject::node(1),
+        };
+        let chunks = node.read_chunks(&[], &read_ctx, REPORT_CHUNK_BUDGET, Some(7), true);
+        assert_eq!(chunks.len(), 1);
+        let m = im::decode_report_data_message(&chunks[0]).expect("decodable");
+        assert!(m.reports.is_empty());
+        assert!(m.more_chunks);
+        assert!(!m.suppress_response);
+
+        // trailer が無いとき（属性だけの購読）は従来どおり more=false。
+        let chunks = node.read_chunks(&[], &read_ctx, REPORT_CHUNK_BUDGET, Some(7), false);
+        let m = im::decode_report_data_message(&chunks[0]).expect("decodable");
+        assert!(!m.more_chunks);
+    }
 
     /// Minimal `DeviceConfig` fixture for tests that need a `ServeState`
     /// (`config` is only read when a `WindowRequest` reopens the window

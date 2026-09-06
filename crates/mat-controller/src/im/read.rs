@@ -489,6 +489,45 @@ pub enum ReportEntryOut {
     },
 }
 
+/// One AttributeReportIB (spec §8.9.2.2) — either `{1: AttributeDataIB}`
+/// (data) or `{0: AttributeStatusIB}` (status). Extracted out of
+/// `encode_report_data_entries` so `encode_report_data_full` (im::event) can
+/// share it for the attribute half of a mixed attribute+event ReportData.
+pub(super) fn encode_attribute_report_ib(w: &mut Writer, entry: &ReportEntryOut) {
+    w.start_struct(Tag::Anonymous); // AttributeReportIB
+    match entry {
+        ReportEntryOut::Data(report) => {
+            w.start_struct(Tag::Context(1)); // AttributeDataIB
+            w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
+            w.start_list(Tag::Context(1)); // Path
+            w.put_uint(Tag::Context(2), u64::from(report.endpoint));
+            w.put_uint(Tag::Context(3), u64::from(report.cluster));
+            w.put_uint(Tag::Context(4), u64::from(report.attribute));
+            w.end_container(); // Path
+            w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
+            w.end_container(); // AttributeDataIB
+        }
+        ReportEntryOut::Status {
+            endpoint,
+            cluster,
+            attribute,
+            status,
+        } => {
+            w.start_struct(Tag::Context(0)); // AttributeStatusIB
+            w.start_list(Tag::Context(0)); // Path
+            w.put_uint(Tag::Context(2), u64::from(*endpoint));
+            w.put_uint(Tag::Context(3), u64::from(*cluster));
+            w.put_uint(Tag::Context(4), u64::from(*attribute));
+            w.end_container(); // Path
+            w.start_struct(Tag::Context(1)); // StatusIB
+            w.put_uint(Tag::Context(0), u64::from(*status));
+            w.end_container(); // StatusIB
+            w.end_container(); // AttributeStatusIB
+        }
+    }
+    w.end_container(); // AttributeReportIB
+}
+
 /// ReportDataMessage (spec §8.9.2): server-side encode, mirroring
 /// `decode_report_data_message`'s nesting. Shape: `struct{0:
 /// SubscriptionId?, 1: array[AttributeReportIB], 3: MoreChunkedMessages?,
@@ -498,61 +537,21 @@ pub enum ReportEntryOut {
 /// list{2:endpoint,3:cluster,4:attribute}, 1: struct{0:status}}}` (status —
 /// AttributeStatusIB, spec §8.9.6). The general (subscription-capable,
 /// mixed data/status) encoder; `encode_report_data` is the read-only
-/// convenience wrapper over it.
+/// convenience wrapper over it. Thin wrapper over `encode_report_data_full`
+/// (im::event) with no event reports.
 pub fn encode_report_data_entries(
     entries: &[ReportEntryOut],
     suppress_response: bool,
     subscription_id: Option<u32>,
     more_chunks: bool,
 ) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    if let Some(sub_id) = subscription_id {
-        w.put_uint(Tag::Context(0), u64::from(sub_id));
-    }
-    w.start_array(Tag::Context(1)); // AttributeReportIBs
-    for entry in entries {
-        w.start_struct(Tag::Anonymous); // AttributeReportIB
-        match entry {
-            ReportEntryOut::Data(report) => {
-                w.start_struct(Tag::Context(1)); // AttributeDataIB
-                w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
-                w.start_list(Tag::Context(1)); // Path
-                w.put_uint(Tag::Context(2), u64::from(report.endpoint));
-                w.put_uint(Tag::Context(3), u64::from(report.cluster));
-                w.put_uint(Tag::Context(4), u64::from(report.attribute));
-                w.end_container(); // Path
-                w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
-                w.end_container(); // AttributeDataIB
-            }
-            ReportEntryOut::Status {
-                endpoint,
-                cluster,
-                attribute,
-                status,
-            } => {
-                w.start_struct(Tag::Context(0)); // AttributeStatusIB
-                w.start_list(Tag::Context(0)); // Path
-                w.put_uint(Tag::Context(2), u64::from(*endpoint));
-                w.put_uint(Tag::Context(3), u64::from(*cluster));
-                w.put_uint(Tag::Context(4), u64::from(*attribute));
-                w.end_container(); // Path
-                w.start_struct(Tag::Context(1)); // StatusIB
-                w.put_uint(Tag::Context(0), u64::from(*status));
-                w.end_container(); // StatusIB
-                w.end_container(); // AttributeStatusIB
-            }
-        }
-        w.end_container(); // AttributeReportIB
-    }
-    w.end_container(); // AttributeReportIBs
-    if more_chunks {
-        w.put_bool(Tag::Context(3), true); // MoreChunkedMessages
-    }
-    w.put_bool(Tag::Context(4), suppress_response); // SuppressResponse
-    w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
-    w.end_container(); // outer struct
-    w.finish()
+    super::event::encode_report_data_full(
+        entries,
+        &[],
+        suppress_response,
+        subscription_id,
+        more_chunks,
+    )
 }
 
 /// `encode_report_data_entries` convenience wrapper for the common read

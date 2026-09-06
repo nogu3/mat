@@ -4,13 +4,16 @@
 //! mechanically by `cargo check -p mat-device --no-default-features` in CI.
 
 pub mod access_control;
+pub mod boolean_state;
 pub mod bridge;
 pub mod bridged_device_basic_information;
 pub mod case;
 pub mod commissioning;
 pub mod datamodel;
+pub mod events;
 pub mod fabric_store;
 pub mod general_diagnostics;
+pub mod generic_switch;
 pub mod group_invoke;
 pub mod group_key_management;
 pub mod group_membership;
@@ -21,3 +24,4 @@ pub mod mdns_records;
 pub mod network_commissioning;
 pub mod onoff;
 pub mod pase;
+pub mod stimulus;

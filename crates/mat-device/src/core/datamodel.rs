@@ -18,11 +18,16 @@
 //! (spec §8.10.1) rather than being silently dropped or failing the whole
 //! exchange.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use mat_controller::im::{self, AttrPathIn, AttrReportOut, ImError, ReportEntryOut};
+use mat_controller::im::{
+    self, AttrPathIn, AttrReportOut, EventEntryOut, EventPathIn, EventReportOut, ImError,
+    ReportEntryOut,
+};
 
 use crate::core::access_control::Subject;
+use crate::core::events::{EmittedEvent, EventLog, StoredEvent};
+use crate::core::stimulus::{Stimulus, StimulusError, StimulusOutcome, StimulusReply};
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 /// The DataVersion (spec §7.10.3) every `(endpoint, cluster)` starts at,
@@ -77,6 +82,14 @@ pub struct InvokeCtx {
     /// decision is made against (`Node::handle_invoke`/`handle_write` →
     /// `AclStore::check`). `Default` is node 0, which no real CASE peer uses.
     pub subject: Subject,
+    /// Every event the handler emitted while serving this command / write /
+    /// stimulus — the event-side counterpart of `changed`, pushed by the
+    /// `ClusterHandler` implementation itself (which knows only its own
+    /// event ids and priorities). `Node` is the one place that knows the
+    /// `(endpoint, cluster)` and the EventNumber they belong to, so it
+    /// drains them into its `EventLog` (`Node::drain_events`) right where
+    /// it bumps the DataVersion for `changed`.
+    pub events: Vec<EmittedEvent>,
 }
 
 /// What `Node::handle_im` produced for one incoming IM message: the reply
@@ -289,6 +302,37 @@ pub trait ClusterHandler: Send {
     fn invoke_privilege(&self, _command: u32) -> u8 {
         crate::core::access_control::PRIVILEGE_OPERATE
     }
+    /// Every event id this cluster can generate (spec §7.14) — the event
+    /// counterpart of [`attributes`]. `Node` uses it to expand a wildcard
+    /// event path and to decide whether a *concrete* event path resolves at
+    /// all (an id not listed here is `STATUS_UNSUPPORTED_EVENT`). Defaults
+    /// to empty: every cluster implemented so far generates no events.
+    ///
+    /// [`attributes`]: Self::attributes
+    fn events(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    /// The privilege (spec §9.10.5) a session must hold over this
+    /// `(endpoint, cluster)` to *receive* `event` — the event-side sibling
+    /// of [`read_privilege`], with the same View default.
+    ///
+    /// [`read_privilege`]: Self::read_privilege
+    fn event_privilege(&self, _event: u32) -> u8 {
+        crate::core::access_control::PRIVILEGE_VIEW
+    }
+    /// Applies an external stimulus (a simulated button press, a simulated
+    /// sensor state change — see `core::stimulus`) to this cluster.
+    /// Implementations mutate their own state and report what happened
+    /// through `ctx` exactly as `invoke` does: changed attribute ids onto
+    /// `ctx.changed`, emitted events onto `ctx.events`.
+    ///
+    /// `StimulusReply::Unsupported` (the default — no cluster reacts to a
+    /// stimulus unless it says so) means "not my business": `Node::
+    /// stimulate` moves on to the next cluster on the endpoint. `Rejected`
+    /// means "mine, but not right now" and stops the search with an error.
+    fn stimulate(&mut self, _stimulus: &Stimulus, _ctx: &mut InvokeCtx) -> StimulusReply {
+        StimulusReply::Unsupported
+    }
 }
 
 /// Interaction Model server-side dispatch errors: either a malformed
@@ -355,6 +399,12 @@ pub struct Node {
     /// which is what keeps this dispatch's own tests — and every cluster's
     /// — about the thing they actually test rather than about ACL wiring.
     acl: Option<crate::core::access_control::AclStore>,
+    /// This node's event log (spec §7.14) — every event any cluster emits
+    /// through `InvokeCtx::events` lands here, numbered node-wide. Defaults
+    /// to `EventLog::default()` (numbering from 1, `DEFAULT_CAP` entries);
+    /// `set_event_log` replaces it — `device::Device::new` seeds the first
+    /// EventNumber the same way it seeds the DataVersion base.
+    event_log: EventLog,
 }
 
 /// Bundles the (endpoint id, its clusters, the reading session's fabric
@@ -382,6 +432,7 @@ impl Node {
             versions: HashMap::new(),
             version_base: INITIAL_DATA_VERSION,
             acl: None,
+            event_log: EventLog::default(),
         }
     }
 
@@ -539,6 +590,285 @@ impl Node {
         self.acl = Some(store);
     }
 
+    /// Replaces this node's event log (spec §7.14). Call once, right after
+    /// construction — like `set_data_version_base`, whose randomized-at-boot
+    /// rationale the first EventNumber shares (a subscriber must not have a
+    /// cached EventMin from a previous boot that silently swallows this
+    /// boot's events). A `Node` that never gets one keeps `EventLog::
+    /// default()` (numbering from 1).
+    pub fn set_event_log(&mut self, log: EventLog) {
+        self.event_log = log;
+    }
+
+    /// The EventNumber the next emitted event will get — i.e. one past
+    /// everything already in the log. `net::runtime` records it as a fresh
+    /// subscription's starting `EventMin` so the priming report doesn't
+    /// replay history the subscriber never asked for.
+    pub fn next_event_number(&self) -> u64 {
+        self.event_log.next_number()
+    }
+
+    /// Every retained event with an EventNumber ≥ `since`, cloned out of the
+    /// log (the caller — `net::runtime`'s subscription bookkeeping — needs
+    /// them past the borrow of `Node` that produced them).
+    pub fn recent_events(&self, since: u64) -> Vec<StoredEvent> {
+        self.event_log.since(since).cloned().collect()
+    }
+
+    /// Moves whatever a handler emitted (`ctx.events`) into the node's event
+    /// log, tagged with the `(endpoint, cluster)` it was dispatched to, and
+    /// returns the EventNumbers assigned — the event-side twin of the
+    /// `ctx.changed` → `(endpoint, cluster, attribute)` + DataVersion bump
+    /// that every caller does right before calling this.
+    ///
+    /// `system_timestamp_ms` (spec §8.9.2.6) has to come from the caller:
+    /// `core` has no clock (I/O-free). The invoke/write dispatch paths pass
+    /// **0** — `Node::handle_im` is handed no time reference and no cluster
+    /// implemented so far emits an event from a command or a write, so
+    /// there is nothing to be wrong about yet. `stimulate`, whose caller
+    /// (`net::runtime`) does know the device's uptime, passes the real
+    /// value. Give the invoke path a real clock the day a cluster emits
+    /// from `invoke`.
+    fn drain_events(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        ctx: &mut InvokeCtx,
+        system_timestamp_ms: u64,
+    ) -> Vec<u64> {
+        ctx.events
+            .drain(..)
+            .map(|ev| {
+                self.event_log
+                    .append(endpoint, cluster, ev, system_timestamp_ms)
+            })
+            .collect()
+    }
+
+    /// Applies an external stimulus (`core::stimulus`) to `endpoint`: the
+    /// first cluster there that claims it (`ClusterHandler::stimulate`
+    /// answering anything but `Unsupported`) handles it, and whatever it
+    /// changed/emitted is turned into a DataVersion bump plus event-log
+    /// entries — the same bookkeeping `invoke_on_endpoint` does for a
+    /// command. `system_timestamp_ms` is the device's uptime in
+    /// milliseconds (see `drain_events`).
+    ///
+    /// No ACL check: a stimulus is the physical world acting on the device
+    /// (a finger on a button), not a Matter session acting on it — there is
+    /// no subject to check. The reporting side is where access control
+    /// applies (`event_entries`).
+    pub fn stimulate(
+        &mut self,
+        endpoint: u16,
+        stimulus: &Stimulus,
+        system_timestamp_ms: u64,
+    ) -> Result<StimulusOutcome, StimulusError> {
+        let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint) else {
+            return Err(StimulusError::UnknownEndpoint);
+        };
+        let mut ctx = InvokeCtx::default();
+        let mut target = None;
+        for handler in clusters.iter_mut() {
+            // Each candidate starts clean: a cluster that answers
+            // `Unsupported` after pushing something (a bug, but a cheap one
+            // to contain) must not leak into the next one's report.
+            ctx.changed.clear();
+            ctx.events.clear();
+            match handler.stimulate(stimulus, &mut ctx) {
+                StimulusReply::Unsupported => continue,
+                StimulusReply::Rejected(reason) => return Err(StimulusError::Rejected(reason)),
+                StimulusReply::Applied => {
+                    target = Some(handler.cluster_id());
+                    break;
+                }
+            }
+        }
+        // `clusters`' mutable borrow of `self.endpoints` ends here — every
+        // line below touches `self.versions` / `self.event_log`, which the
+        // borrow checker (rightly) won't allow while a handler is borrowed.
+        let Some(cluster) = target else {
+            return Err(StimulusError::Unsupported);
+        };
+        let changed: Vec<(u16, u32, u32)> = ctx
+            .changed
+            .drain(..)
+            .map(|attribute| (endpoint, cluster, attribute))
+            .collect();
+        if !changed.is_empty() {
+            let version = self
+                .versions
+                .entry((endpoint, cluster))
+                .or_insert(self.version_base);
+            *version = version.wrapping_add(1);
+        }
+        let event_numbers = self.drain_events(endpoint, cluster, &mut ctx, system_timestamp_ms);
+        Ok(StimulusOutcome {
+            changed,
+            event_numbers,
+        })
+    }
+
+    /// Expands `paths` (EventPathIB wildcards included, spec §8.9.2.2)
+    /// against the event log and returns everything with an EventNumber ≥
+    /// `event_min` (the request's `EventFilterIB::EventMin`, spec §8.9.2.4)
+    /// that `read_ctx`'s session may see, EventNumber ascending and
+    /// de-duplicated across overlapping paths.
+    ///
+    /// The resolution rules mirror `read_entries`' attribute side: a
+    /// wildcard field expands silently (a combination that resolves to
+    /// nothing simply contributes nothing), while a **fully concrete**
+    /// path that doesn't resolve is answered with an `EventEntryOut::
+    /// Status` — `UNSUPPORTED_ENDPOINT` / `UNSUPPORTED_CLUSTER` /
+    /// `UNSUPPORTED_EVENT`. A concrete path that *does* resolve but has
+    /// nothing in the log yields nothing at all (not a status): the event
+    /// exists, it just hasn't happened.
+    ///
+    /// ACL (spec §9.10) is applied per stored event, against the emitting
+    /// cluster's `event_privilege`. A stored event whose `(endpoint,
+    /// cluster)` no longer resolves (a cluster removed after it was logged)
+    /// is dropped — there is no handler left to ask for its privilege, and
+    /// reporting it unchecked would leak past the ACL.
+    pub fn event_entries(
+        &self,
+        paths: &[EventPathIn],
+        event_min: u64,
+        read_ctx: &ReadCtx,
+    ) -> Vec<EventEntryOut> {
+        let mut out: Vec<EventEntryOut> = Vec::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        for path in paths {
+            if let (Some(endpoint), Some(cluster), Some(event)) =
+                (path.endpoint, path.cluster, path.event)
+            {
+                if let Some(status) = self.concrete_event_path_status(endpoint, cluster, event) {
+                    out.push(EventEntryOut::Status {
+                        endpoint,
+                        cluster,
+                        event,
+                        status,
+                    });
+                    continue;
+                }
+            }
+            for stored in self.event_log.since(event_min) {
+                if seen.contains(&stored.number) || !event_path_matches(path, stored) {
+                    continue;
+                }
+                let Some(handler) = self.handler_for(stored.endpoint, stored.cluster) else {
+                    // The cluster that emitted this is gone: no
+                    // `event_privilege` to check it against, so it is not
+                    // reportable any more.
+                    continue;
+                };
+                if !acl_allows(
+                    &self.acl,
+                    read_ctx.fabric_index,
+                    read_ctx.subject,
+                    handler.event_privilege(stored.event),
+                    stored.endpoint,
+                    stored.cluster,
+                ) {
+                    continue;
+                }
+                seen.insert(stored.number);
+                out.push(EventEntryOut::Data(EventReportOut {
+                    endpoint: stored.endpoint,
+                    cluster: stored.cluster,
+                    event: stored.event,
+                    event_number: stored.number,
+                    priority: stored.priority,
+                    system_timestamp_ms: stored.system_timestamp_ms,
+                    data_tlv: stored.data_tlv.clone(),
+                }));
+            }
+        }
+        // `since` already walks the log in ascending order, but several
+        // paths each contribute their own ascending run — sort so the
+        // report as a whole is ascending (spec §8.9.2.6: EventNumber
+        // ordering is what lets a subscriber advance its EventMin).
+        out.sort_by_key(|e| match e {
+            EventEntryOut::Data(d) => d.event_number,
+            // Statuses aren't numbered; keep them ahead of the data they
+            // were requested alongside rather than interleaved arbitrarily.
+            EventEntryOut::Status { .. } => 0,
+        });
+        out
+    }
+
+    /// The IM status a *fully concrete* event path resolves to, or `None`
+    /// when it resolves cleanly (endpoint exists, cluster exists on it, and
+    /// the cluster declares this event id).
+    fn concrete_event_path_status(&self, endpoint: u16, cluster: u32, event: u32) -> Option<u8> {
+        let Some((_, clusters)) = self.endpoints.iter().find(|(id, _)| *id == endpoint) else {
+            return Some(im::STATUS_UNSUPPORTED_ENDPOINT);
+        };
+        let Some(handler) = clusters.iter().find(|h| h.cluster_id() == cluster) else {
+            return Some(im::STATUS_UNSUPPORTED_CLUSTER);
+        };
+        if handler.events().contains(&event) {
+            None
+        } else {
+            Some(im::STATUS_UNSUPPORTED_EVENT)
+        }
+    }
+
+    /// The handler serving `(endpoint, cluster)`, if any.
+    fn handler_for(&self, endpoint: u16, cluster: u32) -> Option<&dyn ClusterHandler> {
+        self.endpoints
+            .iter()
+            .find(|(id, _)| *id == endpoint)?
+            .1
+            .iter()
+            .find(|h| h.cluster_id() == cluster)
+            .map(|h| h.as_ref())
+    }
+
+    /// The event-side counterpart of [`has_readable_path`]: whether a
+    /// SubscribeRequest's `event_paths` may be accepted at all (spec §8.10).
+    /// A fully concrete path always counts (an unresolvable one is answered
+    /// by a status entry in the priming report instead); a path with any
+    /// wildcard field counts only if some endpoint×cluster it expands to
+    /// declares an event (matching `path.event` when that is concrete) this
+    /// session is allowed to receive. Empty `paths` is `false` — the caller
+    /// answers `INVALID_ACTION`.
+    ///
+    /// Note this asks the *schema* (`ClusterHandler::events`), not the log:
+    /// a subscription to an event that simply hasn't fired yet is perfectly
+    /// valid.
+    ///
+    /// [`has_readable_path`]: Self::has_readable_path
+    pub fn has_readable_event_path(&self, paths: &[EventPathIn], read_ctx: &ReadCtx) -> bool {
+        paths.iter().any(|path| {
+            if path.endpoint.is_some() && path.cluster.is_some() && path.event.is_some() {
+                return true;
+            }
+            self.endpoints
+                .iter()
+                .filter(|(ep, _)| path.endpoint.is_none_or(|e| e == *ep))
+                .any(|(endpoint, clusters)| {
+                    clusters
+                        .iter()
+                        .filter(|h| path.cluster.is_none_or(|c| c == h.cluster_id()))
+                        .any(|handler| {
+                            handler
+                                .events()
+                                .into_iter()
+                                .filter(|e| path.event.is_none_or(|want| want == *e))
+                                .any(|e| {
+                                    acl_allows(
+                                        &self.acl,
+                                        read_ctx.fabric_index,
+                                        read_ctx.subject,
+                                        handler.event_privilege(e),
+                                        *endpoint,
+                                        handler.cluster_id(),
+                                    )
+                                })
+                        })
+                })
+        })
+    }
+
     /// Dispatches one incoming IM message. Returns the reply to send back
     /// plus whatever changed while serving it (`ImOutcome`). `read_ctx`
     /// carries the requesting session's fabric index (see `ReadCtx`'s doc)
@@ -607,7 +937,7 @@ impl Node {
         // job (Task 6) — it bypasses `handle_im` for `OPCODE_READ_REQUEST`
         // entirely so it can drive the multi-chunk StatusResponse
         // round-trip.
-        let chunks = self.read_chunks(&paths, read_ctx, usize::MAX, None);
+        let chunks = self.read_chunks(&paths, read_ctx, usize::MAX, None, false);
         Ok(ImOutcome::unchanged(
             im::OPCODE_REPORT_DATA,
             chunks
@@ -649,6 +979,15 @@ impl Node {
     ///   chunk with `StatusResponse(0)` first (`SecureSession::
     ///   subscribe_wildcard`'s loop does exactly that).
     ///
+    /// `trailer_follows` says another ReportData chunk — one this call does
+    /// not produce — still follows the last one: the caller is going to
+    /// append event reports of its own (`event_entries`, on a subscription's
+    /// priming report). The last chunk is then encoded `more_chunks=true`
+    /// (and never suppressed), so the receiver keeps reading instead of
+    /// treating the attribute chunks as the end of the report. `false` is
+    /// the plain case (attributes are all there is) and keeps the byte-for-
+    /// byte shape this method has always produced.
+    ///
     /// Always returns at least one chunk, even for zero entries (an empty
     /// `ReportData`, matching the pre-Task-6 always-one-chunk behavior for
     /// a read that matches nothing).
@@ -658,6 +997,7 @@ impl Node {
         read_ctx: &ReadCtx,
         budget: usize,
         subscription_id: Option<u32>,
+        trailer_follows: bool,
     ) -> Vec<Vec<u8>> {
         let entries = self.read_entries(paths, read_ctx);
         let mut batches: Vec<Vec<ReportEntryOut>> = Vec::new();
@@ -695,9 +1035,11 @@ impl Node {
                 // Priming (`subscription_id.is_some()`): never suppress —
                 // the SubscribeResponse still has to follow on this
                 // exchange, so the initiator must answer even the last
-                // chunk with `StatusResponse(0)`.
-                let suppress = is_last && subscription_id.is_none();
-                im::encode_report_data_entries(&batch, suppress, subscription_id, !is_last)
+                // chunk with `StatusResponse(0)`. Same for a caller that
+                // still has an event chunk to append (`trailer_follows`).
+                let suppress = is_last && subscription_id.is_none() && !trailer_follows;
+                let more = !is_last || trailer_follows;
+                im::encode_report_data_entries(&batch, suppress, subscription_id, more)
             })
             .collect()
     }
@@ -742,12 +1084,11 @@ impl Node {
     /// (`read_attribute_value`, mirroring `expand_attribute`'s concrete-
     /// attribute branch) — otherwise a nonexistent attribute id would
     /// count as valid, since every handler's default `read_privilege` lets
-    /// `read_allowed` pass for any id. `false` for an empty `paths`; the
-    /// caller answers `INVALID_ACTION`. A request carrying only
-    /// EventRequests also decodes to an empty `paths` here (mat-controller's
-    /// `decode_subscribe_request` skips events, spec §8.10's attribute-only
-    /// scope for this device) and is therefore refused too — the same
-    /// answer a chip device with no events gives.
+    /// `read_allowed` pass for any id. `false` for an empty `paths` — but
+    /// that alone is not a refusal: an event-only request qualifies through
+    /// [`Node::has_readable_event_path`], and only a request readable on
+    /// *neither* side is answered with `INVALID_ACTION` (the two gates are
+    /// OR'd in `net::runtime::serve_subscribe_request`).
     pub fn has_readable_path(&self, paths: &[AttrPathIn], read_ctx: &ReadCtx) -> bool {
         paths.iter().any(|path| {
             if path.endpoint.is_some() && path.cluster.is_some() && path.attribute.is_some() {
@@ -1039,8 +1380,9 @@ impl Node {
         // Each `invoke` gets a fresh change list: `ctx` is per-session
         // scratch (`attestation_challenge` outlives one command), so a
         // leftover `changed` from an earlier command in the same session
-        // must not be re-reported as this one's.
+        // must not be re-reported as this one's. Same for `events`.
         ctx.changed.clear();
+        ctx.events.clear();
         let reply = handler.invoke(command, fields_tlv, ctx);
         // The handler reports bare attribute ids (it only knows its own
         // cluster); pair them with the endpoint/cluster it was dispatched
@@ -1057,6 +1399,10 @@ impl Node {
                 .or_insert(self.version_base);
             *version = version.wrapping_add(1);
         }
+        // Events the command emitted go into the log right here, next to
+        // the DataVersion bump. Timestamp 0: this dispatch has no clock —
+        // see `drain_events`' doc (no cluster emits from `invoke` yet).
+        let _ = self.drain_events(endpoint, cluster, ctx, 0);
         Ok((reply, changed))
     }
 
@@ -1230,9 +1576,11 @@ impl Node {
                 continue;
             }
             // Same rationale as `handle_invoke`: `ctx` is per-session
-            // scratch, so a leftover `changed` from an earlier write/invoke
-            // in the same session must not be re-reported as this one's.
+            // scratch, so a leftover `changed`/`events` from an earlier
+            // write/invoke in the same session must not be re-reported as
+            // this one's.
             ctx.changed.clear();
+            ctx.events.clear();
             let status = match handler.write(attribute, &write.data_tlv, write.list_append, ctx) {
                 Ok(()) => im::STATUS_SUCCESS,
                 Err(status) => status,
@@ -1249,6 +1597,10 @@ impl Node {
                     .or_insert(self.version_base);
                 *version = version.wrapping_add(1);
             }
+            // Same as the invoke path: events emitted by this write land in
+            // the log next to its DataVersion bump, timestamp 0 (no clock
+            // here — see `drain_events`).
+            let _ = self.drain_events(endpoint, cluster, ctx, 0);
             changed.extend(entry_changed);
             results.push((endpoint, cluster, attribute, status));
         }
@@ -1295,6 +1647,16 @@ fn acl_allows(
         Some(store) => store.check(ctx_fabric, subject, required, endpoint, cluster),
         None => true,
     }
+}
+
+/// Whether a stored event satisfies one requested `EventPathIn` — a `None`
+/// field is a wildcard that matches anything (spec §8.9.2.2). `urgent` is
+/// not a selector (it asks for a faster report, not a different set), so it
+/// is deliberately ignored here.
+fn event_path_matches(path: &EventPathIn, stored: &StoredEvent) -> bool {
+    path.endpoint.is_none_or(|e| e == stored.endpoint)
+        && path.cluster.is_none_or(|c| c == stored.cluster)
+        && path.event.is_none_or(|ev| ev == stored.event)
 }
 
 /// The five global attributes (spec §7.13, ids 0xFFF8-0xFFFD, EventList
@@ -1735,7 +2097,8 @@ mod tests {
         AclDeviceEntry, AclStore, AUTH_MODE_CASE, AUTH_MODE_GROUP, PRIVILEGE_MANAGE,
         PRIVILEGE_OPERATE, PRIVILEGE_VIEW,
     };
-    use mat_controller::im::{decode_invoke_response, decode_report_data_message};
+    use crate::core::stimulus::PressKind;
+    use mat_controller::im::{decode_invoke_response, decode_report_data_message, EventPriority};
 
     /// `handle_im` with the default contexts, unwrapped down to the
     /// `(opcode, payload)` pair almost every test here asserts on — these
@@ -2758,7 +3121,7 @@ mod tests {
             cluster: None,
             attribute: None,
         }];
-        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None);
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None, false);
         assert!(chunks.len() >= 2);
         for (i, c) in chunks.iter().enumerate() {
             let msg = decode_report_data_message(c).unwrap();
@@ -2857,7 +3220,7 @@ mod tests {
         // `non_final_shape_len > budget` and splits it off before adding
         // any fat entry.
         let budget = final_shape_len;
-        let chunks = node.read_chunks(&paths, &read_ctx, budget, None);
+        let chunks = node.read_chunks(&paths, &read_ctx, budget, None, false);
         assert!(
             chunks.len() >= 2,
             "fat entries after the small batch must still force a split"
@@ -2887,7 +3250,7 @@ mod tests {
             cluster: None,
             attribute: None,
         }];
-        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None);
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, None, false);
         assert_eq!(chunks.len(), 1);
         let msg = decode_report_data_message(&chunks[0]).unwrap();
         assert!(!msg.more_chunks);
@@ -3015,7 +3378,7 @@ mod tests {
             cluster: None,
             attribute: None,
         }];
-        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, Some(0xABCD));
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, Some(0xABCD), false);
         assert!(chunks.len() >= 2, "fixture must force a split");
         for (i, c) in chunks.iter().enumerate() {
             let msg = decode_report_data_message(c).unwrap();
@@ -3612,6 +3975,281 @@ mod tests {
         );
         assert!(matches!(&entries[..], [ReportEntryOut::Data(_)]));
     }
+
+    /// stimulate を実装するテスト用クラスタ: SetState で属性 0 を変え、
+    /// イベント 0 を出す。
+    struct StimHandler {
+        state: bool,
+    }
+
+    impl ClusterHandler for StimHandler {
+        fn cluster_id(&self) -> u32 {
+            0xFC01
+        }
+        fn attributes(&self) -> Vec<u32> {
+            vec![0]
+        }
+        fn events(&self) -> Vec<u32> {
+            vec![0]
+        }
+        fn read(&self, a: u32, _: &ReadCtx) -> Option<Vec<u8>> {
+            (a == 0).then(|| {
+                let mut w = Writer::new();
+                w.put_bool(Tag::Anonymous, self.state);
+                w.finish()
+            })
+        }
+        fn invoke(&mut self, _: u32, _: &[u8], _: &mut InvokeCtx) -> InvokeReply {
+            InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+        }
+        fn stimulate(&mut self, s: &Stimulus, ctx: &mut InvokeCtx) -> StimulusReply {
+            match s {
+                Stimulus::SetState(v) => {
+                    if *v != self.state {
+                        self.state = *v;
+                        ctx.changed.push(0);
+                        ctx.events.push(EmittedEvent {
+                            event: 0,
+                            priority: EventPriority::Info,
+                            data_tlv: None,
+                        });
+                    }
+                    StimulusReply::Applied
+                }
+                Stimulus::Press(_) => StimulusReply::Unsupported,
+            }
+        }
+    }
+
+    fn node_with_stim() -> Node {
+        let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+        node.add_endpoint(2, vec![Box::new(StimHandler { state: false })]);
+        node.set_event_log(EventLog::new(100, 8));
+        node
+    }
+
+    #[test]
+    fn stimulate_appends_events_bumps_data_version_and_reports_changed() {
+        let mut node = node_with_stim();
+        let before = node.data_version(2, 0xFC01);
+        let out = node.stimulate(2, &Stimulus::SetState(true), 777).unwrap();
+        assert_eq!(out.changed, vec![(2, 0xFC01, 0)]);
+        assert_eq!(out.event_numbers, vec![100]);
+        assert_eq!(node.data_version(2, 0xFC01), before.wrapping_add(1));
+        assert_eq!(node.next_event_number(), 101);
+        let ev = &node.recent_events(0)[0];
+        assert_eq!(
+            (ev.endpoint, ev.cluster, ev.event, ev.system_timestamp_ms),
+            (2, 0xFC01, 0, 777)
+        );
+        // 同値: 変化なし、イベントなし、Applied。
+        let out = node.stimulate(2, &Stimulus::SetState(true), 778).unwrap();
+        assert!(out.changed.is_empty() && out.event_numbers.is_empty());
+    }
+
+    #[test]
+    fn stimulate_errors_for_unknown_endpoint_and_unsupported_stimulus() {
+        let mut node = node_with_stim();
+        assert_eq!(
+            node.stimulate(9, &Stimulus::SetState(true), 0),
+            Err(StimulusError::UnknownEndpoint)
+        );
+        assert_eq!(
+            node.stimulate(2, &Stimulus::Press(PressKind::Short), 0),
+            Err(StimulusError::Unsupported)
+        );
+        // 刺激を受けない endpoint 0（Descriptor/BasicInformation のみ）も
+        // Unsupported。
+        assert_eq!(
+            node.stimulate(0, &Stimulus::SetState(true), 0),
+            Err(StimulusError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn event_entries_expand_wildcards_and_honor_event_min() {
+        let mut node = node_with_stim();
+        node.stimulate(2, &Stimulus::SetState(true), 1).unwrap(); // #100
+        node.stimulate(2, &Stimulus::SetState(false), 2).unwrap(); // #101
+        let all = node.event_entries(&[EventPathIn::WILDCARD_URGENT], 0, &ReadCtx::default());
+        assert_eq!(all.len(), 2);
+        let tail = node.event_entries(&[EventPathIn::WILDCARD_URGENT], 101, &ReadCtx::default());
+        assert!(
+            matches!(&tail[..], [EventEntryOut::Data(d)] if d.event_number == 101 && d.system_timestamp_ms == 2)
+        );
+        // 別クラスタの wildcard は黙る。
+        let other = node.event_entries(
+            &[EventPathIn {
+                cluster: Some(0xFC02),
+                ..EventPathIn::default()
+            }],
+            0,
+            &ReadCtx::default(),
+        );
+        assert!(other.is_empty());
+    }
+
+    /// `event_entries` の ACL ゲート（spec §9.10）。`ReadCtx::default()` は
+    /// fabric 0 = ACL 短絡なので、他のイベントテストはゲートを通っていない
+    /// — ここは CASE の ReadCtx（fabric 1 + subject）で見る。
+    /// `StimHandler` は `event_privilege` を既定（View）のままにしてある
+    /// ので、落としているのは ACL そのもの。
+    #[test]
+    fn event_entries_hides_events_the_acl_grants_no_view_on() {
+        // target を OnOff だけに絞った View エントリ: 発生クラスタ
+        // 0xFC01 には効かない（`targets_match`）。
+        let mut w = Writer::new();
+        w.start_array(Tag::Anonymous);
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(0), u64::from(im::CLUSTER_ON_OFF));
+        w.end_container();
+        w.end_container();
+        let other_cluster_only = w.finish();
+
+        let view_entry = |targets_raw: Option<Vec<u8>>| AclDeviceEntry {
+            privilege: PRIVILEGE_VIEW,
+            auth_mode: AUTH_MODE_CASE,
+            subjects: vec![7],
+            targets_raw,
+            fabric_index: 1,
+        };
+        let node_with = |targets_raw: Option<Vec<u8>>| {
+            let mut node = node_with_stim();
+            let store = AclStore::new();
+            store.set_entries_for_test(1, vec![view_entry(targets_raw)]);
+            node.set_acl_store(store);
+            node.stimulate(2, &Stimulus::SetState(true), 1).unwrap();
+            node
+        };
+        let all = |node: &Node, ctx: &ReadCtx| {
+            node.event_entries(&[EventPathIn::WILDCARD_URGENT], 0, ctx)
+        };
+
+        let denied = node_with(Some(other_cluster_only));
+        assert!(all(&denied, &case_read_ctx(1, 7)).is_empty());
+        // fabric 0（PASE）は ACL を通らない既存の短絡: 同じログでも見える。
+        assert_eq!(all(&denied, &ReadCtx::default()).len(), 1);
+        // 別 subject も同様に落ちる（一致するエントリが無い）。
+        assert!(all(&denied, &case_read_ctx(1, 8)).is_empty());
+
+        // 制限なしの View なら出る。
+        let granted = node_with(None);
+        assert_eq!(all(&granted, &case_read_ctx(1, 7)).len(), 1);
+    }
+
+    /// 発生元 `(endpoint, cluster)` がもう解決できないログ項目は黙って
+    /// 落ちる — privilege を訊く相手が居ない以上 ACL を素通しさせられない
+    /// （`event_entries` の doc）。panic もせず Status も出さない。
+    /// `Node` にクラスタ削除 API は無いので、存在しない endpoint 9 の項目を
+    /// 持つログを `set_event_log` で直接差し込んで作る。
+    #[test]
+    fn event_entries_drops_entries_whose_emitting_cluster_is_gone() {
+        let ev = || EmittedEvent {
+            event: 0,
+            priority: EventPriority::Info,
+            data_tlv: None,
+        };
+        let mut log = EventLog::new(100, 8);
+        log.append(9, 0xFC01, ev(), 5); // #100: endpoint 9 は存在しない
+        log.append(2, 0xFC02, ev(), 6); // #101: endpoint 2 にこのクラスタは無い
+        log.append(2, 0xFC01, ev(), 7); // #102: 生きている
+        let mut node = node_with_stim();
+        node.set_event_log(log);
+
+        let out = node.event_entries(&[EventPathIn::WILDCARD_URGENT], 0, &ReadCtx::default());
+        assert!(
+            matches!(&out[..], [EventEntryOut::Data(d)] if d.event_number == 102 && d.endpoint == 2),
+            "解決できない 2 件は落ち、Status も出ない: {out:?}"
+        );
+    }
+
+    #[test]
+    fn concrete_unresolvable_event_paths_report_status() {
+        let node = node_with_stim();
+        let st = |p: EventPathIn| node.event_entries(&[p], 0, &ReadCtx::default());
+        assert!(matches!(
+            &st(EventPathIn {
+                endpoint: Some(9),
+                cluster: Some(0xFC01),
+                event: Some(0),
+                urgent: false
+            })[..],
+            [EventEntryOut::Status { status, .. }] if *status == im::STATUS_UNSUPPORTED_ENDPOINT
+        ));
+        assert!(matches!(
+            &st(EventPathIn {
+                endpoint: Some(2),
+                cluster: Some(0xFC02),
+                event: Some(0),
+                urgent: false
+            })[..],
+            [EventEntryOut::Status { status, .. }] if *status == im::STATUS_UNSUPPORTED_CLUSTER
+        ));
+        assert!(matches!(
+            &st(EventPathIn {
+                endpoint: Some(2),
+                cluster: Some(0xFC01),
+                event: Some(5),
+                urgent: false
+            })[..],
+            [EventEntryOut::Status { status, .. }] if *status == im::STATUS_UNSUPPORTED_EVENT
+        ));
+        // 解決できる具体 path でログが空なら何も返さない（status ではない）。
+        assert!(st(EventPathIn {
+            endpoint: Some(2),
+            cluster: Some(0xFC01),
+            event: Some(0),
+            urgent: false
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn has_readable_event_path_accepts_wildcards_only_when_some_cluster_has_events() {
+        let node = node_with_stim();
+        assert!(node.has_readable_event_path(&[EventPathIn::WILDCARD_URGENT], &ReadCtx::default()));
+        assert!(!node.has_readable_event_path(
+            &[EventPathIn {
+                cluster: Some(0xFC02),
+                ..EventPathIn::default()
+            }],
+            &ReadCtx::default()
+        ));
+        // 具体 path は常に true（status で答える）。
+        assert!(node.has_readable_event_path(
+            &[EventPathIn {
+                endpoint: Some(9),
+                cluster: Some(1),
+                event: Some(1),
+                urgent: false
+            }],
+            &ReadCtx::default()
+        ));
+        assert!(!node.has_readable_event_path(&[], &ReadCtx::default()));
+    }
+
+    #[test]
+    fn read_chunks_trailer_follows_marks_the_last_chunk_more() {
+        let node = node_with_stim();
+        let paths = vec![AttrPathIn {
+            endpoint: Some(2),
+            cluster: Some(0xFC01),
+            attribute: Some(0),
+        }];
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, Some(1), true);
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            im::decode_report_data_message(&chunks[0])
+                .unwrap()
+                .more_chunks
+        );
+        let chunks = node.read_chunks(&paths, &ReadCtx::default(), 900, Some(1), false);
+        assert!(
+            !im::decode_report_data_message(&chunks[0])
+                .unwrap()
+                .more_chunks
+        );
+    }
 }
 
 /// Pins the hand-written cluster/attribute id constants in
@@ -3680,6 +4318,28 @@ mod drift_guard {
         assert_eq!(
             attr("max-paths-per-invoke"),
             im::ATTR_BI_MAX_PATHS_PER_INVOKE
+        );
+    }
+
+    #[test]
+    fn switch_and_boolean_state_ids_match_mat_core_ids() {
+        assert_eq!(resolve_cluster("switch"), Some(im::CLUSTER_SWITCH));
+        let attr = |name: &str| resolve_attribute(im::CLUSTER_SWITCH, name).unwrap().id;
+        assert_eq!(
+            attr("number-of-positions"),
+            im::ATTR_SWITCH_NUMBER_OF_POSITIONS
+        );
+        assert_eq!(attr("current-position"), im::ATTR_SWITCH_CURRENT_POSITION);
+        assert_eq!(attr("multi-press-max"), im::ATTR_SWITCH_MULTI_PRESS_MAX);
+        assert_eq!(
+            resolve_cluster("booleanstate"),
+            Some(im::CLUSTER_BOOLEAN_STATE)
+        );
+        assert_eq!(
+            resolve_attribute(im::CLUSTER_BOOLEAN_STATE, "state-value")
+                .unwrap()
+                .id,
+            im::ATTR_BS_STATE_VALUE
         );
     }
 

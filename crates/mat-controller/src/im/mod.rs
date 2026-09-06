@@ -171,6 +171,37 @@ pub const CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION: u32 = 0x0039;
 /// is currently reachable over its native protocol.
 pub const ATTR_BDBI_REACHABLE: u32 = 0x0011;
 
+/// Switch cluster (spec §1.13) — generic switch (push button / rocker /
+/// latching switch) input reporting.
+pub const CLUSTER_SWITCH: u32 = 0x003B;
+pub const ATTR_SWITCH_NUMBER_OF_POSITIONS: u32 = 0x0000;
+pub const ATTR_SWITCH_CURRENT_POSITION: u32 = 0x0001;
+pub const ATTR_SWITCH_MULTI_PRESS_MAX: u32 = 0x0002;
+/// Switch cluster events (spec §1.13.6).
+pub const EVENT_SWITCH_SWITCH_LATCHED: u32 = 0x00;
+pub const EVENT_SWITCH_INITIAL_PRESS: u32 = 0x01;
+pub const EVENT_SWITCH_LONG_PRESS: u32 = 0x02;
+pub const EVENT_SWITCH_SHORT_RELEASE: u32 = 0x03;
+pub const EVENT_SWITCH_LONG_RELEASE: u32 = 0x04;
+pub const EVENT_SWITCH_MULTI_PRESS_ONGOING: u32 = 0x05;
+pub const EVENT_SWITCH_MULTI_PRESS_COMPLETE: u32 = 0x06;
+/// Switch cluster `FeatureMap` bits (spec §1.13.4).
+pub const SWITCH_FEATURE_LATCHING: u32 = 0x01;
+pub const SWITCH_FEATURE_MOMENTARY: u32 = 0x02;
+pub const SWITCH_FEATURE_MOMENTARY_RELEASE: u32 = 0x04;
+pub const SWITCH_FEATURE_MOMENTARY_LONG_PRESS: u32 = 0x08;
+pub const SWITCH_FEATURE_MOMENTARY_MULTI_PRESS: u32 = 0x10;
+/// BooleanState cluster (spec §1.7) — e.g. contact sensors report their
+/// open/closed state through this cluster's single `StateValue` attribute.
+pub const CLUSTER_BOOLEAN_STATE: u32 = 0x0045;
+pub const ATTR_BS_STATE_VALUE: u32 = 0x0000;
+/// BooleanState cluster event (spec §1.7.6).
+pub const EVENT_BS_STATE_CHANGE: u32 = 0x00;
+/// Generic Switch device type (Device Library §6.6).
+pub const DEVICE_TYPE_GENERIC_SWITCH: u32 = 0x000F;
+/// Contact Sensor device type (Device Library §7.1).
+pub const DEVICE_TYPE_CONTACT_SENSOR: u32 = 0x0015;
+
 /// IM status codes (spec §8.10.1, Table "Status Code Table"). Only the
 /// values `mat-device`'s data model dispatch actually returns today.
 pub const STATUS_SUCCESS: u8 = 0x00;
@@ -181,6 +212,8 @@ pub const STATUS_UNSUPPORTED_ACCESS: u8 = 0x7E;
 pub const STATUS_UNSUPPORTED_ENDPOINT: u8 = 0x7F;
 pub const STATUS_UNSUPPORTED_COMMAND: u8 = 0x81;
 pub const STATUS_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
+/// "The event id is not supported" (spec §8.10.1 Table 8-19).
+pub const STATUS_UNSUPPORTED_EVENT: u8 = 0x8F;
 /// "A constraint was violated" (spec §8.10.1 Table 8-19) — e.g. Groups'
 /// `AddGroup` with the reserved group id 0 (carried inside
 /// `AddGroupResponse.status`, not as an IM-level status).
@@ -327,6 +360,8 @@ impl From<TlvError> for ImError {
 
 mod json;
 pub use json::*;
+mod event;
+pub use event::*;
 mod subscribe;
 pub use subscribe::*;
 mod read;

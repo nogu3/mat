@@ -4,8 +4,8 @@
 use crate::tlv::{Reader, Tag, Value, Writer};
 
 use super::{
-    decode_attribute_requests, expect_struct_start, skip_container, AttrPathIn, ImError,
-    IM_REVISION,
+    decode_attribute_requests, decode_event_filters, decode_event_requests, encode_event_path_ib,
+    expect_struct_start, skip_container, AttrPathIn, EventPathIn, ImError, IM_REVISION,
 };
 
 /// SubscribeRequestMessage (spec §8.10)。`clusters` が空なら全フィールド省略の
@@ -13,30 +13,74 @@ use super::{
 /// wildcard）。非空なら「endpoint wildcard + cluster 指定 + attribute wildcard」
 /// の AttributePathIB をクラスタ数ぶん並べる（priming 軽量化 — 弱リンクでは
 /// full wildcard priming の数十往復が完走できない）。EventRequests は載せない
-/// （v1 は attribute report のみ）。
+/// （events が要る呼び出しは `encode_subscribe_request_full` を使う）。
+///
+/// `encode_subscribe_request_full` への薄いラッパー — events 無しの
+/// `SubscribeSpec` を組み立てて委譲するだけで、出力は従来どおり byte-equal
+/// （`subscribe_request_full_without_events_is_byte_equal_to_legacy` で釘打ち）。
 pub fn encode_subscribe_request(
     min_interval_floor_s: u16,
     max_interval_ceiling_s: u16,
     keep_subscriptions: bool,
     clusters: &[u32],
 ) -> Vec<u8> {
+    encode_subscribe_request_full(&SubscribeSpec {
+        min_interval_floor_s,
+        max_interval_ceiling_s,
+        keep_subscriptions,
+        clusters: clusters.to_vec(),
+        ..SubscribeSpec::default()
+    })
+}
+
+/// `encode_subscribe_request` の入力をまとめた spec。`event_paths` /
+/// `event_min` が両方とも空/`None` なら EventRequests (Context 4) /
+/// EventFilters (Context 5) は省略され、出力は従来の
+/// `encode_subscribe_request` と byte-equal になる。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubscribeSpec {
+    pub min_interval_floor_s: u16,
+    pub max_interval_ceiling_s: u16,
+    pub keep_subscriptions: bool,
+    pub clusters: Vec<u32>,
+    pub event_paths: Vec<EventPathIn>,
+    pub event_min: Option<u64>,
+}
+
+/// events 有りの SubscribeRequest。`event_paths` 空かつ `event_min` None なら
+/// `encode_subscribe_request` と byte-equal（tag 4/5 を省略）。
+pub fn encode_subscribe_request_full(spec: &SubscribeSpec) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
-    w.put_bool(Tag::Context(0), keep_subscriptions);
-    w.put_uint(Tag::Context(1), u64::from(min_interval_floor_s));
-    w.put_uint(Tag::Context(2), u64::from(max_interval_ceiling_s));
+    w.put_bool(Tag::Context(0), spec.keep_subscriptions);
+    w.put_uint(Tag::Context(1), u64::from(spec.min_interval_floor_s));
+    w.put_uint(Tag::Context(2), u64::from(spec.max_interval_ceiling_s));
     w.start_array(Tag::Context(3)); // AttributeRequests
-    if clusters.is_empty() {
+    if spec.clusters.is_empty() {
         w.start_list(Tag::Anonymous); // AttributePathIB（全省略 = wildcard）
         w.end_container();
     } else {
-        for &cluster in clusters {
+        for &cluster in &spec.clusters {
             w.start_list(Tag::Anonymous); // AttributePathIB
             w.put_uint(Tag::Context(3), u64::from(cluster)); // Cluster のみ指定
             w.end_container();
         }
     }
     w.end_container();
+    if !spec.event_paths.is_empty() {
+        w.start_array(Tag::Context(4)); // EventRequests
+        for p in &spec.event_paths {
+            encode_event_path_ib(&mut w, Tag::Anonymous, p);
+        }
+        w.end_container();
+    }
+    if let Some(min) = spec.event_min {
+        w.start_array(Tag::Context(5)); // EventFilters
+        w.start_struct(Tag::Anonymous); // EventFilterIB
+        w.put_uint(Tag::Context(1), min); // EventMin
+        w.end_container();
+        w.end_container();
+    }
     // IsFabricFiltered = true: read と同じ既定（encode_read_request のコメント参照）。
     w.put_bool(Tag::Context(7), true);
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
@@ -53,6 +97,8 @@ pub struct SubscribeRequestIn {
     pub max_interval_ceiling_s: u16,
     pub paths: Vec<AttrPathIn>,
     pub fabric_filtered: bool,
+    pub event_paths: Vec<EventPathIn>,
+    pub event_min: Option<u64>,
 }
 
 /// SubscribeRequestMessage (spec §8.10): server-side decode of
@@ -70,6 +116,8 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
     let mut max_interval_ceiling_s = None;
     let mut paths = Vec::new();
     let mut fabric_filtered = None;
+    let mut event_paths = Vec::new();
+    let mut event_min = None;
     loop {
         let el = r
             .next()?
@@ -93,6 +141,14 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
                 // AttributeRequests
                 paths = decode_attribute_requests(&mut r)?;
             }
+            (Tag::Context(4), Value::ArrayStart) => {
+                // EventRequests
+                event_paths = decode_event_requests(&mut r)?;
+            }
+            (Tag::Context(5), Value::ArrayStart) => {
+                // EventFilters
+                event_min = decode_event_filters(&mut r)?;
+            }
             (Tag::Context(7), Value::Bool(b)) => fabric_filtered = Some(b),
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(&mut r)?;
@@ -112,6 +168,8 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
         ))?,
         paths,
         fabric_filtered: fabric_filtered.unwrap_or(true),
+        event_paths,
+        event_min,
     })
 }
 
@@ -346,5 +404,88 @@ mod tests {
                 attribute: None
             }]
         );
+    }
+
+    /// events 無しの `_full` は従来の encode_subscribe_request と byte-equal（matd 経路の無退行）。
+    #[test]
+    fn subscribe_request_full_without_events_is_byte_equal_to_legacy() {
+        for clusters in [vec![], vec![CLUSTER_ON_OFF, 0x0402]] {
+            let spec = SubscribeSpec {
+                min_interval_floor_s: 0,
+                max_interval_ceiling_s: 300,
+                keep_subscriptions: false,
+                clusters: clusters.clone(),
+                ..SubscribeSpec::default()
+            };
+            assert_eq!(
+                encode_subscribe_request_full(&spec),
+                encode_subscribe_request(0, 300, false, &clusters)
+            );
+        }
+    }
+
+    #[test]
+    fn subscribe_request_full_with_events_roundtrips_through_server_decode() {
+        let spec = SubscribeSpec {
+            min_interval_floor_s: 0,
+            max_interval_ceiling_s: 300,
+            keep_subscriptions: false,
+            clusters: vec![],
+            event_paths: vec![
+                EventPathIn::WILDCARD_URGENT,
+                EventPathIn {
+                    endpoint: Some(2),
+                    cluster: Some(CLUSTER_SWITCH),
+                    event: None,
+                    urgent: false,
+                },
+            ],
+            event_min: Some(1000),
+        };
+        let req = decode_subscribe_request(&encode_subscribe_request_full(&spec)).unwrap();
+        // AttributeRequests は従来どおり full wildcard 1 本（clusters 空）。
+        assert_eq!(
+            req.paths,
+            vec![AttrPathIn {
+                endpoint: None,
+                cluster: None,
+                attribute: None
+            }]
+        );
+        assert_eq!(req.event_paths, spec.event_paths);
+        assert_eq!(req.event_min, Some(1000));
+    }
+
+    #[test]
+    fn legacy_subscribe_request_decodes_with_no_events() {
+        let req = decode_subscribe_request(&encode_subscribe_request(0, 60, false, &[])).unwrap();
+        assert!(req.event_paths.is_empty());
+        assert_eq!(req.event_min, None);
+    }
+
+    #[test]
+    fn subscribe_request_full_tags_events_at_4_and_filters_at_5() {
+        let spec = SubscribeSpec {
+            max_interval_ceiling_s: 60,
+            event_paths: vec![EventPathIn::WILDCARD_URGENT],
+            event_min: Some(5),
+            ..SubscribeSpec::default()
+        };
+        let b = encode_subscribe_request_full(&spec);
+        let mut r = Reader::new(&b);
+        r.next().unwrap(); // struct
+        r.next().unwrap();
+        r.next().unwrap();
+        r.next().unwrap(); // keep/min/max
+        let el = r.next().unwrap().unwrap(); // AttributeRequests
+        assert_eq!(el.tag, Tag::Context(3));
+        crate::tlv::skip_container(&mut r).unwrap();
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(el.tag, Tag::Context(4));
+        assert!(matches!(el.value, Value::ArrayStart));
+        crate::tlv::skip_container(&mut r).unwrap();
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(el.tag, Tag::Context(5));
+        assert!(matches!(el.value, Value::ArrayStart));
     }
 }
