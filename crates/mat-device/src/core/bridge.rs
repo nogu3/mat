@@ -5,13 +5,15 @@
 //! 種別追加は「[`DeviceKind`] に 1 値 + [`build_bridged_endpoint`] に 1
 //! 分岐」で完結する — 設定ファイルのパーサ／net 層はこのモジュールだけを
 //! 見れば新しい device kind を扱える。
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
 
 use mat_controller::im;
 
+use crate::core::boolean_state::BooleanStateHandler;
 use crate::core::bridged_device_basic_information::BridgedDeviceBasicInformationHandler;
 use crate::core::datamodel::{ClusterHandler, DescriptorHandler};
+use crate::core::generic_switch::GenericSwitchHandler;
 use crate::core::group_membership::GroupMembershipStore;
 use crate::core::groups::GroupsHandler;
 use crate::core::identify::IdentifyHandler;
@@ -24,13 +26,26 @@ use crate::core::onoff::OnOffHandler;
 pub enum DeviceKind {
     #[serde(rename = "onoff-light")]
     OnOffLight,
+    #[serde(rename = "switch")]
+    Switch,
+    #[serde(rename = "contact-sensor")]
+    ContactSensor,
+}
+
+/// 1 つの bridged endpoint の観測ハンドル — kind ごとに違う本体クラスタの
+/// 状態を、外側（runtime/ログ）へ種別を保ったまま渡す。
+#[derive(Debug, Clone)]
+pub enum BridgedState {
+    OnOff(Arc<AtomicBool>),
+    Switch(Arc<AtomicU8>),
+    Contact(Arc<AtomicBool>),
 }
 
 /// 1 つの bridged endpoint に載せるクラスタ一式と、外側（runtime/ログ）
 /// へ渡す状態ハンドル。
 pub struct BridgedEndpoint {
     pub clusters: Vec<Box<dyn ClusterHandler>>,
-    pub onoff_state: Arc<AtomicBool>,
+    pub state: BridgedState,
 }
 
 /// `kind`/`name`/`unique_id` から 1 つの bridged endpoint 分のクラスタ一式
@@ -63,7 +78,49 @@ pub fn build_bridged_endpoint(
                     )),
                     Box::new(onoff),
                 ],
-                onoff_state,
+                state: BridgedState::OnOff(onoff_state),
+            }
+        }
+        DeviceKind::Switch => {
+            let (identify, identify_state) = IdentifyHandler::new();
+            let (switch, switch_state) = GenericSwitchHandler::new();
+            BridgedEndpoint {
+                clusters: vec![
+                    Box::new(DescriptorHandler::for_device_types(&[
+                        im::DEVICE_TYPE_GENERIC_SWITCH,
+                        im::DEVICE_TYPE_BRIDGED_NODE,
+                    ])),
+                    Box::new(BridgedDeviceBasicInformationHandler::new(name, unique_id)),
+                    Box::new(identify),
+                    Box::new(GroupsHandler::new(
+                        identify_state,
+                        membership.clone(),
+                        endpoint,
+                    )),
+                    Box::new(switch),
+                ],
+                state: BridgedState::Switch(switch_state),
+            }
+        }
+        DeviceKind::ContactSensor => {
+            let (identify, identify_state) = IdentifyHandler::new();
+            let (contact, contact_state) = BooleanStateHandler::new();
+            BridgedEndpoint {
+                clusters: vec![
+                    Box::new(DescriptorHandler::for_device_types(&[
+                        im::DEVICE_TYPE_CONTACT_SENSOR,
+                        im::DEVICE_TYPE_BRIDGED_NODE,
+                    ])),
+                    Box::new(BridgedDeviceBasicInformationHandler::new(name, unique_id)),
+                    Box::new(identify),
+                    Box::new(GroupsHandler::new(
+                        identify_state,
+                        membership.clone(),
+                        endpoint,
+                    )),
+                    Box::new(contact),
+                ],
+                state: BridgedState::Contact(contact_state),
             }
         }
     }
@@ -131,9 +188,10 @@ mod tests {
             2,
             &GroupMembershipStore::new(),
         );
-        assert!(!endpoint
-            .onoff_state
-            .load(std::sync::atomic::Ordering::SeqCst));
+        let BridgedState::OnOff(state) = &endpoint.state else {
+            panic!("expected BridgedState::OnOff")
+        };
+        assert!(!state.load(std::sync::atomic::Ordering::SeqCst));
 
         let onoff = endpoint
             .clusters
@@ -142,9 +200,10 @@ mod tests {
             .expect("OnOff handler registered");
         onoff.invoke(im::CMD_ON_OFF_ON, &[], &mut InvokeCtx::default());
 
-        assert!(endpoint
-            .onoff_state
-            .load(std::sync::atomic::Ordering::SeqCst));
+        let BridgedState::OnOff(state) = &endpoint.state else {
+            panic!("expected BridgedState::OnOff")
+        };
+        assert!(state.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// 設定ファイル正本表記のデシリアライズ。TOML はこのクレートの
@@ -162,5 +221,98 @@ mod tests {
     fn unknown_kind_spelling_is_a_deserialize_error() {
         let result: Result<DeviceKind, _> = serde_json::from_str("\"not-a-real-kind\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn switch_and_contact_sensor_kinds_yield_their_cluster_sets() {
+        let sw = build_bridged_endpoint(
+            DeviceKind::Switch,
+            "Btn",
+            "uid-2",
+            3,
+            &GroupMembershipStore::new(),
+        );
+        let ids: Vec<u32> = sw.clusters.iter().map(|c| c.cluster_id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                im::CLUSTER_DESCRIPTOR,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::CLUSTER_IDENTIFY,
+                im::CLUSTER_GROUPS,
+                im::CLUSTER_SWITCH
+            ]
+        );
+        assert!(matches!(sw.state, BridgedState::Switch(_)));
+        let cs = build_bridged_endpoint(
+            DeviceKind::ContactSensor,
+            "Door",
+            "uid-3",
+            4,
+            &GroupMembershipStore::new(),
+        );
+        let ids: Vec<u32> = cs.clusters.iter().map(|c| c.cluster_id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                im::CLUSTER_DESCRIPTOR,
+                im::CLUSTER_BRIDGED_DEVICE_BASIC_INFORMATION,
+                im::CLUSTER_IDENTIFY,
+                im::CLUSTER_GROUPS,
+                im::CLUSTER_BOOLEAN_STATE
+            ]
+        );
+        assert!(matches!(cs.state, BridgedState::Contact(_)));
+    }
+
+    #[test]
+    fn deserializes_new_kinds_from_their_config_spelling() {
+        assert_eq!(
+            serde_json::from_str::<DeviceKind>("\"switch\"").unwrap(),
+            DeviceKind::Switch
+        );
+        assert_eq!(
+            serde_json::from_str::<DeviceKind>("\"contact-sensor\"").unwrap(),
+            DeviceKind::ContactSensor
+        );
+    }
+
+    #[test]
+    fn switch_descriptor_lists_generic_switch_and_bridged_node() {
+        let sw = build_bridged_endpoint(
+            DeviceKind::Switch,
+            "Btn",
+            "uid-2",
+            3,
+            &GroupMembershipStore::new(),
+        );
+        let desc = sw
+            .clusters
+            .iter()
+            .find(|c| c.cluster_id() == im::CLUSTER_DESCRIPTOR)
+            .unwrap();
+        let v = mat_controller::im::tlv_to_json(
+            &desc
+                .read(
+                    im::ATTR_DEVICE_TYPE_LIST,
+                    &crate::core::datamodel::ReadCtx::default(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        // DeviceTypeStruct {0: DeviceType, 1: Revision} の配列。
+        let types: Vec<u64> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["0"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                u64::from(im::DEVICE_TYPE_GENERIC_SWITCH),
+                u64::from(im::DEVICE_TYPE_BRIDGED_NODE)
+            ]
+        );
     }
 }

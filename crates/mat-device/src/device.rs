@@ -15,8 +15,6 @@ use mat_controller::setup_code::{self, SetupPayload};
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509::{self, X509Error};
 
-use std::sync::atomic::AtomicBool;
-
 use crate::core::commissioning::CommissioningServer;
 use crate::core::datamodel::{DescriptorHandler, Node};
 use crate::core::fabric_store::FabricStore;
@@ -218,11 +216,12 @@ pub struct Device {
     node: Node,
     comm_server: CommissioningServer,
     group: crate::net::group_rx::GroupRx,
-    /// 各 bridged device の `(設定ファイルの id, OnOff 状態ハンドル)` —
-    /// 宣言順。`Device` 自身はまだ読まない（M4 で mando への転送/状態
-    /// ログが消費する）。
+    /// 各 bridged device の `(設定ファイルの id, 観測ハンドル)` — kind
+    /// ごとに違う本体クラスタの状態を `BridgedState` で保ち、宣言順に積む。
+    /// `Device` 自身はまだ読まない（M4 で mando への転送/状態ログが消費
+    /// する）。
     #[allow(dead_code)]
-    onoff_states: Vec<(String, Arc<AtomicBool>)>,
+    states: Vec<(String, crate::core::bridge::BridgedState)>,
 }
 
 impl Device {
@@ -417,7 +416,7 @@ impl Device {
             )],
         );
 
-        let mut onoff_states = Vec::with_capacity(config.devices.len());
+        let mut states = Vec::with_capacity(config.devices.len());
         for (device, endpoint) in config.devices.iter().zip(&bridged_eps) {
             let built = crate::core::bridge::build_bridged_endpoint(
                 device.kind,
@@ -427,7 +426,7 @@ impl Device {
                 &membership,
             );
             node.add_endpoint(*endpoint, built.clusters);
-            onoff_states.push((device.id.clone(), built.onoff_state));
+            states.push((device.id.clone(), built.state));
         }
 
         let bind_addr: SocketAddr = format!("[::]:{}", config.port)
@@ -478,7 +477,7 @@ impl Device {
             node,
             comm_server,
             group,
-            onoff_states,
+            states,
         })
     }
 
