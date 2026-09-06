@@ -238,10 +238,12 @@ epoch harmlessly).
   epoch it holds. `commission` picks the new epoch up immediately.
 - `fabric list` shows `"ipk_rotation_pending": true` while a rotation is
   pending; `fabric rotate-ipk --abort` clears it.
-- The virtual device `matv` does not accept `KeySetWrite` on key set 0 yet, so
-  against `matv` a rotation always ends `pending` with `device_rejected`
-  (`scripts/e2e-device-m4.sh` pins exactly that behaviour). Real devices
-  follow the spec (§11.2.8.1).
+- The virtual device `matv` follows the spec here too (§11.2.8.1): it accepts
+  `KeySetWrite` on key set 0 with up to three epochs, persists them in
+  `group_keys.json`, and answers CASE for every epoch it holds, so a rotation
+  against `matv` commits and survives a device restart
+  (`scripts/e2e-device-m4.sh` pins the success path, then the pending/abort
+  path with the device stopped).
 - Never part of the `matd` socket protocol (direct-only like `commission`);
   explicit `--matd` exits `2`.
 

@@ -1119,7 +1119,12 @@ impl Runtime {
             }
             UnsecuredFlow::Case => {
                 let local_session_id = random_session_id();
-                let fabrics = self.state.comm_server.fabrics();
+                // IPK rotation 後は keyset 0 の全 epoch から候補を展開する
+                // （`core::case::expand_ipk_candidates` の doc 参照）。
+                let fabrics = crate::core::case::expand_ipk_candidates(
+                    self.state.comm_server.fabrics(),
+                    &self.group.gk_store,
+                );
                 let outcome = crate::net::case::drive_established(
                     Arc::clone(&self.transport),
                     peer,
