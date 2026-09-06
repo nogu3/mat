@@ -94,6 +94,7 @@ pub struct ClusterDef {
     pub id: u32,
     pub attrs: &'static [AttrDef],
     pub cmds: &'static [CmdDef],
+    pub events: &'static [EventDef],
 }
 pub struct AttrDef {
     pub name: &'static str,
@@ -114,6 +115,23 @@ pub struct FieldDef {
     pub ty: Ty,
     pub optional: bool,
 }
+pub struct EventDef {
+    pub name: &'static str,
+    pub id: u32,
+    /// data-model XML の `priority` 属性（`"debug"` | `"info"` | `"critical"`）。
+    /// 省略されている event は `"info"` 既定（生成器側で埋める）。
+    pub priority: &'static str,
+    pub fields: &'static [EventFieldDef],
+}
+/// event フィールド。data-model XML の `<event><field id=..>` は id を明示するが、
+/// 複数クラスタで配列添字と一致しない（e.g. Access Control は id 1 起算）ため
+/// `FieldDef` は再利用せず、id を持つ専用型にする。
+pub struct EventFieldDef {
+    pub name: &'static str,
+    pub id: u8,
+    pub ty: Ty,
+    pub optional: bool,
+}
 
 pub struct AttrRef {
     pub id: u32,
@@ -122,6 +140,10 @@ pub struct AttrRef {
 pub struct CmdRef {
     pub id: u32,
     pub def: Option<&'static CmdDef>,
+}
+pub struct EventRef {
+    pub id: u32,
+    pub def: Option<&'static EventDef>,
 }
 
 pub fn parse_num(input: &str) -> Option<u64> {
@@ -172,6 +194,24 @@ pub fn resolve_command(cluster: u32, input: &str) -> Option<CmdRef> {
         id: def.id,
         def: Some(def),
     })
+}
+
+pub fn resolve_event(cluster: u32, input: &str) -> Option<EventRef> {
+    if let Some(n) = parse_num(input) {
+        return u32::try_from(n).ok().map(|id| EventRef { id, def: None });
+    }
+    let def = find_cluster(cluster)?
+        .events
+        .iter()
+        .find(|e| e.name == input)?;
+    Some(EventRef {
+        id: def.id,
+        def: Some(def),
+    })
+}
+
+pub fn find_event(cluster: u32, id: u32) -> Option<&'static EventDef> {
+    find_cluster(cluster)?.events.iter().find(|e| e.id == id)
 }
 
 /// write / invoke 引数の値ツリー（スカラー + list / struct container）。
@@ -676,6 +716,25 @@ mod tests {
         // open-commissioning-window は timed invoke 必須。
         let c = resolve_command(0x003C, "open-commissioning-window").unwrap();
         assert!(c.def.unwrap().timed);
+    }
+
+    #[test]
+    fn switch_and_boolean_state_events_resolve() {
+        let sw = resolve_cluster("switch").unwrap();
+        assert_eq!(resolve_event(sw, "initial-press").unwrap().id, 0x01);
+        assert_eq!(resolve_event(sw, "multi-press-complete").unwrap().id, 0x06);
+        assert_eq!(resolve_event(sw, "0x03").unwrap().id, 0x03);
+        let def = find_event(sw, 0x06).unwrap();
+        assert_eq!(def.name, "multi-press-complete");
+        assert_eq!(def.priority, "info");
+        assert_eq!(
+            def.fields.iter().map(|f| f.name).collect::<Vec<_>>(),
+            vec!["previous-position", "total-number-of-presses-counted"]
+        );
+        let bs = resolve_cluster("booleanstate").unwrap();
+        assert_eq!(resolve_event(bs, "state-change").unwrap().id, 0x00);
+        assert_eq!(find_event(bs, 0).unwrap().fields[0].name, "state-value");
+        assert!(resolve_event(bs, "nosuch").is_none());
     }
 
     #[test]

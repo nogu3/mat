@@ -251,12 +251,18 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 常駐購読のクラスタ絞り込み（subscriptions.toml、無し = full wildcard）。
     // 設定不備は fail-fast: 黙って wildcard に落ちると弱リンク対策が無効化
     // されたことに気づけない（ambiguous iface autodetect と同じ規律）。
-    let sub_clusters = match matd::subscribe_config::load(&store_path) {
+    let sub_config = match matd::subscribe_config::load(&store_path) {
         Ok(c) => c,
         Err(e) => {
             e.emit();
             std::process::exit(e.kind.exit_code() as i32);
         }
+    };
+    // 属性の絞り込み（`clusters`）とイベント範囲（`events`）は独立。ファイルが
+    // 無ければ属性 = full wildcard、イベント = 全クラスタ urgent（spec §6.2）。
+    let (sub_clusters, event_scope) = match sub_config {
+        Some(c) => (c.clusters, c.events),
+        None => (None, matd::subscribe_config::EventScope::Wildcard),
     };
     if let Some(c) = &sub_clusters {
         tracing::info!(
@@ -264,6 +270,14 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
             "subscriptions.toml loaded; narrowing resident subscribe paths"
         );
     }
+    tracing::info!(
+        event_scope = match &event_scope {
+            matd::subscribe_config::EventScope::Wildcard => "wildcard".to_string(),
+            matd::subscribe_config::EventScope::Clusters(ids) => format!("{} clusters", ids.len()),
+            matd::subscribe_config::EventScope::Off => "off".to_string(),
+        },
+        "resident subscribe event scope"
+    );
     // op 相関ヘルス表: server（note_op）と購読 pump（判定）の共有。
     let sub_health = std::sync::Arc::new(matd::subscription::SubHealth::new(sub_clusters.clone()));
     // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
@@ -275,6 +289,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         store_path.clone(),
         events_tx.clone(),
         sub_clusters,
+        event_scope,
         std::sync::Arc::clone(&sub_health),
     );
 

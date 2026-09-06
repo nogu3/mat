@@ -4,7 +4,8 @@
 //! 新規ノードへ購読ループを spawn（監査#4）。ノードごと: resolve（常駐 mDNS
 //! キャッシュ）→ 専用 CASE → wildcard Subscribe → ポンプ。失敗・死亡は指数
 //! backoff（5s 開始、上限 60s）で再購読。
-//! イベントは `tokio::sync::broadcast` で listen 接続へ配る。
+//! 配信物（属性変化行 + デバイス発イベント行 = `Emitted`）は
+//! `tokio::sync::broadcast` で listen 接続へ配る。
 //! 状態は持たない（リングバッファ/リプレイ無し — 聞いている間だけ届く契約）。
 //! op 相関 + 無音 deadline = max_interval+30s の死活判定（spec 2026-07-21-matd-borndead-detection。teardown 前の probe 延長は実測で純損失と判明し撤去 — spec 2026-07-30）。
 
@@ -22,6 +23,12 @@ use mat_core::output::now_iso8601;
 use mat_core::store::Store;
 
 use crate::server::NativeState;
+use crate::subscribe_config::EventScope;
+
+/// イベント行（EventReport 由来）と、属性行との合流点 `Emitted`。
+/// このファイルが既に約 2400 行あるので別モジュールへ置く。
+mod events;
+pub use events::{events_from_event_reports, Emitted, EventItem};
 
 /// 再購読 backoff の初期値 / 上限。上限は当初 300s だったが、リンク回復後に
 /// 最大 5 分無試行 = センサーの照明 1 回分不発になるため 60s へ短縮
@@ -133,6 +140,11 @@ pub struct SubHealth {
     /// server op 経路（読み手: 「この op は本当に値を変えるか」の証明）で共有する。
     /// ephemeral なプロセス内状態のみ（設計ルール4の永続状態には該当しない）。
     values: Mutex<HashMap<ValueKey, serde_json::Value>>,
+    /// node_id → そのノードで最後に見た EventNumber。再購読時の EventMin
+    /// （= last + 1）で盲目窓中のイベントを回収するためだけに持つ。**プロセス
+    /// メモリのみ**で、matd 再起動で消えて priming 全量からやり直す
+    /// （設計ルール 4 — KVS 以外の永続状態を持たない、spec §0）。
+    event_numbers: Mutex<HashMap<u64, u64>>,
     /// node_id → 購読ライフサイクル状態（status op が読む）。
     status: Mutex<HashMap<u64, NodeSubStatus>>,
     /// node_id → touched フラグ + 起床用 Notify（Issue #20）。pump は
@@ -162,8 +174,47 @@ impl SubHealth {
             clusters: clusters.unwrap_or_default(),
             pending: Mutex::new(HashMap::new()),
             values: Mutex::new(HashMap::new()),
+            event_numbers: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// そのノードで最後に見た EventNumber（未知なら None = 再購読でも
+    /// EventFilters を出さない = デバイスのログ全量が priming で来る）。
+    pub fn last_event_number(&self, node_id: u64) -> Option<u64> {
+        locked(&self.event_numbers).get(&node_id).copied()
+    }
+
+    /// 観測した EventNumber を記録する。既定は最大値を保つ（1 ReportData 内の
+    /// 並び順や、priming と live の交錯で後退させないため）。
+    ///
+    /// 例外は `live`（購読成立後のデバイス発 report）で番号が既知値より
+    /// **小さい**とき: デバイスのイベントログが再起動やカウンタリセットで
+    /// 巻き戻ったということなので、記録も巻き戻す。片方向ラッチのままだと
+    /// 以後の再購読が永久に満たされない EventMin を送り続け、盲目窓の回収
+    /// （spec §6.2）が matd 再起動まで死ぬ。priming は最大値のまま —
+    /// EventFilters を無視して全ログを返すデバイスがあるため（`PrimingRule`）。
+    pub fn note_event_number(&self, node_id: u64, n: u64, live: bool) {
+        use std::collections::hash_map::Entry;
+        match locked(&self.event_numbers).entry(node_id) {
+            Entry::Occupied(mut e) => {
+                let cur = *e.get();
+                if n > cur {
+                    e.insert(n);
+                } else if live && n < cur {
+                    tracing::warn!(
+                        node_id,
+                        stored = cur,
+                        observed = n,
+                        "live event number went backwards; assuming the device event log reset and lowering EventMin"
+                    );
+                    e.insert(n);
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(n);
+            }
         }
     }
 
@@ -323,6 +374,7 @@ impl SubHealth {
         locked(&self.pending).remove(&node_id);
         locked(&self.status).remove(&node_id);
         locked(&self.touched).remove(&node_id);
+        locked(&self.event_numbers).remove(&node_id);
         locked(&self.values).retain(|k, _| k.0 != node_id);
     }
 
@@ -512,10 +564,21 @@ impl Event {
 /// 作れず、list-diff priming recovery も要素追記を遷移と誤認する。path が欠けた
 /// report・status-only も捨てる。
 pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) -> Vec<Event> {
-    let mut out = Vec::new();
     // 1 report から生まれる全イベントで同じ受信時刻を共有する（listener ごと・
     // emit 時刻での再採取はしない — 同時到着イベントは同じ timestamp が正しい）。
-    let ts = now_iso8601();
+    events_from_report_at(node_id, msg, priming, &now_iso8601())
+}
+
+/// `events_from_report` の受信時刻を呼び手が渡す版。同じ ReportData から
+/// 出る属性行とイベント行（`events_from_event_reports`）に同一の `timestamp`
+/// を持たせるために pump が使う（spec §6.2）。
+pub fn events_from_report_at(
+    node_id: u64,
+    msg: &ReportDataMessage,
+    priming: bool,
+    ts: &str,
+) -> Vec<Event> {
+    let mut out = Vec::new();
     for rep in &msg.reports {
         let (Some(endpoint), Some(cluster), Some(attribute)) =
             (rep.endpoint, rep.cluster, rep.attribute)
@@ -550,7 +613,7 @@ pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) 
             continue;
         }
         out.push(Event {
-            timestamp: ts.clone(),
+            timestamp: ts.to_string(),
             node_id,
             endpoint,
             cluster,
@@ -603,22 +666,38 @@ pub(crate) fn stagger_delay(batch_index: usize, batch_len: usize) -> Duration {
     }
 }
 
+/// 常駐購読の範囲（subscriptions.toml 由来）: 属性のクラスタ絞り込みと
+/// イベント範囲。両者は独立（spec §6.2）だが、ノードごとの購読ループへは
+/// 常に一緒に運ぶので 1 つにまとめる。全ループで共有するので `Arc`。
+#[derive(Clone)]
+pub(crate) struct SubscribeScope {
+    /// 属性の絞り込み。空 = full wildcard（空 slice がワイヤ上の wildcard 形）。
+    clusters: Arc<[u32]>,
+    events: Arc<EventScope>,
+}
+
 /// commissioned 全ノードへ購読タスクを張る supervisor を起動する。
 /// `LEDGER_RESCAN_INTERVAL` ごとに台帳を読み直し、新規ノードに購読ループを
 /// 追加 spawn する（op 経路の `require_node` が毎回 store を開き直すのと同じ
 /// 「常駐中の台帳更新を拾う」規律）。`mat unpair` で台帳から消えたノードは
-/// 逆に購読ループを abort して health からも外す。cluster 絞り込みは
-/// subscriptions.toml で実装済み（`clusters` パラメータに配線）。native が Unavailable なら何もしない（`mat fabric
-/// init` 後の再起動で解消 — 再読で直る状態ではないので空回りさせない）。
+/// 逆に購読ループを abort して health からも外す。属性の cluster 絞り込み
+/// （`clusters`）とイベント範囲（`event_scope`）はどちらも subscriptions.toml
+/// 由来で、独立に効く（spec §6.2）。native が Unavailable なら何もしない
+/// （`mat fabric init` 後の再起動で解消 — 再読で直る状態ではないので空回り
+/// させない）。
 pub fn spawn_subscription_manager(
     native: Arc<NativeState>,
     store_path: PathBuf,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<Emitted>,
     clusters: Option<Vec<u32>>,
+    event_scope: EventScope,
     health: Arc<SubHealth>,
 ) -> tokio::task::JoinHandle<()> {
     // None = subscriptions.toml 無し = full wildcard（空 slice がワイヤ上の wildcard 形）。
-    let clusters: Arc<[u32]> = clusters.unwrap_or_default().into();
+    let scope = SubscribeScope {
+        clusters: clusters.unwrap_or_default().into(),
+        events: Arc::new(event_scope),
+    };
     tokio::spawn(async move {
         if !matches!(&*native, NativeState::Ready(_)) {
             return;
@@ -681,7 +760,7 @@ pub fn spawn_subscription_manager(
                         let delay = stagger_delay(i, new_nodes.len());
                         let native = Arc::clone(&native);
                         let events = events.clone();
-                        let clusters = Arc::clone(&clusters);
+                        let scope = scope.clone();
                         let health_for_task = Arc::clone(&health);
                         let handle = tokio::spawn(async move {
                             node_subscription_loop(
@@ -689,7 +768,7 @@ pub fn spawn_subscription_manager(
                                 delay,
                                 native,
                                 events,
-                                clusters,
+                                scope,
                                 health_for_task,
                             )
                             .await
@@ -721,8 +800,8 @@ async fn node_subscription_loop(
     node_id: u64,
     initial_delay: Duration,
     native: Arc<NativeState>,
-    events: broadcast::Sender<Event>,
-    clusters: Arc<[u32]>,
+    events: broadcast::Sender<Emitted>,
+    scope: SubscribeScope,
     health: Arc<SubHealth>,
 ) {
     let NativeState::Ready(backend) = &*native else {
@@ -747,7 +826,7 @@ async fn node_subscription_loop(
     }
     loop {
         let last_error = match run_subscription_once(
-            node_id, backend, &events, &clusters, &health, down_since, failures,
+            node_id, backend, &events, &scope, &health, down_since, failures,
         )
         .await
         {
@@ -818,20 +897,93 @@ async fn node_subscription_loop(
     }
 }
 
+/// イベント行の `priming` フラグの決め方（`emit_event_lines` の入力）。
+enum PrimingRule {
+    /// 購読成立後の live report — 全て実イベント。
+    Live,
+    /// EventMin 無しの priming（起動直後）= デバイスのイベントログ全量。
+    PrimingAll,
+    /// EventMin 付き再購読の priming: 番号が `min` 以上のものだけが盲目窓中の
+    /// 実イベント。**未満は `priming: true` に落とす** — EventFilters を
+    /// 無視して全ログを返すデバイスがあると、再購読（pump 死 + backoff は
+    /// 日常）のたびに古いボタン押下が `priming: false` で流れ、消費者が
+    /// 再発火してしまう。捨てずに落とすのは、消費者が priming 行を無視する
+    /// 既存契約に乗せたまま、ワイヤに来た事実は隠さないため。
+    PrimingSince(u64),
+}
+
+impl PrimingRule {
+    fn for_priming(event_min: Option<u64>) -> Self {
+        match event_min {
+            None => Self::PrimingAll,
+            Some(min) => Self::PrimingSince(min),
+        }
+    }
+
+    /// この番号のイベントを `priming` として流すか。
+    fn priming_for(&self, node_id: u64, event_number: u64) -> bool {
+        match self {
+            Self::Live => false,
+            Self::PrimingAll => true,
+            Self::PrimingSince(min) => {
+                let below = event_number < *min;
+                if below {
+                    tracing::debug!(
+                        node_id,
+                        event_number,
+                        event_min = min,
+                        "priming event below EventMin; device ignored EventFilters, keeping priming"
+                    );
+                }
+                below
+            }
+        }
+    }
+}
+
+/// EventReport 群をイベント行にして listen へ流し、番号を health へ記録する
+/// （priming と live の違いは `rule` が決める `priming` フラグだけ）。番号の
+/// 記録は送信前に行う: 受信者ゼロ（listen 接続なし）でも次の再購読の EventMin
+/// は前へ進める必要がある。
+fn emit_event_lines(
+    node_id: u64,
+    reports: &[mat_controller::im::EventReport],
+    rule: &PrimingRule,
+    ts: &str,
+    events: &broadcast::Sender<Emitted>,
+    health: &SubHealth,
+) {
+    // `priming` はいったん true で組み、番号が分かってから rule で決め直す
+    // （`events_from_event_reports` は 1 通ぶんに一律のフラグしか持てない）。
+    let live = matches!(rule, PrimingRule::Live);
+    for mut item in events_from_event_reports(node_id, reports, true, ts) {
+        item.priming = rule.priming_for(node_id, item.event_number);
+        health.note_event_number(node_id, item.event_number, live);
+        let _ = events.send(Emitted::Event(item)); // 受信者ゼロは正常
+    }
+}
+
 /// 1 回の購読試行。確立+Subscribe 成立まで到達したら Ok(reason) を返して抜ける
 /// （ポンプ死亡=正常喪失。reason は pump 終了理由の人間可読文字列で、呼び手が
 /// `Down.last_error` の detail に使う）。確立前の失敗は Err。
 async fn run_subscription_once(
     node_id: u64,
     backend: &crate::native::NativeBackend,
-    events: &broadcast::Sender<Event>,
-    clusters: &[u32],
+    events: &broadcast::Sender<Emitted>,
+    scope: &SubscribeScope,
     health: &SubHealth,
     down_since: tokio::time::Instant,
     prior_failures: u32,
 ) -> Result<String, mat_core::error::MatError> {
     let mut conn = backend.establish_subscription(node_id).await?;
-    let (info, priming) = match conn.subscribe_wildcard(clusters).await {
+    // 前回の購読で見た最後の EventNumber を知っていれば EventMin = last + 1 を
+    // 載せる → 盲目窓中に起きたイベントだけが priming に乗って戻る（spec §6.2）。
+    let event_min = health.last_event_number(node_id).map(|n| n + 1);
+    let event_paths = scope.events.to_paths();
+    let (info, priming, priming_events) = match conn
+        .subscribe(&scope.clusters, &event_paths, event_min)
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             // CASE は成立済み — 放置すると Issue #20 の黙殺経路になる
@@ -846,6 +998,8 @@ async fn run_subscription_once(
         max_interval_s = info.max_interval_s,
         down_s = down_since.elapsed().as_secs(),
         attempts = prior_failures + 1,
+        event_paths = event_paths.len(),
+        event_min = ?event_min,
         "subscription established"
     );
     health.mark_established(node_id, info.subscription_id, info.max_interval_s);
@@ -854,9 +1008,23 @@ async fn run_subscription_once(
     for msg in &priming {
         for ev in events_from_report(node_id, msg, true) {
             // 盲目期間中に起きた実遷移はここで通常イベントへ昇格する。
-            let _ = events.send(health.observe(ev)); // 受信者ゼロは正常（listen 接続なし）
+            let _ = events.send(Emitted::Attribute(health.observe(ev))); // 受信者ゼロは正常（listen 接続なし）
         }
     }
+    // priming イベントは EventMin を載せられたときだけ「実イベント」:
+    // 番号が EventMin 以上 = 盲目窓中に本当に起きた（属性の recovered 推定に
+    // 相当するものを推定なしで得る）。起動直後（EventMin 無し）はデバイスの
+    // ログ全量なので priming: true（消費者は無視する既存契約、spec §6.2）。
+    // 番号の検査は matd 側で行う — デバイスの EventFilters 尊重を信用しない
+    // （`PrimingRule::PrimingSince` のコメント）。
+    emit_event_lines(
+        node_id,
+        &priming_events,
+        &PrimingRule::for_priming(event_min),
+        &now_iso8601(),
+        events,
+        health,
+    );
     let deadline = silence_deadline(info.max_interval_s);
     tracing::debug!(
         node_id,
@@ -924,15 +1092,25 @@ async fn run_subscription_once(
         }
         let remaining = deadline.saturating_sub(last_msg.elapsed());
         let slice = PUMP_SLICE.min(remaining);
-        match conn.next_report(slice).await {
-            Ok(Some(msg)) => {
+        match conn.next_report_full(slice).await {
+            Ok(Some(report)) => {
                 proven = true;
                 last_msg = tokio::time::Instant::now();
                 health.clear_pending(node_id);
                 health.note_device_msg(node_id);
-                for ev in events_from_report(node_id, &msg, false) {
-                    let _ = events.send(health.observe(ev));
+                // 同じ ReportData 由来の属性行とイベント行は同じ受信時刻を持つ。
+                let ts = now_iso8601();
+                for ev in events_from_report_at(node_id, &report.data, false, &ts) {
+                    let _ = events.send(Emitted::Attribute(health.observe(ev)));
                 }
+                emit_event_lines(
+                    node_id,
+                    &report.events,
+                    &PrimingRule::Live,
+                    &ts,
+                    events,
+                    health,
+                );
                 // keep-alive（reports 空）も受信 = 経路生存の証明として扱う。
             }
             Ok(None) => {
@@ -967,7 +1145,37 @@ mod tests {
         est: FakeEstablisher,
         clusters: Option<Vec<u32>>,
     ) -> (
-        broadcast::Receiver<Event>,
+        AttrRx,
+        Arc<SubHealth>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (rx, health, dir, handle) = spawn_manager_with(est, clusters, EventScope::Wildcard);
+        (AttrRx(rx), health, dir, handle)
+    }
+
+    /// 属性行だけを取り出す受信ラッパ。既存の購読テストは属性行しか作らない
+    /// （fake の priming/live イベントキューは既定で空）ので、`rx.recv()` の
+    /// 呼び出し形をそのまま保てる。イベント行が混ざったら足場の想定違いなので
+    /// panic させる。
+    struct AttrRx(broadcast::Receiver<Emitted>);
+
+    impl AttrRx {
+        async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
+            match self.0.recv().await? {
+                Emitted::Attribute(e) => Ok(e),
+                Emitted::Event(e) => panic!("属性行を期待したがイベント行が来た: {e:?}"),
+            }
+        }
+    }
+
+    /// `spawn_manager` の event スコープ指定版（イベント購読のテスト用）。
+    fn spawn_manager_with(
+        est: FakeEstablisher,
+        clusters: Option<Vec<u32>>,
+        event_scope: EventScope,
+    ) -> (
+        broadcast::Receiver<Emitted>,
         Arc<SubHealth>,
         tempfile::TempDir,
         tokio::task::JoinHandle<()>,
@@ -989,6 +1197,7 @@ mod tests {
             dir.path().to_path_buf(),
             tx,
             clusters,
+            event_scope,
             Arc::clone(&health),
         );
         (rx, health, dir, handle)
@@ -1207,14 +1416,14 @@ mod tests {
     }
 
     /// manager 経路: subscriptions.toml 由来のクラスタ集合が SubscribeConn::
-    /// subscribe_wildcard まで届く（絞り込みの配線の釘打ち）。
+    /// subscribe まで届く（絞り込みの配線の釘打ち）。
     #[tokio::test]
     async fn manager_passes_clusters_to_subscribe() {
         let est = FakeEstablisher::default();
         let seen = Arc::clone(&est.sub_clusters);
         let (mut rx, _health, _dir, _handles) = spawn_manager(est, Some(vec![0x0006, 0x0406]));
 
-        // priming イベントが届いた時点で subscribe_wildcard は呼ばれている。
+        // priming イベントが届いた時点で subscribe は呼ばれている。
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("no event within 2s")
@@ -1808,7 +2017,7 @@ mod tests {
         );
     }
 
-    /// subscribe_wildcard が失敗したとき（CASE は成立済み）も close される
+    /// subscribe が失敗したとき（CASE は成立済み）も close される
     /// （Issue #20）。establish_subscription 自体の失敗は CASE 未成立なので
     /// close 不要 — この経路とは区別する。
     #[tokio::test]
@@ -1816,24 +2025,28 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let est = FakeEstablisher {
-            fail_wildcard: true,
+            fail_subscribe: true,
             ..Default::default()
         };
         let close_calls = Arc::clone(&est.sub_close_calls);
         let health = Arc::new(SubHealth::new(None));
         let (events, _rx) = broadcast::channel(4);
         let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        let scope = SubscribeScope {
+            clusters: Vec::new().into(),
+            events: Arc::new(EventScope::Wildcard),
+        };
         let err = run_subscription_once(
             5,
             &native,
             &events,
-            &[],
+            &scope,
             &health,
             tokio::time::Instant::now(),
             0,
         )
         .await
-        .expect_err("subscribe_wildcard 失敗は Err で伝播すること");
+        .expect_err("subscribe 失敗は Err で伝播すること");
         assert_eq!(err.kind, mat_core::error::ErrorKind::SessionFailed);
         assert_eq!(
             close_calls.load(Ordering::SeqCst),
@@ -2020,6 +2233,7 @@ mod tests {
             dir.path().to_path_buf(),
             tx,
             None,
+            EventScope::Wildcard,
             Arc::clone(&health),
         );
         // リトライが実際に回っていることを先に確かめる。
@@ -2059,10 +2273,17 @@ mod tests {
         let est = FakeEstablisher::default();
         let native = crate::native::NativeBackend::with_establisher(Box::new(est));
         let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = broadcast::channel(64);
+        let (tx, rx) = broadcast::channel(64);
+        let mut rx = AttrRx(rx);
         let health = Arc::new(SubHealth::new(None));
-        let _handle =
-            spawn_subscription_manager(state, store_path.clone(), tx, None, Arc::clone(&health));
+        let _handle = spawn_subscription_manager(
+            state,
+            store_path.clone(),
+            tx,
+            None,
+            EventScope::Wildcard,
+            Arc::clone(&health),
+        );
         // supervisor に初回ティック（読み失敗）を踏ませてから store を作る。
         // start_paused の単一スレッド実行では、この sleep の await 中に
         // supervisor タスクが走る。
@@ -2105,10 +2326,17 @@ mod tests {
         let est = FakeEstablisher::default();
         let native = crate::native::NativeBackend::with_establisher(Box::new(est));
         let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
-        let (tx, mut rx) = broadcast::channel(64);
+        let (tx, rx) = broadcast::channel(64);
+        let mut rx = AttrRx(rx);
         let health = Arc::new(SubHealth::new(None));
-        let _handle =
-            spawn_subscription_manager(state, store_path.clone(), tx, None, Arc::clone(&health));
+        let _handle = spawn_subscription_manager(
+            state,
+            store_path.clone(),
+            tx,
+            None,
+            EventScope::Wildcard,
+            Arc::clone(&health),
+        );
         // 2 ノードぶんの priming 初着時刻（仮想時計）を記録する。
         let mut first_seen: std::collections::HashMap<u64, tokio::time::Instant> =
             std::collections::HashMap::new();
@@ -2458,5 +2686,252 @@ mod tests {
             SubHealth::new(Some(vec![0x0006, 0x0406])).clusters(),
             Some(&[0x0006u32, 0x0406][..])
         );
+    }
+
+    /// 最後に見た EventNumber は最大値を保つ（順不同で届いても後退しない）。
+    /// forget で痕跡ごと消える = 再購読は priming 全量からやり直す。
+    #[test]
+    fn note_event_number_keeps_the_max() {
+        let h = SubHealth::new(None);
+        assert_eq!(h.last_event_number(5), None);
+        h.note_event_number(5, 10, false);
+        h.note_event_number(5, 7, false);
+        assert_eq!(h.last_event_number(5), Some(10));
+        h.note_event_number(5, 11, false);
+        assert_eq!(h.last_event_number(5), Some(11));
+        h.forget(5);
+        assert_eq!(h.last_event_number(5), None);
+    }
+
+    /// live report の番号が既知値より小さい = デバイスのイベントログが
+    /// 巻き戻った（再起動 / カウンタリセット）。片方向ラッチのままだと以後の
+    /// 再購読が満たされない EventMin を送り続けるので、記録も巻き戻す。
+    /// priming は最大値のまま（EventFilters 無視デバイス対策）。
+    #[test]
+    fn note_event_number_rewinds_only_for_live_reports() {
+        let h = SubHealth::new(None);
+        h.note_event_number(5, 100, false);
+        h.note_event_number(5, 5, false);
+        assert_eq!(h.last_event_number(5), Some(100), "priming は後退させない");
+        h.note_event_number(5, 5, true);
+        assert_eq!(
+            h.last_event_number(5),
+            Some(5),
+            "live の巻き戻りは記録も巻き戻す"
+        );
+        // 巻き戻した後も通常の最大値ラッチに戻る。
+        h.note_event_number(5, 6, true);
+        assert_eq!(h.last_event_number(5), Some(6));
+    }
+
+    /// イベント行だけを n 件集める（属性行は読み飛ばす）。
+    async fn collect_event_lines(
+        rx: &mut broadcast::Receiver<Emitted>,
+        n: usize,
+    ) -> Vec<EventItem> {
+        let mut out = Vec::new();
+        while out.len() < n {
+            let got = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("イベント行が届かない")
+                .unwrap();
+            if let Emitted::Event(item) = got {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    /// spec §6.2 の核: 起動直後（最後の EventNumber を知らない）の priming
+    /// イベントは `priming: true`。pump が死んで再購読するときは EventMin =
+    /// 最後に見た番号 + 1 を載せ、そこで届く priming は盲目窓中の実イベント
+    /// なので `priming: false` で流す。
+    #[tokio::test(start_paused = true)]
+    async fn priming_events_become_real_events_once_event_min_is_known() {
+        use mat_controller::im::EventPathIn;
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        *est.sub_priming_events.lock().unwrap() =
+            vec![switch_press_event(12, 1), switch_press_event(10, 1)];
+        let priming_events = Arc::clone(&est.sub_priming_events);
+        let seen_min = Arc::clone(&est.sub_event_min);
+        let seen_paths = Arc::clone(&est.sub_event_paths);
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        let first = collect_event_lines(&mut rx, 2).await;
+        assert!(
+            first.iter().all(|e| e.priming),
+            "初回 priming は priming: true"
+        );
+        assert_eq!(
+            first.iter().map(|e| e.event_number).collect::<Vec<_>>(),
+            vec![10, 12],
+            "EventNumber 昇順で流す"
+        );
+        assert_eq!(*seen_min.lock().unwrap(), None, "初回は EventFilters 無し");
+        assert_eq!(
+            *seen_paths.lock().unwrap(),
+            vec![EventPathIn::WILDCARD_URGENT]
+        );
+        assert_eq!(health.last_event_number(5), Some(12));
+
+        // 盲目窓中に起きた 2 件（EventMin = 13 以上）を次の priming に用意する。
+        *priming_events.lock().unwrap() =
+            vec![switch_press_event(13, 1), switch_press_event(15, 1)];
+        // 確立の**あと**に注入して走っている pump を殺す = 再購読させる。
+        fail_next_report.store(1, std::sync::atomic::Ordering::SeqCst);
+        let second = collect_event_lines(&mut rx, 2).await;
+        assert!(
+            second.iter().all(|e| !e.priming),
+            "EventMin を知っている再購読の priming は実イベント: {second:?}"
+        );
+        assert_eq!(
+            *seen_min.lock().unwrap(),
+            Some(13),
+            "EventMin = 最後に見た番号 + 1"
+        );
+    }
+
+    /// pump が受けた live イベントは `Emitted::Event` で流れ、同じ ReportData
+    /// 由来の属性行と `timestamp` を共有する。番号は last_event_number へ。
+    #[tokio::test(start_paused = true)]
+    async fn live_events_share_the_report_timestamp_and_advance_event_min() {
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        let live = Arc::clone(&est.sub_live);
+        let live_events = Arc::clone(&est.sub_live_events);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        // 確立（priming 属性行）を待ってから live を注入する。
+        let priming = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("priming")
+            .unwrap();
+        assert!(matches!(priming, Emitted::Attribute(e) if e.priming));
+
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        live_events
+            .lock()
+            .unwrap()
+            .push_back(vec![switch_press_event(31, 1)]);
+
+        let attr = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("live 属性行")
+            .unwrap();
+        let Emitted::Attribute(attr) = attr else {
+            panic!("属性行が先に来るはず: {attr:?}");
+        };
+        assert!(!attr.priming);
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("live イベント行")
+            .unwrap();
+        let Emitted::Event(event) = event else {
+            panic!("イベント行が来るはず: {event:?}");
+        };
+        assert!(!event.priming);
+        assert_eq!(event.event_number, 31);
+        assert_eq!(
+            event.timestamp, attr.timestamp,
+            "同一 ReportData の属性行とイベント行は同じ受信時刻"
+        );
+        assert_eq!(health.last_event_number(5), Some(31));
+    }
+
+    /// デバイスのイベントログが巻き戻った（再起動 / カウンタリセット）ときは、
+    /// live report の番号まで記録も戻す。戻さないと以後の再購読は永久に
+    /// 満たされない EventMin を送り続け、盲目窓の回収が matd 再起動まで死ぬ。
+    #[tokio::test(start_paused = true)]
+    async fn live_event_below_the_stored_number_rewinds_event_min() {
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        // priming で 100 まで見た状態を作る。
+        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(100, 1)];
+        let live = Arc::clone(&est.sub_live);
+        let live_events = Arc::clone(&est.sub_live_events);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        let primed = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(primed[0].event_number, 100);
+        assert_eq!(health.last_event_number(5), Some(100));
+
+        // デバイスがログを巻き戻したあとの live イベント（番号 5）。
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        live_events
+            .lock()
+            .unwrap()
+            .push_back(vec![switch_press_event(5, 1)]);
+
+        let live_line = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(live_line[0].event_number, 5);
+        assert!(!live_line[0].priming);
+        assert_eq!(
+            health.last_event_number(5),
+            Some(5),
+            "live の巻き戻りは記録も巻き戻す（次の EventMin = 6）"
+        );
+    }
+
+    /// デバイスが EventFilters を無視してイベントログ全量を priming で返しても、
+    /// 盲目窓の契約は matd 側で守る: EventMin **未満**の priming イベントは
+    /// `priming: true` に落とす（捨てない — 消費者は priming 行を無視する契約
+    /// なので、落とすとワイヤの事実を隠すことになる）。EventMin **以上**だけが
+    /// 盲目窓中の実イベント = `priming: false`。
+    #[tokio::test(start_paused = true)]
+    async fn priming_events_below_event_min_are_downgraded_to_priming() {
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        // 1 回目の priming は 12 だけ → last = 12 → 再購読の EventMin = 13。
+        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(12, 1)];
+        let priming_events = Arc::clone(&est.sub_priming_events);
+        let seen_min = Arc::clone(&est.sub_event_min);
+        let fail_next_report = Arc::clone(&est.fail_next_report);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        let first = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(first[0].event_number, 12);
+        assert!(first[0].priming);
+        assert_eq!(health.last_event_number(5), Some(12));
+
+        // 2 回目の priming は 12（フィルタ無視の再送）と 13（盲目窓中の実イベント）。
+        *priming_events.lock().unwrap() =
+            vec![switch_press_event(12, 1), switch_press_event(13, 1)];
+        fail_next_report.store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let second = collect_event_lines(&mut rx, 2).await;
+        assert_eq!(*seen_min.lock().unwrap(), Some(13));
+        assert_eq!(
+            second
+                .iter()
+                .map(|e| (e.event_number, e.priming))
+                .collect::<Vec<_>>(),
+            vec![(12, true), (13, false)],
+            "EventMin 未満は priming: true のまま、以上だけ実イベント: {second:?}"
+        );
+        assert_eq!(health.last_event_number(5), Some(13));
+    }
+
+    /// `events = []`（`EventScope::Off`）は EventRequests / EventFilters を
+    /// 出さない = フェーズ A 以前のワイヤに戻る。
+    #[tokio::test]
+    async fn event_scope_off_sends_no_event_paths_and_no_event_min() {
+        let est = FakeEstablisher::default();
+        let seen_paths = Arc::clone(&est.sub_event_paths);
+        let seen_min = Arc::clone(&est.sub_event_min);
+        let (mut rx, _health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Off);
+
+        // priming 属性行が届いた時点で subscribe は呼ばれている。
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no event within 2s")
+            .unwrap();
+        assert!(seen_paths.lock().unwrap().is_empty());
+        assert_eq!(*seen_min.lock().unwrap(), None);
     }
 }

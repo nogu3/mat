@@ -4,22 +4,53 @@
 # virtual device", run with the real `matd` and `mat` binaries against the
 # real `matv` device host (no mocks on either side of the socket).
 #
-# Flow: build the workspace (release) -> run `matv` (single onoff-light
-# device, EP1=Aggregator/EP2=the light per `mat-device`'s bridge topology) in
+# Flow: build the workspace (release) -> run `matv` (EP1=Aggregator per
+# `mat-device`'s bridge topology, then one endpoint per `[[device]]` in
+# declaration order: EP2=the onoff light, EP3=a Generic Switch, EP4=a
+# contact sensor; `--stdin-control` with stdin on a fifo the script holds
+# open, so the two event-emitting devices can be stimulated on demand) in
 # the background -> `mat fabric init` + `mat commission` into a throwaway
-# store (same as e2e-device-m1.sh) -> `mat group provision` against the
+# store (same as e2e-device-m1.sh) -> `mat describe`, asserting the
+# endpoint ledger (light on $DEVICE_EP, switch/booleanstate endpoints read
+# off the wire rather than hard-coded) -> `mat group provision` against the
 # commissioned node, asserting `status:"provisioned"` (the KeySetWrite +
 # group-key-map write + AddGroup + ACL write sequence actually lands on
 # matv) -> `mat group list`, asserting the provisioned group shows up in the
 # controller kvs -> `mat group remove` (asserting all four removal steps
 # landed on matv and no groups or non-IPK keysets remain in the controller
 # kvs — keyset 0 itself may or may not be visible in that chain) ->
-# `mat group provision` again -> start `matd` against the same store, poll
+# `mat group provision` again -> write `<store>/subscriptions.toml` with
+# `events = ["switch", "booleanstate"]` and *no* `clusters` key (attributes
+# stay full wildcard; this also exercises matd accepting an events-only
+# config) -> start `matd` against the same store, poll
 # `matd status` until its
 # resident wildcard Subscribe to node 1 reaches `state:"established"` ->
 # start `mat listen --count 1` in the background -> `mat on` (routed through
 # matd) -> assert the backgrounded `mat listen` received an onoff on-off=true
-# event before its budget ran out.
+# event before its budget ran out -> three event-subscription legs:
+#
+#   leg A: `mat listen --cluster switch --event --count 2` + a short press on
+#          the Generic Switch -> `initial-press` then `short-release`, in
+#          ascending EventNumber, `priming:false`, no `attribute` key.
+#   leg B: `mat listen --cluster booleanstate --count 2` + a contact-sensor
+#          close -> both shapes for the one transition: the attribute line
+#          (`state-value` = true) and the event line (`state-change` with
+#          `data.state-value` = true), in either order.
+#   leg C: EventMin recovery. A direct-path op with *no* `MAT_MATD_SOCKET`
+#          (so no `node_touched` hint) evicts matd's subscribe session
+#          without matd noticing -> the contact sensor opens during that
+#          blind window (nobody is subscribed) -> a `mat listen` client
+#          attaches -> a second direct-path op *with* `MAT_MATD_SOCKET`
+#          sends the hint, matd re-subscribes with `EventMin = last + 1`,
+#          and the blind-window event comes back inside the priming payload
+#          as `priming:false` (matd re-checks the number itself rather than
+#          trusting the device's EventFilters). matd's "subscription
+#          established" log line must carry `event_min = Some(..)` for that
+#          attempt.
+#
+# There is deliberately no "restart matd" leg: a fresh matd has no last
+# EventNumber, so it subscribes without EventMin and every priming event is
+# `priming:true` by design — nothing to assert about recovery there.
 #
 # Why the toggle might show up as `recovered:true` rather than a live dirty
 # report: `matd` holds the resident Subscribe on a *dedicated* CASE session,
@@ -46,7 +77,11 @@
 #   MAT_E2E_TIMEOUT_S  seconds budgeted for `mat commission`, for matd's
 #                      subscription to node 1 to reach `established`, and
 #                      (in ms) for `mat listen`'s receive window (default:
-#                      30).
+#                      30). Keep it well under ~90 s: leg C's blind window
+#                      only holds while it stays shorter than matd's silence
+#                      deadline (max_interval 60 s + slack), otherwise matd
+#                      re-subscribes on its own mid-window and the recovery
+#                      event is delivered to nobody.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -68,6 +103,17 @@ MATD_STDOUT="$WORKDIR/matd.stdout.log"
 MATD_STDERR="$WORKDIR/matd.stderr.log"
 LISTEN_STDOUT="$WORKDIR/listen.stdout.log"
 LISTEN_STDERR="$WORKDIR/listen.stderr.log"
+# events 脚（A/B/C）はそれぞれ別の `mat listen` を起こすので、行の混線を避ける
+# ために脚ごとにログを分ける。
+LISTEN_A_STDOUT="$WORKDIR/listen-a.stdout.log"
+LISTEN_A_STDERR="$WORKDIR/listen-a.stderr.log"
+LISTEN_B_STDOUT="$WORKDIR/listen-b.stdout.log"
+LISTEN_B_STDERR="$WORKDIR/listen-b.stderr.log"
+LISTEN_C_STDOUT="$WORKDIR/listen-c.stdout.log"
+LISTEN_C_STDERR="$WORKDIR/listen-c.stderr.log"
+# matv の `--stdin-control` へ刺激（ボタン押下 / 接点開閉）を流す名前付きパイプ。
+MATV_STDIN="$WORKDIR/matv.stdin"
+SUBSCRIPTIONS_TOML="$MAT_STORE_DIR/subscriptions.toml"
 mkdir -p "$DEVICE_STORE" "$MAT_STORE_DIR"
 
 # jq is NOT guaranteed on the host running this script — see
@@ -166,6 +212,9 @@ cleanup() {
         kill "$DEVICE_PID" 2>/dev/null || true
         wait "$DEVICE_PID" 2>/dev/null || true
     fi
+    # fifo の書き手（`exec 3<>` で開きっぱなしにしている fd）を閉じる。まだ
+    # 開いていない段（mkfifo より前の失敗）で呼ばれても害が無いよう握り潰す。
+    exec 3>&- 2>/dev/null || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -186,13 +235,55 @@ iface = "$IFACE"
 id = "e2e-light"
 kind = "onoff-light"
 name = "E2E Light"
+
+# 宣言順 = endpoint 採番順。light を先頭に残すことで EP2 = light（既存脚の
+# DEVICE_EP）が動かない。以降の 2 台は events 脚（イベント購読）用で、
+# どちらも --stdin-control の刺激で動く。
+# （この heredoc は unquoted なので、コメントにもバッククォート・$ を書かない。）
+[[device]]
+id = "btn"
+kind = "switch"
+name = "E2E Button"
+
+[[device]]
+id = "door"
+kind = "contact-sensor"
+name = "E2E Door"
 EOF
 
-echo "==> starting matv (iface=$IFACE, store=$DEVICE_STORE)" >&2
+# 刺激の投入口。`3<>`（read/write）で開くのは、`3>`（write only）だと読み手が
+# 現れるまで open がブロックしてしまうため — この fd はスクリプトが最後まで
+# 握り続けるので matv の stdin に EOF が来ず、`--stdin-control` のフックが
+# 途中で畳まれることもない（cleanup で閉じる）。
+mkfifo "$MATV_STDIN"
+exec 3<>"$MATV_STDIN"
+
+echo "==> starting matv (iface=$IFACE, store=$DEVICE_STORE, stdin-control)" >&2
 RUST_LOG="${RUST_LOG:-info}" \
-    ./target/release/matv --config "$MATV_CONFIG" \
-    >"$DEVICE_STDOUT" 2>"$DEVICE_STDERR" &
+    ./target/release/matv --config "$MATV_CONFIG" --stdin-control \
+    <"$MATV_STDIN" >"$DEVICE_STDOUT" 2>"$DEVICE_STDERR" &
 DEVICE_PID=$!
+
+# fifo に刺激 1 行を書き、matv が `applied` 行を stdout に返すまで待つ
+# （投入の着地を確認してから購読側の assert に進むため）。
+send_stimulus() {
+    local line="$1" before after deadline
+    before=$(grep -c '"applied"' "$DEVICE_STDOUT" || true)
+    printf '%s\n' "$line" >&3
+    deadline=$((SECONDS + TIMEOUT_S))
+    while ((SECONDS < deadline)); do
+        after=$(grep -c '"applied"' "$DEVICE_STDOUT" || true)
+        if ((after > before)); then
+            echo "==> stimulus applied: $line" >&2
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "matv never applied the stimulus $line (budget ${TIMEOUT_S}s):" >&2
+    echo "-- matv stdout --" >&2; tail -n 20 "$DEVICE_STDOUT" >&2
+    echo "-- matv stderr --" >&2; tail -n 40 "$DEVICE_STDERR" >&2
+    exit 1
+}
 
 # matv prints exactly one JSON line to stdout before entering the serve
 # loop (mat 流儀: stdout=JSON, ログ=stderr).
@@ -242,6 +333,36 @@ echo "$COMMISSION_JSON"
 STATUS="$(json_get status "$COMMISSION_JSON")"
 [[ "$STATUS" == "success" ]]
 echo "==> commissioned (node=$NODE_ID)" >&2
+
+# endpoint 採番は `[[device]]` の宣言順という規約だが、決め打ちせずに
+# `mat describe` の server-list から引く（規約が変わったら数値ではなく
+# ここが落ちる）。cluster 6 = onoff、59 = switch、69 = booleanstate。
+echo "==> mat describe (endpoint ledger: light / btn / door)" >&2
+DESCRIBE_JSON="$(
+    MAT_STORE="$MAT_STORE_DIR" \
+        ./target/release/mat --iface "$IFACE" describe --node "$NODE_ID"
+)"
+echo "$DESCRIBE_JSON" >&2
+ENDPOINTS="$(printf '%s' "$DESCRIBE_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+want = [(6, "light"), (59, "btn"), (69, "door")]
+found = {}
+for ep in d["endpoints"]:
+    for cluster_id, name in want:
+        if cluster_id in ep["clusters"]:
+            assert name not in found, ("two endpoints claim " + name, d)
+            found[name] = ep["endpoint"]
+missing = [name for _, name in want if name not in found]
+assert not missing, ("no endpoint serves " + ",".join(missing), d)
+print(found["light"], found["btn"], found["door"])
+')"
+read -r LIGHT_EP BTN_EP DOOR_EP <<<"$ENDPOINTS"
+[[ "$LIGHT_EP" == "$DEVICE_EP" ]] || {
+    echo "the onoff light moved off endpoint $DEVICE_EP (describe says $LIGHT_EP): $DESCRIBE_JSON" >&2
+    exit 1
+}
+echo "==> PASS: endpoints — light=$LIGHT_EP btn=$BTN_EP door=$DOOR_EP" >&2
 
 echo "==> mat group provision (group=$GROUP_ID, node=$NODE_ID, endpoint=$DEVICE_EP)" >&2
 GROUP_JSON="$(
@@ -323,7 +444,14 @@ echo "$READ_JSON"
 echo "==> PASS: groupcast on reached matv over multicast (on-off=true)" >&2
 MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" off --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
 
-echo "==> starting matd (store=$MAT_STORE_DIR, iface=$IFACE, socket=$MATD_SOCK)" >&2
+# イベント購読の範囲設定。`clusters` キーを **書かない** = 属性は full wildcard
+# のまま（既存の onoff listen 脚は無改変で通る）。`events` だけの config を matd
+# が受理することの実走確認も兼ねる。
+cat >"$SUBSCRIPTIONS_TOML" <<'EOF'
+events = ["switch", "booleanstate"]
+EOF
+
+echo "==> starting matd (store=$MAT_STORE_DIR, iface=$IFACE, socket=$MATD_SOCK, subscriptions.toml: events-only)" >&2
 RUST_LOG="${RUST_LOG:-info}" \
     ./target/release/matd --store "$MAT_STORE_DIR" --iface "$IFACE" --socket "$MATD_SOCK" \
     >"$MATD_STDOUT" 2>"$MATD_STDERR" &
@@ -507,3 +635,207 @@ if [[ "$EVT_NODE" != "$NODE_ID" || "$EVT_CLUSTER" != "onoff" || "$EVT_ATTR" != "
 fi
 
 echo "==> PASS: matd's resident Subscribe delivered the on-off=true event through mat listen: $EVENT_LINE" >&2
+
+# ---------------------------------------------------------------------------
+# events legs — matv の刺激 → matd の常駐 Subscribe（EventRequests 付き） →
+# `mat listen --event`。上の onoff 脚と同じ matd / 同じ購読を使い回す。
+# ---------------------------------------------------------------------------
+
+# `mat listen` が matd の event bus に繋がるまで待つ（上の onoff 脚と同じ
+# 「matd 側から観測する」やり方 — ack 行は出力されないため）。脚を跨いで
+# 使うので、開始前の "listen client attached" 件数からの増加で判定する。
+wait_listen_attached() {
+    local before="$1" pid="$2" out="$3" err="$4" after deadline
+    deadline=$((SECONDS + TIMEOUT_S))
+    while ((SECONDS < deadline)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "mat listen exited before attaching to matd:" >&2
+            echo "-- stdout --" >&2; cat "$out" >&2
+            echo "-- stderr --" >&2; cat "$err" >&2
+            exit 1
+        fi
+        after=$(grep -c "listen client attached" "$MATD_STDERR" || true)
+        if ((after > before)); then
+            echo "==> mat listen attached (attached clients so far: $after)" >&2
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "mat listen never attached to matd (\"listen client attached\" stuck at $before, budget ${TIMEOUT_S}s):" >&2
+    tail -n 60 "$MATD_STDERR" >&2
+    exit 1
+}
+
+# JSON 形状の assert が落ちたときの診断出力。cleanup が WORKDIR を無条件に
+# 消すので、ここで matd / matv のログ末尾を出しておかないとイベント購読が
+# 壊れたときの手がかりが永久に失われる（他の失敗経路と同じ扱いに揃える）。
+fail_leg() {
+    local leg="$1" out="$2" err="$3"
+    echo "==> FAIL: events $leg — JSON shape assertion failed (python traceback above)" >&2
+    echo "-- mat listen stdout --" >&2; cat "$out" >&2 || true
+    echo "-- mat listen stderr --" >&2; tail -n 40 "$err" >&2 || true
+    echo "-- matd stderr tail --" >&2; tail -n 40 "$MATD_STDERR" >&2 || true
+    echo "-- matv stderr tail --" >&2; tail -n 40 "$DEVICE_STDERR" >&2 || true
+    exit 1
+}
+
+# 背景の `mat listen`（$LISTEN_PID）の終了を待ち、stdout を出して 0 終了を確かめる。
+finish_listen() {
+    local out="$1" err="$2" code=0
+    echo "==> waiting for mat listen (pid $LISTEN_PID) to finish (budget ${LISTEN_TIMEOUT_MS}ms)" >&2
+    wait "$LISTEN_PID" || code=$?
+    LISTEN_PID=""
+    echo "-- mat listen stdout --" >&2
+    cat "$out" >&2
+    if ((code != 0)); then
+        echo "mat listen exited $code:" >&2
+        echo "-- stderr --" >&2; cat "$err" >&2
+        echo "-- matd stderr tail --" >&2; tail -n 60 "$MATD_STDERR" >&2
+        exit 1
+    fi
+}
+
+echo "==> events leg A: mat listen --cluster switch --event --count 2 (short press on btn, endpoint $BTN_EP)" >&2
+ATTACH_BEFORE=$(grep -c "listen client attached" "$MATD_STDERR" || true)
+MAT_STORE="$MAT_STORE_DIR" \
+    ./target/release/mat listen \
+        --node "$NODE_ID" --cluster switch --event \
+        --count 2 --timeout-ms "$LISTEN_TIMEOUT_MS" \
+        --matd "$MATD_SOCK" \
+        >"$LISTEN_A_STDOUT" 2>"$LISTEN_A_STDERR" &
+LISTEN_PID=$!
+wait_listen_attached "$ATTACH_BEFORE" "$LISTEN_PID" "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
+send_stimulus '{"device":"btn","press":"short"}'
+finish_listen "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
+if ! python3 - "$LISTEN_A_STDOUT" "$NODE_ID" "$BTN_EP" <<'PY'
+import json, sys
+path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+lines = [json.loads(l) for l in open(path) if l.strip()]
+assert len(lines) == 2, lines
+first, second = lines
+for e in lines:
+    assert e["node_id"] == node_id, e
+    assert e["endpoint"] == endpoint, e
+    assert e["cluster"] == "switch", e
+    assert e["priority"] == "info", e
+    assert e["priming"] is False, e
+    # イベント行に属性側のキーは付かない（欠落回収は EventNumber で行う）。
+    assert "attribute" not in e, e
+    assert "recovered" not in e, e
+assert first["event"] == "initial-press", first
+assert first["data"] == {"new-position": 1}, first
+assert second["event"] == "short-release", second
+assert second["data"] == {"previous-position": 1}, second
+assert second["event_number"] > first["event_number"], lines
+PY
+then
+    fail_leg "leg A" "$LISTEN_A_STDOUT" "$LISTEN_A_STDERR"
+fi
+echo "==> PASS: leg A — switch initial-press + short-release in ascending EventNumber (priming:false)" >&2
+
+echo "==> events leg B: mat listen --cluster booleanstate --count 2 (door closes, endpoint $DOOR_EP)" >&2
+ATTACH_BEFORE=$(grep -c "listen client attached" "$MATD_STDERR" || true)
+MAT_STORE="$MAT_STORE_DIR" \
+    ./target/release/mat listen \
+        --node "$NODE_ID" --cluster booleanstate \
+        --count 2 --timeout-ms "$LISTEN_TIMEOUT_MS" \
+        --matd "$MATD_SOCK" \
+        >"$LISTEN_B_STDOUT" 2>"$LISTEN_B_STDERR" &
+LISTEN_PID=$!
+wait_listen_attached "$ATTACH_BEFORE" "$LISTEN_PID" "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
+send_stimulus '{"device":"door","state":true}'
+finish_listen "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
+if ! python3 - "$LISTEN_B_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
+import json, sys
+path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+lines = [json.loads(l) for l in open(path) if l.strip()]
+assert len(lines) == 2, lines
+# 1 つの遷移が属性行とイベント行の両方で届く（順不同）。
+attrs = [e for e in lines if "attribute" in e]
+events = [e for e in lines if "event" in e]
+assert len(attrs) == 1 and len(events) == 1, lines
+a, ev = attrs[0], events[0]
+for e in lines:
+    assert e["node_id"] == node_id, e
+    assert e["endpoint"] == endpoint, e
+    assert e["cluster"] == "booleanstate", e
+assert a["attribute"] == "state-value", a
+assert a["value"] is True, a
+assert ev["event"] == "state-change", ev
+assert ev["data"] == {"state-value": True}, ev
+assert ev["priming"] is False, ev
+PY
+then
+    fail_leg "leg B" "$LISTEN_B_STDOUT" "$LISTEN_B_STDERR"
+fi
+echo "==> PASS: leg B — one booleanstate transition delivered as both an attribute line and a state-change event line" >&2
+
+# 脚 C: EventMin 回収。matd が「購読が死んだ」ことを知らないまま実イベントが
+# 起きる盲目窓を作り、再購読時の EventFilters（EventMin = last + 1）でそれが
+# 回収されること（= priming の全量返しではなく実イベント）を確かめる。
+echo "==> events leg C: EventMin recovery across a blind window" >&2
+EVENTMIN_BEFORE=$(grep -cE "event_min ?= ?Some\(" "$MATD_STDERR" || true)
+SUBS_BEFORE=$(grep -c "subscription transport bound" "$MATD_STDERR" || true)
+
+# MAT_MATD_SOCKET を **渡さない** 直経路 op。matv の唯一の CASE セッション
+# （= matd の購読）を奪うが、node_touched ヒントは飛ばないので matd は気づか
+# ない（無音 deadline は max_interval + slack ＝ ずっと先）。ここから盲目窓。
+echo "==> evicting matd's subscribe session silently (direct-path op, no node_touched hint)" >&2
+MAT_STORE="$MAT_STORE_DIR" MAT_MATD=0 \
+    ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+
+# 盲目窓の中で起きる実イベント（購読者はゼロ、matv のイベントログにだけ残る）。
+send_stimulus '{"device":"door","state":false}'
+
+# 回収先の listen を先に繋いでおく（再購読の priming より後に繋ぐと取り逃す）。
+ATTACH_BEFORE=$(grep -c "listen client attached" "$MATD_STDERR" || true)
+MAT_STORE="$MAT_STORE_DIR" \
+    ./target/release/mat listen \
+        --node "$NODE_ID" --cluster booleanstate --event state-change \
+        --count 1 --timeout-ms "$LISTEN_TIMEOUT_MS" \
+        --matd "$MATD_SOCK" \
+        >"$LISTEN_C_STDOUT" 2>"$LISTEN_C_STDERR" &
+LISTEN_PID=$!
+wait_listen_attached "$ATTACH_BEFORE" "$LISTEN_PID" "$LISTEN_C_STDOUT" "$LISTEN_C_STDERR"
+
+# ここで初めて matd に「セッションが塗り替えられた」と教える（MAT_MATD_SOCKET
+# 付き = node_touched ヒント、rotate 脚と同じ撃ち方）。この op 自身のセッション
+# は mat の終了で閉じるので、matd の再購読を後から奪うものはもう無い。
+echo "==> direct-path op *with* MAT_MATD_SOCKET (node_touched hint) — matd must resubscribe with EventMin" >&2
+MAT_STORE="$MAT_STORE_DIR" MAT_MATD=0 MAT_MATD_SOCKET="$MATD_SOCK" \
+    ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+
+finish_listen "$LISTEN_C_STDOUT" "$LISTEN_C_STDERR"
+if ! python3 - "$LISTEN_C_STDOUT" "$NODE_ID" "$DOOR_EP" <<'PY'
+import json, sys
+path, node_id, endpoint = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+lines = [json.loads(l) for l in open(path) if l.strip()]
+assert len(lines) == 1, lines
+ev = lines[0]
+assert ev["node_id"] == node_id, ev
+assert ev["endpoint"] == endpoint, ev
+assert ev["cluster"] == "booleanstate", ev
+assert ev["event"] == "state-change", ev
+assert ev["data"] == {"state-value": False}, ev
+# 盲目窓中の実イベントとして回収された証拠（priming の全量返しなら true）。
+assert ev["priming"] is False, ev
+assert "attribute" not in ev, ev
+PY
+then
+    fail_leg "leg C" "$LISTEN_C_STDOUT" "$LISTEN_C_STDERR"
+fi
+
+SUBS_AFTER=$(grep -c "subscription transport bound" "$MATD_STDERR" || true)
+if ! ((SUBS_AFTER > SUBS_BEFORE)); then
+    echo "matd never established a fresh subscription CASE for the recovery leg (stuck at $SUBS_BEFORE)" >&2
+    tail -n 80 "$MATD_STDERR" >&2
+    exit 1
+fi
+EVENTMIN_AFTER=$(grep -cE "event_min ?= ?Some\(" "$MATD_STDERR" || true)
+if ! ((EVENTMIN_AFTER > EVENTMIN_BEFORE)); then
+    echo "matd's \"subscription established\" line never carried event_min = Some(..) (stuck at $EVENTMIN_BEFORE)" >&2
+    grep "subscription established" "$MATD_STDERR" >&2 || true
+    exit 1
+fi
+grep -E "event_min ?= ?Some\(" "$MATD_STDERR" | tail -n1 >&2
+echo "==> PASS: leg C — the blind-window state-change(false) came back through EventMin recovery as priming:false (subscription CASEs $SUBS_BEFORE -> $SUBS_AFTER)" >&2

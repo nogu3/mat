@@ -145,11 +145,64 @@ clusters = [
   that exposes none of the listed clusters will never establish its subscription
   (it retries on backoff forever). Ensure each node serves at least one of the
   listed clusters.
-- When this file is present, `mat listen` only ever sees events for the
-  listed clusters — a `--cluster` filter naming a cluster outside that set
-  simply never matches anything.
+- When this file is present, `mat listen`'s **attribute** lines only ever
+  come from the listed clusters — a `--cluster` filter naming a cluster
+  outside that set simply never matches anything on the attribute side.
+  (This narrows attribute paths only; the `events` key below narrows
+  **event** paths independently — see there for what "no event lines
+  outside the list" means on the event side.)
 - Read once at `matd` startup; an edit needs a `matd` restart to take effect
   (e.g. `systemctl --user restart matd`).
 - `mat` (one-shot) never reads this file — like the rest of the resident
   Subscribe, it is matd-only.
+
+### `events` — event subscription scope
+
+`events` is independent of `clusters` above: `clusters` narrows the
+**attribute** paths of the resident Subscribe, `events` controls which
+clusters' **events** (`EventRequests`) it asks for. Either key can be present
+without the other, and a file with only one of them is valid.
+
+```toml
+# All three forms are independent of `clusters`.
+events = ["switch", "booleanstate"]   # only these clusters' events
+events = []                           # no EventRequests at all
+# events key omitted entirely          -> all clusters' events (wildcard)
+```
+
+- **Key absent** — every cluster's events, urgent priority (the same
+  wildcard discipline as an absent `subscriptions.toml`).
+- **`events = [...]`** — only the listed clusters' events, urgent priority.
+  Same name/numeric resolution as `clusters` (chip-tool notation or
+  `"0x0006"`/`"6"`, unknown names are `store_parse`).
+- **`events = []`** — no `EventRequests` at all: the resident Subscribe goes
+  out exactly as it did before event subscription support (Phase A), i.e.
+  attribute reports only.
+- All event paths are sent `IsUrgent = true` regardless of which of the
+  three forms is in effect — there is no non-urgent option (see [Resident
+  Subscribe and `mat listen`](commands.md#resident-subscribe-and-mat-listen)
+  for why).
+- **Rollout / canary.** Order matters: **update the `mat listen` consumers
+  first**, then enable `events`. Even the narrow canary list puts
+  `booleanstate` `state-change` lines (and `switch` presses) into every
+  unfiltered `mat listen` stream, and those lines count against `--count`,
+  so a consumer doing `mat listen --count 1` can get an event line where it
+  used to get an attribute line. Give each consumer either a branch on the
+  `attribute` / `event` key or an explicit `--attribute` flag before turning
+  the key on. Then start production `matd` with `events = ["switch",
+  "booleanstate"]` rather than jumping straight to wildcard: watch priming
+  time across all nodes and stderr for any device rejecting the
+  `EventRequests` path — `matd` logs one `warn` per report with
+  `rejected` (count) plus the first rejected endpoint/cluster/event/status,
+  and `INVALID_ACTION` during establish/priming — then widen by removing the
+  `events` key entirely once that looks clean. `events = []` is the instant
+  off switch if the widen step goes wrong.
+- **Upgrade caveat — absent means wildcard.** Upgrading `matd` to a
+  phase-B-or-later build with an *existing* `subscriptions.toml` that has no
+  `events` key turns on wildcard event subscriptions for every commissioned
+  node the moment `matd` restarts (the same absent-file default as
+  `clusters`, but new behavior the day this key first exists). If that is
+  not what you want on day one, add an explicit `events = [...]` (or
+  `events = []`) line to `subscriptions.toml` **before** deploying the
+  upgrade, following the canary path above.
 

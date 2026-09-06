@@ -134,7 +134,11 @@ events). Virtual buttons and sensors are driven from stdin with
 Each applied stimulus prints `{"device":..,"applied":..,"event_numbers":[..]}`
 on stdout; a bad line prints a `{"error":{"kind":..}}` line on stderr and the
 hook keeps reading. Events reach a subscriber through the subscription's
-EventReports (`mat listen` support lands in a later release).
+EventReports — run `mat listen --event` in another terminal to stream them:
+
+```json
+{"timestamp":"2026-09-06T21:00:00+09:00","node_id":1,"endpoint":3,"cluster":"switch","event":"initial-press","event_number":3,"priority":"info","data":{"new-position":1},"priming":false}
+```
 
 `matv` also receives groupcast: it binds a second UDP socket on `5540`
 (the Matter groupcast multicast destination port; SO_REUSEPORT so several

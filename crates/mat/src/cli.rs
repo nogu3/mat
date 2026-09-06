@@ -339,6 +339,7 @@ pub enum Command {
     /// （matd 専用 — matd 不在時は `matd_unavailable` / exit 13。direct
     /// fallback は無い）。1 行 1 JSON。`--count` 到達で exit 0（0 = 無期限）、
     /// `--timeout-ms` 経過で打ち切り（0 = 無期限）。0 件で timeout は exit 3。
+    /// 既定（`--attribute` も `--event` も無し）は属性行・イベント行の両方を流す。
     Listen {
         /// フィルタ: node_id または node alias（省略 = 全ノード）。
         #[arg(short = 'n', long = "node", value_name = "N|ALIAS")]
@@ -350,8 +351,20 @@ pub enum Command {
         #[arg(short = 'c', long, value_name = "NAME")]
         cluster: Option<String>,
         /// フィルタ: 属性名（chip-tool 表記、--cluster 必須）または数値 ID。
-        #[arg(short = 'a', long, value_name = "NAME")]
+        /// 指定すると属性行のみを流す（`--event` と同時指定不可）。
+        #[arg(short = 'a', long, value_name = "NAME", conflicts_with = "event")]
         attribute: Option<String>,
+        /// フィルタ: イベント名（chip-tool 表記、--cluster 必須）または数値 ID。
+        /// 指定するとイベント行のみを流す（`--attribute` と同時指定不可）。
+        /// 値を省略すると全イベント名が対象（`--event` 単独 = ワイルドカード）。
+        #[arg(
+            long,
+            value_name = "NAME",
+            num_args = 0..=1,
+            default_missing_value = "*",
+            conflicts_with = "attribute"
+        )]
+        event: Option<String>,
         /// 受信するイベント数（到達で exit 0、0 = 無期限。`--timeout-ms 0`
         /// と対称の意味論）。
         #[arg(long, value_name = "N", default_value_t = 1)]

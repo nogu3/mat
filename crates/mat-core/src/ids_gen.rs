@@ -3,7 +3,7 @@
 // scripts/gen-ids.py のヘッダ参照。
 #![cfg_attr(rustfmt, rustfmt::skip)]
 #![allow(clippy::unreadable_literal)]
-use super::ids::{AttrDef, ClusterDef, CmdDef, FieldDef, StructDef, StructField, Ty, TypeTag};
+use super::ids::{AttrDef, ClusterDef, CmdDef, EventDef, EventFieldDef, FieldDef, StructDef, StructField, Ty, TypeTag};
 
 static S_ACCESSCONTROL_ACCESSCONTROLENTRYSTRUCT: StructDef = StructDef { name: "AccessControlEntryStruct", fields: &[
     StructField { name: "privilege", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false },
@@ -1251,6 +1251,11 @@ static ATTRS_ACCESSCONTROL: &[AttrDef] = &[
 static CMDS_ACCESSCONTROL: &[CmdDef] = &[
     CmdDef { name: "review-fabric-restrictions", id: 0x00, timed: false, fields: &[FieldDef { name: "arl", ty: Ty::ListOfStruct(&S_ACCESSCONTROL_COMMISSIONINGACCESSRESTRICTIONENTRYSTRUCT), optional: false }] },
 ];
+static EVENTS_ACCESSCONTROL: &[EventDef] = &[
+    EventDef { name: "access-control-entry-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "admin-node-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "admin-passcode-id", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "change-type", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "latest-value", id: 4, ty: Ty::Struct(&S_ACCESSCONTROL_ACCESSCONTROLENTRYSTRUCT), optional: false }] },
+    EventDef { name: "access-control-extension-changed", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "admin-node-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "admin-passcode-id", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "change-type", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "latest-value", id: 4, ty: Ty::Struct(&S_ACCESSCONTROL_ACCESSCONTROLEXTENSIONSTRUCT), optional: false }] },
+    EventDef { name: "fabric-restriction-review-update", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "token", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "instruction", id: 1, ty: Ty::Scalar(TypeTag::Str), optional: true }, EventFieldDef { name: "arl-request-flow-url", id: 2, ty: Ty::Scalar(TypeTag::Str), optional: true }] },
+];
 static ATTRS_ACCOUNTLOGIN: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1262,6 +1267,9 @@ static CMDS_ACCOUNTLOGIN: &[CmdDef] = &[
     CmdDef { name: "get-setup-pin", id: 0x00, timed: true, fields: &[FieldDef { name: "temp-account-identifier", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
     CmdDef { name: "login", id: 0x02, timed: true, fields: &[FieldDef { name: "temp-account-identifier", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "setup-pin", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "node", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
     CmdDef { name: "logout", id: 0x03, timed: true, fields: &[FieldDef { name: "node", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+];
+static EVENTS_ACCOUNTLOGIN: &[EventDef] = &[
+    EventDef { name: "logged-out", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "node", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
 static ATTRS_ACTIONS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1287,6 +1295,10 @@ static CMDS_ACTIONS: &[CmdDef] = &[
     CmdDef { name: "start-action-with-duration", id: 0x03, timed: false, fields: &[FieldDef { name: "action-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "invoke-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "duration", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "stop-action", id: 0x04, timed: false, fields: &[FieldDef { name: "action-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "invoke-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
+static EVENTS_ACTIONS: &[EventDef] = &[
+    EventDef { name: "action-failed", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "action-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "invoke-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "new-state", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "error", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "state-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "action-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "invoke-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "new-state", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_ACTIVATEDCARBONFILTERMONITORING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1303,6 +1315,8 @@ static ATTRS_ACTIVATEDCARBONFILTERMONITORING: &[AttrDef] = &[
 static CMDS_ACTIVATEDCARBONFILTERMONITORING: &[CmdDef] = &[
     CmdDef { name: "reset-condition", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_ACTIVATEDCARBONFILTERMONITORING: &[EventDef] = &[
+];
 static ATTRS_ADMINISTRATORCOMMISSIONING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "admin-fabric-index", id: 0x0001, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
@@ -1318,6 +1332,8 @@ static CMDS_ADMINISTRATORCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "open-commissioning-window", id: 0x00, timed: true, fields: &[FieldDef { name: "commissioning-timeout", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "pake-passcode-verifier", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "discriminator", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "iterations", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "salt", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
     CmdDef { name: "revoke-commissioning", id: 0x02, timed: true, fields: &[] },
 ];
+static EVENTS_ADMINISTRATORCOMMISSIONING: &[EventDef] = &[
+];
 static ATTRS_AIRQUALITY: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "air-quality", id: 0x0000, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
@@ -1327,6 +1343,8 @@ static ATTRS_AIRQUALITY: &[AttrDef] = &[
     AttrDef { name: "generated-command-list", id: 0xfff8, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_AIRQUALITY: &[CmdDef] = &[
+];
+static EVENTS_AIRQUALITY: &[EventDef] = &[
 ];
 static ATTRS_APPLICATIONBASIC: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1345,6 +1363,8 @@ static ATTRS_APPLICATIONBASIC: &[AttrDef] = &[
 ];
 static CMDS_APPLICATIONBASIC: &[CmdDef] = &[
 ];
+static EVENTS_APPLICATIONBASIC: &[EventDef] = &[
+];
 static ATTRS_APPLICATIONLAUNCHER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1359,6 +1379,8 @@ static CMDS_APPLICATIONLAUNCHER: &[CmdDef] = &[
     CmdDef { name: "launch-app", id: 0x00, timed: false, fields: &[FieldDef { name: "application", ty: Ty::Struct(&S_APPLICATIONLAUNCHER_APPLICATIONSTRUCT), optional: true }, FieldDef { name: "data", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
     CmdDef { name: "stop-app", id: 0x01, timed: false, fields: &[FieldDef { name: "application", ty: Ty::Struct(&S_APPLICATIONLAUNCHER_APPLICATIONSTRUCT), optional: true }] },
 ];
+static EVENTS_APPLICATIONLAUNCHER: &[EventDef] = &[
+];
 static ATTRS_AUDIOOUTPUT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1371,6 +1393,8 @@ static ATTRS_AUDIOOUTPUT: &[AttrDef] = &[
 static CMDS_AUDIOOUTPUT: &[CmdDef] = &[
     CmdDef { name: "rename-output", id: 0x01, timed: false, fields: &[FieldDef { name: "index", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "name", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
     CmdDef { name: "select-output", id: 0x00, timed: false, fields: &[FieldDef { name: "index", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_AUDIOOUTPUT: &[EventDef] = &[
 ];
 static ATTRS_BALLASTCONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1394,6 +1418,8 @@ static ATTRS_BALLASTCONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "physical-min-level", id: 0x0000, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_BALLASTCONFIGURATION: &[CmdDef] = &[
+];
+static EVENTS_BALLASTCONFIGURATION: &[EventDef] = &[
 ];
 static ATTRS_BASICINFORMATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1428,6 +1454,12 @@ static ATTRS_BASICINFORMATION: &[AttrDef] = &[
 ];
 static CMDS_BASICINFORMATION: &[CmdDef] = &[
 ];
+static EVENTS_BASICINFORMATION: &[EventDef] = &[
+    EventDef { name: "leave", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "fabric-index", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "reachable-changed", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "reachable-new-value", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
+    EventDef { name: "shut-down", id: 0x01, priority: "critical", fields: &[] },
+    EventDef { name: "start-up", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "software-version", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_BINDING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1438,6 +1470,8 @@ static ATTRS_BINDING: &[AttrDef] = &[
 ];
 static CMDS_BINDING: &[CmdDef] = &[
 ];
+static EVENTS_BINDING: &[EventDef] = &[
+];
 static ATTRS_BOOLEANSTATE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1447,6 +1481,9 @@ static ATTRS_BOOLEANSTATE: &[AttrDef] = &[
     AttrDef { name: "state-value", id: 0x0000, ty: Ty::Scalar(TypeTag::Bool), writable: false, timed_write: false },
 ];
 static CMDS_BOOLEANSTATE: &[CmdDef] = &[
+];
+static EVENTS_BOOLEANSTATE: &[EventDef] = &[
+    EventDef { name: "state-change", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "state-value", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
 ];
 static ATTRS_BOOLEANSTATECONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1466,6 +1503,10 @@ static ATTRS_BOOLEANSTATECONFIGURATION: &[AttrDef] = &[
 static CMDS_BOOLEANSTATECONFIGURATION: &[CmdDef] = &[
     CmdDef { name: "enable-disable-alarm", id: 0x01, timed: false, fields: &[FieldDef { name: "alarms-to-enable-disable", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "suppress-alarm", id: 0x00, timed: false, fields: &[FieldDef { name: "alarms-to-suppress", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_BOOLEANSTATECONFIGURATION: &[EventDef] = &[
+    EventDef { name: "alarms-state-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "alarms-active", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "alarms-suppressed", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "sensor-fault", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "sensor-fault", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
 static ATTRS_BRIDGEDDEVICEBASICINFORMATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1495,6 +1536,13 @@ static ATTRS_BRIDGEDDEVICEBASICINFORMATION: &[AttrDef] = &[
 static CMDS_BRIDGEDDEVICEBASICINFORMATION: &[CmdDef] = &[
     CmdDef { name: "keep-active", id: 0x80, timed: false, fields: &[FieldDef { name: "stay-active-duration", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "timeout-ms", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_BRIDGEDDEVICEBASICINFORMATION: &[EventDef] = &[
+    EventDef { name: "active-changed", id: 0x80, priority: "info", fields: &[EventFieldDef { name: "promised-active-duration", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "leave", id: 0x02, priority: "info", fields: &[] },
+    EventDef { name: "reachable-changed", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "reachable-new-value", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
+    EventDef { name: "shut-down", id: 0x01, priority: "critical", fields: &[] },
+    EventDef { name: "start-up", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "software-version", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1519,6 +1567,8 @@ static CMDS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "mptz-remove-preset", id: 0x04, timed: false, fields: &[FieldDef { name: "preset-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "mptz-save-preset", id: 0x03, timed: false, fields: &[FieldDef { name: "preset-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "name", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
     CmdDef { name: "mptz-set-position", id: 0x00, timed: false, fields: &[FieldDef { name: "pan", ty: Ty::Scalar(TypeTag::Int), optional: true }, FieldDef { name: "tilt", ty: Ty::Scalar(TypeTag::Int), optional: true }, FieldDef { name: "zoom", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+];
+static EVENTS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT: &[EventDef] = &[
 ];
 static ATTRS_CAMERAAVSTREAMMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1580,6 +1630,8 @@ static CMDS_CAMERAAVSTREAMMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "video-stream-deallocate", id: 0x06, timed: false, fields: &[FieldDef { name: "video-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "video-stream-modify", id: 0x05, timed: false, fields: &[FieldDef { name: "video-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "watermark-enabled", ty: Ty::Scalar(TypeTag::Bool), optional: true }, FieldDef { name: "osd-enabled", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
 ];
+static EVENTS_CAMERAAVSTREAMMANAGEMENT: &[EventDef] = &[
+];
 static ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1599,6 +1651,8 @@ static ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "uncertainty", id: 0x0007, ty: Ty::Scalar(TypeTag::F32), writable: false, timed_write: false },
 ];
 static CMDS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_CARBONDIOXIDECONCENTRATIONMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1620,6 +1674,8 @@ static ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_CARBONMONOXIDECONCENTRATIONMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_CHANNEL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1638,6 +1694,8 @@ static CMDS_CHANNEL: &[CmdDef] = &[
     CmdDef { name: "record-program", id: 0x06, timed: false, fields: &[FieldDef { name: "program-identifier", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "should-record-series", ty: Ty::Scalar(TypeTag::Bool), optional: false }, FieldDef { name: "external-id-list", ty: Ty::ListOfStruct(&S_CHANNEL_ADDITIONALINFOSTRUCT), optional: false }, FieldDef { name: "data", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
     CmdDef { name: "skip-channel", id: 0x03, timed: false, fields: &[FieldDef { name: "count", ty: Ty::Scalar(TypeTag::Int), optional: false }] },
 ];
+static EVENTS_CHANNEL: &[EventDef] = &[
+];
 static ATTRS_CHIME: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1650,6 +1708,8 @@ static ATTRS_CHIME: &[AttrDef] = &[
 ];
 static CMDS_CHIME: &[CmdDef] = &[
     CmdDef { name: "play-chime-sound", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_CHIME: &[EventDef] = &[
 ];
 static ATTRS_CLOSURECONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1668,6 +1728,12 @@ static CMDS_CLOSURECONTROL: &[CmdDef] = &[
     CmdDef { name: "calibrate", id: 0x02, timed: false, fields: &[] },
     CmdDef { name: "move-to", id: 0x01, timed: false, fields: &[FieldDef { name: "position", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "latch", ty: Ty::Scalar(TypeTag::Bool), optional: true }, FieldDef { name: "speed", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
     CmdDef { name: "stop", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_CLOSURECONTROL: &[EventDef] = &[
+    EventDef { name: "engage-state-changed", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "engage-value", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
+    EventDef { name: "movement-completed", id: 0x01, priority: "info", fields: &[] },
+    EventDef { name: "operational-error", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "error-state", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "secure-state-changed", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "secure-value", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
 ];
 static ATTRS_CLOSUREDIMENSION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1690,6 +1756,8 @@ static ATTRS_CLOSUREDIMENSION: &[AttrDef] = &[
 static CMDS_CLOSUREDIMENSION: &[CmdDef] = &[
     CmdDef { name: "set-target", id: 0x00, timed: false, fields: &[FieldDef { name: "position", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "latch", ty: Ty::Scalar(TypeTag::Bool), optional: true }, FieldDef { name: "speed", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
     CmdDef { name: "step", id: 0x01, timed: false, fields: &[FieldDef { name: "direction", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "number-of-steps", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "speed", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+];
+static EVENTS_CLOSUREDIMENSION: &[EventDef] = &[
 ];
 static ATTRS_COLORCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1753,6 +1821,8 @@ static CMDS_COLORCONTROL: &[CmdDef] = &[
     CmdDef { name: "step-hue", id: 0x02, timed: false, fields: &[FieldDef { name: "step-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "step-size", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transition-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-mask", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-override", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "step-saturation", id: 0x05, timed: false, fields: &[FieldDef { name: "step-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "step-size", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transition-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-mask", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-override", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_COLORCONTROL: &[EventDef] = &[
+];
 static ATTRS_COMMISSIONERCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1765,6 +1835,9 @@ static CMDS_COMMISSIONERCONTROL: &[CmdDef] = &[
     CmdDef { name: "commission-node", id: 0x01, timed: false, fields: &[FieldDef { name: "request-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "response-timeout-seconds", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "request-commissioning-approval", id: 0x00, timed: false, fields: &[FieldDef { name: "request-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "vendor-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "product-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "label", ty: Ty::Scalar(TypeTag::Str), optional: true }] },
 ];
+static EVENTS_COMMISSIONERCONTROL: &[EventDef] = &[
+    EventDef { name: "commissioning-request-result", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "request-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "client-node-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "status-code", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_COMMODITYMETERING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1776,6 +1849,8 @@ static ATTRS_COMMODITYMETERING: &[AttrDef] = &[
     AttrDef { name: "metered-quantity-timestamp", id: 0x0001, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_COMMODITYMETERING: &[CmdDef] = &[
+];
+static EVENTS_COMMODITYMETERING: &[EventDef] = &[
 ];
 static ATTRS_COMMODITYPRICE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1791,6 +1866,9 @@ static ATTRS_COMMODITYPRICE: &[AttrDef] = &[
 static CMDS_COMMODITYPRICE: &[CmdDef] = &[
     CmdDef { name: "get-detailed-forecast-request", id: 0x02, timed: false, fields: &[FieldDef { name: "details", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "get-detailed-price-request", id: 0x00, timed: false, fields: &[FieldDef { name: "details", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_COMMODITYPRICE: &[EventDef] = &[
+    EventDef { name: "price-change", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "current-price", id: 0, ty: Ty::Struct(&S_COMMODITYPRICE_COMMODITYPRICESTRUCT), optional: false }] },
 ];
 static ATTRS_COMMODITYTARIFF: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1822,6 +1900,8 @@ static CMDS_COMMODITYTARIFF: &[CmdDef] = &[
     CmdDef { name: "get-day-entry", id: 0x01, timed: false, fields: &[FieldDef { name: "day-entry-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "get-tariff-component", id: 0x00, timed: false, fields: &[FieldDef { name: "tariff-component-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_COMMODITYTARIFF: &[EventDef] = &[
+];
 static ATTRS_CONTENTAPPOBSERVER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1831,6 +1911,8 @@ static ATTRS_CONTENTAPPOBSERVER: &[AttrDef] = &[
 ];
 static CMDS_CONTENTAPPOBSERVER: &[CmdDef] = &[
     CmdDef { name: "content-app-message", id: 0x00, timed: false, fields: &[FieldDef { name: "data", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "encoding-hint", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
+];
+static EVENTS_CONTENTAPPOBSERVER: &[EventDef] = &[
 ];
 static ATTRS_CONTENTCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1859,6 +1941,9 @@ static CMDS_CONTENTCONTROL: &[CmdDef] = &[
     CmdDef { name: "unblock-unrated-content", id: 0x08, timed: false, fields: &[] },
     CmdDef { name: "update-pin", id: 0x00, timed: false, fields: &[FieldDef { name: "old-pin", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "new-pin", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
 ];
+static EVENTS_CONTENTCONTROL: &[EventDef] = &[
+    EventDef { name: "remaining-screen-time-expired", id: 0x00, priority: "info", fields: &[] },
+];
 static ATTRS_CONTENTLAUNCHER: &[AttrDef] = &[
     AttrDef { name: "accept-header", id: 0x0000, ty: Ty::List(TypeTag::Str), writable: false, timed_write: false },
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1871,6 +1956,8 @@ static ATTRS_CONTENTLAUNCHER: &[AttrDef] = &[
 static CMDS_CONTENTLAUNCHER: &[CmdDef] = &[
     CmdDef { name: "launch-content", id: 0x00, timed: false, fields: &[FieldDef { name: "search", ty: Ty::Struct(&S_CONTENTLAUNCHER_CONTENTSEARCHSTRUCT), optional: false }, FieldDef { name: "auto-play", ty: Ty::Scalar(TypeTag::Bool), optional: false }, FieldDef { name: "data", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "playback-preferences", ty: Ty::Struct(&S_CONTENTLAUNCHER_PLAYBACKPREFERENCESSTRUCT), optional: true }, FieldDef { name: "use-current-context", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
     CmdDef { name: "launch-url", id: 0x01, timed: false, fields: &[FieldDef { name: "content-url", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "display-string", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "branding-information", ty: Ty::Struct(&S_CONTENTLAUNCHER_BRANDINGINFORMATIONSTRUCT), optional: true }] },
+];
+static EVENTS_CONTENTLAUNCHER: &[EventDef] = &[
 ];
 static ATTRS_DESCRIPTOR: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1886,6 +1973,8 @@ static ATTRS_DESCRIPTOR: &[AttrDef] = &[
     AttrDef { name: "tag-list", id: 0x0004, ty: Ty::ListOfStruct(&S_DESCRIPTOR_SEMANTICTAGSTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_DESCRIPTOR: &[CmdDef] = &[
+];
+static EVENTS_DESCRIPTOR: &[EventDef] = &[
 ];
 static ATTRS_DEVICEENERGYMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "abs-max-power", id: 0x0004, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
@@ -1912,6 +2001,12 @@ static CMDS_DEVICEENERGYMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "resume-request", id: 0x04, timed: false, fields: &[] },
     CmdDef { name: "start-time-adjust-request", id: 0x02, timed: false, fields: &[FieldDef { name: "requested-start-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "cause", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_DEVICEENERGYMANAGEMENT: &[EventDef] = &[
+    EventDef { name: "paused", id: 0x02, priority: "info", fields: &[] },
+    EventDef { name: "power-adjust-end", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "cause", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "duration", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "energy-use", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "power-adjust-start", id: 0x00, priority: "info", fields: &[] },
+    EventDef { name: "resumed", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "cause", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_DEVICEENERGYMANAGEMENTMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1924,6 +2019,8 @@ static ATTRS_DEVICEENERGYMANAGEMENTMODE: &[AttrDef] = &[
 static CMDS_DEVICEENERGYMANAGEMENTMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_DEVICEENERGYMANAGEMENTMODE: &[EventDef] = &[
+];
 static ATTRS_DIAGNOSTICLOGS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1933,6 +2030,8 @@ static ATTRS_DIAGNOSTICLOGS: &[AttrDef] = &[
 ];
 static CMDS_DIAGNOSTICLOGS: &[CmdDef] = &[
     CmdDef { name: "retrieve-logs-request", id: 0x00, timed: false, fields: &[FieldDef { name: "intent", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "requested-protocol", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transfer-file-designator", ty: Ty::Scalar(TypeTag::Str), optional: true }] },
+];
+static EVENTS_DIAGNOSTICLOGS: &[EventDef] = &[
 ];
 static ATTRS_DISHWASHERALARM: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1949,6 +2048,9 @@ static CMDS_DISHWASHERALARM: &[CmdDef] = &[
     CmdDef { name: "modify-enabled-alarms", id: 0x01, timed: false, fields: &[FieldDef { name: "mask", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "reset", id: 0x00, timed: false, fields: &[FieldDef { name: "alarms", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_DISHWASHERALARM: &[EventDef] = &[
+    EventDef { name: "notify", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "active", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "inactive", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "mask", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_DISHWASHERMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -1960,6 +2062,8 @@ static ATTRS_DISHWASHERMODE: &[AttrDef] = &[
 ];
 static CMDS_DISHWASHERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_DISHWASHERMODE: &[EventDef] = &[
 ];
 static ATTRS_DOORLOCK: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2036,6 +2140,13 @@ static CMDS_DOORLOCK: &[CmdDef] = &[
     CmdDef { name: "unlock-door", id: 0x01, timed: true, fields: &[FieldDef { name: "pin-code", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
     CmdDef { name: "unlock-with-timeout", id: 0x03, timed: true, fields: &[FieldDef { name: "timeout", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "pin-code", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
 ];
+static EVENTS_DOORLOCK: &[EventDef] = &[
+    EventDef { name: "door-lock-alarm", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "alarm-code", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "door-state-change", id: 0x01, priority: "critical", fields: &[EventFieldDef { name: "door-state", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "lock-operation", id: 0x02, priority: "critical", fields: &[EventFieldDef { name: "lock-operation-type", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "operation-source", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "user-index", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "fabric-index", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "source-node", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "credentials", id: 5, ty: Ty::ListOfStruct(&S_DOORLOCK_CREDENTIALSTRUCT), optional: true }] },
+    EventDef { name: "lock-operation-error", id: 0x03, priority: "critical", fields: &[EventFieldDef { name: "lock-operation-type", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "operation-source", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "operation-error", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "user-index", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "fabric-index", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "source-node", id: 5, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "credentials", id: 6, ty: Ty::ListOfStruct(&S_DOORLOCK_CREDENTIALSTRUCT), optional: true }] },
+    EventDef { name: "lock-user-change", id: 0x04, priority: "info", fields: &[EventFieldDef { name: "lock-data-type", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "data-operation-type", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "operation-source", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "user-index", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "fabric-index", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "source-node", id: 5, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "data-index", id: 6, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_ECOSYSTEMINFORMATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2046,6 +2157,8 @@ static ATTRS_ECOSYSTEMINFORMATION: &[AttrDef] = &[
     AttrDef { name: "location-directory", id: 0x0001, ty: Ty::ListOfStruct(&S_ECOSYSTEMINFORMATION_ECOSYSTEMLOCATIONSTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_ECOSYSTEMINFORMATION: &[CmdDef] = &[
+];
+static EVENTS_ECOSYSTEMINFORMATION: &[EventDef] = &[
 ];
 static ATTRS_ELECTRICALENERGYMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2062,6 +2175,10 @@ static ATTRS_ELECTRICALENERGYMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_ELECTRICALENERGYMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_ELECTRICALENERGYMEASUREMENT: &[EventDef] = &[
+    EventDef { name: "cumulative-energy-measured", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "energy-imported", id: 0, ty: Ty::Struct(&S_ELECTRICALENERGYMEASUREMENT_ENERGYMEASUREMENTSTRUCT), optional: true }, EventFieldDef { name: "energy-exported", id: 1, ty: Ty::Struct(&S_ELECTRICALENERGYMEASUREMENT_ENERGYMEASUREMENTSTRUCT), optional: true }] },
+    EventDef { name: "periodic-energy-measured", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "energy-imported", id: 0, ty: Ty::Struct(&S_ELECTRICALENERGYMEASUREMENT_ENERGYMEASUREMENTSTRUCT), optional: true }, EventFieldDef { name: "energy-exported", id: 1, ty: Ty::Struct(&S_ELECTRICALENERGYMEASUREMENT_ENERGYMEASUREMENTSTRUCT), optional: true }] },
+];
 static ATTRS_ELECTRICALGRIDCONDITIONS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2073,6 +2190,9 @@ static ATTRS_ELECTRICALGRIDCONDITIONS: &[AttrDef] = &[
     AttrDef { name: "local-generation-available", id: 0x0000, ty: Ty::Scalar(TypeTag::Bool), writable: true, timed_write: false },
 ];
 static CMDS_ELECTRICALGRIDCONDITIONS: &[CmdDef] = &[
+];
+static EVENTS_ELECTRICALGRIDCONDITIONS: &[EventDef] = &[
+    EventDef { name: "current-conditions-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "current-conditions", id: 0, ty: Ty::Struct(&S_ELECTRICALGRIDCONDITIONS_ELECTRICALGRIDCONDITIONSSTRUCT), optional: false }] },
 ];
 static ATTRS_ELECTRICALPOWERMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2101,6 +2221,9 @@ static ATTRS_ELECTRICALPOWERMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "voltage", id: 0x0004, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_ELECTRICALPOWERMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_ELECTRICALPOWERMEASUREMENT: &[EventDef] = &[
+    EventDef { name: "measurement-period-ranges", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "ranges", id: 0, ty: Ty::ListOfStruct(&S_ELECTRICALPOWERMEASUREMENT_MEASUREMENTRANGESTRUCT), optional: false }] },
 ];
 static ATTRS_ENERGYEVSE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2141,6 +2264,14 @@ static CMDS_ENERGYEVSE: &[CmdDef] = &[
     CmdDef { name: "set-targets", id: 0x05, timed: true, fields: &[FieldDef { name: "charging-target-schedules", ty: Ty::ListOfStruct(&S_ENERGYEVSE_CHARGINGTARGETSCHEDULESTRUCT), optional: false }] },
     CmdDef { name: "start-diagnostics", id: 0x04, timed: true, fields: &[] },
 ];
+static EVENTS_ENERGYEVSE: &[EventDef] = &[
+    EventDef { name: "energy-transfer-started", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "session-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "maximum-current", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "maximum-discharge-current", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "energy-transfer-stopped", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "session-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "reason", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "energy-transferred", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "energy-discharged", id: 5, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "ev-connected", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "session-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "ev-not-detected", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "session-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "session-duration", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "session-energy-charged", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "session-energy-discharged", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "fault", id: 0x04, priority: "critical", fields: &[EventFieldDef { name: "session-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "fault-state-previous-state", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "fault-state-current-state", id: 4, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "rfid", id: 0x05, priority: "info", fields: &[EventFieldDef { name: "uid", id: 0, ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
+];
 static ATTRS_ENERGYEVSEMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2152,6 +2283,8 @@ static ATTRS_ENERGYEVSEMODE: &[AttrDef] = &[
 ];
 static CMDS_ENERGYEVSEMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_ENERGYEVSEMODE: &[EventDef] = &[
 ];
 static ATTRS_ENERGYPREFERENCE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2166,6 +2299,8 @@ static ATTRS_ENERGYPREFERENCE: &[AttrDef] = &[
     AttrDef { name: "low-power-mode-sensitivities", id: 0x0003, ty: Ty::ListOfStruct(&S_ENERGYPREFERENCE_BALANCESTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_ENERGYPREFERENCE: &[CmdDef] = &[
+];
+static EVENTS_ENERGYPREFERENCE: &[EventDef] = &[
 ];
 static ATTRS_ETHERNETNETWORKDIAGNOSTICS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2185,6 +2320,8 @@ static ATTRS_ETHERNETNETWORKDIAGNOSTICS: &[AttrDef] = &[
 ];
 static CMDS_ETHERNETNETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_ETHERNETNETWORKDIAGNOSTICS: &[EventDef] = &[
 ];
 static ATTRS_FANCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2208,6 +2345,8 @@ static ATTRS_FANCONTROL: &[AttrDef] = &[
 static CMDS_FANCONTROL: &[CmdDef] = &[
     CmdDef { name: "step", id: 0x00, timed: false, fields: &[FieldDef { name: "direction", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "wrap", ty: Ty::Scalar(TypeTag::Bool), optional: true }, FieldDef { name: "lowest-off", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
 ];
+static EVENTS_FANCONTROL: &[EventDef] = &[
+];
 static ATTRS_FAULTINJECTION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2219,6 +2358,8 @@ static CMDS_FAULTINJECTION: &[CmdDef] = &[
     CmdDef { name: "fail-at-fault", id: 0x00, timed: false, fields: &[FieldDef { name: "type", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "num-calls-to-skip", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "num-calls-to-fail", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "take-mutex", ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
     CmdDef { name: "fail-randomly-at-fault", id: 0x01, timed: false, fields: &[FieldDef { name: "type", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "percentage", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_FAULTINJECTION: &[EventDef] = &[
+];
 static ATTRS_FIXEDLABEL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2228,6 +2369,8 @@ static ATTRS_FIXEDLABEL: &[AttrDef] = &[
     AttrDef { name: "label-list", id: 0x0000, ty: Ty::ListOfStruct(&S_FIXEDLABEL_LABELSTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_FIXEDLABEL: &[CmdDef] = &[
+];
+static EVENTS_FIXEDLABEL: &[EventDef] = &[
 ];
 static ATTRS_FLOWMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2241,6 +2384,8 @@ static ATTRS_FLOWMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "tolerance", id: 0x0003, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_FLOWMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_FLOWMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2261,6 +2406,8 @@ static ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "uncertainty", id: 0x0007, ty: Ty::Scalar(TypeTag::F32), writable: false, timed_write: false },
 ];
 static CMDS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_FORMALDEHYDECONCENTRATIONMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_GENERALCOMMISSIONING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2287,6 +2434,8 @@ static CMDS_GENERALCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "set-regulatory-config", id: 0x02, timed: false, fields: &[FieldDef { name: "new-regulatory-config", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "country-code", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "breadcrumb", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "set-tc-acknowledgements", id: 0x06, timed: false, fields: &[FieldDef { name: "tc-version", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "tc-user-response", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_GENERALCOMMISSIONING: &[EventDef] = &[
+];
 static ATTRS_GENERALDIAGNOSTICS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "active-hardware-faults", id: 0x0005, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2308,6 +2457,12 @@ static CMDS_GENERALDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "test-event-trigger", id: 0x00, timed: false, fields: &[FieldDef { name: "enable-key", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "event-trigger", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "time-snapshot", id: 0x01, timed: false, fields: &[] },
 ];
+static EVENTS_GENERALDIAGNOSTICS: &[EventDef] = &[
+    EventDef { name: "boot-reason", id: 0x03, priority: "critical", fields: &[EventFieldDef { name: "boot-reason", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "hardware-fault-change", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "network-fault-change", id: 0x02, priority: "critical", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "radio-fault-change", id: 0x01, priority: "critical", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_GROUPKEYMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2325,6 +2480,8 @@ static CMDS_GROUPKEYMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "key-set-remove", id: 0x03, timed: false, fields: &[FieldDef { name: "group-key-set-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "key-set-write", id: 0x00, timed: false, fields: &[FieldDef { name: "group-key-set", ty: Ty::Struct(&S_GROUPKEYMANAGEMENT_GROUPKEYSETSTRUCT), optional: false }] },
 ];
+static EVENTS_GROUPKEYMANAGEMENT: &[EventDef] = &[
+];
 static ATTRS_GROUPS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2341,6 +2498,8 @@ static CMDS_GROUPS: &[CmdDef] = &[
     CmdDef { name: "remove-group", id: 0x03, timed: false, fields: &[FieldDef { name: "group-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "view-group", id: 0x01, timed: false, fields: &[FieldDef { name: "group-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_GROUPS: &[EventDef] = &[
+];
 static ATTRS_HEPAFILTERMONITORING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2356,6 +2515,8 @@ static ATTRS_HEPAFILTERMONITORING: &[AttrDef] = &[
 ];
 static CMDS_HEPAFILTERMONITORING: &[CmdDef] = &[
     CmdDef { name: "reset-condition", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_HEPAFILTERMONITORING: &[EventDef] = &[
 ];
 static ATTRS_ICDMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2379,6 +2540,8 @@ static CMDS_ICDMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "stay-active-request", id: 0x03, timed: false, fields: &[FieldDef { name: "stay-active-duration", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "unregister-client", id: 0x02, timed: false, fields: &[FieldDef { name: "check-in-node-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "verification-key", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
 ];
+static EVENTS_ICDMANAGEMENT: &[EventDef] = &[
+];
 static ATTRS_IDENTIFY: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2391,6 +2554,8 @@ static ATTRS_IDENTIFY: &[AttrDef] = &[
 static CMDS_IDENTIFY: &[CmdDef] = &[
     CmdDef { name: "identify", id: 0x00, timed: false, fields: &[FieldDef { name: "identify-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "trigger-effect", id: 0x40, timed: false, fields: &[FieldDef { name: "effect-identifier", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "effect-variant", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_IDENTIFY: &[EventDef] = &[
 ];
 static ATTRS_ILLUMINANCEMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2405,6 +2570,8 @@ static ATTRS_ILLUMINANCEMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "tolerance", id: 0x0003, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_ILLUMINANCEMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_ILLUMINANCEMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_JOINTFABRICADMINISTRATOR: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2421,6 +2588,8 @@ static CMDS_JOINTFABRICADMINISTRATOR: &[CmdDef] = &[
     CmdDef { name: "open-joint-commissioning-window", id: 0x04, timed: false, fields: &[FieldDef { name: "commissioning-timeout", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "pake-passcode-verifier", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "discriminator", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "iterations", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "salt", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
     CmdDef { name: "transfer-anchor-complete", id: 0x07, timed: false, fields: &[] },
     CmdDef { name: "transfer-anchor-request", id: 0x05, timed: false, fields: &[] },
+];
+static EVENTS_JOINTFABRICADMINISTRATOR: &[EventDef] = &[
 ];
 static ATTRS_JOINTFABRICDATASTORE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2465,6 +2634,8 @@ static CMDS_JOINTFABRICDATASTORE: &[CmdDef] = &[
     CmdDef { name: "update-key-set", id: 0x01, timed: false, fields: &[FieldDef { name: "group-key-set", ty: Ty::Struct(&S_JOINTFABRICDATASTORE_DATASTOREGROUPKEYSETSTRUCT), optional: false }] },
     CmdDef { name: "update-node", id: 0x0b, timed: false, fields: &[FieldDef { name: "node-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "friendly-name", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
 ];
+static EVENTS_JOINTFABRICDATASTORE: &[EventDef] = &[
+];
 static ATTRS_KEYPADINPUT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2474,6 +2645,8 @@ static ATTRS_KEYPADINPUT: &[AttrDef] = &[
 ];
 static CMDS_KEYPADINPUT: &[CmdDef] = &[
     CmdDef { name: "send-key", id: 0x00, timed: false, fields: &[FieldDef { name: "key-code", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_KEYPADINPUT: &[EventDef] = &[
 ];
 static ATTRS_LAUNDRYDRYERCONTROLS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2485,6 +2658,8 @@ static ATTRS_LAUNDRYDRYERCONTROLS: &[AttrDef] = &[
     AttrDef { name: "supported-dryness-levels", id: 0x0000, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_LAUNDRYDRYERCONTROLS: &[CmdDef] = &[
+];
+static EVENTS_LAUNDRYDRYERCONTROLS: &[EventDef] = &[
 ];
 static ATTRS_LAUNDRYWASHERCONTROLS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2499,6 +2674,8 @@ static ATTRS_LAUNDRYWASHERCONTROLS: &[AttrDef] = &[
 ];
 static CMDS_LAUNDRYWASHERCONTROLS: &[CmdDef] = &[
 ];
+static EVENTS_LAUNDRYWASHERCONTROLS: &[EventDef] = &[
+];
 static ATTRS_LAUNDRYWASHERMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2510,6 +2687,8 @@ static ATTRS_LAUNDRYWASHERMODE: &[AttrDef] = &[
 ];
 static CMDS_LAUNDRYWASHERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_LAUNDRYWASHERMODE: &[EventDef] = &[
 ];
 static ATTRS_LEVELCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2543,6 +2722,8 @@ static CMDS_LEVELCONTROL: &[CmdDef] = &[
     CmdDef { name: "stop", id: 0x03, timed: false, fields: &[FieldDef { name: "options-mask", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-override", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "stop-with-on-off", id: 0x07, timed: false, fields: &[FieldDef { name: "options-mask", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "options-override", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_LEVELCONTROL: &[EventDef] = &[
+];
 static ATTRS_LOCALIZATIONCONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "active-locale", id: 0x0000, ty: Ty::Scalar(TypeTag::Str), writable: true, timed_write: false },
@@ -2554,6 +2735,8 @@ static ATTRS_LOCALIZATIONCONFIGURATION: &[AttrDef] = &[
 ];
 static CMDS_LOCALIZATIONCONFIGURATION: &[CmdDef] = &[
 ];
+static EVENTS_LOCALIZATIONCONFIGURATION: &[EventDef] = &[
+];
 static ATTRS_LOWPOWER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2563,6 +2746,8 @@ static ATTRS_LOWPOWER: &[AttrDef] = &[
 ];
 static CMDS_LOWPOWER: &[CmdDef] = &[
     CmdDef { name: "sleep", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_LOWPOWER: &[EventDef] = &[
 ];
 static ATTRS_MEDIAINPUT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2578,6 +2763,8 @@ static CMDS_MEDIAINPUT: &[CmdDef] = &[
     CmdDef { name: "rename-input", id: 0x03, timed: false, fields: &[FieldDef { name: "index", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "name", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
     CmdDef { name: "select-input", id: 0x00, timed: false, fields: &[FieldDef { name: "index", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "show-input-status", id: 0x01, timed: false, fields: &[] },
+];
+static EVENTS_MEDIAINPUT: &[EventDef] = &[
 ];
 static ATTRS_MEDIAPLAYBACK: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2613,6 +2800,9 @@ static CMDS_MEDIAPLAYBACK: &[CmdDef] = &[
     CmdDef { name: "start-over", id: 0x03, timed: false, fields: &[] },
     CmdDef { name: "stop", id: 0x02, timed: false, fields: &[] },
 ];
+static EVENTS_MEDIAPLAYBACK: &[EventDef] = &[
+    EventDef { name: "state-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "current-state", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "start-time", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "duration", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "sampled-position", id: 3, ty: Ty::Struct(&S_MEDIAPLAYBACK_PLAYBACKPOSITIONSTRUCT), optional: false }, EventFieldDef { name: "playback-speed", id: 4, ty: Ty::Scalar(TypeTag::F32), optional: false }, EventFieldDef { name: "seek-range-end", id: 5, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "seek-range-start", id: 6, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "data", id: 7, ty: Ty::Scalar(TypeTag::Bytes), optional: true }, EventFieldDef { name: "audio-advance-unmuted", id: 8, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
+];
 static ATTRS_MESSAGES: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "active-message-i-ds", id: 0x0001, ty: Ty::List(TypeTag::Bytes), writable: false, timed_write: false },
@@ -2625,6 +2815,11 @@ static ATTRS_MESSAGES: &[AttrDef] = &[
 static CMDS_MESSAGES: &[CmdDef] = &[
     CmdDef { name: "cancel-messages-request", id: 0x01, timed: false, fields: &[FieldDef { name: "message-i-ds", ty: Ty::List(TypeTag::Bytes), optional: false }] },
     CmdDef { name: "present-messages-request", id: 0x00, timed: false, fields: &[FieldDef { name: "message-id", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "priority", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "message-control", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "start-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "duration", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "message-text", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "responses", ty: Ty::ListOfStruct(&S_MESSAGES_MESSAGERESPONSEOPTIONSTRUCT), optional: true }] },
+];
+static EVENTS_MESSAGES: &[EventDef] = &[
+    EventDef { name: "message-complete", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "message-id", id: 0, ty: Ty::Scalar(TypeTag::Bytes), optional: false }, EventFieldDef { name: "response-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }, EventFieldDef { name: "reply", id: 2, ty: Ty::Scalar(TypeTag::Str), optional: true }, EventFieldDef { name: "future-messages-preference", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "message-presented", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "message-id", id: 0, ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
+    EventDef { name: "message-queued", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "message-id", id: 0, ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
 ];
 static ATTRS_METERIDENTIFICATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2639,6 +2834,8 @@ static ATTRS_METERIDENTIFICATION: &[AttrDef] = &[
     AttrDef { name: "protocol-version", id: 0x0003, ty: Ty::Scalar(TypeTag::Str), writable: false, timed_write: false },
 ];
 static CMDS_METERIDENTIFICATION: &[CmdDef] = &[
+];
+static EVENTS_METERIDENTIFICATION: &[EventDef] = &[
 ];
 static ATTRS_MICROWAVEOVENCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2660,6 +2857,8 @@ static CMDS_MICROWAVEOVENCONTROL: &[CmdDef] = &[
     CmdDef { name: "add-more-time", id: 0x01, timed: false, fields: &[FieldDef { name: "time-to-add", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "set-cooking-parameters", id: 0x00, timed: false, fields: &[FieldDef { name: "cook-mode", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "cook-time", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "power-setting", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "watt-setting-index", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "start-after-setting", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
 ];
+static EVENTS_MICROWAVEOVENCONTROL: &[EventDef] = &[
+];
 static ATTRS_MICROWAVEOVENMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2670,6 +2869,8 @@ static ATTRS_MICROWAVEOVENMODE: &[AttrDef] = &[
     AttrDef { name: "supported-modes", id: 0x0000, ty: Ty::ListOfStruct(&S_MICROWAVEOVENMODE_MODEOPTIONSTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_MICROWAVEOVENMODE: &[CmdDef] = &[
+];
+static EVENTS_MICROWAVEOVENMODE: &[EventDef] = &[
 ];
 static ATTRS_MODESELECT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2686,6 +2887,8 @@ static ATTRS_MODESELECT: &[AttrDef] = &[
 ];
 static CMDS_MODESELECT: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_MODESELECT: &[EventDef] = &[
 ];
 static ATTRS_NETWORKCOMMISSIONING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2714,6 +2917,8 @@ static CMDS_NETWORKCOMMISSIONING: &[CmdDef] = &[
     CmdDef { name: "reorder-network", id: 0x08, timed: false, fields: &[FieldDef { name: "network-id", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "network-index", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "breadcrumb", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
     CmdDef { name: "scan-networks", id: 0x00, timed: false, fields: &[FieldDef { name: "ssid", ty: Ty::Scalar(TypeTag::Bytes), optional: true }, FieldDef { name: "breadcrumb", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
+static EVENTS_NETWORKCOMMISSIONING: &[EventDef] = &[
+];
 static ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2733,6 +2938,8 @@ static ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "uncertainty", id: 0x0007, ty: Ty::Scalar(TypeTag::F32), writable: false, timed_write: false },
 ];
 static CMDS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_OCCUPANCYSENSING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2757,6 +2964,9 @@ static ATTRS_OCCUPANCYSENSING: &[AttrDef] = &[
 ];
 static CMDS_OCCUPANCYSENSING: &[CmdDef] = &[
 ];
+static EVENTS_OCCUPANCYSENSING: &[EventDef] = &[
+    EventDef { name: "occupancy-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "occupancy", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_ONOFF: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2776,6 +2986,8 @@ static CMDS_ONOFF: &[CmdDef] = &[
     CmdDef { name: "on-with-recall-global-scene", id: 0x41, timed: false, fields: &[] },
     CmdDef { name: "on-with-timed-off", id: 0x42, timed: false, fields: &[FieldDef { name: "on-off-control", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "on-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "off-wait-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "toggle", id: 0x02, timed: false, fields: &[] },
+];
+static EVENTS_ONOFF: &[EventDef] = &[
 ];
 static ATTRS_OPERATIONALCREDENTIALS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2802,6 +3014,8 @@ static CMDS_OPERATIONALCREDENTIALS: &[CmdDef] = &[
     CmdDef { name: "update-fabric-label", id: 0x09, timed: false, fields: &[FieldDef { name: "label", ty: Ty::Scalar(TypeTag::Str), optional: false }] },
     CmdDef { name: "update-noc", id: 0x07, timed: false, fields: &[FieldDef { name: "noc-value", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "icac-value", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
 ];
+static EVENTS_OPERATIONALCREDENTIALS: &[EventDef] = &[
+];
 static ATTRS_OPERATIONALSTATE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2821,6 +3035,10 @@ static CMDS_OPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "start", id: 0x02, timed: false, fields: &[] },
     CmdDef { name: "stop", id: 0x01, timed: false, fields: &[] },
 ];
+static EVENTS_OPERATIONALSTATE: &[EventDef] = &[
+    EventDef { name: "operation-completion", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "completion-error-code", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "total-operational-time", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }, EventFieldDef { name: "paused-time", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "operational-error", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "error-state", id: 0, ty: Ty::Struct(&S_OPERATIONALSTATE_ERRORSTATESTRUCT), optional: false }] },
+];
 static ATTRS_OTASOFTWAREUPDATEPROVIDER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2832,6 +3050,8 @@ static CMDS_OTASOFTWAREUPDATEPROVIDER: &[CmdDef] = &[
     CmdDef { name: "apply-update-request", id: 0x02, timed: false, fields: &[FieldDef { name: "update-token", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "new-version", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "notify-update-applied", id: 0x04, timed: false, fields: &[FieldDef { name: "update-token", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "software-version", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "query-image", id: 0x00, timed: false, fields: &[FieldDef { name: "vendor-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "product-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "software-version", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "protocols-supported", ty: Ty::List(TypeTag::UInt), optional: false }, FieldDef { name: "hardware-version", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "location", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "requestor-can-consent", ty: Ty::Scalar(TypeTag::Bool), optional: true }, FieldDef { name: "metadata-for-provider", ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
+];
+static EVENTS_OTASOFTWAREUPDATEPROVIDER: &[EventDef] = &[
 ];
 static ATTRS_OTASOFTWAREUPDATEREQUESTOR: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2846,6 +3066,11 @@ static ATTRS_OTASOFTWAREUPDATEREQUESTOR: &[AttrDef] = &[
 ];
 static CMDS_OTASOFTWAREUPDATEREQUESTOR: &[CmdDef] = &[
     CmdDef { name: "announce-ota-provider", id: 0x00, timed: false, fields: &[FieldDef { name: "provider-node-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "vendor-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "announcement-reason", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "metadata-for-node", ty: Ty::Scalar(TypeTag::Bytes), optional: true }, FieldDef { name: "endpoint", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_OTASOFTWAREUPDATEREQUESTOR: &[EventDef] = &[
+    EventDef { name: "download-error", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "software-version", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "bytes-downloaded", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "progress-percent", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "platform-code", id: 3, ty: Ty::Scalar(TypeTag::Int), optional: false }] },
+    EventDef { name: "state-transition", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "previous-state", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "new-state", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "reason", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "target-software-version", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "version-applied", id: 0x01, priority: "critical", fields: &[EventFieldDef { name: "software-version", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "product-id", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
 static ATTRS_OVENCAVITYOPERATIONALSTATE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2864,6 +3089,10 @@ static CMDS_OVENCAVITYOPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "start", id: 0x02, timed: false, fields: &[] },
     CmdDef { name: "stop", id: 0x01, timed: false, fields: &[] },
 ];
+static EVENTS_OVENCAVITYOPERATIONALSTATE: &[EventDef] = &[
+    EventDef { name: "operation-completion", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "completion-error-code", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "total-operational-time", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }, EventFieldDef { name: "paused-time", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "operational-error", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "error-state", id: 0, ty: Ty::Struct(&S_OVENCAVITYOPERATIONALSTATE_ERRORSTATESTRUCT), optional: false }] },
+];
 static ATTRS_OVENMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2875,6 +3104,8 @@ static ATTRS_OVENMODE: &[AttrDef] = &[
 ];
 static CMDS_OVENMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_OVENMODE: &[EventDef] = &[
 ];
 static ATTRS_OZONECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2896,6 +3127,8 @@ static ATTRS_OZONECONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_OZONECONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_OZONECONCENTRATIONMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_PM10CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2915,6 +3148,8 @@ static ATTRS_PM10CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "uncertainty", id: 0x0007, ty: Ty::Scalar(TypeTag::F32), writable: false, timed_write: false },
 ];
 static CMDS_PM10CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_PM10CONCENTRATIONMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_PM1CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2936,6 +3171,8 @@ static ATTRS_PM1CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_PM1CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_PM1CONCENTRATIONMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_PM25CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2955,6 +3192,8 @@ static ATTRS_PM25CONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "uncertainty", id: 0x0007, ty: Ty::Scalar(TypeTag::F32), writable: false, timed_write: false },
 ];
 static CMDS_PM25CONCENTRATIONMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_PM25CONCENTRATIONMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_POWERSOURCE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -2997,6 +3236,11 @@ static ATTRS_POWERSOURCE: &[AttrDef] = &[
 ];
 static CMDS_POWERSOURCE: &[CmdDef] = &[
 ];
+static EVENTS_POWERSOURCE: &[EventDef] = &[
+    EventDef { name: "bat-charge-fault-change", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "bat-fault-change", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "wired-fault-change", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_POWERSOURCECONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3006,6 +3250,8 @@ static ATTRS_POWERSOURCECONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "sources", id: 0x0000, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_POWERSOURCECONFIGURATION: &[CmdDef] = &[
+];
+static EVENTS_POWERSOURCECONFIGURATION: &[EventDef] = &[
 ];
 static ATTRS_POWERTOPOLOGY: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3017,6 +3263,8 @@ static ATTRS_POWERTOPOLOGY: &[AttrDef] = &[
     AttrDef { name: "generated-command-list", id: 0xfff8, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_POWERTOPOLOGY: &[CmdDef] = &[
+];
+static EVENTS_POWERTOPOLOGY: &[EventDef] = &[
 ];
 static ATTRS_PRESSUREMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3036,6 +3284,8 @@ static ATTRS_PRESSUREMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_PRESSUREMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_PRESSUREMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_PROXYCONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3044,6 +3294,8 @@ static ATTRS_PROXYCONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "generated-command-list", id: 0xfff8, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_PROXYCONFIGURATION: &[CmdDef] = &[
+];
+static EVENTS_PROXYCONFIGURATION: &[EventDef] = &[
 ];
 static ATTRS_PROXYDISCOVERY: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3054,6 +3306,8 @@ static ATTRS_PROXYDISCOVERY: &[AttrDef] = &[
 ];
 static CMDS_PROXYDISCOVERY: &[CmdDef] = &[
 ];
+static EVENTS_PROXYDISCOVERY: &[EventDef] = &[
+];
 static ATTRS_PROXYVALID: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3063,6 +3317,8 @@ static ATTRS_PROXYVALID: &[AttrDef] = &[
 ];
 static CMDS_PROXYVALID: &[CmdDef] = &[
 ];
+static EVENTS_PROXYVALID: &[EventDef] = &[
+];
 static ATTRS_PULSEWIDTHMODULATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3071,6 +3327,8 @@ static ATTRS_PULSEWIDTHMODULATION: &[AttrDef] = &[
     AttrDef { name: "generated-command-list", id: 0xfff8, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_PULSEWIDTHMODULATION: &[CmdDef] = &[
+];
+static EVENTS_PULSEWIDTHMODULATION: &[EventDef] = &[
 ];
 static ATTRS_PUMPCONFIGURATIONANDCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3104,6 +3362,25 @@ static ATTRS_PUMPCONFIGURATIONANDCONTROL: &[AttrDef] = &[
 ];
 static CMDS_PUMPCONFIGURATIONANDCONTROL: &[CmdDef] = &[
 ];
+static EVENTS_PUMPCONFIGURATIONANDCONTROL: &[EventDef] = &[
+    EventDef { name: "air-detection", id: 0x0f, priority: "info", fields: &[] },
+    EventDef { name: "dry-running", id: 0x05, priority: "critical", fields: &[] },
+    EventDef { name: "electronic-fatal-failure", id: 0x0c, priority: "critical", fields: &[] },
+    EventDef { name: "electronic-non-fatal-failure", id: 0x0b, priority: "info", fields: &[] },
+    EventDef { name: "electronic-temperature-high", id: 0x08, priority: "info", fields: &[] },
+    EventDef { name: "general-fault", id: 0x0d, priority: "info", fields: &[] },
+    EventDef { name: "leakage", id: 0x0e, priority: "info", fields: &[] },
+    EventDef { name: "motor-temperature-high", id: 0x06, priority: "info", fields: &[] },
+    EventDef { name: "power-missing-phase", id: 0x02, priority: "info", fields: &[] },
+    EventDef { name: "pump-blocked", id: 0x09, priority: "critical", fields: &[] },
+    EventDef { name: "pump-motor-fatal-failure", id: 0x07, priority: "critical", fields: &[] },
+    EventDef { name: "sensor-failure", id: 0x0a, priority: "info", fields: &[] },
+    EventDef { name: "supply-voltage-high", id: 0x01, priority: "info", fields: &[] },
+    EventDef { name: "supply-voltage-low", id: 0x00, priority: "info", fields: &[] },
+    EventDef { name: "system-pressure-high", id: 0x04, priority: "info", fields: &[] },
+    EventDef { name: "system-pressure-low", id: 0x03, priority: "info", fields: &[] },
+    EventDef { name: "turbine-operation", id: 0x10, priority: "info", fields: &[] },
+];
 static ATTRS_PUSHAVSTREAMTRANSPORT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3120,6 +3397,10 @@ static CMDS_PUSHAVSTREAMTRANSPORT: &[CmdDef] = &[
     CmdDef { name: "manually-trigger-transport", id: 0x05, timed: false, fields: &[FieldDef { name: "connection-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "activation-reason", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "time-control", ty: Ty::Struct(&S_PUSHAVSTREAMTRANSPORT_TRANSPORTMOTIONTRIGGERTIMECONTROLSTRUCT), optional: true }] },
     CmdDef { name: "modify-push-transport", id: 0x03, timed: false, fields: &[FieldDef { name: "connection-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transport-options", ty: Ty::Struct(&S_PUSHAVSTREAMTRANSPORT_TRANSPORTOPTIONSSTRUCT), optional: false }] },
     CmdDef { name: "set-transport-status", id: 0x04, timed: false, fields: &[FieldDef { name: "connection-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transport-status", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_PUSHAVSTREAMTRANSPORT: &[EventDef] = &[
+    EventDef { name: "push-transport-begin", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "connection-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "trigger-type", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "activation-reason", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "push-transport-end", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "connection-id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "trigger-type", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "activation-reason", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
 static ATTRS_RADONCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3141,6 +3422,8 @@ static ATTRS_RADONCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_RADONCONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_RADONCONCENTRATIONMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_REFRIGERATORALARM: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3153,6 +3436,9 @@ static ATTRS_REFRIGERATORALARM: &[AttrDef] = &[
 ];
 static CMDS_REFRIGERATORALARM: &[CmdDef] = &[
 ];
+static EVENTS_REFRIGERATORALARM: &[EventDef] = &[
+    EventDef { name: "notify", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "active", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "inactive", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "state", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "mask", id: 3, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3164,6 +3450,8 @@ static ATTRS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[AttrDef] = &[
 ];
 static CMDS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE: &[EventDef] = &[
 ];
 static ATTRS_RELATIVEHUMIDITYMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3178,6 +3466,8 @@ static ATTRS_RELATIVEHUMIDITYMEASUREMENT: &[AttrDef] = &[
 ];
 static CMDS_RELATIVEHUMIDITYMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_RELATIVEHUMIDITYMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_RVCCLEANMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3189,6 +3479,8 @@ static ATTRS_RVCCLEANMODE: &[AttrDef] = &[
 ];
 static CMDS_RVCCLEANMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_RVCCLEANMODE: &[EventDef] = &[
 ];
 static ATTRS_RVCOPERATIONALSTATE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3208,6 +3500,10 @@ static CMDS_RVCOPERATIONALSTATE: &[CmdDef] = &[
     CmdDef { name: "pause", id: 0x00, timed: false, fields: &[] },
     CmdDef { name: "resume", id: 0x03, timed: false, fields: &[] },
 ];
+static EVENTS_RVCOPERATIONALSTATE: &[EventDef] = &[
+    EventDef { name: "operation-completion", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "completion-error-code", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "total-operational-time", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }, EventFieldDef { name: "paused-time", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+    EventDef { name: "operational-error", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "error-state", id: 0, ty: Ty::Struct(&S_RVCOPERATIONALSTATE_ERRORSTATESTRUCT), optional: false }] },
+];
 static ATTRS_RVCRUNMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3220,6 +3516,8 @@ static ATTRS_RVCRUNMODE: &[AttrDef] = &[
 static CMDS_RVCRUNMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_RVCRUNMODE: &[EventDef] = &[
+];
 static ATTRS_SAMPLEMEI: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3231,6 +3529,9 @@ static ATTRS_SAMPLEMEI: &[AttrDef] = &[
 static CMDS_SAMPLEMEI: &[CmdDef] = &[
     CmdDef { name: "add-arguments", id: 0x02, timed: false, fields: &[FieldDef { name: "arg1", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "arg2", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "ping", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_SAMPLEMEI: &[EventDef] = &[
+    EventDef { name: "ping-count-event", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "count", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
 static ATTRS_SCENESMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3251,6 +3552,8 @@ static CMDS_SCENESMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "store-scene", id: 0x04, timed: false, fields: &[FieldDef { name: "group-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "scene-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "view-scene", id: 0x01, timed: false, fields: &[FieldDef { name: "group-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "scene-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
 ];
+static EVENTS_SCENESMANAGEMENT: &[EventDef] = &[
+];
 static ATTRS_SERVICEAREA: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3267,6 +3570,8 @@ static ATTRS_SERVICEAREA: &[AttrDef] = &[
 static CMDS_SERVICEAREA: &[CmdDef] = &[
     CmdDef { name: "select-areas", id: 0x00, timed: false, fields: &[FieldDef { name: "new-areas", ty: Ty::List(TypeTag::UInt), optional: false }] },
     CmdDef { name: "skip-area", id: 0x02, timed: false, fields: &[FieldDef { name: "skipped-area", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_SERVICEAREA: &[EventDef] = &[
 ];
 static ATTRS_SMOKECOALARM: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3291,6 +3596,19 @@ static ATTRS_SMOKECOALARM: &[AttrDef] = &[
 static CMDS_SMOKECOALARM: &[CmdDef] = &[
     CmdDef { name: "self-test-request", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_SMOKECOALARM: &[EventDef] = &[
+    EventDef { name: "alarm-muted", id: 0x06, priority: "info", fields: &[] },
+    EventDef { name: "all-clear", id: 0x0a, priority: "info", fields: &[] },
+    EventDef { name: "co-alarm", id: 0x01, priority: "critical", fields: &[EventFieldDef { name: "alarm-severity-level", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "end-of-service", id: 0x04, priority: "info", fields: &[] },
+    EventDef { name: "hardware-fault", id: 0x03, priority: "info", fields: &[] },
+    EventDef { name: "interconnect-co-alarm", id: 0x09, priority: "critical", fields: &[EventFieldDef { name: "alarm-severity-level", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "interconnect-smoke-alarm", id: 0x08, priority: "critical", fields: &[EventFieldDef { name: "alarm-severity-level", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "low-battery", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "alarm-severity-level", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "mute-ended", id: 0x07, priority: "info", fields: &[] },
+    EventDef { name: "self-test-complete", id: 0x05, priority: "info", fields: &[] },
+    EventDef { name: "smoke-alarm", id: 0x00, priority: "critical", fields: &[EventFieldDef { name: "alarm-severity-level", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_SOFTWAREDIAGNOSTICS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3305,6 +3623,9 @@ static ATTRS_SOFTWAREDIAGNOSTICS: &[AttrDef] = &[
 static CMDS_SOFTWAREDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-watermarks", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_SOFTWAREDIAGNOSTICS: &[EventDef] = &[
+    EventDef { name: "software-fault", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "id", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "name", id: 1, ty: Ty::Scalar(TypeTag::Str), optional: true }, EventFieldDef { name: "fault-recording", id: 2, ty: Ty::Scalar(TypeTag::Bytes), optional: true }] },
+];
 static ATTRS_SOILMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3315,6 +3636,8 @@ static ATTRS_SOILMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "soil-moisture-measurement-limits", id: 0x0000, ty: Ty::Struct(&S_GLOBAL_MEASUREMENTACCURACYSTRUCT), writable: false, timed_write: false },
 ];
 static CMDS_SOILMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_SOILMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_SWITCH: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3328,6 +3651,15 @@ static ATTRS_SWITCH: &[AttrDef] = &[
 ];
 static CMDS_SWITCH: &[CmdDef] = &[
 ];
+static EVENTS_SWITCH: &[EventDef] = &[
+    EventDef { name: "initial-press", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "new-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "long-press", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "new-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "long-release", id: 0x04, priority: "info", fields: &[EventFieldDef { name: "previous-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "multi-press-complete", id: 0x06, priority: "info", fields: &[EventFieldDef { name: "previous-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "total-number-of-presses-counted", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "multi-press-ongoing", id: 0x05, priority: "info", fields: &[EventFieldDef { name: "new-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "current-number-of-presses-counted", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "short-release", id: 0x03, priority: "info", fields: &[EventFieldDef { name: "previous-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "switch-latched", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "new-position", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_TARGETNAVIGATOR: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3339,6 +3671,9 @@ static ATTRS_TARGETNAVIGATOR: &[AttrDef] = &[
 ];
 static CMDS_TARGETNAVIGATOR: &[CmdDef] = &[
     CmdDef { name: "navigate-target", id: 0x00, timed: false, fields: &[FieldDef { name: "target", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "data", ty: Ty::Scalar(TypeTag::Str), optional: true }] },
+];
+static EVENTS_TARGETNAVIGATOR: &[EventDef] = &[
+    EventDef { name: "target-updated", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "target-list", id: 0, ty: Ty::ListOfStruct(&S_TARGETNAVIGATOR_TARGETINFOSTRUCT), optional: false }, EventFieldDef { name: "current-target", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "data", id: 2, ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
 ];
 static ATTRS_TEMPERATURECONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3356,6 +3691,8 @@ static ATTRS_TEMPERATURECONTROL: &[AttrDef] = &[
 static CMDS_TEMPERATURECONTROL: &[CmdDef] = &[
     CmdDef { name: "set-temperature", id: 0x00, timed: false, fields: &[FieldDef { name: "target-temperature", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "target-temperature-level", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
+static EVENTS_TEMPERATURECONTROL: &[EventDef] = &[
+];
 static ATTRS_TEMPERATUREMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3368,6 +3705,8 @@ static ATTRS_TEMPERATUREMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "tolerance", id: 0x0003, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_TEMPERATUREMEASUREMENT: &[CmdDef] = &[
+];
+static EVENTS_TEMPERATUREMEASUREMENT: &[EventDef] = &[
 ];
 static ATTRS_THERMOSTAT: &[AttrDef] = &[
     AttrDef { name: "abs-max-cool-setpoint-limit", id: 0x0006, ty: Ty::Scalar(TypeTag::UInt), writable: false, timed_write: false },
@@ -3445,6 +3784,8 @@ static CMDS_THERMOSTAT: &[CmdDef] = &[
     CmdDef { name: "set-weekly-schedule", id: 0x01, timed: false, fields: &[FieldDef { name: "number-of-transitions-for-sequence", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "day-of-week-for-sequence", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "mode-for-sequence", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "transitions", ty: Ty::ListOfStruct(&S_THERMOSTAT_WEEKLYSCHEDULETRANSITIONSTRUCT), optional: false }] },
     CmdDef { name: "setpoint-raise-lower", id: 0x00, timed: false, fields: &[FieldDef { name: "mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "amount", ty: Ty::Scalar(TypeTag::Int), optional: false }] },
 ];
+static EVENTS_THERMOSTAT: &[EventDef] = &[
+];
 static ATTRS_THERMOSTATUSERINTERFACECONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3456,6 +3797,8 @@ static ATTRS_THERMOSTATUSERINTERFACECONFIGURATION: &[AttrDef] = &[
     AttrDef { name: "temperature-display-mode", id: 0x0000, ty: Ty::Scalar(TypeTag::UInt), writable: true, timed_write: false },
 ];
 static CMDS_THERMOSTATUSERINTERFACECONFIGURATION: &[CmdDef] = &[
+];
+static EVENTS_THERMOSTATUSERINTERFACECONFIGURATION: &[EventDef] = &[
 ];
 static ATTRS_THREADBORDERROUTERMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3475,6 +3818,8 @@ static CMDS_THREADBORDERROUTERMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "get-pending-dataset-request", id: 0x01, timed: false, fields: &[] },
     CmdDef { name: "set-active-dataset-request", id: 0x03, timed: true, fields: &[FieldDef { name: "active-dataset", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "breadcrumb", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
     CmdDef { name: "set-pending-dataset-request", id: 0x04, timed: true, fields: &[FieldDef { name: "pending-dataset", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
+];
+static EVENTS_THREADBORDERROUTERMANAGEMENT: &[EventDef] = &[
 ];
 static ATTRS_THREADNETWORKDIAGNOSTICS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3551,6 +3896,10 @@ static ATTRS_THREADNETWORKDIAGNOSTICS: &[AttrDef] = &[
 static CMDS_THREADNETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_THREADNETWORKDIAGNOSTICS: &[EventDef] = &[
+    EventDef { name: "connection-status", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "connection-status", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "network-fault-change", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "current", id: 0, ty: Ty::List(TypeTag::UInt), optional: false }, EventFieldDef { name: "previous", id: 1, ty: Ty::List(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_THREADNETWORKDIRECTORY: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3566,6 +3915,8 @@ static CMDS_THREADNETWORKDIRECTORY: &[CmdDef] = &[
     CmdDef { name: "get-operational-dataset", id: 0x02, timed: false, fields: &[FieldDef { name: "extended-pan-id", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
     CmdDef { name: "remove-network", id: 0x01, timed: true, fields: &[FieldDef { name: "extended-pan-id", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
 ];
+static EVENTS_THREADNETWORKDIRECTORY: &[EventDef] = &[
+];
 static ATTRS_TIMEFORMATLOCALIZATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "active-calendar-type", id: 0x0001, ty: Ty::Scalar(TypeTag::UInt), writable: true, timed_write: false },
@@ -3577,6 +3928,8 @@ static ATTRS_TIMEFORMATLOCALIZATION: &[AttrDef] = &[
     AttrDef { name: "supported-calendar-types", id: 0x0002, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
 ];
 static CMDS_TIMEFORMATLOCALIZATION: &[CmdDef] = &[
+];
+static EVENTS_TIMEFORMATLOCALIZATION: &[EventDef] = &[
 ];
 static ATTRS_TIMER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3593,6 +3946,8 @@ static CMDS_TIMER: &[CmdDef] = &[
     CmdDef { name: "reduce-time", id: 0x03, timed: false, fields: &[FieldDef { name: "time-reduction", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "reset-timer", id: 0x01, timed: false, fields: &[] },
     CmdDef { name: "set-timer", id: 0x00, timed: false, fields: &[FieldDef { name: "new-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_TIMER: &[EventDef] = &[
 ];
 static ATTRS_TIMESYNCHRONIZATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3621,6 +3976,13 @@ static CMDS_TIMESYNCHRONIZATION: &[CmdDef] = &[
     CmdDef { name: "set-trusted-time-source", id: 0x01, timed: false, fields: &[FieldDef { name: "trusted-time-source", ty: Ty::Struct(&S_TIMESYNCHRONIZATION_FABRICSCOPEDTRUSTEDTIMESOURCESTRUCT), optional: false }] },
     CmdDef { name: "set-utc-time", id: 0x00, timed: false, fields: &[FieldDef { name: "utc-time", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "granularity", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "time-source", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
+static EVENTS_TIMESYNCHRONIZATION: &[EventDef] = &[
+    EventDef { name: "dst-status", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "dst-offset-active", id: 0, ty: Ty::Scalar(TypeTag::Bool), optional: false }] },
+    EventDef { name: "dst-table-empty", id: 0x00, priority: "info", fields: &[] },
+    EventDef { name: "missing-trusted-time-source", id: 0x04, priority: "info", fields: &[] },
+    EventDef { name: "time-failure", id: 0x03, priority: "info", fields: &[] },
+    EventDef { name: "time-zone-status", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "offset", id: 0, ty: Ty::Scalar(TypeTag::Int), optional: false }, EventFieldDef { name: "name", id: 1, ty: Ty::Scalar(TypeTag::Str), optional: true }] },
+];
 static ATTRS_TLSCERTIFICATEMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3643,6 +4005,8 @@ static CMDS_TLSCERTIFICATEMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "remove-root-certificate", id: 0x06, timed: false, fields: &[FieldDef { name: "caid", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "tls-client-csr", id: 0x07, timed: false, fields: &[FieldDef { name: "nonce", ty: Ty::Scalar(TypeTag::Bytes), optional: false }] },
 ];
+static EVENTS_TLSCERTIFICATEMANAGEMENT: &[EventDef] = &[
+];
 static ATTRS_TLSCLIENTMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3656,6 +4020,8 @@ static CMDS_TLSCLIENTMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "find-endpoint", id: 0x02, timed: false, fields: &[FieldDef { name: "endpoint-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "provision-endpoint", id: 0x00, timed: false, fields: &[FieldDef { name: "hostname", ty: Ty::Scalar(TypeTag::Bytes), optional: false }, FieldDef { name: "port", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "caid", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "ccdid", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "endpoint-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "remove-endpoint", id: 0x04, timed: false, fields: &[FieldDef { name: "endpoint-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_TLSCLIENTMANAGEMENT: &[EventDef] = &[
 ];
 static ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3677,6 +4043,8 @@ static ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[AttrDef] =
 ];
 static CMDS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[CmdDef] = &[
 ];
+static EVENTS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT: &[EventDef] = &[
+];
 static ATTRS_UNITLOCALIZATION: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3687,6 +4055,8 @@ static ATTRS_UNITLOCALIZATION: &[AttrDef] = &[
     AttrDef { name: "temperature-unit", id: 0x0000, ty: Ty::Scalar(TypeTag::UInt), writable: true, timed_write: false },
 ];
 static CMDS_UNITLOCALIZATION: &[CmdDef] = &[
+];
+static EVENTS_UNITLOCALIZATION: &[EventDef] = &[
 ];
 static ATTRS_UNITTESTING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3814,6 +4184,11 @@ static CMDS_UNITTESTING: &[CmdDef] = &[
     CmdDef { name: "test-unknown-command", id: 0x03, timed: false, fields: &[] },
     CmdDef { name: "timed-invoke-request", id: 0x12, timed: true, fields: &[] },
 ];
+static EVENTS_UNITTESTING: &[EventDef] = &[
+    EventDef { name: "test-different-vendor-mei-event", id: 0xfff200ee, priority: "info", fields: &[EventFieldDef { name: "arg1", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "test-event", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "arg1", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "arg2", id: 2, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "arg3", id: 3, ty: Ty::Scalar(TypeTag::Bool), optional: false }, EventFieldDef { name: "arg4", id: 4, ty: Ty::Struct(&S_UNITTESTING_SIMPLESTRUCT), optional: false }, EventFieldDef { name: "arg5", id: 5, ty: Ty::ListOfStruct(&S_UNITTESTING_SIMPLESTRUCT), optional: false }, EventFieldDef { name: "arg6", id: 6, ty: Ty::List(TypeTag::UInt), optional: false }] },
+    EventDef { name: "test-fabric-scoped-event", id: 0x02, priority: "info", fields: &[] },
+];
 static ATTRS_USERLABEL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3823,6 +4198,8 @@ static ATTRS_USERLABEL: &[AttrDef] = &[
     AttrDef { name: "label-list", id: 0x0000, ty: Ty::ListOfStruct(&S_USERLABEL_LABELSTRUCT), writable: true, timed_write: false },
 ];
 static CMDS_USERLABEL: &[CmdDef] = &[
+];
+static EVENTS_USERLABEL: &[EventDef] = &[
 ];
 static ATTRS_VALVECONFIGURATIONANDCONTROL: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3846,6 +4223,10 @@ static CMDS_VALVECONFIGURATIONANDCONTROL: &[CmdDef] = &[
     CmdDef { name: "close", id: 0x01, timed: false, fields: &[] },
     CmdDef { name: "open", id: 0x00, timed: false, fields: &[FieldDef { name: "open-duration", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "target-level", ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
 ];
+static EVENTS_VALVECONFIGURATIONANDCONTROL: &[EventDef] = &[
+    EventDef { name: "valve-fault", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "valve-fault", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "valve-state-changed", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "valve-state", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "valve-level", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: true }] },
+];
 static ATTRS_WAKEONLAN: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3856,6 +4237,8 @@ static ATTRS_WAKEONLAN: &[AttrDef] = &[
     AttrDef { name: "mac-address", id: 0x0000, ty: Ty::Scalar(TypeTag::Str), writable: false, timed_write: false },
 ];
 static CMDS_WAKEONLAN: &[CmdDef] = &[
+];
+static EVENTS_WAKEONLAN: &[EventDef] = &[
 ];
 static ATTRS_WATERHEATERMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3874,6 +4257,10 @@ static CMDS_WATERHEATERMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "boost", id: 0x00, timed: false, fields: &[FieldDef { name: "boost-info", ty: Ty::Struct(&S_WATERHEATERMANAGEMENT_WATERHEATERBOOSTINFOSTRUCT), optional: false }] },
     CmdDef { name: "cancel-boost", id: 0x01, timed: false, fields: &[] },
 ];
+static EVENTS_WATERHEATERMANAGEMENT: &[EventDef] = &[
+    EventDef { name: "boost-ended", id: 0x01, priority: "info", fields: &[] },
+    EventDef { name: "boost-started", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "boost-info", id: 0, ty: Ty::Struct(&S_WATERHEATERMANAGEMENT_WATERHEATERBOOSTINFOSTRUCT), optional: false }] },
+];
 static ATTRS_WATERHEATERMODE: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3885,6 +4272,8 @@ static ATTRS_WATERHEATERMODE: &[AttrDef] = &[
 ];
 static CMDS_WATERHEATERMODE: &[CmdDef] = &[
     CmdDef { name: "change-to-mode", id: 0x00, timed: false, fields: &[FieldDef { name: "new-mode", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
+static EVENTS_WATERHEATERMODE: &[EventDef] = &[
 ];
 static ATTRS_WEBRTCTRANSPORTPROVIDER: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3901,6 +4290,8 @@ static CMDS_WEBRTCTRANSPORTPROVIDER: &[CmdDef] = &[
     CmdDef { name: "provide-offer", id: 0x02, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "sdp", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "stream-usage", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "originating-endpoint-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "video-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "audio-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "ice-servers", ty: Ty::ListOfStruct(&S_GLOBAL_ICESERVERSTRUCT), optional: true }, FieldDef { name: "ice-transport-policy", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "metadata-enabled", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
     CmdDef { name: "solicit-offer", id: 0x00, timed: false, fields: &[FieldDef { name: "stream-usage", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "originating-endpoint-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "video-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "audio-stream-id", ty: Ty::Scalar(TypeTag::UInt), optional: true }, FieldDef { name: "ice-servers", ty: Ty::ListOfStruct(&S_GLOBAL_ICESERVERSTRUCT), optional: true }, FieldDef { name: "ice-transport-policy", ty: Ty::Scalar(TypeTag::Str), optional: true }, FieldDef { name: "metadata-enabled", ty: Ty::Scalar(TypeTag::Bool), optional: true }] },
 ];
+static EVENTS_WEBRTCTRANSPORTPROVIDER: &[EventDef] = &[
+];
 static ATTRS_WEBRTCTRANSPORTREQUESTOR: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3914,6 +4305,8 @@ static CMDS_WEBRTCTRANSPORTREQUESTOR: &[CmdDef] = &[
     CmdDef { name: "end", id: 0x03, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "reason", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "ice-candidates", id: 0x02, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "ice-candidates", ty: Ty::ListOfStruct(&S_GLOBAL_ICECANDIDATESTRUCT), optional: false }] },
     CmdDef { name: "offer", id: 0x00, timed: false, fields: &[FieldDef { name: "web-rtc-session-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "sdp", ty: Ty::Scalar(TypeTag::Str), optional: false }, FieldDef { name: "ice-servers", ty: Ty::ListOfStruct(&S_GLOBAL_ICESERVERSTRUCT), optional: true }, FieldDef { name: "ice-transport-policy", ty: Ty::Scalar(TypeTag::Str), optional: true }] },
+];
+static EVENTS_WEBRTCTRANSPORTREQUESTOR: &[EventDef] = &[
 ];
 static ATTRS_WIFINETWORKDIAGNOSTICS: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3938,6 +4331,11 @@ static ATTRS_WIFINETWORKDIAGNOSTICS: &[AttrDef] = &[
 static CMDS_WIFINETWORKDIAGNOSTICS: &[CmdDef] = &[
     CmdDef { name: "reset-counts", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_WIFINETWORKDIAGNOSTICS: &[EventDef] = &[
+    EventDef { name: "association-failure", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "association-failure-cause", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "status", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "connection-status", id: 0x02, priority: "info", fields: &[EventFieldDef { name: "connection-status", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "disconnection", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "reason-code", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 static ATTRS_WIFINETWORKMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3949,6 +4347,8 @@ static ATTRS_WIFINETWORKMANAGEMENT: &[AttrDef] = &[
 ];
 static CMDS_WIFINETWORKMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "network-passphrase-request", id: 0x00, timed: false, fields: &[] },
+];
+static EVENTS_WIFINETWORKMANAGEMENT: &[EventDef] = &[
 ];
 static ATTRS_WINDOWCOVERING: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -3988,6 +4388,8 @@ static CMDS_WINDOWCOVERING: &[CmdDef] = &[
     CmdDef { name: "stop-motion", id: 0x02, timed: false, fields: &[] },
     CmdDef { name: "up-or-open", id: 0x00, timed: false, fields: &[] },
 ];
+static EVENTS_WINDOWCOVERING: &[EventDef] = &[
+];
 static ATTRS_ZONEMANAGEMENT: &[AttrDef] = &[
     AttrDef { name: "accepted-command-list", id: 0xfff9, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
     AttrDef { name: "attribute-list", id: 0xfffb, ty: Ty::List(TypeTag::UInt), writable: false, timed_write: false },
@@ -4009,147 +4411,151 @@ static CMDS_ZONEMANAGEMENT: &[CmdDef] = &[
     CmdDef { name: "remove-zone", id: 0x03, timed: false, fields: &[FieldDef { name: "zone-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
     CmdDef { name: "update-two-d-cartesian-zone", id: 0x02, timed: false, fields: &[FieldDef { name: "zone-id", ty: Ty::Scalar(TypeTag::UInt), optional: false }, FieldDef { name: "zone", ty: Ty::Struct(&S_ZONEMANAGEMENT_TWODCARTESIANZONESTRUCT), optional: false }] },
 ];
+static EVENTS_ZONEMANAGEMENT: &[EventDef] = &[
+    EventDef { name: "zone-stopped", id: 0x01, priority: "info", fields: &[EventFieldDef { name: "zone", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "reason", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+    EventDef { name: "zone-triggered", id: 0x00, priority: "info", fields: &[EventFieldDef { name: "zone", id: 0, ty: Ty::Scalar(TypeTag::UInt), optional: false }, EventFieldDef { name: "reason", id: 1, ty: Ty::Scalar(TypeTag::UInt), optional: false }] },
+];
 
 /// 名前昇順（binary search 用）。
 pub(super) static CLUSTERS: &[ClusterDef] = &[
-    ClusterDef { name: "accesscontrol", id: 0x001f, attrs: ATTRS_ACCESSCONTROL, cmds: CMDS_ACCESSCONTROL },
-    ClusterDef { name: "accountlogin", id: 0x050e, attrs: ATTRS_ACCOUNTLOGIN, cmds: CMDS_ACCOUNTLOGIN },
-    ClusterDef { name: "actions", id: 0x0025, attrs: ATTRS_ACTIONS, cmds: CMDS_ACTIONS },
-    ClusterDef { name: "activatedcarbonfiltermonitoring", id: 0x0072, attrs: ATTRS_ACTIVATEDCARBONFILTERMONITORING, cmds: CMDS_ACTIVATEDCARBONFILTERMONITORING },
-    ClusterDef { name: "administratorcommissioning", id: 0x003c, attrs: ATTRS_ADMINISTRATORCOMMISSIONING, cmds: CMDS_ADMINISTRATORCOMMISSIONING },
-    ClusterDef { name: "airquality", id: 0x005b, attrs: ATTRS_AIRQUALITY, cmds: CMDS_AIRQUALITY },
-    ClusterDef { name: "applicationbasic", id: 0x050d, attrs: ATTRS_APPLICATIONBASIC, cmds: CMDS_APPLICATIONBASIC },
-    ClusterDef { name: "applicationlauncher", id: 0x050c, attrs: ATTRS_APPLICATIONLAUNCHER, cmds: CMDS_APPLICATIONLAUNCHER },
-    ClusterDef { name: "audiooutput", id: 0x050b, attrs: ATTRS_AUDIOOUTPUT, cmds: CMDS_AUDIOOUTPUT },
-    ClusterDef { name: "ballastconfiguration", id: 0x0301, attrs: ATTRS_BALLASTCONFIGURATION, cmds: CMDS_BALLASTCONFIGURATION },
-    ClusterDef { name: "basicinformation", id: 0x0028, attrs: ATTRS_BASICINFORMATION, cmds: CMDS_BASICINFORMATION },
-    ClusterDef { name: "binding", id: 0x001e, attrs: ATTRS_BINDING, cmds: CMDS_BINDING },
-    ClusterDef { name: "booleanstate", id: 0x0045, attrs: ATTRS_BOOLEANSTATE, cmds: CMDS_BOOLEANSTATE },
-    ClusterDef { name: "booleanstateconfiguration", id: 0x0080, attrs: ATTRS_BOOLEANSTATECONFIGURATION, cmds: CMDS_BOOLEANSTATECONFIGURATION },
-    ClusterDef { name: "bridgeddevicebasicinformation", id: 0x0039, attrs: ATTRS_BRIDGEDDEVICEBASICINFORMATION, cmds: CMDS_BRIDGEDDEVICEBASICINFORMATION },
-    ClusterDef { name: "cameraavsettingsuserlevelmanagement", id: 0x0552, attrs: ATTRS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT, cmds: CMDS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT },
-    ClusterDef { name: "cameraavstreammanagement", id: 0x0551, attrs: ATTRS_CAMERAAVSTREAMMANAGEMENT, cmds: CMDS_CAMERAAVSTREAMMANAGEMENT },
-    ClusterDef { name: "carbondioxideconcentrationmeasurement", id: 0x040d, attrs: ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_CARBONDIOXIDECONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "carbonmonoxideconcentrationmeasurement", id: 0x040c, attrs: ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_CARBONMONOXIDECONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "channel", id: 0x0504, attrs: ATTRS_CHANNEL, cmds: CMDS_CHANNEL },
-    ClusterDef { name: "chime", id: 0x0556, attrs: ATTRS_CHIME, cmds: CMDS_CHIME },
-    ClusterDef { name: "closurecontrol", id: 0x0104, attrs: ATTRS_CLOSURECONTROL, cmds: CMDS_CLOSURECONTROL },
-    ClusterDef { name: "closuredimension", id: 0x0105, attrs: ATTRS_CLOSUREDIMENSION, cmds: CMDS_CLOSUREDIMENSION },
-    ClusterDef { name: "colorcontrol", id: 0x0300, attrs: ATTRS_COLORCONTROL, cmds: CMDS_COLORCONTROL },
-    ClusterDef { name: "commissionercontrol", id: 0x0751, attrs: ATTRS_COMMISSIONERCONTROL, cmds: CMDS_COMMISSIONERCONTROL },
-    ClusterDef { name: "commoditymetering", id: 0x0b07, attrs: ATTRS_COMMODITYMETERING, cmds: CMDS_COMMODITYMETERING },
-    ClusterDef { name: "commodityprice", id: 0x0095, attrs: ATTRS_COMMODITYPRICE, cmds: CMDS_COMMODITYPRICE },
-    ClusterDef { name: "commoditytariff", id: 0x0700, attrs: ATTRS_COMMODITYTARIFF, cmds: CMDS_COMMODITYTARIFF },
-    ClusterDef { name: "contentappobserver", id: 0x0510, attrs: ATTRS_CONTENTAPPOBSERVER, cmds: CMDS_CONTENTAPPOBSERVER },
-    ClusterDef { name: "contentcontrol", id: 0x050f, attrs: ATTRS_CONTENTCONTROL, cmds: CMDS_CONTENTCONTROL },
-    ClusterDef { name: "contentlauncher", id: 0x050a, attrs: ATTRS_CONTENTLAUNCHER, cmds: CMDS_CONTENTLAUNCHER },
-    ClusterDef { name: "descriptor", id: 0x001d, attrs: ATTRS_DESCRIPTOR, cmds: CMDS_DESCRIPTOR },
-    ClusterDef { name: "deviceenergymanagement", id: 0x0098, attrs: ATTRS_DEVICEENERGYMANAGEMENT, cmds: CMDS_DEVICEENERGYMANAGEMENT },
-    ClusterDef { name: "deviceenergymanagementmode", id: 0x009f, attrs: ATTRS_DEVICEENERGYMANAGEMENTMODE, cmds: CMDS_DEVICEENERGYMANAGEMENTMODE },
-    ClusterDef { name: "diagnosticlogs", id: 0x0032, attrs: ATTRS_DIAGNOSTICLOGS, cmds: CMDS_DIAGNOSTICLOGS },
-    ClusterDef { name: "dishwasheralarm", id: 0x005d, attrs: ATTRS_DISHWASHERALARM, cmds: CMDS_DISHWASHERALARM },
-    ClusterDef { name: "dishwashermode", id: 0x0059, attrs: ATTRS_DISHWASHERMODE, cmds: CMDS_DISHWASHERMODE },
-    ClusterDef { name: "doorlock", id: 0x0101, attrs: ATTRS_DOORLOCK, cmds: CMDS_DOORLOCK },
-    ClusterDef { name: "ecosysteminformation", id: 0x0750, attrs: ATTRS_ECOSYSTEMINFORMATION, cmds: CMDS_ECOSYSTEMINFORMATION },
-    ClusterDef { name: "electricalenergymeasurement", id: 0x0091, attrs: ATTRS_ELECTRICALENERGYMEASUREMENT, cmds: CMDS_ELECTRICALENERGYMEASUREMENT },
-    ClusterDef { name: "electricalgridconditions", id: 0x00a0, attrs: ATTRS_ELECTRICALGRIDCONDITIONS, cmds: CMDS_ELECTRICALGRIDCONDITIONS },
-    ClusterDef { name: "electricalpowermeasurement", id: 0x0090, attrs: ATTRS_ELECTRICALPOWERMEASUREMENT, cmds: CMDS_ELECTRICALPOWERMEASUREMENT },
-    ClusterDef { name: "energyevse", id: 0x0099, attrs: ATTRS_ENERGYEVSE, cmds: CMDS_ENERGYEVSE },
-    ClusterDef { name: "energyevsemode", id: 0x009d, attrs: ATTRS_ENERGYEVSEMODE, cmds: CMDS_ENERGYEVSEMODE },
-    ClusterDef { name: "energypreference", id: 0x009b, attrs: ATTRS_ENERGYPREFERENCE, cmds: CMDS_ENERGYPREFERENCE },
-    ClusterDef { name: "ethernetnetworkdiagnostics", id: 0x0037, attrs: ATTRS_ETHERNETNETWORKDIAGNOSTICS, cmds: CMDS_ETHERNETNETWORKDIAGNOSTICS },
-    ClusterDef { name: "fancontrol", id: 0x0202, attrs: ATTRS_FANCONTROL, cmds: CMDS_FANCONTROL },
-    ClusterDef { name: "faultinjection", id: 0xfff1fc06, attrs: ATTRS_FAULTINJECTION, cmds: CMDS_FAULTINJECTION },
-    ClusterDef { name: "fixedlabel", id: 0x0040, attrs: ATTRS_FIXEDLABEL, cmds: CMDS_FIXEDLABEL },
-    ClusterDef { name: "flowmeasurement", id: 0x0404, attrs: ATTRS_FLOWMEASUREMENT, cmds: CMDS_FLOWMEASUREMENT },
-    ClusterDef { name: "formaldehydeconcentrationmeasurement", id: 0x042b, attrs: ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT, cmds: CMDS_FORMALDEHYDECONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "generalcommissioning", id: 0x0030, attrs: ATTRS_GENERALCOMMISSIONING, cmds: CMDS_GENERALCOMMISSIONING },
-    ClusterDef { name: "generaldiagnostics", id: 0x0033, attrs: ATTRS_GENERALDIAGNOSTICS, cmds: CMDS_GENERALDIAGNOSTICS },
-    ClusterDef { name: "groupkeymanagement", id: 0x003f, attrs: ATTRS_GROUPKEYMANAGEMENT, cmds: CMDS_GROUPKEYMANAGEMENT },
-    ClusterDef { name: "groups", id: 0x0004, attrs: ATTRS_GROUPS, cmds: CMDS_GROUPS },
-    ClusterDef { name: "hepafiltermonitoring", id: 0x0071, attrs: ATTRS_HEPAFILTERMONITORING, cmds: CMDS_HEPAFILTERMONITORING },
-    ClusterDef { name: "icdmanagement", id: 0x0046, attrs: ATTRS_ICDMANAGEMENT, cmds: CMDS_ICDMANAGEMENT },
-    ClusterDef { name: "identify", id: 0x0003, attrs: ATTRS_IDENTIFY, cmds: CMDS_IDENTIFY },
-    ClusterDef { name: "illuminancemeasurement", id: 0x0400, attrs: ATTRS_ILLUMINANCEMEASUREMENT, cmds: CMDS_ILLUMINANCEMEASUREMENT },
-    ClusterDef { name: "jointfabricadministrator", id: 0x0753, attrs: ATTRS_JOINTFABRICADMINISTRATOR, cmds: CMDS_JOINTFABRICADMINISTRATOR },
-    ClusterDef { name: "jointfabricdatastore", id: 0x0752, attrs: ATTRS_JOINTFABRICDATASTORE, cmds: CMDS_JOINTFABRICDATASTORE },
-    ClusterDef { name: "keypadinput", id: 0x0509, attrs: ATTRS_KEYPADINPUT, cmds: CMDS_KEYPADINPUT },
-    ClusterDef { name: "laundrydryercontrols", id: 0x004a, attrs: ATTRS_LAUNDRYDRYERCONTROLS, cmds: CMDS_LAUNDRYDRYERCONTROLS },
-    ClusterDef { name: "laundrywashercontrols", id: 0x0053, attrs: ATTRS_LAUNDRYWASHERCONTROLS, cmds: CMDS_LAUNDRYWASHERCONTROLS },
-    ClusterDef { name: "laundrywashermode", id: 0x0051, attrs: ATTRS_LAUNDRYWASHERMODE, cmds: CMDS_LAUNDRYWASHERMODE },
-    ClusterDef { name: "levelcontrol", id: 0x0008, attrs: ATTRS_LEVELCONTROL, cmds: CMDS_LEVELCONTROL },
-    ClusterDef { name: "localizationconfiguration", id: 0x002b, attrs: ATTRS_LOCALIZATIONCONFIGURATION, cmds: CMDS_LOCALIZATIONCONFIGURATION },
-    ClusterDef { name: "lowpower", id: 0x0508, attrs: ATTRS_LOWPOWER, cmds: CMDS_LOWPOWER },
-    ClusterDef { name: "mediainput", id: 0x0507, attrs: ATTRS_MEDIAINPUT, cmds: CMDS_MEDIAINPUT },
-    ClusterDef { name: "mediaplayback", id: 0x0506, attrs: ATTRS_MEDIAPLAYBACK, cmds: CMDS_MEDIAPLAYBACK },
-    ClusterDef { name: "messages", id: 0x0097, attrs: ATTRS_MESSAGES, cmds: CMDS_MESSAGES },
-    ClusterDef { name: "meteridentification", id: 0x0b06, attrs: ATTRS_METERIDENTIFICATION, cmds: CMDS_METERIDENTIFICATION },
-    ClusterDef { name: "microwaveovencontrol", id: 0x005f, attrs: ATTRS_MICROWAVEOVENCONTROL, cmds: CMDS_MICROWAVEOVENCONTROL },
-    ClusterDef { name: "microwaveovenmode", id: 0x005e, attrs: ATTRS_MICROWAVEOVENMODE, cmds: CMDS_MICROWAVEOVENMODE },
-    ClusterDef { name: "modeselect", id: 0x0050, attrs: ATTRS_MODESELECT, cmds: CMDS_MODESELECT },
-    ClusterDef { name: "networkcommissioning", id: 0x0031, attrs: ATTRS_NETWORKCOMMISSIONING, cmds: CMDS_NETWORKCOMMISSIONING },
-    ClusterDef { name: "nitrogendioxideconcentrationmeasurement", id: 0x0413, attrs: ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "occupancysensing", id: 0x0406, attrs: ATTRS_OCCUPANCYSENSING, cmds: CMDS_OCCUPANCYSENSING },
-    ClusterDef { name: "onoff", id: 0x0006, attrs: ATTRS_ONOFF, cmds: CMDS_ONOFF },
-    ClusterDef { name: "operationalcredentials", id: 0x003e, attrs: ATTRS_OPERATIONALCREDENTIALS, cmds: CMDS_OPERATIONALCREDENTIALS },
-    ClusterDef { name: "operationalstate", id: 0x0060, attrs: ATTRS_OPERATIONALSTATE, cmds: CMDS_OPERATIONALSTATE },
-    ClusterDef { name: "otasoftwareupdateprovider", id: 0x0029, attrs: ATTRS_OTASOFTWAREUPDATEPROVIDER, cmds: CMDS_OTASOFTWAREUPDATEPROVIDER },
-    ClusterDef { name: "otasoftwareupdaterequestor", id: 0x002a, attrs: ATTRS_OTASOFTWAREUPDATEREQUESTOR, cmds: CMDS_OTASOFTWAREUPDATEREQUESTOR },
-    ClusterDef { name: "ovencavityoperationalstate", id: 0x0048, attrs: ATTRS_OVENCAVITYOPERATIONALSTATE, cmds: CMDS_OVENCAVITYOPERATIONALSTATE },
-    ClusterDef { name: "ovenmode", id: 0x0049, attrs: ATTRS_OVENMODE, cmds: CMDS_OVENMODE },
-    ClusterDef { name: "ozoneconcentrationmeasurement", id: 0x0415, attrs: ATTRS_OZONECONCENTRATIONMEASUREMENT, cmds: CMDS_OZONECONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "pm10concentrationmeasurement", id: 0x042d, attrs: ATTRS_PM10CONCENTRATIONMEASUREMENT, cmds: CMDS_PM10CONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "pm1concentrationmeasurement", id: 0x042c, attrs: ATTRS_PM1CONCENTRATIONMEASUREMENT, cmds: CMDS_PM1CONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "pm25concentrationmeasurement", id: 0x042a, attrs: ATTRS_PM25CONCENTRATIONMEASUREMENT, cmds: CMDS_PM25CONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "powersource", id: 0x002f, attrs: ATTRS_POWERSOURCE, cmds: CMDS_POWERSOURCE },
-    ClusterDef { name: "powersourceconfiguration", id: 0x002e, attrs: ATTRS_POWERSOURCECONFIGURATION, cmds: CMDS_POWERSOURCECONFIGURATION },
-    ClusterDef { name: "powertopology", id: 0x009c, attrs: ATTRS_POWERTOPOLOGY, cmds: CMDS_POWERTOPOLOGY },
-    ClusterDef { name: "pressuremeasurement", id: 0x0403, attrs: ATTRS_PRESSUREMEASUREMENT, cmds: CMDS_PRESSUREMEASUREMENT },
-    ClusterDef { name: "proxyconfiguration", id: 0x0042, attrs: ATTRS_PROXYCONFIGURATION, cmds: CMDS_PROXYCONFIGURATION },
-    ClusterDef { name: "proxydiscovery", id: 0x0043, attrs: ATTRS_PROXYDISCOVERY, cmds: CMDS_PROXYDISCOVERY },
-    ClusterDef { name: "proxyvalid", id: 0x0044, attrs: ATTRS_PROXYVALID, cmds: CMDS_PROXYVALID },
-    ClusterDef { name: "pulsewidthmodulation", id: 0x001c, attrs: ATTRS_PULSEWIDTHMODULATION, cmds: CMDS_PULSEWIDTHMODULATION },
-    ClusterDef { name: "pumpconfigurationandcontrol", id: 0x0200, attrs: ATTRS_PUMPCONFIGURATIONANDCONTROL, cmds: CMDS_PUMPCONFIGURATIONANDCONTROL },
-    ClusterDef { name: "pushavstreamtransport", id: 0x0555, attrs: ATTRS_PUSHAVSTREAMTRANSPORT, cmds: CMDS_PUSHAVSTREAMTRANSPORT },
-    ClusterDef { name: "radonconcentrationmeasurement", id: 0x042f, attrs: ATTRS_RADONCONCENTRATIONMEASUREMENT, cmds: CMDS_RADONCONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "refrigeratoralarm", id: 0x0057, attrs: ATTRS_REFRIGERATORALARM, cmds: CMDS_REFRIGERATORALARM },
-    ClusterDef { name: "refrigeratorandtemperaturecontrolledcabinetmode", id: 0x0052, attrs: ATTRS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE, cmds: CMDS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE },
-    ClusterDef { name: "relativehumiditymeasurement", id: 0x0405, attrs: ATTRS_RELATIVEHUMIDITYMEASUREMENT, cmds: CMDS_RELATIVEHUMIDITYMEASUREMENT },
-    ClusterDef { name: "rvccleanmode", id: 0x0055, attrs: ATTRS_RVCCLEANMODE, cmds: CMDS_RVCCLEANMODE },
-    ClusterDef { name: "rvcoperationalstate", id: 0x0061, attrs: ATTRS_RVCOPERATIONALSTATE, cmds: CMDS_RVCOPERATIONALSTATE },
-    ClusterDef { name: "rvcrunmode", id: 0x0054, attrs: ATTRS_RVCRUNMODE, cmds: CMDS_RVCRUNMODE },
-    ClusterDef { name: "samplemei", id: 0xfff1fc20, attrs: ATTRS_SAMPLEMEI, cmds: CMDS_SAMPLEMEI },
-    ClusterDef { name: "scenesmanagement", id: 0x0062, attrs: ATTRS_SCENESMANAGEMENT, cmds: CMDS_SCENESMANAGEMENT },
-    ClusterDef { name: "servicearea", id: 0x0150, attrs: ATTRS_SERVICEAREA, cmds: CMDS_SERVICEAREA },
-    ClusterDef { name: "smokecoalarm", id: 0x005c, attrs: ATTRS_SMOKECOALARM, cmds: CMDS_SMOKECOALARM },
-    ClusterDef { name: "softwarediagnostics", id: 0x0034, attrs: ATTRS_SOFTWAREDIAGNOSTICS, cmds: CMDS_SOFTWAREDIAGNOSTICS },
-    ClusterDef { name: "soilmeasurement", id: 0x0430, attrs: ATTRS_SOILMEASUREMENT, cmds: CMDS_SOILMEASUREMENT },
-    ClusterDef { name: "switch", id: 0x003b, attrs: ATTRS_SWITCH, cmds: CMDS_SWITCH },
-    ClusterDef { name: "targetnavigator", id: 0x0505, attrs: ATTRS_TARGETNAVIGATOR, cmds: CMDS_TARGETNAVIGATOR },
-    ClusterDef { name: "temperaturecontrol", id: 0x0056, attrs: ATTRS_TEMPERATURECONTROL, cmds: CMDS_TEMPERATURECONTROL },
-    ClusterDef { name: "temperaturemeasurement", id: 0x0402, attrs: ATTRS_TEMPERATUREMEASUREMENT, cmds: CMDS_TEMPERATUREMEASUREMENT },
-    ClusterDef { name: "thermostat", id: 0x0201, attrs: ATTRS_THERMOSTAT, cmds: CMDS_THERMOSTAT },
-    ClusterDef { name: "thermostatuserinterfaceconfiguration", id: 0x0204, attrs: ATTRS_THERMOSTATUSERINTERFACECONFIGURATION, cmds: CMDS_THERMOSTATUSERINTERFACECONFIGURATION },
-    ClusterDef { name: "threadborderroutermanagement", id: 0x0452, attrs: ATTRS_THREADBORDERROUTERMANAGEMENT, cmds: CMDS_THREADBORDERROUTERMANAGEMENT },
-    ClusterDef { name: "threadnetworkdiagnostics", id: 0x0035, attrs: ATTRS_THREADNETWORKDIAGNOSTICS, cmds: CMDS_THREADNETWORKDIAGNOSTICS },
-    ClusterDef { name: "threadnetworkdirectory", id: 0x0453, attrs: ATTRS_THREADNETWORKDIRECTORY, cmds: CMDS_THREADNETWORKDIRECTORY },
-    ClusterDef { name: "timeformatlocalization", id: 0x002c, attrs: ATTRS_TIMEFORMATLOCALIZATION, cmds: CMDS_TIMEFORMATLOCALIZATION },
-    ClusterDef { name: "timer", id: 0x0047, attrs: ATTRS_TIMER, cmds: CMDS_TIMER },
-    ClusterDef { name: "timesynchronization", id: 0x0038, attrs: ATTRS_TIMESYNCHRONIZATION, cmds: CMDS_TIMESYNCHRONIZATION },
-    ClusterDef { name: "tlscertificatemanagement", id: 0x0801, attrs: ATTRS_TLSCERTIFICATEMANAGEMENT, cmds: CMDS_TLSCERTIFICATEMANAGEMENT },
-    ClusterDef { name: "tlsclientmanagement", id: 0x0802, attrs: ATTRS_TLSCLIENTMANAGEMENT, cmds: CMDS_TLSCLIENTMANAGEMENT },
-    ClusterDef { name: "totalvolatileorganiccompoundsconcentrationmeasurement", id: 0x042e, attrs: ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT, cmds: CMDS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT },
-    ClusterDef { name: "unitlocalization", id: 0x002d, attrs: ATTRS_UNITLOCALIZATION, cmds: CMDS_UNITLOCALIZATION },
-    ClusterDef { name: "unittesting", id: 0xfff1fc05, attrs: ATTRS_UNITTESTING, cmds: CMDS_UNITTESTING },
-    ClusterDef { name: "userlabel", id: 0x0041, attrs: ATTRS_USERLABEL, cmds: CMDS_USERLABEL },
-    ClusterDef { name: "valveconfigurationandcontrol", id: 0x0081, attrs: ATTRS_VALVECONFIGURATIONANDCONTROL, cmds: CMDS_VALVECONFIGURATIONANDCONTROL },
-    ClusterDef { name: "wakeonlan", id: 0x0503, attrs: ATTRS_WAKEONLAN, cmds: CMDS_WAKEONLAN },
-    ClusterDef { name: "waterheatermanagement", id: 0x0094, attrs: ATTRS_WATERHEATERMANAGEMENT, cmds: CMDS_WATERHEATERMANAGEMENT },
-    ClusterDef { name: "waterheatermode", id: 0x009e, attrs: ATTRS_WATERHEATERMODE, cmds: CMDS_WATERHEATERMODE },
-    ClusterDef { name: "webrtctransportprovider", id: 0x0553, attrs: ATTRS_WEBRTCTRANSPORTPROVIDER, cmds: CMDS_WEBRTCTRANSPORTPROVIDER },
-    ClusterDef { name: "webrtctransportrequestor", id: 0x0554, attrs: ATTRS_WEBRTCTRANSPORTREQUESTOR, cmds: CMDS_WEBRTCTRANSPORTREQUESTOR },
-    ClusterDef { name: "wifinetworkdiagnostics", id: 0x0036, attrs: ATTRS_WIFINETWORKDIAGNOSTICS, cmds: CMDS_WIFINETWORKDIAGNOSTICS },
-    ClusterDef { name: "wifinetworkmanagement", id: 0x0451, attrs: ATTRS_WIFINETWORKMANAGEMENT, cmds: CMDS_WIFINETWORKMANAGEMENT },
-    ClusterDef { name: "windowcovering", id: 0x0102, attrs: ATTRS_WINDOWCOVERING, cmds: CMDS_WINDOWCOVERING },
-    ClusterDef { name: "zonemanagement", id: 0x0550, attrs: ATTRS_ZONEMANAGEMENT, cmds: CMDS_ZONEMANAGEMENT },
+    ClusterDef { name: "accesscontrol", id: 0x001f, attrs: ATTRS_ACCESSCONTROL, cmds: CMDS_ACCESSCONTROL, events: EVENTS_ACCESSCONTROL },
+    ClusterDef { name: "accountlogin", id: 0x050e, attrs: ATTRS_ACCOUNTLOGIN, cmds: CMDS_ACCOUNTLOGIN, events: EVENTS_ACCOUNTLOGIN },
+    ClusterDef { name: "actions", id: 0x0025, attrs: ATTRS_ACTIONS, cmds: CMDS_ACTIONS, events: EVENTS_ACTIONS },
+    ClusterDef { name: "activatedcarbonfiltermonitoring", id: 0x0072, attrs: ATTRS_ACTIVATEDCARBONFILTERMONITORING, cmds: CMDS_ACTIVATEDCARBONFILTERMONITORING, events: EVENTS_ACTIVATEDCARBONFILTERMONITORING },
+    ClusterDef { name: "administratorcommissioning", id: 0x003c, attrs: ATTRS_ADMINISTRATORCOMMISSIONING, cmds: CMDS_ADMINISTRATORCOMMISSIONING, events: EVENTS_ADMINISTRATORCOMMISSIONING },
+    ClusterDef { name: "airquality", id: 0x005b, attrs: ATTRS_AIRQUALITY, cmds: CMDS_AIRQUALITY, events: EVENTS_AIRQUALITY },
+    ClusterDef { name: "applicationbasic", id: 0x050d, attrs: ATTRS_APPLICATIONBASIC, cmds: CMDS_APPLICATIONBASIC, events: EVENTS_APPLICATIONBASIC },
+    ClusterDef { name: "applicationlauncher", id: 0x050c, attrs: ATTRS_APPLICATIONLAUNCHER, cmds: CMDS_APPLICATIONLAUNCHER, events: EVENTS_APPLICATIONLAUNCHER },
+    ClusterDef { name: "audiooutput", id: 0x050b, attrs: ATTRS_AUDIOOUTPUT, cmds: CMDS_AUDIOOUTPUT, events: EVENTS_AUDIOOUTPUT },
+    ClusterDef { name: "ballastconfiguration", id: 0x0301, attrs: ATTRS_BALLASTCONFIGURATION, cmds: CMDS_BALLASTCONFIGURATION, events: EVENTS_BALLASTCONFIGURATION },
+    ClusterDef { name: "basicinformation", id: 0x0028, attrs: ATTRS_BASICINFORMATION, cmds: CMDS_BASICINFORMATION, events: EVENTS_BASICINFORMATION },
+    ClusterDef { name: "binding", id: 0x001e, attrs: ATTRS_BINDING, cmds: CMDS_BINDING, events: EVENTS_BINDING },
+    ClusterDef { name: "booleanstate", id: 0x0045, attrs: ATTRS_BOOLEANSTATE, cmds: CMDS_BOOLEANSTATE, events: EVENTS_BOOLEANSTATE },
+    ClusterDef { name: "booleanstateconfiguration", id: 0x0080, attrs: ATTRS_BOOLEANSTATECONFIGURATION, cmds: CMDS_BOOLEANSTATECONFIGURATION, events: EVENTS_BOOLEANSTATECONFIGURATION },
+    ClusterDef { name: "bridgeddevicebasicinformation", id: 0x0039, attrs: ATTRS_BRIDGEDDEVICEBASICINFORMATION, cmds: CMDS_BRIDGEDDEVICEBASICINFORMATION, events: EVENTS_BRIDGEDDEVICEBASICINFORMATION },
+    ClusterDef { name: "cameraavsettingsuserlevelmanagement", id: 0x0552, attrs: ATTRS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT, cmds: CMDS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT, events: EVENTS_CAMERAAVSETTINGSUSERLEVELMANAGEMENT },
+    ClusterDef { name: "cameraavstreammanagement", id: 0x0551, attrs: ATTRS_CAMERAAVSTREAMMANAGEMENT, cmds: CMDS_CAMERAAVSTREAMMANAGEMENT, events: EVENTS_CAMERAAVSTREAMMANAGEMENT },
+    ClusterDef { name: "carbondioxideconcentrationmeasurement", id: 0x040d, attrs: ATTRS_CARBONDIOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_CARBONDIOXIDECONCENTRATIONMEASUREMENT, events: EVENTS_CARBONDIOXIDECONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "carbonmonoxideconcentrationmeasurement", id: 0x040c, attrs: ATTRS_CARBONMONOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_CARBONMONOXIDECONCENTRATIONMEASUREMENT, events: EVENTS_CARBONMONOXIDECONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "channel", id: 0x0504, attrs: ATTRS_CHANNEL, cmds: CMDS_CHANNEL, events: EVENTS_CHANNEL },
+    ClusterDef { name: "chime", id: 0x0556, attrs: ATTRS_CHIME, cmds: CMDS_CHIME, events: EVENTS_CHIME },
+    ClusterDef { name: "closurecontrol", id: 0x0104, attrs: ATTRS_CLOSURECONTROL, cmds: CMDS_CLOSURECONTROL, events: EVENTS_CLOSURECONTROL },
+    ClusterDef { name: "closuredimension", id: 0x0105, attrs: ATTRS_CLOSUREDIMENSION, cmds: CMDS_CLOSUREDIMENSION, events: EVENTS_CLOSUREDIMENSION },
+    ClusterDef { name: "colorcontrol", id: 0x0300, attrs: ATTRS_COLORCONTROL, cmds: CMDS_COLORCONTROL, events: EVENTS_COLORCONTROL },
+    ClusterDef { name: "commissionercontrol", id: 0x0751, attrs: ATTRS_COMMISSIONERCONTROL, cmds: CMDS_COMMISSIONERCONTROL, events: EVENTS_COMMISSIONERCONTROL },
+    ClusterDef { name: "commoditymetering", id: 0x0b07, attrs: ATTRS_COMMODITYMETERING, cmds: CMDS_COMMODITYMETERING, events: EVENTS_COMMODITYMETERING },
+    ClusterDef { name: "commodityprice", id: 0x0095, attrs: ATTRS_COMMODITYPRICE, cmds: CMDS_COMMODITYPRICE, events: EVENTS_COMMODITYPRICE },
+    ClusterDef { name: "commoditytariff", id: 0x0700, attrs: ATTRS_COMMODITYTARIFF, cmds: CMDS_COMMODITYTARIFF, events: EVENTS_COMMODITYTARIFF },
+    ClusterDef { name: "contentappobserver", id: 0x0510, attrs: ATTRS_CONTENTAPPOBSERVER, cmds: CMDS_CONTENTAPPOBSERVER, events: EVENTS_CONTENTAPPOBSERVER },
+    ClusterDef { name: "contentcontrol", id: 0x050f, attrs: ATTRS_CONTENTCONTROL, cmds: CMDS_CONTENTCONTROL, events: EVENTS_CONTENTCONTROL },
+    ClusterDef { name: "contentlauncher", id: 0x050a, attrs: ATTRS_CONTENTLAUNCHER, cmds: CMDS_CONTENTLAUNCHER, events: EVENTS_CONTENTLAUNCHER },
+    ClusterDef { name: "descriptor", id: 0x001d, attrs: ATTRS_DESCRIPTOR, cmds: CMDS_DESCRIPTOR, events: EVENTS_DESCRIPTOR },
+    ClusterDef { name: "deviceenergymanagement", id: 0x0098, attrs: ATTRS_DEVICEENERGYMANAGEMENT, cmds: CMDS_DEVICEENERGYMANAGEMENT, events: EVENTS_DEVICEENERGYMANAGEMENT },
+    ClusterDef { name: "deviceenergymanagementmode", id: 0x009f, attrs: ATTRS_DEVICEENERGYMANAGEMENTMODE, cmds: CMDS_DEVICEENERGYMANAGEMENTMODE, events: EVENTS_DEVICEENERGYMANAGEMENTMODE },
+    ClusterDef { name: "diagnosticlogs", id: 0x0032, attrs: ATTRS_DIAGNOSTICLOGS, cmds: CMDS_DIAGNOSTICLOGS, events: EVENTS_DIAGNOSTICLOGS },
+    ClusterDef { name: "dishwasheralarm", id: 0x005d, attrs: ATTRS_DISHWASHERALARM, cmds: CMDS_DISHWASHERALARM, events: EVENTS_DISHWASHERALARM },
+    ClusterDef { name: "dishwashermode", id: 0x0059, attrs: ATTRS_DISHWASHERMODE, cmds: CMDS_DISHWASHERMODE, events: EVENTS_DISHWASHERMODE },
+    ClusterDef { name: "doorlock", id: 0x0101, attrs: ATTRS_DOORLOCK, cmds: CMDS_DOORLOCK, events: EVENTS_DOORLOCK },
+    ClusterDef { name: "ecosysteminformation", id: 0x0750, attrs: ATTRS_ECOSYSTEMINFORMATION, cmds: CMDS_ECOSYSTEMINFORMATION, events: EVENTS_ECOSYSTEMINFORMATION },
+    ClusterDef { name: "electricalenergymeasurement", id: 0x0091, attrs: ATTRS_ELECTRICALENERGYMEASUREMENT, cmds: CMDS_ELECTRICALENERGYMEASUREMENT, events: EVENTS_ELECTRICALENERGYMEASUREMENT },
+    ClusterDef { name: "electricalgridconditions", id: 0x00a0, attrs: ATTRS_ELECTRICALGRIDCONDITIONS, cmds: CMDS_ELECTRICALGRIDCONDITIONS, events: EVENTS_ELECTRICALGRIDCONDITIONS },
+    ClusterDef { name: "electricalpowermeasurement", id: 0x0090, attrs: ATTRS_ELECTRICALPOWERMEASUREMENT, cmds: CMDS_ELECTRICALPOWERMEASUREMENT, events: EVENTS_ELECTRICALPOWERMEASUREMENT },
+    ClusterDef { name: "energyevse", id: 0x0099, attrs: ATTRS_ENERGYEVSE, cmds: CMDS_ENERGYEVSE, events: EVENTS_ENERGYEVSE },
+    ClusterDef { name: "energyevsemode", id: 0x009d, attrs: ATTRS_ENERGYEVSEMODE, cmds: CMDS_ENERGYEVSEMODE, events: EVENTS_ENERGYEVSEMODE },
+    ClusterDef { name: "energypreference", id: 0x009b, attrs: ATTRS_ENERGYPREFERENCE, cmds: CMDS_ENERGYPREFERENCE, events: EVENTS_ENERGYPREFERENCE },
+    ClusterDef { name: "ethernetnetworkdiagnostics", id: 0x0037, attrs: ATTRS_ETHERNETNETWORKDIAGNOSTICS, cmds: CMDS_ETHERNETNETWORKDIAGNOSTICS, events: EVENTS_ETHERNETNETWORKDIAGNOSTICS },
+    ClusterDef { name: "fancontrol", id: 0x0202, attrs: ATTRS_FANCONTROL, cmds: CMDS_FANCONTROL, events: EVENTS_FANCONTROL },
+    ClusterDef { name: "faultinjection", id: 0xfff1fc06, attrs: ATTRS_FAULTINJECTION, cmds: CMDS_FAULTINJECTION, events: EVENTS_FAULTINJECTION },
+    ClusterDef { name: "fixedlabel", id: 0x0040, attrs: ATTRS_FIXEDLABEL, cmds: CMDS_FIXEDLABEL, events: EVENTS_FIXEDLABEL },
+    ClusterDef { name: "flowmeasurement", id: 0x0404, attrs: ATTRS_FLOWMEASUREMENT, cmds: CMDS_FLOWMEASUREMENT, events: EVENTS_FLOWMEASUREMENT },
+    ClusterDef { name: "formaldehydeconcentrationmeasurement", id: 0x042b, attrs: ATTRS_FORMALDEHYDECONCENTRATIONMEASUREMENT, cmds: CMDS_FORMALDEHYDECONCENTRATIONMEASUREMENT, events: EVENTS_FORMALDEHYDECONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "generalcommissioning", id: 0x0030, attrs: ATTRS_GENERALCOMMISSIONING, cmds: CMDS_GENERALCOMMISSIONING, events: EVENTS_GENERALCOMMISSIONING },
+    ClusterDef { name: "generaldiagnostics", id: 0x0033, attrs: ATTRS_GENERALDIAGNOSTICS, cmds: CMDS_GENERALDIAGNOSTICS, events: EVENTS_GENERALDIAGNOSTICS },
+    ClusterDef { name: "groupkeymanagement", id: 0x003f, attrs: ATTRS_GROUPKEYMANAGEMENT, cmds: CMDS_GROUPKEYMANAGEMENT, events: EVENTS_GROUPKEYMANAGEMENT },
+    ClusterDef { name: "groups", id: 0x0004, attrs: ATTRS_GROUPS, cmds: CMDS_GROUPS, events: EVENTS_GROUPS },
+    ClusterDef { name: "hepafiltermonitoring", id: 0x0071, attrs: ATTRS_HEPAFILTERMONITORING, cmds: CMDS_HEPAFILTERMONITORING, events: EVENTS_HEPAFILTERMONITORING },
+    ClusterDef { name: "icdmanagement", id: 0x0046, attrs: ATTRS_ICDMANAGEMENT, cmds: CMDS_ICDMANAGEMENT, events: EVENTS_ICDMANAGEMENT },
+    ClusterDef { name: "identify", id: 0x0003, attrs: ATTRS_IDENTIFY, cmds: CMDS_IDENTIFY, events: EVENTS_IDENTIFY },
+    ClusterDef { name: "illuminancemeasurement", id: 0x0400, attrs: ATTRS_ILLUMINANCEMEASUREMENT, cmds: CMDS_ILLUMINANCEMEASUREMENT, events: EVENTS_ILLUMINANCEMEASUREMENT },
+    ClusterDef { name: "jointfabricadministrator", id: 0x0753, attrs: ATTRS_JOINTFABRICADMINISTRATOR, cmds: CMDS_JOINTFABRICADMINISTRATOR, events: EVENTS_JOINTFABRICADMINISTRATOR },
+    ClusterDef { name: "jointfabricdatastore", id: 0x0752, attrs: ATTRS_JOINTFABRICDATASTORE, cmds: CMDS_JOINTFABRICDATASTORE, events: EVENTS_JOINTFABRICDATASTORE },
+    ClusterDef { name: "keypadinput", id: 0x0509, attrs: ATTRS_KEYPADINPUT, cmds: CMDS_KEYPADINPUT, events: EVENTS_KEYPADINPUT },
+    ClusterDef { name: "laundrydryercontrols", id: 0x004a, attrs: ATTRS_LAUNDRYDRYERCONTROLS, cmds: CMDS_LAUNDRYDRYERCONTROLS, events: EVENTS_LAUNDRYDRYERCONTROLS },
+    ClusterDef { name: "laundrywashercontrols", id: 0x0053, attrs: ATTRS_LAUNDRYWASHERCONTROLS, cmds: CMDS_LAUNDRYWASHERCONTROLS, events: EVENTS_LAUNDRYWASHERCONTROLS },
+    ClusterDef { name: "laundrywashermode", id: 0x0051, attrs: ATTRS_LAUNDRYWASHERMODE, cmds: CMDS_LAUNDRYWASHERMODE, events: EVENTS_LAUNDRYWASHERMODE },
+    ClusterDef { name: "levelcontrol", id: 0x0008, attrs: ATTRS_LEVELCONTROL, cmds: CMDS_LEVELCONTROL, events: EVENTS_LEVELCONTROL },
+    ClusterDef { name: "localizationconfiguration", id: 0x002b, attrs: ATTRS_LOCALIZATIONCONFIGURATION, cmds: CMDS_LOCALIZATIONCONFIGURATION, events: EVENTS_LOCALIZATIONCONFIGURATION },
+    ClusterDef { name: "lowpower", id: 0x0508, attrs: ATTRS_LOWPOWER, cmds: CMDS_LOWPOWER, events: EVENTS_LOWPOWER },
+    ClusterDef { name: "mediainput", id: 0x0507, attrs: ATTRS_MEDIAINPUT, cmds: CMDS_MEDIAINPUT, events: EVENTS_MEDIAINPUT },
+    ClusterDef { name: "mediaplayback", id: 0x0506, attrs: ATTRS_MEDIAPLAYBACK, cmds: CMDS_MEDIAPLAYBACK, events: EVENTS_MEDIAPLAYBACK },
+    ClusterDef { name: "messages", id: 0x0097, attrs: ATTRS_MESSAGES, cmds: CMDS_MESSAGES, events: EVENTS_MESSAGES },
+    ClusterDef { name: "meteridentification", id: 0x0b06, attrs: ATTRS_METERIDENTIFICATION, cmds: CMDS_METERIDENTIFICATION, events: EVENTS_METERIDENTIFICATION },
+    ClusterDef { name: "microwaveovencontrol", id: 0x005f, attrs: ATTRS_MICROWAVEOVENCONTROL, cmds: CMDS_MICROWAVEOVENCONTROL, events: EVENTS_MICROWAVEOVENCONTROL },
+    ClusterDef { name: "microwaveovenmode", id: 0x005e, attrs: ATTRS_MICROWAVEOVENMODE, cmds: CMDS_MICROWAVEOVENMODE, events: EVENTS_MICROWAVEOVENMODE },
+    ClusterDef { name: "modeselect", id: 0x0050, attrs: ATTRS_MODESELECT, cmds: CMDS_MODESELECT, events: EVENTS_MODESELECT },
+    ClusterDef { name: "networkcommissioning", id: 0x0031, attrs: ATTRS_NETWORKCOMMISSIONING, cmds: CMDS_NETWORKCOMMISSIONING, events: EVENTS_NETWORKCOMMISSIONING },
+    ClusterDef { name: "nitrogendioxideconcentrationmeasurement", id: 0x0413, attrs: ATTRS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT, cmds: CMDS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT, events: EVENTS_NITROGENDIOXIDECONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "occupancysensing", id: 0x0406, attrs: ATTRS_OCCUPANCYSENSING, cmds: CMDS_OCCUPANCYSENSING, events: EVENTS_OCCUPANCYSENSING },
+    ClusterDef { name: "onoff", id: 0x0006, attrs: ATTRS_ONOFF, cmds: CMDS_ONOFF, events: EVENTS_ONOFF },
+    ClusterDef { name: "operationalcredentials", id: 0x003e, attrs: ATTRS_OPERATIONALCREDENTIALS, cmds: CMDS_OPERATIONALCREDENTIALS, events: EVENTS_OPERATIONALCREDENTIALS },
+    ClusterDef { name: "operationalstate", id: 0x0060, attrs: ATTRS_OPERATIONALSTATE, cmds: CMDS_OPERATIONALSTATE, events: EVENTS_OPERATIONALSTATE },
+    ClusterDef { name: "otasoftwareupdateprovider", id: 0x0029, attrs: ATTRS_OTASOFTWAREUPDATEPROVIDER, cmds: CMDS_OTASOFTWAREUPDATEPROVIDER, events: EVENTS_OTASOFTWAREUPDATEPROVIDER },
+    ClusterDef { name: "otasoftwareupdaterequestor", id: 0x002a, attrs: ATTRS_OTASOFTWAREUPDATEREQUESTOR, cmds: CMDS_OTASOFTWAREUPDATEREQUESTOR, events: EVENTS_OTASOFTWAREUPDATEREQUESTOR },
+    ClusterDef { name: "ovencavityoperationalstate", id: 0x0048, attrs: ATTRS_OVENCAVITYOPERATIONALSTATE, cmds: CMDS_OVENCAVITYOPERATIONALSTATE, events: EVENTS_OVENCAVITYOPERATIONALSTATE },
+    ClusterDef { name: "ovenmode", id: 0x0049, attrs: ATTRS_OVENMODE, cmds: CMDS_OVENMODE, events: EVENTS_OVENMODE },
+    ClusterDef { name: "ozoneconcentrationmeasurement", id: 0x0415, attrs: ATTRS_OZONECONCENTRATIONMEASUREMENT, cmds: CMDS_OZONECONCENTRATIONMEASUREMENT, events: EVENTS_OZONECONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "pm10concentrationmeasurement", id: 0x042d, attrs: ATTRS_PM10CONCENTRATIONMEASUREMENT, cmds: CMDS_PM10CONCENTRATIONMEASUREMENT, events: EVENTS_PM10CONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "pm1concentrationmeasurement", id: 0x042c, attrs: ATTRS_PM1CONCENTRATIONMEASUREMENT, cmds: CMDS_PM1CONCENTRATIONMEASUREMENT, events: EVENTS_PM1CONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "pm25concentrationmeasurement", id: 0x042a, attrs: ATTRS_PM25CONCENTRATIONMEASUREMENT, cmds: CMDS_PM25CONCENTRATIONMEASUREMENT, events: EVENTS_PM25CONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "powersource", id: 0x002f, attrs: ATTRS_POWERSOURCE, cmds: CMDS_POWERSOURCE, events: EVENTS_POWERSOURCE },
+    ClusterDef { name: "powersourceconfiguration", id: 0x002e, attrs: ATTRS_POWERSOURCECONFIGURATION, cmds: CMDS_POWERSOURCECONFIGURATION, events: EVENTS_POWERSOURCECONFIGURATION },
+    ClusterDef { name: "powertopology", id: 0x009c, attrs: ATTRS_POWERTOPOLOGY, cmds: CMDS_POWERTOPOLOGY, events: EVENTS_POWERTOPOLOGY },
+    ClusterDef { name: "pressuremeasurement", id: 0x0403, attrs: ATTRS_PRESSUREMEASUREMENT, cmds: CMDS_PRESSUREMEASUREMENT, events: EVENTS_PRESSUREMEASUREMENT },
+    ClusterDef { name: "proxyconfiguration", id: 0x0042, attrs: ATTRS_PROXYCONFIGURATION, cmds: CMDS_PROXYCONFIGURATION, events: EVENTS_PROXYCONFIGURATION },
+    ClusterDef { name: "proxydiscovery", id: 0x0043, attrs: ATTRS_PROXYDISCOVERY, cmds: CMDS_PROXYDISCOVERY, events: EVENTS_PROXYDISCOVERY },
+    ClusterDef { name: "proxyvalid", id: 0x0044, attrs: ATTRS_PROXYVALID, cmds: CMDS_PROXYVALID, events: EVENTS_PROXYVALID },
+    ClusterDef { name: "pulsewidthmodulation", id: 0x001c, attrs: ATTRS_PULSEWIDTHMODULATION, cmds: CMDS_PULSEWIDTHMODULATION, events: EVENTS_PULSEWIDTHMODULATION },
+    ClusterDef { name: "pumpconfigurationandcontrol", id: 0x0200, attrs: ATTRS_PUMPCONFIGURATIONANDCONTROL, cmds: CMDS_PUMPCONFIGURATIONANDCONTROL, events: EVENTS_PUMPCONFIGURATIONANDCONTROL },
+    ClusterDef { name: "pushavstreamtransport", id: 0x0555, attrs: ATTRS_PUSHAVSTREAMTRANSPORT, cmds: CMDS_PUSHAVSTREAMTRANSPORT, events: EVENTS_PUSHAVSTREAMTRANSPORT },
+    ClusterDef { name: "radonconcentrationmeasurement", id: 0x042f, attrs: ATTRS_RADONCONCENTRATIONMEASUREMENT, cmds: CMDS_RADONCONCENTRATIONMEASUREMENT, events: EVENTS_RADONCONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "refrigeratoralarm", id: 0x0057, attrs: ATTRS_REFRIGERATORALARM, cmds: CMDS_REFRIGERATORALARM, events: EVENTS_REFRIGERATORALARM },
+    ClusterDef { name: "refrigeratorandtemperaturecontrolledcabinetmode", id: 0x0052, attrs: ATTRS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE, cmds: CMDS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE, events: EVENTS_REFRIGERATORANDTEMPERATURECONTROLLEDCABINETMODE },
+    ClusterDef { name: "relativehumiditymeasurement", id: 0x0405, attrs: ATTRS_RELATIVEHUMIDITYMEASUREMENT, cmds: CMDS_RELATIVEHUMIDITYMEASUREMENT, events: EVENTS_RELATIVEHUMIDITYMEASUREMENT },
+    ClusterDef { name: "rvccleanmode", id: 0x0055, attrs: ATTRS_RVCCLEANMODE, cmds: CMDS_RVCCLEANMODE, events: EVENTS_RVCCLEANMODE },
+    ClusterDef { name: "rvcoperationalstate", id: 0x0061, attrs: ATTRS_RVCOPERATIONALSTATE, cmds: CMDS_RVCOPERATIONALSTATE, events: EVENTS_RVCOPERATIONALSTATE },
+    ClusterDef { name: "rvcrunmode", id: 0x0054, attrs: ATTRS_RVCRUNMODE, cmds: CMDS_RVCRUNMODE, events: EVENTS_RVCRUNMODE },
+    ClusterDef { name: "samplemei", id: 0xfff1fc20, attrs: ATTRS_SAMPLEMEI, cmds: CMDS_SAMPLEMEI, events: EVENTS_SAMPLEMEI },
+    ClusterDef { name: "scenesmanagement", id: 0x0062, attrs: ATTRS_SCENESMANAGEMENT, cmds: CMDS_SCENESMANAGEMENT, events: EVENTS_SCENESMANAGEMENT },
+    ClusterDef { name: "servicearea", id: 0x0150, attrs: ATTRS_SERVICEAREA, cmds: CMDS_SERVICEAREA, events: EVENTS_SERVICEAREA },
+    ClusterDef { name: "smokecoalarm", id: 0x005c, attrs: ATTRS_SMOKECOALARM, cmds: CMDS_SMOKECOALARM, events: EVENTS_SMOKECOALARM },
+    ClusterDef { name: "softwarediagnostics", id: 0x0034, attrs: ATTRS_SOFTWAREDIAGNOSTICS, cmds: CMDS_SOFTWAREDIAGNOSTICS, events: EVENTS_SOFTWAREDIAGNOSTICS },
+    ClusterDef { name: "soilmeasurement", id: 0x0430, attrs: ATTRS_SOILMEASUREMENT, cmds: CMDS_SOILMEASUREMENT, events: EVENTS_SOILMEASUREMENT },
+    ClusterDef { name: "switch", id: 0x003b, attrs: ATTRS_SWITCH, cmds: CMDS_SWITCH, events: EVENTS_SWITCH },
+    ClusterDef { name: "targetnavigator", id: 0x0505, attrs: ATTRS_TARGETNAVIGATOR, cmds: CMDS_TARGETNAVIGATOR, events: EVENTS_TARGETNAVIGATOR },
+    ClusterDef { name: "temperaturecontrol", id: 0x0056, attrs: ATTRS_TEMPERATURECONTROL, cmds: CMDS_TEMPERATURECONTROL, events: EVENTS_TEMPERATURECONTROL },
+    ClusterDef { name: "temperaturemeasurement", id: 0x0402, attrs: ATTRS_TEMPERATUREMEASUREMENT, cmds: CMDS_TEMPERATUREMEASUREMENT, events: EVENTS_TEMPERATUREMEASUREMENT },
+    ClusterDef { name: "thermostat", id: 0x0201, attrs: ATTRS_THERMOSTAT, cmds: CMDS_THERMOSTAT, events: EVENTS_THERMOSTAT },
+    ClusterDef { name: "thermostatuserinterfaceconfiguration", id: 0x0204, attrs: ATTRS_THERMOSTATUSERINTERFACECONFIGURATION, cmds: CMDS_THERMOSTATUSERINTERFACECONFIGURATION, events: EVENTS_THERMOSTATUSERINTERFACECONFIGURATION },
+    ClusterDef { name: "threadborderroutermanagement", id: 0x0452, attrs: ATTRS_THREADBORDERROUTERMANAGEMENT, cmds: CMDS_THREADBORDERROUTERMANAGEMENT, events: EVENTS_THREADBORDERROUTERMANAGEMENT },
+    ClusterDef { name: "threadnetworkdiagnostics", id: 0x0035, attrs: ATTRS_THREADNETWORKDIAGNOSTICS, cmds: CMDS_THREADNETWORKDIAGNOSTICS, events: EVENTS_THREADNETWORKDIAGNOSTICS },
+    ClusterDef { name: "threadnetworkdirectory", id: 0x0453, attrs: ATTRS_THREADNETWORKDIRECTORY, cmds: CMDS_THREADNETWORKDIRECTORY, events: EVENTS_THREADNETWORKDIRECTORY },
+    ClusterDef { name: "timeformatlocalization", id: 0x002c, attrs: ATTRS_TIMEFORMATLOCALIZATION, cmds: CMDS_TIMEFORMATLOCALIZATION, events: EVENTS_TIMEFORMATLOCALIZATION },
+    ClusterDef { name: "timer", id: 0x0047, attrs: ATTRS_TIMER, cmds: CMDS_TIMER, events: EVENTS_TIMER },
+    ClusterDef { name: "timesynchronization", id: 0x0038, attrs: ATTRS_TIMESYNCHRONIZATION, cmds: CMDS_TIMESYNCHRONIZATION, events: EVENTS_TIMESYNCHRONIZATION },
+    ClusterDef { name: "tlscertificatemanagement", id: 0x0801, attrs: ATTRS_TLSCERTIFICATEMANAGEMENT, cmds: CMDS_TLSCERTIFICATEMANAGEMENT, events: EVENTS_TLSCERTIFICATEMANAGEMENT },
+    ClusterDef { name: "tlsclientmanagement", id: 0x0802, attrs: ATTRS_TLSCLIENTMANAGEMENT, cmds: CMDS_TLSCLIENTMANAGEMENT, events: EVENTS_TLSCLIENTMANAGEMENT },
+    ClusterDef { name: "totalvolatileorganiccompoundsconcentrationmeasurement", id: 0x042e, attrs: ATTRS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT, cmds: CMDS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT, events: EVENTS_TOTALVOLATILEORGANICCOMPOUNDSCONCENTRATIONMEASUREMENT },
+    ClusterDef { name: "unitlocalization", id: 0x002d, attrs: ATTRS_UNITLOCALIZATION, cmds: CMDS_UNITLOCALIZATION, events: EVENTS_UNITLOCALIZATION },
+    ClusterDef { name: "unittesting", id: 0xfff1fc05, attrs: ATTRS_UNITTESTING, cmds: CMDS_UNITTESTING, events: EVENTS_UNITTESTING },
+    ClusterDef { name: "userlabel", id: 0x0041, attrs: ATTRS_USERLABEL, cmds: CMDS_USERLABEL, events: EVENTS_USERLABEL },
+    ClusterDef { name: "valveconfigurationandcontrol", id: 0x0081, attrs: ATTRS_VALVECONFIGURATIONANDCONTROL, cmds: CMDS_VALVECONFIGURATIONANDCONTROL, events: EVENTS_VALVECONFIGURATIONANDCONTROL },
+    ClusterDef { name: "wakeonlan", id: 0x0503, attrs: ATTRS_WAKEONLAN, cmds: CMDS_WAKEONLAN, events: EVENTS_WAKEONLAN },
+    ClusterDef { name: "waterheatermanagement", id: 0x0094, attrs: ATTRS_WATERHEATERMANAGEMENT, cmds: CMDS_WATERHEATERMANAGEMENT, events: EVENTS_WATERHEATERMANAGEMENT },
+    ClusterDef { name: "waterheatermode", id: 0x009e, attrs: ATTRS_WATERHEATERMODE, cmds: CMDS_WATERHEATERMODE, events: EVENTS_WATERHEATERMODE },
+    ClusterDef { name: "webrtctransportprovider", id: 0x0553, attrs: ATTRS_WEBRTCTRANSPORTPROVIDER, cmds: CMDS_WEBRTCTRANSPORTPROVIDER, events: EVENTS_WEBRTCTRANSPORTPROVIDER },
+    ClusterDef { name: "webrtctransportrequestor", id: 0x0554, attrs: ATTRS_WEBRTCTRANSPORTREQUESTOR, cmds: CMDS_WEBRTCTRANSPORTREQUESTOR, events: EVENTS_WEBRTCTRANSPORTREQUESTOR },
+    ClusterDef { name: "wifinetworkdiagnostics", id: 0x0036, attrs: ATTRS_WIFINETWORKDIAGNOSTICS, cmds: CMDS_WIFINETWORKDIAGNOSTICS, events: EVENTS_WIFINETWORKDIAGNOSTICS },
+    ClusterDef { name: "wifinetworkmanagement", id: 0x0451, attrs: ATTRS_WIFINETWORKMANAGEMENT, cmds: CMDS_WIFINETWORKMANAGEMENT, events: EVENTS_WIFINETWORKMANAGEMENT },
+    ClusterDef { name: "windowcovering", id: 0x0102, attrs: ATTRS_WINDOWCOVERING, cmds: CMDS_WINDOWCOVERING, events: EVENTS_WINDOWCOVERING },
+    ClusterDef { name: "zonemanagement", id: 0x0550, attrs: ATTRS_ZONEMANAGEMENT, cmds: CMDS_ZONEMANAGEMENT, events: EVENTS_ZONEMANAGEMENT },
 ];
