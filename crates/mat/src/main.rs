@@ -24,6 +24,7 @@ use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
 fn main() -> ExitCode {
+    reset_sigpipe();
     init_tracing();
 
     // 引数エラー（exit 2）は clap が直接処理する。
@@ -298,6 +299,21 @@ fn main() -> ExitCode {
             e.emit();
             ExitCode::from(e.kind.exit_code())
         }
+    }
+}
+
+/// SIGPIPE を既定動作（プロセス終了）に戻す。Rust の runtime は SIGPIPE を
+/// 無視して起動するので、`mat ... | head -1` のように stdout のパイプ先が先に
+/// 閉じると `println!` が EPIPE で panic し、stderr に "failed printing to
+/// stdout: Broken pipe" を吐いて exit 101 になる。通常の CLI と同じく黙って
+/// SIGPIPE で終わらせる（stderr のエラー JSON には影響しない — パイプ先が
+/// 閉じているのは stdout だけ）。unix 以外は no-op。
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: SIG_DFL の設定はプロセス起動直後・スレッド生成前の 1 回だけで、
+    // 副作用は「EPIPE の代わりに SIGPIPE で終了する」に限られる。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

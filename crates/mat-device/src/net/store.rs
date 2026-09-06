@@ -423,7 +423,11 @@ mod tests {
                 fabric_index: 1,
                 keyset_id: 42,
                 epoch_key0: [7u8; 16],
-                epoch_start_time0: 0
+                epoch_start_time0: 0,
+                epoch_key1: None,
+                epoch_start_time1: 0,
+                epoch_key2: None,
+                epoch_start_time2: 0,
             }]
         );
         assert_eq!(store2.map_entries_for(1), vec![(10, 42)]);

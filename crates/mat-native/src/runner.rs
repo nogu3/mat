@@ -108,6 +108,12 @@ pub async fn provision(
     p: &ProvisionParams,
     note: Option<&str>,
 ) -> Result<Value, MatError> {
+    // keyset 0 = IPK。KVS（`k/0`）にも各ノードの keyset 0 にも触る前に拒む
+    // （`write_group_provision` にも同じガードがあるが、そちらは KVS 層の
+    // 防波堤 — ここで止めれば設定不備のエラーより先に引数の誤りが出る）。
+    if p.keyset_id == crate::ops::IPK_KEYSET_ID {
+        return Err(crate::group_settings::ipk_keyset_reserved());
+    }
     let Some(gs) = &engine.group_settings else {
         return Err(MatError::group_ctx_unconfigured());
     };
@@ -350,6 +356,36 @@ mod tests {
         };
         let body = provision(&runner, &engine, &second, None).await.unwrap();
         assert!(body.get("note").is_none());
+    }
+
+    /// `--keyset-id 0` は IPK keyset の上書き（controller KVS の `k/0` も各
+    /// ノードの keyset 0 も）になるので、KVS にもノードにも触る前に
+    /// parse_error で拒む。IPK を替えるのは `mat fabric rotate-ipk`。
+    #[tokio::test]
+    async fn provision_rejects_keyset_zero_before_kvs_and_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("chip_tool_config.ini");
+        std::fs::write(&ini, "[Default]\n").unwrap();
+        let mut engine = Engine::with_parts(Box::new(ScriptedEstablisher), None);
+        engine.group_settings = Some(crate::group_settings::GroupSettingsCtx {
+            main_ini: ini.clone(),
+            fabric_index: 2,
+            cfid: [7u8; 8],
+        });
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = touched.clone();
+        let runner = OneShotRunner::new(&engine, move |_| {
+            t.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let p = ProvisionParams {
+            keyset_id: 0,
+            ..params(Some("42".repeat(16)))
+        };
+        let err = provision(&runner, &engine, &p, None).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert!(err.detail.contains("rotate-ipk"), "{}", err.detail);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "[Default]\n");
+        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

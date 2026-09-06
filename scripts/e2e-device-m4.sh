@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# M4 IPK rotation E2E against the virtual device — pins the *failure* path,
-# because `matv` (mat-device) does not accept KeySetWrite on key set 0 yet
-# (INVALID_COMMAND) and holds a single epoch key. Flow: build -> matv ->
-# `mat fabric init` + `mat commission` -> `mat group provision` ->
-# `mat fabric rotate-ipk` (expect exit 4 = device_rejected, stdout body
-# status:"pending", node 1 failed with kind device_rejected) -> `mat fabric
-# list` shows ipk_rotation_pending:true -> `mat on` and `mat group invoke`
-# still work (the controller did NOT switch epochs) -> `mat fabric rotate-ipk
-# --abort` (status:"aborted") -> `fabric list` pending:false -> `mat on` again.
-#
-# When matv learns KeySetWrite(0) (multi-epoch IPK), flip the expectations:
-# rotate-ipk exits 0 with status:"rotated", and `mat on` afterwards proves
-# CASE with the new IPK.
+# M4 IPK rotation E2E against the virtual device — success path first, then
+# the pending/abort path. `matv` (mat-device) accepts KeySetWrite on key set 0
+# (multi-epoch IPK, persisted in group_keys.json) and answers CASE for every
+# epoch it holds. Flow: build -> matv -> `mat fabric init` + `mat commission`
+# -> `mat group provision` -> `mat fabric rotate-ipk` (exit 0, status:"rotated")
+# -> `fabric list` pending:false -> `mat on` (CASE with the NEW IPK) + `mat
+# group invoke` (groupcast keys untouched) -> matv restarted (proves the
+# rotated IPK survived a restart) -> `mat on` again -> matv stopped -> `mat
+# fabric rotate-ipk` (expect non-zero, status:"pending", node 1 failed) ->
+# `fabric list` pending:true -> `--abort` (status:"aborted") -> pending:false
+# -> matv restarted -> `mat on` still works (the controller never switched).
 #
 # Env:
 #   MAT_E2E_IFACE     interface both matv's mDNS advertiser and mat's
@@ -148,54 +146,96 @@ GROUP_JSON="$(
 )"
 [[ "$(json_get status "$GROUP_JSON")" == "provisioned" ]]
 
-echo "==> mat fabric rotate-ipk (expect pending: matv rejects KeySetWrite(0))" >&2
+assert_pending() {
+    local expected="$1" json
+    json="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat fabric list)"
+    echo "$json" >&2
+    printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = [x for x in d["fabrics"] if x["current"]][0]
+assert f["ipk_rotation_pending"] is '"$expected"', d
+'
+}
+
+# (Re)start matv on the same store and wait for its setup-payload line —
+# the device keeps its fabric + rotated IPK (group_keys.json) across restarts.
+start_matv() {
+    : >"$DEVICE_STDOUT"
+    RUST_LOG="${RUST_LOG:-info}" \
+        ./target/release/matv --config "$MATV_CONFIG" \
+        >"$DEVICE_STDOUT" 2>>"$DEVICE_STDERR" &
+    DEVICE_PID=$!
+    for _ in $(seq 1 50); do
+        [[ -n "$(head -n1 "$DEVICE_STDOUT" 2>/dev/null)" ]] && return 0
+        kill -0 "$DEVICE_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    echo "matv did not come back:" >&2
+    cat "$DEVICE_STDERR" >&2
+    exit 1
+}
+
+stop_matv() {
+    kill "$DEVICE_PID" 2>/dev/null || true
+    wait "$DEVICE_PID" 2>/dev/null || true
+    DEVICE_PID=""
+}
+
+echo "==> mat fabric rotate-ipk (expect rotated: matv accepts KeySetWrite(0))" >&2
+ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" fabric rotate-ipk)"
+echo "$ROTATE_JSON"
+printf '%s' "$ROTATE_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["status"] == "rotated", d
+n = d["nodes"][0]
+assert n["node_id"] == '"$NODE_ID"' and n["status"] == "ok", d
+'
+assert_pending False
+echo "==> PASS: rotate-ipk committed" >&2
+
+echo "==> CASE with the new IPK (mat on) + groupcast keys untouched (group invoke)" >&2
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" group invoke -g "$GROUP_ID" -c onoff --command off -e "$DEVICE_EP" >&2
+sleep 1
+READ_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" read --node "$NODE_ID" --endpoint "$DEVICE_EP" --cluster onoff --attribute on-off)"
+[[ "$(json_get value "$READ_JSON")" == "false" ]] || { echo "groupcast off did not land after rotation: $READ_JSON" >&2; exit 1; }
+echo "==> PASS: unicast on the new IPK + groupcast after rotation" >&2
+
+echo "==> restart matv: the rotated IPK must survive (group_keys.json)" >&2
+stop_matv
+start_matv
+MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+echo "==> PASS: CASE with the rotated IPK after a device restart" >&2
+
+echo "==> stop matv, rotate again (expect pending: node unreachable)" >&2
+stop_matv
 set +e
-ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" fabric rotate-ipk 2>"$WORKDIR/rotate.stderr")"
+ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_OP_TIMEOUT_MS=8000 ./target/release/mat --iface "$IFACE" fabric rotate-ipk 2>"$WORKDIR/rotate.stderr")"
 ROTATE_RC=$?
 set -e
 echo "$ROTATE_JSON"
 cat "$WORKDIR/rotate.stderr" >&2
-[[ "$ROTATE_RC" == "4" ]] || { echo "expected exit 4 (device_rejected), got $ROTATE_RC" >&2; exit 1; }
+[[ "$ROTATE_RC" != "0" ]] || { echo "expected a non-zero exit for a pending rotation" >&2; exit 1; }
 printf '%s' "$ROTATE_JSON" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 assert d["status"] == "pending", d
 n = d["nodes"][0]
 assert n["node_id"] == '"$NODE_ID"' and n["status"] == "failed", d
-assert n["error"]["kind"] == "device_rejected", d
 '
-grep -q '"kind":"device_rejected"' "$WORKDIR/rotate.stderr"
-echo "==> PASS: rotate-ipk ended pending with device_rejected on node $NODE_ID" >&2
-
-echo "==> fabric list shows ipk_rotation_pending:true" >&2
-LIST_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat fabric list)"
-echo "$LIST_JSON" >&2
-printf '%s' "$LIST_JSON" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-f = [x for x in d["fabrics"] if x["current"]][0]
-assert f["ipk_rotation_pending"] is True, d
-'
-
-echo "==> controller still on the old IPK: mat on + group invoke keep working" >&2
-MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
-MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" group invoke -g "$GROUP_ID" -c onoff --command off -e "$DEVICE_EP" >&2
-sleep 1
-READ_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" read --node "$NODE_ID" --endpoint "$DEVICE_EP" --cluster onoff --attribute on-off)"
-[[ "$(json_get value "$READ_JSON")" == "false" ]] || { echo "groupcast off did not land after pending rotation: $READ_JSON" >&2; exit 1; }
-echo "==> PASS: unicast + groupcast unaffected by a pending rotation" >&2
+assert_pending True
+echo "==> PASS: rotate-ipk ended pending with node $NODE_ID failed" >&2
 
 echo "==> mat fabric rotate-ipk --abort" >&2
 ABORT_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" fabric rotate-ipk --abort)"
 echo "$ABORT_JSON"
 [[ "$(json_get status "$ABORT_JSON")" == "aborted" ]]
-LIST_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat fabric list)"
-printf '%s' "$LIST_JSON" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-f = [x for x in d["fabrics"] if x["current"]][0]
-assert f["ipk_rotation_pending"] is False, d
-'
+assert_pending False
+
+echo "==> restart matv: the controller never switched, so the node is still reachable" >&2
+start_matv
 MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
 echo "==> PASS: abort cleared pending; node still reachable" >&2
-echo "==> ALL PASS (m4: ipk rotation failure path against matv)" >&2
+echo "==> ALL PASS (m4: ipk rotation success + pending/abort paths against matv)" >&2

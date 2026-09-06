@@ -238,10 +238,12 @@ epoch harmlessly).
   epoch it holds. `commission` picks the new epoch up immediately.
 - `fabric list` shows `"ipk_rotation_pending": true` while a rotation is
   pending; `fabric rotate-ipk --abort` clears it.
-- The virtual device `matv` does not accept `KeySetWrite` on key set 0 yet, so
-  against `matv` a rotation always ends `pending` with `device_rejected`
-  (`scripts/e2e-device-m4.sh` pins exactly that behaviour). Real devices
-  follow the spec (§11.2.8.1).
+- The virtual device `matv` follows the spec here too (§11.2.8.1): it accepts
+  `KeySetWrite` on key set 0 with up to three epochs, persists them in
+  `group_keys.json`, and answers CASE for every epoch it holds, so a rotation
+  against `matv` commits and survives a device restart
+  (`scripts/e2e-device-m4.sh` pins the success path, then the pending/abort
+  path with the device stopped).
 - Never part of the `matd` socket protocol (direct-only like `commission`);
   explicit `--matd` exits `2`.
 
@@ -933,6 +935,9 @@ Outputs:
   fixed key only when several controllers must share the same wire group. The key
   is never printed to stdout (it is a credential; it lives in the KVS).
 - `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
+  Keyset **0 is reserved for the IPK** and is rejected (`parse_error`, exit 1)
+  before anything is written — provisioning it would overwrite the fabric's IPK
+  on every node and in the controller KVS. Use `mat fabric rotate-ipk` instead.
 - **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup / ACL
   write on every node) and **especially unstable on Thread** (multicast retransmits and
   IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.

@@ -979,6 +979,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "libc",
  "mat-controller",
  "mat-core",
  "mat-native",
@@ -1000,6 +1001,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "libc",
  "mat-controller",
  "mat-core",
  "mat-native",
@@ -1017,6 +1019,7 @@ version = "1.33.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "libc",
  "mat-controller",
  "mat-device",
  "serde",

@@ -103,6 +103,15 @@ struct FileDeviceConfig {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE by default, so a closed stdout (`matv ... | head -1`)
+    // would turn the setup-payload `println!` into a panic. Restore the
+    // default so the process just exits on SIGPIPE like any other CLI.
+    #[cfg(unix)]
+    // SAFETY: setting SIG_DFL once at process start, before any thread is
+    // spawned; the only effect is exiting on SIGPIPE instead of EPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         // stdout is reserved for the single JSON setup-payload line (mat

@@ -174,6 +174,11 @@ pub fn classify_group_datagram(
     let mut candidates = 0usize;
     let mut opened = None;
     for ks in deps.gk_store.keysets() {
+        // keyset 0 = IPK（rotation で store に入る）は CASE 用で groupcast の
+        // 鍵ではない — 候補から外す（GroupKeyMap が 0 を指すことも無い）。
+        if ks.keyset_id == crate::core::group_key_management::IPK_KEY_SET_ID {
+            continue;
+        }
         let Some(f) = deps
             .fabrics
             .iter()
@@ -436,6 +441,29 @@ mod tests {
         m.add(1, 10, 2).unwrap();
         m.add(1, 10, 3).unwrap();
         (vec![fabric(1)], gk, m)
+    }
+
+    /// keyset 0（IPK、rotation で store に入る）は groupcast の復号候補に
+    /// しない: その epoch で組んだ datagram は候補ゼロで落ちる。
+    #[test]
+    fn ipk_keyset_zero_is_not_a_groupcast_candidate() {
+        let (fabrics, gk, m) = provisioned();
+        const IPK_EPOCH: [u8; 16] = [3u8; 16];
+        gk.upsert_keyset(1, 0, IPK_EPOCH, 0).unwrap();
+        let deps = GroupRxDeps {
+            fabrics: &fabrics,
+            gk_store: &gk,
+            membership: &m,
+        };
+        let mut replay = GroupReplayGuard::new();
+        let dg = datagram(&fabrics[0], &IPK_EPOCH, 1, 10);
+        assert_eq!(
+            classify_group_datagram(&dg, &deps, &mut replay).unwrap_err(),
+            GroupDrop::NoKeyset { candidates: 0 }
+        );
+        // 通常の keyset 42 は従来どおり通る。
+        let ok = datagram(&fabrics[0], &EPOCH, 2, 10);
+        assert!(classify_group_datagram(&ok, &deps, &mut replay).is_ok());
     }
 
     fn datagram(f: &FabricEntry, epoch: &[u8; 16], counter: u32, group: u16) -> Vec<u8> {

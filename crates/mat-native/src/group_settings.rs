@@ -80,7 +80,21 @@ pub fn remove_group(ctx: &GroupSettingsCtx, group_id: u16) -> Result<Option<bool
 /// 触った可能性があるため chip-tool を重ねない）。kind は Other に寄せ、
 /// detail で復旧手段を示す（chip-tool 経路の分類とは厳密一致しない —
 /// native op の写像表と同じ扱い）。
+/// `--keyset-id 0` の拒否（parse_error）。`runner::provision` が KVS にも
+/// ノードにも触る前に返すのと、`write_group_provision` の KVS 層ガード
+/// （[`GroupSettingsError::IpkKeysetReserved`]）の写像の両方がこれ 1 本。
+pub fn ipk_keyset_reserved() -> MatError {
+    MatError::new(
+        ErrorKind::ParseError,
+        "keyset 0 is reserved for the IPK (key set 0) and cannot be provisioned as a group keyset; \
+         use `mat fabric rotate-ipk` to change the IPK",
+    )
+}
+
 fn map_gs_err(e: GroupSettingsError) -> MatError {
+    if matches!(e, GroupSettingsError::IpkKeysetReserved) {
+        return ipk_keyset_reserved();
+    }
     let detail = match &e {
         GroupSettingsError::DuplicateBind { group_id, keyset_id } => format!(
             "keyset {keyset_id} is already bound to group {group_id} in the controller kvs; use --rebind"

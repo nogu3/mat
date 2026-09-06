@@ -918,3 +918,32 @@ fn timed_flag_is_accepted_by_invoke_and_write() {
         .assert()
         .code(10);
 }
+
+/// stdout のパイプ先が先に閉じたとき（`mat ... | head -1` 等）、Rust 既定の
+/// SIGPIPE 無視のままだと `println!` が EPIPE で panic して stderr に
+/// "panicked at ... Broken pipe" を吐く。`main` 冒頭で SIGPIPE を既定動作に
+/// 戻しているので、通常の CLI と同じく黙って SIGPIPE で終了する。
+#[cfg(unix)]
+#[test]
+fn closed_stdout_terminates_quietly_by_sigpipe() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("chip_tool_config.ini"), "[Default]\n").unwrap();
+    // 読み側を先に閉じたパイプを stdout に渡す — 子が書いた瞬間に EPIPE。
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mat"))
+        .env("MAT_IFACE", "lo")
+        .env("MAT_MATD", "0")
+        .arg("--store")
+        .arg(dir.path())
+        .args(["group", "list"])
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_eq!(out.status.signal(), Some(13), "status: {:?}", out.status);
+}

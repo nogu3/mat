@@ -28,6 +28,8 @@ getrandom = "0.2"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# 3 バイナリの main 冒頭で SIGPIPE を既定動作へ戻すためだけ（unix）。
+libc = "0.2"
 
 [profile.release]
 strip = true

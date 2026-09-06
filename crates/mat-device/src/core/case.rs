@@ -43,6 +43,43 @@ impl From<FabricEntry> for CaseFabric {
     }
 }
 
+/// Expands each fabric into one CASE candidate per IPK epoch the device
+/// holds, so a Sigma1 built with either the old or the new IPK after an IPK
+/// rotation (`KeySetWrite(0, {current, new})` from `mat fabric rotate-ipk`)
+/// still selects the fabric — `CaseResponderCore` tries
+/// `case_destination_id` against every candidate (spec §4.14.2.2), exactly
+/// how the chip SDK walks every epoch key of key set 0.
+///
+/// A fabric with no key set 0 in `gk_store` (never rotated) is passed
+/// through unchanged: its IPK is still the one `AddNOC` installed
+/// (`FabricEntry::ipk_operational`). Once key set 0 exists it is the sole
+/// source of truth — the `AddNOC` IPK is *not* kept as an extra candidate,
+/// otherwise a rotated-out epoch would stay valid forever. Newest epoch
+/// first, so the common case (the controller already switched) matches on
+/// the first candidate.
+pub fn expand_ipk_candidates(
+    fabrics: Vec<FabricEntry>,
+    gk_store: &crate::core::group_key_management::GroupKeyStore,
+) -> Vec<FabricEntry> {
+    use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
+
+    let mut out = Vec::with_capacity(fabrics.len());
+    for entry in fabrics {
+        let Some(ipk) = gk_store.ipk_keyset(entry.fabric_index) else {
+            out.push(entry);
+            continue;
+        };
+        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+        for (epoch, _start) in ipk.epochs().into_iter().rev() {
+            out.push(FabricEntry {
+                ipk_operational: derive_ipk_operational(&epoch, &cfid),
+                ..entry.clone()
+            });
+        }
+    }
+    out
+}
+
 /// `FabricEntry`-based CASE responder core. Wraps
 /// `mat_controller::case_responder::CaseResponderCore` — see the module doc
 /// for why the actual state machine lives there.
@@ -147,5 +184,90 @@ mod tests {
             }
         }
         assert_eq!(session_id, Some(0xB0B1));
+    }
+
+    fn sigma1_for(ipk_operational: &[u8; 16], entry: &FabricEntry) -> Vec<u8> {
+        let initiator_secret = random_p256_secret();
+        let initiator_eph = eph_pub_bytes(&initiator_secret);
+        let initiator_random = [0x42u8; 32];
+        let dest_id = case_destination_id(
+            ipk_operational,
+            &initiator_random,
+            &entry.root_public_key,
+            entry.fabric_id,
+            entry.node_id,
+        );
+        encode_sigma1(&initiator_random, 0x1234, &dest_id, &initiator_eph)
+    }
+
+    /// keyset 0 が無ければ素通し、あれば epoch ごとに 1 候補（新しい順）で、
+    /// AddNOC の IPK は候補から外れる。
+    #[test]
+    fn expand_ipk_candidates_derives_one_fabric_per_ipk_epoch() {
+        use crate::core::group_key_management::GroupKeyStore;
+        use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
+
+        let entry = fabric_entry();
+        let gk = GroupKeyStore::new();
+        let same = expand_ipk_candidates(vec![entry.clone()], &gk);
+        assert_eq!(same, vec![entry.clone()]);
+
+        gk.upsert_keyset_epochs(1, 0, &[([0xA1; 16], 1), ([0xB2; 16], 2)])
+            .unwrap();
+        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+        let expanded = expand_ipk_candidates(vec![entry.clone()], &gk);
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(
+            expanded[0].ipk_operational,
+            derive_ipk_operational(&[0xB2; 16], &cfid),
+            "newest epoch first"
+        );
+        assert_eq!(
+            expanded[1].ipk_operational,
+            derive_ipk_operational(&[0xA1; 16], &cfid)
+        );
+        for e in &expanded {
+            assert_eq!(
+                (e.fabric_index, e.node_id),
+                (entry.fabric_index, entry.node_id)
+            );
+        }
+        // 他 fabric の keyset 0 は影響しない。
+        let mut other = entry.clone();
+        other.fabric_index = 2;
+        assert_eq!(expand_ipk_candidates(vec![other.clone()], &gk), vec![other]);
+    }
+
+    /// rotation 後: 旧・新どちらの IPK で組んだ Sigma1 にも Sigma2 を返し、
+    /// AddNOC 時の IPK（keyset 0 に無い）では fabric 選択に失敗する。
+    #[test]
+    fn rotated_ipk_answers_sigma1_for_old_and_new_epochs_only() {
+        use crate::core::group_key_management::GroupKeyStore;
+        use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational};
+
+        let entry = fabric_entry();
+        let gk = GroupKeyStore::new();
+        gk.upsert_keyset_epochs(1, 0, &[([0xA1; 16], 1), ([0xB2; 16], 2)])
+            .unwrap();
+        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+        let candidates = expand_ipk_candidates(vec![entry.clone()], &gk);
+
+        for epoch in [[0xA1; 16], [0xB2; 16]] {
+            let mut core = CaseResponderCore::new(candidates.clone(), 0xB0B1);
+            let sigma1 = sigma1_for(&derive_ipk_operational(&epoch, &cfid), &entry);
+            assert!(
+                matches!(
+                    core.on_message(OPCODE_SIGMA1, &sigma1),
+                    Ok(CaseOutput::Reply(_, OPCODE_SIGMA2))
+                ),
+                "epoch {epoch:?} must select the fabric"
+            );
+        }
+        let mut core = CaseResponderCore::new(candidates, 0xB0B1);
+        let stale = sigma1_for(&entry.ipk_operational, &entry);
+        assert!(
+            core.on_message(OPCODE_SIGMA1, &stale).is_err(),
+            "the AddNOC-era IPK is no longer a candidate once key set 0 exists"
+        );
     }
 }
