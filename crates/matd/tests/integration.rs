@@ -75,7 +75,7 @@ async fn start_matd_with_events(
 ) -> (
     PathBuf,
     tokio::task::JoinHandle<()>,
-    tokio::sync::broadcast::Sender<matd::subscription::Event>,
+    tokio::sync::broadcast::Sender<matd::subscription::Emitted>,
     std::sync::Arc<matd::subscription::SubHealth>,
 ) {
     let socket = std::env::temp_dir().join(format!("matd-test-{}.sock", rand_suffix()));
@@ -98,8 +98,8 @@ async fn start_matd_with_events(
     (socket, handle, tx, health)
 }
 
-fn occupancy_event(node_id: u64) -> matd::subscription::Event {
-    matd::subscription::Event {
+fn occupancy_event(node_id: u64) -> matd::subscription::Emitted {
+    matd::subscription::Emitted::Attribute(matd::subscription::Event {
         timestamp: "2026-07-20T00:00:00+09:00".to_string(),
         node_id,
         endpoint: 1,
@@ -108,7 +108,7 @@ fn occupancy_event(node_id: u64) -> matd::subscription::Event {
         value: serde_json::json!(1),
         priming: false,
         recovered: false,
-    }
+    })
 }
 
 /// matd の serve をバックグラウンドで起動し、socket path を返す。listen を使わない

@@ -1559,7 +1559,10 @@ mod tests {
         assert!(conn.next_report_full(slice).await.unwrap().is_none());
 
         // 属性 + イベントが同じ report に同居する形。
-        est.sub_live.lock().unwrap().push_back(onoff_report(1, false));
+        est.sub_live
+            .lock()
+            .unwrap()
+            .push_back(onoff_report(1, false));
         est.sub_live_events
             .lock()
             .unwrap()

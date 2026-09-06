@@ -258,15 +258,26 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
             std::process::exit(e.kind.exit_code() as i32);
         }
     };
-    // Task 3 が events スコープ（sub_config の `events`）を購読 pump に配線する
-    // までは、属性の絞り込み（`clusters`）だけを取り出して従来どおり使う。
-    let sub_clusters = sub_config.and_then(|c| c.clusters);
+    // 属性の絞り込み（`clusters`）とイベント範囲（`events`）は独立。ファイルが
+    // 無ければ属性 = full wildcard、イベント = 全クラスタ urgent（spec §6.2）。
+    let (sub_clusters, event_scope) = match sub_config {
+        Some(c) => (c.clusters, c.events),
+        None => (None, matd::subscribe_config::EventScope::Wildcard),
+    };
     if let Some(c) = &sub_clusters {
         tracing::info!(
             clusters = c.len(),
             "subscriptions.toml loaded; narrowing resident subscribe paths"
         );
     }
+    tracing::info!(
+        event_scope = match &event_scope {
+            matd::subscribe_config::EventScope::Wildcard => "wildcard".to_string(),
+            matd::subscribe_config::EventScope::Clusters(ids) => format!("{} clusters", ids.len()),
+            matd::subscribe_config::EventScope::Off => "off".to_string(),
+        },
+        "resident subscribe event scope"
+    );
     // op 相関ヘルス表: server（note_op）と購読 pump（判定）の共有。
     let sub_health = std::sync::Arc::new(matd::subscription::SubHealth::new(sub_clusters.clone()));
     // 常駐購読は native が使えるときだけ張る（Unavailable なら listen は
@@ -278,6 +289,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         store_path.clone(),
         events_tx.clone(),
         sub_clusters,
+        event_scope,
         std::sync::Arc::clone(&sub_health),
     );
 
