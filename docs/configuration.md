@@ -153,3 +153,26 @@ clusters = [
 - `mat` (one-shot) never reads this file — like the rest of the resident
   Subscribe, it is matd-only.
 
+### `events` — event subscription scope
+
+`events` is independent of `clusters` above: `clusters` narrows the
+**attribute** paths of the resident Subscribe, `events` controls which
+clusters' **events** (`EventRequests`) it asks for. Either key can be present
+without the other, and a file with only one of them is valid.
+
+```toml
+# All three forms are independent of `clusters`.
+events = ["switch", "booleanstate"]   # only these clusters' events
+events = []                           # no EventRequests at all
+# events key omitted entirely          -> all clusters' events (wildcard)
+```
+
+- **Key absent** — every cluster's events, urgent priority (the same
+  wildcard discipline as an absent `subscriptions.toml`).
+- **`events = [...]`** — only the listed clusters' events, urgent priority.
+  Same name/numeric resolution as `clusters` (chip-tool notation or
+  `"0x0006"`/`"6"`, unknown names are `store_parse`).
+- **`events = []`** — no `EventRequests` at all: the resident Subscribe goes
+  out exactly as it did before event subscription support (Phase A), i.e.
+  attribute reports only.
+

@@ -251,13 +251,16 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 常駐購読のクラスタ絞り込み（subscriptions.toml、無し = full wildcard）。
     // 設定不備は fail-fast: 黙って wildcard に落ちると弱リンク対策が無効化
     // されたことに気づけない（ambiguous iface autodetect と同じ規律）。
-    let sub_clusters = match matd::subscribe_config::load(&store_path) {
+    let sub_config = match matd::subscribe_config::load(&store_path) {
         Ok(c) => c,
         Err(e) => {
             e.emit();
             std::process::exit(e.kind.exit_code() as i32);
         }
     };
+    // Task 3 が events スコープ（sub_config の `events`）を購読 pump に配線する
+    // までは、属性の絞り込み（`clusters`）だけを取り出して従来どおり使う。
+    let sub_clusters = sub_config.and_then(|c| c.clusters);
     if let Some(c) = &sub_clusters {
         tracing::info!(
             clusters = c.len(),
