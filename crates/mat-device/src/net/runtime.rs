@@ -1898,6 +1898,7 @@ async fn serve_subscribe_request(
         &read_ctx,
         REPORT_CHUNK_BUDGET,
         Some(subscription_id),
+        false,
     );
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
@@ -2257,7 +2258,7 @@ async fn serve_read_request_chunked(
         fabric_filtered: req.fabric_filtered,
         subject: session_subject(session),
     };
-    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None);
+    let chunks = node.read_chunks(&paths, &read_ctx, REPORT_CHUNK_BUDGET, None, false);
     let last_index = chunks.len().saturating_sub(1);
     tracing::debug!(
         exchange_id = msg.proto.exchange_id,
