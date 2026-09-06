@@ -53,8 +53,16 @@ pub enum GroupSettingsError {
     NotFound {
         group_id: u16,
     },
+    /// keyset 0 は IPK（`f/<i>/k/0`、spec §11.2.6.2）専用で group provision
+    /// では書けない — 通すと IPK を 1 epoch の group keyset で上書きする
+    /// （IPK を替えるのは `mat fabric rotate-ipk`）。何も書かずに中断。
+    IpkKeysetReserved,
     Kvs(KvsError),
 }
+
+/// IPK の KeySet id（spec §11.2.6.2）。`write_group_provision` はこの id を
+/// 拒む（[`GroupSettingsError::IpkKeysetReserved`]）。
+pub const IPK_KEYSET_ID: u16 = 0;
 
 impl std::fmt::Display for GroupSettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,6 +80,10 @@ impl std::fmt::Display for GroupSettingsError {
             GroupSettingsError::NotFound { group_id } => write!(
                 f,
                 "group_settings: group {group_id} is not provisioned in the controller kvs"
+            ),
+            GroupSettingsError::IpkKeysetReserved => write!(
+                f,
+                "group_settings: keyset 0 is reserved for the IPK (use `mat fabric rotate-ipk` to change it)"
             ),
             GroupSettingsError::Kvs(e) => write!(f, "group_settings: {e}"),
         }
@@ -858,6 +870,9 @@ pub fn write_group_provision(
     compressed_fabric_id: &[u8; 8],
     w: &GroupProvisionWrite<'_>,
 ) -> Result<(), GroupSettingsError> {
+    if w.keyset_id == IPK_KEYSET_ID {
+        return Err(GroupSettingsError::IpkKeysetReserved);
+    }
     let mut txn = KvsTxn::open(main_ini)?;
     let fkey = format!("f/{fabric_index}/g");
     let mut fabric = match txn.get(&fkey)? {
@@ -1144,6 +1159,29 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// keyset 0 は IPK（`f/<i>/k/0`）専用。provision で通すと IPK を group 用の
+    /// 1 epoch keyset で上書きしてしまうので、何も書かずに拒む。
+    #[test]
+    fn keyset_zero_is_reserved_for_the_ipk_and_writes_nothing() {
+        let (_d, p) = tmp_ini("[Default]\n");
+        let err = write_group_provision(
+            &p,
+            2,
+            &CFID,
+            &GroupProvisionWrite {
+                group_id: 99,
+                keyset_id: 0,
+                name: "e2e",
+                epoch_key: [0x42; 16],
+                rebind: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GroupSettingsError::IpkKeysetReserved));
+        assert!(err.to_string().contains("keyset 0"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "[Default]\n");
     }
 
     #[test]
@@ -1485,7 +1523,21 @@ mod tests {
     #[test]
     fn remove_group_never_unlinks_the_ipk_keyset_zero() {
         let (_d, p) = tmp_ini("[Default]\n");
-        provision(&p, 1, 0, false);
+        // `write_group_provision` は keyset 0 を拒む（`IpkKeysetReserved`）ので、
+        // 「group が keyset 0 に bind されている」chip-tool 時代の状態は
+        // 同じ 5 レコードを guard 抜きで手組みして再現する。
+        {
+            let mut txn = KvsTxn::open(&p).unwrap();
+            let mut fabric = FabricData::empty();
+            write_group(&mut txn, 2, &mut fabric, 1, "e2e").unwrap();
+            let op = derive_ipk_operational(&[0x42; 16], &CFID);
+            let hash = derive_group_session_id(&op);
+            write_keyset(&mut txn, 2, &mut fabric, 0, &op, hash).unwrap();
+            write_keymap(&mut txn, 2, &mut fabric, 1, 0, false).unwrap();
+            write_fabric_list(&mut txn, 2, &mut fabric).unwrap();
+            txn.set("f/2/g", &fabric.serialize());
+            txn.commit().unwrap();
+        }
         let before = read_groups(&p, 2).unwrap();
         assert!(
             before.keysets.iter().any(|k| k.keyset_id == 0),

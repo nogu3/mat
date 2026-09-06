@@ -492,7 +492,8 @@ pub enum GroupCommand {
         /// provision 対象の commission 済み node_id または node alias（1つ以上）。
         #[arg(long = "nodes", required = true, num_args = 1..)]
         node_ids: Vec<NodeRef>,
-        /// 鍵束 ID（GroupKeySetID）。既定 42。
+        /// 鍵束 ID（GroupKeySetID）。既定 42。0 は IPK 用に予約されていて
+        /// 指定できない（parse_error — IPK を替えるのは `fabric rotate-ipk`）。
         #[arg(long, value_name = "N", default_value_t = 42)]
         keyset_id: u16,
         /// group 名（chip-tool groupsettings / AddGroup 用）。既定 `grp<group_id>`。

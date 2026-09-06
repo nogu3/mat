@@ -933,6 +933,9 @@ Outputs:
   fixed key only when several controllers must share the same wire group. The key
   is never printed to stdout (it is a credential; it lives in the KVS).
 - `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
+  Keyset **0 is reserved for the IPK** and is rejected (`parse_error`, exit 1)
+  before anything is written — provisioning it would overwrite the fabric's IPK
+  on every node and in the controller KVS. Use `mat fabric rotate-ipk` instead.
 - **Provision is heavy and fragile** (KeySetWrite / GroupKeyMap / AddGroup / ACL
   write on every node) and **especially unstable on Thread** (multicast retransmits and
   IPv6 packet drops lower delivery). Wi-Fi / Ethernet Matter lights fare better.
