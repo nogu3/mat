@@ -29,7 +29,7 @@ use mat_controller::group_settings::{self, GroupSettingsError};
 use mat_controller::kvs::{self, read_mat_ipk_epoch_slot, IpkEpochSlot, KvsError};
 use mat_core::error::{ErrorKind, MatError};
 
-use crate::{Establisher, NativeConfig, OneShotResolver, Resolver};
+use crate::{Establisher, NativeConfig, NodeConn, OneShotResolver, Resolver};
 
 /// epoch 鍵 → その IPK で CASE を張る確立器を作る関数（`RotateCtx::make_establisher`
 /// の型。clippy::type_complexity 対策の別名）。
@@ -220,11 +220,21 @@ pub async fn run_with(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutc
 }
 
 fn read_slot(ctx: &RotateCtx, slot: IpkEpochSlot) -> Result<Option<[u8; 16]>, MatError> {
-    read_mat_ipk_epoch_slot(&ctx.main_ini, ctx.fabric_index, slot).map_err(|e| {
-        MatError::new(
+    read_mat_ipk_epoch_slot(&ctx.main_ini, ctx.fabric_index, slot).map_err(|e| match e {
+        KvsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => MatError::new(
+            ErrorKind::StoreMissing,
+            format!(
+                "{} not found — run `mat fabric init` to bootstrap the credential store",
+                ctx.main_ini.display()
+            ),
+        ),
+        KvsError::Io(io) => {
+            MatError::new(ErrorKind::Other, format!("kvs ipk epoch ({slot}): {io}"))
+        }
+        e => MatError::new(
             ErrorKind::StoreParse,
-            format!("kvs ipk epoch ({slot:?}): {e}"),
-        )
+            format!("kvs ipk epoch ({slot}): {e}"),
+        ),
     })
 }
 
@@ -409,21 +419,32 @@ async fn distribute(
 ) -> Vec<NodeOutcome> {
     let mut out = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
-        let step = one_node(write_with, verify_with, epochs, node_id);
+        // `one_node` は確立した conn をここへ置く（establish 直後に格納、使う
+        // ときはロックしたまま invoke、close も held から take() して行う）。
+        // タイムアウトで `step` future が drop されても、確立済みの conn は
+        // held に残る（drop 時にロックは解放されるので下で取り出せる）ので、
+        // ここで拾って close する。
+        let held: Arc<tokio::sync::Mutex<Option<Box<dyn NodeConn>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let step = one_node(write_with, verify_with, epochs, node_id, Arc::clone(&held));
         let result = if timeout_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), step).await {
                 Ok(r) => r,
-                // タイムアウト時は in-flight の `step` future をここで drop
-                // する（tokio::time::timeout の仕様）ので、conn.close() は
-                // 呼ばれない。直経路は one-shot（次回 run で新規に確立し直す
-                // だけ）で、デバイス側も自分でセッションをタイムアウトさせる
-                // ため、close せずに手放すのはここでは許容している。
-                Err(_) => Err(MatError::new(
-                    ErrorKind::Timeout,
-                    format!(
-                        "node {node_id}: ipk rotation step (key-set-write + verify-case) exceeded {timeout_ms} ms"
-                    ),
-                )),
+                Err(_) => {
+                    // close 自体が hang して全体を止めないよう bounded（結果は
+                    // 無視 — 直経路は one-shot で、デバイス側も自分でセッション
+                    // をタイムアウトさせるため、ここで閉じ切れなくても致命では
+                    // ない）。
+                    if let Some(mut c) = held.lock().await.take() {
+                        let _ = tokio::time::timeout(Duration::from_millis(500), c.close()).await;
+                    }
+                    Err(MatError::new(
+                        ErrorKind::Timeout,
+                        format!(
+                            "node {node_id}: ipk rotation step (key-set-write + verify-case) exceeded {timeout_ms} ms"
+                        ),
+                    ))
+                }
             }
         } else {
             step.await
@@ -447,19 +468,30 @@ async fn one_node(
     verify_with: &dyn Establisher,
     epochs: &[([u8; 16], u64)],
     node_id: u64,
+    held: Arc<tokio::sync::Mutex<Option<Box<dyn NodeConn>>>>,
 ) -> Result<(), MatError> {
-    let mut conn = write_with
+    let conn = write_with
         .establish(node_id)
         .await
         .map_err(|e| step_err(node_id, "establish", e))?;
-    let written = crate::ops::write_ipk_keyset(conn.as_mut(), epochs).await;
-    conn.close().await;
+    *held.lock().await = Some(conn);
+    let written = {
+        let mut guard = held.lock().await;
+        let conn = guard.as_mut().expect("held just set above");
+        crate::ops::write_ipk_keyset(conn.as_mut(), epochs).await
+    };
+    if let Some(mut c) = held.lock().await.take() {
+        c.close().await;
+    }
     written.map_err(|e| step_err(node_id, "", e))?;
-    let mut conn = verify_with
+    let conn = verify_with
         .establish(node_id)
         .await
         .map_err(|e| step_err(node_id, "verify-case", e))?;
-    conn.close().await;
+    *held.lock().await = Some(conn);
+    if let Some(mut c) = held.lock().await.take() {
+        c.close().await;
+    }
     Ok(())
 }
 
@@ -481,8 +513,9 @@ mod tests {
 
     use async_trait::async_trait;
     use mat_controller::fabric::{derive_group_session_id, derive_ipk_operational};
+    use mat_controller::im::encode_key_set_write_fields_multi;
     use mat_controller::kvs::{mat_ipk_epoch_key, mat_ipk_epoch_slot_key, KvsTxn, MAIN_INI_FILE};
-    use mat_controller::tlv::{Tag, Writer};
+    use mat_controller::tlv::{Reader, Tag, Value, Writer};
     use mat_core::error::ErrorKind;
 
     use crate::NodeConn;
@@ -535,6 +568,15 @@ mod tests {
         establish_fail: HashMap<u64, ErrorKind>,
         invoke_fail: HashMap<u64, ErrorKind>,
         log: std::sync::Arc<Mutex<Vec<String>>>,
+        /// 払い出す FakeConn の送信系呼び出し（invoke 等）の遅延。per-node
+        /// timeout 時の close 検証用（既定 None = 遅延なし）。
+        delay: Option<std::time::Duration>,
+        /// 払い出す FakeConn 全体で共有する `close_calls`。None ならテストごとに
+        /// 新規カウンタ（close 呼び出し回数を見ないテストの既定動作）。
+        close_calls: Option<std::sync::Arc<AtomicUsize>>,
+        /// 払い出す FakeConn の `invoke_sink`（KeySetWrite の CommandFields TLV を
+        /// 記録する）。None なら記録しない（既存テストの挙動は不変）。
+        invoke_sink: Option<crate::test_support::InvokedFieldsLog>,
     }
 
     #[async_trait]
@@ -554,6 +596,12 @@ mod tests {
             Ok(Box::new(FakeConn {
                 fail_first_send: fail.is_some(),
                 fail_kind: fail.unwrap_or(ErrorKind::Timeout),
+                delay: self.delay,
+                close_calls: self
+                    .close_calls
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::new(AtomicUsize::new(0))),
+                invoke_sink: self.invoke_sink.clone(),
                 ..FakeConn::scripted()
             }))
         }
@@ -564,6 +612,9 @@ mod tests {
         ctx: RotateCtx,
         log: std::sync::Arc<Mutex<Vec<String>>>,
         made: std::sync::Arc<AtomicUsize>,
+        /// 全確立器が払い出す FakeConn の `invoke` 成功記録（`(endpoint, cluster,
+        /// command, fields_tlv)`）。KeySetWrite の epoch 順序を pin するテスト用。
+        invoked: crate::test_support::InvokedFieldsLog,
     }
 
     /// k/0（mat 1 スロット形）+ ipk-epoch=CUR の INI を持つ RotateCtx。
@@ -586,7 +637,12 @@ mod tests {
 
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let made = std::sync::Arc::new(AtomicUsize::new(0));
-        let (log2, made2) = (std::sync::Arc::clone(&log), std::sync::Arc::clone(&made));
+        let invoked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (log2, made2, invoked2) = (
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&made),
+            std::sync::Arc::clone(&invoked),
+        );
         let ctx = RotateCtx {
             main_ini,
             fabric_index: 2,
@@ -601,6 +657,9 @@ mod tests {
                     establish_fail: establish_fail.clone(),
                     invoke_fail: invoke_fail.clone(),
                     log: std::sync::Arc::clone(&log2),
+                    delay: None,
+                    close_calls: None,
+                    invoke_sink: Some(std::sync::Arc::clone(&invoked2)),
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -609,6 +668,7 @@ mod tests {
             ctx,
             log,
             made,
+            invoked,
         }
     }
 
@@ -663,6 +723,70 @@ mod tests {
         assert!(!body.to_string().to_lowercase().contains(&next_hex));
     }
 
+    /// KeySetWrite の CommandFields TLV
+    /// (`{0: GroupKeySet{0: id, 1: policy, 2..7: key0/start0/key1/start1/key2/start2}}`)
+    /// を歩いて、内側の GroupKeySet struct の leaf 要素を出現順に返す
+    /// （`mat-controller::im::cmdfields` の同種テストと同じ手筋 — バイト一致
+    /// だけでは encoder の変更に追随してしまうため、デコードして直接主張する）。
+    fn key_set_write_leaf_fields(tlv: &[u8]) -> Vec<(Tag, Value<'_>)> {
+        let mut r = Reader::new(tlv);
+        assert_eq!(r.next().unwrap().unwrap().value, Value::StructStart); // outer anonymous struct
+        let el = r.next().unwrap().unwrap();
+        assert_eq!(
+            (el.tag, el.value),
+            (Tag::Context(0), Value::StructStart),
+            "field 0 = GroupKeySet struct"
+        );
+        let mut seen = Vec::new();
+        loop {
+            let el = r.next().unwrap().unwrap();
+            if el.value == Value::ContainerEnd {
+                break;
+            }
+            seen.push((el.tag, el.value));
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn rotate_key_set_write_carries_current_at_1_and_next_at_2() {
+        let h = harness(HashMap::new(), HashMap::new());
+        let out = run_with(&h.ctx, &params(&[5], RotateMode::Rotate))
+            .await
+            .unwrap();
+        assert_eq!(out.status, RotateStatus::Rotated);
+        let next = slot(&h, IpkEpochSlot::Current).unwrap();
+
+        let invoked = h.invoked.lock().unwrap();
+        assert_eq!(invoked.len(), 1, "exactly one KeySetWrite: {invoked:?}");
+        let (endpoint, cluster, command, fields) = &invoked[0];
+        assert_eq!(*endpoint, 0);
+        assert_eq!(*cluster, 0x003F);
+        assert_eq!(*command, 0x0000);
+
+        // バイト一致で pin（現行@1、新@2）。
+        let expected = encode_key_set_write_fields_multi(0, &[(CUR, 1), (next, 2)]);
+        assert_eq!(
+            fields, &expected,
+            "KeySetWrite fields must carry current epoch at slot 1 and the new epoch at slot 2"
+        );
+
+        // デコードして ctx 2..7 を直接主張する。
+        assert_eq!(
+            key_set_write_leaf_fields(fields),
+            vec![
+                (Tag::Context(0), Value::Uint(0)), // GroupKeySetID = 0 (IPK)
+                (Tag::Context(1), Value::Uint(0)), // GroupKeySecurityPolicy = TrustFirst
+                (Tag::Context(2), Value::Bytes(&CUR)),
+                (Tag::Context(3), Value::Uint(1)),
+                (Tag::Context(4), Value::Bytes(&next)),
+                (Tag::Context(5), Value::Uint(2)),
+                (Tag::Context(6), Value::Null),
+                (Tag::Context(7), Value::Null),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn rotate_with_one_failure_stays_pending_and_is_resumable() {
         let h = harness(
@@ -707,12 +831,14 @@ mod tests {
             ctx,
             log,
             made,
+            invoked,
         } = h;
         let h2 = Harness {
             _dir,
             ctx: harness_ctx_reusing(&ctx),
             log,
             made,
+            invoked,
         };
         let out = run_with(&h2.ctx, &params(&[6], RotateMode::Rotate))
             .await
@@ -737,6 +863,9 @@ mod tests {
                     establish_fail: HashMap::new(),
                     invoke_fail: HashMap::new(),
                     log: std::sync::Arc::clone(&log),
+                    delay: None,
+                    close_calls: None,
+                    invoke_sink: None,
                 }) as Box<dyn Establisher>)
             }),
         }
@@ -784,6 +913,9 @@ mod tests {
                     },
                     invoke_fail: HashMap::new(),
                     log: std::sync::Arc::clone(&log),
+                    delay: None,
+                    close_calls: None,
+                    invoke_sink: None,
                 }) as Box<dyn Establisher>)
             }),
         };
@@ -857,6 +989,51 @@ mod tests {
         }
     }
 
+    /// establish は即成功するが、確立済み conn の invoke（KeySetWrite）が per-node
+    /// timeout より遅い場合、タイムアウトで打ち切られても held conn は close
+    /// されなければならない（実装前は close_calls が 0 のまま赤になる）。
+    #[tokio::test]
+    async fn rotate_per_node_timeout_closes_established_conn() {
+        let h = harness(HashMap::new(), HashMap::new());
+        let log = std::sync::Arc::clone(&h.log);
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let close_calls2 = std::sync::Arc::clone(&close_calls);
+        let ctx = RotateCtx {
+            main_ini: h.ctx.main_ini.clone(),
+            fabric_index: 2,
+            cfid: CFID,
+            cur_epoch: CUR,
+            make_establisher: Box::new(move |epoch: &[u8; 16]| {
+                let label = if *epoch == CUR { "cur" } else { "other" };
+                Ok(Box::new(NodeFake {
+                    label,
+                    establish_fail: HashMap::new(),
+                    invoke_fail: HashMap::new(),
+                    log: std::sync::Arc::clone(&log),
+                    delay: Some(std::time::Duration::from_secs(1)),
+                    close_calls: Some(std::sync::Arc::clone(&close_calls2)),
+                    invoke_sink: None,
+                }) as Box<dyn Establisher>)
+            }),
+        };
+        let p = RotateIpkParams {
+            node_ids: vec![5],
+            mode: RotateMode::Rotate,
+            per_node_timeout_ms: 50,
+        };
+        let out = run_with(&ctx, &p).await.unwrap();
+        assert_eq!(out.status, RotateStatus::Pending);
+        assert_eq!(
+            out.nodes[0].error.as_ref().unwrap().kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "established conn must be closed even though the step timed out"
+        );
+    }
+
     #[tokio::test]
     async fn catch_up_uses_prev_to_write_and_cur_to_verify() {
         let h = harness(HashMap::new(), HashMap::new());
@@ -880,6 +1057,50 @@ mod tests {
         assert_eq!(slot(&h, IpkEpochSlot::Prev), Some([0x0A; 16]));
         assert_eq!(slot(&h, IpkEpochSlot::Next), None);
         assert_eq!(out.body(2)["status"], "caught_up");
+    }
+
+    #[tokio::test]
+    async fn catch_up_key_set_write_carries_prev_at_1_and_current_at_2() {
+        let h = harness(HashMap::new(), HashMap::new());
+        const PREV: [u8; 16] = [0x0A; 16];
+        {
+            let mut txn = KvsTxn::open(&h.ctx.main_ini).unwrap();
+            txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Prev), &PREV);
+            txn.commit().unwrap();
+        }
+        let out = run_with(&h.ctx, &params(&[9], RotateMode::CatchUp))
+            .await
+            .unwrap();
+        assert_eq!(out.status, RotateStatus::CaughtUp);
+
+        let invoked = h.invoked.lock().unwrap();
+        assert_eq!(invoked.len(), 1, "exactly one KeySetWrite: {invoked:?}");
+        let (endpoint, cluster, command, fields) = &invoked[0];
+        assert_eq!(*endpoint, 0);
+        assert_eq!(*cluster, 0x003F);
+        assert_eq!(*command, 0x0000);
+
+        // バイト一致で pin（旧@1、現行@2）。
+        let expected = encode_key_set_write_fields_multi(0, &[(PREV, 1), (CUR, 2)]);
+        assert_eq!(
+            fields, &expected,
+            "catch-up KeySetWrite fields must carry the previous epoch at slot 1 and the current epoch at slot 2"
+        );
+
+        // デコードして ctx 2..7 を直接主張する。
+        assert_eq!(
+            key_set_write_leaf_fields(fields),
+            vec![
+                (Tag::Context(0), Value::Uint(0)),
+                (Tag::Context(1), Value::Uint(0)),
+                (Tag::Context(2), Value::Bytes(&PREV)),
+                (Tag::Context(3), Value::Uint(1)),
+                (Tag::Context(4), Value::Bytes(&CUR)),
+                (Tag::Context(5), Value::Uint(2)),
+                (Tag::Context(6), Value::Null),
+                (Tag::Context(7), Value::Null),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -976,5 +1197,79 @@ mod tests {
             read_mat_ipk_epoch_slot(&main_ini, 2, IpkEpochSlot::Next).unwrap(),
             None
         );
+    }
+
+    /// `read_slot` の I/O エラー写像専用のテスト群。establisher は呼ばれない
+    /// 経路のみ使うため panic する fake を積む。
+    fn ctx_with_ini(main_ini: PathBuf) -> RotateCtx {
+        RotateCtx {
+            main_ini,
+            fabric_index: 2,
+            cfid: CFID,
+            cur_epoch: CUR,
+            make_establisher: Box::new(|_epoch: &[u8; 16]| {
+                panic!("read_slot が先に失敗するはずで、establisher は作られない")
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_slot_missing_ini_is_store_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_ini = dir.path().join(MAIN_INI_FILE); // 作らない = 不在
+        let ctx = ctx_with_ini(main_ini.clone());
+        let e = read_slot(&ctx, IpkEpochSlot::Next).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::StoreMissing);
+        assert!(
+            e.detail.contains(&main_ini.display().to_string()),
+            "{}",
+            e.detail
+        );
+        assert!(e.detail.contains("mat fabric init"), "{}", e.detail);
+
+        // run_with(Rotate) は abort 以外で read_slot(Next) を最初に呼ぶ —
+        // 同じ kind になることを確認する。
+        let e2 = run_with(&ctx, &params(&[5], RotateMode::Rotate))
+            .await
+            .unwrap_err();
+        assert_eq!(e2.kind, ErrorKind::StoreMissing);
+    }
+
+    #[test]
+    fn read_slot_bad_bytes_is_store_parse_with_slot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_ini = dir.path().join(MAIN_INI_FILE);
+        std::fs::write(&main_ini, "[Default]\n").unwrap();
+        let mut txn = KvsTxn::open(&main_ini).unwrap();
+        txn.set(&mat_ipk_epoch_slot_key(2, IpkEpochSlot::Next), &[1, 2, 3]); // 16 バイトでない
+        txn.commit().unwrap();
+        let ctx = ctx_with_ini(main_ini);
+        let e = read_slot(&ctx, IpkEpochSlot::Next).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::StoreParse);
+        assert!(e.detail.contains("ipk-epoch-next"), "{}", e.detail);
+        assert!(!e.detail.contains("Next)"), "{}", e.detail);
+    }
+
+    #[test]
+    fn read_slot_permission_denied_is_other() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let main_ini = dir.path().join(MAIN_INI_FILE);
+            std::fs::write(&main_ini, "[Default]\n").unwrap();
+            std::fs::set_permissions(&main_ini, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let ctx = ctx_with_ini(main_ini.clone());
+            let result = read_slot(&ctx, IpkEpochSlot::Next);
+            // tempdir の削除が失敗しないよう権限を戻す。
+            std::fs::set_permissions(&main_ini, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let e = match result {
+                // root 実行時などで読めてしまったら、権限エラーの検証対象外として pass。
+                Ok(_) => return,
+                Err(e) => e,
+            };
+            assert_eq!(e.kind, ErrorKind::Other);
+            assert!(e.detail.contains("ipk-epoch-next"), "{}", e.detail);
+        }
     }
 }

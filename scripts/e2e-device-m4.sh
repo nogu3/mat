@@ -16,8 +16,16 @@
 #                      discovery use (default: `eth1` — same rationale as
 #                      e2e-device-m1.sh).
 #   MAT_E2E_TIMEOUT_S  seconds budgeted for `mat commission` (default: 30).
+#
+# Requires: python3 (see the guard right below).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# The rotate-ipk assertions below (assert_pending / ROTATE_JSON checks) need
+# python3 — the sed fallback in json_get cannot reach nested fields. Fail
+# fast with a clear message instead of an opaque "python3: command not found"
+# halfway through (after matv is already running).
+command -v python3 >/dev/null 2>&1 || { echo "e2e-device-m4: python3 is required (nested JSON assertions)" >&2; exit 1; }
 
 IFACE="${MAT_E2E_IFACE:-eth1}"
 TIMEOUT_S="${MAT_E2E_TIMEOUT_S:-30}"

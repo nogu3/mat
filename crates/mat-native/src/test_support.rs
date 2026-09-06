@@ -14,6 +14,12 @@ use mat_core::error::{ErrorKind, MatError};
 
 use crate::{Establisher, NodeConn};
 
+/// `invoke` の CommandFields TLV 記録の共有先: `(endpoint, cluster, command,
+/// fields_tlv)` の外部 Arc（`FakeConn::invoke_sink` / rotate_ipk.rs のテスト
+/// harness が共有する — `close_calls` と同じ手法。clippy::type_complexity 対策
+/// の別名）。
+pub type InvokedFieldsLog = std::sync::Arc<std::sync::Mutex<Vec<(u16, u32, u32, Vec<u8>)>>>;
+
 /// 購読 fake。`priming` は subscribe_wildcard が返す priming チャンク、`live` は
 /// next_report が 1 呼び出し 1 通で払い出す共有キュー（FakeEstablisher.sub_live
 /// と同一 — テストが確立後に注入できる）。尽きたら timeout まで待って Ok(None)
@@ -161,6 +167,15 @@ pub struct FakeConn {
     /// `write_tlv` の TLV ペイロード記録（M8a Task9）: (endpoint, cluster, attribute, tlv_bytes)。
     /// group-key-map マージ検証用。
     pub written_tlv: Vec<(u16, u32, u32, Vec<u8>)>,
+    /// `invoke` の CommandFields TLV 記録: `written_tlv` と同じ形
+    /// `(endpoint, cluster, command, fields_tlv)`。成功した呼び出しのみ記録
+    /// （`fields` は `Option` — 無ければ空 Vec として記録する）。
+    pub invoked_fields: Vec<(u16, u32, u32, Vec<u8>)>,
+    /// `invoke` の記録先を establisher 経由で払い出された conn からも観測する
+    /// ための外部 Arc（`close_calls` と同じ手法 — conn 自体への参照が
+    /// テスト側に残らない経路向け）。成功した呼び出しのみ、`invoked_fields`
+    /// と同じタプルを push する。
+    pub invoke_sink: Option<InvokedFieldsLog>,
     /// 送信系メソッド冒頭の遅延（deadline 執行テスト用、Issue #16）。None = 遅延なし。
     pub delay: Option<std::time::Duration>,
     /// `close()` の呼び出し回数。establisher へ渡してしまい conn 自体への参照が
@@ -181,6 +196,8 @@ impl Default for FakeConn {
             invoke_responses: HashMap::new(),
             calls: Vec::new(),
             written_tlv: Vec::new(),
+            invoked_fields: Vec::new(),
+            invoke_sink: None,
             delay: None,
             close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         }
@@ -262,7 +279,7 @@ impl NodeConn for FakeConn {
         endpoint: u16,
         cluster: u32,
         command: u32,
-        _fields: Option<Vec<u8>>,
+        fields: Option<Vec<u8>>,
         _timed: bool,
     ) -> Result<(), MatError> {
         if let Some(d) = self.delay {
@@ -275,6 +292,11 @@ impl NodeConn for FakeConn {
         }
         self.calls
             .push(format!("invoke({endpoint},{cluster:#06X},{command:#06X})"));
+        let recorded = (endpoint, cluster, command, fields.unwrap_or_default());
+        self.invoked_fields.push(recorded.clone());
+        if let Some(sink) = &self.invoke_sink {
+            sink.lock().unwrap().push(recorded);
+        }
         Ok(())
     }
 
