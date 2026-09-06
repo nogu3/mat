@@ -195,6 +195,11 @@ pub enum Op {
     /// dispatch で短絡する。`node_id()` は意図的に None — abort_op の drop_session /
     /// deadline 対象にしない（fire-and-forget、再購読完了を待たない契約）。
     NodeTouched { node_id: u64 },
+    /// 確立器の資格情報（IPK を含む）を KVS から読み直す admin op（`matd reload`、
+    /// および `mat fabric rotate-ipk` が commit 後に送る）。native の確立器には
+    /// 触るが、デバイス・ワイヤ・per-node Mutex には触れない — Status と同じく
+    /// dispatch で短絡する。`node_id()` は None。
+    Reload,
 }
 
 impl Op {
@@ -223,7 +228,8 @@ impl Op {
             | Op::Ping
             | Op::Status
             | Op::Shutdown
-            | Op::NodeTouched { .. } => None,
+            | Op::NodeTouched { .. }
+            | Op::Reload => None,
         }
     }
 
@@ -252,6 +258,7 @@ impl Op {
             Op::Status => "status",
             Op::Shutdown => "shutdown",
             Op::NodeTouched { .. } => "node_touched",
+            Op::Reload => "reload",
         }
     }
 
@@ -277,7 +284,8 @@ impl Op {
             | Op::Ping
             | Op::Status
             | Op::Shutdown
-            | Op::NodeTouched { .. } => None,
+            | Op::NodeTouched { .. }
+            | Op::Reload => None,
         }
     }
 
@@ -304,7 +312,8 @@ impl Op {
             | Op::Ping
             | Op::Status
             | Op::Shutdown
-            | Op::NodeTouched { .. } => None,
+            | Op::NodeTouched { .. }
+            | Op::Reload => None,
         }
     }
 
@@ -341,7 +350,8 @@ impl Op {
             | Op::Ping
             | Op::Status
             | Op::Shutdown
-            | Op::NodeTouched { .. } => None,
+            | Op::NodeTouched { .. }
+            | Op::Reload => None,
         }
     }
 }
@@ -709,6 +719,19 @@ mod tests {
         assert_eq!(r.op.endpoint(), None);
         assert_eq!(r.op.log_path(), None);
         assert_eq!(r.op.name(), "status");
+    }
+
+    #[test]
+    fn reload_has_no_node_and_matches_wire_tag() {
+        // admin op（`matd reload` / rotate-ipk 後の mat が送る）。native の確立器
+        // の資格情報を差し替えるが、デバイス・ワイヤ・per-node Mutex には触れない。
+        let r = parse(r#"{"op":"reload"}"#);
+        assert!(matches!(r.op, Op::Reload));
+        assert_eq!(r.op.node_id(), None);
+        assert_eq!(r.op.group_id(), None);
+        assert_eq!(r.op.endpoint(), None);
+        assert_eq!(r.op.log_path(), None);
+        assert_eq!(r.op.name(), "reload");
     }
 
     #[test]

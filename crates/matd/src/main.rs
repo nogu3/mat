@@ -68,6 +68,9 @@ enum Command {
     Stop,
     /// 稼働中 matd の購読とデーモンの現況を JSON で返す（socket 経由）。
     Status,
+    /// 稼働中 matd に KVS の資格情報（IPK）を読み直させる（socket 経由、
+    /// `mat fabric rotate-ipk` の後に。warm session と購読はそのまま）。
+    Reload,
 }
 
 fn main() {
@@ -120,6 +123,7 @@ async fn run(cli: Cli) -> Result<(), MatError> {
     match cli.command {
         Some(Command::Stop) => admin_op(cli.socket, "shutdown").await,
         Some(Command::Status) => admin_op(cli.socket, "status").await,
+        Some(Command::Reload) => admin_op(cli.socket, "reload").await,
         None => serve_daemon(cli).await,
     }
 }
@@ -288,13 +292,14 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         started: std::time::Instant::now(),
         iface: iface.clone(),
         fabric_index: cli.fabric_index,
+        reloads: server::ReloadStats::default(),
     });
     server::serve(&socket, store_path, native, events_tx, sub_health, daemon)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
 
-/// stop / status: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
+/// stop / status / reload: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
 /// stdout へ出す。居なければ「not running」で exit 1。
 async fn admin_op(socket: Option<PathBuf>, op: &str) -> Result<(), MatError> {
     let socket = socket.unwrap_or_else(mat_core::socket::default_socket_path);
