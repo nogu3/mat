@@ -20,26 +20,40 @@ use crate::{Establisher, NodeConn};
 /// の別名）。
 pub type InvokedFieldsLog = std::sync::Arc<std::sync::Mutex<Vec<(u16, u32, u32, Vec<u8>)>>>;
 
-/// 購読 fake。`priming` は subscribe_wildcard が返す priming チャンク、`live` は
-/// next_report が 1 呼び出し 1 通で払い出す共有キュー（FakeEstablisher.sub_live
-/// と同一 — テストが確立後に注入できる）。尽きたら timeout まで待って Ok(None)
-/// （実セッションの無音と同じ形）。
+/// 購読 fake。`priming` / `priming_events` は subscribe が返す priming チャンクと
+/// priming イベント、`live` / `live_events` は next_report_full が 1 呼び出し
+/// 1 通で払い出す共有キュー（FakeEstablisher.sub_live / sub_live_events と同一 —
+/// テストが確立後に注入できる）。属性とイベントのキューは**独立**に pop する
+/// ので、「属性のみ」「イベントのみ」「両方」の 3 形をテストが作れる。両方
+/// 尽きたら timeout まで待って Ok(None)（実セッションの無音と同じ形）。
 pub struct FakeSubConn {
     pub max_interval_s: u16,
     pub priming: Vec<mat_controller::im::ReportDataMessage>,
+    /// subscribe が返す priming イベント（establisher が毎回同じ内容を配る —
+    /// 再購読で priming フラグの規則を試せるように使い捨てにしない）。
+    pub priming_events: Vec<mat_controller::im::EventReport>,
     pub live: std::sync::Arc<
         std::sync::Mutex<std::collections::VecDeque<mat_controller::im::ReportDataMessage>>,
     >,
-    /// subscribe_wildcard が受けた clusters の記録先（FakeEstablisher と共有）。
+    pub live_events: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<Vec<mat_controller::im::EventReport>>>,
+    >,
+    /// subscribe が受けた clusters の記録先（FakeEstablisher と共有）。
     pub seen_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
-    /// 残り回数だけ `next_report` を `SessionFailed` で失敗させる（0 = 常に成功）。
-    /// `FakeEstablisher::fail_next_report` と同一の Arc — テストが確立後に
-    /// 注入して pump を狙って殺せる。
+    /// subscribe が受けた event_paths の記録先（FakeEstablisher と共有）。
+    pub seen_event_paths: std::sync::Arc<std::sync::Mutex<Vec<mat_controller::im::EventPathIn>>>,
+    /// subscribe が受けた event_min の記録先（FakeEstablisher と共有）。
+    /// 再購読のたび上書きされるので、テストは「最後の subscribe が
+    /// EventMin を載せたか」を見る。
+    pub seen_event_min: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    /// 残り回数だけ `next_report_full` を `SessionFailed` で失敗させる
+    /// （0 = 常に成功）。`FakeEstablisher::fail_next_report` と同一の Arc —
+    /// テストが確立後に注入して pump を狙って殺せる。
     pub fail_next_report: std::sync::Arc<AtomicUsize>,
     /// `close()` の呼び出し回数を数える。establisher に渡してしまうため
     /// 共有 Arc で観測する（matd の購読テストが使う）。
     pub close_calls: std::sync::Arc<AtomicUsize>,
-    /// `subscribe_wildcard` を fail_kind で失敗させるか。CASE 成立後に
+    /// `subscribe` を fail_kind で失敗させるか。CASE 成立後に
     /// subscribe だけが失敗する経路（Issue #20: この場合も close が必要）を
     /// 再現するための軸 — `FakeEstablisher::fail_subscription`（establish
     /// 自体の失敗、CASE 未成立で close 不要）とは別物。
@@ -73,13 +87,32 @@ pub fn onoff_report(sub_id: u32, value: bool) -> mat_controller::im::ReportDataM
     }
 }
 
+/// switch/initial-press の EventReport 1 件（テストフィクスチャ共通形）。
+/// `data` のキーは context tag の 10 進文字列 — 実デコーダ
+/// (`im::decode_event_reports`) が返す形と同じ。
+pub fn switch_press_event(event_number: u64, new_position: u64) -> mat_controller::im::EventReport {
+    mat_controller::im::EventReport::Data(mat_controller::im::EventData {
+        endpoint: 2,
+        cluster: 0x003B, // switch
+        event: 0x01,     // initial-press
+        event_number,
+        priority: mat_controller::im::EventPriority::Info,
+        timestamp: Some(mat_controller::im::EventTimestamp::System(5_000)),
+        data: Some(serde_json::json!({ "0": new_position })),
+    })
+}
+
 impl Default for FakeSubConn {
     fn default() -> Self {
         Self {
             max_interval_s: 60,
             priming: vec![onoff_report(1, true)],
+            priming_events: Vec::new(),
             live: std::sync::Arc::default(),
+            live_events: std::sync::Arc::default(),
             seen_clusters: std::sync::Arc::default(),
+            seen_event_paths: std::sync::Arc::default(),
+            seen_event_min: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
             close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             fail_wildcard: false,
@@ -87,49 +120,69 @@ impl Default for FakeSubConn {
     }
 }
 
+impl FakeSubConn {
+    /// 両キューから 1 通ぶんを取り出す。片方だけ残っていても report は成立する
+    /// （属性のみ / イベントのみ）。両方空なら None。
+    fn pop_report(&self) -> Option<mat_controller::session::SubscriptionReport> {
+        let data = self.live.lock().unwrap().pop_front();
+        let events = self.live_events.lock().unwrap().pop_front();
+        if data.is_none() && events.is_none() {
+            return None;
+        }
+        Some(mat_controller::session::SubscriptionReport {
+            data: data.unwrap_or(mat_controller::im::ReportDataMessage {
+                reports: Vec::new(),
+                subscription_id: Some(1),
+                more_chunks: false,
+                suppress_response: false,
+            }),
+            events: events.unwrap_or_default(),
+        })
+    }
+}
+
 #[async_trait]
 impl crate::SubscribeConn for FakeSubConn {
-    async fn subscribe_wildcard(
+    async fn subscribe(
         &mut self,
         clusters: &[u32],
-    ) -> Result<
-        (
-            crate::SubscriptionInfo,
-            Vec<mat_controller::im::ReportDataMessage>,
-        ),
-        MatError,
-    > {
+        event_paths: &[mat_controller::im::EventPathIn],
+        event_min: Option<u64>,
+    ) -> Result<crate::SubscribeStart, MatError> {
         if self.fail_wildcard {
             return Err(MatError::new(
                 ErrorKind::SessionFailed,
-                "fake subscribe_wildcard failure",
+                "fake subscribe failure",
             ));
         }
         *self.seen_clusters.lock().unwrap() = clusters.to_vec();
+        *self.seen_event_paths.lock().unwrap() = event_paths.to_vec();
+        *self.seen_event_min.lock().unwrap() = event_min;
         Ok((
             crate::SubscriptionInfo {
                 subscription_id: 1,
                 max_interval_s: self.max_interval_s,
             },
             std::mem::take(&mut self.priming),
+            self.priming_events.clone(),
         ))
     }
 
-    async fn next_report(
+    async fn next_report_full(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+    ) -> Result<Option<mat_controller::session::SubscriptionReport>, MatError> {
         if take_failure(&self.fail_next_report) {
             return Err(MatError::new(
                 ErrorKind::SessionFailed,
                 "fake subscription session error",
             ));
         }
-        if let Some(r) = self.live.lock().unwrap().pop_front() {
+        if let Some(r) = self.pop_report() {
             return Ok(Some(r));
         }
         tokio::time::sleep(timeout).await;
-        Ok(self.live.lock().unwrap().pop_front())
+        Ok(self.pop_report())
     }
 
     async fn close(&mut self) {
@@ -405,10 +458,22 @@ pub struct FakeEstablisher {
     /// 直近の establish_subscription が返した FakeSubConn の seen_clusters と
     /// 共有される記録先（matd の manager テストが検証に使う）。
     pub sub_clusters: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// 直近の establish_subscription が返した FakeSubConn の seen_event_paths /
+    /// seen_event_min と共有される記録先（イベント購読の配線の検証用）。
+    pub sub_event_paths: std::sync::Arc<std::sync::Mutex<Vec<mat_controller::im::EventPathIn>>>,
+    pub sub_event_min: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     /// 全 FakeSubConn と共有する live キュー（テストが確立後に report を注入する）。
     pub sub_live: std::sync::Arc<
         std::sync::Mutex<std::collections::VecDeque<mat_controller::im::ReportDataMessage>>,
     >,
+    /// 全 FakeSubConn と共有する live イベントキュー（`sub_live` と独立に pop
+    /// される — イベントだけの report もテストが作れる）。
+    pub sub_live_events: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<Vec<mat_controller::im::EventReport>>>,
+    >,
+    /// 払い出す FakeSubConn が subscribe のたび返す priming イベント
+    /// （使い捨てにしない = 再購読でも同じ内容が届く）。
+    pub sub_priming_events: std::sync::Arc<std::sync::Mutex<Vec<mat_controller::im::EventReport>>>,
     /// `establish_subscription` を残り回数だけ `fail_kind` で失敗させる
     /// （0 = 常に成功）。matd の再確立 backoff ラダーを回すためのカウンタ。
     pub fail_subscription: std::sync::Arc<AtomicUsize>,
@@ -438,7 +503,11 @@ impl Default for FakeEstablisher {
             fail_first_send: false,
             fail_kind: ErrorKind::Timeout,
             sub_clusters: std::sync::Arc::default(),
+            sub_event_paths: std::sync::Arc::default(),
+            sub_event_min: std::sync::Arc::default(),
             sub_live: std::sync::Arc::default(),
+            sub_live_events: std::sync::Arc::default(),
+            sub_priming_events: std::sync::Arc::default(),
             fail_subscription: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
             conn_delay: None,
@@ -477,7 +546,11 @@ impl Establisher for FakeEstablisher {
         }
         Ok(Box::new(FakeSubConn {
             seen_clusters: std::sync::Arc::clone(&self.sub_clusters),
+            seen_event_paths: std::sync::Arc::clone(&self.sub_event_paths),
+            seen_event_min: std::sync::Arc::clone(&self.sub_event_min),
             live: std::sync::Arc::clone(&self.sub_live),
+            live_events: std::sync::Arc::clone(&self.sub_live_events),
+            priming_events: self.sub_priming_events.lock().unwrap().clone(),
             fail_next_report: std::sync::Arc::clone(&self.fail_next_report),
             close_calls: std::sync::Arc::clone(&self.sub_close_calls),
             fail_wildcard: self.fail_wildcard,

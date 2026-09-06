@@ -191,24 +191,55 @@ pub struct SubscriptionInfo {
     pub max_interval_s: u16,
 }
 
+/// `SubscribeConn::subscribe` の戻り: 成立情報 + priming の属性チャンク列 +
+/// priming イベント（型が長いだけの組 — clippy::type_complexity 対策の別名）。
+pub type SubscribeStart = (
+    SubscriptionInfo,
+    Vec<mat_controller::im::ReportDataMessage>,
+    Vec<mat_controller::im::EventReport>,
+);
+
 /// 購読専用コネクション（専用 UdpTransport + 専用 CASE をポンプが独占する。
 /// 既存 op 経路 = warm session は不変 — spec 構造判断）。
 #[async_trait]
 pub trait SubscribeConn: Send {
-    /// Subscribe を張り、成立情報と priming report 群を返す。`clusters` 空 =
-    /// full wildcard、非空 = 「endpoint wildcard + cluster 指定」のパス列挙
-    /// （priming 軽量化 — subscriptions.toml 由来）。
+    /// Subscribe を張り、成立情報と priming（属性チャンク列 + イベント）を
+    /// 返す。`clusters` 空 = full wildcard、非空 = 「endpoint wildcard +
+    /// cluster 指定」のパス列挙（priming 軽量化 — subscriptions.toml 由来）。
+    /// `event_paths` 空かつ `event_min` None なら EventRequests /
+    /// EventFilters を出さず、ワイヤは従来の属性のみ購読と byte-equal
+    /// （フェーズ A で釘打ち済み）。`event_min` は再購読時の盲目窓回収
+    /// （EventFilters の EventMin = 前回見た番号 + 1）。
+    async fn subscribe(
+        &mut self,
+        clusters: &[u32],
+        event_paths: &[mat_controller::im::EventPathIn],
+        event_min: Option<u64>,
+    ) -> Result<SubscribeStart, MatError>;
+    /// 次のデバイス発 report を属性 + イベントの両方で待つ（keep-alive は
+    /// 両方空の Some で返る）。`timeout` 内無音は `Ok(None)` — エラーでは
+    /// ない（pump がスライスで刻んで死活判定するための契約）。`Err` は
+    /// セッション異常のみ。
+    async fn next_report_full(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<mat_controller::session::SubscriptionReport>, MatError>;
+    /// 属性のみを見る薄いラッパ（イベント無しの購読）。実装は
+    /// `subscribe` / `next_report_full` 側だけに置く。
     async fn subscribe_wildcard(
         &mut self,
         clusters: &[u32],
-    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError>;
-    /// 次のデバイス発 report を待つ（keep-alive は reports 空の Some で返る）。
-    /// `timeout` 内無音は `Ok(None)` — エラーではない（pump がスライスで刻んで
-    /// 死活判定するための契約）。`Err` はセッション異常のみ。
+    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
+        let (info, priming, _events) = self.subscribe(clusters, &[], None).await?;
+        Ok((info, priming))
+    }
+    /// 次のデバイス発 report の属性側だけを待つ薄いラッパ。
     async fn next_report(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError>;
+    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+        Ok(self.next_report_full(timeout).await?.map(|r| r.data))
+    }
     /// セッションを手放す直前の後始末。CloseSession を best-effort 送信する
     /// （Issue #20: 放置セッションが FP300 系の常駐購読を黙殺する）。fake は
     /// 既定 no-op で足りるよう default 実装を持つ。
@@ -722,40 +753,48 @@ struct SubscriptionSession {
 
 #[async_trait]
 impl SubscribeConn for SubscriptionSession {
-    async fn subscribe_wildcard(
+    async fn subscribe(
         &mut self,
         clusters: &[u32],
-    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
-        let (resp, priming) = self
+        event_paths: &[mat_controller::im::EventPathIn],
+        event_min: Option<u64>,
+    ) -> Result<SubscribeStart, MatError> {
+        // 間隔 / KeepSubscriptions はこのプロセスの固定方針（上の定数）。
+        // spec が運ぶのは呼び手が決める部分（属性クラスタ絞り込みと
+        // イベント範囲）だけ。
+        let spec = mat_controller::im::SubscribeSpec {
+            min_interval_floor_s: SUBSCRIBE_MIN_INTERVAL_FLOOR_S,
+            max_interval_ceiling_s: SUBSCRIBE_MAX_INTERVAL_CEILING_S,
+            keep_subscriptions: SUBSCRIBE_KEEP_SUBSCRIPTIONS,
+            clusters: clusters.to_vec(),
+            event_paths: event_paths.to_vec(),
+            event_min,
+        };
+        let outcome = self
             .session
-            .subscribe_wildcard(
-                SUBSCRIBE_MIN_INTERVAL_FLOOR_S,
-                SUBSCRIBE_MAX_INTERVAL_CEILING_S,
-                SUBSCRIBE_KEEP_SUBSCRIPTIONS,
-                clusters,
-                &self.mrp,
-            )
+            .subscribe(&spec, &self.mrp)
             .await
             .map_err(map_session_err)?;
         Ok((
             SubscriptionInfo {
-                subscription_id: resp.subscription_id,
-                max_interval_s: resp.max_interval_s,
+                subscription_id: outcome.response.subscription_id,
+                max_interval_s: outcome.response.max_interval_s,
             },
-            priming,
+            outcome.priming,
+            outcome.priming_events,
         ))
     }
 
-    async fn next_report(
+    async fn next_report_full(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
+    ) -> Result<Option<mat_controller::session::SubscriptionReport>, MatError> {
         match self
             .session
-            .next_subscription_report(timeout, &self.mrp)
+            .next_subscription_report_full(timeout, &self.mrp)
             .await
         {
-            Ok(msg) => Ok(Some(msg)),
+            Ok(report) => Ok(Some(report)),
             Err(mat_controller::session::SessionError::Silence) => Ok(None),
             Err(e) => Err(map_session_err(e)),
         }
@@ -1487,6 +1526,64 @@ mod tests {
             .expect("live report");
         assert_eq!(msg.reports.len(), 1);
         let _ = FakeSubConn::default(); // 型が公開されていること
+    }
+
+    /// イベント付き購読（フェーズ B）: `subscribe` が受けた event_paths /
+    /// event_min を fake が記録し、priming イベントを払い出す。
+    #[tokio::test]
+    async fn fake_sub_conn_records_event_scope_and_serves_priming_events() {
+        use crate::test_support::{switch_press_event, FakeEstablisher};
+        let est = FakeEstablisher::default();
+        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(7, 1)];
+        let mut conn = est.establish_subscription(5).await.unwrap();
+        let paths = vec![mat_controller::im::EventPathIn::WILDCARD_URGENT];
+        let (info, priming, priming_events) =
+            conn.subscribe(&[0x0006], &paths, Some(42)).await.unwrap();
+        assert_eq!(info.max_interval_s, 60);
+        assert_eq!(priming.len(), 1);
+        assert_eq!(priming_events, vec![switch_press_event(7, 1)]);
+        assert_eq!(*est.sub_clusters.lock().unwrap(), vec![0x0006]);
+        assert_eq!(*est.sub_event_paths.lock().unwrap(), paths);
+        assert_eq!(*est.sub_event_min.lock().unwrap(), Some(42));
+    }
+
+    /// `next_report_full`: 属性キューとイベントキューは独立に払い出される
+    /// （属性のみ / イベントのみ / 両方 の 3 形をテストが作れる）。
+    #[tokio::test]
+    async fn fake_sub_conn_next_report_full_serves_live_events() {
+        use crate::test_support::{onoff_report, switch_press_event, FakeEstablisher};
+        let slice = std::time::Duration::from_millis(50);
+        let est = FakeEstablisher::default();
+        let mut conn = est.establish_subscription(5).await.unwrap();
+        conn.subscribe(&[], &[], None).await.unwrap();
+        assert!(conn.next_report_full(slice).await.unwrap().is_none());
+
+        // 属性 + イベントが同じ report に同居する形。
+        est.sub_live.lock().unwrap().push_back(onoff_report(1, false));
+        est.sub_live_events
+            .lock()
+            .unwrap()
+            .push_back(vec![switch_press_event(9, 1)]);
+        let r = conn
+            .next_report_full(slice)
+            .await
+            .unwrap()
+            .expect("live report");
+        assert_eq!(r.data.reports.len(), 1);
+        assert_eq!(r.events, vec![switch_press_event(9, 1)]);
+
+        // イベントだけの report（属性キューは空）。
+        est.sub_live_events
+            .lock()
+            .unwrap()
+            .push_back(vec![switch_press_event(10, 1)]);
+        let r = conn
+            .next_report_full(slice)
+            .await
+            .unwrap()
+            .expect("event-only report");
+        assert!(r.data.reports.is_empty());
+        assert_eq!(r.events.len(), 1);
     }
 
     /// fake の失敗カウンタ: 残り回数だけ失敗し、尽きたら成功する
