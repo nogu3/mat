@@ -244,7 +244,12 @@ epoch harmlessly).
   attempts would fail after the *next* rotation drops that epoch. Existing
   warm sessions and resident subscriptions are untouched by the reload; the
   new IPK is used from the next CASE establishment on. `commission` picks the
-  new epoch up immediately.
+  new epoch up immediately. The hint goes to `MAT_MATD_SOCKET` (or the default
+  socket path) — with a daemon on a non-default socket (a container's
+  `/run/matd/matd.sock`, say) set `MAT_MATD_SOCKET` for the rotation, or run
+  `matd reload --socket …` afterwards. A `reloaded` answer that reports the IPK
+  unchanged is logged as a warning on stderr: that daemon is serving a
+  different store or fabric index than the one just rotated.
 - `fabric list` shows `"ipk_rotation_pending": true` while a rotation is
   pending; `fabric rotate-ipk --abort` clears it.
 - The virtual device `matv` follows the spec here too (§11.2.8.1): it accepts
@@ -1119,6 +1124,13 @@ matd reload --socket /run/mat/matd.sock
 native backend failed to build at startup, `reload` returns that error like
 every other op (the daemon must be restarted once the store is fixed).
 
+Errors follow `mat`'s contract, not stdout: only the success body above is
+printed to stdout, while `{"error":{"kind","detail"}}` goes to stderr and the
+exit code is the kind's (a changed fabric identity is `other`, exit `1`; a
+store that went missing or unreadable is `store_missing` / `store_parse`, exit
+`10`). With no daemon answering the socket, `matd reload` reports `matd not
+running at …` and exits `1` — the same as `matd status` and `matd stop`.
+
 Ask the running daemon what it is doing with `matd status` — one JSON line on
 stdout with daemon basics and the per-node state of the resident subscriptions
 (the same lifecycle the logs narrate: `establishing` → `established` →
@@ -1470,6 +1482,12 @@ auto-detect falling back. The op itself still runs entirely on the direct
 path either way — `matd` never executes it, only reacts afterward — and
 `discover` / `commission` / `fabric init` send no hint at all (no CASE
 session, or, for `commission`, no subscription yet to refresh).
+
+`fabric rotate-ipk` sends a hint of its own kind on the same socket: after a
+committed rotation it asks the running `matd` to `reload` its credentials and
+reports the answer as `matd_reload` (see IPK rotation above). Unlike
+`node_touched` it waits for the reply, but it stays informational — the
+rotation's exit code does not depend on it.
 
 ```bash
 mat --iface eth0 on --node 5

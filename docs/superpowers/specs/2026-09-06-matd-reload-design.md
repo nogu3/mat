@@ -59,7 +59,7 @@ prime 競合 WARN を生む。本設計は restart を `matd reload`（socket ad
   合流（`parse_error` にならない）、`log_op` の op 名は `"reload"`。
 - `server::dispatch` で `Status` / `NodeTouched` と同じく短絡する（`run_op` を
   通さない）。ただし native には触る（`NativeState::Ready(backend)` の
-  `backend.engine().reload_credentials(cfg)`）。per-node Mutex は取らない —
+  `backend.engine().reload_credentials()`）。per-node Mutex は取らない —
   確立器内部の swap だけで足りる。
 - `NativeState::Unavailable(e)` のときは `e` をそのまま返す（他 op と同じ規律）。
 
@@ -111,13 +111,17 @@ matd 不在は「not running」で exit 1（既存の `send_admin_op` 規律）�
   `mat-native::rotate_ipk` は matd を知らないまま（body の組み立てに matd の
   語彙を入れない）。
 - `matd_client::hint_reload`: `hint_node_touched` と同じ socket 候補
-  （`MAT_MATD_SOCKET` / 既定）・同じ接続失敗の扱い（debug ログ）・同じ 300 ms
-  read timeout で `{"op":"reload"}` を 1 行送り、応答 1 行を**読む**（ここが
-  node_touched との差）。判定:
+  （`MAT_MATD_SOCKET` / 既定）・同じ接続失敗の扱い（debug ログ）で
+  `{"op":"reload"}` を 1 行送り、応答 1 行を**読む**（ここが node_touched との
+  差）。read timeout は 1500 ms（`node_touched` の 300 ms より長い — 応答を
+  報告に使ううえ、matd 側の reload は KVS 読み直し + NOC 自己発行を伴う）。判定:
   - 接続不能 → `not_running`
   - 応答が JSON で `reloaded == true` → `reloaded`
   - それ以外（`{"error":...}`、旧 matd の `parse_error`、timeout、非 JSON）
     → `failed`（detail は `tracing::warn!` に出す。body には状態語だけ）
+  - `reloaded == true` かつ `ipk == "unchanged"` は `reloaded` のまま（語彙は
+    3 値固定）だが、「その matd は別 store / 別 fabric index を見ていないか」を
+    `tracing::warn!` で stderr に出す（commit 直後に IPK が動かないのは異常）。
 - body:
 
 ```json
@@ -140,9 +144,9 @@ matd 不在は「not running」で exit 1（既存の `send_admin_op` 規律）�
 ### 4.1 `Establisher::reload_credentials`
 
 ```rust
-/// 資格情報を差し替える（IPK ローテーション後の matd reload）。既定は非対応。
-/// 戻り値は「ipk_operational が変わったか」。
-fn reload_credentials(&self, _creds: FabricCredentials) -> Result<bool, MatError> {
+/// KVS を読み直して差し替える（IPK ローテーション後の matd reload）。既定は
+/// 非対応。戻り値は「ipk_operational が変わったか」。
+fn reload_credentials(&self) -> Result<bool, MatError> {
     Err(MatError::new(ErrorKind::Other,
         "credential reload not supported by this establisher"))
 }
