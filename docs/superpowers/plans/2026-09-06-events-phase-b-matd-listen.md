@@ -18,7 +18,7 @@
 ## Global Constraints
 
 - 属性イベント行（`attribute` キーを持つ JSON）の形は**無改変**。イベント行は `event` キーを持つ（spec §6.1 の 3 例が正）。
-- `mat listen` の既定（filter 無し）は属性行とイベント行の**両方**を流す。`--attribute` 指定で属性行のみ、`--event` 指定でイベント行のみ。両方指定は `parse_error`（exit 2）。
+- `mat listen` の既定（filter 無し）は属性行とイベント行の**両方**を流す。`--attribute <name>` 指定で属性行のみ、`--event` 指定でイベント行のみ。`--event` は値が**任意**（`--event` 単独 = 全イベント名、`--event <name>` = そのイベントだけ。ワイヤでは単独指定を `"event": "*"` で運ぶ）。両方指定は `parse_error`（exit 2）。旧 `mat` クライアント（`event` キー無し）は従来どおり接続でき、両方の行が流れる（属性行の形は無改変）。
 - matd の EventRequests は `subscriptions.toml` の `events` で制御: 無指定 = wildcard（全クラスタ、urgent）、`events = ["switch", "booleanstate"]` = そのクラスタの wildcard event path、`events = []` = EventRequests 無し（フェーズ A 以前と byte-equal なワイヤ）。属性の `clusters` と独立。
 - 全 event path は `IsUrgent = true`（spec §6.3）。
 - matd は `last_event_number: Option<u64>` をノードごとにプロセスメモリだけで持つ。再購読の `event_min = last + 1`。matd 起動直後は EventFilters 無し。
@@ -35,23 +35,26 @@
 | `crates/mat-core/src/ids.rs` | `EventDef`, `ClusterDef::events`, `resolve_event(cluster, input) -> Option<EventRef>`, `find_event(cluster, id)` |
 | `crates/matd/src/subscribe_config.rs` | `events` キー（`Option<Vec<u32>>`、`Some(vec![])` = 無効） |
 | `crates/matd/src/subscription.rs` | `Emitted { Attribute(Event), Event(EventItem) }`、`EventItem::to_json`、`events_from_report_full`、`last_event_number` 管理、`subscribe(spec)` への乗り換え |
-| `crates/matd/src/native.rs`（または `mat-native::runner` の conn 型） | `SubscriptionConn::subscribe(&SubscribeSpec)` / `next_report_full` |
+| `crates/mat-native/src/lib.rs` | `SubscribeConn` trait（購読専用 conn、`subscribe_wildcard` / `next_report` の隣）に `subscribe(clusters, event_paths, event_min)` / `next_report_full` を足し、`SubscriptionSession` で `SecureSession::subscribe` / `next_subscription_report_full` に配線 |
+| `crates/mat-native/src/test_support.rs` | `FakeSubConn` / `FakeEstablisher` に新 2 メソッドの fake（`priming_events` / `live_events` 注入口） |
 | `crates/matd/src/server.rs` | `ListenFilter::event`、`matches(&Emitted)`、ストリームの JSON 化 |
 | `crates/matd/src/protocol.rs` | `Op::Listen { event: Option<String> }` |
 | `crates/mat/src/cli.rs`, `resolve.rs`, `matd_client.rs` | `--event` フラグ、排他チェック、wire |
-| `scripts/e2e-device-m5-events.sh` | matv（switch + contact-sensor、`--stdin-control`）相手の e2e |
-| `docs/commands.md`, `docs/configuration.md`, `ARCHITECTURE.md`, `README.md` | イベント行の契約、`events` 設定、記録 |
+| `scripts/e2e-device-m3.sh` | 既存 matd×matv e2e に events 脚を追加（matv に `switch` + `contact-sensor` を足し `--stdin-control`、`mat listen --event`） |
+| `docs/commands.md`, `docs/configuration.md`, `ARCHITECTURE.md`, `README.md` | イベント行の契約、`events` 設定、記録（リリース / 本番デプロイは本計画の外 = 別セッション、version bump しない） |
 
 ---
 
-### Task 0: 前提コード確認（着手時、コード変更なし）
+### Task 0: 前提コード確認（2026-09-06 実施済み、base = main f93845d = v1.35.0）
 
-- [ ] `crates/matd/src/subscription.rs` の `run_subscription_once` が `conn.subscribe_wildcard(clusters)` / `conn.next_report(slice)` を呼んでいること（2026-09-06 時点: 834 行・925 行付近）。`conn` の型と定義場所（`crates/matd/src/native.rs::establish_subscription` の戻り値。`mat-native::runner` 側にあれば S2 マージ後の形を確認）。
-- [ ] `crates/matd/src/server.rs::ListenFilter { node_id, endpoint, cluster, attribute }` と `matches(&Event)`（337–400 行付近）。
-- [ ] `crates/matd/src/protocol.rs::Op::Listen { node_id, endpoint, cluster, attribute }`（174 行付近）。
-- [ ] `crates/mat/src/matd_client.rs::listen_request_json` / `dispatch_listen`、`crates/mat/src/cli.rs::Command::Listen`（342 行付近）。
-- [ ] `mat_controller::session::{SubscribeOutcome, SubscriptionReport}`、`im::{SubscribeSpec, EventPathIn, EventReport, EventData, EventPriority}` がフェーズ A のとおり存在すること。
-- [ ] ずれがあれば本計画の該当 Task を直してからコミットし、Task 1 へ。
+- [x] `crates/matd/src/subscription.rs::run_subscription_once`（824 行）は `conn.subscribe_wildcard(clusters)`（834 行）/ `conn.next_report(slice)`（927 行）を呼ぶ。`conn` は `Box<dyn mat_native::SubscribeConn>`（trait は `crates/mat-native/src/lib.rs` 197 行付近、実装 `SubscriptionSession` は同 722 行付近、fake は `crates/mat-native/src/test_support.rs::FakeSubConn`）。`crates/matd/src/native.rs::establish_subscription`（357 行）は `Establisher::establish_subscription` へ委譲するだけ。**→ 計画の「matd/src/native.rs（または runner）」は誤り、Task 3 を `mat-native/src/lib.rs` + `test_support.rs` に訂正済み。**
+- [x] `crates/matd/src/server.rs::ListenFilter { node_id, endpoint, cluster, attribute }`（370 行）と `from_op` / `matches(&Event)`（378 / 424 行）。
+- [x] `crates/matd/src/protocol.rs::Op::Listen`（174 行、全フィールド `#[serde(default)]`、`deny_unknown_fields` 無し = 新キー追加で旧クライアント無退行）。
+- [x] `crates/mat/src/matd_client.rs::listen_request_json`（635 行）/ `dispatch_listen`（661 行）、`crates/mat/src/cli.rs::Command::Listen`（342 行、`attribute: Option<String>`）。
+- [x] `mat_controller::session::{SubscribeOutcome { response, priming, priming_events }, SubscriptionReport { data, events }}`（`session/subscribe.rs`）、`SecureSession::subscribe(&SubscribeSpec, &MrpConfig)` / `next_subscription_report_full`、`im::{SubscribeSpec { clusters: Vec<u32>, event_paths, event_min, .. }, EventPathIn::WILDCARD_URGENT, EventReport::{Data, Status}, EventData, EventPriority::as_str, EventTimestamp}` はフェーズ A のとおり存在。
+- [x] `crates/matd/src/subscribe_config.rs::load(store_root) -> Result<Option<Vec<u32>>, MatError>`、呼び出しは `crates/matd/src/main.rs` 254 行のみ。
+- [x] matv は 1 CASE セッションしか同時に持てない（`scripts/e2e-device-m3.sh` 冒頭コメント）。直経路 op は matd の購読セッションを追い出す — Task 5 の EventMin 回収脚はこの性質を使う（matd 再起動ではない: 再起動は `last = None` → 全量 `priming: true` が spec §6.2 の正しい挙動）。
+- [x] ユーザー指示（2026-09-06）: e2e は新規 m5 ではなく **`scripts/e2e-device-m3.sh` にステップ追加**、リリース / hogar デプロイ / version bump は別セッション。Task 5 / 6 を訂正済み。
 
 ---
 
@@ -131,10 +134,17 @@ python3 scripts/gen-ids.py /tmp/chip > crates/mat-core/src/ids_gen.rs
 ### Task 3: matd 購読ポンプのイベント対応
 
 **Files:**
-- Modify: `crates/matd/src/subscription.rs`, `crates/matd/src/native.rs`（conn 型の場所に応じて）
+- Modify: `crates/mat-native/src/lib.rs`（`SubscribeConn` trait + `SubscriptionSession`）, `crates/mat-native/src/test_support.rs`（`FakeSubConn` / `FakeEstablisher`）, `crates/matd/src/subscription.rs`, `crates/matd/src/main.rs`（`SubscribeConfig` の受け渡し）
 
 **Interfaces:**
 - Consumes: `SecureSession::subscribe(&SubscribeSpec, cfg) -> SubscribeOutcome`、`next_subscription_report_full -> SubscriptionReport`、`EventScope::to_paths`。
+- Produces（`mat-native`）: `SubscribeConn` trait に追加
+  ```rust
+  async fn subscribe(&mut self, clusters: &[u32], event_paths: &[EventPathIn], event_min: Option<u64>)
+      -> Result<(SubscriptionInfo, Vec<ReportDataMessage>, Vec<EventReport>), MatError>;   // (info, priming 属性チャンク, priming events)
+  async fn next_report_full(&mut self, timeout: Duration) -> Result<Option<SubscriptionReport>, MatError>;
+  ```
+  `SubscriptionSession` は min/max/keep の既存定数で `SubscribeSpec` を組んで `SecureSession::subscribe` を呼ぶ。`event_paths` 空かつ `event_min` None のときワイヤは `subscribe_wildcard` と byte-equal（フェーズ A の釘打ちに乗る）。既存 `subscribe_wildcard` / `next_report` は無改変で残す（他の呼び出し元があれば）か、matd が使わなくなるなら `subscribe` の薄いラッパにする。`FakeSubConn` は `priming_events: Vec<EventReport>` と `live_events: Arc<Mutex<VecDeque<Vec<EventReport>>>>`（`live` の各 report に相乗りさせる形でもよい）、`seen_event_paths` / `seen_event_min` の記録先を持つ。
 - Produces:
   ```rust
   pub enum Emitted { Attribute(Event), Event(EventItem) }
@@ -166,45 +176,46 @@ python3 scripts/gen-ids.py /tmp/chip > crates/mat-core/src/ids_gen.rs
 - Modify: `crates/matd/src/protocol.rs`, `crates/matd/src/server.rs`, `crates/mat/src/cli.rs`, `crates/mat/src/resolve.rs`, `crates/mat/src/matd_client.rs`, `crates/mat/tests/listen.rs`, `crates/matd/tests/integration.rs`
 
 **Interfaces:**
-- `Op::Listen { .., event: Option<String> }`（wire キー `"event"`）。
-- `ListenFilter { .., attribute: Option<u32>, event: Option<u32> }`; `from_op` は attribute と event の両指定を `parse_error`。`matches(&Emitted)`: `Attribute` 行は `event.is_none()` かつ既存条件; `Event` 行は `attribute.is_none()` かつ node/endpoint/cluster 一致かつ `event` 一致（None = wildcard）。
-- `mat listen --event <name>`（`--attribute` と `conflicts_with`）。`listen_request_json` に `event`。
+- `Op::Listen { .., event: Option<String> }`（wire キー `"event"`、`#[serde(default)]`。`"*"` = イベント行のみ・全イベント名）。
+- `ListenFilter { .., attribute: Option<u32>, event: Option<Option<u32>> }`（`event: Some(None)` = `"*"`、`Some(Some(id))` = 名前/数値を `resolve_event`（`--cluster` 必須、数値なら不要 — attribute と同じ規則）で解決）; `from_op` は attribute と event の両指定を `parse_error`。`matches(&Emitted)`: `Attribute` 行は `event.is_none()` かつ既存条件; `Event` 行は `attribute.is_none()` かつ node/endpoint/cluster 一致かつ `event` が `None` / `Some(None)` / `Some(Some(id == ev.event))` のいずれか。
+- `mat listen --event [<name>]`（clap `num_args(0..=1)`、`default_missing_value = "*"`、`--attribute` と `conflicts_with`）。`listen_request_json` に `event`（未指定なら省略、旧 matd 互換）。
 
 - [ ] Step 1: tests — protocol parse（`event` 省略/指定）、`ListenFilter::matches` の 2×2（attribute 指定 × 行種別）、両指定拒否、`listen_request_json` に `event` が載る、`mat listen --attribute x --event y` が exit 2。matd `tests/integration.rs` の listen テストに「イベント行が流れる」ケース（fake backend で `Emitted::Event` を流す）。
 - [ ] Step 2〜5: 失敗確認 → 実装 → `cargo test -p matd -p mat` → Commit `feat(listen): --event フィルタとイベント行のストリーム配信`。
 
 ---
 
-### Task 5: matv 相手の e2e と実機
+### Task 5: e2e-device-m3 に events 脚を追加
 
 **Files:**
-- Create: `scripts/e2e-device-m5-events.sh`（`scripts/e2e-device-m4.sh` を雛形に）
-- Modify: `docs/development.md`（e2e 一覧）
+- Modify: `scripts/e2e-device-m3.sh`（ヘッダの Flow コメントも更新）, `docs/development.md`（e2e 一覧があれば）
 
-- [ ] Step 1: スクリプト — matv（`switch` + `contact-sensor`、`--stdin-control`、stdin は名前付きパイプ）→ `mat fabric init` → `mat commission` → `matd` 起動（`subscriptions.toml` に `events = ["switch", "booleanstate"]`）→ `mat listen --event initial-press --count 1 --timeout-ms 20000 &` → パイプへ `{"device":"btn","press":"short"}` → listen の出力 JSON に `"event":"initial-press"` と `"data":{"new-position":1}` があること → `mat listen --cluster booleanstate --count 2`（属性行 + イベント行の両方）→ matd 停止・再起動の間に `{"device":"door","state":false}` を注入 → 再起動後の `mat listen --event state-change --count 1` に `priming:false` で届く（EventMin 回収）。
-- [ ] Step 2: `task check` + スクリプト実走（ローカル、`iface` は WSL の実 IF）。
-- [ ] Step 3: 実機（任意）: Aqara の開閉/ボタンがあれば jarvis 経由で commission して `mat listen --event` を確認。無ければ「実機未実施」と ARCHITECTURE に明記。
-- [ ] Step 4: Commit — `test(e2e): m5 イベント購読（matv --stdin-control → matd → mat listen --event）`
+**設計（matv は同時 1 CASE セッション — ヘッダコメント参照）:**
+- matv の `[[device]]` に `id = "btn", kind = "switch"` と `id = "door", kind = "contact-sensor"` を足し、`--stdin-control` を付けて起動。stdin は名前付きパイプ（`mkfifo`、書き手側 fd をスクリプトが `exec 3>fifo` で開き続けて EOF を防ぐ）。エンドポイントは matv の JSON 出力 / `mat describe` から取る（EP2 = light、EP3 = btn、EP4 = door の想定だが決め打ちせず assert で確認）。
+- matd の store に `subscriptions.toml` を `events = ["switch", "booleanstate"]` **のみ**（`clusters` 無し = 属性は full wildcard のまま。Task 2 の「events だけの config を受理」の実走確認を兼ねる）で置く。既存の onoff listen 脚は無改変で通ること。
+- 脚 A（必須、ユーザー指示）: `mat listen --cluster switch --event --count 2 --timeout-ms T &` → fifo に `{"device":"btn","press":"short"}` → 出力 2 行に `"event":"initial-press"`（`"data":{"new-position":1}`）と `"event":"short-release"`（`"data":{"previous-position":1}`）が **EventNumber 昇順**で並び、`"priming":false`、`"attribute"` キー無し。
+- 脚 B: `mat listen --cluster booleanstate --count 2 &` → `{"device":"door","state":true}` → 属性行（`"attribute":"state-value"`, `"value":true`）とイベント行（`"event":"state-change"`, `"data":{"state-value":true}`）の両方が届く（順不同で可）。
+- 脚 C（EventMin 回収）: `MAT_MATD=0`（`MAT_MATD_SOCKET` **無し** = node_touched ヒントを送らない）で直経路 `mat on` を 1 本撃ち matv の唯一セッションを奪う → 即 `{"device":"door","state":false}`（購読が死んでいる間のイベント）→ `mat listen --cluster booleanstate --event state-change --count 1 &` → `MAT_MATD_SOCKET` 付きの直経路 op（既存脚と同じ）でヒントを送り matd を再購読させる → listen の出力が `"data":{"state-value":false}` かつ **`"priming":false`**（`event_min = last+1` で回収された = 盲目窓の実イベント）。matd stderr に EventFilters 付き再購読のログ（Task 3 で `event_min` を info ログに出す）があることも grep。
+- 既存の「matd 再起動」相当は足さない（再起動後は `last = None` → 全量 `priming: true` が仕様）。
+
+- [ ] Step 1: スクリプト編集（既存脚の assert は 1 文字も変えない）。
+- [ ] Step 2: `task check` + `MAT_E2E_IFACE=<WSL の実 IF> bash scripts/e2e-device-m3.sh` 実走 → 終了コード 0。
+- [ ] Step 3: Commit — `test(e2e): m3 に events 脚（matv --stdin-control → matd → mat listen --event、EventMin 回収）`
 
 ---
 
-### Task 6: ドキュメントと本番ロールアウト記録
+### Task 6: ドキュメント
 
-- [ ] `docs/commands.md` Listen 節: イベント行の契約（spec §6.1 の 3 例、`event` キーで判別、`--event`、`recovered` 無し、`priming` 規則）。既存消費者への注意（casa は `attribute` キー有無で分岐）。
+- [ ] `docs/commands.md` Listen 節: イベント行の契約（spec §6.1 の 3 例、`event` キーで判別、`--event [<name>]`、`recovered` 無し、`priming` 規則 = matd 起動直後の全量は `true`、EventMin 回収分は `false`）。既存消費者への注意（casa は `attribute` キー有無で分岐）。「Routing through matd」の op 表に `event` キーを追記。
+- [ ] `docs/configuration.md`: Task 2 で書いた `events` の 3 形を見直し、canary 手順（`events = ["switch","booleanstate"]` → 観察 → wildcard、戻しは `events = []`）を添える。
 - [ ] `README.md`: `mat listen` の例にイベント行を 1 つ。
-- [ ] `ARCHITECTURE.md`: 「Phase 5 拡張 — イベント購読 フェーズ B」節（priming 所要時間の実測、canary の手順: `events = ["switch","booleanstate"]` → 24h 観察 → wildcard へ、戻しは `events = []`）。
-- [ ] リリース: minor bump（ユーザー規律どおり major は打たない）、`task semver` で破壊点を棚卸し（`ReportDataMessage` 無改変なので外部破壊は無い見込み）。
-- [ ] 本番デプロイ（despliegue skill）は canary 設定付きで。デプロイ後 `matd status` で established 19/19 と priming 所要時間を記録。
-- [ ] ロールアウト注意（フェーズ A レビュー由来）: `IsUrgent` を**必ず on のまま**にする。
-      `subscriptions.toml` が将来 urgent を落とせるようにした場合、報告は max-interval
-      （最大 300 秒）まで待つことになり、その間に溜まったイベントは 1 レポートあたりの
-      イベント上限（デバイス側の予算内キャップ、`send_subscription_report`）に当たって
-      分割配送になる — 欠落はしないが遅延が積む。urgent on ならこの窓は min-interval に縮む。
-
----
+- [ ] `ARCHITECTURE.md`: 「Phase 5 拡張 — イベント購読 フェーズ B」節（設計判断: urgent 固定、last_event_number はプロセスメモリのみ、`"*"` ワイヤ、実機スモークの結果または「実機未実施」）。
+- [ ] ロールアウト注意（フェーズ A レビュー由来）を ARCHITECTURE に残す: `IsUrgent` を**必ず on のまま**にする。urgent を落とすと報告は max-interval（最大 300 秒）まで待ち、溜まったイベントはデバイス側の 1 レポート上限で分割配送になる（欠落はしないが遅延が積む）。
+- [ ] リリース（minor bump / crates.io）と本番デプロイは**本計画の外**（別セッション）。version bump しない。
+- [ ] Commit — `docs: イベント購読 フェーズ B（mat listen --event、subscriptions.toml events、ARCHITECTURE 記録）`
 
 ## Self-Review
 
 - Spec §6.1 → Task 3（JSON 形）+ Task 4（フィルタ）+ Task 6（docs）。§6.2 → Task 2（設定）+ Task 3（EventMin / priming 規則 / canary は Task 6）。§6.3 → Task 2 の `to_paths` が常に urgent。§2.4 のイベント名 → Task 1。
 - 型名: `Emitted` / `EventItem` / `EventScope` / `EventDef` / `resolve_event` / `find_event` は Task 間で統一。
-- S2 依存: Task 3 の conn 型と `FakeEstablisher` は S2 マージ後の形に合わせる（Task 0 で確認）。
+- S2 依存: Task 3 の conn 型と `FakeEstablisher` は S2 マージ後の形に合わせる（Task 0 で確認済み: `mat_native::SubscribeConn`）。
