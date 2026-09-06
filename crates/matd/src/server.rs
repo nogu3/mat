@@ -1166,16 +1166,22 @@ mod tests {
         assert_eq!(status["reloads"]["count"], 1);
         assert!(status["reloads"]["last_at"].is_string());
 
-        // 2 回目: unchanged でも回数は進む。
+        // 2 回目は IPK が動かなかった確立器で: `ipk` は unchanged に写り、
+        // それでも reload 自体は成功なので回数は進む。
+        let unchanged = NativeState::Ready(Box::new(NativeBackend::with_establisher(Box::new(
+            ReloadOkEstablisher { changed: false },
+        ))));
         let (body, _) = dispatch(
             r#"{"op":"reload"}"#,
-            &state,
+            &unchanged,
             &store_path,
             &health,
             &daemon,
             &events,
         )
         .await;
+        assert_eq!(body["reloaded"], true);
+        assert_eq!(body["ipk"], "unchanged");
         assert_eq!(body["reload_count"], 2);
     }
 
