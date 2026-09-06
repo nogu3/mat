@@ -151,7 +151,14 @@ fn main() {
         }
     };
 
-    if let Err(e) = runtime.block_on(run(file_cfg, cli.stdin_control)) {
+    let result = runtime.block_on(run(file_cfg, cli.stdin_control));
+    // Ctrl-C で `run` が戻った後、ランタイムの暗黙 drop に任せてはいけない:
+    // `Runtime::Drop` は blocking プールの実行中タスクの完了を待つが、
+    // `--stdin-control` の読み手は `tokio::io::stdin()` の専用スレッドで
+    // **キャンセルできない** `read()` に入っているので、stdin が開いたまま
+    // （EOF が来ない）だとそこで永久に止まる。畳むのを待たずに抜ける。
+    runtime.shutdown_background();
+    if let Err(e) = result {
         eprintln!("matv: {e}");
         std::process::exit(1);
     }

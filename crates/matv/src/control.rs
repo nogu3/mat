@@ -101,6 +101,8 @@ pub async fn run_stdin_control(handle: StimulusHandle) {
             Err(StimulusApplyError::Node(e)) => {
                 eprintln!("{}", error_json("other", &e.to_string()))
             }
+            // ランタイム（デバイス本体）が消えた後は、以降の行も同じ
+            // エラーを繰り返すだけなのでフックごと畳む。
             Err(StimulusApplyError::Closed) => {
                 eprintln!("{}", error_json("other", "device runtime is gone"));
                 return;
