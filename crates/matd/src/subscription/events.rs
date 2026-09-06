@@ -127,9 +127,13 @@ fn device_time_json(ts: EventTimestamp) -> Option<serde_json::Value> {
 /// listen のイベント行へ。`ts` は呼び手が 1 回だけ採った受信時刻
 /// （同一 report 由来の属性行と同じ文字列を共有する）。
 ///
-/// `Status` エントリ（そのイベント path が拒否された）は debug ログで捨てる:
+/// `Status` エントリ（そのイベント path が拒否された）は行にしない:
 /// listen の消費者にとっては「起きなかった」と区別できず、行として流す意味が
-/// ない。並びは EventNumber 昇順（spec §6.2 — デバイスは昇順で送る建前だが、
+/// ない。ただし運用側は subscriptions.toml のカナリア時に「拒否されたか」を
+/// stderr で確かめる（docs/configuration.md）ので、**この 1 通ぶんにつき
+/// warn 1 行**へ集約する（件数 + 先頭の status。1 エントリ 1 行にはしない —
+/// 拒否は path 数ぶん一斉に来る）。エントリ個別は debug のまま。
+/// 並びは EventNumber 昇順（spec §6.2 — デバイスは昇順で送る建前だが、
 /// チャンクをまたいで集めるのでここで確定させる）。
 pub fn events_from_event_reports(
     node_id: u64,
@@ -138,6 +142,9 @@ pub fn events_from_event_reports(
     ts: &str,
 ) -> Vec<EventItem> {
     let mut out: Vec<EventItem> = Vec::with_capacity(events.len());
+    // 拒否された path の集約（件数 + 先頭 1 件）。warn は最後に 1 行だけ出す。
+    let mut rejected = 0usize;
+    let mut first_reject: Option<&EventReport> = None;
     for rep in events {
         match rep {
             EventReport::Data(d) => out.push(EventItem {
@@ -166,8 +173,29 @@ pub fn events_from_event_reports(
                     status,
                     "dropping event status report"
                 );
+                rejected += 1;
+                first_reject.get_or_insert(rep);
             }
         }
+    }
+    if let Some(EventReport::Status {
+        endpoint,
+        cluster,
+        event,
+        status,
+    }) = first_reject
+    {
+        // 拒否は運用の判断材料（そのイベント path をこのデバイスは持たない /
+        // ACL で拒む）なので本番の既定レベルで見えるところに 1 行出す。
+        tracing::warn!(
+            node_id,
+            rejected,
+            first_endpoint = ?endpoint,
+            first_cluster = ?cluster,
+            first_event = ?event,
+            first_status = status,
+            "device rejected event paths (reports dropped)"
+        );
     }
     out.sort_by_key(|e| e.event_number);
     out
@@ -309,6 +337,8 @@ mod tests {
     }
 
     /// EventNumber 昇順に並べ替え、Status エントリは捨てる（spec §6.2）。
+    /// 拒否は warn 1 行に集約されるが、**行としては流さない**のが契約 —
+    /// ここで釘打つのは出力側（ログはアサートしない）。
     #[test]
     fn events_from_event_reports_sorts_and_drops_status() {
         let reports = vec![
@@ -317,6 +347,13 @@ mod tests {
                 endpoint: Some(9),
                 cluster: Some(0x003B),
                 event: Some(0x02),
+                status: 0x7F,
+            },
+            // 拒否は path 数ぶん一斉に来る（集約 warn の想定入力）。
+            EventReport::Status {
+                endpoint: Some(9),
+                cluster: Some(0x0045),
+                event: Some(0x00),
                 status: 0x7F,
             },
             data_report(0x03, 10, json!({"0": 1})),

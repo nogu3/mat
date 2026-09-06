@@ -182,12 +182,21 @@ events = []                           # no EventRequests at all
   three forms is in effect — there is no non-urgent option (see [Resident
   Subscribe and `mat listen`](commands.md#resident-subscribe-and-mat-listen)
   for why).
-- **Rollout / canary.** Start production `matd` with `events = ["switch",
+- **Rollout / canary.** Order matters: **update the `mat listen` consumers
+  first**, then enable `events`. Even the narrow canary list puts
+  `booleanstate` `state-change` lines (and `switch` presses) into every
+  unfiltered `mat listen` stream, and those lines count against `--count`,
+  so a consumer doing `mat listen --count 1` can get an event line where it
+  used to get an attribute line. Give each consumer either a branch on the
+  `attribute` / `event` key or an explicit `--attribute` flag before turning
+  the key on. Then start production `matd` with `events = ["switch",
   "booleanstate"]` rather than jumping straight to wildcard: watch priming
   time across all nodes and stderr for any device rejecting the
-  `EventRequests` path (`INVALID_ACTION` during establish/priming), then
-  widen by removing the `events` key entirely once that looks clean.
-  `events = []` is the instant off switch if the widen step goes wrong.
+  `EventRequests` path — `matd` logs one `warn` per report with
+  `rejected` (count) plus the first rejected endpoint/cluster/event/status,
+  and `INVALID_ACTION` during establish/priming — then widen by removing the
+  `events` key entirely once that looks clean. `events = []` is the instant
+  off switch if the widen step goes wrong.
 - **Upgrade caveat — absent means wildcard.** Upgrading `matd` to a
   phase-B-or-later build with an *existing* `subscriptions.toml` that has no
   `events` key turns on wildcard event subscriptions for every commissioned

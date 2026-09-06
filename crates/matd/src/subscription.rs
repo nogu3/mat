@@ -186,13 +186,36 @@ impl SubHealth {
         locked(&self.event_numbers).get(&node_id).copied()
     }
 
-    /// 観測した EventNumber を記録する。最大値を保つ（1 ReportData 内の
+    /// 観測した EventNumber を記録する。既定は最大値を保つ（1 ReportData 内の
     /// 並び順や、priming と live の交錯で後退させないため）。
-    pub fn note_event_number(&self, node_id: u64, n: u64) {
-        locked(&self.event_numbers)
-            .entry(node_id)
-            .and_modify(|cur| *cur = (*cur).max(n))
-            .or_insert(n);
+    ///
+    /// 例外は `live`（購読成立後のデバイス発 report）で番号が既知値より
+    /// **小さい**とき: デバイスのイベントログが再起動やカウンタリセットで
+    /// 巻き戻ったということなので、記録も巻き戻す。片方向ラッチのままだと
+    /// 以後の再購読が永久に満たされない EventMin を送り続け、盲目窓の回収
+    /// （spec §6.2）が matd 再起動まで死ぬ。priming は最大値のまま —
+    /// EventFilters を無視して全ログを返すデバイスがあるため（`PrimingRule`）。
+    pub fn note_event_number(&self, node_id: u64, n: u64, live: bool) {
+        use std::collections::hash_map::Entry;
+        match locked(&self.event_numbers).entry(node_id) {
+            Entry::Occupied(mut e) => {
+                let cur = *e.get();
+                if n > cur {
+                    e.insert(n);
+                } else if live && n < cur {
+                    tracing::warn!(
+                        node_id,
+                        stored = cur,
+                        observed = n,
+                        "live event number went backwards; assuming the device event log reset and lowering EventMin"
+                    );
+                    e.insert(n);
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(n);
+            }
+        }
     }
 
     /// 状態変更 op が success した。cluster が購読対象なら pending を打つ。
@@ -932,9 +955,10 @@ fn emit_event_lines(
 ) {
     // `priming` はいったん true で組み、番号が分かってから rule で決め直す
     // （`events_from_event_reports` は 1 通ぶんに一律のフラグしか持てない）。
+    let live = matches!(rule, PrimingRule::Live);
     for mut item in events_from_event_reports(node_id, reports, true, ts) {
         item.priming = rule.priming_for(node_id, item.event_number);
-        health.note_event_number(node_id, item.event_number);
+        health.note_event_number(node_id, item.event_number, live);
         let _ = events.send(Emitted::Event(item)); // 受信者ゼロは正常
     }
 }
@@ -1392,14 +1416,14 @@ mod tests {
     }
 
     /// manager 経路: subscriptions.toml 由来のクラスタ集合が SubscribeConn::
-    /// subscribe_wildcard まで届く（絞り込みの配線の釘打ち）。
+    /// subscribe まで届く（絞り込みの配線の釘打ち）。
     #[tokio::test]
     async fn manager_passes_clusters_to_subscribe() {
         let est = FakeEstablisher::default();
         let seen = Arc::clone(&est.sub_clusters);
         let (mut rx, _health, _dir, _handles) = spawn_manager(est, Some(vec![0x0006, 0x0406]));
 
-        // priming イベントが届いた時点で subscribe_wildcard は呼ばれている。
+        // priming イベントが届いた時点で subscribe は呼ばれている。
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("no event within 2s")
@@ -1993,7 +2017,7 @@ mod tests {
         );
     }
 
-    /// subscribe_wildcard が失敗したとき（CASE は成立済み）も close される
+    /// subscribe が失敗したとき（CASE は成立済み）も close される
     /// （Issue #20）。establish_subscription 自体の失敗は CASE 未成立なので
     /// close 不要 — この経路とは区別する。
     #[tokio::test]
@@ -2001,7 +2025,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let est = FakeEstablisher {
-            fail_wildcard: true,
+            fail_subscribe: true,
             ..Default::default()
         };
         let close_calls = Arc::clone(&est.sub_close_calls);
@@ -2670,13 +2694,34 @@ mod tests {
     fn note_event_number_keeps_the_max() {
         let h = SubHealth::new(None);
         assert_eq!(h.last_event_number(5), None);
-        h.note_event_number(5, 10);
-        h.note_event_number(5, 7);
+        h.note_event_number(5, 10, false);
+        h.note_event_number(5, 7, false);
         assert_eq!(h.last_event_number(5), Some(10));
-        h.note_event_number(5, 11);
+        h.note_event_number(5, 11, false);
         assert_eq!(h.last_event_number(5), Some(11));
         h.forget(5);
         assert_eq!(h.last_event_number(5), None);
+    }
+
+    /// live report の番号が既知値より小さい = デバイスのイベントログが
+    /// 巻き戻った（再起動 / カウンタリセット）。片方向ラッチのままだと以後の
+    /// 再購読が満たされない EventMin を送り続けるので、記録も巻き戻す。
+    /// priming は最大値のまま（EventFilters 無視デバイス対策）。
+    #[test]
+    fn note_event_number_rewinds_only_for_live_reports() {
+        let h = SubHealth::new(None);
+        h.note_event_number(5, 100, false);
+        h.note_event_number(5, 5, false);
+        assert_eq!(h.last_event_number(5), Some(100), "priming は後退させない");
+        h.note_event_number(5, 5, true);
+        assert_eq!(
+            h.last_event_number(5),
+            Some(5),
+            "live の巻き戻りは記録も巻き戻す"
+        );
+        // 巻き戻した後も通常の最大値ラッチに戻る。
+        h.note_event_number(5, 6, true);
+        assert_eq!(h.last_event_number(5), Some(6));
     }
 
     /// イベント行だけを n 件集める（属性行は読み飛ばす）。
@@ -2795,6 +2840,41 @@ mod tests {
             "同一 ReportData の属性行とイベント行は同じ受信時刻"
         );
         assert_eq!(health.last_event_number(5), Some(31));
+    }
+
+    /// デバイスのイベントログが巻き戻った（再起動 / カウンタリセット）ときは、
+    /// live report の番号まで記録も戻す。戻さないと以後の再購読は永久に
+    /// 満たされない EventMin を送り続け、盲目窓の回収が matd 再起動まで死ぬ。
+    #[tokio::test(start_paused = true)]
+    async fn live_event_below_the_stored_number_rewinds_event_min() {
+        use mat_native::test_support::switch_press_event;
+
+        let est = FakeEstablisher::default();
+        // priming で 100 まで見た状態を作る。
+        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(100, 1)];
+        let live = Arc::clone(&est.sub_live);
+        let live_events = Arc::clone(&est.sub_live_events);
+        let (mut rx, health, _dir, _handles) = spawn_manager_with(est, None, EventScope::Wildcard);
+
+        let primed = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(primed[0].event_number, 100);
+        assert_eq!(health.last_event_number(5), Some(100));
+
+        // デバイスがログを巻き戻したあとの live イベント（番号 5）。
+        live.lock().unwrap().push_back(onoff_report(1, false));
+        live_events
+            .lock()
+            .unwrap()
+            .push_back(vec![switch_press_event(5, 1)]);
+
+        let live_line = collect_event_lines(&mut rx, 1).await;
+        assert_eq!(live_line[0].event_number, 5);
+        assert!(!live_line[0].priming);
+        assert_eq!(
+            health.last_event_number(5),
+            Some(5),
+            "live の巻き戻りは記録も巻き戻す（次の EventMin = 6）"
+        );
     }
 
     /// デバイスが EventFilters を無視してイベントログ全量を priming で返しても、

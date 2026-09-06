@@ -1253,11 +1253,12 @@ controller のコーデック / セッション API と仮想デバイス側の�
   隔離 matd、store コピー、`events = ["switch","booleanstate"]`、本番 19 ノード）**:
   全 19 ノードが ~2.5 分で established、全ノードが `EventRequests` を受理
   （`INVALID_ACTION` 無し）、接点センサーの実 `booleanstate` `state-change` が
-  `mat listen --event` に届いた（実測ライン、node_id は掲載可: `{"cluster":
-  "booleanstate","data":{"state-value":false},"device_time":{"system_ms":
-  577001426},"endpoint":1,"event":"state-change","event_number":590151,
-  "node_id":19,"priority":"info","timestamp":
-  "2026-09-07T00:37:33.672836671+09:00","priming":true}`）、旧 1.35.0 の
+  `mat listen --event` に届いた（実機が送った実測ライン。**node_id と
+  timestamp は本リポジトリが public なので仮値に置換**: `{"timestamp":
+  "2026-09-07T00:37:33+09:00","node_id":25,"endpoint":1,"cluster":
+  "booleanstate","event":"state-change","event_number":590151,"priority":
+  "info","data":{"state-value":false},"device_time":{"system_ms":577001426},
+  "priming":true}`）、旧 1.35.0 の
   `mat listen` クライアントは属性行を無改変のまま受け続けた、`--attribute` +
   `--event` は exit `2`。
   - **副次観測**: 同一ファブリックへの 2 つ目の controller セッション（このスモーク

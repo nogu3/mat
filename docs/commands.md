@@ -758,8 +758,12 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   `--event [<name>]` selects device-originated event lines instead of
   attribute-change lines (bare `--event` = every event name); `--attribute`
   and `--event` are mutually exclusive.
-- `--count` (default `1`) is how many events to receive before exiting `0`;
+- `--count` (default `1`) is how many lines to receive before exiting `0`;
   `0` means no count limit — keep streaming (symmetric with `--timeout-ms 0`).
+  **Both kinds of line count**: without `--attribute` / `--event` the stream
+  carries attribute-change lines *and* device-originated event lines, so a
+  default `mat listen --count 1` returns whichever arrives first. Pass
+  `--attribute` or `--event` when the count must be of one kind.
   `--timeout-ms` (default `60000`) cuts the wait short; `0` means wait
   forever. Reaching `--count` exits `0`; the timeout firing with **zero**
   events received exits `3` (with at least one event received, it still exits
@@ -809,13 +813,13 @@ mat listen [--node <id|alias>] [--endpoint <n>] [--cluster <name>] [--attribute 
   and now also see event lines mixed in, so a consumer written against the
   old attribute-only contract (e.g. casa) needs a one-line change: skip or
   branch on lines that have no `attribute` key. Three examples — the first
-  two are Generic Switch presses (spec shape), the third is a real
-  `booleanstate` `state-change` captured during the phase B real-device
-  smoke:
+  two are Generic Switch presses (spec shape), the third is a
+  `booleanstate` `state-change` a real device sent during the phase B
+  real-device smoke (node id and timestamp shown as example values):
   ```json
   {"timestamp":"2026-09-06T21:00:00+09:00","node_id":25,"endpoint":2,"cluster":"switch","event":"initial-press","event_number":1725600000123,"priority":"info","data":{"new-position":1},"priming":false}
   {"timestamp":"2026-09-06T21:00:01+09:00","node_id":25,"endpoint":2,"cluster":"switch","event":"multi-press-complete","event_number":1725600000130,"priority":"info","data":{"previous-position":1,"total-number-of-presses-counted":2},"priming":false}
-  {"cluster":"booleanstate","data":{"state-value":false},"device_time":{"system_ms":577001426},"endpoint":1,"event":"state-change","event_number":590151,"node_id":19,"priority":"info","timestamp":"2026-09-07T00:37:33.672836671+09:00","priming":true}
+  {"timestamp":"2026-09-07T00:37:33+09:00","node_id":25,"endpoint":1,"cluster":"booleanstate","event":"state-change","event_number":590151,"priority":"info","data":{"state-value":false},"device_time":{"system_ms":577001426},"priming":true}
   ```
   Keys: `timestamp` (receive time — same contract as attribute lines from the
   same ReportData), `node_id`, `endpoint`, `cluster` (name from
@@ -1280,6 +1284,15 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   ```
   The reverse direction is safe: an older `mat` against a new `matd` sends
   neither field and behaves exactly as before.
+- **Version skew: `mat listen --event` against an older `matd` (≤ 1.35.0).**
+  The event filter is a new key in the `listen` request, and an old daemon
+  ignores unknown keys — so `--event` is **silently dropped**: attribute lines
+  stream as before and `--count 1` returns an attribute line instead of an
+  event line (no error, exit `0`). There is no direct-path fallback for
+  `listen`, so the fix is to upgrade `matd` **before** `mat` — an older `mat`
+  against a new `matd` keeps working unchanged (it never sends the key).
+  Older daemons also never subscribe to `EventRequests` at all, so no event
+  line exists to receive in the first place.
 - node_id commissioning is re-checked by `matd` against the same credential store
   per request, so the error kinds and exit codes match the direct path.
 

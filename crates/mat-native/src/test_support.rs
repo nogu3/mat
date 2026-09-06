@@ -57,7 +57,7 @@ pub struct FakeSubConn {
     /// subscribe だけが失敗する経路（Issue #20: この場合も close が必要）を
     /// 再現するための軸 — `FakeEstablisher::fail_subscription`（establish
     /// 自体の失敗、CASE 未成立で close 不要）とは別物。
-    pub fail_wildcard: bool,
+    pub fail_subscribe: bool,
 }
 
 /// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
@@ -115,7 +115,7 @@ impl Default for FakeSubConn {
             seen_event_min: std::sync::Arc::default(),
             fail_next_report: std::sync::Arc::default(),
             close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
-            fail_wildcard: false,
+            fail_subscribe: false,
         }
     }
 }
@@ -149,7 +149,7 @@ impl crate::SubscribeConn for FakeSubConn {
         event_paths: &[mat_controller::im::EventPathIn],
         event_min: Option<u64>,
     ) -> Result<crate::SubscribeStart, MatError> {
-        if self.fail_wildcard {
+        if self.fail_subscribe {
             return Err(MatError::new(
                 ErrorKind::SessionFailed,
                 "fake subscribe failure",
@@ -491,9 +491,9 @@ pub struct FakeEstablisher {
     /// 側の close() 呼び出しをテストが establish 後から観測するための Arc —
     /// conn 自体は establish_subscription に渡ってしまい参照が残せない）。
     pub sub_close_calls: std::sync::Arc<AtomicUsize>,
-    /// 払い出す `FakeSubConn` の `subscribe_wildcard` を失敗させるか
+    /// 払い出す `FakeSubConn` の `subscribe` を失敗させるか
     /// （Issue #20: CASE 成立後に subscribe だけ失敗する経路の close 検証用）。
-    pub fail_wildcard: bool,
+    pub fail_subscribe: bool,
 }
 
 impl Default for FakeEstablisher {
@@ -514,7 +514,7 @@ impl Default for FakeEstablisher {
             establish_delay: None,
             conn_close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             sub_close_calls: std::sync::Arc::new(AtomicUsize::new(0)),
-            fail_wildcard: false,
+            fail_subscribe: false,
         }
     }
 }
@@ -553,7 +553,7 @@ impl Establisher for FakeEstablisher {
             priming_events: self.sub_priming_events.lock().unwrap().clone(),
             fail_next_report: std::sync::Arc::clone(&self.fail_next_report),
             close_calls: std::sync::Arc::clone(&self.sub_close_calls),
-            fail_wildcard: self.fail_wildcard,
+            fail_subscribe: self.fail_subscribe,
             ..Default::default()
         }))
     }
