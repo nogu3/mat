@@ -90,6 +90,7 @@ async fn start_matd_with_events(
         started: std::time::Instant::now(),
         iface: "lo".into(),
         fabric_index: 1,
+        reloads: matd::server::ReloadStats::default(),
     });
     let handle = tokio::spawn(async move {
         let _ = matd::server::serve(&socket_clone, store_path, native, tx2, health2, daemon).await;

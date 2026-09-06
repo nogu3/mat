@@ -112,7 +112,9 @@ backend maps its transport/IM outcomes to `3`/`4`/`5`/`6`, falling back to
   materials and adopting it (persisted to `mat/f/<idx>/ipk-epoch`). IPK
   rotation is `mat fabric rotate-ipk` (direct-only; pending / prev epochs
   live at `mat/f/<idx>/ipk-epoch-next` / `-prev`; the controller switches
-  only after every listed node holds both epochs).
+  only after every listed node holds both epochs). A running `matd` picks
+  the new IPK up via the `reload` admin op (`matd reload`; rotate-ipk sends
+  it on commit and reports `matd_reload`) — no restart.
 - `matd`-only ops vs direct-only ops: `discover` / `commission` / `unpair` /
   `fabric init` / `open-window` / `diag` / `group grant` / `group remove` /
   `fabric rotate-ipk` are never part of the `matd` socket protocol — they

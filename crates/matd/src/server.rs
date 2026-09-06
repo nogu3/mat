@@ -46,12 +46,45 @@ impl NativeState {
     }
 }
 
-/// 起動時に確定するデーモン基本情報（status op が返す）。
+/// `reload` の回数と最終時刻（`status` の `reloads`）。`&self` で更新できるよう
+/// Atomic + Mutex（`DaemonInfo` は `Arc` 共有）。
+#[derive(Default)]
+pub struct ReloadStats {
+    count: std::sync::atomic::AtomicU64,
+    last_at: std::sync::Mutex<Option<String>>,
+}
+
+impl ReloadStats {
+    /// 成功 1 回を記録し、この回を含む累計を返す。
+    pub fn record(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        *self
+            .last_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now_iso8601());
+        n
+    }
+
+    /// `status` 用 snapshot: `{"count": N, "last_at": "<ISO 8601>" | null}`。
+    pub fn snapshot(&self) -> Value {
+        use std::sync::atomic::Ordering;
+        let last_at = self
+            .last_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        json!({ "count": self.count.load(Ordering::SeqCst), "last_at": last_at })
+    }
+}
+
+/// `status` が返すデーモン基本情報（起動時に確定する値 + reload 統計）。
 pub struct DaemonInfo {
     pub version: &'static str,
     pub started: std::time::Instant,
     pub iface: String,
     pub fabric_index: u8,
+    pub reloads: ReloadStats,
 }
 
 /// ソケットを bind し、接続を受け付け続ける。`Ctrl-C` で抜ける。
@@ -546,6 +579,9 @@ async fn dispatch(
             );
             Ok(json!({ "resubscribing": true }))
         }
+        // 確立器の資格情報を差し替えるだけ（warm session / 購読 / per-node
+        // Mutex には触れない）。失敗時はメモリも回数も変えない。
+        Op::Reload => reload_body(native, daemon),
         _ => run_op(&req.op, native, store_path, health, deadline).await,
     };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -841,7 +877,12 @@ pub(crate) fn to_device_op(op: &Op) -> Result<MatdOp, MatError> {
             },
         }),
         Op::GroupBump => MatdOp::Bump,
-        Op::Listen { .. } | Op::Ping | Op::Status | Op::Shutdown | Op::NodeTouched { .. } => {
+        Op::Listen { .. }
+        | Op::Ping
+        | Op::Status
+        | Op::Shutdown
+        | Op::NodeTouched { .. }
+        | Op::Reload => {
             return Err(MatError::parse_error(
                 "internal: non-device op reached to_device_op (dispatch invariant violated)",
             ))
@@ -917,7 +958,8 @@ fn op_state_target(op: &Op) -> Option<(u64, u16)> {
         | Op::Ping
         | Op::Status
         | Op::Shutdown
-        | Op::NodeTouched { .. } => None,
+        | Op::NodeTouched { .. }
+        | Op::Reload => None,
     }
 }
 
@@ -944,6 +986,28 @@ pub(crate) fn note_op_expectation(op: &Op, health: &SubHealth) {
 fn require_node(store_path: &Path, node_id: u64) -> Result<(), MatError> {
     Store::open(store_path)?.require_node(node_id)?;
     Ok(())
+}
+
+/// `reload`: 確立器へ KVS の資格情報（IPK を含む）を読み直させ、成功なら回数を
+/// 進める。`Unavailable`（起動時の構築失敗）は他 op と同じくそのエラーを返す —
+/// reload での復帰はスコープ外（restart が唯一の復帰手段）。
+fn reload_body(native: &NativeState, daemon: &DaemonInfo) -> Result<Value, MatError> {
+    let backend = match native {
+        NativeState::Ready(b) => b,
+        NativeState::Unavailable(e) => return Err(e.clone()),
+    };
+    let changed = backend.engine().reload_credentials()?;
+    let count = daemon.reloads.record();
+    tracing::info!(
+        ipk_changed = changed,
+        reload_count = count,
+        "credentials reloaded from kvs"
+    );
+    Ok(json!({
+        "reloaded": true,
+        "ipk": if changed { "changed" } else { "unchanged" },
+        "reload_count": count,
+    }))
 }
 
 /// `status` op の応答ボディ（timestamp / id は dispatch が付ける）。
@@ -976,6 +1040,7 @@ fn status_body(
         "fabric_index": daemon.fabric_index,
         "store": store_path.display().to_string(),
         "subscribed_clusters": clusters,
+        "reloads": daemon.reloads.snapshot(),
         "listen_clients": events.receiver_count(),
         "nodes": health.status_nodes(),
     })
@@ -1005,12 +1070,7 @@ mod tests {
         let (_dir, store_path) = make_store();
         let state = NativeState::Unavailable(MatError::store_missing("no KVS materials"));
         let health = SubHealth::new(Some(vec![0x0006]));
-        let daemon = DaemonInfo {
-            version: "test",
-            started: std::time::Instant::now(),
-            iface: "lo".into(),
-            fabric_index: 2,
-        };
+        let daemon = test_daemon();
         let (events, rx) = tokio::sync::broadcast::channel::<crate::subscription::Event>(8);
         drop(rx);
 
@@ -1037,6 +1097,155 @@ mod tests {
         assert!(body["nodes"].as_array().unwrap().is_empty());
         assert!(body["uptime_s"].is_u64());
         assert!(body["timestamp"].is_string());
+    }
+
+    fn test_daemon() -> DaemonInfo {
+        DaemonInfo {
+            version: "test",
+            started: std::time::Instant::now(),
+            iface: "lo".into(),
+            fabric_index: 2,
+            reloads: ReloadStats::default(),
+        }
+    }
+
+    /// reload に成功する確立器（Task 1 の既定実装を上書き）。establish は使わない。
+    struct ReloadOkEstablisher {
+        changed: bool,
+    }
+    #[async_trait::async_trait]
+    impl mat_native::Establisher for ReloadOkEstablisher {
+        async fn establish(
+            &self,
+            _node_id: u64,
+        ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
+            Err(MatError::new(ErrorKind::Other, "not used"))
+        }
+        fn reload_credentials(&self) -> Result<bool, MatError> {
+            Ok(self.changed)
+        }
+    }
+
+    /// reload 成功: 応答形・回数・status への反映。
+    #[tokio::test]
+    async fn dispatch_reload_swaps_credentials_and_counts() {
+        let (_dir, store_path) = make_store();
+        let native =
+            NativeBackend::with_establisher(Box::new(ReloadOkEstablisher { changed: true }));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
+        let daemon = test_daemon();
+        let (events, rx) = tokio::sync::broadcast::channel::<crate::subscription::Event>(8);
+        drop(rx);
+
+        let (body, is_shutdown) = dispatch(
+            r#"{"op":"reload","id":9}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert!(!is_shutdown);
+        assert_eq!(body["id"], 9);
+        assert_eq!(body["reloaded"], true);
+        assert_eq!(body["ipk"], "changed");
+        assert_eq!(body["reload_count"], 1);
+        assert!(body["timestamp"].is_string());
+
+        let (status, _) = dispatch(
+            r#"{"op":"status"}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert_eq!(status["reloads"]["count"], 1);
+        assert!(status["reloads"]["last_at"].is_string());
+
+        // 2 回目は IPK が動かなかった確立器で: `ipk` は unchanged に写り、
+        // それでも reload 自体は成功なので回数は進む。
+        let unchanged = NativeState::Ready(Box::new(NativeBackend::with_establisher(Box::new(
+            ReloadOkEstablisher { changed: false },
+        ))));
+        let (body, _) = dispatch(
+            r#"{"op":"reload"}"#,
+            &unchanged,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert_eq!(body["reloaded"], true);
+        assert_eq!(body["ipk"], "unchanged");
+        assert_eq!(body["reload_count"], 2);
+    }
+
+    /// 確立器が reload 非対応（既定実装）→ other、回数は進まず status も未 reload。
+    #[tokio::test]
+    async fn dispatch_reload_unsupported_establisher_is_other_and_not_counted() {
+        use crate::native::test_support::FakeEstablisher;
+        let (_dir, store_path) = make_store();
+        let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+        let state = NativeState::Ready(Box::new(native));
+        let health = SubHealth::new(None);
+        let daemon = test_daemon();
+        let (events, rx) = tokio::sync::broadcast::channel::<crate::subscription::Event>(8);
+        drop(rx);
+
+        let (body, _) = dispatch(
+            r#"{"op":"reload"}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "other");
+        assert!(body["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not supported"));
+
+        let (status, _) = dispatch(
+            r#"{"op":"status"}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert_eq!(status["reloads"]["count"], 0);
+        assert!(status["reloads"]["last_at"].is_null());
+    }
+
+    /// native が起動時 Unavailable → そのエラーをそのまま返す（他 op と同じ規律）。
+    #[tokio::test]
+    async fn dispatch_reload_reports_native_unavailable() {
+        let (_dir, store_path) = make_store();
+        let state = NativeState::Unavailable(MatError::store_missing("no KVS materials"));
+        let health = SubHealth::new(None);
+        let daemon = test_daemon();
+        let (events, rx) = tokio::sync::broadcast::channel::<crate::subscription::Event>(8);
+        drop(rx);
+
+        let (body, _) = dispatch(
+            r#"{"op":"reload"}"#,
+            &state,
+            &store_path,
+            &health,
+            &daemon,
+            &events,
+        )
+        .await;
+        assert_eq!(body["error"]["kind"], "store_missing");
+        assert_eq!(body["error"]["detail"], "no KVS materials");
     }
 
     #[test]
@@ -1348,6 +1557,7 @@ mod tests {
             Op::Status,
             Op::Shutdown,
             Op::NodeTouched { node_id: 1 },
+            Op::Reload,
             Op::Listen {
                 node_id: None,
                 endpoint: None,

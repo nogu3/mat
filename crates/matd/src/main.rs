@@ -68,6 +68,9 @@ enum Command {
     Stop,
     /// 稼働中 matd の購読とデーモンの現況を JSON で返す（socket 経由）。
     Status,
+    /// 稼働中 matd に KVS の資格情報（IPK）を読み直させる（socket 経由、
+    /// `mat fabric rotate-ipk` の後に。warm session と購読はそのまま）。
+    Reload,
 }
 
 fn main() {
@@ -120,6 +123,7 @@ async fn run(cli: Cli) -> Result<(), MatError> {
     match cli.command {
         Some(Command::Stop) => admin_op(cli.socket, "shutdown").await,
         Some(Command::Status) => admin_op(cli.socket, "status").await,
+        Some(Command::Reload) => admin_op(cli.socket, "reload").await,
         None => serve_daemon(cli).await,
     }
 }
@@ -288,20 +292,53 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         started: std::time::Instant::now(),
         iface: iface.clone(),
         fabric_index: cli.fabric_index,
+        reloads: server::ReloadStats::default(),
     });
     server::serve(&socket, store_path, native, events_tx, sub_health, daemon)
         .await
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
 
-/// stop / status: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
-/// stdout へ出す。居なければ「not running」で exit 1。
+/// stop / status / reload: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
+/// stdout へ出す。居なければ「not running」で exit 1。matd がエラー応答を返した
+/// ときは stdout に出さず、その kind の exit code で終わる（`reload` は identity
+/// 不一致・store_missing・native Unavailable で実際にエラーを返す op）。
 async fn admin_op(socket: Option<PathBuf>, op: &str) -> Result<(), MatError> {
     let socket = socket.unwrap_or_else(mat_core::socket::default_socket_path);
     let resp = send_admin_op(&socket, op).await?;
-    // 成功応答は stdout（純粋 JSON）。
-    println!("{resp}");
+    // 成功応答だけが stdout（純粋 JSON）。
+    println!("{}", admin_response_to_result(resp)?);
     Ok(())
+}
+
+/// admin op の応答 JSON を CLI の結果へ写す。`{"error":{"kind","detail"}}` は
+/// `MatError` にして返し（stdout ではなく stderr + kind の exit code へ回す）、
+/// それ以外はそのまま通す。`mat` 側の [`matd_client::emit_response`] と同じ規律
+/// （未知 kind は warn して `other` = exit 1）。
+fn admin_response_to_result(resp: Value) -> Result<Value, MatError> {
+    let Some(err) = resp.get("error") else {
+        return Ok(resp);
+    };
+    let kind = match err
+        .get("kind")
+        .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
+    {
+        Some(k) => k,
+        None => {
+            let raw_kind = err.get("kind").cloned().unwrap_or(Value::Null);
+            tracing::warn!(
+                kind = %raw_kind,
+                "unknown error kind from matd; mapping to `other` for the exit code"
+            );
+            ErrorKind::Other
+        }
+    };
+    let detail = err
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("matd returned an error without a detail: {resp}"));
+    Err(MatError::new(kind, detail))
 }
 
 /// socket に `{"op":"<op>"}` を送り応答 1 行を読む。接続不能は「not running」
@@ -342,4 +379,47 @@ async fn send_admin_op(socket: &Path, op: &str) -> Result<Value, MatError> {
         })?;
     serde_json::from_str(&line)
         .map_err(|e| MatError::parse_error(format!("matd response was not JSON: {e}; body={line}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 成功応答はそのまま素通し（stdout に出る JSON）。
+    #[test]
+    fn admin_response_success_passes_through() {
+        let resp = json!({"reloaded": true, "ipk": "changed", "reload_count": 1});
+        let out = admin_response_to_result(resp.clone()).expect("success body");
+        assert_eq!(out, resp);
+    }
+
+    /// `{"error":{...}}` は Err に写す（main が stderr + kind の exit code へ回す）。
+    #[test]
+    fn admin_response_error_maps_to_mat_error_with_kind() {
+        let resp = json!({"error": {"kind": "store_missing", "detail": "no KVS materials"}});
+        let err = admin_response_to_result(resp).expect_err("error body");
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        assert_eq!(err.detail, "no KVS materials");
+        assert_eq!(err.kind.exit_code(), 10);
+    }
+
+    /// 未知の kind（新しい matd / 壊れた応答）は other = exit 1 へ倒す。
+    #[test]
+    fn admin_response_unknown_kind_falls_back_to_other() {
+        let resp = json!({"error": {"kind": "not_a_kind_we_know", "detail": "??"}});
+        let err = admin_response_to_result(resp).expect_err("error body");
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert_eq!(err.detail, "??");
+        assert_eq!(err.kind.exit_code(), 1);
+    }
+
+    /// detail 欠落でも panic せず、何が起きたか分かる detail を作る。
+    #[test]
+    fn admin_response_error_without_detail_is_still_an_error() {
+        let resp = json!({"error": {"kind": "other"}});
+        let err = admin_response_to_result(resp).expect_err("error body");
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(!err.detail.is_empty(), "detail should never be empty");
+    }
 }

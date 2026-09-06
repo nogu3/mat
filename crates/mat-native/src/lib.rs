@@ -230,6 +230,16 @@ pub trait Establisher: Send + Sync {
             "subscription not supported by this establisher",
         ))
     }
+    /// 資格情報を KVS から読み直して差し替える（IPK ローテーション後の
+    /// `matd reload`）。戻り値は `ipk_operational` が変わったか。既定は非対応 —
+    /// 実確立器（CaseEstablisher）だけが上書きする。同期メソッド（I/O は
+    /// KVS の 1 回読みだけ、ネットワークには触れない）。
+    fn reload_credentials(&self) -> Result<bool, MatError> {
+        Err(MatError::new(
+            ErrorKind::Other,
+            "credential reload not supported by this establisher",
+        ))
+    }
 }
 
 /// native エンジン: 確立器 + （任意の）group 送信コンテキスト。
@@ -412,9 +422,10 @@ pub fn case_establisher(
         )
     })?;
     Ok(Box::new(CaseEstablisher {
-        creds: Arc::new(creds),
+        creds: std::sync::RwLock::new(Arc::new(creds)),
         scope_id,
         resolver,
+        cfg: cfg.clone(),
     }))
 }
 
@@ -525,14 +536,71 @@ impl Engine {
             group_settings: None,
         }
     }
+
+    /// 資格情報（IPK を含む）を KVS から読み直して確立器へ差し替える
+    /// （`matd reload`）。既存 session には触れない — 次の確立から効く。
+    /// 戻り値は `ipk_operational` が変わったか。
+    pub fn reload_credentials(&self) -> Result<bool, MatError> {
+        self.establisher.reload_credentials()
+    }
 }
 
 /// 実確立器: 保持した資格情報で mDNS 解決 → CASE。op セッションのソケットは
 /// ノードごとに専用（監査#3）— 共有ソケットは group multicast 送信のみ。
+/// `creds` は `reload_credentials` で丸ごと差し替わる（`RwLock<Arc<_>>`: 読み手
+/// は Arc をクローンして走るので、進行中の確立は旧資格情報で完走し、次の確立
+/// から新しい方を使う）。`cfg` は差し替え時に KVS を読み直すための起動設定。
 struct CaseEstablisher {
-    creds: Arc<FabricCredentials>,
+    creds: std::sync::RwLock<Arc<FabricCredentials>>,
     scope_id: u32,
     resolver: Arc<dyn Resolver>,
+    cfg: NativeConfig,
+}
+
+impl CaseEstablisher {
+    /// 現在の資格情報（Arc クローン）。poison は中身をそのまま使う
+    /// （SubHealth と同じ規律 — panic 中のスレッドが壊せる不変条件は無い）。
+    fn creds(&self) -> Arc<FabricCredentials> {
+        Arc::clone(
+            &self
+                .creds
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// 資格情報を差し替え、`ipk_operational` が変わったかを返す。
+    /// IPK が同じでも `FabricCredentials` は丸ごと入れ替わる（新しく自己発行
+    /// した運用鍵 + NOC になる）。mat はセッションを resume しない（毎回
+    /// CASE を張り直す）ので、これは無害。
+    fn swap_credentials(&self, fresh: FabricCredentials) -> bool {
+        let mut slot = self
+            .creds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = slot.ipk_operational != fresh.ipk_operational;
+        *slot = Arc::new(fresh);
+        changed
+    }
+}
+
+/// reload の identity 照合: fabric_id / node_id / root 公開鍵が起動時と違う
+/// store は「別の fabric」なので reload では受けず restart を案内する（warm
+/// session・購読・CFID がすべて別物になるため）。
+pub(crate) fn check_identity(
+    current: &FabricCredentials,
+    fresh: &FabricCredentials,
+) -> Result<(), MatError> {
+    if current.fabric_id != fresh.fabric_id
+        || current.node_id != fresh.node_id
+        || current.root_public_key != fresh.root_public_key
+    {
+        return Err(MatError::new(
+            ErrorKind::Other,
+            "fabric identity changed (fabric_id/node_id/root key) since start-up; restart matd",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -542,7 +610,8 @@ impl Establisher for CaseEstablisher {
         // recv して screen で捨てる（監査#3）。試行ごとの専用 UdpTransport の
         // bind と候補アドレスの staggered race（Happy Eyeballs）は
         // `case::establish_any` が一括して行う。
-        let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
+        let creds = self.creds();
+        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
         let resolved = self
             .resolver
             .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
@@ -550,7 +619,7 @@ impl Establisher for CaseEstablisher {
             .map_err(|e| map_resolve_err(node_id, e))?;
         let mrp = resolved.mrp_config();
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &self.creds, node_id, &mrp, case::RACE_STAGGER)
+        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
             .await
             .map_err(|e| map_establish_err(node_id, EstablishRole::Op, e))?;
         // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
@@ -574,7 +643,8 @@ impl Establisher for CaseEstablisher {
         // 購読専用ソケット: op 用の transport と recv を奪い合わないよう、
         // ノードごとに専用 UdpTransport + 専用 CASE（spec 構造判断）。bind と
         // 候補レースは op 側と同じく `case::establish_any`。
-        let cfid = compressed_fabric_id(&self.creds.root_public_key, self.creds.fabric_id);
+        let creds = self.creds();
+        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
         let resolved = self
             .resolver
             .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
@@ -582,7 +652,7 @@ impl Establisher for CaseEstablisher {
             .map_err(|e| map_resolve_err(node_id, e))?;
         let mrp = resolved.mrp_config();
         let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &self.creds, node_id, &mrp, case::RACE_STAGGER)
+        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
             .await
             .map_err(|e| map_establish_err(node_id, EstablishRole::Subscription, e))?;
         tracing::info!(
@@ -595,6 +665,12 @@ impl Establisher for CaseEstablisher {
             session: est.session,
             mrp,
         }))
+    }
+
+    fn reload_credentials(&self) -> Result<bool, MatError> {
+        let fresh = load_fabric_credentials(&self.cfg)?;
+        check_identity(&self.creds(), &fresh)?;
+        Ok(self.swap_credentials(fresh))
     }
 }
 
@@ -1462,6 +1538,208 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[test]
+    fn establisher_reload_is_unsupported_by_default() {
+        use crate::test_support::FakeEstablisher;
+        let engine = Engine::with_parts(Box::new(FakeEstablisher::default()), None);
+        let err = engine.reload_credentials().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(
+            err.detail.contains("not supported"),
+            "detail={}",
+            err.detail
+        );
+    }
+
+    #[test]
+    fn check_identity_accepts_same_fabric_and_rejects_changes() {
+        let a = fake_creds([0xCC; 16], 0x1234, 0x1B669, [0xAA; 65]);
+        // 同じ identity、IPK だけ違う = OK（ローテーション後の姿）。
+        let b = fake_creds([0xDD; 16], 0x1234, 0x1B669, [0xAA; 65]);
+        check_identity(&a, &b).expect("ipk change alone is fine");
+        // fabric_id / node_id / root 公開鍵のどれが変わっても other で拒否。
+        for (label, other) in [
+            (
+                "fabric_id",
+                fake_creds([0xCC; 16], 0x9999, 0x1B669, [0xAA; 65]),
+            ),
+            ("node_id", fake_creds([0xCC; 16], 0x1234, 0x77, [0xAA; 65])),
+            (
+                "root key",
+                fake_creds([0xCC; 16], 0x1234, 0x1B669, [0xAB; 65]),
+            ),
+        ] {
+            let err = check_identity(&a, &other).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Other, "{label}");
+            assert!(
+                err.detail.contains("restart matd"),
+                "{label}: {}",
+                err.detail
+            );
+        }
+    }
+
+    /// テスト用: 証明書無しの `FabricCredentials`（identity 照合と swap だけに使う）。
+    fn fake_creds(
+        ipk: [u8; 16],
+        fabric_id: u64,
+        node_id: u64,
+        root_public_key: [u8; 65],
+    ) -> FabricCredentials {
+        FabricCredentials {
+            rcac_tlv: Vec::new(),
+            icac_tlv: None,
+            noc_tlv: Vec::new(),
+            op_public_key: [0u8; 65],
+            op_private_key: [0u8; 32],
+            ipk_operational: ipk,
+            node_id,
+            fabric_id,
+            root_public_key,
+        }
+    }
+
+    #[test]
+    fn case_establisher_swap_reports_ipk_change() {
+        let est = CaseEstablisher {
+            creds: std::sync::RwLock::new(Arc::new(fake_creds([0xCC; 16], 1, 2, [0xAA; 65]))),
+            scope_id: 0,
+            resolver: Arc::new(OneShotResolver),
+            cfg: NativeConfig {
+                store: std::path::PathBuf::from("/nonexistent"),
+                iface: "lo".into(),
+                thread_iface: None,
+                fabric_index: 1,
+                issuer_index: 0,
+            },
+        };
+        // 同じ IPK → false、違う IPK → true、その後は新しい値が見える。
+        assert!(!est.swap_credentials(fake_creds([0xCC; 16], 1, 2, [0xAA; 65])));
+        assert!(est.swap_credentials(fake_creds([0xDD; 16], 1, 2, [0xAA; 65])));
+        assert_eq!(est.creds().ipk_operational, [0xDD; 16]);
+    }
+
+    /// KVS が無い store で reload すると store_missing（`load_fabric_credentials`
+    /// と同じ写像）。swap は起きない。
+    #[test]
+    fn case_establisher_reload_maps_missing_store_to_store_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let est = CaseEstablisher {
+            creds: std::sync::RwLock::new(Arc::new(fake_creds([0xCC; 16], 1, 2, [0xAA; 65]))),
+            scope_id: 0,
+            resolver: Arc::new(OneShotResolver),
+            cfg: NativeConfig {
+                store: dir.path().to_path_buf(),
+                iface: "lo".into(),
+                thread_iface: None,
+                fabric_index: 1,
+                issuer_index: 0,
+            },
+        };
+        let err = est.reload_credentials().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        assert_eq!(est.creds().ipk_operational, [0xCC; 16]);
+    }
+
+    /// 実 KVS のフィクスチャ: 新しい fabric を bootstrap した store（chip-tool
+    /// INI 互換の alpha + main）と、それを指す `NativeConfig`。TempDir は
+    /// 呼び手が生かし続ける（drop でストアごと消える）。
+    fn bootstrapped_store(fabric_id: u64, node_id: u64) -> (tempfile::TempDir, NativeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let fab = mat_controller::commissioning::CommissioningFabric::generate(fabric_id, node_id)
+            .unwrap();
+        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
+        let cfg = NativeConfig {
+            store: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        (dir, cfg)
+    }
+
+    /// `case_establisher` と同じ形の確立器を、iface 解決を挟まずに組む
+    /// （テストに実 iface は要らない — reload は KVS しか触らない）。
+    fn establisher_over_store(
+        creds_cfg: &NativeConfig,
+        reload_cfg: &NativeConfig,
+    ) -> CaseEstablisher {
+        let creds = load_fabric_credentials(creds_cfg).expect("bootstrapped store loads");
+        CaseEstablisher {
+            creds: std::sync::RwLock::new(Arc::new(creds)),
+            scope_id: 0,
+            resolver: Arc::new(OneShotResolver),
+            cfg: reload_cfg.clone(),
+        }
+    }
+
+    /// (a) ストアが変わっていなければ reload は `Ok(false)`、IPK も据え置き。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_is_false_when_unchanged() {
+        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
+        let est = establisher_over_store(&cfg, &cfg);
+        let before = est.creds().ipk_operational;
+        assert!(
+            !est.reload_credentials()
+                .expect("reload over an intact store"),
+            "unchanged store must report ipk unchanged"
+        );
+        assert_eq!(est.creds().ipk_operational, before);
+    }
+
+    /// (b) `f/<idx>/k/0` を別 epoch で書き換える（rotate-ipk の commit と同じ
+    /// 経路）と reload は `Ok(true)`、新 epoch の運用鍵が入る。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_picks_up_a_rotated_ipk() {
+        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
+        let est = establisher_over_store(&cfg, &cfg);
+        let before = est.creds();
+        let cfid = compressed_fabric_id(&before.root_public_key, before.fabric_id);
+        let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
+        let cur = mat_controller::kvs::read_mat_ipk_epoch(&main_ini, cfg.fabric_index)
+            .unwrap()
+            .expect("bootstrap persists the current epoch");
+        let next = [0x5A; 16];
+        assert_ne!(cur, next, "the fixture epoch must differ from the new one");
+        mat_controller::group_settings::begin_ipk_rotation(&main_ini, cfg.fabric_index, &next)
+            .unwrap();
+        mat_controller::group_settings::commit_ipk_rotation(
+            &main_ini,
+            cfg.fabric_index,
+            &cfid,
+            &cur,
+            &next,
+        )
+        .unwrap();
+
+        assert!(
+            est.reload_credentials().expect("reload after a commit"),
+            "a rotated IPK must report changed"
+        );
+        assert_eq!(
+            est.creds().ipk_operational,
+            mat_controller::fabric::derive_ipk_operational(&next, &cfid),
+            "the new epoch's operational key must be installed"
+        );
+    }
+
+    /// (c) 別 fabric の store を指した reload は `other` で拒否され、資格情報は
+    /// 一切差し替わらない（restart 案内）。
+    #[test]
+    fn case_establisher_reload_over_real_kvs_rejects_a_different_fabric() {
+        let (_dir_a, cfg_a) = bootstrapped_store(0x1234, 112233);
+        let (_dir_b, cfg_b) = bootstrapped_store(0x9999, 112233);
+        // 起動時の資格情報は A、reload が読むのは B（= 取り違えた store）。
+        let est = establisher_over_store(&cfg_a, &cfg_b);
+        let before = est.creds().ipk_operational;
+
+        let err = est.reload_credentials().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("restart matd"), "detail={}", err.detail);
+        assert_eq!(est.creds().ipk_operational, before, "no swap on rejection");
+    }
 }
 
 #[cfg(test)]
@@ -1541,12 +1819,19 @@ mod dedicated_op_socket_tests {
         };
         let creds = FabricCredentials::from_self_issued(materials).expect("creds");
         let est = CaseEstablisher {
-            creds: Arc::new(creds),
+            creds: std::sync::RwLock::new(Arc::new(creds)),
             scope_id: 0,
             resolver: Arc::new(FixedPortResolver {
                 ports,
                 next: AtomicUsize::new(0),
             }),
+            cfg: NativeConfig {
+                store: std::path::PathBuf::from("/nonexistent"),
+                iface: "lo".into(),
+                thread_iface: None,
+                fabric_index: 1,
+                issuer_index: 0,
+            },
         };
 
         let (a, b) = tokio::join!(
@@ -1567,5 +1852,80 @@ mod dedicated_op_socket_tests {
             sb.port(),
             "op sockets must be dedicated per establish (audit #3)"
         );
+    }
+
+    /// reload の釘打ち: 間違った IPK で建てた確立器は CASE に失敗し、正しい
+    /// 資格情報へ swap した直後の establish は成功する（進行中セッション無し
+    /// の最小形 — swap が「次の確立から効く」ことを実 CASE で確認する）。
+    #[tokio::test]
+    async fn swapped_credentials_are_used_by_the_next_establish() {
+        let noc = MatterCert::parse(case_ts::NODE01_NOC).expect("parse fixture NOC");
+        let responder_node_id = noc.node_id().expect("node id");
+        let fabric_id = noc.fabric_id().expect("fabric id");
+        let op_priv: [u8; 32] = case_ts::NODE01_PRIV.try_into().unwrap();
+
+        // 応答器 2 つ（1 回目の失敗で 1 つ目が終わっても 2 回目が着く先を持つ）。
+        let mut handles = Vec::new();
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let t = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap();
+            ports.push(t.local_addr().unwrap().port());
+            handles.push(tokio::spawn(case_ts::responder_task(
+                t,
+                case_ts::INITIATOR_NODE_ID,
+                responder_node_id,
+                case_ts::NODE01_NOC.to_vec(),
+                case_ts::ICA01.to_vec(),
+                op_priv,
+                case_ts::ROOT01_CHIP.to_vec(),
+            )));
+        }
+
+        let materials = |ipk: [u8; 16]| SelfIssueMaterials {
+            rcac: case_ts::ROOT01_CHIP.to_vec(),
+            root_private_key: case_ts::ROOT01_PRIV.try_into().unwrap(),
+            ipk_operational: ipk,
+            node_id: case_ts::INITIATOR_NODE_ID,
+            fabric_id,
+        };
+        let wrong = FabricCredentials::from_self_issued(materials([0xDD; 16])).expect("creds");
+        let right = FabricCredentials::from_self_issued(materials(case_ts::IPK)).expect("creds");
+        let est = CaseEstablisher {
+            creds: std::sync::RwLock::new(Arc::new(wrong)),
+            scope_id: 0,
+            resolver: Arc::new(FixedPortResolver {
+                ports,
+                next: AtomicUsize::new(0),
+            }),
+            cfg: NativeConfig {
+                store: std::path::PathBuf::from("/nonexistent"),
+                iface: "lo".into(),
+                thread_iface: None,
+                fabric_index: 1,
+                issuer_index: 0,
+            },
+        };
+
+        // `expect_err` は `Box<dyn NodeConn>: Debug` を要求してしまう（未実装）
+        // ので、既存の `fake_sub_conn_next_report_fails_when_injected_after_establish`
+        // と同じ match で取り出す。
+        let err = match est.establish(responder_node_id).await {
+            Err(e) => e,
+            Ok(_) => panic!("wrong IPK must not establish"),
+        };
+        assert_eq!(err.kind, ErrorKind::SessionFailed, "detail={}", err.detail);
+
+        assert!(est.swap_credentials(right), "IPK differs → changed");
+        let mut conn = est
+            .establish(responder_node_id)
+            .await
+            .expect("establish with the swapped credentials");
+        assert!(!conn.read_onoff(1).await.expect("read after swap"));
+
+        for h in handles {
+            h.abort();
+        }
     }
 }

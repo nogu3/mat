@@ -6,13 +6,15 @@
 
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use mat_controller::commissioning::CommissioningFabric;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
-use mat_native::rotate_ipk::{self, RotateIpkParams, RotateMode};
+use mat_native::rotate_ipk::{self, RotateIpkParams, RotateMode, RotateStatus};
 use mat_native::NativeConfig;
+
+use crate::matd_client::MatdReload;
 
 /// 初回 fabric bootstrap: root CA + ランダム epoch IPK を生成し、chip-tool
 /// INI 互換 KVS を新規作成する。store ディレクトリが無ければ作る（init は
@@ -167,9 +169,60 @@ pub fn run_rotate_ipk(
         nodes = outcome.nodes.len(),
         "fabric rotate-ipk executed"
     );
-    output::emit(outcome.body(cfg.fabric_index));
+    let mut body = outcome.body(cfg.fabric_index);
+    attach_matd_reload(&mut body, &outcome.status, crate::matd_client::hint_reload);
+    output::emit(body);
     match outcome.partial_error() {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// commit（`rotated`）のときだけ稼働中 matd へ reload を頼み、結果を body の
+/// `matd_reload` に載せる。pending / catch-up / abort / idle は controller 側の
+/// 現行 epoch が変わらないので撃たない。`hint` は差し替え可能（テスト用）。
+fn attach_matd_reload(body: &mut Value, status: &RotateStatus, hint: impl FnOnce() -> MatdReload) {
+    if matches!(status, RotateStatus::Rotated) {
+        body["matd_reload"] = json!(hint().as_str());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_matd_reload_only_after_commit() {
+        use crate::matd_client::MatdReload;
+        use mat_native::rotate_ipk::RotateStatus;
+        use std::cell::Cell;
+
+        // rotated: hint が 1 回呼ばれ、結果が body に載る。
+        let called = Cell::new(0);
+        let mut body = json!({ "status": "rotated" });
+        attach_matd_reload(&mut body, &RotateStatus::Rotated, || {
+            called.set(called.get() + 1);
+            MatdReload::Reloaded
+        });
+        assert_eq!(called.get(), 1);
+        assert_eq!(body["matd_reload"], "reloaded");
+
+        // controller 側 epoch が変わらない結果では撃たない・載せない。
+        for status in [
+            RotateStatus::Pending,
+            RotateStatus::CaughtUp,
+            RotateStatus::CatchUpIncomplete,
+            RotateStatus::Aborted,
+            RotateStatus::Idle,
+        ] {
+            let called = Cell::new(0);
+            let mut body = json!({ "status": status.as_str() });
+            attach_matd_reload(&mut body, &status, || {
+                called.set(called.get() + 1);
+                MatdReload::Reloaded
+            });
+            assert_eq!(called.get(), 0, "{}", status.as_str());
+            assert!(body.get("matd_reload").is_none(), "{}", status.as_str());
+        }
     }
 }
