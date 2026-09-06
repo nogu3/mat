@@ -1178,6 +1178,10 @@ mat 系だけで扱えるようにすること（脱 HA の一段）。オート
   Generic Switch（momentary MS|MSR|MSL|MSM、bridged kind `switch`）と Boolean State
   （kind `contact-sensor`）。報告規則は urgent = min-interval レジーム（最小間隔が来たら送る）、
   non-urgent = 次の報告に相乗り。priming は EventFilters の EventMin を尊重する。
+  dirty / keep-alive 報告は従来どおり 1 メッセージ（分割しない）で、イベントは
+  `REPORT_CHUNK_BUDGET`（900 B、Switch のイベント約 20 件）に収まる古い順の接頭辞だけ載せ、
+  `next_event` は実送信分だけ進める（残りは `pending_urgent` のまま次の min-interval で続く —
+  最終レビューで「64 件が 1 通に乗って送信失敗 → 購読落ち」を潰した是正）。
 - **`matv`**: `--stdin-control` — stdin の JSON 1 行 = 刺激 1 件（成功は stdout の JSON 行、
   失敗は stderr の error 行）。フェーズ B の e2e とデモの入口。
 - **互換境界（matd を触らないための約束、spec §3.4）**: `ReportDataMessage` にフィールドを
