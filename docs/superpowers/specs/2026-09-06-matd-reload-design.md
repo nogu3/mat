@@ -160,18 +160,19 @@ fn reload_credentials(&self, _creds: FabricCredentials) -> Result<bool, MatError
   比較結果を返す。lock poison は `unwrap_or_else(PoisonError::into_inner)`
   （SubHealth の poison 耐性化と同じ規律）。
 
-### 4.3 `Engine::reload_credentials(&self, cfg: &NativeConfig) -> Result<bool, MatError>`
+### 4.3 `Engine::reload_credentials(&self) -> Result<bool, MatError>`
 
-1. `load_fabric_credentials(cfg)`（既存。KVS 読みは `kvs` の flock 規律に従う）。
-2. identity 検証: `Engine` が build 時に控える `identity: Option<(fabric_id, node_id,
-   root_public_key)>` と比較。不一致は `other`「fabric identity changed ...;
-   restart matd」。`with_parts` 構築（テスト）は `None` = 検証スキップ。
-3. `self.establisher.reload_credentials(creds)` の結果を返す。
+`self.establisher.reload_credentials()` へ委譲するだけ。KVS の読み直し・identity
+照合・swap はすべて `CaseEstablisher` の中（`cfg: NativeConfig` を構築時に
+控える）:
+
+1. `load_fabric_credentials(&self.cfg)`（既存。KVS 読みは `kvs` の flock 規律に従う）。
+2. `check_identity(current, fresh)`: fabric_id / node_id / root 公開鍵の不一致は
+   `other`「fabric identity changed ...; restart matd」。
+3. `swap_credentials(fresh)` の結果（IPK が変わったか）を返す。
 
 `NativeBackend`（matd）は `engine()` を既に公開しているので追加 API は不要。
-matd は `NativeConfig` を `serve_daemon` で組み立てて `NativeBackend::build_with_resolver`
-へ渡しているので、`DaemonInfo` に `native_cfg: NativeConfig` を持たせて
-`dispatch` へ届ける（`NativeConfig: Clone`）。
+matd 側は `NativeConfig` を持ち回らない（確立器が自分で持つ）。
 
 ### 4.4 原子性と既存セッション
 
