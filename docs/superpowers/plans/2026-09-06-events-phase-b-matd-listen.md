@@ -4,7 +4,7 @@
 
 > **着手条件（満たすまで実装しない）:**
 > 1. フェーズ A（`docs/superpowers/plans/2026-09-06-events-phase-a-controller-device.md`）が main にマージ済み。
-> 2. 並行セッション S2 の **matd reload op** が main にマージ済み（`crates/matd` と `mat-native::runner` の並行編集を避ける）。
+> 2. 並行セッション S2 の **matd reload op** が main にマージ済み（`crates/matd` と `mat-native::runner` の並行編集を避ける）。**→ 2026-09-06 に満了（main d1727fb「Merge: matd reload」）。**
 > 3. 着手時に main を pull し、本計画の「前提コード確認」（Task 0）で参照している関数名・行がまだ合っているかを確認してから始める。ずれていれば計画を先に直す。
 
 **Goal:** `matd` の常駐 Subscribe に EventRequests を載せ、デバイス発の EventReport を `mat listen` の JSON 行として流す。盲目窓中のイベントは EventFilters（EventMin）で欠落なく回収する。
