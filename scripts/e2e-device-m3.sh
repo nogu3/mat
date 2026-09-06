@@ -118,8 +118,10 @@ for n in d.get('nodes') or []:
 }
 
 # matd の node $NODE_ID への常駐 Subscribe が established になるまで待つ
-# （budget TIMEOUT_S 秒）。起動直後と、rotate-ipk の proof CASE が matv の唯一
-# session を奪った後の再確立の両方で使う。
+# （budget TIMEOUT_S 秒）。起動直後と、直経路 op が matv の唯一 session を奪った
+# 後の再確立の両方で使う。「落ちてから戻った」ことの証明にはならない点に注意
+# （matd は無音 deadline まで established を報告し続ける）— 張り直しの実証は
+# matd stderr の "subscription transport bound" の増加を数える（回転後の段）。
 wait_matd_established() {
     local why="$1"
     echo "==> waiting for matd's resident Subscribe to node $NODE_ID ($why; established, budget ${TIMEOUT_S}s)" >&2
@@ -376,6 +378,11 @@ STATUS_JSON="$(./target/release/matd status --socket "$MATD_SOCK")"
 [[ "$(matd_node_state "$STATUS_JSON" "$NODE_ID")" == "established" ]] || { echo "reload must not touch the subscription: $STATUS_JSON" >&2; exit 1; }
 echo "==> PASS: matd reload (unchanged) kept the subscription up" >&2
 
+# 回転前の「購読用 CASE が成立した回数」。回転後に 1 本増えることが、reload 済み
+# の新 IPK で張り直せた証拠になる（rotate-ipk は node_touched を撃たないので、
+# この時点から回転完了までに増えることは無い）。
+SUBS_BEFORE=$(grep -c "subscription transport bound" "$MATD_STDERR" || true)
+
 echo "==> mat fabric rotate-ipk (direct path; matv accepts KeySetWrite(0)) — expect matd_reload=reloaded" >&2
 ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_MATD_SOCKET="$MATD_SOCK" ./target/release/mat --iface "$IFACE" fabric rotate-ipk)"
 echo "$ROTATE_JSON"
@@ -385,9 +392,32 @@ STATUS_JSON="$(./target/release/matd status --socket "$MATD_SOCK")"
 [[ "$(matd_reload_count "$STATUS_JSON")" == "2" ]] || { echo "status.reloads.count should be 2 after rotate: $STATUS_JSON" >&2; exit 1; }
 echo "==> PASS: rotate-ipk committed and matd reloaded the new IPK (count=2)" >&2
 
-# rotate の proof CASE が matv の唯一 session を奪うので購読は一度落ちる。
-# 再確立（= reload 後の新 IPK での cold establish）を待ってから先へ進む。
-wait_matd_established "after rotate-ipk"
+# rotate の proof CASE が matv の唯一 session を奪うので購読は一度落ちる。ただ
+# matd がそれを知るのは無音 deadline なので、直後の `matd status` は established
+# のままで、購読の張り直しの証拠にならない（warm op session 経由の `mat on` も
+# 同じ）。直経路 op を 1 本撃って node_touched ヒントを送り、matd に即時の
+# 再購読をさせ、"subscription transport bound"（= 購読専用 CASE の新規成立）が
+# 1 本増えることを確かめる。この CASE は reload 済みの新 IPK で張られる。
+echo "==> direct-path op (node_touched hint) to make matd resubscribe now (subscription CASEs so far: $SUBS_BEFORE)" >&2
+MAT_STORE="$MAT_STORE_DIR" MAT_MATD=0 MAT_MATD_SOCKET="$MATD_SOCK" \
+    ./target/release/mat --iface "$IFACE" on --node "$NODE_ID" --endpoint "$DEVICE_EP" >&2
+SUBS_AFTER="$SUBS_BEFORE"
+SUBS_DEADLINE=$((SECONDS + TIMEOUT_S))
+while ((SECONDS < SUBS_DEADLINE)); do
+    SUBS_AFTER=$(grep -c "subscription transport bound" "$MATD_STDERR" || true)
+    if ((SUBS_AFTER > SUBS_BEFORE)); then
+        break
+    fi
+    sleep 0.3
+done
+if ! ((SUBS_AFTER > SUBS_BEFORE)); then
+    echo "matd never established a fresh subscription CASE after the rotation" >&2
+    echo "(\"subscription transport bound\" count stuck at $SUBS_BEFORE, budget ${TIMEOUT_S}s)" >&2
+    tail -n 80 "$MATD_STDERR" >&2
+    exit 1
+fi
+echo "==> subscription CASEs after the rotation: $SUBS_AFTER (was $SUBS_BEFORE)" >&2
+echo "==> PASS: matd re-established its subscription after the rotation (fresh CASE on the reloaded IPK)" >&2
 
 echo "==> mat on via matd after the rotation (matd must establish with the new IPK)" >&2
 ON_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat on --node "$NODE_ID" --endpoint "$DEVICE_EP" --matd "$MATD_SOCK")"

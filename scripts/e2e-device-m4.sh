@@ -40,6 +40,11 @@ DEVICE_STDERR="$WORKDIR/device.stderr.log"
 DEVICE_STORE="$WORKDIR/device-store"
 MAT_STORE_DIR="$WORKDIR/mat-store"
 MATV_CONFIG="$WORKDIR/matv.toml"
+# rotate-ipk sends a `reload` hint to whatever matd answers MAT_MATD_SOCKET /
+# the default socket path. This test runs against matv only, so point the hint
+# at a path that never exists: a real daemon on this machine (which serves a
+# different store) must not be reloaded by this run.
+NO_MATD_SOCK="$WORKDIR/no-matd.sock"
 mkdir -p "$DEVICE_STORE" "$MAT_STORE_DIR"
 
 # jq is NOT guaranteed on the host running this script — see
@@ -191,7 +196,7 @@ stop_matv() {
 }
 
 echo "==> mat fabric rotate-ipk (expect rotated: matv accepts KeySetWrite(0))" >&2
-ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" fabric rotate-ipk)"
+ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_MATD_SOCKET="$NO_MATD_SOCK" ./target/release/mat --iface "$IFACE" fabric rotate-ipk)"
 echo "$ROTATE_JSON"
 printf '%s' "$ROTATE_JSON" | python3 -c '
 import json, sys
@@ -220,7 +225,7 @@ echo "==> PASS: CASE with the rotated IPK after a device restart" >&2
 echo "==> stop matv, rotate again (expect pending: node unreachable)" >&2
 stop_matv
 set +e
-ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_OP_TIMEOUT_MS=8000 ./target/release/mat --iface "$IFACE" fabric rotate-ipk 2>"$WORKDIR/rotate.stderr")"
+ROTATE_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_MATD_SOCKET="$NO_MATD_SOCK" MAT_OP_TIMEOUT_MS=8000 ./target/release/mat --iface "$IFACE" fabric rotate-ipk 2>"$WORKDIR/rotate.stderr")"
 ROTATE_RC=$?
 set -e
 echo "$ROTATE_JSON"
@@ -237,7 +242,7 @@ assert_pending True
 echo "==> PASS: rotate-ipk ended pending with node $NODE_ID failed" >&2
 
 echo "==> mat fabric rotate-ipk --abort" >&2
-ABORT_JSON="$(MAT_STORE="$MAT_STORE_DIR" ./target/release/mat --iface "$IFACE" fabric rotate-ipk --abort)"
+ABORT_JSON="$(MAT_STORE="$MAT_STORE_DIR" MAT_MATD_SOCKET="$NO_MATD_SOCK" ./target/release/mat --iface "$IFACE" fabric rotate-ipk --abort)"
 echo "$ABORT_JSON"
 [[ "$(json_get status "$ABORT_JSON")" == "aborted" ]]
 assert_pending False
