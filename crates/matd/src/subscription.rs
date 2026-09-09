@@ -149,7 +149,7 @@ pub struct SubHealth {
     status: Mutex<HashMap<u64, NodeSubStatus>>,
     /// node_id → touched フラグ + 起床用 Notify（Issue #20）。pump は
     /// cancel-unsafe なのでフラグ+スライスポーリングで拾い、backoff 睡眠だけ
-    /// Notify で起こす。同じ Mutex<HashMap> に同居させない理由: flag と
+    /// Notify で起こす。同じ `Mutex<HashMap>` に同居させない理由: flag と
     /// Notify のライフサイクルが pending/status とは別軸（フラグの消費が
     /// Notify の使い回し防止と一体で、専用の消費 API が要る）。
     touched: Mutex<HashMap<u64, TouchedState>>,

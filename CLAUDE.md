@@ -159,7 +159,7 @@ ARCHITECTURE.md).
 Tasks are defined with [Task](https://taskfile.dev) — run `task` to list them
 (build / install / test / clippy / fmt / check / dist:arm64 / docker:*).
 
-Run `task check` (CI equivalent: fmt:check + clippy + test) before any commit.
+Run `task check` (CI equivalent: fmt:check + clippy + doc:check + test) before any commit.
 Matter uses mDNS / IPv6 multicast, so Docker runs require host networking
 (`docker run --network host`).
 
