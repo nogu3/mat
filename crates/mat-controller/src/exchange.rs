@@ -19,7 +19,7 @@ pub const MRP_BACKOFF_JITTER: f64 = 0.25;
 /// 正しさではないので、ここでは panic させない（暗号用途には使わないこと）。
 pub fn unit_random() -> f64 {
     let mut b = [0u8; 8];
-    if getrandom::getrandom(&mut b).is_err() {
+    if getrandom::fill(&mut b).is_err() {
         return 0.5;
     }
     (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64
@@ -141,7 +141,7 @@ pub struct UnsecuredExchange<'t> {
 impl<'t> UnsecuredExchange<'t> {
     pub fn new(transport: &'t Transport, peer: SocketAddr) -> Self {
         let mut b = [0u8; 10];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         Self {
             transport,
             peer,

@@ -297,7 +297,7 @@ impl GroupSender {
     ) -> Result<(u32, Vec<String>), GroupSendError> {
         let counter = self.counter.next().map_err(GroupSendError::Io)?;
         let mut ex = [0u8; 2];
-        getrandom::getrandom(&mut ex).expect("os rng");
+        getrandom::fill(&mut ex).expect("os rng");
         let datagram = build_group_datagram(
             creds,
             self.source_node_id,

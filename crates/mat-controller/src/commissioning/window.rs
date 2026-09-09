@@ -22,7 +22,7 @@ pub const INVALID_PASSCODES: [u32; 12] = [
 fn random_valid_passcode() -> u32 {
     loop {
         let mut b = [0u8; 4];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         let candidate = u32::from_le_bytes(b) % 99_999_998 + 1; // 1..=99_999_998
         if !INVALID_PASSCODES.contains(&candidate) {
             return candidate;
@@ -36,7 +36,7 @@ fn random_valid_passcode() -> u32 {
 /// 生成をここへ切り出した——挙動は不変）。
 pub fn random_discriminator() -> u16 {
     let mut disc_b = [0u8; 2];
-    getrandom::getrandom(&mut disc_b).expect("os rng");
+    getrandom::fill(&mut disc_b).expect("os rng");
     u16::from_le_bytes(disc_b) & 0x0FFF
 }
 
@@ -90,7 +90,7 @@ pub async fn open_commissioning_window(
     validate_window_params(discriminator, iterations)?;
     let passcode = random_valid_passcode();
     let mut salt = [0u8; 32];
-    getrandom::getrandom(&mut salt).expect("os rng");
+    getrandom::fill(&mut salt).expect("os rng");
     let verifier = crate::spake2p::compute_verifier(passcode, &salt, iterations);
     // OpenCommissioningWindow は timed invoke 必須（spec §11.19.8.1）。
     let resp = session

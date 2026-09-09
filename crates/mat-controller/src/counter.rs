@@ -4,7 +4,7 @@
 /// fabric bootstrap の `g/gdc` 初期化（`write_kvs_bootstrap`）が共有する。
 pub fn random_initial() -> u32 {
     let mut b = [0u8; 4];
-    getrandom::getrandom(&mut b).expect("os rng");
+    getrandom::fill(&mut b).expect("os rng");
     (u32::from_le_bytes(b) & 0x0FFF_FFFF) + 1
 }
 

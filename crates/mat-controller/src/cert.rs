@@ -145,7 +145,7 @@ pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
         .map_err(|_| CertError::Malformed("pubkey encode"))?;
 
     let mut rcac_id_b = [0u8; 8];
-    getrandom::getrandom(&mut rcac_id_b).expect("os rng");
+    getrandom::fill(&mut rcac_id_b).expect("os rng");
     let rcac_id = u64::from_le_bytes(rcac_id_b);
     let subject = vec![DnAttr {
         tlv_tag: 20,
@@ -164,7 +164,7 @@ pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
     ];
 
     let mut serial = [0u8; 8];
-    getrandom::getrandom(&mut serial).expect("os rng");
+    getrandom::fill(&mut serial).expect("os rng");
     serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
 
     let mut rcac = MatterCert {

@@ -179,7 +179,7 @@ pub(super) async fn run_credential_steps(
 
     // 5. attestation（厳格）。
     let mut nonce = [0u8; 32];
-    getrandom::getrandom(&mut nonce).expect("os rng");
+    getrandom::fill(&mut nonce).expect("os rng");
     let resp = session
         .invoke_for_data(
             0,
@@ -216,7 +216,7 @@ pub(super) async fn run_credential_steps(
 
     // 6. CSR → NOC 発行。
     let mut csr_nonce = [0u8; 32];
-    getrandom::getrandom(&mut csr_nonce).expect("os rng");
+    getrandom::fill(&mut csr_nonce).expect("os rng");
     let resp = session
         .invoke_for_data(
             0,

@@ -347,7 +347,7 @@ pub fn derive_session_keys(shared: &[u8], ipk: &[u8; 16], transcript: &[u8; 32])
 pub fn random_p256_secret() -> p256::SecretKey {
     loop {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         if let Ok(sk) = p256::SecretKey::from_slice(&b) {
             return sk;
         }
@@ -362,7 +362,7 @@ pub fn random_p256_secret() -> p256::SecretKey {
 pub fn random_nonzero_u16() -> u16 {
     loop {
         let mut b = [0u8; 2];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         let v = u16::from_le_bytes(b);
         if v != 0 {
             return v;
@@ -447,7 +447,7 @@ pub async fn establish(
 ) -> Result<SecureSession, CaseError> {
     // 1. Material: initiator random / ephemeral key pair / local session id.
     let mut initiator_random = [0u8; 32];
-    getrandom::getrandom(&mut initiator_random).expect("os rng");
+    getrandom::fill(&mut initiator_random).expect("os rng");
     let eph_secret = random_p256_secret();
     let eph_pub = eph_pub_bytes(&eph_secret);
     let local_session_id = random_nonzero_u16();

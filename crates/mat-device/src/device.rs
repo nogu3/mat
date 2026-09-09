@@ -186,7 +186,7 @@ fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<Stri
         }
     }
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(format!("os rng: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(format!("os rng: {e}")))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(&path, &hex)?;
     Ok(hex)
@@ -346,7 +346,7 @@ impl Device {
         // base`のdoc参照）: 目的は前ブートのキャッシュ済み DataVersion との
         // 偶然一致の排除であり、クラスタごとに独立させる必要はない。
         let mut version_seed = [0u8; 4];
-        getrandom::getrandom(&mut version_seed)
+        getrandom::fill(&mut version_seed)
             .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
         node.set_data_version_base(u32::from_le_bytes(version_seed));
         // ACL enforcement (spec §9.10) を有効化する唯一の呼び出し —

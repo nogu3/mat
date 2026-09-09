@@ -553,7 +553,7 @@ fn null_value() -> Vec<u8> {
 fn random_p256_secret() -> p256::SecretKey {
     loop {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         if let Ok(sk) = p256::SecretKey::from_slice(&b) {
             return sk;
         }

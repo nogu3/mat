@@ -69,7 +69,7 @@ fn cat(version: u32) -> u32 {
 fn fabric_with_cat_admin(admin_cats: &[u32]) -> (CommissioningFabric, FabricCredentials) {
     let (rcac, root_private_key) = generate_rcac().expect("generate rcac");
     let mut ipk_epoch = [0u8; 16];
-    getrandom::getrandom(&mut ipk_epoch).expect("os rng");
+    getrandom::fill(&mut ipk_epoch).expect("os rng");
     let ipk_operational =
         derive_ipk_operational(&ipk_epoch, &compressed_fabric_id(&rcac.pub_key, FABRIC_ID));
 

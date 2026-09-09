@@ -43,7 +43,7 @@ pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
 /// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す。
 pub fn generate_epoch_key() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed to fill epoch key");
+    getrandom::fill(&mut bytes).expect("getrandom failed to fill epoch key");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
