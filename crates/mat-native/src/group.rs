@@ -25,7 +25,7 @@ pub struct GroupCtx {
     /// 送出先リスト。先頭 = 運用 iface（従来挙動）。
     pub egress: Vec<GroupEgress>,
     pub dest_port: u16,
-    /// 運用 iface 名 (egress[0] と同じもの)。thread egress 後付け時の
+    /// 運用 iface 名 (`egress[0]` と同じもの)。thread egress 後付け時の
     /// 二重送出回避 (同名なら張らない) に使う。
     pub op_iface: String,
     /// build 時に thread egress を確立できなかった Auto/None 由来の構成なら

@@ -1,4 +1,4 @@
-//! File-backed [`FabricPersist`](crate::core::fabric_store::FabricPersist)
+//! File-backed [`FabricPersist`]
 //! implementation — the only place `mat-device` writes fabric state to
 //! disk. Whole-table JSON via `serde_json`, written atomically (tmp +
 //! fsync + rename) with `mat_core::fsatomic::write_atomic` so a crash
@@ -54,7 +54,7 @@ pub fn store_in_dir(dir: &Path) -> FileFabricStore {
     FileFabricStore::new(dir.join("fabrics.json"))
 }
 
-/// File-backed [`AclPersist`](crate::core::access_control::AclPersist)
+/// File-backed [`AclPersist`]
 /// implementation — same JSON-via-`serde_json` +
 /// `mat_core::fsatomic::write_atomic` discipline as [`FileFabricStore`]
 /// above. Unlike `fabrics.json`, `acl.json` holds no key material (just
@@ -101,7 +101,7 @@ struct BasicInfoRecord {
     location: String,
 }
 
-/// File-backed [`BasicInfoPersist`](crate::core::datamodel::BasicInfoPersist)
+/// File-backed [`BasicInfoPersist`]
 /// implementation — same JSON-via-`serde_json` +
 /// `mat_core::fsatomic::write_atomic` discipline as [`FileAclStore`] above.
 /// No key material here either, so no owner-only permission restriction.

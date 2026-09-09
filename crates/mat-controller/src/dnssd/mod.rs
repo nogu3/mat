@@ -6,7 +6,7 @@
 //! No advertising, no cache: bind `[::]:5353`, join `ff02::fb`, and query with
 //! the QU (unicast-response) bit set — then fold both the unicast replies and
 //! the multicast answers a responder may send to the group instead (see
-//! [`bind_mdns_socket`] and [`QU_CLASS_IN`]). Fold responses until
+//! `bind_mdns_socket` and `QU_CLASS_IN`). Fold responses until
 //! SRV + at least one AAAA for its target are in hand. TXT is folded when
 //! it arrives in the same responses but is not waited for — MRP falls back
 //! to the spec default interval without it.

@@ -1,6 +1,6 @@
 //! OnOff クラスタサーバ (spec §1.5, cluster 0x0006)。M2 スコープ: On/Off/
 //! Toggle と OnOff 属性のみ（effect 付きコマンド・GlobalSceneControl 等は
-//! スコープ外）。状態は Arc<AtomicBool> — net 側ランタイム/matv がクローン
+//! スコープ外）。状態は `Arc<AtomicBool>` — net 側ランタイム/matv がクローン
 //! を持ち、購読レポートとログに使う。
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
