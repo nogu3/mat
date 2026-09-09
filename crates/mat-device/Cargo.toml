@@ -29,15 +29,16 @@ serde_json = { workspace = true }
 getrandom = { workspace = true }
 # Session-key HKDF (spec §4.13.2.3), used by `core::pase` — unconditional
 # (not gated behind `net`): `core` must stay I/O-free but still needs this
-# crypto primitive. Versions match mat-controller's own hkdf/sha2 deps
-# (hkdf 0.13 / sha2 0.11) so the workspace resolves to one digest series.
-hkdf = "0.13"
-sha2 = "0.11"
+# crypto primitive. Declared in `[workspace.dependencies]` alongside
+# mat-controller's, so both crates structurally share one hkdf/sha2 series
+# (a bump is a single edit in the root Cargo.toml).
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 # Operational keypair generation for CSRRequest (`core::commissioning`) —
 # unconditional for the same reason as hkdf/sha2 above (pure crypto, not
-# I/O). Version/features match mat-controller's own p256 dependency
-# (p256 0.14, `ecdh` + `ecdsa`).
-p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+# I/O). Same workspace-level declaration as mat-controller's p256
+# (`ecdh` + `ecdsa` features come from the root Cargo.toml).
+p256 = { workspace = true }
 
 [dev-dependencies]
 mat-controller = { workspace = true, features = ["test-responder"] }
