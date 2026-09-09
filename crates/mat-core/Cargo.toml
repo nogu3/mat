@@ -3,6 +3,7 @@ name = "mat-core"
 description = "Shared core for the mat Matter CLI — mat's JSON schema, error/exit-code classification, credential store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["matter", "smart-home", "iot"]

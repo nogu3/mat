@@ -7,9 +7,9 @@
 //! の KDF とは異なる点に注意。
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
+use hmac::{Hmac, KeyInit, Mac};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
+use p256::{AffinePoint, ProjectivePoint, Scalar, Sec1Point};
 use sha2::{Digest, Sha256};
 
 use crate::case::random_p256_secret;
@@ -87,8 +87,8 @@ pub fn compute_verifier(passcode: u32, salt: &[u8], iterations: u32) -> [u8; 97]
 /// `pub(crate)`: also used by `test_support`'s PASE verifier responder
 /// (audit Tier 5) to decode pA / the SPAKE_M/SPAKE_N constants.
 pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
-    let ep = EncodedPoint::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
-    let ap = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
+    let ep = Sec1Point::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
+    let ap = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&ep))
         .ok_or(SpakeError::BadPoint)?;
     let p = ProjectivePoint::from(ap);
     if p == ProjectivePoint::IDENTITY {
@@ -101,7 +101,7 @@ pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> 
 /// (audit Tier 5) to encode pB.
 pub(crate) fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
     p.to_affine()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .try_into()
         .expect("uncompressed SEC1 P-256 point is always 65 bytes")
@@ -513,5 +513,25 @@ mod tests {
         let v2 = Spake2pVerifier::from_verifier_material(&material).unwrap();
         // 同じ乱数 y を注入できないため、p_b 同士ではなく w0/L の一致で検証する。
         assert_eq!(v1.w0_l_bytes(), v2.w0_l_bytes());
+    }
+
+    /// PBKDF2-HMAC-SHA256 → mod n 還元の w0/w1 ゴールデン（2026-09-09、
+    /// pbkdf2 0.12 / p256 0.13 で採取、新系列でも同値）。passcode / salt / iterations は
+    /// Matter テストデバイスの既定値。
+    #[test]
+    fn golden_w0_w1_are_stable() {
+        let (w0, w1) = derive_w0_w1(20202021, b"SPAKE2P Key Salt", 1000);
+        const W0: [u8; 32] = [
+            0xb9, 0x61, 0x70, 0xaa, 0xe8, 0x03, 0x34, 0x68, 0x84, 0x72, 0x4f, 0xe9, 0xa3, 0xb2,
+            0x87, 0xc3, 0x03, 0x30, 0xc2, 0xa6, 0x60, 0x37, 0x5d, 0x17, 0xbb, 0x20, 0x5a, 0x8c,
+            0xf1, 0xae, 0xcb, 0x35,
+        ];
+        const W1: [u8; 32] = [
+            0x82, 0x3d, 0x26, 0x42, 0x25, 0xe3, 0x6f, 0x49, 0x23, 0xb4, 0x3a, 0xd6, 0x4f, 0x8c,
+            0x86, 0x2a, 0x30, 0xf4, 0xa1, 0x29, 0xbb, 0xf9, 0xee, 0x80, 0x74, 0xa3, 0x2d, 0x6d,
+            0x67, 0x58, 0x6a, 0x90,
+        ];
+        assert_eq!(w0.to_bytes().as_slice(), &W0);
+        assert_eq!(w1.to_bytes().as_slice(), &W1);
     }
 }

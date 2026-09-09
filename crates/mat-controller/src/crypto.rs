@@ -115,7 +115,7 @@ pub fn encrypt_payload(
                 aad,
             },
         )
-        // 事前チェック後は到達不能（ccm 0.5 の唯一の失敗はサイズ超過）。保険として残す。
+        // 事前チェック後は到達不能（ccm 0.6 の唯一の失敗はサイズ超過）。保険として残す。
         .map_err(|_| CryptoError::PayloadTooLarge)
 }
 
@@ -291,7 +291,7 @@ mod tests {
         let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
         let priv_bytes: [u8; 32] = sk.to_bytes().into();
         let vk = sk.verifying_key();
-        let pub_bytes: [u8; 65] = vk.to_encoded_point(false).as_bytes().try_into().unwrap();
+        let pub_bytes: [u8; 65] = vk.to_sec1_point(false).as_bytes().try_into().unwrap();
         let msg = b"attestation over TBS bytes";
         let sig = sign_ecdsa_p256(&priv_bytes, msg).unwrap();
         verify_ecdsa_p256(&pub_bytes, msg, &sig).unwrap();
@@ -302,5 +302,44 @@ mod tests {
             verify_ecdsa_p256(&[0u8; 65], msg, &sig),
             Err(CryptoError::BadKey)
         ));
+    }
+
+    /// RustCrypto 依存を上げても暗号文が 1 バイトも変わらないことを固定する
+    /// ゴールデン（2026-09-09、aes 0.8 / ccm 0.5 で採取、新系列でも同値）。
+    #[test]
+    fn golden_ccm_ciphertext_is_stable() {
+        let key: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let nonce: [u8; 13] = core::array::from_fn(|i| 0xA0 + i as u8);
+        let ct = encrypt_payload(
+            &key,
+            &nonce,
+            b"matter-aad",
+            b"the quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        const EXPECTED: [u8; 43 + 16] = [
+            0x2d, 0xc5, 0x25, 0xf4, 0x06, 0xdb, 0x75, 0x83, 0x2f, 0xb5, 0xf7, 0x0a, 0xdb, 0xce,
+            0x7c, 0xcc, 0x52, 0xe5, 0xf4, 0xf4, 0xe1, 0x9b, 0xb0, 0xe2, 0x66, 0xa9, 0xc0, 0x22,
+            0xea, 0xe2, 0xab, 0xa9, 0xa3, 0xf1, 0xfb, 0x53, 0x37, 0xd6, 0xa2, 0x64, 0x1f, 0x8c,
+            0x01, 0xbf, 0xc6, 0x73, 0x0c, 0xf7, 0xcc, 0x5e, 0x1d, 0x68, 0x18, 0x9a, 0x1e, 0x86,
+            0xdf, 0x14, 0x9f,
+        ];
+        assert_eq!(ct, EXPECTED);
+    }
+
+    /// ECDSA は RFC 6979 決定的署名なので依存を上げても同じ r||s になる
+    /// （2026-09-09、p256 0.13 で採取、新系列でも同値）。
+    #[test]
+    fn golden_ecdsa_signature_is_stable() {
+        let sk: [u8; 32] = core::array::from_fn(|i| 0x11 + i as u8);
+        let sig = sign_ecdsa_p256(&sk, b"tbs-message").unwrap();
+        const EXPECTED: [u8; 64] = [
+            0x22, 0x7a, 0xb5, 0xd5, 0x00, 0x7a, 0xcc, 0x93, 0x0b, 0xcb, 0xa6, 0x05, 0x60, 0xb4,
+            0xc2, 0xd3, 0xee, 0x6b, 0xae, 0x62, 0x5c, 0xdb, 0xf2, 0x7c, 0x37, 0xda, 0x27, 0x78,
+            0x60, 0x98, 0xc9, 0x1f, 0xb8, 0x55, 0x8d, 0x6b, 0x0c, 0x5d, 0x7b, 0xe3, 0xb9, 0x6b,
+            0xb9, 0xf7, 0x5a, 0x03, 0x17, 0x2a, 0x71, 0x43, 0xa7, 0xe9, 0x06, 0x8a, 0xd6, 0x12,
+            0xff, 0x13, 0x0d, 0xda, 0xa5, 0x83, 0xd1, 0x29,
+        ];
+        assert_eq!(sig, EXPECTED);
     }
 }

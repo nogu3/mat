@@ -1,7 +1,7 @@
 //! Fabric credentials and CASE-related derivations (spec §4.3.2, §4.14.2).
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Compressed fabric id (spec §4.3.2.2): HKDF over the root public key
@@ -212,14 +212,14 @@ impl FabricCredentials {
     /// Generate a fresh operational key, self-issue a NOC under the KVS root,
     /// and assemble credentials for CASE.
     pub fn from_self_issued(m: crate::kvs::SelfIssueMaterials) -> Result<Self, FabricError> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
 
         // 1. new operational key pair.
         let sk = crate::case::random_p256_secret();
         let op_private_key: [u8; 32] = sk.to_bytes().into();
         let op_public_key: [u8; 65] = sk
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .map_err(|_| FabricError::GenKey)?;

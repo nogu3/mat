@@ -5,6 +5,7 @@ members = ["crates/mat-core", "crates/mat", "crates/matd", "crates/mat-controlle
 [workspace.package]
 version = "1.36.0"
 edition = "2021"
+rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/nogu3/mat"
 

@@ -3,6 +3,7 @@ name = "mat-device"
 description = "Matter device-side stack (PASE/CASE responder, Interaction Model server) — backend for the matv virtual device host"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["matter", "smart-home", "iot", "virtual-device"]
@@ -28,13 +29,15 @@ serde_json = { workspace = true }
 getrandom = { workspace = true }
 # Session-key HKDF (spec §4.13.2.3), used by `core::pase` — unconditional
 # (not gated behind `net`): `core` must stay I/O-free but still needs this
-# crypto primitive. Versions match mat-controller's own hkdf/sha2 deps.
-hkdf = "0.12"
-sha2 = "0.10"
+# crypto primitive. Versions match mat-controller's own hkdf/sha2 deps
+# (hkdf 0.13 / sha2 0.11) so the workspace resolves to one digest series.
+hkdf = "0.13"
+sha2 = "0.11"
 # Operational keypair generation for CSRRequest (`core::commissioning`) —
 # unconditional for the same reason as hkdf/sha2 above (pure crypto, not
-# I/O). Version/features match mat-controller's own p256 dependency.
-p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+# I/O). Version/features match mat-controller's own p256 dependency
+# (p256 0.14, `ecdh` + `ecdsa`).
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 
 [dev-dependencies]
 mat-controller = { workspace = true, features = ["test-responder"] }

@@ -6,6 +6,7 @@ name = "matterctl"
 description = "Matter device control CLI — drives a native Rust Matter controller in-process and emits pure structured JSON"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"

@@ -134,12 +134,12 @@ pub fn issue_noc_with_cats(
 /// KeyUsage(keyCertSign|cRLSign) / SubjectKeyId(自身) /
 /// AuthorityKeyId(自身の SKID) — 自己署名なので issuer も自分。
 pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     let sk = crate::case::random_p256_secret();
     let private_key: [u8; 32] = sk.to_bytes().into();
     let public_key: [u8; 65] = sk
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .try_into()
         .map_err(|_| CertError::Malformed("pubkey encode"))?;
@@ -1117,6 +1117,26 @@ mod tests {
         assert_eq!(subject_key_id(&node.pub_key), expected);
     }
 
+    /// SKID が chip-tool 自身の計算値と一致する（外部実装アンカー）。同一クレートで
+    /// 両辺を計算する上のテストと違い、sha1 の版が変わっても自己整合で通らない。
+    #[test]
+    fn golden_subject_key_id_matches_chip_tool() {
+        let node = MatterCert::parse(NODE_CHIP).unwrap();
+        const CHIP_SKID: [u8; 20] = [
+            0x69, 0x67, 0xc9, 0x12, 0xf8, 0xa3, 0xe6, 0x89, 0x55, 0x6f, 0x89, 0x9b, 0x65, 0xd7,
+            0x6f, 0x53, 0xfa, 0x65, 0xc7, 0xb6,
+        ];
+        assert_eq!(subject_key_id(&node.pub_key), CHIP_SKID);
+
+        // 固定文字列でなく chip-tool フィクスチャ自身が持つ SubjectKeyId 拡張と比較
+        // し、上の CHIP_SKID がそのフィクスチャ由来であることも証明する。
+        let fixture_skid = node.extensions.iter().find_map(|e| match e {
+            CertExtension::SubjectKeyId(id) => Some(id.clone()),
+            _ => None,
+        });
+        assert_eq!(fixture_skid.as_deref(), Some(CHIP_SKID.as_slice()));
+    }
+
     #[test]
     fn to_tlv_roundtrips_all_fixtures() {
         // パース → 再エンコード → 元の TLV バイトと完全一致（エンコーダ正しさの決定的アンカー）
@@ -1162,10 +1182,10 @@ mod tests {
         rcac.verify_signed_by(&rcac.pub_key).unwrap();
         // この root で NOC を発行してチェーン検証が通る
         let op = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let op_pub: [u8; 65] = op
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap();
@@ -1246,13 +1266,13 @@ mod tests {
 
     /// テスト用: 新規 RCAC とそこから発行した NOC、および双方の秘密鍵。
     fn fresh_chain() -> (MatterCert, [u8; 32], MatterCert, [u8; 32]) {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, root_key) = generate_rcac().unwrap();
         let op = crate::case::random_p256_secret();
         let op_priv: [u8; 32] = op.to_bytes().into();
         let op_pub: [u8; 65] = op
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap();
@@ -1278,12 +1298,12 @@ mod tests {
         // 監査 Tier1① の攻撃再現: fabric 内ノード A が自分の NOC_A を ICAC に
         // 仕立て、A の運用鍵で偽 NOC_X（subject=node X, issuer=NOC_A.subject）を
         // 発行して積む。CA 制約検査が無いと署名・DN・fabric-id 全てを通過する。
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, _root_key, noc_a, a_op_priv) = fresh_chain();
         let x = crate::case::random_p256_secret();
         let x_pub: [u8; 65] = x
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap();

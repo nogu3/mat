@@ -273,10 +273,10 @@ mod tests {
         assert_eq!(creds.node_id, 0x1_0001);
         // デバイス NOC も同じ root でチェーン検証が通る
         let dev = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let dev_pub: [u8; 65] = dev
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap();

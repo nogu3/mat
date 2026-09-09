@@ -73,13 +73,13 @@ mod tests {
     /// (a) embedded key scalar <-> vendored DAC public key match.
     #[test]
     fn chip_test_dac_key_matches_cert() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
 
         let secret = p256::SecretKey::from_slice(&CHIP_TEST_DAC_PRIVATE_KEY)
             .expect("embedded scalar is a valid p256 secret key");
         let derived_pubkey: [u8; 65] = secret
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .expect("uncompressed p256 point is 65 bytes");

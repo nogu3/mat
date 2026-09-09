@@ -827,7 +827,7 @@ mod tests {
     /// and `cB` can just be garbage bytes.
     #[tokio::test]
     async fn confirm_mismatch_sends_abort_status_report() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
 
         /// A syntactically valid (on-curve, non-identity) P-256 point that is
         /// *not* the real SPAKE2+ shareV — good enough to reach the cB check.
@@ -838,7 +838,7 @@ mod tests {
                 if let Ok(sk) = p256::SecretKey::from_slice(&b) {
                     return sk
                         .public_key()
-                        .to_encoded_point(false)
+                        .to_sec1_point(false)
                         .as_bytes()
                         .try_into()
                         .expect("uncompressed p256 point is 65 bytes");
