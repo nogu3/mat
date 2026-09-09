@@ -469,7 +469,7 @@ impl Engine {
         Self::build_with_resolver(cfg, Arc::new(OneShotResolver)).await
     }
 
-    /// [`build`] と同じだが、establish の mDNS 解決に使う [`Resolver`] を注入する
+    /// [`Self::build`] と同じだが、establish の mDNS 解決に使う [`Resolver`] を注入する
     /// （matd が `CachingResolver` を渡す。`mat` 一発は `build` の OneShotResolver）。
     pub async fn build_with_resolver(
         cfg: &NativeConfig,

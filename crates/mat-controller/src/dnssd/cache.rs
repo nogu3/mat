@@ -32,7 +32,7 @@ struct CacheInner {
     query_tx: mpsc::UnboundedSender<String>,
 }
 
-/// matd 常駐 mDNS キャッシュのハンドル。listener タスク（[`run_operational_cache`]）
+/// matd 常駐 mDNS キャッシュのハンドル。listener タスク（`run_operational_cache`）
 /// と `CachingResolver` が `Arc` で共有する。設計ルール4: `mat` 一発は使わない
 /// （matd 専用）。`Clone` は内部 `Arc` の複製。
 #[derive(Clone, Debug)]

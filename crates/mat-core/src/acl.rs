@@ -84,7 +84,7 @@ pub fn merge_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclE
     Some(merged)
 }
 
-/// Group エントリ（authMode=Group かつ subjects == [group_id]）を除いた全リスト。
+/// Group エントリ（authMode=Group かつ subjects == `[group_id]`）を除いた全リスト。
 /// 該当が 1 件も無ければ `None`（冪等、write 不要）。`merge_group_entry` と同じく
 /// fabric-filtered read の結果を渡すこと。
 pub fn without_group_entry(entries: &[AclEntry], group_id: u16) -> Option<Vec<AclEntry>> {

@@ -48,11 +48,19 @@ tasks:
     cmds:
       - cargo fmt --check
 
+  doc:check:
+    desc: rustdoc 警告チェック（-D warnings。壊れた intra-doc link・生の <型> 等を CI で止める）
+    env:
+      RUSTDOCFLAGS: -D warnings
+    cmds:
+      - cargo doc --workspace --no-deps
+
   check:
-    desc: CI 相当（fmt:check + clippy + test）
+    desc: CI 相当（fmt:check + clippy + doc:check + test）
     cmds:
       - task: fmt:check
       - task: clippy
+      - task: doc:check
       - task: test
 
   semver:

@@ -188,7 +188,7 @@ pub fn cms_sign(
 /// **CSA 認証済みの CD ではない** — モジュール doc 参照。
 ///
 /// 以前は `device_type` も引数に取っていたが、CD に載る `device_type_id`
-/// は常に固定値 [`DEVICE_TYPE_ID_IN_CD`]（matter.js の正典値）になった
+/// は常に固定値 `DEVICE_TYPE_ID_IN_CD`（matter.js の正典値）になった
 /// ため削除した（`CERTIFICATE_ID`/`DEVICE_TYPE_ID_IN_CD` の doc 参照）。
 pub fn generate_dev_certification_declaration(
     vendor_id: u16,

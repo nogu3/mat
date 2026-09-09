@@ -9,7 +9,7 @@ task run -- discover  # run (native backend)
 task test             # tests (native FakeConn + binary integration; no real devices)
 task clippy           # lint (-D warnings)
 task fmt              # format
-task check            # CI equivalent (fmt:check + clippy + test)
+task check            # CI equivalent (fmt:check + clippy + doc:check + test)
 
 task dist:arm64       # aarch64-gnu + BLE deploy build -> dist/arm64/{mat,matd}
 task docker:build     # slim x86_64 image (mat/matd only)
