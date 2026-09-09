@@ -458,13 +458,12 @@ impl Node {
     /// §11.1.6.15) rather than the fixed `"matv-dev"` fallback — what
     /// `device::Device::new` uses so BasicInformation's UniqueID is the
     /// per-install value persisted at `<store_dir>/unique_id`. Delegates to
-    /// [`with_root_endpoint_persisted_impl`] with the spec-default
+    /// `with_root_endpoint_persisted_impl` with the spec-default
     /// NodeLabel/Location (`""`/`"XX"`) and no persist backend — the ~15
     /// existing call sites (mostly tests) never touch disk for
     /// NodeLabel/Location, same as before this task.
     ///
     /// [`with_root_endpoint`]: Self::with_root_endpoint
-    /// [`with_root_endpoint_persisted_impl`]: Self::with_root_endpoint_persisted_impl
     pub fn with_root_endpoint_unique(vendor_id: u16, product_id: u16, unique_id: &str) -> Self {
         Self::with_root_endpoint_persisted_impl(
             vendor_id,

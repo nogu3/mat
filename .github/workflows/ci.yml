@@ -1,4 +1,4 @@
-# task check 相当（fmt:check + clippy + test）を PR / main push で回す。
+# task check 相当（fmt:check + clippy + doc:check + test）を PR / main push で回す。
 # テストは trait-level FakeConn 単体テスト + backend フリーの binary 統合テストを含む。実 chip-tool は不要。
 # ble feature（bluer → libdbus）も clippy + test でコンパイルする — これが無いと
 # ble.rs / commissioning.rs の BLE 経路の初コンパイルが手動 `task dist:arm64`
@@ -31,6 +31,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: clippy (ble)
         run: cargo clippy --all-targets --features ble -- -D warnings
+      - name: doc (rustdoc -D warnings)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: check (mat-device core, no I/O)
         run: cargo check -p mat-device --no-default-features
       - name: test

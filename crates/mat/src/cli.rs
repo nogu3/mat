@@ -613,7 +613,7 @@ pub enum GroupCommand {
     },
 
     /// provision 済みグループの ACL 修復: 各ノードの ACL に Group エントリ
-    /// （privilege=Operate, authMode=Group, subjects=[GroupId]）を read-merge-write
+    /// （privilege=Operate, authMode=Group, subjects=`[GroupId]`）を read-merge-write
     /// で追記する。既にあれば何もしない（冪等）。provision の 4 ステップ目と同じ
     /// 処理を単独実行する（controller 側 groupsettings が非冪等で provision を
     /// 再実行できない既存グループの救済用）。常に直経路（--matd 明示時は exit 2）。

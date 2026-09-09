@@ -1,8 +1,8 @@
 //! chip-tool 互換 KVS への controller 側 group state 書込（M8c-2）。
 //!
 //! chip-tool `groupsettings add-group / add-keysets / (unbind-keyset) /
-//! bind-keyset` が KVS に残す 5 レコード（g/gfl, f/<i>/g, f/<i>/g/<gid>,
-//! f/<i>/gk/<id>, f/<i>/k/<ksid>）を、上流 v1.4.2.0 GroupDataProviderImpl
+//! bind-keyset` が KVS に残す 5 レコード（`g/gfl`, `f/<i>/g`, `f/<i>/g/<gid>`,
+//! `f/<i>/gk/<id>`, `f/<i>/k/<ksid>`）を、上流 v1.4.2.0 GroupDataProviderImpl
 //! と同じリンク規律（group=末尾挿入・終端0 / keyset=head 挿入・終端0xFFFF、
 //! id 0 = IPK は有効値 / keymap=末尾連結・id は max+1 で sparse / 走査は
 //! count 正）で書く。1 回の provision は 1 つの KvsTxn（flock 区間）で
@@ -1073,7 +1073,7 @@ pub fn begin_ipk_rotation(
 }
 
 /// IPK ローテーションの commit（1 KvsTxn）: `f/<idx>/k/0` の slot 0 を
-/// `derive(next)` に差し替え（[`keyset_with_slot0`] — policy / 残スロット / next
+/// `derive(next)` に差し替え（`keyset_with_slot0` — policy / 残スロット / next
 /// リンクは無傷）、`ipk-epoch := next`、`ipk-epoch-prev := cur`、`ipk-epoch-next`
 /// を削除。pending が無い / 値が `next` と違う / k/0 が無い・解釈不能は `Corrupt`
 /// で何も書かない。

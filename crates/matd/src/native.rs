@@ -98,7 +98,7 @@ impl NativeBackend {
         Ok(Self::from_engine(mat_native::Engine::build(cfg).await?))
     }
 
-    /// [`build`] と同じだが Resolver を注入する（matd が CachingResolver を渡す）。
+    /// [`Self::build`] と同じだが Resolver を注入する（matd が CachingResolver を渡す）。
     pub async fn build_with_resolver(
         cfg: &NativeConfig,
         resolver: std::sync::Arc<dyn mat_native::Resolver>,

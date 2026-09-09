@@ -90,7 +90,7 @@ struct FileConfig {
     /// M3: bridge がぶら下げるデバイス群（`[[device]]` の配列）。宣言順が
     /// そのまま endpoint 採番順になる。`serde(default)` は「未宣言 = 空
     /// ベクタ」をパースエラーではなく `load_config` のバリデーション
-    /// エラー（"config must declare at least one [[device]]"）にするため
+    /// エラー（`"config must declare at least one [[device]]"`）にするため
     /// — TOML の missing-field メッセージより設定者に伝わる。
     #[serde(default, rename = "device")]
     devices: Vec<FileDeviceConfig>,

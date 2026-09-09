@@ -1748,10 +1748,10 @@ impl CommissioningFabric {
 
     /// 初回 fabric bootstrap（M8c-3）: この fabric を chip-tool INI 互換 KVS へ
     /// 新規永続する。書くもの:
-    ///   alpha ini … ExampleOpCredsCAKey<issuer> = pub65||priv32（97B）
-    ///   main ini  … f/<idx>/r = RCAC(TLV) / f/<idx>/n = admin NOC(TLV)
-    ///               f/<idx>/k/0 = IPK keyset blob（3 スロット、終端 0xFFFF）
-    ///               mat/f/<idx>/ipk-epoch = ランダム epoch（mat 専用キー）
+    ///   alpha ini … `ExampleOpCredsCAKey<issuer>` = pub65||priv32（97B）
+    ///   main ini  … `f/<idx>/r` = RCAC(TLV) / `f/<idx>/n` = admin NOC(TLV)
+    ///               `f/<idx>/k/0` = IPK keyset blob（3 スロット、終端 0xFFFF）
+    ///               `mat/f/<idx>/ipk-epoch` = ランダム epoch（mat 専用キー）
     ///               g/gdc = Global Group Data Counter（spec 4.5.1 レンジの
     ///               ランダム初期値、u32 LE — 欠落だと groupcast 永久不可）
     /// 既に KVS があれば `KvsError::AlreadyExists`（上書きしない — 誤 store
