@@ -291,7 +291,7 @@ mod tests {
         let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
         let priv_bytes: [u8; 32] = sk.to_bytes().into();
         let vk = sk.verifying_key();
-        let pub_bytes: [u8; 65] = vk.to_encoded_point(false).as_bytes().try_into().unwrap();
+        let pub_bytes: [u8; 65] = vk.to_sec1_point(false).as_bytes().try_into().unwrap();
         let msg = b"attestation over TBS bytes";
         let sig = sign_ecdsa_p256(&priv_bytes, msg).unwrap();
         verify_ecdsa_p256(&pub_bytes, msg, &sig).unwrap();

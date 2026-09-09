@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
 
 use crate::cert::{verify_noc_chain, MatterCert};
@@ -376,7 +376,7 @@ pub fn random_nonzero_u16() -> u16 {
 /// 再利用する。`pub`（Task 10）: mat-device の CASE responder core（ephemeral
 /// 鍵）とその統合テスト（device operational 鍵）でも再利用する。
 pub fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
-    let point = secret.public_key().to_encoded_point(false);
+    let point = secret.public_key().to_sec1_point(false);
     point
         .as_bytes()
         .try_into()

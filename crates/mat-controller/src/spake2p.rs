@@ -7,9 +7,9 @@
 //! の KDF とは異なる点に注意。
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
+use hmac::{Hmac, KeyInit, Mac};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
+use p256::{AffinePoint, ProjectivePoint, Scalar, Sec1Point};
 use sha2::{Digest, Sha256};
 
 use crate::case::random_p256_secret;
@@ -87,8 +87,8 @@ pub fn compute_verifier(passcode: u32, salt: &[u8], iterations: u32) -> [u8; 97]
 /// `pub(crate)`: also used by `test_support`'s PASE verifier responder
 /// (audit Tier 5) to decode pA / the SPAKE_M/SPAKE_N constants.
 pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
-    let ep = EncodedPoint::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
-    let ap = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
+    let ep = Sec1Point::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
+    let ap = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&ep))
         .ok_or(SpakeError::BadPoint)?;
     let p = ProjectivePoint::from(ap);
     if p == ProjectivePoint::IDENTITY {
@@ -101,7 +101,7 @@ pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> 
 /// (audit Tier 5) to encode pB.
 pub(crate) fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
     p.to_affine()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .try_into()
         .expect("uncompressed SEC1 P-256 point is always 65 bytes")
