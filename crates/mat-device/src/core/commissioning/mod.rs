@@ -563,10 +563,10 @@ fn random_p256_secret() -> p256::SecretKey {
 /// `secret`'s SEC1 uncompressed public key (65 bytes) — device-side
 /// equivalent of `mat_controller::case::eph_pub_bytes`.
 fn public_key_bytes(secret: &p256::SecretKey) -> [u8; 65] {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     secret
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .try_into()
         .expect("uncompressed p256 point is 65 bytes")
