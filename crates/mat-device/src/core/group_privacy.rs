@@ -194,4 +194,18 @@ mod tests {
         assert!(deobfuscate_header(&[0u8; 3], &OP).is_none());
         assert!(!obfuscate_header(&mut [0u8; 3], &OP));
     }
+
+    /// group privacy 鍵（HKDF-SHA256、spec §4.16.2）のゴールデン
+    /// （2026-09-09、hkdf 0.12 で採取）。
+    #[test]
+    fn golden_privacy_key_is_stable() {
+        let op: [u8; 16] = core::array::from_fn(|i| 0x90 + i as u8);
+        assert_eq!(
+            derive_privacy_key(&op),
+            [
+                0x65, 0xb9, 0xc1, 0x87, 0x3b, 0x65, 0x45, 0x00, 0xbe, 0xc8, 0x53, 0x33, 0x90, 0x59,
+                0xff, 0x8f,
+            ]
+        );
+    }
 }

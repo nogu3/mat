@@ -810,4 +810,35 @@ mod tests {
         assert_eq!(keys.r2i, again.r2i);
         assert_ne!(keys.i2r, keys.r2i);
     }
+
+    /// CASE セッション鍵（HKDF-SHA256、spec §4.14.2.6）のゴールデン
+    /// （2026-09-09、hkdf 0.12 で採取）。
+    #[test]
+    fn golden_session_keys_are_stable() {
+        let shared: [u8; 32] = core::array::from_fn(|i| 0x30 + i as u8);
+        let ipk: [u8; 16] = core::array::from_fn(|i| 0x50 + i as u8);
+        let transcript: [u8; 32] = core::array::from_fn(|i| 0x70 + i as u8);
+        let k = derive_session_keys(&shared, &ipk, &transcript);
+        assert_eq!(
+            k.i2r,
+            [
+                0x6e, 0xba, 0xaa, 0x00, 0xef, 0xe6, 0xf8, 0xdc, 0xae, 0xa9, 0xb6, 0xab, 0x35, 0x9d,
+                0x9d, 0xb9,
+            ]
+        );
+        assert_eq!(
+            k.r2i,
+            [
+                0x07, 0xc9, 0x3a, 0x07, 0x28, 0x91, 0x4d, 0x1d, 0x62, 0x91, 0x14, 0x5e, 0xba, 0x10,
+                0x26, 0x3b,
+            ]
+        );
+        assert_eq!(
+            k.attestation_challenge,
+            [
+                0x60, 0xaf, 0xc3, 0x96, 0x93, 0x0a, 0xe4, 0x6f, 0x8d, 0xc8, 0x6e, 0x4a, 0x38, 0xc3,
+                0xa9, 0xf4,
+            ]
+        );
+    }
 }
