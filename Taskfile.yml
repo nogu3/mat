@@ -55,6 +55,25 @@ tasks:
       - task: clippy
       - task: test
 
+  deps:
+    desc: "依存の棚卸し（未使用依存 = cargo machete、RustSec 勧告 = cargo audit、古い依存 = deps:outdated の情報表示。要: cargo install --locked cargo-machete cargo-audit。ネットワーク依存なので check には含めない）"
+    cmds:
+      - cargo machete
+      - cargo audit
+      - task: deps:outdated
+
+  deps:outdated:
+    desc: "古い依存の一覧（情報表示のみ、失敗しても deps は落とさない）。cargo update --dry-run の available: 行 = semver 範囲外の新版（workspace 継承の依存も拾う）。cargo-outdated があれば直接依存の表も追加表示（workspace = true の依存は出ない）"
+    cmds:
+      - cmd: |
+          echo "== semver 範囲外の新版（cargo update --dry-run --verbose）"
+          cargo update --dry-run --verbose 2>&1 | grep -E "available:" || true
+          if command -v cargo-outdated >/dev/null 2>&1; then
+            echo "== cargo outdated（直接依存、workspace 継承分は表示されない）"
+            cargo outdated --workspace --root-deps-only
+          fi
+        ignore_error: true
+
   semver:
     desc: "crates.io 公開版との semver 判定（publish 前に必ず実行。要: cargo install cargo-semver-checks。ble 等の非 default feature は対象外 — libdbus 無しで回すため）"
     cmds:
