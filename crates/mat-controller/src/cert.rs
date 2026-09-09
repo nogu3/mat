@@ -1117,6 +1117,26 @@ mod tests {
         assert_eq!(subject_key_id(&node.pub_key), expected);
     }
 
+    /// SKID が chip-tool 自身の計算値と一致する（外部実装アンカー）。同一クレートで
+    /// 両辺を計算する上のテストと違い、sha1 の版が変わっても自己整合で通らない。
+    #[test]
+    fn golden_subject_key_id_matches_chip_tool() {
+        let node = MatterCert::parse(NODE_CHIP).unwrap();
+        const CHIP_SKID: [u8; 20] = [
+            0x69, 0x67, 0xc9, 0x12, 0xf8, 0xa3, 0xe6, 0x89, 0x55, 0x6f, 0x89, 0x9b, 0x65, 0xd7,
+            0x6f, 0x53, 0xfa, 0x65, 0xc7, 0xb6,
+        ];
+        assert_eq!(subject_key_id(&node.pub_key), CHIP_SKID);
+
+        // 固定文字列でなく chip-tool フィクスチャ自身が持つ SubjectKeyId 拡張と比較
+        // し、上の CHIP_SKID がそのフィクスチャ由来であることも証明する。
+        let fixture_skid = node.extensions.iter().find_map(|e| match e {
+            CertExtension::SubjectKeyId(id) => Some(id.clone()),
+            _ => None,
+        });
+        assert_eq!(fixture_skid.as_deref(), Some(CHIP_SKID.as_slice()));
+    }
+
     #[test]
     fn to_tlv_roundtrips_all_fixtures() {
         // パース → 再エンコード → 元の TLV バイトと完全一致（エンコーダ正しさの決定的アンカー）

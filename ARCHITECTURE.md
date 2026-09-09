@@ -1337,7 +1337,7 @@ abort し `status` からも外すので、unpair 後の matd 再起動は要ら
 （`MAT_MATD=0` で直経路）。
 - spec: `docs/superpowers/specs/2026-09-03-cli-gaps-design.md`。
 
-- **2026-09-09 RustCrypto 新系列へ**: sha1/sha2 0.11、hmac/hkdf/pbkdf2 0.13、aes 0.9、ccm 0.6、p256 0.14（digest 0.11 / cipher 0.5 / aead 0.6 / elliptic-curve 0.14、generic-array → hybrid-array）に一括更新。更新前に採取したゴールデン 5 件（CCM 暗号文・ECDSA 署名・SPAKE2+ w0/w1・CASE セッション鍵・group privacy 鍵）と RFC 9383 / spec ベクタで暗号出力の不変を固定し、matv 相手の E2E M1/M3/M4 で PASE・CASE・CCM・groupcast の実配線を確認。呼び出しコードのロジック変更なし（型変換の `.into()` / import の追従のみ）。
+- **2026-09-09 RustCrypto 新系列へ**: sha1/sha2 0.11、hmac/hkdf/pbkdf2 0.13、aes 0.9、ccm 0.6、p256 0.14（digest 0.11 / cipher 0.5 / aead 0.6 / elliptic-curve 0.14、generic-array → hybrid-array）に一括更新。更新前に採取したゴールデン 5 件（CCM 暗号文・ECDSA 署名・SPAKE2+ w0/w1・CASE セッション鍵・group privacy 鍵）と RFC 9383 / spec ベクタで暗号出力の不変を固定し、matv 相手の E2E M1/M3/M4 で PASE・CASE・CCM・groupcast の実配線を確認。呼び出しコードのロジック変更なし（実際の差分は elliptic-curve 0.14 の sec1 API 改名 `EncodedPoint`/`to_encoded_point` → `Sec1Point`/`to_sec1_point` と `hmac::KeyInit` import の追従のみ）。public API のうち `case::random_p256_secret` / `x509::generate_csr` / `spake2p::derive_w0_w1` は p256 0.14 の型を露出する（`task semver` には映らない下流ソース互換の変更、リリースは minor のまま）。MSRV を `[workspace.package] rust-version = "1.87"` に明記（新系列の下限 1.85 と、既存コードの `usize::is_multiple_of`（1.87 安定化）の大きい方）。
 
 ---
 

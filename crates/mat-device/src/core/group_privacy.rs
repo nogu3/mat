@@ -196,7 +196,7 @@ mod tests {
     }
 
     /// group privacy 鍵（HKDF-SHA256、spec §4.16.2）のゴールデン
-    /// （2026-09-09、hkdf 0.12 で採取）。
+    /// （2026-09-09、hkdf 0.12 で採取、新系列でも同値）。
     #[test]
     fn golden_privacy_key_is_stable() {
         let op: [u8; 16] = core::array::from_fn(|i| 0x90 + i as u8);

@@ -3,6 +3,7 @@ name = "mat-device"
 description = "Matter device-side stack (PASE/CASE responder, Interaction Model server) — backend for the matv virtual device host"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["matter", "smart-home", "iot", "virtual-device"]

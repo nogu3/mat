@@ -812,7 +812,7 @@ mod tests {
     }
 
     /// CASE セッション鍵（HKDF-SHA256、spec §4.14.2.6）のゴールデン
-    /// （2026-09-09、hkdf 0.12 で採取）。
+    /// （2026-09-09、hkdf 0.12 で採取、新系列でも同値）。
     #[test]
     fn golden_session_keys_are_stable() {
         let shared: [u8; 32] = core::array::from_fn(|i| 0x30 + i as u8);

@@ -3,6 +3,7 @@ name = "matd"
 description = "Resident Matter daemon for the mat CLI — warm CASE sessions and a resident Subscribe (mat listen)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["matter", "smart-home", "iot", "daemon"]

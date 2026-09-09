@@ -115,7 +115,7 @@ pub fn encrypt_payload(
                 aad,
             },
         )
-        // 事前チェック後は到達不能（ccm 0.5 の唯一の失敗はサイズ超過）。保険として残す。
+        // 事前チェック後は到達不能（ccm 0.6 の唯一の失敗はサイズ超過）。保険として残す。
         .map_err(|_| CryptoError::PayloadTooLarge)
 }
 
@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// RustCrypto 依存を上げても暗号文が 1 バイトも変わらないことを固定する
-    /// ゴールデン（2026-09-09、aes 0.8 / ccm 0.5 で採取）。
+    /// ゴールデン（2026-09-09、aes 0.8 / ccm 0.5 で採取、新系列でも同値）。
     #[test]
     fn golden_ccm_ciphertext_is_stable() {
         let key: [u8; 16] = core::array::from_fn(|i| i as u8);
@@ -328,7 +328,7 @@ mod tests {
     }
 
     /// ECDSA は RFC 6979 決定的署名なので依存を上げても同じ r||s になる
-    /// （2026-09-09、p256 0.13 で採取）。
+    /// （2026-09-09、p256 0.13 で採取、新系列でも同値）。
     #[test]
     fn golden_ecdsa_signature_is_stable() {
         let sk: [u8; 32] = core::array::from_fn(|i| 0x11 + i as u8);

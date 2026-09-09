@@ -516,7 +516,7 @@ mod tests {
     }
 
     /// PBKDF2-HMAC-SHA256 → mod n 還元の w0/w1 ゴールデン（2026-09-09、
-    /// pbkdf2 0.12 / p256 0.13 で採取）。passcode / salt / iterations は
+    /// pbkdf2 0.12 / p256 0.13 で採取、新系列でも同値）。passcode / salt / iterations は
     /// Matter テストデバイスの既定値。
     #[test]
     fn golden_w0_w1_are_stable() {
