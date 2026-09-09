@@ -262,7 +262,7 @@ impl CaseResponderCore {
         let resp_secret = random_p256_secret();
         let responder_eph_pub = eph_pub_bytes(&resp_secret);
         let mut responder_random = [0u8; 32];
-        getrandom::getrandom(&mut responder_random).expect("os rng");
+        getrandom::fill(&mut responder_random).expect("os rng");
 
         let shared = ecdh(&resp_secret, &sigma1.initiator_eph_pub)?;
         let sigma1_hash = sha256(payload);
@@ -290,7 +290,7 @@ impl CaseResponderCore {
         // so we generate and embed one per handshake without persisting it
         // anywhere.
         let mut resumption_id = [0u8; 16];
-        getrandom::getrandom(&mut resumption_id).expect("os rng");
+        getrandom::fill(&mut resumption_id).expect("os rng");
         let tbe2 = encode_tbe(
             &fabric.noc_tlv,
             fabric.icac_tlv.as_deref(),
@@ -964,7 +964,7 @@ mod tests {
         let op_pub = eph_pub_bytes(&op_secret);
         let op_priv: [u8; 32] = op_secret.to_bytes().into();
         let mut serial = [0u8; 8];
-        getrandom::getrandom(&mut serial).expect("os rng");
+        getrandom::fill(&mut serial).expect("os rng");
         serial[0] &= 0x7F; // BER INTEGER minimal positive form
         let noc = crate::cert::issue_noc_with_cats(
             &op_pub, node_id, fabric_id, &root_cert, &root_priv, &serial, cats,

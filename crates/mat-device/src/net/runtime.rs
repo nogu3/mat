@@ -149,7 +149,7 @@ const REPORT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 fn random_subscription_id() -> u32 {
     loop {
         let mut b = [0u8; 4];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         let v = u32::from_le_bytes(b);
         if v != 0 {
             return v;
@@ -461,7 +461,7 @@ fn remove_fabric_drops_session(removed_fabric_index: u8, session_fabric_index: u
 fn random_session_id() -> u16 {
     loop {
         let mut b = [0u8; 2];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         let v = u16::from_le_bytes(b);
         if v != 0 {
             return v;
@@ -476,7 +476,7 @@ fn random_session_id() -> u16 {
 /// ultimately resolve to the same one address this device advertises).
 fn random_hex_name() -> String {
     let mut b = [0u8; 8];
-    getrandom::getrandom(&mut b).expect("os rng");
+    getrandom::fill(&mut b).expect("os rng");
     b.iter().map(|x| format!("{x:02X}")).collect()
 }
 
@@ -833,7 +833,7 @@ impl Runtime {
         // within one handshake (it round-trips to the peer in
         // PBKDFParamResponse), not secret or per-attempt.
         let mut pase_salt = [0u8; 16];
-        getrandom::getrandom(&mut pase_salt).expect("os rng");
+        getrandom::fill(&mut pase_salt).expect("os rng");
         // Commissioning window boot-time policy (Task 14, `CommissioningWindow`'s
         // doc comment): open only for a device with no fabric yet — one already
         // on disk means this device was commissioned in an earlier run, so a

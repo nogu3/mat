@@ -227,7 +227,7 @@ impl FabricCredentials {
         // 2. self-issue a NOC under the root.
         let rcac = crate::cert::MatterCert::parse(&m.rcac).map_err(FabricError::Cert)?;
         let mut serial = [0u8; 8];
-        getrandom::getrandom(&mut serial).expect("os rng");
+        getrandom::fill(&mut serial).expect("os rng");
         serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
         let noc = crate::cert::issue_noc(
             &op_public_key,

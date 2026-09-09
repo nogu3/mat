@@ -227,7 +227,7 @@ impl SecureSession {
     /// Generates a random exchange id for a new exchange on this session.
     pub fn new_exchange_id() -> u16 {
         let mut b = [0u8; 2];
-        getrandom::getrandom(&mut b).expect("os rng");
+        getrandom::fill(&mut b).expect("os rng");
         u16::from_le_bytes(b)
     }
 }

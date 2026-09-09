@@ -43,7 +43,7 @@ impl CommissioningFabric {
     pub fn generate(fabric_id: u64, admin_node_id: u64) -> Result<Self, CommissionError> {
         let (rcac, root_private_key) = cert::generate_rcac()?;
         let mut ipk_epoch = [0u8; 16];
-        getrandom::getrandom(&mut ipk_epoch).map_err(|_| CommissionError::Malformed {
+        getrandom::fill(&mut ipk_epoch).map_err(|_| CommissionError::Malformed {
             step: "commissioning_fabric_generate",
             detail: "os rng failure",
         })?;
@@ -104,7 +104,7 @@ impl CommissioningFabric {
     ) -> Result<Vec<u8>, CommissionError> {
         let rcac = MatterCert::parse(&self.rcac_tlv)?;
         let mut serial = [0u8; 8];
-        getrandom::getrandom(&mut serial).map_err(|_| CommissionError::Malformed {
+        getrandom::fill(&mut serial).map_err(|_| CommissionError::Malformed {
             step: "issue_device_noc",
             detail: "os rng failure",
         })?;

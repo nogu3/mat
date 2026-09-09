@@ -504,7 +504,7 @@ pub async fn establish(
 ) -> Result<SecureSession, PaseError> {
     // 1. Material: initiator random / local session id.
     let mut initiator_random = [0u8; 32];
-    getrandom::getrandom(&mut initiator_random).expect("os rng");
+    getrandom::fill(&mut initiator_random).expect("os rng");
     let local_session_id = random_nonzero_u16();
 
     // 2. PBKDFParamRequest / Response.
@@ -834,7 +834,7 @@ mod tests {
         fn random_point() -> [u8; 65] {
             loop {
                 let mut b = [0u8; 32];
-                getrandom::getrandom(&mut b).expect("os rng");
+                getrandom::fill(&mut b).expect("os rng");
                 if let Ok(sk) = p256::SecretKey::from_slice(&b) {
                     return sk
                         .public_key()

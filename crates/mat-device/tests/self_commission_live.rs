@@ -278,7 +278,7 @@ async fn pase_after_commissioning_complete_is_silently_dropped() {
 
         let raw = UdpTransport::bind().await.unwrap();
         let mut initiator_random = [0u8; 32];
-        getrandom::getrandom(&mut initiator_random).expect("os rng");
+        getrandom::fill(&mut initiator_random).expect("os rng");
         let header = MessageHeader {
             session_id: 0,
             security_flags: 0,

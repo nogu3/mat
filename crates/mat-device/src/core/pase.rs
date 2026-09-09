@@ -187,7 +187,7 @@ impl PaseResponderCore {
     fn handle_pbkdf_param_request(&mut self, payload: &[u8]) -> Result<PaseOutput, PaseCoreError> {
         let req = pase::decode_pbkdf_param_request(payload)?;
         let mut responder_random = [0u8; 32];
-        getrandom::getrandom(&mut responder_random).expect("os rng");
+        getrandom::fill(&mut responder_random).expect("os rng");
         let resp_bytes = pase::encode_pbkdf_param_response(
             &req.initiator_random,
             &responder_random,
