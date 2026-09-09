@@ -26,6 +26,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4"
+# RustCrypto 一群は mat-controller / mat-device の両方が使う。ここに集約して
+# 両クレートは `{ workspace = true }` で参照する（版・feature の一致を構造で
+# 保証し、バンプは 1 段で済む）。
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+aes = "0.9"
+ccm = "0.6"
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

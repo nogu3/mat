@@ -19,16 +19,16 @@ test-responder = []
 
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
-ccm = "0.6"
-aes = "0.9"
+ccm = { workspace = true }
+aes = { workspace = true }
 base64ct = { version = "1", features = ["alloc"] }
 getrandom = { workspace = true }
-sha2 = "0.11"
-sha1 = "0.11"
-hkdf = "0.13"
-hmac = "0.13"
-p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+p256 = { workspace = true }
+pbkdf2 = { workspace = true }
 socket2 = "0.6"
 rustix = { version = "1", features = ["fs"] }
 tracing = { workspace = true }
