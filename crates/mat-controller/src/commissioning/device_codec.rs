@@ -10,31 +10,15 @@
 
 use crate::tlv::{Tag, Writer};
 
-use super::tlv_fields::{
-    scan_struct_fields, take_bytes, take_u16, take_u32, take_u64, take_u8, take_utf8,
-};
+use super::tlv_fields::{required, scan_struct_fields, take_bytes, take_u64, take_uint, take_utf8};
 use super::CommissionError;
-
-// doc コメントの intra-doc link（「逆方向は [`encode_*`]」）が同じ module に
-// あった頃のまま解決できるように、rustdoc ビルドだけで sibling を scope に置く。
-#[cfg(doc)]
-use super::{
-    decode_attestation_response, decode_cert_chain_response, decode_commissioning_status_response,
-    decode_csr_response, decode_noc_response, encode_add_noc, encode_add_trusted_root,
-    encode_arm_fail_safe, encode_attestation_request, encode_cert_chain_request,
-    encode_csr_request, encode_open_commissioning_window, encode_remove_fabric,
-    encode_set_regulatory_config, encode_update_fabric_label, parse_nocsr_elements,
-};
 
 /// `fields` から struct 直下の 32 バイト nonce（タグ `tag`）を取り出す。
 /// AttestationRequest/CSRRequest はどちらも `{0: nonce(32)}` という同じ形
 /// なので実装を共有する。
 fn decode_nonce32(fields: &[u8], tag: u8, step: &'static str) -> Result<[u8; 32], CommissionError> {
     let mut map = scan_struct_fields(fields, step)?;
-    let bytes = take_bytes(&mut map, tag).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing nonce",
-    })?;
+    let bytes = required(take_bytes(&mut map, tag), step, "missing nonce")?;
     bytes.try_into().map_err(|_| CommissionError::Malformed {
         step,
         detail: "nonce length",
@@ -42,74 +26,69 @@ fn decode_nonce32(fields: &[u8], tag: u8, step: &'static str) -> Result<[u8; 32]
 }
 
 /// ArmFailSafeRequest（spec §11.10.6.2）: `{0: ExpiryLengthSeconds, 1:
-/// Breadcrumb}`。デバイス側 decoder（逆方向は [`encode_arm_fail_safe`]）。
+/// Breadcrumb}`。デバイス側 decoder（逆方向は [`super::encode_arm_fail_safe`]）。
 /// 戻り値は `(expiry_seconds, breadcrumb)`——`Breadcrumb` は spec上 optional
 /// なので欠落時は 0。
 pub fn decode_arm_fail_safe(fields: &[u8]) -> Result<(u16, u64), CommissionError> {
     let step = "arm_fail_safe_request";
     let mut map = scan_struct_fields(fields, step)?;
-    let expiry =
-        take_u16(&mut map, 0, step, "expiry out of range")?.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing expiry",
-        })?;
+    let expiry = required(
+        take_uint::<u16>(&mut map, 0, step, "expiry out of range")?,
+        step,
+        "missing expiry",
+    )?;
     let breadcrumb = take_u64(&mut map, 1).unwrap_or(0);
     Ok((expiry, breadcrumb))
 }
 
 /// SetRegulatoryConfigRequest（spec §11.10.6.4）: `{0: NewRegulatoryConfig,
 /// 1: CountryCode, 2: Breadcrumb}`。デバイス側 decoder（逆方向は
-/// [`encode_set_regulatory_config`]）。戻り値は `(config, country,
+/// [`super::encode_set_regulatory_config`]）。戻り値は `(config, country,
 /// breadcrumb)`。
 pub fn decode_set_regulatory_config(fields: &[u8]) -> Result<(u8, String, u64), CommissionError> {
     let step = "set_regulatory_config_request";
     let mut map = scan_struct_fields(fields, step)?;
-    let config =
-        take_u8(&mut map, 0, step, "config out of range")?.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing config",
-        })?;
-    let country = take_utf8(&mut map, 1).ok_or(CommissionError::Malformed {
+    let config = required(
+        take_uint::<u8>(&mut map, 0, step, "config out of range")?,
         step,
-        detail: "missing country",
-    })?;
+        "missing config",
+    )?;
+    let country = required(take_utf8(&mut map, 1), step, "missing country")?;
     let breadcrumb = take_u64(&mut map, 2).unwrap_or(0);
     Ok((config, country, breadcrumb))
 }
 
 /// AttestationRequest（spec §11.17.6.7）: `{0: AttestationNonce}`。デバイス
-/// 側 decoder（逆方向は [`encode_attestation_request`]）。
+/// 側 decoder（逆方向は [`super::encode_attestation_request`]）。
 pub fn decode_attestation_request(fields: &[u8]) -> Result<[u8; 32], CommissionError> {
     decode_nonce32(fields, 0, "attestation_request")
 }
 
 /// CertificateChainRequest（spec §11.17.6.4）: `{0: CertificateType}`
 /// （`CERT_TYPE_DAC`/`CERT_TYPE_PAI`）。デバイス側 decoder（逆方向は
-/// [`encode_cert_chain_request`]）。
+/// [`super::encode_cert_chain_request`]）。
 pub fn decode_cert_chain_request(fields: &[u8]) -> Result<u8, CommissionError> {
     let step = "cert_chain_request";
     let mut map = scan_struct_fields(fields, step)?;
-    take_u8(&mut map, 0, step, "cert type out of range")?.ok_or(CommissionError::Malformed {
+    required(
+        take_uint::<u8>(&mut map, 0, step, "cert type out of range")?,
         step,
-        detail: "missing cert type",
-    })
+        "missing cert type",
+    )
 }
 
 /// CSRRequest（spec §11.17.6.9）: `{0: CSRNonce}`。デバイス側 decoder（逆
-/// 方向は [`encode_csr_request`]）。
+/// 方向は [`super::encode_csr_request`]）。
 pub fn decode_csr_request(fields: &[u8]) -> Result<[u8; 32], CommissionError> {
     decode_nonce32(fields, 0, "csr_request")
 }
 
 /// AddTrustedRootCertificate（spec §11.17.6.11）: `{0: RootCACertificate}`。
-/// デバイス側 decoder（逆方向は [`encode_add_trusted_root`]）。
+/// デバイス側 decoder（逆方向は [`super::encode_add_trusted_root`]）。
 pub fn decode_add_trusted_root(fields: &[u8]) -> Result<Vec<u8>, CommissionError> {
     let step = "add_trusted_root_request";
     let mut map = scan_struct_fields(fields, step)?;
-    take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing rcac",
-    })
+    required(take_bytes(&mut map, 0), step, "missing rcac")
 }
 
 /// [`decode_add_noc`]'s decoded fields: `(noc_tlv, icac_tlv, ipk_epoch,
@@ -118,42 +97,32 @@ pub type AddNocFields = (Vec<u8>, Option<Vec<u8>>, [u8; 16], u64, u16);
 
 /// AddNOC（spec §11.17.6.13）: `{0: NOCValue, 1: ICACValue(optional), 2:
 /// IPKValue, 3: CaseAdminSubject, 4: AdminVendorId}`。デバイス側 decoder
-/// （逆方向は [`encode_add_noc`] — あちらは tag1（ICACValue）を意図的に
+/// （逆方向は [`super::encode_add_noc`] — あちらは tag1（ICACValue）を意図的に
 /// 省略するが、この decoder は spec どおり optional として受理する）。戻り
 /// 値は [`AddNocFields`]。
 pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
     let step = "add_noc_request";
     let mut map = scan_struct_fields(fields, step)?;
-    let noc = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing noc",
-    })?;
+    let noc = required(take_bytes(&mut map, 0), step, "missing noc")?;
     let icac = take_bytes(&mut map, 1);
-    let ipk_bytes = take_bytes(&mut map, 2).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing ipk",
-    })?;
+    let ipk_bytes = required(take_bytes(&mut map, 2), step, "missing ipk")?;
     let ipk: [u8; 16] = ipk_bytes
         .try_into()
         .map_err(|_| CommissionError::Malformed {
             step,
             detail: "ipk length",
         })?;
-    let case_admin_subject = take_u64(&mut map, 3).ok_or(CommissionError::Malformed {
+    let case_admin_subject = required(take_u64(&mut map, 3), step, "missing case admin subject")?;
+    let admin_vendor_id = required(
+        take_uint::<u16>(&mut map, 4, step, "admin vendor id out of range")?,
         step,
-        detail: "missing case admin subject",
-    })?;
-    let admin_vendor_id = take_u16(&mut map, 4, step, "admin vendor id out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing admin vendor id",
-        },
+        "missing admin vendor id",
     )?;
     Ok((noc, icac, ipk, case_admin_subject, admin_vendor_id))
 }
 
 /// UpdateFabricLabel（spec §11.17.6.11）: `{0: Label}`。デバイス側 decoder
-/// （逆方向は [`encode_update_fabric_label`]）。`Label` は spec 上最大 32
+/// （逆方向は [`super::encode_update_fabric_label`]）。`Label` は spec 上最大 32
 /// 文字（§11.17.5.20 `FabricDescriptorStruct` の `Label` フィールドと同じ
 /// 制約）——超過は `CommissionError::Malformed` にする。呼び出し元
 /// （`mat_device::core::commissioning`）は他の decode エラーと同じく
@@ -162,10 +131,7 @@ pub fn decode_add_noc(fields: &[u8]) -> Result<AddNocFields, CommissionError> {
 pub fn decode_update_fabric_label(fields: &[u8]) -> Result<String, CommissionError> {
     let step = "update_fabric_label_request";
     let mut map = scan_struct_fields(fields, step)?;
-    let label = take_utf8(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing label",
-    })?;
+    let label = required(take_utf8(&mut map, 0), step, "missing label")?;
     if label.len() > 32 {
         return Err(CommissionError::Malformed {
             step,
@@ -176,17 +142,18 @@ pub fn decode_update_fabric_label(fields: &[u8]) -> Result<String, CommissionErr
 }
 
 /// RemoveFabric（spec §11.17.6.15）: `{0: FabricIndex}`。デバイス側 decoder
-/// （逆方向は [`encode_remove_fabric`]）。`UpdateFabricLabel` と異なり
+/// （逆方向は [`super::encode_remove_fabric`]）。`UpdateFabricLabel` と異なり
 /// `FabricIndex` を明示するのは、削除対象が呼び出しセッション自身の
 /// fabric とは限らないから（Android がハンドオフ後に自分の一時 fabric
 /// を名指しで消すのが典型ケース）。
 pub fn decode_remove_fabric(fields: &[u8]) -> Result<u8, CommissionError> {
     let step = "remove_fabric_request";
     let mut map = scan_struct_fields(fields, step)?;
-    take_u8(&mut map, 0, step, "fabric index out of range")?.ok_or(CommissionError::Malformed {
+    required(
+        take_uint::<u8>(&mut map, 0, step, "fabric index out of range")?,
         step,
-        detail: "missing fabric index",
-    })
+        "missing fabric index",
+    )
 }
 
 /// [`decode_open_commissioning_window`]'s decoded fields: `(timeout_s,
@@ -195,7 +162,7 @@ pub type OpenCommissioningWindowFields = (u16, Vec<u8>, u16, u32, Vec<u8>);
 
 /// OpenCommissioningWindow（spec §11.19.8.1）: `{0: CommissioningTimeout, 1:
 /// PAKEPasscodeVerifier, 2: Discriminator, 3: Iterations, 4: Salt}`。デバイ
-/// ス側 decoder（逆方向は [`encode_open_commissioning_window`]）。戻り値は
+/// ス側 decoder（逆方向は [`super::encode_open_commissioning_window`]）。戻り値は
 /// [`OpenCommissioningWindowFields`] — 範囲検証（verifier 長 97 /
 /// iterations 1000..=100000 / salt 長 16..=32 / timeout 180..=900）はここ
 /// では行わない（デバイス側ハンドラが Busy/PAKEParameterError/
@@ -205,38 +172,30 @@ pub fn decode_open_commissioning_window(
 ) -> Result<OpenCommissioningWindowFields, CommissionError> {
     let step = "open_commissioning_window_request";
     let mut map = scan_struct_fields(fields, step)?;
-    let timeout_s =
-        take_u16(&mut map, 0, step, "timeout out of range")?.ok_or(CommissionError::Malformed {
-            step,
-            detail: "missing timeout",
-        })?;
-    let verifier = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
+    let timeout_s = required(
+        take_uint::<u16>(&mut map, 0, step, "timeout out of range")?,
         step,
-        detail: "missing verifier",
-    })?;
-    let discriminator = take_u16(&mut map, 2, step, "discriminator out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing discriminator",
-        },
+        "missing timeout",
     )?;
-    let iterations = take_u32(&mut map, 3, step, "iterations out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing iterations",
-        },
-    )?;
-    let salt = take_bytes(&mut map, 4).ok_or(CommissionError::Malformed {
+    let verifier = required(take_bytes(&mut map, 1), step, "missing verifier")?;
+    let discriminator = required(
+        take_uint::<u16>(&mut map, 2, step, "discriminator out of range")?,
         step,
-        detail: "missing salt",
-    })?;
+        "missing discriminator",
+    )?;
+    let iterations = required(
+        take_uint::<u32>(&mut map, 3, step, "iterations out of range")?,
+        step,
+        "missing iterations",
+    )?;
+    let salt = required(take_bytes(&mut map, 4), step, "missing salt")?;
     Ok((timeout_s, verifier, discriminator, iterations, salt))
 }
 
 /// `*CommissioningResponse`（ArmFailSafeResponse / SetRegulatoryConfig
 /// Response / CommissioningCompleteResponse 共通、spec §11.10.6.3 / .5 /
 /// .7）: `{0: ErrorCode, 1: DebugText}`。デバイス側 encoder（逆方向は
-/// [`decode_commissioning_status_response`]）。
+/// [`super::decode_commissioning_status_response`]）。
 ///
 /// `DebugText` は spec 上 **mandatory**（空でもタグを省略できない）。
 /// 我々の decoder は欠落を空文字列で埋める寛容な実装なので自己往復では
@@ -255,7 +214,7 @@ pub fn encode_commissioning_status_response(error_code: u8, debug_text: &str) ->
 
 /// AttestationResponse（spec §11.17.6.8）: `{0: AttestationElements, 1:
 /// AttestationSignature}`。デバイス側 encoder（逆方向は
-/// [`decode_attestation_response`]）。
+/// [`super::decode_attestation_response`]）。
 pub fn encode_attestation_response(elements: &[u8], signature: &[u8; 64]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
@@ -266,7 +225,7 @@ pub fn encode_attestation_response(elements: &[u8], signature: &[u8; 64]) -> Vec
 }
 
 /// CertificateChainResponse（spec §11.17.6.5）: `{0: Certificate}`。デバイ
-/// ス側 encoder（逆方向は [`decode_cert_chain_response`]）。
+/// ス側 encoder（逆方向は [`super::decode_cert_chain_response`]）。
 pub fn encode_cert_chain_response(cert_der: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
@@ -276,7 +235,7 @@ pub fn encode_cert_chain_response(cert_der: &[u8]) -> Vec<u8> {
 }
 
 /// NOCSRElements（spec §11.17.6.10.1）: `{1: csr, 2: CSRNonce}`。デバイス側
-/// encoder（逆方向は [`parse_nocsr_elements`]）——vendor reserved フィール
+/// encoder（逆方向は [`super::parse_nocsr_elements`]）——vendor reserved フィール
 /// ド（tag3/4）は出さない。
 pub fn encode_nocsr_elements(csr_der: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
     let mut w = Writer::new();
@@ -289,7 +248,7 @@ pub fn encode_nocsr_elements(csr_der: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
 
 /// CSRResponse（spec §11.17.6.10）: `{0: NOCSRElements, 1:
 /// AttestationSignature}`。デバイス側 encoder（逆方向は
-/// [`decode_csr_response`]）。`nocsr_elements` は [`encode_nocsr_elements`]
+/// [`super::decode_csr_response`]）。`nocsr_elements` は [`encode_nocsr_elements`]
 /// の出力（生 TLV バイト列）をそのまま渡す。
 pub fn encode_csr_response(nocsr_elements: &[u8], signature: &[u8; 64]) -> Vec<u8> {
     let mut w = Writer::new();
@@ -302,7 +261,7 @@ pub fn encode_csr_response(nocsr_elements: &[u8], signature: &[u8; 64]) -> Vec<u
 
 /// NOCResponse（spec §11.17.6.14, AddNOC / RemoveFabric 共通の応答）:
 /// `{0: StatusCode, 1: FabricIndex(optional), 2: DebugText(optional)}`。
-/// デバイス側 encoder（逆方向は [`decode_noc_response`]）。
+/// デバイス側 encoder（逆方向は [`super::decode_noc_response`]）。
 pub fn encode_noc_response(status: u8, fabric_index: Option<u8>) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);

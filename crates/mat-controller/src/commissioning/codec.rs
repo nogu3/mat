@@ -4,7 +4,7 @@
 
 use crate::tlv::{Tag, Writer};
 
-use super::tlv_fields::{scan_struct_fields, take_bytes, take_u8, take_utf8};
+use super::tlv_fields::{required, scan_struct_fields, take_bytes, take_uint, take_utf8};
 use super::CommissionError;
 
 // --- builders ---
@@ -181,11 +181,10 @@ pub fn decode_commissioning_status_response(
 ) -> Result<(u8, String), CommissionError> {
     let step = "commissioning_status_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let error_code = take_u8(&mut map, 0, step, "errorCode out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing errorCode",
-        },
+    let error_code = required(
+        take_uint::<u8>(&mut map, 0, step, "errorCode out of range")?,
+        step,
+        "missing errorCode",
     )?;
     let debug_text = take_utf8(&mut map, 1).unwrap_or_default();
     Ok((error_code, debug_text))
@@ -196,14 +195,8 @@ pub fn decode_commissioning_status_response(
 pub fn decode_attestation_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), CommissionError> {
     let step = "attestation_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let elements = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing elements",
-    })?;
-    let sig_bytes = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing signature",
-    })?;
+    let elements = required(take_bytes(&mut map, 0), step, "missing elements")?;
+    let sig_bytes = required(take_bytes(&mut map, 1), step, "missing signature")?;
     let signature: [u8; 64] = sig_bytes
         .try_into()
         .map_err(|_| CommissionError::Malformed {
@@ -218,10 +211,7 @@ pub fn decode_attestation_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]),
 pub fn decode_cert_chain_response(fields: &[u8]) -> Result<Vec<u8>, CommissionError> {
     let step = "cert_chain_response";
     let mut map = scan_struct_fields(fields, step)?;
-    take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing certificate",
-    })
+    required(take_bytes(&mut map, 0), step, "missing certificate")
 }
 
 /// CSRResponse（spec §11.17.6.10）: `{0: NOCSRElements, 1:
@@ -231,14 +221,8 @@ pub fn decode_cert_chain_response(fields: &[u8]) -> Result<Vec<u8>, CommissionEr
 pub fn decode_csr_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), CommissionError> {
     let step = "csr_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let elements = take_bytes(&mut map, 0).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing nocsr elements",
-    })?;
-    let sig_bytes = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing signature",
-    })?;
+    let elements = required(take_bytes(&mut map, 0), step, "missing nocsr elements")?;
+    let sig_bytes = required(take_bytes(&mut map, 1), step, "missing signature")?;
     let signature: [u8; 64] = sig_bytes
         .try_into()
         .map_err(|_| CommissionError::Malformed {
@@ -254,14 +238,8 @@ pub fn decode_csr_response(fields: &[u8]) -> Result<(Vec<u8>, [u8; 64]), Commiss
 pub fn parse_nocsr_elements(elements: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CommissionError> {
     let step = "nocsr_elements";
     let mut map = scan_struct_fields(elements, step)?;
-    let csr = take_bytes(&mut map, 1).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing csr",
-    })?;
-    let nonce = take_bytes(&mut map, 2).ok_or(CommissionError::Malformed {
-        step,
-        detail: "missing csr nonce",
-    })?;
+    let csr = required(take_bytes(&mut map, 1), step, "missing csr")?;
+    let nonce = required(take_bytes(&mut map, 2), step, "missing csr nonce")?;
     Ok((csr, nonce))
 }
 
@@ -271,13 +249,12 @@ pub fn parse_nocsr_elements(elements: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Commi
 pub fn decode_noc_response(fields: &[u8]) -> Result<(u8, Option<u8>), CommissionError> {
     let step = "noc_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let status = take_u8(&mut map, 0, step, "statusCode out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing statusCode",
-        },
+    let status = required(
+        take_uint::<u8>(&mut map, 0, step, "statusCode out of range")?,
+        step,
+        "missing statusCode",
     )?;
-    let fabric_index = take_u8(&mut map, 1, step, "fabricIndex out of range")?;
+    let fabric_index = take_uint::<u8>(&mut map, 1, step, "fabricIndex out of range")?;
     Ok((status, fabric_index))
 }
 
@@ -290,11 +267,10 @@ pub fn decode_network_config_response(
 ) -> Result<(u8, Option<String>), CommissionError> {
     let step = "network_config_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let status = take_u8(&mut map, 0, step, "networkingStatus out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing networkingStatus",
-        },
+    let status = required(
+        take_uint::<u8>(&mut map, 0, step, "networkingStatus out of range")?,
+        step,
+        "missing networkingStatus",
     )?;
     let debug_text = take_utf8(&mut map, 1);
     Ok((status, debug_text))
@@ -310,11 +286,10 @@ pub fn decode_connect_network_response(
 ) -> Result<(u8, Option<String>), CommissionError> {
     let step = "connect_network_response";
     let mut map = scan_struct_fields(fields, step)?;
-    let status = take_u8(&mut map, 0, step, "networkingStatus out of range")?.ok_or(
-        CommissionError::Malformed {
-            step,
-            detail: "missing networkingStatus",
-        },
+    let status = required(
+        take_uint::<u8>(&mut map, 0, step, "networkingStatus out of range")?,
+        step,
+        "missing networkingStatus",
     )?;
     let debug_text = take_utf8(&mut map, 1);
     Ok((status, debug_text))
