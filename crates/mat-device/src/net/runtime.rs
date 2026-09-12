@@ -489,22 +489,6 @@ fn iface_link_local_addr(iface: &str) -> Result<Ipv6Addr, DeviceError> {
     )))
 }
 
-/// Builds the `OperationalAdvert` for one installed fabric entry.
-fn operational_advert(
-    entry: &FabricEntry,
-    hostname: &str,
-    port: u16,
-    addr_v6: Ipv6Addr,
-) -> OperationalAdvert {
-    OperationalAdvert {
-        compressed_fabric_id: compressed_fabric_id(&entry.root_public_key, entry.fabric_id),
-        node_id: entry.node_id,
-        hostname: hostname.to_string(),
-        port,
-        addr_v6,
-    }
-}
-
 /// The mDNS advertiser plus everything needed to build adverts for it
 /// (hostname/port/address are fixed for the process lifetime once
 /// resolved). Kept together, behind one `Option`, because bringing up mDNS
@@ -516,6 +500,48 @@ struct MdnsCtx {
     hostname: String,
     port: u16,
     addr_v6: Ipv6Addr,
+}
+
+impl MdnsCtx {
+    /// The commissionable advert for the current window
+    /// (`advert_params_for_window` decides `discriminator`/`cm`). A fresh
+    /// random instance name every time, per spec §4.3.1.
+    fn commissionable_advert(
+        &self,
+        config: &DeviceConfig,
+        discriminator: u16,
+        cm: u8,
+    ) -> CommissionableAdvert {
+        CommissionableAdvert {
+            instance: random_hex_name(),
+            hostname: self.hostname.clone(),
+            discriminator,
+            vendor_id: config.vendor_id,
+            product_id: config.product_id,
+            port: self.port,
+            addr_v6: self.addr_v6,
+            cm,
+        }
+    }
+
+    /// Builds the `OperationalAdvert` for one installed fabric entry.
+    fn operational_advert(&self, entry: &FabricEntry) -> OperationalAdvert {
+        OperationalAdvert {
+            compressed_fabric_id: compressed_fabric_id(&entry.root_public_key, entry.fabric_id),
+            node_id: entry.node_id,
+            hostname: self.hostname.clone(),
+            port: self.port,
+            addr_v6: self.addr_v6,
+        }
+    }
+
+    /// Withdraws `entry`'s operational advert (goodbye + drop).
+    async fn retire_operational(&self, entry: &FabricEntry) {
+        let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
+        self.mdns
+            .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
+            .await;
+    }
 }
 
 /// Brings up the mDNS advertiser: resolves `config.iface`, spawns the
@@ -568,21 +594,20 @@ async fn bring_up_mdns(
     let mdns = MdnsAdvertiser::spawn(scope_id)
         .await
         .map_err(DeviceError::Io)?;
+    let ctx = MdnsCtx {
+        mdns,
+        hostname,
+        port,
+        addr_v6,
+    };
     if let Some((discriminator, cm)) = advert_params_for_window(window, config.discriminator) {
-        mdns.set_commissionable(Some(CommissionableAdvert {
-            instance: random_hex_name(),
-            hostname: hostname.clone(),
-            discriminator,
-            vendor_id: config.vendor_id,
-            product_id: config.product_id,
-            port,
-            addr_v6,
-            cm,
-        }))
-        .await;
+        ctx.mdns
+            .set_commissionable(Some(ctx.commissionable_advert(config, discriminator, cm)))
+            .await;
     }
     for entry in comm_server.fabrics() {
-        mdns.add_operational(operational_advert(&entry, &hostname, port, addr_v6))
+        ctx.mdns
+            .add_operational(ctx.operational_advert(&entry))
             .await;
     }
     // Every `set_commissionable`/`add_operational` call above already
@@ -594,14 +619,9 @@ async fn bring_up_mdns(
     // proactively broadcast the moment mDNS is up, not just answered on
     // demand — and is otherwise harmless (RFC 6762 puts no limit on how
     // often a responder may announce its own records).
-    mdns.announce().await;
+    ctx.mdns.announce().await;
 
-    Ok(MdnsCtx {
-        mdns,
-        hostname,
-        port,
-        addr_v6,
-    })
+    Ok(ctx)
 }
 
 /// `bring_up_mdns` retry backoff state, kept only while mDNS hasn't come up
@@ -1292,10 +1312,7 @@ impl Runtime {
                 "fail-safe expired without CommissioningComplete — rolling back fabric and its mDNS advert"
             );
             if let Some(ctx) = self.state.mdns.as_ref() {
-                let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-                ctx.mdns
-                    .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                    .await;
+                ctx.retire_operational(&entry).await;
             }
         }
     }
@@ -1323,12 +1340,7 @@ impl Runtime {
                         .handle_group_invoke(&batch.endpoints, &batch.invokes, &mut ctx);
                 tracing::debug!(peer = %from, fabric_index = batch.fabric_index, group_id = batch.group_id, source_node_id = batch.source_node_id, endpoints = ?batch.endpoints, changed = changed.len(), "groupcast invoke applied");
                 if let Some(sub) = self.state.subscription.as_mut() {
-                    sub.note_changed(&changed);
-                    // No cluster emits from a groupcast invoke today (see
-                    // `Node::drain_events`), so this is a no-op — kept next
-                    // to `note_changed` so the day one does, its events get
-                    // the urgent regime instead of waiting for a keep-alive.
-                    sub.note_events(&self.state.node.recent_events(sub.next_event));
+                    sub.note_outcome(&changed, &self.state.node);
                 }
             }
             Err(reason) => {
@@ -1364,8 +1376,7 @@ impl Runtime {
                             "stimulus applied"
                         );
                         if let Some(sub) = self.state.subscription.as_mut() {
-                            sub.note_changed(&out.changed);
-                            sub.note_events(&self.state.node.recent_events(sub.next_event));
+                            sub.note_outcome(&out.changed, &self.state.node);
                         }
                         Ok(out)
                     }
@@ -1618,14 +1629,8 @@ async fn serve_secured_message(
         // becomes dirty — the `select!` report branch (`on_subscription_due`) picks it up at
         // the subscription's next deadline. Recorded *before* the reply is
         // sent so a change is never lost to a failing reply.
-        //
-        // Same for anything it *emitted*: no cluster emits from an invoke or
-        // a write today (see `Node::drain_events`), so `note_events` is a
-        // no-op — kept here so the first one that does gets the urgent
-        // regime, exactly as a stimulus-driven event does (`on_stimulus`).
         if let Some(sub) = subscription.as_mut() {
-            sub.note_changed(&changed);
-            sub.note_events(&node.recent_events(sub.next_event));
+            sub.note_outcome(&changed, node);
         }
         let reply_result = session
             .reply_reliable(
@@ -1684,12 +1689,7 @@ async fn advertise_added_fabric(
     if fabrics_after.len() > fabrics_before {
         if let (Some(entry), Some(ctx)) = (fabrics_after.last(), mdns) {
             ctx.mdns
-                .add_operational(operational_advert(
-                    entry,
-                    &ctx.hostname,
-                    ctx.port,
-                    ctx.addr_v6,
-                ))
+                .add_operational(ctx.operational_advert(entry))
                 .await;
         }
     }
@@ -1720,16 +1720,7 @@ async fn reconcile_admin_window(
                 (mdns, advert_params_for_window(window, config.discriminator))
             {
                 ctx.mdns
-                    .set_commissionable(Some(CommissionableAdvert {
-                        instance: random_hex_name(),
-                        hostname: ctx.hostname.clone(),
-                        discriminator,
-                        vendor_id: config.vendor_id,
-                        product_id: config.product_id,
-                        port: ctx.port,
-                        addr_v6: ctx.addr_v6,
-                        cm,
-                    }))
+                    .set_commissionable(Some(ctx.commissionable_advert(config, discriminator, cm)))
                     .await;
             }
         }
@@ -1755,38 +1746,43 @@ async fn close_window_on_commissioning_complete(
     mdns: Option<&MdnsCtx>,
     window: &mut CommissioningWindow,
 ) {
-    if resp_opcode == im::OPCODE_INVOKE_RESPONSE {
-        if let Some((cluster, command)) = req_cluster_command {
-            if cluster == mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
-                && command == mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
-            {
-                if let Ok(outcome) = im::decode_invoke_response(resp_payload) {
-                    if outcome.status == im::STATUS_SUCCESS {
-                        if let Some(ctx) = mdns {
-                            ctx.mdns.set_commissionable(None).await;
-                        }
-                        // Task 14: CommissioningComplete is the other event
-                        // (besides the 15-minute/`CommissioningTimeout`
-                        // deadline in `on_commissioning_window_expired`) that closes the
-                        // commissioning window — a controller that just
-                        // finished commissioning has no reason to PASE in
-                        // again, and refusing it stops a second
-                        // commissioner from racing in during whatever's
-                        // left of the window.
-                        *window = CommissioningWindow::Closed;
-                        // Task 4: this close is runtime-initiated (General
-                        // Commissioning's CommissioningComplete doesn't
-                        // touch the AC cluster's admin_window itself), so
-                        // tell core explicitly — keeps `WindowStatus`
-                        // honest for an ECM window that just got
-                        // committed by completion rather than expiry/
-                        // revoke. A no-op for the boot window.
-                        comm_server.close_admin_window();
-                    }
-                }
-            }
-        }
+    if resp_opcode != im::OPCODE_INVOKE_RESPONSE {
+        return;
     }
+    let Some((cluster, command)) = req_cluster_command else {
+        return;
+    };
+    if cluster != mat_controller::commissioning::CLUSTER_GENERAL_COMMISSIONING
+        || command != mat_controller::commissioning::CMD_COMMISSIONING_COMPLETE
+    {
+        return;
+    }
+    let Ok(outcome) = im::decode_invoke_response(resp_payload) else {
+        return;
+    };
+    if outcome.status != im::STATUS_SUCCESS {
+        return;
+    }
+    if let Some(ctx) = mdns {
+        ctx.mdns.set_commissionable(None).await;
+    }
+    // Task 14: CommissioningComplete is the other event
+    // (besides the 15-minute/`CommissioningTimeout`
+    // deadline in `on_commissioning_window_expired`) that closes the
+    // commissioning window — a controller that just
+    // finished commissioning has no reason to PASE in
+    // again, and refusing it stops a second
+    // commissioner from racing in during whatever's
+    // left of the window.
+    *window = CommissioningWindow::Closed;
+    // Task 4: this close is runtime-initiated (General
+    // Commissioning's CommissioningComplete doesn't
+    // touch the AC cluster's admin_window itself), so
+    // tell core explicitly — keeps `WindowStatus`
+    // honest for an ECM window that just got
+    // committed by completion rather than expiry/
+    // revoke. A no-op for the boot window.
+    comm_server.close_admin_window();
 }
 
 /// RemoveFabric (Task 6): the store may have shed a fabric this
@@ -1807,10 +1803,7 @@ async fn retire_removed_fabric(
 ) -> ServeOutcome {
     if let Some(entry) = comm_server.take_removed_fabric() {
         if let Some(ctx) = mdns {
-            let cfid = compressed_fabric_id(&entry.root_public_key, entry.fabric_id);
-            ctx.mdns
-                .remove_operational(u64::from_be_bytes(cfid), entry.node_id)
-                .await;
+            ctx.retire_operational(&entry).await;
         }
         if remove_fabric_drops_session(entry.fabric_index, session_fabric_index) {
             tracing::info!(
@@ -2199,10 +2192,11 @@ fn fit_events(
 /// ceiling, which would fail the send and drop the subscription). So only
 /// the longest prefix that fits `REPORT_CHUNK_BUDGET` goes out, oldest
 /// first; `sub.next_event` then advances to *what was actually sent* + 1,
-/// and `pending_urgent` is kept set whenever something was left out, so the
-/// remainder follows at the next min-interval instead of waiting for the
-/// max-interval keep-alive. Nothing is lost — the log holds it until it is
-/// reported (or until the FIFO overruns, which is the pre-existing cap).
+/// and `pending_urgent` is left as `note_events` set it whenever something
+/// was left out (so an urgent remainder follows at the next min-interval
+/// instead of waiting for the max-interval keep-alive) and cleared once a
+/// report drained everything. Nothing is lost — the log holds it until it
+/// is reported (or until the FIFO overruns, which is the pre-existing cap).
 ///
 /// Returns `false` if the report couldn't be delivered or the subscriber
 /// answered anything other than SUCCESS; the caller then drops the
