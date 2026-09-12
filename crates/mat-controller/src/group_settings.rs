@@ -113,24 +113,10 @@ fn corrupt(key: &str, reason: &'static str) -> GroupSettingsError {
 }
 
 /// 未知タグを読み飛ばして、現在開いているコンテナ（相対深さ0）の
-/// `ContainerEnd` まで消費する（`kvs.rs` の `skip_rest_of_container` と
-/// 同じ寛容走査だが、こちらの parser 群は `Option` チェーンで書かれている
-/// ので `Option` を返す）。
+/// `ContainerEnd` まで消費する（[`crate::tlv::skip_container`] の `Option`
+/// 版 — こちらの parser 群は `Option` チェーンで書かれている）。
 fn skip_container(r: &mut Reader) -> Option<()> {
-    let mut depth: i32 = 0;
-    loop {
-        let el = r.next().ok()??;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => {
-                if depth == 0 {
-                    return Some(());
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
+    crate::tlv::skip_container(r).ok()
 }
 
 /// GroupName を `GROUP_NAME_MAX` バイト以内へ char 境界で切り詰める。上流は

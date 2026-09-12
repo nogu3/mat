@@ -166,21 +166,13 @@ fn next_keyset_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a
 /// `ContainerEnd` that matches the container we're inside of). Used both to
 /// skip over unknown/uninteresting subtrees and to finish consuming a
 /// container after we've already extracted what we needed from its start.
+/// Delegates to [`crate::tlv::skip_container`], folding every failure into
+/// `BadKeyset { "malformed tlv" }` like `next_keyset_el`.
 fn skip_rest_of_container(r: &mut Reader, fabric_index: u8) -> Result<(), KvsError> {
-    let mut depth: i32 = 0;
-    loop {
-        let el = next_keyset_el(r, fabric_index)?;
-        match el.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => {
-                if depth == 0 {
-                    return Ok(());
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
+    crate::tlv::skip_container(r).map_err(|_| KvsError::BadKeyset {
+        fabric_index,
+        reason: "malformed tlv",
+    })
 }
 
 /// Parses one `GroupKey` struct (start_time / hash / key bytes) from within

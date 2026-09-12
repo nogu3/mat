@@ -37,16 +37,15 @@ pub(super) fn expect_struct(r: &mut Reader, step: &'static str) -> Result<(), Co
 
 /// 未知のタグに付随するコンテナを、対応する `ContainerEnd` まで読み飛ばす
 /// （深さ 1 の状態、つまり start 要素は読み終わっている前提）。
+/// [`crate::tlv::skip_container`] に委譲し、[`next_el`] と同じ文言へ写す。
 pub(super) fn skip_container(r: &mut Reader, step: &'static str) -> Result<(), CommissionError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        match next_el(r, step)?.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
+    crate::tlv::skip_container(r).map_err(|e| CommissionError::Malformed {
+        step,
+        detail: match e {
+            crate::tlv::TlvError::Truncated => "truncated",
+            _ => "tlv decode error",
+        },
+    })
 }
 
 /// [`scan_struct_fields`] が集める TLV leaf 要素の値。以下の decoder が読む

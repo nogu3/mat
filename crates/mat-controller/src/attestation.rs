@@ -380,28 +380,31 @@ fn parse_elements(elements: &[u8]) -> Result<(Vec<u8>, [u8; 32]), AttestationErr
 
     let mut cd: Option<Vec<u8>> = None;
     let mut nonce: Option<[u8; 32]> = None;
-    let mut depth = 0usize; // 深さ 0 = AttestationElements 直下
     loop {
         let el = r
             .next()
             .map_err(|_| AttestationError::Elements("tlv parse error"))?
             .ok_or(AttestationError::Elements("truncated elements"))?;
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
+            (_, Value::ContainerEnd) => break,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                // vendor-reserved のネストは丸ごと読み飛ばす（中の Context(2) を
+                // nonce と誤認しない）。
+                crate::tlv::skip_container(&mut r).map_err(|e| match e {
+                    crate::tlv::TlvError::Truncated => {
+                        AttestationError::Elements("truncated elements")
+                    }
+                    _ => AttestationError::Elements("tlv parse error"),
+                })?;
             }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => depth += 1,
-            (Tag::Context(1), Value::Bytes(b)) if depth == 0 => cd = Some(b.to_vec()),
-            (Tag::Context(2), Value::Bytes(b)) if depth == 0 => {
+            (Tag::Context(1), Value::Bytes(b)) => cd = Some(b.to_vec()),
+            (Tag::Context(2), Value::Bytes(b)) => {
                 nonce = Some(
                     b.try_into()
                         .map_err(|_| AttestationError::Elements("nonce wrong length"))?,
                 );
             }
-            _ => {} // timestamp / firmware_information / ネスト内要素は素通り
+            _ => {} // timestamp / firmware_information は素通り
         }
     }
 
