@@ -4,7 +4,9 @@
 use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
 
 use super::read::{decode_attribute_path_ib, decode_attribute_status_ib};
-use super::{expect_struct_start, skip_container, ImError, IM_REVISION};
+use super::{
+    expect_struct_start, put_attribute_path, put_status_ib, skip_container, ImError, IM_REVISION,
+};
 
 /// WriteRequestMessage (spec §8.9.2.4) の共通本体。`timed` が TimedRequest
 /// フィールドの値になる。公開関数 `encode_write_request_tlv` /
@@ -23,11 +25,7 @@ fn encode_write_request_inner(
     w.put_bool(Tag::Context(1), timed); // TimedRequest
     w.start_array(Tag::Context(2)); // WriteRequests
     w.start_struct(Tag::Anonymous); // AttributeDataIB
-    w.start_list(Tag::Context(1)); // AttributePathIB
-    w.put_uint(Tag::Context(2), u64::from(endpoint));
-    w.put_uint(Tag::Context(3), u64::from(cluster));
-    w.put_uint(Tag::Context(4), u64::from(attribute));
-    w.end_container(); // AttributePathIB
+    put_attribute_path(&mut w, Tag::Context(1), endpoint, cluster, Some(attribute)); // AttributePathIB
     w.put_raw_element(Tag::Context(2), data_tlv); // Data
     w.end_container(); // AttributeDataIB
     w.end_container(); // WriteRequests
@@ -257,14 +255,8 @@ pub fn encode_write_response(results: &[(u16, u32, u32, u8)]) -> Vec<u8> {
     w.start_array(Tag::Context(0)); // WriteResponses
     for &(endpoint, cluster, attribute, status) in results {
         w.start_struct(Tag::Anonymous); // AttributeStatusIB
-        w.start_list(Tag::Context(0)); // Path
-        w.put_uint(Tag::Context(2), u64::from(endpoint));
-        w.put_uint(Tag::Context(3), u64::from(cluster));
-        w.put_uint(Tag::Context(4), u64::from(attribute));
-        w.end_container(); // Path
-        w.start_struct(Tag::Context(1)); // StatusIB
-        w.put_uint(Tag::Context(0), u64::from(status));
-        w.end_container(); // StatusIB
+        put_attribute_path(&mut w, Tag::Context(0), endpoint, cluster, Some(attribute)); // Path
+        put_status_ib(&mut w, Tag::Context(1), status, None); // StatusIB
         w.end_container(); // AttributeStatusIB
     }
     w.end_container(); // WriteResponses

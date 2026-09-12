@@ -9,7 +9,7 @@
 //! Timed / StatusResponse), `write`, `cmdfields` (per-command CommandFields
 //! encoders) and `json` (TLV → JSON).
 
-use crate::tlv::{Reader, TlvError, Value};
+use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
 
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
@@ -370,6 +370,36 @@ pub use invoke::*;
 mod write;
 pub use write::*;
 
+/// AttributePathIB (spec §8.9.2.2) as a list under `tag`:
+/// `list{2: endpoint, 3: cluster, [4: attribute]}`. `attribute: None`
+/// omits tag 4 (cluster-wide wildcard).
+pub(crate) fn put_attribute_path(
+    w: &mut Writer,
+    tag: Tag,
+    endpoint: u16,
+    cluster: u32,
+    attribute: Option<u32>,
+) {
+    w.start_list(tag);
+    w.put_uint(Tag::Context(2), u64::from(endpoint));
+    w.put_uint(Tag::Context(3), u64::from(cluster));
+    if let Some(attribute) = attribute {
+        w.put_uint(Tag::Context(4), u64::from(attribute));
+    }
+    w.end_container();
+}
+
+/// StatusIB (spec §8.9.2.3) as a struct under `tag`:
+/// `struct{0: status, [1: cluster_status]}`.
+pub(crate) fn put_status_ib(w: &mut Writer, tag: Tag, status: u8, cluster_status: Option<u8>) {
+    w.start_struct(tag);
+    w.put_uint(Tag::Context(0), u64::from(status));
+    if let Some(cs) = cluster_status {
+        w.put_uint(Tag::Context(1), u64::from(cs));
+    }
+    w.end_container();
+}
+
 /// Reads the next element and requires it to be a struct start (every IM
 /// message is a top-level anonymous struct).
 fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {
@@ -455,6 +485,88 @@ mod tests {
         w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
         w.end_container();
         assert_eq!(got, w.finish());
+    }
+
+    #[test]
+    fn put_attribute_path_and_status_ib_shapes() {
+        let mut w = Writer::new();
+        put_attribute_path(&mut w, Tag::Context(1), 1, 0x0006, Some(0));
+        put_attribute_path(&mut w, Tag::Anonymous, 2, 0x0035, None);
+        put_status_ib(&mut w, Tag::Context(1), 0x81, Some(0x42));
+        put_status_ib(&mut w, Tag::Context(1), 0, None);
+        let b = w.finish();
+        let mut r = Reader::new(&b);
+        let mut els = Vec::new();
+        while let Some(e) = r.next().unwrap() {
+            els.push((e.tag, e.value));
+        }
+        assert_eq!(els[0], (Tag::Context(1), Value::ListStart));
+        assert_eq!(els[1], (Tag::Context(2), Value::Uint(1)));
+        assert_eq!(els[2], (Tag::Context(3), Value::Uint(6)));
+        assert_eq!(els[3], (Tag::Context(4), Value::Uint(0)));
+        assert_eq!(els[4], (Tag::Anonymous, Value::ContainerEnd));
+        assert_eq!(els[5], (Tag::Anonymous, Value::ListStart));
+        assert_eq!(els[6], (Tag::Context(2), Value::Uint(2)));
+        assert_eq!(els[7], (Tag::Context(3), Value::Uint(0x35)));
+        assert_eq!(els[8], (Tag::Anonymous, Value::ContainerEnd)); // no tag 4
+        assert_eq!(els[9], (Tag::Context(1), Value::StructStart));
+        assert_eq!(els[10], (Tag::Context(0), Value::Uint(0x81)));
+        assert_eq!(els[11], (Tag::Context(1), Value::Uint(0x42)));
+        assert_eq!(els[12], (Tag::Anonymous, Value::ContainerEnd));
+        assert_eq!(els[13], (Tag::Context(1), Value::StructStart));
+        assert_eq!(els[14], (Tag::Context(0), Value::Uint(0)));
+        assert_eq!(els[15], (Tag::Anonymous, Value::ContainerEnd));
+    }
+
+    #[test]
+    fn encoders_are_byte_stable_after_path_status_extraction() {
+        assert_eq!(
+            encode_read_request(1, 6, 0),
+            vec![
+                0x15, 0x36, 0x00, 0x17, 0x24, 0x02, 0x01, 0x24, 0x03, 0x06, 0x24, 0x04, 0x00, 0x18,
+                0x18, 0x29, 0x03, 0x24, 0xff, 0x0c, 0x18
+            ]
+        );
+        assert_eq!(
+            encode_read_request_cluster(1, 0x35),
+            vec![
+                0x15, 0x36, 0x00, 0x17, 0x24, 0x02, 0x01, 0x24, 0x03, 0x35, 0x18, 0x18, 0x29, 0x03,
+                0x24, 0xff, 0x0c, 0x18
+            ]
+        );
+        assert_eq!(
+            encode_write_response(&[(0, 0x1F, 0, 0)]),
+            vec![
+                0x15, 0x36, 0x00, 0x15, 0x37, 0x00, 0x24, 0x02, 0x00, 0x24, 0x03, 0x1f, 0x24, 0x04,
+                0x00, 0x18, 0x35, 0x01, 0x24, 0x00, 0x00, 0x18, 0x18, 0x18, 0x24, 0xff, 0x0c, 0x18
+            ]
+        );
+        assert_eq!(
+            encode_invoke_response_status(1, 6, 1, 0x81, Some(0x42)),
+            vec![
+                0x15, 0x28, 0x00, 0x36, 0x01, 0x15, 0x35, 0x01, 0x37, 0x00, 0x24, 0x00, 0x01, 0x24,
+                0x01, 0x06, 0x24, 0x02, 0x01, 0x18, 0x35, 0x01, 0x24, 0x00, 0x81, 0x24, 0x01, 0x42,
+                0x18, 0x18, 0x18, 0x18, 0x24, 0xff, 0x0c, 0x18
+            ]
+        );
+        assert_eq!(
+            encode_report_data_entries(
+                &[ReportEntryOut::Status {
+                    endpoint: 1,
+                    cluster: 6,
+                    attribute: 0,
+                    status: 0x86,
+                }],
+                true,
+                None,
+                false,
+            ),
+            vec![
+                0x15, 0x36, 0x01, 0x15, 0x35, 0x00, 0x37, 0x00, 0x24, 0x02, 0x01, 0x24, 0x03, 0x06,
+                0x24, 0x04, 0x00, 0x18, 0x35, 0x01, 0x24, 0x00, 0x86, 0x18, 0x18, 0x18, 0x18, 0x29,
+                0x04, 0x24, 0xff, 0x0c, 0x18
+            ]
+        );
     }
 
     #[test]

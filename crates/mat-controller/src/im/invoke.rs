@@ -5,7 +5,8 @@
 use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
 
 use super::{
-    expect_struct_start, skip_container, ImError, InvokeOutcome, InvokeResponseData, IM_REVISION,
+    expect_struct_start, put_status_ib, skip_container, ImError, InvokeOutcome, InvokeResponseData,
+    IM_REVISION,
 };
 
 /// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
@@ -353,12 +354,19 @@ fn decode_invoke_response_ib(r: &mut Reader) -> Result<InvokeOutcome, ImError> {
     ))
 }
 
-/// InvokeResponseMessage (spec §8.9.4). Only the first InvokeResponseIB is
-/// interpreted (M2 invokes one command at a time).
-pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> {
+/// Shared outer walk of an InvokeResponseMessage (spec §8.9.4): finds the
+/// `InvokeResponses` array (tag 1) and decodes only its first
+/// InvokeResponseIB with `decode_ib`, skipping every other element and any
+/// later responses (M2 invokes one command at a time). Common body of
+/// `decode_invoke_response` / `decode_invoke_response_data`, which differ
+/// only in which IB decoder they pass in.
+fn decode_first_invoke_response_ib<T>(
+    payload: &[u8],
+    decode_ib: fn(&mut Reader) -> Result<T, ImError>,
+) -> Result<T, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
-    let mut outcome: Option<InvokeOutcome> = None;
+    let mut result: Option<T> = None;
     loop {
         let el = r
             .next()?
@@ -375,7 +383,7 @@ pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> 
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart if first => {
-                            outcome = Some(decode_invoke_response_ib(&mut r)?);
+                            result = Some(decode_ib(&mut r)?);
                             first = false;
                         }
                         Value::StructStart => skip_container(&mut r)?,
@@ -393,9 +401,15 @@ pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> 
             _ => {}
         }
     }
-    outcome.ok_or(ImError::Malformed(
+    result.ok_or(ImError::Malformed(
         "invoke response without InvokeResponseIB",
     ))
+}
+
+/// InvokeResponseMessage (spec §8.9.4). Only the first InvokeResponseIB is
+/// interpreted (M2 invokes one command at a time).
+pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> {
+    decode_first_invoke_response_ib(payload, decode_invoke_response_ib)
 }
 
 /// CommandDataIB (spec §8.9.4.2): `{0: CommandPathIB, 1: CommandFields}`.
@@ -481,46 +495,7 @@ fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, 
 /// today's fail-on-error behavior should check `status` themselves (see
 /// `SecureSession::invoke_for_data`).
 pub fn decode_invoke_response_data(payload: &[u8]) -> Result<InvokeResponseData, ImError> {
-    let mut r = Reader::new(payload);
-    expect_struct_start(&mut r)?;
-    let mut result: Option<InvokeResponseData> = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated invoke response"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::ArrayStart) => {
-                // InvokeResponses
-                let mut first = true;
-                loop {
-                    let e2 = r
-                        .next()?
-                        .ok_or(ImError::Malformed("truncated invoke responses"))?;
-                    match e2.value {
-                        Value::ContainerEnd => break,
-                        Value::StructStart if first => {
-                            result = Some(decode_invoke_response_ib_data(&mut r)?);
-                            first = false;
-                        }
-                        Value::StructStart => skip_container(&mut r)?,
-                        _ => {
-                            return Err(ImError::Malformed(
-                                "unexpected element in invoke responses",
-                            ))
-                        }
-                    }
-                }
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
-            }
-            _ => {}
-        }
-    }
-    result.ok_or(ImError::Malformed(
-        "invoke response without InvokeResponseIB",
-    ))
+    decode_first_invoke_response_ib(payload, decode_invoke_response_ib_data)
 }
 
 /// InvokeResponseMessage (spec §8.9.4) for a single command's
@@ -554,12 +529,7 @@ pub fn encode_invoke_response_status(
     w.put_uint(Tag::Context(1), u64::from(cluster));
     w.put_uint(Tag::Context(2), u64::from(command));
     w.end_container(); // CommandPath
-    w.start_struct(Tag::Context(1)); // StatusIB
-    w.put_uint(Tag::Context(0), u64::from(status));
-    if let Some(cs) = cluster_status {
-        w.put_uint(Tag::Context(1), u64::from(cs));
-    }
-    w.end_container(); // StatusIB
+    put_status_ib(&mut w, Tag::Context(1), status, cluster_status); // StatusIB
     w.end_container(); // CommandStatusIB
     w.end_container(); // InvokeResponseIB
     w.end_container(); // InvokeResponses
