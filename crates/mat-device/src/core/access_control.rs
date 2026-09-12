@@ -425,7 +425,8 @@ impl ClusterHandler for AccessControlHandler {
             return Err(im::STATUS_UNSUPPORTED_ACCESS);
         }
         if list_append {
-            let Some(entry) = decode_single_acl_entry(data_tlv) else {
+            let Some(entry) = tlv_value::decode_single_struct(data_tlv, decode_acl_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             validate_entry(&entry)?;
@@ -437,7 +438,8 @@ impl ClusterHandler for AccessControlHandler {
                 ..entry
             });
         } else {
-            let Some(entries) = decode_acl_entries(data_tlv) else {
+            let Some(entries) = tlv_value::decode_struct_list(data_tlv, decode_acl_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             for entry in &entries {
@@ -512,41 +514,16 @@ fn write_acl_entry(w: &mut Writer, entry: &AclDeviceEntry) {
     w.end_container();
 }
 
-/// write の全置換径路: `data_tlv` は `AccessControlEntryStruct` の array。
-fn decode_acl_entries(data_tlv: &[u8]) -> Option<Vec<AclDeviceEntry>> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::ArrayStart {
-        return None;
-    }
-    let mut entries = Vec::new();
-    loop {
-        let el = r.next().ok()??;
-        match el.value {
-            Value::ContainerEnd => break,
-            Value::StructStart => entries.push(decode_acl_entry_body(&mut r)?),
-            _ => return None,
-        }
-    }
-    Some(entries)
-}
-
-/// write の ListIndex null append 径路: `data_tlv` は単一の
-/// `AccessControlEntryStruct`（array に包まれない）。
-fn decode_single_acl_entry(data_tlv: &[u8]) -> Option<AclDeviceEntry> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::StructStart {
-        return None;
-    }
-    decode_acl_entry_body(&mut r)
-}
-
 /// `AccessControlEntryStruct` 1 件分のフィールド列を読む。呼び出し側が
 /// その `StructStart` を消費済みであることが前提。`Context(254)` は
 /// write 径路では呼び出し側が上書きするため実質無視されるが、
 /// read 結果を検証するテストヘルパ（`decode_entries_for_test`）はこの値を
 /// そのまま使う。
+///
+/// write の全置換径路（`data_tlv` = `AccessControlEntryStruct` の array）は
+/// `tlv_value::decode_struct_list`、ListIndex null append 径路（`data_tlv`
+/// = 単一の `AccessControlEntryStruct`、array に包まれない）は
+/// `tlv_value::decode_single_struct` がどちらもこの `body` reader を使う。
 fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
     let mut privilege = None;
     let mut auth_mode = None;
@@ -846,7 +823,7 @@ pub(crate) fn encode_targets_for_test(
 /// テスト専用の array-of-entries デコーダ（`read` の戻り値 → `(privilege,
 /// auth_mode, subjects, fabric_index)` の 4 要素タプル列）。
 pub(crate) fn decode_entries_for_test(tlv: &[u8]) -> Vec<(u8, u8, Vec<u64>, u8)> {
-    decode_acl_entries(tlv)
+    tlv_value::decode_struct_list(tlv, decode_acl_entry_body)
         .expect("well-formed acl read tlv")
         .into_iter()
         .map(|e| (e.privilege, e.auth_mode, e.subjects, e.fabric_index))

@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use mat_controller::im;
 use mat_controller::sync::locked;
 #[cfg(test)]
-use mat_controller::tlv::Writer;
-use mat_controller::tlv::{Reader, Tag, Value};
+use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::tlv_value;
@@ -115,23 +114,7 @@ impl ClusterHandler for IdentifyHandler {
 
 /// `Identify` request fields (spec §1.2.7.1): `{0: IdentifyTime (uint16)}`.
 fn decode_identify_time(fields_tlv: &[u8]) -> Option<u16> {
-    let mut r = Reader::new(fields_tlv);
-    match r.next() {
-        Ok(Some(el)) if el.value == Value::StructStart => {}
-        _ => return None,
-    }
-    let mut time = None;
-    loop {
-        match r.next() {
-            Ok(Some(el)) => match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => break,
-                (Tag::Context(0), Value::Uint(v)) => time = u16::try_from(v).ok(),
-                _ => {}
-            },
-            _ => return None,
-        }
-    }
-    time
+    tlv_value::decode_struct_uint_field(fields_tlv, 0).and_then(|v| u16::try_from(v).ok())
 }
 
 #[cfg(test)]

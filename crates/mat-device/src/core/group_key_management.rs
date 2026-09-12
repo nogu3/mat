@@ -595,8 +595,8 @@ impl ClusterHandler for GroupKeyManagementHandler {
     /// `keyset_id` の KeySet が無い（`GroupKeyStore::keyset_exists`）場合は
     /// `STATUS_CONSTRAINT_ERROR` — 存在しない keyset への参照を弾く。wire
     /// 形の `fabricIndex`（254）は無視し、常に `ctx.fabric_index` を使う
-    /// （`decode_group_key_map_entries`/`decode_single_group_key_map_entry`
-    /// はそもそも 254 を読まない — クライアント実装
+    /// （`decode_group_key_map_entry_body` はそもそも 254 を読まない —
+    /// クライアント実装
     /// `mat_controller::im::cmdfields::encode_group_key_map_tlv` の
     /// コメントどおり、書く側もこのフィールドを送らない）。
     fn write(
@@ -613,14 +613,18 @@ impl ClusterHandler for GroupKeyManagementHandler {
             return Err(im::STATUS_UNSUPPORTED_ACCESS);
         }
         if list_append {
-            let Some(entry) = decode_single_group_key_map_entry(data_tlv) else {
+            let Some(entry) =
+                tlv_value::decode_single_struct(data_tlv, decode_group_key_map_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             self.check_map_entry(ctx.fabric_index, &entry)?;
             self.store
                 .append_map_entry(ctx.fabric_index, entry.0, entry.1);
         } else {
-            let Some(entries) = decode_group_key_map_entries(data_tlv) else {
+            let Some(entries) =
+                tlv_value::decode_struct_list(data_tlv, decode_group_key_map_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             for entry in &entries {
@@ -782,47 +786,21 @@ fn encode_group_key_map(entries: &[(u8, u16, u16)]) -> Vec<u8> {
     w.finish()
 }
 
-/// `ATTR_GROUP_KEY_MAP` write の全置換径路: `data_tlv` は
-/// `array[GroupKeyMapStruct{1:GroupId(u16), 2:GroupKeySetID(u16)}]`
-/// （wire 形はクライアント実装
-/// `mat_controller::im::encode_group_key_map_tlv` が正 — `fabricIndex`
-/// (254) は送られてこない前提で、来ても `decode_group_key_map_entry_body`
-/// が無視する）。構造が array/struct のネストと食い違う、または必須
-/// フィールド（GroupId/GroupKeySetID のどちらか）が欠けていれば `None`
-/// — `write` はこれを一律 `STATUS_CONSTRAINT_ERROR` に畳む
-/// （`decode_acl_entries`/`AccessControlHandler::write`と同じ裁定）。
-fn decode_group_key_map_entries(data_tlv: &[u8]) -> Option<Vec<(u16, u16)>> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::ArrayStart {
-        return None;
-    }
-    let mut entries = Vec::new();
-    loop {
-        let el = r.next().ok()??;
-        match el.value {
-            Value::ContainerEnd => break,
-            Value::StructStart => entries.push(decode_group_key_map_entry_body(&mut r)?),
-            _ => return None,
-        }
-    }
-    Some(entries)
-}
-
-/// write の `ListIndex` null append 径路: `data_tlv` は単一の
-/// `GroupKeyMapStruct`（array に包まれない）。
-fn decode_single_group_key_map_entry(data_tlv: &[u8]) -> Option<(u16, u16)> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::StructStart {
-        return None;
-    }
-    decode_group_key_map_entry_body(&mut r)
-}
-
 /// `GroupKeyMapStruct` 1 件分のフィールド列を読む。呼び出し側がその
 /// `StructStart` を消費済みであることが前提。`Context(1)`=GroupId,
 /// `Context(2)`=GroupKeySetID 以外（`fabricIndex`含む）は読み捨てる。
+///
+/// `ATTR_GROUP_KEY_MAP` write の全置換径路（`data_tlv` =
+/// `array[GroupKeyMapStruct{1:GroupId(u16), 2:GroupKeySetID(u16)}]`、wire
+/// 形はクライアント実装 `mat_controller::im::encode_group_key_map_tlv` が
+/// 正 — `fabricIndex` (254) は送られてこない前提で、来てもこの reader が
+/// 無視する）は `tlv_value::decode_struct_list`、`ListIndex` null append
+/// 径路（`data_tlv` = 単一の `GroupKeyMapStruct`、array に包まれない）は
+/// `tlv_value::decode_single_struct` がどちらもこの `body` reader を使う。
+/// 構造が array/struct のネストと食い違う、または必須フィールド
+/// （GroupId/GroupKeySetID のどちらか）が欠けていれば `None` —
+/// `write` はこれを一律 `STATUS_CONSTRAINT_ERROR` に畳む
+/// （`decode_acl_entry_body`/`AccessControlHandler::write`と同じ裁定）。
 fn decode_group_key_map_entry_body(r: &mut Reader) -> Option<(u16, u16)> {
     let mut group_id = None;
     let mut keyset_id = None;
@@ -845,26 +823,7 @@ fn decode_group_key_map_entry_body(r: &mut Reader) -> Option<(u16, u16)> {
 /// と同じ形（先頭 struct の Context(0) uint、ネストは読み飛ばす）。形不正・
 /// id 欠落は `None` → 呼び出し側は `STATUS_INVALID_COMMAND`。
 fn decode_key_set_id(fields_tlv: &[u8]) -> Option<u16> {
-    let mut r = Reader::new(fields_tlv);
-    match r.next() {
-        Ok(Some(el)) if el.value == Value::StructStart => {}
-        _ => return None,
-    }
-    let mut keyset_id = None;
-    loop {
-        match r.next() {
-            Ok(Some(el)) => match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => break,
-                (Tag::Context(0), Value::Uint(v)) => keyset_id = u16::try_from(v).ok(),
-                (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                    mat_controller::tlv::skip_container(&mut r).ok()?;
-                }
-                _ => {}
-            },
-            _ => return None,
-        }
-    }
-    keyset_id
+    tlv_value::decode_struct_uint_field(fields_tlv, 0).and_then(|v| u16::try_from(v).ok())
 }
 
 /// `KeySetReadResponse {0: GroupKeySetStruct}`（spec §11.2.8.3）。EpochKey0/1/2

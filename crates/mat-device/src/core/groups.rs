@@ -214,30 +214,7 @@ impl ClusterHandler for GroupsHandler {
 /// `{0: GroupID (uint16), ...}` — AddGroup/ViewGroup/RemoveGroup/
 /// AddGroupIfIdentifying に共通の先頭フィールド。
 fn decode_group_id(fields_tlv: &[u8]) -> Option<u16> {
-    let mut r = Reader::new(fields_tlv);
-    match r.next() {
-        Ok(Some(el)) if el.value == Value::StructStart => {}
-        _ => return None,
-    }
-    let mut group_id = None;
-    let mut depth = 0u32;
-    loop {
-        match r.next() {
-            Ok(Some(el)) => match (el.tag, el.value) {
-                (_, Value::ContainerEnd) => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                }
-                (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => depth += 1,
-                (Tag::Context(0), Value::Uint(v)) if depth == 0 => group_id = u16::try_from(v).ok(),
-                _ => {}
-            },
-            _ => return None,
-        }
-    }
-    group_id
+    tlv_value::decode_struct_uint_field(fields_tlv, 0).and_then(|v| u16::try_from(v).ok())
 }
 
 /// GetGroupMembership の `{0: GroupList (array of uint16)}` (spec §1.3.7.3)。
