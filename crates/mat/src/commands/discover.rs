@@ -31,7 +31,7 @@ use mat_core::store::Store;
 pub fn run(
     store_path: &Path,
     probe: bool,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
 ) -> Result<(), MatError> {
     // discover の commissionable 探索は認証情報不要。store 無しでも動くべきなので
     // open ではなく open_or_init（無ければ空ストアを bootstrap）。commissioned は
@@ -41,12 +41,6 @@ pub fn run(
     // commissionable 探索は native browse 一本化（M8c-3 で chip-tool 経路撤去、
     // Task 11 で avahi-browse フォールバックも撤去 — mDNS は dnssd 一本）。
     // 結果 0 件は正常。IO 失敗はハードエラー（黙って落とさない — spec 設計3）。
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "discover: native backend not configured (internal)",
-        )
-    })?;
     let iface = cfg.iface;
     let commissionable = native_commissionables(iface).map_err(|e| {
         MatError::new(

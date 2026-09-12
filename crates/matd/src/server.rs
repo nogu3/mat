@@ -1922,7 +1922,7 @@ mod tests {
     }
 
     /// M8c-3: group_provision はコントローラ側 group state・デバイス側ともに
-    /// 常に native（group_settings_ctx を注入すれば KVS への実書込みまで検証できる）。
+    /// 常に native（group_settings を注入すれば KVS への実書込みまで検証できる）。
     #[tokio::test]
     async fn group_provision_writes_controller_and_device_state_natively() {
         let dir = tempfile::tempdir().unwrap();
@@ -1955,7 +1955,7 @@ mod tests {
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
     }
 
-    /// group_settings_ctx が未構成（テスト注入時のみ起こり得る）だと internal エラー。
+    /// group_settings が未構成（テスト注入時のみ起こり得る）だと internal エラー。
     #[tokio::test]
     async fn group_provision_without_group_settings_ctx_is_internal_error() {
         let native = NativeBackend::with_establisher(Box::new(ScriptedEstablisher));

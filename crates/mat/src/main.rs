@@ -195,30 +195,26 @@ fn main() -> ExitCode {
             mat_native::ThreadIfaceChoice::Auto(n)
         }),
     };
-    let native_cfg = Some(native_direct::Config {
+    let native_cfg = native_direct::Config {
         iface: &iface_owned,
         thread_iface,
         fabric_index: args.fabric_index,
         issuer_index: args.issuer_index,
-    });
-    if let Some(cfg) = &native_cfg {
-        if let Some(op) = device_op {
-            return match native_direct::run(op, &store_path, cfg, args.op_timeout_ms) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
-                    e.emit();
-                    ExitCode::from(e.kind.exit_code())
-                }
-            };
-        }
+    };
+    if let Some(op) = device_op {
+        return match native_direct::run(op, &store_path, &native_cfg, args.op_timeout_ms) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
+                e.emit();
+                ExitCode::from(e.kind.exit_code())
+            }
+        };
     }
 
     // `Dispatch::Dedicated` の残り（fabric / listen は早期 return 済み）。
     let result = match &command {
-        Command::Discover { probe } => {
-            commands::discover::run(&store_path, *probe, native_cfg.as_ref())
-        }
+        Command::Discover { probe } => commands::discover::run(&store_path, *probe, &native_cfg),
         Command::Commission {
             setup_code,
             node_id,
@@ -230,18 +226,12 @@ fn main() -> ExitCode {
             setup_code,
             *node_id,
             alias.as_deref(),
-            native_cfg.as_ref(),
+            &native_cfg,
             thread_dataset.as_deref(),
             *transport,
         ),
         Command::Unpair { node_id, force } => node_id.id().and_then(|node| {
-            commands::unpair::run(
-                &store_path,
-                node,
-                *force,
-                native_cfg.as_ref(),
-                args.op_timeout_ms,
-            )
+            commands::unpair::run(&store_path, node, *force, &native_cfg, args.op_timeout_ms)
         }),
         Command::Diag {
             action:
@@ -251,9 +241,9 @@ fn main() -> ExitCode {
                     deep,
                 },
         } => node_id.id().and_then(|node| {
-            endpoint.id().and_then(|ep| {
-                commands::diag::node(&store_path, node, ep, *deep, native_cfg.as_ref())
-            })
+            endpoint
+                .id()
+                .and_then(|ep| commands::diag::node(&store_path, node, ep, *deep, &native_cfg))
         }),
         Command::Diag {
             action: DiagCommand::Mesh { nodes },
@@ -261,7 +251,7 @@ fn main() -> ExitCode {
             .iter()
             .map(mat_core::alias::NodeRef::id)
             .collect::<Result<Vec<u64>, MatError>>()
-            .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
+            .and_then(|ids| commands::diag::mesh(&store_path, &ids, &native_cfg)),
         Command::Fabric {
             action:
                 FabricAction::RotateIpk {
@@ -279,7 +269,7 @@ fn main() -> ExitCode {
                     &ids,
                     *catch_up,
                     *abort,
-                    native_cfg.as_ref(),
+                    &native_cfg,
                     args.op_timeout_ms,
                 )
             }),

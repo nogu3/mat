@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use mat_core::error::{ErrorKind, MatError};
 use mat_native::runner::NodeRunner;
 
-pub use mat_native::group::{GroupCtx, GroupOutcome};
+pub use mat_native::group::GroupCtx;
 pub use mat_native::{Establisher, NativeConfig, NodeConn, Resolver};
 
 #[cfg(test)]
@@ -84,7 +84,7 @@ pub struct NativeBackend {
 
 /// 手動 `Debug`: `Engine` / warm セッションは `Debug` を持たず、
 /// また表示すべき秘密（鍵）を内包し得るため中身は出さない。`Result::expect_err`
-/// が `NativeBackend: Debug` を要求する（build のテスト）ためだけに提供する。
+/// が `NativeBackend: Debug` を要求する（build_with_resolver のテスト）ためだけに提供する。
 impl std::fmt::Debug for NativeBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeBackend").finish_non_exhaustive()
@@ -93,12 +93,8 @@ impl std::fmt::Debug for NativeBackend {
 
 impl NativeBackend {
     /// KVS から資格情報を1回読み、NOC を自己発行し、UDP transport を bind、
-    /// iface の scope_id を解決して実確立器を構築する。プロセス寿命で不変。
-    pub async fn build(cfg: &NativeConfig) -> Result<Self, MatError> {
-        Ok(Self::from_engine(mat_native::Engine::build(cfg).await?))
-    }
-
-    /// [`Self::build`] と同じだが Resolver を注入する（matd が CachingResolver を渡す）。
+    /// iface の scope_id を解決して実確立器を構築する（Resolver は注入 — matd は
+    /// CachingResolver を渡す）。プロセス寿命で不変。
     pub async fn build_with_resolver(
         cfg: &NativeConfig,
         resolver: std::sync::Arc<dyn mat_native::Resolver>,
@@ -148,13 +144,6 @@ impl NativeBackend {
         let mut engine = mat_native::Engine::with_parts(establisher, group);
         engine.group_settings = gs;
         Self::from_engine(engine)
-    }
-
-    /// controller 側 group state の KVS 書込資材（M8c-2）。None = native 構築が
-    /// 未完（テスト注入等; 本番 `Engine::build` では常に `Some`）— 呼び出し側
-    /// （`server::group_provision`）は internal エラーとして拒否する（M8c-3）。
-    pub fn group_settings_ctx(&self) -> Option<&mat_native::group_settings::GroupSettingsCtx> {
-        self.engine.group_settings.as_ref()
     }
 
     /// group 送信 / group_settings / 確立器を持つ共有エンジン（`mat_native::op`
@@ -567,28 +556,6 @@ mod tests {
             .expect("session must be lazily re-established after fatal error");
         assert!(v);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn group_settings_ctx_reflects_injected_value() {
-        let gs = mat_native::group_settings::GroupSettingsCtx {
-            main_ini: std::path::PathBuf::from("/tmp/does-not-exist.ini"),
-            fabric_index: 2,
-            cfid: [7u8; 8],
-        };
-        let backend =
-            NativeBackend::with_parts_gs(Box::new(FakeEstablisher::default()), None, Some(gs));
-        let ctx = backend
-            .group_settings_ctx()
-            .expect("injected group_settings must be reflected");
-        assert_eq!(ctx.fabric_index, 2);
-        assert_eq!(ctx.cfid, [7u8; 8]);
-    }
-
-    #[test]
-    fn group_settings_ctx_is_none_without_injection() {
-        let backend = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
-        assert!(backend.group_settings_ctx().is_none());
     }
 
     #[tokio::test]

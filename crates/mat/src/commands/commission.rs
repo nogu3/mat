@@ -22,7 +22,7 @@ pub fn run(
     setup_code: &str,
     node_id: Option<u64>,
     alias: Option<&str>,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
     thread_dataset: Option<&str>,
     transport: crate::cli::TransportArg,
 ) -> Result<(), MatError> {
@@ -33,12 +33,6 @@ pub fn run(
     // native commission（M8c-1; M8c-3 で唯一の経路）。発見空振り = unreachable、
     // KVS/資材/epoch 系 = store_missing/store_parse、PASE 開始後の失敗も含め
     // すべてハードエラー（chip-tool フォールバックは撤去）。
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "commission: native backend not configured (internal)",
-        )
-    })?;
     native_commission(cfg, &store, setup_code, node_id, thread_dataset, transport)?;
     record_success(&mut store, node_id, alias)
 }

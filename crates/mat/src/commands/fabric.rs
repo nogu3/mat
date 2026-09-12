@@ -120,15 +120,9 @@ pub fn run_rotate_ipk(
     nodes: &[u64],
     catch_up: bool,
     abort: bool,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
     op_timeout_ms: u64,
 ) -> Result<(), MatError> {
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "rotate-ipk: native backend not configured (internal)",
-        )
-    })?;
     let store = mat_core::store::Store::open(store_path)?;
     let node_ids: Vec<u64> = if nodes.is_empty() {
         store.nodes().map(|n| n.node_id).collect()

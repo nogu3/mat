@@ -29,7 +29,7 @@ pub fn node(
     node_id: u64,
     endpoint: u16,
     deep: bool,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
 ) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     store.require_node(node_id)?;
@@ -39,12 +39,6 @@ pub fn node(
 
     // IM 部分（operational + thread）は native（M8c-2; M8c-3 で唯一の経路）。
     // エンジン構築失敗はハードエラー（`diag_im_probe` が写像済み）。
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "diag node: native backend not configured (internal)",
-        )
-    })?;
     let p = crate::native_direct::diag_im_probe(cfg, store.root(), node_id, endpoint)?;
     checks.operational = Some(OperationalCheck {
         resolved: p.resolved,
@@ -169,7 +163,7 @@ fn deep_probes(
 pub fn mesh(
     store_path: &Path,
     node_ids: &[u64],
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
 ) -> Result<(), MatError> {
     let store = Store::open(store_path)?;
     let targets: Vec<u64> = if node_ids.is_empty() {
@@ -188,12 +182,6 @@ pub fn mesh(
     let items = if targets.is_empty() {
         Vec::new()
     } else {
-        let cfg = native.ok_or_else(|| {
-            MatError::new(
-                ErrorKind::Other,
-                "diag mesh: native backend not configured (internal)",
-            )
-        })?;
         crate::native_direct::diag_mesh_probe(cfg, store.root(), &targets)?
     };
 

@@ -458,9 +458,8 @@ fn group_remove_unknown_node_exits_11() {
 #[test]
 fn group_provision_rejects_bad_epoch_key() {
     // require_node(5) はここでは通る（台帳にある）。epoch key の検証は
-    // controller state 書込（KVS/chip-tool）より前に走るので、この失敗は
-    // バックエンドに一切触れない（`provision_controller_state` 冒頭で
-    // `resolve_epoch_key` を呼ぶ — `crates/mat/src/commands/group.rs` 参照）。
+    // engine 構築より前に走るので、この失敗はバックエンドに一切触れない
+    // （`native_direct::execute` 冒頭で `resolve_epoch_key` を呼ぶ）。
     let store = store_with_node5();
     mat(store.path())
         .args([

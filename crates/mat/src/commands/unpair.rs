@@ -22,17 +22,11 @@ pub fn run(
     store_path: &Path,
     node_id: u64,
     force: bool,
-    native: Option<&native_direct::Config<'_>>,
+    cfg: &native_direct::Config<'_>,
     op_timeout_ms: u64,
 ) -> Result<(), MatError> {
     let mut store = Store::open(store_path)?;
     store.require_node(node_id)?;
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "unpair: native backend not configured (internal)",
-        )
-    })?;
 
     let op = DeviceOp::Node(NodeOp {
         node_id,
