@@ -23,7 +23,7 @@ use crate::secure_channel::{
 };
 use crate::session::{SecureSession, SessionKeys};
 use crate::spake2p::{self, SpakeError};
-use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
+use crate::tlv::{skip_container, Reader, StructFields, Tag, TlvError, Value, Writer};
 use crate::transport::Transport;
 
 /// PASE opcodes (spec §4.13.1.2): PBKDFParamRequest/Response and
@@ -121,6 +121,28 @@ impl std::fmt::Display for PaseError {
 
 impl std::error::Error for PaseError {}
 
+/// `StructFields::open` の `Err` を `PaseError` に写す。`open` は「次の要素が
+/// struct ではない／入力が空」を番号 `InvalidType(0)` で返す（`Reader` は
+/// 予約型 `0x19..=0x1F` にしか `InvalidType` を出さないので衝突しない）ので
+/// それだけを `"top-level struct"` とし、本物の TLV デコードエラーは
+/// `"tlv"` に落とす —— 手書き走査時代のラベル分けそのまま。
+fn top_level_struct_err(e: TlvError) -> PaseError {
+    match e {
+        TlvError::InvalidType(0) => PaseError::Malformed("top-level struct"),
+        _ => PaseError::Malformed("tlv"),
+    }
+}
+
+/// struct フィールド走査（`StructFields::next_scalar` / `next_field`）の `Err`
+/// を `PaseError` に写す。`ContainerEnd` 到達前の入力終端は `truncated`
+/// （呼び出し元ごとのラベル）、それ以外は `"tlv"`。
+fn field_err(e: TlvError, truncated: &'static str) -> PaseError {
+    match e {
+        TlvError::Truncated => PaseError::Malformed(truncated),
+        _ => PaseError::Malformed("tlv"),
+    }
+}
+
 /// Encodes PBKDFParamRequest: `struct{1: initiatorRandom[32],
 /// 2: initiatorSessionId, 3: passcodeId=0, 4: hasPBKDFParameters=false}`.
 /// The optional SessionParams (tag 5) is never sent.
@@ -158,26 +180,14 @@ pub struct PbkdfParamRequest {
 /// `encode_pbkdf_param_request`.
 pub fn decode_pbkdf_param_request(payload: &[u8]) -> Result<PbkdfParamRequest, PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut initiator_random: Option<[u8; 32]> = None;
     let mut initiator_session_id: Option<u16> = None;
     let mut has_pbkdf_parameters: Option<bool> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 initiator_random = Some(
                     b.try_into()
@@ -190,9 +200,6 @@ pub fn decode_pbkdf_param_request(payload: &[u8]) -> Result<PbkdfParamRequest, P
             }
             Value::Bool(v) if el.tag == Tag::Context(4) => {
                 has_pbkdf_parameters = Some(v);
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {} // e.g. tag 3 (passcodeId): ignored
         }
@@ -252,53 +259,42 @@ pub fn encode_pbkdf_param_response(
 /// right after calling this function.
 pub fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse, PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    // tag 4 の入れ子 struct に降りる必要があるので、この decoder だけ
+    // `next_field`（container start も受け取る）。他 5 本は `next_scalar`。
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut responder_session_id: Option<u16> = None;
     let mut iterations: Option<u32> = None;
     let mut salt: Option<Vec<u8>> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_field().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Uint(v) if el.tag == Tag::Context(3) => {
                 responder_session_id = Some(
                     u16::try_from(v).map_err(|_| PaseError::Malformed("responder session id"))?,
                 );
             }
-            Value::StructStart if el.tag == Tag::Context(4) => loop {
-                let inner = r
-                    .next()
-                    .map_err(|_| PaseError::Malformed("tlv"))?
-                    .ok_or(PaseError::Malformed("truncated pbkdf parameters"))?;
-                match inner.value {
-                    Value::ContainerEnd => break,
-                    Value::Uint(v) if inner.tag == Tag::Context(1) => {
-                        iterations =
-                            Some(u32::try_from(v).map_err(|_| PaseError::Malformed("iterations"))?);
+            Value::StructStart if el.tag == Tag::Context(4) => {
+                let mut pbkdf = StructFields::inside(f.reader());
+                while let Some(inner) = pbkdf
+                    .next_scalar()
+                    .map_err(|e| field_err(e, "truncated pbkdf parameters"))?
+                {
+                    match inner.value {
+                        Value::Uint(v) if inner.tag == Tag::Context(1) => {
+                            iterations = Some(
+                                u32::try_from(v).map_err(|_| PaseError::Malformed("iterations"))?,
+                            );
+                        }
+                        Value::Bytes(b) if inner.tag == Tag::Context(2) => {
+                            salt = Some(b.to_vec());
+                        }
+                        _ => {} // e.g. tag 3 (bitrate for OWF hash, unused)
                     }
-                    Value::Bytes(b) if inner.tag == Tag::Context(2) => {
-                        salt = Some(b.to_vec());
-                    }
-                    Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                        skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
-                    }
-                    _ => {} // e.g. tag 3 (bitrate for OWF hash, unused)
                 }
-            },
+            }
             Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
+                skip_container(f.reader()).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {} // e.g. tags 1/2 (randoms): ignored
         }
@@ -335,32 +331,17 @@ pub fn encode_pake1(p_a: &[u8; 65]) -> Vec<u8> {
 /// `encode_pake1`.
 pub fn decode_pake1(payload: &[u8]) -> Result<[u8; 65], PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut p_a: Option<[u8; 65]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 p_a = Some(
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("pA length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -386,25 +367,13 @@ pub fn encode_pake2(p_b: &[u8; 65], c_b: &[u8; 32]) -> Vec<u8> {
 /// direction codec, widened for out-of-crate test scaffolding.
 pub fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut p_b: Option<[u8; 65]> = None;
     let mut c_b: Option<[u8; 32]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 p_b = Some(
                     b.try_into()
@@ -416,9 +385,6 @@ pub fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("cB length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -446,32 +412,17 @@ pub fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
 /// `encode_pake3`.
 pub fn decode_pake3(payload: &[u8]) -> Result<[u8; 32], PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut c_a: Option<[u8; 32]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 c_a = Some(
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("cA length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -1058,5 +1009,179 @@ mod tests {
                 0x89, 0x32,
             ]
         );
+    }
+
+    // --- Task 11: StructFields 置換後の Malformed ラベル固定 ---
+
+    /// `Malformed` のラベルを取り出す（`Ok` 型に `Debug` を要求しないよう
+    /// `unwrap_err` は使わない）。
+    fn label<T>(r: Result<T, PaseError>) -> &'static str {
+        match r {
+            Err(PaseError::Malformed(l)) => l,
+            Err(other) => panic!("expected Malformed, got {other}"),
+            Ok(_) => panic!("expected Err(Malformed), got Ok"),
+        }
+    }
+
+    /// `StructFields` 置換前の手書き走査と同じ `Malformed` ラベルを出すことを
+    /// 固定する。唯一の意図的な差分は「struct の中で *要素自体* が途中で
+    /// 切れている」ケース（下記 `accepted delta` 印）: 以前は Reader の
+    /// `Truncated` を `"tlv"` に畳んでいたが、`next_scalar` が入力終端と同じ
+    /// `Truncated` を返すため `"truncated"`（入れ子では
+    /// `"truncated pbkdf parameters"`）になる。
+    #[test]
+    fn decoder_malformed_labels_are_stable() {
+        // --- top-level struct の検査 ---
+        assert_eq!(label(decode_pake1(&[])), "top-level struct");
+        // uint / array は struct ではない
+        assert_eq!(label(decode_pake1(&[0x04, 0x2A])), "top-level struct");
+        assert_eq!(label(decode_pake1(&[0x16, 0x18])), "top-level struct");
+        // 予約 element type / tag バイト欠けは Reader エラー → "tlv"
+        assert_eq!(label(decode_pake1(&[0x19])), "tlv");
+        assert_eq!(label(decode_pake1(&[0x24])), "tlv");
+
+        // --- struct フィールド走査の終端 ---
+        // ContainerEnd なしで入力終端
+        assert_eq!(label(decode_pake1(&[0x15])), "truncated");
+        // 要素自体が途中で切れている (accepted delta: 以前は "tlv")
+        assert_eq!(label(decode_pake1(&[0x15, 0x04])), "truncated");
+        // struct の中の Reader エラーは "tlv" のまま
+        assert_eq!(label(decode_pake1(&[0x15, 0x19, 0x18])), "tlv");
+
+        // --- フィールド単位のラベル ---
+        let pake1_with = |tag: u8, len: usize| {
+            let mut w = crate::tlv::Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(tag), &vec![0u8; len]);
+            w.end_container();
+            w.finish()
+        };
+        assert_eq!(label(decode_pake1(&pake1_with(1, 64))), "pA length");
+        assert_eq!(label(decode_pake1(&pake1_with(9, 65))), "pA");
+        assert_eq!(label(decode_pake3(&pake1_with(1, 31))), "cA length");
+        assert_eq!(label(decode_pake3(&pake1_with(9, 32))), "cA");
+        assert_eq!(label(decode_pake2(&pake1_with(1, 64))), "pB length");
+        assert_eq!(label(decode_pake2(&pake1_with(2, 31))), "cB length");
+        assert_eq!(label(decode_pake2(&pake1_with(1, 65))), "cB");
+        assert_eq!(label(decode_pake2(&pake1_with(9, 65))), "pB");
+
+        // PBKDFParamRequest
+        let req = |f: &dyn Fn(&mut crate::tlv::Writer)| {
+            let mut w = crate::tlv::Writer::new();
+            w.start_struct(Tag::Anonymous);
+            f(&mut w);
+            w.end_container();
+            w.finish()
+        };
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_bytes(Tag::Context(1), &[0u8; 31])
+            ))),
+            "initiator random length"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_uint(Tag::Context(2), 0x1_0000)
+            ))),
+            "session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_uint(Tag::Context(3), 0)
+            ))),
+            "initiator random"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_bytes(Tag::Context(1), &[0u8; 32])
+            ))),
+            "initiator session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(&|w| {
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+                w.put_uint(Tag::Context(2), 1);
+            }))),
+            "has pbkdf parameters"
+        );
+        // 未知の入れ子コンテナ (tag 5 SessionParams) は丸ごと飛ばして成功する
+        let with_session_params = req(&|w| {
+            w.put_bytes(Tag::Context(1), &[0u8; 32]);
+            w.put_uint(Tag::Context(2), 1);
+            w.start_struct(Tag::Context(5));
+            w.put_uint(Tag::Context(1), 300);
+            w.start_array(Tag::Context(2));
+            w.put_uint(Tag::Anonymous, 7);
+            w.end_container();
+            w.end_container();
+            w.put_bool(Tag::Context(4), true);
+        });
+        let parsed = decode_pbkdf_param_request(&with_session_params).unwrap();
+        assert!(parsed.has_pbkdf_parameters);
+
+        // PBKDFParamResponse
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(
+                &|w| w.put_uint(Tag::Context(3), 0x1_0000)
+            ))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|_w| {}))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(
+                &|w| w.put_uint(Tag::Context(3), 1)
+            ))),
+            "iterations"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|w| {
+                w.put_uint(Tag::Context(3), 1);
+                w.start_struct(Tag::Context(4));
+                w.put_uint(Tag::Context(1), 0x1_0000_0000);
+                w.end_container();
+            }))),
+            "iterations"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|w| {
+                w.put_uint(Tag::Context(3), 1);
+                w.start_struct(Tag::Context(4));
+                w.put_uint(Tag::Context(1), 1000);
+                w.end_container();
+            }))),
+            "salt"
+        );
+        // 入れ子 struct が ContainerEnd なしで終端 → 入れ子専用ラベル
+        let mut w = crate::tlv::Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(3), 1);
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), 1000);
+        w.end_container();
+        w.end_container();
+        let full = w.finish();
+        let cut = &full[..full.len() - 2]; // 入れ子と外側の ContainerEnd を落とす
+        assert_eq!(
+            label(decode_pbkdf_param_response(cut)),
+            "truncated pbkdf parameters"
+        );
+        // 入れ子の中の未知コンテナ (tag 3) も飛ばして成功する
+        let nested_skip = req(&|w| {
+            w.put_uint(Tag::Context(3), 0xB0B1);
+            w.start_struct(Tag::Context(4));
+            w.put_uint(Tag::Context(1), 1000);
+            w.start_array(Tag::Context(3));
+            w.put_uint(Tag::Anonymous, 1);
+            w.end_container();
+            w.put_bytes(Tag::Context(2), b"0123456789abcdef");
+            w.end_container();
+        });
+        let resp = decode_pbkdf_param_response(&nested_skip).unwrap();
+        assert_eq!(resp.responder_session_id, 0xB0B1);
+        assert_eq!(resp.iterations, 1000);
+        assert_eq!(resp.salt, b"0123456789abcdef");
     }
 }
