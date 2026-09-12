@@ -506,10 +506,16 @@ impl<'t> ExchangeCore<'t> {
     ) -> Result<(), ExchangeError> {
         let ack = self.piggyback_ack();
         if self.transport.is_reliable() {
+            // 意図的に last_sent_counter を更新しない: 更新するのは
+            // send_reliable/send_once のみで、そのアクセサは
+            // UnsecuredExchange にしか出ていない（final 送信を持たないため）。
             let (datagram, _) = self.build(protocol_id, opcode, false, ack, payload);
             self.transport.send_to(&datagram, self.peer).await?;
             return Ok(());
         }
+        // 意図的に last_sent_counter を更新しない: 更新するのは
+        // send_reliable/send_once のみで、そのアクセサは
+        // UnsecuredExchange にしか出ていない（final 送信を持たないため）。
         let (datagram, our_counter) = self.build(protocol_id, opcode, true, ack, payload);
         mrp_send_loop(
             self,
@@ -681,7 +687,9 @@ impl<'t> ResponderExchange<'t> {
     /// 実応答（または直後の任意の実メッセージ — 受信できたこと自体が我々の
     /// 送信が処理された証拠、という `send_reliable` と同じ簡略化）が届くまで
     /// MRP 再送する。standalone ack のみで確定した場合は `None`。
-    /// `UnsecuredExchange::send_reliable` の鏡像。
+    /// `UnsecuredExchange::send_reliable` と同じ `ExchangeCore::send_reliable`
+    /// を responder の役割で呼ぶだけ（peer の直近メッセージへの ack を
+    /// piggyback する）。
     pub async fn reply_reliable(
         &mut self,
         protocol_id: u16,

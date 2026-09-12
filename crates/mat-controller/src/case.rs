@@ -27,8 +27,10 @@ use crate::session::{SecureSession, SessionKeys};
 use crate::transport::{Transport, UdpTransport};
 
 pub(crate) use crate::secure_channel::SC_PROTOCOL_CODE_CLOSE_SESSION;
-/// StatusReport codec — lives in [`crate::secure_channel`]; re-exported so
-/// mat-device's CASE/PASE net drivers keep importing it from here.
+/// StatusReport codec — lives in [`crate::secure_channel`]. `encode_status_report`
+/// is re-exported here because `mat-device`'s CASE net driver
+/// (`mat-device/src/net/case.rs`) imports it from `case`; `parse_status_report`
+/// is re-exported alongside it for symmetry and for this crate's own callers.
 pub use crate::secure_channel::{encode_status_report, parse_status_report};
 
 pub(crate) mod wire;

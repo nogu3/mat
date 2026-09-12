@@ -488,15 +488,8 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
 // `tests/btp_pase_plumbing.rs` が共有する GattLink の裏側役）
 // ============================================================================
 
-/// A fake BTP peripheral driving the far side of a [`crate::btp::GattLink`]:
-/// it answers the handshake, reassembles what the central writes, and
-/// indicates frames back. `btp.rs`'s own unit tests and the cross-crate
-/// `tests/btp_pase_plumbing.rs` share this one implementation.
-///
-/// The three channel / reassembly fields are `pub` because several `btp.rs`
-/// tests need frame-level access (they assert on individual frames, inject
-/// out-of-order segments, or watch for silence); the four methods only cover
-/// the well-behaved message-level cases.
+/// Test-only fake BTP peripheral + `fake_link` constructor shared by
+/// `btp.rs`'s tests and `tests/btp_pase_plumbing.rs`.
 pub mod btp_fake {
     use crate::btp::{
         encode_data_packet, encode_standalone_ack, handshake_request, segment_payload_capacity,
@@ -504,6 +497,16 @@ pub mod btp_fake {
     };
 
     /// テスト用 BTP peripheral。GattLink の裏側を演じる。
+    ///
+    /// A fake BTP peripheral driving the far side of a [`crate::btp::GattLink`]:
+    /// it answers the handshake, reassembles what the central writes, and
+    /// indicates frames back. `btp.rs`'s own unit tests and the cross-crate
+    /// `tests/btp_pase_plumbing.rs` share this one implementation.
+    ///
+    /// The three channel / reassembly fields are `pub` because several `btp.rs`
+    /// tests need frame-level access (they assert on individual frames, inject
+    /// out-of-order segments, or watch for silence); the four methods only cover
+    /// the well-behaved message-level cases.
     pub struct FakePeripheral {
         pub from_client: tokio::sync::mpsc::Receiver<Vec<u8>>, // C1 writes
         pub to_client: tokio::sync::mpsc::Sender<Vec<u8>>,     // C2 indications
