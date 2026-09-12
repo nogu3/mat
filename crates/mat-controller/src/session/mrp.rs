@@ -8,13 +8,14 @@ use tokio::time::Instant;
 
 use crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION;
 use crate::crypto::{open_message, seal_message, OpenError};
-use crate::exchange::{IncomingMessage, MrpConfig};
+use crate::exchange::{
+    boxed_screen, is_standalone_ack, mrp_send_loop, recv_until, IncomingMessage, MrpConfig, Verdict,
+};
 use crate::message::{
     Destination, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
     PROTOCOL_ID_SECURE_CHANNEL,
 };
 use crate::secure_channel::{encode_status_report, GENERAL_CODE_SUCCESS};
-use crate::transport::MAX_DATAGRAM;
 
 use super::{SecureSession, SessionError};
 
@@ -162,6 +163,17 @@ impl SecureSession {
             .await
     }
 
+    /// Buffers an already-acked peer-initiated message for the subscription /
+    /// request APIs, evicting the oldest when full (identical policy in
+    /// `screen_with`'s filter-miss path and `respond_status`'s ack wait).
+    pub(super) fn stash_peer_initiated(&mut self, msg: IncomingMessage) {
+        if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
+            tracing::warn!("peer-initiated report buffer full; dropping oldest");
+            self.peer_initiated.pop_front();
+        }
+        self.peer_initiated.push_back(msg);
+    }
+
     /// Decrypts a datagram and screens it per `filter`. Returns `None` for
     /// foreign or duplicate traffic, or traffic that fails the delivery
     /// filter (duplicates are re-acked here). Ack/dedup happen unconditionally
@@ -272,14 +284,8 @@ impl SecureSession {
             // 中身は別 exchange のケース）は ack 済みのまま黙って捨てられ、
             // ピアは再送しないため永久喪失していた（レビュー指摘: cross-
             // exchange secured request のack-then-drop）。
-            let is_standalone_ack = proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-            if proto.initiator && !is_standalone_ack {
-                if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
-                    tracing::warn!("peer-initiated report buffer full; dropping oldest");
-                    self.peer_initiated.pop_front();
-                }
-                self.peer_initiated.push_back(IncomingMessage {
+            if proto.initiator && !is_standalone_ack(&proto) {
+                self.stash_peer_initiated(IncomingMessage {
                     header,
                     proto,
                     payload,
@@ -318,48 +324,27 @@ impl SecureSession {
         }
         let (datagram, our_counter) =
             self.seal(exchange_id, true, protocol_id, opcode, true, None, payload)?;
-        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now()
-                + crate::exchange::jittered_interval(
-                    interval,
-                    cfg.jitter,
-                    crate::exchange::unit_random(),
-                );
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break; // interval 経過 → 再送
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self.screen(&buf[..n], from, exchange_id).await? else {
-                    continue;
-                };
-                let acks_us = msg.proto.acked_counter == Some(our_counter);
-                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-                if is_standalone_ack {
-                    if acks_us {
-                        return Ok(None);
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s.screen(buf, from, exchange_id).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    if is_standalone_ack(&msg.proto) {
+                        return Ok(if msg.proto.acked_counter == Some(our_counter) {
+                            Verdict::Done(None)
+                        } else {
+                            Verdict::Ignore
+                        });
                     }
-                    continue;
-                }
-                return Ok(Some(msg));
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(SessionError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+                    Ok(Verdict::Done(Some(msg)))
+                })
+            },
+        )
+        .await
     }
 
     /// Waits for the next real (non-ack) message on the given exchange.
@@ -368,29 +353,24 @@ impl SecureSession {
         exchange_id: u16,
         timeout: Duration,
     ) -> Result<IncomingMessage, SessionError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(SessionError::Timeout);
-            }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let Ok(recv) =
-                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-            else {
-                return Err(SessionError::Timeout);
-            };
-            let (n, from) = recv?;
-            let Some(msg) = self.screen(&buf[..n], from, exchange_id).await? else {
-                continue;
-            };
-            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            return Ok(msg);
-        }
+        recv_until(
+            self,
+            timeout,
+            || SessionError::Timeout,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s.screen(buf, from, exchange_id).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    Ok(if is_standalone_ack(&msg.proto) {
+                        Verdict::Ignore
+                    } else {
+                        Verdict::Done(msg)
+                    })
+                })
+            },
+        )
+        .await
     }
 }
 
@@ -399,7 +379,7 @@ mod tests {
     use super::*;
     use crate::secure_channel::parse_status_report;
     use crate::session::test_util::*;
-    use crate::transport::Transport;
+    use crate::transport::{Transport, MAX_DATAGRAM};
     use std::sync::Arc;
 
     #[tokio::test]

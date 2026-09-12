@@ -3,13 +3,10 @@
 //! pump。属性のみを見る旧 API（`subscribe_wildcard` /
 //! `next_subscription_report`）は、この 2 つの薄いラッパ。
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
-use crate::exchange::MrpConfig;
-use crate::message::{OPCODE_MRP_STANDALONE_ACK, PROTOCOL_ID_SECURE_CHANNEL};
-use crate::transport::MAX_DATAGRAM;
+use crate::exchange::{boxed_screen, is_standalone_ack, recv_until, MrpConfig, Verdict};
 
 use super::client::MAX_REPORT_CHUNKS;
 use super::mrp::ScreenFilter;
@@ -232,33 +229,28 @@ impl SecureSession {
         let msg = if let Some(m) = self.peer_initiated.pop_front() {
             m
         } else {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(SessionError::Silence);
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    return Err(SessionError::Silence);
-                };
-                let (n, from) = recv?;
-                tracing::debug!(len = n, %from, "sub pump: datagram received");
-                let Some(m) = self
-                    .screen_with(&buf[..n], from, ScreenFilter::AnyPeerInitiated)
-                    .await?
-                else {
-                    continue;
-                };
-                if m.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && m.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-                {
-                    continue;
-                }
-                break m;
-            }
+            recv_until(
+                self,
+                timeout,
+                || SessionError::Silence,
+                |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                    boxed_screen(async move {
+                        tracing::debug!(len = buf.len(), %from, "sub pump: datagram received");
+                        let Some(m) = s
+                            .screen_with(buf, from, ScreenFilter::AnyPeerInitiated)
+                            .await?
+                        else {
+                            return Ok(Verdict::Ignore);
+                        };
+                        Ok(if is_standalone_ack(&m.proto) {
+                            Verdict::Ignore
+                        } else {
+                            Verdict::Done(m)
+                        })
+                    })
+                },
+            )
+            .await?
         };
         if msg.proto.opcode != im::OPCODE_REPORT_DATA {
             return Err(SessionError::UnexpectedOpcode(msg.proto.opcode));
