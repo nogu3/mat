@@ -299,9 +299,8 @@ pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCach
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssd::codec::push_name;
     use crate::dnssd::test_util::{
-        synth_aaaa_class, synth_commissionable_response, synth_response,
+        synth_aaaa_class, synth_commissionable_response, synth_response, MsgBuilder,
     };
     use crate::dnssd::{iface_index, CLASS_IN};
     use std::net::Ipv6Addr;
@@ -434,30 +433,10 @@ mod tests {
     /// AAAA 到着時に target 一致で touched になり完成する (最終レビュー #1,
     /// step 4 の target→touched 走査)。
     fn synth_srv_txt_only(service: &str, target: &str, port: u16, txt: &[&str]) -> Vec<u8> {
-        let mut m = Vec::new();
-        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
-        m.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]); // qd 0, an 2 (SRV+TXT)
-        push_name(&mut m, service);
-        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl 120
-        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
-        rdata.extend_from_slice(&port.to_be_bytes());
-        let mut tname = Vec::new();
-        push_name(&mut tname, target);
-        rdata.extend_from_slice(&tname);
-        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        m.extend_from_slice(&rdata);
-        push_name(&mut m, service);
-        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-        let mut rdata = Vec::new();
-        for s in txt {
-            rdata.push(s.len() as u8);
-            rdata.extend_from_slice(s.as_bytes());
-        }
-        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        m.extend_from_slice(&rdata);
-        m
+        MsgBuilder::new()
+            .srv(service, port, target)
+            .txt(service, txt)
+            .finish()
     }
 
     fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {

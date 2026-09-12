@@ -307,11 +307,9 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::push_name;
     use super::super::test_util::{
-        multicast_ifaces, spawn_multicast_announcer, synth_commissionable_response, MC,
+        multicast_ifaces, spawn_multicast_announcer, synth_commissionable_response, MsgBuilder, MC,
     };
-    use super::super::{CLASS_IN, TYPE_PTR};
     use super::*;
 
     /// browse（discover の commissionable 列挙）も同じくマルチキャストのみの
@@ -353,7 +351,6 @@ mod tests {
     /// browse 用の合成応答: PTR(service→instance) + SRV/TXT/AAAA を 1 メッセージに
     /// 詰める（additional 同梱の行儀良い responder 相当）。`records` で個別に
     /// 抜き差しできるよう、載せるレコード種を引数で選ぶ。
-    #[allow(clippy::too_many_arguments)]
     fn synth_browse_response(
         service: &str,
         instance: &str,
@@ -361,64 +358,17 @@ mod tests {
         with_txt: Option<&[&str]>,
         with_aaaa: Option<(&str, Ipv6Addr)>,
     ) -> Vec<u8> {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&0u16.to_be_bytes()); // id
-        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // QR|AA
-        msg.extend_from_slice(&0u16.to_be_bytes()); // qd
-        let mut count: u16 = 1; // PTR
-        if with_srv.is_some() {
-            count += 1;
-        }
-        if with_txt.is_some() {
-            count += 1;
-        }
-        if with_aaaa.is_some() {
-            count += 1;
-        }
-        msg.extend_from_slice(&count.to_be_bytes()); // an
-        msg.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
-                                              // PTR: service -> instance
-        push_name(&mut msg, service);
-        msg.extend_from_slice(&TYPE_PTR.to_be_bytes());
-        msg.extend_from_slice(&CLASS_IN.to_be_bytes());
-        msg.extend_from_slice(&[0, 0, 0, 120]);
-        let mut ptr_rdata = Vec::new();
-        push_name(&mut ptr_rdata, instance);
-        msg.extend_from_slice(&(ptr_rdata.len() as u16).to_be_bytes());
-        msg.extend_from_slice(&ptr_rdata);
+        let mut b = MsgBuilder::new().ptr(service, instance);
         if let Some((port, target)) = with_srv {
-            push_name(&mut msg, instance);
-            msg.extend_from_slice(&TYPE_SRV.to_be_bytes());
-            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
-            msg.extend_from_slice(&[0, 0, 0, 120]);
-            let mut rdata = vec![0, 0, 0, 0]; // priority/weight
-            rdata.extend_from_slice(&port.to_be_bytes());
-            push_name(&mut rdata, target);
-            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            msg.extend_from_slice(&rdata);
+            b = b.srv(instance, port, target);
         }
         if let Some(strings) = with_txt {
-            push_name(&mut msg, instance);
-            msg.extend_from_slice(&TYPE_TXT.to_be_bytes());
-            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
-            msg.extend_from_slice(&[0, 0, 0, 120]);
-            let mut rdata = Vec::new();
-            for s in strings {
-                rdata.push(s.len() as u8);
-                rdata.extend_from_slice(s.as_bytes());
-            }
-            msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            msg.extend_from_slice(&rdata);
+            b = b.txt(instance, strings);
         }
         if let Some((host, addr)) = with_aaaa {
-            push_name(&mut msg, host);
-            msg.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-            msg.extend_from_slice(&CLASS_IN.to_be_bytes());
-            msg.extend_from_slice(&[0, 0, 0, 120]);
-            msg.extend_from_slice(&16u16.to_be_bytes());
-            msg.extend_from_slice(&addr.octets());
+            b = b.aaaa(host, addr);
         }
-        msg
+        b.finish()
     }
 
     #[test]

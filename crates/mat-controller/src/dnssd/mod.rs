@@ -47,7 +47,7 @@ mod cache;
 mod codec;
 mod resolve;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 pub use browse::*;
 pub use cache::*;
 pub use resolve::*;
