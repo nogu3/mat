@@ -32,11 +32,11 @@ use crate::core::tlv_value;
 /// `AccessControlEntryPrivilegeEnum` (spec §11.1.7.1) の全値。`check` の
 /// privilege lattice（`privilege_grants`）と AddNOC 自動 admin エントリの
 /// 両方がこれを使う。
-pub(crate) const PRIVILEGE_VIEW: u8 = 1;
-pub(crate) const PRIVILEGE_PROXY_VIEW: u8 = 2;
-pub(crate) const PRIVILEGE_OPERATE: u8 = 3;
-pub(crate) const PRIVILEGE_MANAGE: u8 = 4;
-pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
+pub const PRIVILEGE_VIEW: u8 = 1;
+pub const PRIVILEGE_PROXY_VIEW: u8 = 2;
+pub const PRIVILEGE_OPERATE: u8 = 3;
+pub const PRIVILEGE_MANAGE: u8 = 4;
+pub const PRIVILEGE_ADMINISTER: u8 = 5;
 
 /// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が
 /// 照合に使う値の 1 つ — CASE。PASE は fabric を持たないので ACL の対象外
@@ -44,11 +44,11 @@ pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
 /// auth mode ごとに排他: CASE エントリは CASE session（`Subject::node`/
 /// `Subject::new`、`group_id == None`）にしか一致しない — group session
 /// （`Subject::group`）には決して一致しない（`subject_matches_entry`）。
-pub(crate) const AUTH_MODE_CASE: u8 = 2;
+pub const AUTH_MODE_CASE: u8 = 2;
 /// `AccessControlEntryAuthModeEnum::Group` — `mat group grant` が書く
 /// エントリの auth mode。`write` の妥当性検査（`validate_entry`）が
 /// subject を GroupId として検査する根拠。
-pub(crate) const AUTH_MODE_GROUP: u8 = 3;
+pub const AUTH_MODE_GROUP: u8 = 3;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
 /// `AccessControlEntriesPerFabric` (spec §11.1.5) — 固定値を返すのみで

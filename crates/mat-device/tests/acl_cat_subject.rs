@@ -31,8 +31,6 @@
 //! credentials.
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
-
 use mat_controller::case::{eph_pub_bytes, random_p256_secret};
 use mat_controller::cert::{generate_rcac, issue_noc_with_cats, verify_noc_chain};
 use mat_controller::commissioning::CommissioningFabric;
@@ -40,22 +38,15 @@ use mat_controller::fabric::{compressed_fabric_id, derive_ipk_operational, Fabri
 use mat_controller::im::{self, ImError};
 use mat_controller::kvs::SelfIssueMaterials;
 use mat_controller::session::{SecureSession, SessionError};
-use mat_controller::tlv::{Tag, Writer};
 
-use mat_device::core::access_control::cat_subject;
-use mat_device::device::Device;
+use mat_device::core::access_control::{cat_subject, AUTH_MODE_CASE, PRIVILEGE_ADMINISTER};
 
 mod support;
-use support::{commission_directly_as, device_config};
+use support::{acl_entries_tlv, commission_directly_as, device_config, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 660_033;
 const FABRIC_ID: u64 = 0x2233_4455;
 const CAT_ID: u32 = 0xABCD;
-
-/// `AccessControlEntryPrivilegeEnum` / `AccessControlEntryAuthModeEnum`
-/// values (spec §11.1.7.1), mirrored as in `acl_enforce.rs`.
-const PRIVILEGE_ADMINISTER: u8 = 5;
-const AUTH_MODE_CASE: u8 = 2;
 const FABRIC_INDEX: u8 = 1;
 
 /// CAT value for identifier `CAT_ID` at `version`.
@@ -112,24 +103,6 @@ fn fabric_with_cat_admin(admin_cats: &[u32]) -> (CommissioningFabric, FabricCred
     (fabric, creds)
 }
 
-/// One-entry Administer/CASE ACL array for `subject` (same wire shape as
-/// `acl_enforce.rs`'s `encode_single_acl_entry_tlv`).
-fn admin_entry_for(subject: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_array(Tag::Anonymous);
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(1), u64::from(PRIVILEGE_ADMINISTER));
-    w.put_uint(Tag::Context(2), u64::from(AUTH_MODE_CASE));
-    w.start_array(Tag::Context(3));
-    w.put_uint(Tag::Anonymous, subject);
-    w.end_container();
-    w.put_null(Tag::Context(4));
-    w.put_uint(Tag::Context(254), u64::from(FABRIC_INDEX));
-    w.end_container();
-    w.end_container();
-    w.finish()
-}
-
 /// The single subject of the single ACL entry the device currently holds.
 async fn read_sole_acl_subject(session: &mut SecureSession) -> u64 {
     let acl = session
@@ -158,21 +131,12 @@ async fn read_sole_acl_subject(session: &mut SecureSession) -> u64 {
 #[tokio::test]
 async fn cat_case_admin_subject_authorizes_the_admin_by_its_nocs_cat() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     // Step 1: CaseAdminSubject = CAT v2, admin NOC carries CAT v3.
     let (fabric, creds) = fabric_with_cat_admin(&[cat(3)]);
     let mut session =
-        commission_directly_as(addr, &paa_der, &fabric, cat_subject(cat(2)), &creds).await;
+        commission_directly_as(dev.addr, &dev.paa_der, &fabric, cat_subject(cat(2)), &creds).await;
     let cfg = support::fast_cfg();
 
     assert_eq!(
@@ -200,7 +164,10 @@ async fn cat_case_admin_subject_authorizes_the_admin_by_its_nocs_cat() {
             0,
             im::CLUSTER_ACCESS_CONTROL,
             im::ATTR_ACL,
-            &admin_entry_for(cat_subject(cat(1))),
+            &acl_entries_tlv(
+                &[(PRIVILEGE_ADMINISTER, AUTH_MODE_CASE, &[cat_subject(cat(1))])],
+                FABRIC_INDEX,
+            ),
             None,
             &cfg,
         )
@@ -218,7 +185,10 @@ async fn cat_case_admin_subject_authorizes_the_admin_by_its_nocs_cat() {
             0,
             im::CLUSTER_ACCESS_CONTROL,
             im::ATTR_ACL,
-            &admin_entry_for(cat_subject(cat(4))),
+            &acl_entries_tlv(
+                &[(PRIVILEGE_ADMINISTER, AUTH_MODE_CASE, &[cat_subject(cat(4))])],
+                FABRIC_INDEX,
+            ),
             None,
             &cfg,
         )
@@ -239,6 +209,6 @@ async fn cat_case_admin_subject_authorizes_the_admin_by_its_nocs_cat() {
         ),
     }
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

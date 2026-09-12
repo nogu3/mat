@@ -694,6 +694,27 @@ impl Device {
     }
 }
 
+/// The loopback `DeviceConfig` unit tests build: ephemeral unicast and
+/// group ports (`0`) so several `Device`s in one test never collide.
+#[cfg(test)]
+pub(crate) fn test_device_config(
+    store_dir: std::path::PathBuf,
+    devices: Vec<VirtualDeviceConfig>,
+) -> DeviceConfig {
+    DeviceConfig {
+        passcode: 20202021,
+        discriminator: 0xF00,
+        vendor_id: 0xFFF1,
+        product_id: 0x8000,
+        port: 0,
+        store_dir,
+        iface: "lo".into(),
+        attestation: AttestationMode::default(),
+        group_port: 0,
+        devices,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,18 +764,8 @@ mod tests {
     #[tokio::test]
     async fn bridge_topology_and_ledger_stability() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = |devices: Vec<VirtualDeviceConfig>| DeviceConfig {
-            passcode: 20202021,
-            discriminator: 0xF00,
-            vendor_id: 0xFFF1,
-            product_id: 0x8000,
-            // Port 0 so several `Device`s in this one test never collide.
-            port: 0,
-            store_dir: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            attestation: AttestationMode::default(),
-            group_port: 0,
-            devices,
+        let cfg = |devices: Vec<VirtualDeviceConfig>| {
+            test_device_config(dir.path().to_path_buf(), devices)
         };
         let dev = |id: &str, name: &str| VirtualDeviceConfig {
             id: id.into(),
@@ -880,17 +891,8 @@ mod tests {
     #[tokio::test]
     async fn stale_group_membership_of_removed_devices_is_pruned_on_start() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = |devices: Vec<VirtualDeviceConfig>| DeviceConfig {
-            passcode: 20202021,
-            discriminator: 0xF00,
-            vendor_id: 0xFFF1,
-            product_id: 0x8000,
-            port: 0,
-            store_dir: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            attestation: AttestationMode::default(),
-            group_port: 0,
-            devices,
+        let cfg = |devices: Vec<VirtualDeviceConfig>| {
+            test_device_config(dir.path().to_path_buf(), devices)
         };
         let dev = |id: &str| VirtualDeviceConfig {
             id: id.into(),
@@ -943,28 +945,22 @@ mod tests {
     #[tokio::test]
     async fn bridged_unique_ids_are_string32_stable_and_distinct() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = || DeviceConfig {
-            passcode: 20202021,
-            discriminator: 0xF00,
-            vendor_id: 0xFFF1,
-            product_id: 0x8000,
-            port: 0,
-            store_dir: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            attestation: AttestationMode::default(),
-            group_port: 0,
-            devices: vec![
-                VirtualDeviceConfig {
-                    id: "e2e-light".into(),
-                    kind: DeviceKind::OnOffLight,
-                    name: "E2E Light".into(),
-                },
-                VirtualDeviceConfig {
-                    id: "other-light".into(),
-                    kind: DeviceKind::OnOffLight,
-                    name: "Other Light".into(),
-                },
-            ],
+        let cfg = || {
+            test_device_config(
+                dir.path().to_path_buf(),
+                vec![
+                    VirtualDeviceConfig {
+                        id: "e2e-light".into(),
+                        kind: DeviceKind::OnOffLight,
+                        name: "E2E Light".into(),
+                    },
+                    VirtualDeviceConfig {
+                        id: "other-light".into(),
+                        kind: DeviceKind::OnOffLight,
+                        name: "Other Light".into(),
+                    },
+                ],
+            )
         };
         let unique_id_at = |node: &mut Node, endpoint: u16| -> String {
             read_attr(
@@ -1015,18 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn group_socket_is_bound_on_the_configured_port() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = DeviceConfig {
-            passcode: 20202021,
-            discriminator: 0xF00,
-            vendor_id: 0xFFF1,
-            product_id: 0x8000,
-            port: 0,
-            store_dir: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            attestation: AttestationMode::default(),
-            group_port: 0,
-            devices: vec![],
-        };
+        let cfg = test_device_config(dir.path().to_path_buf(), vec![]);
         let d = Device::new(cfg).unwrap();
         assert!(d.group_local_addr().unwrap().port() != 0);
     }

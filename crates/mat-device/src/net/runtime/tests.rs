@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn event_entry(number: u64) -> im::EventEntryOut {
@@ -84,26 +83,6 @@ fn an_event_only_priming_report_still_opens_with_a_more_chunks_attribute_report(
     let chunks = node.read_chunks(&[], &read_ctx, REPORT_CHUNK_BUDGET, Some(7), false);
     let m = im::decode_report_data_message(&chunks[0]).expect("decodable");
     assert!(!m.more_chunks);
-}
-
-/// Minimal `DeviceConfig` fixture for tests that need a `ServeState`
-/// (`config` is only read when a `WindowRequest` reopens the window
-/// with `mdns: Some(..)`, neither of which any `serve_secured`-driving
-/// test below exercises — `store_dir`/`iface` are never touched by
-/// those paths, so their placeholder values are never resolved).
-pub(super) fn test_config() -> DeviceConfig {
-    DeviceConfig {
-        passcode: 20202021,
-        discriminator: 3840,
-        vendor_id: 0xFFF1,
-        product_id: 0x8000,
-        port: 5540,
-        store_dir: std::path::PathBuf::new(),
-        iface: String::new(),
-        attestation: Default::default(),
-        group_port: 0,
-        devices: vec![],
-    }
 }
 
 #[test]

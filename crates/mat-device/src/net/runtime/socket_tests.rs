@@ -1,4 +1,3 @@
-use super::tests::test_config;
 use super::*;
 
 use mat_controller::crypto::{open_message, seal_message};
@@ -283,7 +282,7 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
             mdns: None,
             subscription: &mut None,
             window: &mut CommissioningWindow::Closed,
-            config: &test_config(),
+            config: &crate::device::test_device_config(std::path::PathBuf::new(), vec![]),
         },
     )
     .await;
@@ -410,7 +409,7 @@ async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
             mdns: None,
             subscription: &mut None,
             window: &mut CommissioningWindow::Closed,
-            config: &test_config(),
+            config: &crate::device::test_device_config(std::path::PathBuf::new(), vec![]),
         },
     )
     .await;
@@ -470,7 +469,7 @@ async fn subscription_priming_round_trips_multiple_chunks() {
             mdns: None,
             subscription: &mut subscription,
             window: &mut CommissioningWindow::Closed,
-            config: &test_config(),
+            config: &crate::device::test_device_config(std::path::PathBuf::new(), vec![]),
         },
     )
     .await;
@@ -671,7 +670,7 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
             mdns: None,
             subscription: &mut None,
             window: &mut CommissioningWindow::Closed,
-            config: &test_config(),
+            config: &crate::device::test_device_config(std::path::PathBuf::new(), vec![]),
         },
     )
     .await;
@@ -794,7 +793,7 @@ async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
             mdns: None,
             subscription: &mut None,
             window: &mut CommissioningWindow::Closed,
-            config: &test_config(),
+            config: &crate::device::test_device_config(std::path::PathBuf::new(), vec![]),
         },
     )
     .await;

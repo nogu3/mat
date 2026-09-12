@@ -31,11 +31,13 @@ use mat_controller::commissioning::{
 use mat_controller::fabric::FabricCredentials;
 use mat_controller::pase;
 use mat_controller::session::SecureSession;
+use mat_controller::tlv::{Tag, Writer};
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509;
 
 use mat_device::core::bridge::DeviceKind;
-use mat_device::device::{AttestationMode, DeviceConfig, VirtualDeviceConfig};
+use mat_device::device::{AttestationMode, Device, DeviceConfig, VirtualDeviceConfig};
+use mat_device::net::stimulus::StimulusHandle;
 
 /// The endpoint the one bridged device in [`device_config`] lands on — EP0
 /// is the root, EP1 the Aggregator, so the first (and here only) bridged
@@ -374,4 +376,86 @@ pub async fn commission_directly_as(
     assert_eq!(fabric_index, Some(1));
 
     case_and_complete(addr, creds).await
+}
+
+/// One `AccessControlEntryStruct` (spec §11.1.7.1) into `w`: `{1:
+/// privilege, 2: authMode, 3: subjects(array), 4: targets(null), 254:
+/// fabricIndex}` — the same wire shape as
+/// `mat_device::core::access_control::write_acl_entry` /
+/// `mat_native::ops::encode_acl_entries_tlv` (both crate-private, hence
+/// this test-side copy).
+#[allow(dead_code)]
+pub fn put_acl_entry(
+    w: &mut Writer,
+    privilege: u8,
+    auth_mode: u8,
+    subjects: &[u64],
+    fabric_index: u8,
+) {
+    w.start_struct(Tag::Anonymous);
+    w.put_uint(Tag::Context(1), u64::from(privilege));
+    w.put_uint(Tag::Context(2), u64::from(auth_mode));
+    w.start_array(Tag::Context(3));
+    for s in subjects {
+        w.put_uint(Tag::Anonymous, *s);
+    }
+    w.end_container();
+    w.put_null(Tag::Context(4));
+    w.put_uint(Tag::Context(254), u64::from(fabric_index));
+    w.end_container();
+}
+
+/// Full-replace `ACL` Data TLV: an anonymous array of [`put_acl_entry`]s.
+#[allow(dead_code)]
+pub fn acl_entries_tlv(entries: &[(u8, u8, &[u64])], fabric_index: u8) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_array(Tag::Anonymous);
+    for (privilege, auth_mode, subjects) in entries {
+        put_acl_entry(&mut w, *privilege, *auth_mode, subjects, fabric_index);
+    }
+    w.end_container();
+    w.finish()
+}
+
+/// A `Device` built from `config` and already `run`ning on its own task —
+/// the preamble every integration test used to spell out. `addr` is the
+/// `[::]` bind rewritten to `[::1]` (the wildcard is not a destination),
+/// `paa_der` is what `Device::new` wrote to `<store>/paa/paa.der` (the
+/// trust anchor `commission_directly` needs), `group_addr` is the
+/// groupcast socket if it bound. `task` is the running device; `abort()`
+/// it to stop.
+#[allow(dead_code)]
+pub struct RunningDevice {
+    pub addr: SocketAddr,
+    pub group_addr: Option<SocketAddr>,
+    pub paa_der: Vec<u8>,
+    pub stimulus: StimulusHandle,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+#[allow(dead_code)]
+pub fn spawn_device(config: DeviceConfig) -> RunningDevice {
+    let store_dir = config.store_dir.clone();
+    let device = Device::new(config).expect("device new");
+    let loopback = |a: SocketAddr| {
+        SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            a.port(),
+        )
+    };
+    let addr = loopback(device.local_addr());
+    let group_addr = device.group_local_addr().map(loopback);
+    let paa_der = std::fs::read(store_dir.join("paa").join("paa.der"))
+        .expect("device should have written its PAA DER at Device::new");
+    let stimulus = device.stimulus_handle();
+    let task = tokio::spawn(async move {
+        let _ = device.run().await;
+    });
+    RunningDevice {
+        addr,
+        group_addr,
+        paa_der,
+        stimulus,
+        task,
+    }
 }

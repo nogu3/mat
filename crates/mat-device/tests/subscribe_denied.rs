@@ -17,7 +17,6 @@
 //! MaxInterval, proving the rejected request did tear it down.
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use mat_controller::commissioning::CommissioningFabric;
@@ -25,33 +24,15 @@ use mat_controller::im;
 use mat_controller::session::SecureSession;
 use mat_controller::tlv::{Tag, Writer};
 
-use mat_device::device::Device;
+use mat_device::core::access_control::{AUTH_MODE_CASE, PRIVILEGE_OPERATE};
 
 mod support;
-use support::{commission_directly, device_config};
+use support::{acl_entries_tlv, commission_directly, device_config, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 660_033;
-const PRIVILEGE_OPERATE: u8 = 3;
-const AUTH_MODE_CASE: u8 = 2;
 const FABRIC_INDEX: u8 = 1;
 /// Generous: the change report is due at MinIntervalFloor = 0.
 const REPORT_WAIT: Duration = Duration::from_secs(10);
-
-fn operate_entry_tlv() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_array(Tag::Anonymous);
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(1), u64::from(PRIVILEGE_OPERATE));
-    w.put_uint(Tag::Context(2), u64::from(AUTH_MODE_CASE));
-    w.start_array(Tag::Context(3));
-    w.put_uint(Tag::Anonymous, ADMIN_NODE_ID);
-    w.end_container();
-    w.put_null(Tag::Context(4));
-    w.put_uint(Tag::Context(254), u64::from(FABRIC_INDEX));
-    w.end_container();
-    w.end_container();
-    w.finish()
-}
 
 /// A hand-rolled SubscribeRequest whose only attribute path is
 /// AccessControl's ACL — Administer-gated, so an Operate subject's wildcard
@@ -82,20 +63,11 @@ fn unreadable_subscribe_request(keep_subscriptions: bool) -> Vec<u8> {
 #[tokio::test]
 async fn unreadable_wildcard_subscribe_is_invalid_action_and_keeps_the_existing_subscription() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4455, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // Demote to Operate (judged against the pre-replace Administer entry).
@@ -104,7 +76,10 @@ async fn unreadable_wildcard_subscribe_is_invalid_action_and_keeps_the_existing_
             0,
             im::CLUSTER_ACCESS_CONTROL,
             im::ATTR_ACL,
-            &operate_entry_tlv(),
+            &acl_entries_tlv(
+                &[(PRIVILEGE_OPERATE, AUTH_MODE_CASE, &[ADMIN_NODE_ID])],
+                FABRIC_INDEX,
+            ),
             None,
             &cfg,
         )
@@ -175,8 +150,8 @@ async fn unreadable_wildcard_subscribe_is_invalid_action_and_keeps_the_existing_
         rd.reports
     );
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }
 
 /// Mirror of the test above with `KeepSubscriptions=false`: the same
@@ -191,20 +166,11 @@ async fn unreadable_wildcard_subscribe_is_invalid_action_and_keeps_the_existing_
 async fn unreadable_wildcard_subscribe_with_keep_subscriptions_false_tears_down_the_existing_subscription(
 ) {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4455, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // Demote to Operate (judged against the pre-replace Administer entry).
@@ -213,7 +179,10 @@ async fn unreadable_wildcard_subscribe_with_keep_subscriptions_false_tears_down_
             0,
             im::CLUSTER_ACCESS_CONTROL,
             im::ATTR_ACL,
-            &operate_entry_tlv(),
+            &acl_entries_tlv(
+                &[(PRIVILEGE_OPERATE, AUTH_MODE_CASE, &[ADMIN_NODE_ID])],
+                FABRIC_INDEX,
+            ),
             None,
             &cfg,
         )
@@ -279,6 +248,6 @@ async fn unreadable_wildcard_subscribe_with_keep_subscriptions_false_tears_down_
         "no report (change or keep-alive) should arrive once the subscription was torn down, got {result:?}"
     );
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }
