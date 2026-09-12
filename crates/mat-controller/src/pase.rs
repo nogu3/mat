@@ -44,7 +44,6 @@ pub const OPCODE_PASE_PAKE3: u8 = 0x24;
 /// `Context = Crypto_Hash("CHIP PAKE V1 Commissioning" || PBKDFParamRequest
 /// || PBKDFParamResponse)`.
 const PAKE_CONTEXT_PREFIX: &[u8] = b"CHIP PAKE V1 Commissioning";
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 /// StatusReport success check (general_code, protocol_code); `protocol_id`
 /// is ignored here (unlike `case::establish`'s 3-tuple check against
 /// `secure_channel::STATUS_REPORT_SUCCESS`).
@@ -495,6 +494,14 @@ pub fn pake_context(request_bytes: &[u8], response_bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// PASE session keys: `HKDF-SHA256(salt=[], ikm=Ke, info="SessionKeys")`
+/// split into I2R / R2I / AttestationChallenge (spec §4.13.2.3). `pub` so
+/// the responder role (`test_support::pase_responder_task`, mat-device's
+/// `core::pase`) derives the same keys through the same code.
+pub fn derive_session_keys(k_e: &[u8; 16]) -> SessionKeys {
+    crate::secure_channel::session_keys_from_hkdf(&[], k_e)
+}
+
 /// Runs the PASE initiator handshake against `peer` and returns the
 /// resulting secured session on success. Both sides use node id 0 — PASE
 /// sessions are unauthenticated at the Matter fabric layer (spec §4.13).
@@ -657,18 +664,9 @@ pub async fn establish(
         });
     }
 
-    // 6. Session keys: HKDF-SHA256(salt=[], ikm=Ke, info="SessionKeys") 48B
-    // (spec §4.13.2.3) — note the ikm is Ke (16B, TT hash's second half),
-    // not the full SPAKE2+ shared secret.
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&[]), &shared.k_e);
-    let mut okm = [0u8; 48];
-    hk.expand(INFO_SESSION_KEYS, &mut okm)
-        .expect("valid length");
-    let keys = SessionKeys {
-        i2r: okm[..16].try_into().expect("16"),
-        r2i: okm[16..32].try_into().expect("16"),
-        attestation_challenge: okm[32..].try_into().expect("16"),
-    };
+    // 6. Session keys (spec §4.13.2.3) — ikm is Ke (16 B, TT hash's second
+    // half), not the full SPAKE2+ shared secret.
+    let keys = derive_session_keys(&shared.k_e);
 
     // 7. PASE sessions are unauthenticated: both sides use node id 0.
     Ok(SecureSession::new(
@@ -1076,5 +1074,35 @@ mod tests {
             result,
             Err(PaseError::Malformed("pbkdf iterations out of range"))
         ));
+    }
+
+    /// PASE SessionKeys golden (HKDF-SHA256, salt=[], ikm=Ke, "SessionKeys").
+    /// Computed once from the pre-refactor inline derivation; pins the
+    /// `derive_session_keys` extraction byte-for-byte.
+    #[test]
+    fn golden_pase_session_keys_are_stable() {
+        let k_e: [u8; 16] = core::array::from_fn(|i| 0x10 + i as u8);
+        let keys = derive_session_keys(&k_e);
+        assert_eq!(
+            keys.i2r,
+            [
+                0x87, 0x1e, 0x53, 0x79, 0xe8, 0xc1, 0xc6, 0x1d, 0x6a, 0x31, 0x8c, 0x9c, 0x40, 0x53,
+                0x22, 0xff,
+            ]
+        );
+        assert_eq!(
+            keys.r2i,
+            [
+                0x10, 0x98, 0x57, 0x34, 0x45, 0xc3, 0x28, 0xd4, 0x59, 0xfe, 0x0c, 0x7f, 0xe9, 0x24,
+                0xf7, 0x87,
+            ]
+        );
+        assert_eq!(
+            keys.attestation_challenge,
+            [
+                0x5e, 0x6a, 0x9b, 0x7f, 0x85, 0x94, 0xad, 0xbb, 0x29, 0x9b, 0xad, 0xb4, 0x61, 0x99,
+                0x89, 0x32,
+            ]
+        );
     }
 }

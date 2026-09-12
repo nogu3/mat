@@ -32,6 +32,22 @@ pub const SC_PROTOCOL_CODE_BUSY: u16 = 4;
 /// StatusReport (session established).
 pub const STATUS_REPORT_SUCCESS: (u16, u32, u16) = (0, 0, 0);
 
+const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
+
+/// HKDF-SHA256(salt, ikm, info="SessionKeys") expanded to 48 bytes and split
+/// into I2R / R2I / AttestationChallenge (spec §4.13.2.3 / §4.14.2.6).
+pub fn session_keys_from_hkdf(salt: &[u8], ikm: &[u8]) -> crate::session::SessionKeys {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), ikm);
+    let mut okm = [0u8; 48];
+    hk.expand(INFO_SESSION_KEYS, &mut okm)
+        .expect("valid length");
+    crate::session::SessionKeys {
+        i2r: okm[..16].try_into().expect("16"),
+        r2i: okm[16..32].try_into().expect("16"),
+        attestation_challenge: okm[32..].try_into().expect("16"),
+    }
+}
+
 /// `parse_status_report`'s only failure: fewer than 8 payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusReportTruncated;

@@ -25,8 +25,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use sha2::Sha256;
-
 use crate::case_responder::{
     CaseFabric, CaseOutput, CaseResponderCore, OPCODE_SIGMA1, OPCODE_SIGMA3,
 };
@@ -39,9 +37,6 @@ use crate::message::{
 };
 use crate::tlv::{Tag, Writer};
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
-
-/// spec §4.13.2.3 — mirror of the crate-private one in `pase.rs`.
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
 // Shared fabric material. IPK must be identical on both sides.
 pub const IPK: [u8; 16] = [0xCC; 16];
@@ -64,17 +59,6 @@ pub fn fast_cfg() -> MrpConfig {
         backoff: 1.0,
         jitter: 0.0,
     }
-}
-
-// --- crypto helper (still needed: PASE session keys below;
-// `case_responder::CaseResponderCore` handles CASE's own HKDF derivations
-// internally now) ---
-
-fn hkdf48(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 48] {
-    let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), shared);
-    let mut out = [0u8; 48];
-    hk.expand(info, &mut out).expect("valid length");
-    out
 }
 
 // --- unsecured framing helpers for the responder ---
@@ -470,9 +454,9 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         .expect("send pase status report");
 
     // --- SessionKeys（spec §4.13.2.3: HKDF(salt=[], ikm=Ke, "SessionKeys")）---
-    let okm = hkdf48(&k_e, &[], INFO_SESSION_KEYS);
-    let i2r: [u8; 16] = okm[..16].try_into().unwrap();
-    let r2i: [u8; 16] = okm[16..32].try_into().unwrap();
+    let keys = pase::derive_session_keys(&k_e);
+    let i2r = keys.i2r;
+    let r2i = keys.r2i;
 
     // --- Serve one secured IM ReadRequest（PASE は両側 node id 0）---
     serve_one_read(

@@ -34,7 +34,6 @@ const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
 const TBE3_NONCE: &[u8; 13] = b"NCASE_Sigma3N";
 const INFO_S2K: &[u8] = b"Sigma2";
 const INFO_S3K: &[u8] = b"Sigma3";
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
 /// CASE ハンドシェイク各往復の応答待ち。op 予算設計の成分。
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -306,15 +305,7 @@ pub fn derive_session_keys(shared: &[u8], ipk: &[u8; 16], transcript: &[u8; 32])
     let mut salt = Vec::with_capacity(48);
     salt.extend_from_slice(ipk);
     salt.extend_from_slice(transcript);
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), shared);
-    let mut okm = [0u8; 48];
-    hk.expand(INFO_SESSION_KEYS, &mut okm)
-        .expect("valid length");
-    SessionKeys {
-        i2r: okm[..16].try_into().expect("16"),
-        r2i: okm[16..32].try_into().expect("16"),
-        attestation_challenge: okm[32..].try_into().expect("16"),
-    }
+    crate::secure_channel::session_keys_from_hkdf(&salt, shared)
 }
 
 /// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
