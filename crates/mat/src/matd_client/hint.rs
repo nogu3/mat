@@ -115,18 +115,13 @@ fn classify_reload_ack(resp: &str) -> ReloadAck {
 
 /// `{"op":"reload"}` を 1 行送り、応答 1 行を [`classify_reload_ack`] で分類する。
 /// timeout は `NoAck`（送受信自体は成立した）、I/O エラーは Err。
-fn send_reload_line(mut stream: UnixStream) -> std::io::Result<ReloadAck> {
-    let mut line = serde_json::to_vec(&json!({ "op": "reload" }))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    line.push(b'\n');
-    stream.write_all(&line)?;
-    stream.set_read_timeout(Some(RELOAD_ACK_TIMEOUT))?;
-    let mut reader = BufReader::new(stream);
-    let mut resp = String::new();
-    if reader.read_line(&mut resp).is_err() {
-        return Ok(ReloadAck::NoAck); // timeout 等 = ack 無し
-    }
-    Ok(classify_reload_ack(&resp))
+fn send_reload_line(stream: UnixStream) -> std::io::Result<ReloadAck> {
+    Ok(
+        match request_line(stream, &json!({ "op": "reload" }), RELOAD_ACK_TIMEOUT)? {
+            Some(resp) => classify_reload_ack(&resp),
+            None => ReloadAck::NoAck,
+        },
+    )
 }
 
 /// 直経路 op（native_direct）完了後、matd がいれば `node_touched` ヒントを送る
@@ -166,76 +161,36 @@ fn hint_node_touched_at(sockets: &[PathBuf], node_id: u64) {
 /// る価値が無い）。応答本体には関心が無い（ack `{"resubscribing":true}` でも
 /// 旧 matd の `parse_error` でも同じ扱い）ので、300ms 上限で読み捨てるだけで
 /// 十分（matd 応答が来ない＝matd 停止/ハング相当、これ以上待つ理由が無い）。
-fn send_hint_line(mut stream: UnixStream, node_id: u64) -> std::io::Result<()> {
-    let op = json!({ "op": "node_touched", "node_id": node_id });
-    let mut line = serde_json::to_vec(&op)
+fn send_hint_line(stream: UnixStream, node_id: u64) -> std::io::Result<()> {
+    request_line(
+        stream,
+        &json!({ "op": "node_touched", "node_id": node_id }),
+        Duration::from_millis(300),
+    )
+    .map(|_| ())
+}
+
+/// `op` を 1 行送り、応答 1 行を `read_timeout` まで待つ。write 失敗は Err、
+/// read 失敗（timeout 等）は `Ok(None)`（送受信自体は成立 — 「応答なし」）。
+/// `node_touched` と `reload` の 2 本のヒント送信路が共有する核。
+fn request_line(
+    mut stream: UnixStream,
+    op: &Value,
+    read_timeout: Duration,
+) -> std::io::Result<Option<String>> {
+    let mut line = serde_json::to_vec(op)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
     stream.write_all(&line)?;
-    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
-    let _ = reader.read_line(&mut resp); // 応答は読み捨てるだけ（内容不問）
-    Ok(())
+    Ok(reader.read_line(&mut resp).ok().map(|_| resp))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Issue #20: 直経路 op 後の fire-and-forget ヒント。matd がいれば
-    /// `{"op":"node_touched","node_id":N}` を 1 行送る（応答は読み捨て）。
-    #[test]
-    fn hint_node_touched_sends_op_line_to_matd() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("matd.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut req = String::new();
-            reader.read_line(&mut req).unwrap();
-            let mut conn = conn;
-            conn.write_all(b"{\"resubscribing\":true}\n").unwrap();
-            req
-        });
-
-        hint_node_touched_at(&[path], 42);
-
-        let req = server.join().unwrap();
-        let v: Value = serde_json::from_str(&req).unwrap();
-        assert_eq!(v, json!({"op":"node_touched","node_id":42}));
-    }
-
-    /// 旧 matd（node_touched 未対応）は `parse_error` を返してくるが、
-    /// ヒント送信側はその応答も内容を見ずに読み捨てるだけで完走する。
-    #[test]
-    fn hint_node_touched_ignores_old_matd_parse_error_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("matd.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut req = String::new();
-            reader.read_line(&mut req).unwrap();
-            let mut conn = conn;
-            conn.write_all(b"{\"error\":{\"kind\":\"parse_error\",\"detail\":\"unknown op\"}}\n")
-                .unwrap();
-        });
-
-        hint_node_touched_at(&[path], 7); // panic せず完走すること
-
-        server.join().unwrap();
-    }
-
-    /// matd 不在（socket に誰もいない）でも panic せず、戻り値なしで完走する。
-    #[test]
-    fn hint_node_touched_is_silent_without_matd() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("no-such.sock");
-        hint_node_touched_at(&[missing], 1);
-    }
 
     /// listener を 1 本立て、受けた要求行と固定応答を返すテスト用 matd。
     fn one_shot_matd(
@@ -254,6 +209,34 @@ mod tests {
             req
         });
         (dir, path, server)
+    }
+
+    /// Issue #20: 直経路 op 後の fire-and-forget ヒント。matd がいれば
+    /// `{"op":"node_touched","node_id":N}` を 1 行送る（応答は読み捨て）。
+    #[test]
+    fn hint_node_touched_sends_op_line_to_matd() {
+        let (_dir, path, server) = one_shot_matd(b"{\"resubscribing\":true}\n");
+        hint_node_touched_at(&[path], 42);
+        let v: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(v, json!({"op":"node_touched","node_id":42}));
+    }
+
+    /// 旧 matd（node_touched 未対応）は `parse_error` を返してくるが、
+    /// ヒント送信側はその応答も内容を見ずに読み捨てるだけで完走する。
+    #[test]
+    fn hint_node_touched_ignores_old_matd_parse_error_response() {
+        let (_dir, path, server) =
+            one_shot_matd(b"{\"error\":{\"kind\":\"parse_error\",\"detail\":\"unknown op\"}}\n");
+        hint_node_touched_at(&[path], 7); // panic せず完走すること
+        server.join().unwrap();
+    }
+
+    /// matd 不在（socket に誰もいない）でも panic せず、戻り値なしで完走する。
+    #[test]
+    fn hint_node_touched_is_silent_without_matd() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.sock");
+        hint_node_touched_at(&[missing], 1);
     }
 
     #[test]

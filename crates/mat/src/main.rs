@@ -82,10 +82,7 @@ fn main() -> ExitCode {
         if let Some(result) = result {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    e.emit();
-                    ExitCode::from(e.kind.exit_code())
-                }
+                Err(e) => e.emit_exit(),
             };
         }
     }
@@ -98,33 +95,64 @@ fn main() -> ExitCode {
     {
         return match commands::group::run_list(&store_path, args.fabric_index) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                e.emit();
-                ExitCode::from(e.kind.exit_code())
-            }
+            Err(e) => e.emit_exit(),
         };
     }
 
     // listen は初の matd 専用 op（direct fallback なし — 常駐なしに購読は成立
     // しない）。経路解決の socket だけ流用し、Direct（MAT_MATD=falsy）は
     // matd_unavailable で即エラー。
-    if let Command::Listen { .. } = &command {
+    if let Command::Listen {
+        node_id,
+        endpoint,
+        cluster,
+        attribute,
+        event,
+        count,
+        timeout_ms,
+        reconnect,
+    } = &command
+    {
+        // alias は resolve 層で Id に確定済み。ここで数値に落として listen 層へ
+        // フィールドで渡す（Command の再分解を listen 層に持ち込まない）。
+        let ids = node_id
+            .as_ref()
+            .map(mat_core::alias::NodeRef::id)
+            .transpose()
+            .and_then(|n| {
+                endpoint
+                    .as_ref()
+                    .map(mat_core::alias::EndpointRef::id)
+                    .transpose()
+                    .map(|e| (n, e))
+            });
+        let (node, endpoint) = match ids {
+            Ok(v) => v,
+            Err(e) => return e.emit_exit(),
+        };
+        let params = matd_client::ListenParams {
+            node,
+            endpoint,
+            cluster: cluster.clone(),
+            attribute: attribute.clone(),
+            event: event.clone(),
+            count: *count,
+            timeout_ms: *timeout_ms,
+            reconnect: *reconnect,
+        };
         return match matd_client::resolve_route(
             &args.matd,
             std::env::var_os("MAT_MATD_SOCKET"),
             std::env::var_os("MAT_MATD"),
         ) {
             matd_client::Route::Forced(sockets) | matd_client::Route::Auto(sockets) => {
-                matd_client::dispatch_listen(&sockets, &command)
+                matd_client::dispatch_listen(&sockets, &params)
             }
-            matd_client::Route::Direct => {
-                mat_core::error::MatError::new(
-                    ErrorKind::MatdUnavailable,
-                    "`mat listen` requires matd (MAT_MATD=0 disables it)",
-                )
-                .emit();
-                ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
-            }
+            matd_client::Route::Direct => MatError::new(
+                ErrorKind::MatdUnavailable,
+                "`mat listen` requires matd (MAT_MATD=0 disables it)",
+            )
+            .emit_exit(),
         };
     }
 
@@ -132,10 +160,7 @@ fn main() -> ExitCode {
     // 未知名・符号化不能・不正 color spec は matd に触れる前に固有 kind で失敗）。
     let dispatch = match device_op::classify(&command) {
         Ok(d) => d,
-        Err(e) => {
-            e.emit();
-            return ExitCode::from(e.kind.exit_code());
-        }
+        Err(e) => return e.emit_exit(),
     };
     let device_op = match &dispatch {
         device_op::Dispatch::Device(op) => Some(op),
@@ -180,10 +205,7 @@ fn main() -> ExitCode {
                 tracing::info!(iface = %i, "iface auto-selected (native default)");
                 i
             }
-            Err(e) => {
-                e.emit();
-                return ExitCode::from(e.kind.exit_code());
-            }
+            Err(e) => return e.emit_exit(),
         },
     };
     // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
@@ -206,8 +228,7 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
-                e.emit();
-                ExitCode::from(e.kind.exit_code())
+                e.emit_exit()
             }
         };
     }
@@ -286,8 +307,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::debug!(kind = ?e.kind, detail = %e.detail, "command failed");
-            e.emit();
-            ExitCode::from(e.kind.exit_code())
+            e.emit_exit()
         }
     }
 }

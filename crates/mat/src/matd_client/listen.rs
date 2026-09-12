@@ -8,8 +8,6 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 
-use crate::cli::Command;
-use mat_core::alias::NodeRef;
 use mat_core::error::{ErrorKind, MatError};
 
 use super::connect_candidates;
@@ -42,74 +40,39 @@ fn listen_request_json(
     op
 }
 
-/// `mat listen`: matd へ接続し、ack 後のイベント行をそのまま stdout へ流す。
-/// count/timeout は mat 側制御（enl listen と同じ UX）。matd 不在・応答なし・
-/// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。`--reconnect`
-/// 指定時はその喪失を backoff 再接続で跨ぐ（count 累積・deadline 1 本）。
-pub fn dispatch_listen(sockets: &[PathBuf], command: &Command) -> ExitCode {
-    let Command::Listen {
-        node_id,
-        endpoint,
-        cluster,
-        attribute,
-        event,
-        count,
-        timeout_ms,
-        reconnect,
-    } = command
-    else {
-        // 内部バグ経路: 非 Listen command が来ても panic しない（v1 Task6 規律）。
-        let e = MatError::parse_error(
-            "internal: dispatch_listen called with non-Listen command (dispatch invariant violated)",
-        );
-        e.emit();
-        return ExitCode::from(e.kind.exit_code());
-    };
-    // 未解決 alias が届いた場合（内部バグ）は typed error を emit して抜ける
-    // （他の経路と同じ MatError::emit + exit_code パターン、panic しない）。
-    let node_num = match node_id.as_ref().map(NodeRef::id).transpose() {
-        Ok(n) => n,
-        Err(e) => {
-            e.emit();
-            return ExitCode::from(e.kind.exit_code());
-        }
-    };
-    let endpoint_num = match endpoint
-        .as_ref()
-        .map(mat_core::alias::EndpointRef::id)
-        .transpose()
-    {
-        Ok(e) => e,
-        Err(e) => {
-            e.emit();
-            return ExitCode::from(e.kind.exit_code());
-        }
-    };
-    let op = listen_request_json(node_num, endpoint_num, cluster, attribute, event);
+/// `mat listen` の引数（alias は main で数値に確定済み）。`Command::Listen` を
+/// ここで再分解しないため、「非 Listen command が来た」「未解決 alias が届いた」
+/// の internal-bug アームが不要になる。
+pub struct ListenParams {
+    pub node: Option<u64>,
+    pub endpoint: Option<u16>,
+    pub cluster: Option<String>,
+    pub attribute: Option<String>,
+    pub event: Option<String>,
+    pub count: u32,
+    pub timeout_ms: u64,
+    pub reconnect: bool,
+}
 
-    if *reconnect {
-        return run_listen_reconnecting(sockets, &op, *count, *timeout_ms);
+pub fn dispatch_listen(sockets: &[PathBuf], p: &ListenParams) -> ExitCode {
+    let op = listen_request_json(p.node, p.endpoint, &p.cluster, &p.attribute, &p.event);
+    if p.reconnect {
+        return run_listen_reconnecting(sockets, &op, p.count, p.timeout_ms);
     }
-
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            MatError::new(
+            return MatError::new(
                 ErrorKind::MatdUnavailable,
                 format!("{detail}; `mat listen` requires a running matd"),
             )
-            .emit();
-            return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
+            .emit_exit();
         }
     };
     tracing::info!(socket = %socket.display(), "listening via matd");
-
-    match run_listen_stream(stream, &op, *count, *timeout_ms) {
+    match run_listen_stream(stream, &op, p.count, p.timeout_ms) {
         Ok(code) => code,
-        Err(detail) => {
-            MatError::new(ErrorKind::MatdUnavailable, &detail).emit();
-            ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
-        }
+        Err(detail) => MatError::new(ErrorKind::MatdUnavailable, &detail).emit_exit(),
     }
 }
 
@@ -262,8 +225,7 @@ fn run_listen_reconnecting(
 /// timeout 打ち切り: 0 件なら timeout(exit 3)、1 件以上なら成功（enl 準拠）。
 fn finish_on_timeout(received: u32) -> ExitCode {
     if received == 0 {
-        MatError::new(ErrorKind::Timeout, "no events received within --timeout-ms").emit();
-        ExitCode::from(ErrorKind::Timeout.exit_code())
+        MatError::new(ErrorKind::Timeout, "no events received within --timeout-ms").emit_exit()
     } else {
         ExitCode::SUCCESS
     }
