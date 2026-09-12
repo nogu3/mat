@@ -1,10 +1,12 @@
 //! CASE initiator state machine (Sigma1 -> Sigma2 verify -> Sigma3 -> StatusReport).
 //!
 //! Establishes a secured session with a peer already on our fabric (spec
-//! §4.14). This module owns the wire encoding of Sigma1/2/3, transcript
-//! hashing, NOC-chain / signature verification of the peer, and the HKDF
-//! derivations feeding `session::SessionKeys`. Protocol code stays here —
-//! callers only see `establish()` and a `SecureSession` on success.
+//! §4.14). This module owns the transcript hashing, NOC-chain / signature
+//! verification of the peer, and the HKDF derivations feeding
+//! `session::SessionKeys`; the Sigma1/2/3 / TBS / TBE wire encoding it
+//! shares with the responder role lives in the private `wire` submodule.
+//! Protocol code stays here — callers only see `establish()` and a
+//! `SecureSession` on success.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,7 +24,6 @@ use crate::secure_channel::{
     StatusReportTruncated, OPCODE_SIGMA1, OPCODE_SIGMA2, OPCODE_SIGMA3, STATUS_REPORT_SUCCESS,
 };
 use crate::session::{SecureSession, SessionKeys};
-use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 use crate::transport::{Transport, UdpTransport};
 
 pub(crate) use crate::secure_channel::SC_PROTOCOL_CODE_CLOSE_SESSION;
@@ -30,10 +31,13 @@ pub(crate) use crate::secure_channel::SC_PROTOCOL_CODE_CLOSE_SESSION;
 /// mat-device's CASE/PASE net drivers keep importing it from here.
 pub use crate::secure_channel::{encode_status_report, parse_status_report};
 
-const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
-const TBE3_NONCE: &[u8; 13] = b"NCASE_Sigma3N";
-const INFO_S2K: &[u8] = b"Sigma2";
-const INFO_S3K: &[u8] = b"Sigma3";
+pub(crate) mod wire;
+
+/// Sigma1 encoder — lives in `case::wire` (one copy, shared with the responder
+/// role); re-exported so `mat-device`'s CASE tests keep importing it from
+/// here.
+pub use wire::encode_sigma1;
+pub(crate) use wire::{Sigma2, Tbe as Tbe2};
 
 /// CASE ハンドシェイク各往復の応答待ち。op 予算設計の成分。
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -133,161 +137,17 @@ impl std::fmt::Display for CaseError {
 
 impl std::error::Error for CaseError {}
 
-pub(crate) struct Sigma2 {
-    pub responder_random: [u8; 32],
-    pub responder_session_id: u16,
-    pub responder_eph_pub: [u8; 65],
-    pub encrypted2: Vec<u8>,
-}
-
-pub(crate) struct Tbe2 {
-    pub noc: Vec<u8>,
-    pub icac: Option<Vec<u8>>,
-    pub signature: [u8; 64],
-}
-
-/// Encodes Sigma1: `struct{1: random, 2: session_id, 3: dest_id, 4: eph_pub}`.
-/// No optional fields (resumption, session params) are sent. `pub` (Task 10):
-/// `mat-device`'s CASE responder unit test builds Sigma1 with this same
-/// initiator-authoritative encoder rather than hand-rolling a second copy.
-pub fn encode_sigma1(
-    random: &[u8; 32],
-    session_id: u16,
-    dest_id: &[u8; 32],
-    eph_pub: &[u8; 65],
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), random);
-    w.put_uint(Tag::Context(2), u64::from(session_id));
-    w.put_bytes(Tag::Context(3), dest_id);
-    w.put_bytes(Tag::Context(4), eph_pub);
-    w.end_container();
-    w.finish()
-}
-
-/// Parses Sigma2: `struct{1: responder_random, 2: responder_session_id,
-/// 3: responder_eph_pub, 4: encrypted2, [5: session params (skipped)]}`.
+/// Parses Sigma2 through [`wire::parse_sigma2`], labelling the failure as
+/// this role's [`CaseError::Sigma2Malformed`].
 pub(crate) fn parse_sigma2(payload: &[u8]) -> Result<Sigma2, CaseError> {
-    let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| CaseError::Sigma2Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(CaseError::Sigma2Malformed("top-level struct")),
-    }
-
-    let mut responder_random: Option<[u8; 32]> = None;
-    let mut responder_session_id: Option<u16> = None;
-    let mut responder_eph_pub: Option<[u8; 65]> = None;
-    let mut encrypted2: Option<Vec<u8>> = None;
-
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| CaseError::Sigma2Malformed("tlv"))?
-            .ok_or(CaseError::Sigma2Malformed("truncated"))?;
-        match el.value {
-            Value::ContainerEnd => break,
-            Value::Bytes(b) if el.tag == Tag::Context(1) => {
-                responder_random = Some(
-                    b.try_into()
-                        .map_err(|_| CaseError::Sigma2Malformed("responder random length"))?,
-                );
-            }
-            Value::Uint(v) if el.tag == Tag::Context(2) => {
-                responder_session_id = Some(
-                    u16::try_from(v)
-                        .map_err(|_| CaseError::Sigma2Malformed("responder session id"))?,
-                );
-            }
-            Value::Bytes(b) if el.tag == Tag::Context(3) => {
-                responder_eph_pub =
-                    Some(b.try_into().map_err(|_| {
-                        CaseError::Sigma2Malformed("responder ephemeral key length")
-                    })?);
-            }
-            Value::Bytes(b) if el.tag == Tag::Context(4) => {
-                encrypted2 = Some(b.to_vec());
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| CaseError::Sigma2Malformed("tlv"))?;
-            }
-            _ => {} // unknown/unsupported scalar field: ignore
-        }
-    }
-
-    let responder_session_id =
-        responder_session_id.ok_or(CaseError::Sigma2Malformed("responder session id"))?;
-    if responder_session_id == 0 {
-        return Err(CaseError::Sigma2Malformed(
-            "responder session id must be non-zero",
-        ));
-    }
-
-    Ok(Sigma2 {
-        responder_random: responder_random.ok_or(CaseError::Sigma2Malformed("responder random"))?,
-        responder_session_id,
-        responder_eph_pub: responder_eph_pub
-            .ok_or(CaseError::Sigma2Malformed("responder ephemeral key"))?,
-        encrypted2: encrypted2.ok_or(CaseError::Sigma2Malformed("encrypted2"))?,
-    })
-}
-
-/// Parses the decrypted TBE payload: `struct{1: noc, [2: icac], 3: signature,
-/// [4: resumption id (ignored)]}`. Shared by Sigma2's TBE2 (this module calls
-/// it via `decrypt_tbe2`).
-fn parse_tbe(payload: &[u8]) -> Result<Tbe2, CaseError> {
-    let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| CaseError::Sigma2Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(CaseError::Sigma2Malformed("tbe top-level struct")),
-    }
-
-    let mut noc: Option<Vec<u8>> = None;
-    let mut icac: Option<Vec<u8>> = None;
-    let mut signature: Option<[u8; 64]> = None;
-
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| CaseError::Sigma2Malformed("tlv"))?
-            .ok_or(CaseError::Sigma2Malformed("truncated tbe"))?;
-        match el.value {
-            Value::ContainerEnd => break,
-            Value::Bytes(b) if el.tag == Tag::Context(1) => noc = Some(b.to_vec()),
-            Value::Bytes(b) if el.tag == Tag::Context(2) => icac = Some(b.to_vec()),
-            Value::Bytes(b) if el.tag == Tag::Context(3) => {
-                signature = Some(
-                    b.try_into()
-                        .map_err(|_| CaseError::Sigma2Malformed("tbe signature length"))?,
-                );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| CaseError::Sigma2Malformed("tlv"))?;
-            }
-            _ => {} // e.g. resumption id: ignored
-        }
-    }
-
-    Ok(Tbe2 {
-        noc: noc.ok_or(CaseError::Sigma2Malformed("tbe noc"))?,
-        icac,
-        signature: signature.ok_or(CaseError::Sigma2Malformed("tbe signature"))?,
-    })
+    wire::parse_sigma2(payload).map_err(CaseError::Sigma2Malformed)
 }
 
 /// Decrypts and parses Sigma2's TBE2 blob with the S2K key.
 pub(crate) fn decrypt_tbe2(s2k: &[u8; 16], encrypted2: &[u8]) -> Result<Tbe2, CaseError> {
-    let pt = crate::crypto::decrypt_payload(s2k, TBE2_NONCE, b"", encrypted2)
+    let pt = crate::crypto::decrypt_payload(s2k, wire::TBE2_NONCE, b"", encrypted2)
         .map_err(|_| CaseError::Tbe2DecryptFailed)?;
-    parse_tbe(&pt)
+    wire::parse_tbe(&pt).map_err(CaseError::Sigma2Malformed)
 }
 
 /// `pub`（Task 10）: mat-device の CASE responder core が S2K/S3K をこの関数で
@@ -349,59 +209,6 @@ pub fn eph_pub_bytes(secret: &p256::SecretKey) -> [u8; 65] {
         .as_bytes()
         .try_into()
         .expect("uncompressed p256 point is 65 bytes")
-}
-
-/// ECDH between our ephemeral secret and the peer's ephemeral public key.
-fn ecdh(secret: &p256::SecretKey, peer_pub: &[u8; 65]) -> Result<[u8; 32], CaseError> {
-    let pk = p256::PublicKey::from_sec1_bytes(peer_pub)
-        .map_err(|_| CaseError::Sigma2Malformed("responder ephemeral key"))?;
-    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), pk.as_affine());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(shared.raw_secret_bytes().as_slice());
-    Ok(out)
-}
-
-/// TBS payload signed over in Sigma2/Sigma3:
-/// `struct{1: noc, [2: icac], 3: sender_eph_pub, 4: receiver_eph_pub}`.
-fn encode_tbs(
-    noc: &[u8],
-    icac: Option<&[u8]>,
-    sender_eph: &[u8; 65],
-    receiver_eph: &[u8; 65],
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), noc);
-    if let Some(icac) = icac {
-        w.put_bytes(Tag::Context(2), icac);
-    }
-    w.put_bytes(Tag::Context(3), sender_eph);
-    w.put_bytes(Tag::Context(4), receiver_eph);
-    w.end_container();
-    w.finish()
-}
-
-/// TBE3 plaintext (encrypted into Sigma3):
-/// `struct{1: noc, [2: icac], 3: signature}`.
-fn encode_tbe3(noc: &[u8], icac: Option<&[u8]>, sig: &[u8; 64]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), noc);
-    if let Some(icac) = icac {
-        w.put_bytes(Tag::Context(2), icac);
-    }
-    w.put_bytes(Tag::Context(3), sig);
-    w.end_container();
-    w.finish()
-}
-
-/// Sigma3 wire payload: `struct{1: encrypted3}`.
-fn encode_sigma3(encrypted3: &[u8]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), encrypted3);
-    w.end_container();
-    w.finish()
 }
 
 /// Runs the CASE initiator handshake against `peer` and returns the
@@ -476,14 +283,19 @@ pub async fn establish(
 
     // 3. Verify Sigma2.
     let sigma2 = parse_sigma2(&msg.payload)?;
-    let shared = ecdh(&eph_secret, &sigma2.responder_eph_pub)?;
+    let shared = wire::ecdh(&eph_secret, &sigma2.responder_eph_pub)
+        .ok_or(CaseError::Sigma2Malformed("responder ephemeral key"))?;
     let sigma1_hash: [u8; 32] = transcript.clone().finalize().into();
-    let mut s2k_salt = Vec::with_capacity(16 + 32 + 65 + 32);
-    s2k_salt.extend_from_slice(&creds.ipk_operational);
-    s2k_salt.extend_from_slice(&sigma2.responder_random);
-    s2k_salt.extend_from_slice(&sigma2.responder_eph_pub);
-    s2k_salt.extend_from_slice(&sigma1_hash);
-    let s2k = derive_sigma_key(&shared, &s2k_salt, INFO_S2K);
+    let s2k = derive_sigma_key(
+        &shared,
+        &wire::s2k_salt(
+            &creds.ipk_operational,
+            &sigma2.responder_random,
+            &sigma2.responder_eph_pub,
+            &sigma1_hash,
+        ),
+        wire::INFO_S2K,
+    );
     // Salt computed against sigma1 alone; now fold Sigma2's raw payload in
     // for subsequent transcript hashes (same order chip-tool uses).
     transcript.update(&msg.payload);
@@ -511,7 +323,7 @@ pub async fn establish(
             cert_fabric_id,
         });
     }
-    let tbs2 = encode_tbs(
+    let tbs2 = wire::encode_tbs(
         &tbe2.noc,
         tbe2.icac.as_deref(),
         &sigma2.responder_eph_pub,
@@ -521,7 +333,7 @@ pub async fn establish(
         .map_err(|_| CaseError::Sigma2SignatureInvalid)?;
 
     // 4. Sigma3.
-    let tbs3 = encode_tbs(
+    let tbs3 = wire::encode_tbs(
         &creds.noc_tlv,
         creds.icac_tlv.as_deref(),
         &eph_pub,
@@ -529,15 +341,16 @@ pub async fn establish(
     );
     let signature = crate::crypto::sign_ecdsa_p256(&creds.op_private_key, &tbs3)
         .map_err(|_| CaseError::Crypto("sigma3 signature"))?;
-    let tbe3 = encode_tbe3(&creds.noc_tlv, creds.icac_tlv.as_deref(), &signature);
+    let tbe3 = wire::encode_tbe(&creds.noc_tlv, creds.icac_tlv.as_deref(), &signature, None);
     let sigma2_hash: [u8; 32] = transcript.clone().finalize().into();
-    let mut s3k_salt = Vec::with_capacity(48);
-    s3k_salt.extend_from_slice(&creds.ipk_operational);
-    s3k_salt.extend_from_slice(&sigma2_hash);
-    let s3k = derive_sigma_key(&shared, &s3k_salt, INFO_S3K);
-    let encrypted3 = crate::crypto::encrypt_payload(&s3k, TBE3_NONCE, b"", &tbe3)
+    let s3k = derive_sigma_key(
+        &shared,
+        &wire::s3k_salt(&creds.ipk_operational, &sigma2_hash),
+        wire::INFO_S3K,
+    );
+    let encrypted3 = crate::crypto::encrypt_payload(&s3k, wire::TBE3_NONCE, b"", &tbe3)
         .map_err(|_| CaseError::Crypto("sigma3 payload too large"))?;
-    let sigma3 = encode_sigma3(&encrypted3);
+    let sigma3 = wire::encode_sigma3(&encrypted3);
     transcript.update(&sigma3);
 
     let resp = ex
@@ -631,7 +444,7 @@ impl std::error::Error for EstablishAnyError {}
 /// **専用の** UDP ソケットを bind し、`stagger` 間隔で [`establish`] を起動、
 /// 最初に成功した試行を採用して残りを drop する（[`crate::race`]）。
 ///
-/// 専用ソケットが必須なのは、`UnsecuredExchange::screen` が自分の exchange
+/// 専用ソケットが必須なのは、unsecured exchange の screening が自分の exchange
 /// 以外のデータグラムを捨てるため — 1 ソケットを共有すると並行試行が互いの
 /// 応答を吸って落とす。同一ノードへの並行 Sigma1 自体は安全（local session
 /// id / exchange id / source node id は試行ごとにランダム）。
@@ -747,7 +560,7 @@ mod tests {
         w.put_bytes(Tag::Context(4), &[0x88; 16]);
         w.end_container();
         let key = [0x42; 16];
-        let ct = crate::crypto::encrypt_payload(&key, TBE2_NONCE, b"", &w.finish()).unwrap();
+        let ct = crate::crypto::encrypt_payload(&key, wire::TBE2_NONCE, b"", &w.finish()).unwrap();
         let tbe = decrypt_tbe2(&key, &ct).unwrap();
         assert_eq!(tbe.noc, b"noc-tlv");
         assert_eq!(tbe.icac, None);
