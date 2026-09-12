@@ -913,7 +913,7 @@ op.rs のテストに追加（`mod tests` 内）:
     /// 単一ノードと groupcast のショートカットは同じワイヤ（監査 Tier 3）。
     #[tokio::test]
     async fn node_and_group_shortcuts_share_wire() {
-        let color = mat_core::color::resolve_color("red").unwrap();
+        let color = mat_core::color::from_hue_sat(0, 100);
         let mut conn = FakeConn::default();
         run_node_op(&mut conn, &node(NodeOpKind::Color { endpoint: 1, color: color.clone(), transition: 3 })).await.unwrap();
         run_node_op(&mut conn, &node(NodeOpKind::color_temp(1, Some(2700), None, 3))).await.unwrap();
@@ -930,7 +930,7 @@ op.rs のテストに追加（`mod tests` 内）:
         }
     }
 ```
-（`mat_core::color::resolve_color` の実名は `grep -n 'pub fn' crates/mat-core/src/color.rs` で確認して合わせる。`ResolvedColor` が `Clone` でなければ `derive(Clone)` は既に op.rs の enum が `Clone` なので付いているはず — 確認する。）
+（`ResolvedColor` は `Clone` 済み — `crates/mat-core/src/color.rs:70`。）
 
 - [ ] **Step 7: `open_egress`**
 
