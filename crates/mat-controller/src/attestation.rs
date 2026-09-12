@@ -737,10 +737,31 @@ mod tests {
         encode_attestation_elements(b"fake-cd", nonce, 0)
     }
 
-    fn sign(fix: &Fixture, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
+    /// `elements ‖ challenge` に DAC 鍵で署名する。
+    fn sign_with(dac_key: &p256::SecretKey, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
         let msg = attestation_tbs(elements, challenge);
-        let priv_bytes: [u8; 32] = fix.dac_key.to_bytes().into();
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
         sign_ecdsa_p256(&priv_bytes, &msg).unwrap()
+    }
+
+    fn sign(fix: &Fixture, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
+        sign_with(&fix.dac_key, elements, challenge)
+    }
+
+    /// 固定 nonce / challenge / 偽 CD で `verify_device_attestation` を呼ぶ。
+    /// `rejects_*` 系（チェーン制約の分岐だけを踏ませたいテスト）の共通足場。
+    fn verify_chain(
+        dac: &[u8],
+        pai: &[u8],
+        paa: &[u8],
+        dac_key: &p256::SecretKey,
+    ) -> Result<(), AttestationError> {
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let sig = sign_with(dac_key, &el, &challenge);
+        let paa_ders = [paa.to_vec()];
+        verify_device_attestation(dac, pai, &paa_ders, &[], &el, &sig, &nonce, &challenge)
     }
 
     #[test]
@@ -861,24 +882,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac/pai vid mismatch")
@@ -917,24 +921,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &fake_pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &fake_pai, &paa, &dac_key).unwrap_err();
         // メッセージまで固定: 手前のチェック（issuer/subject 照合など）で
         // 落ちて分岐がマスクされる退行を検出できるように。
         assert!(matches!(
@@ -974,24 +961,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac must not be a ca certificate")
@@ -1022,24 +992,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("paa is not a ca certificate")
@@ -1111,24 +1064,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("pai keyusage missing keycertsign")
@@ -1167,24 +1103,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("paa keyusage missing keycertsign")
@@ -1216,24 +1135,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0021), // digitalSignature|keyCertSign
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac keyusage must not sign certificates")
@@ -1265,24 +1167,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             None, // keyUsage 拡張なし
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap();
+        verify_chain(&dac, &pai, &paa, &dac_key).unwrap();
     }
 
     // --- Task 3: VID スコープ PAA / DAC PID 必須 ---
@@ -1322,24 +1207,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("vid-scoped paa/pai vid mismatch")
@@ -1373,24 +1241,7 @@ mod tests {
             None,
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(err, AttestationError::Chain("dac missing pid")));
     }
 

@@ -1020,6 +1020,20 @@ mod tests {
         }
     }
 
+    /// テスト用フィクスチャ: root01 の証明書＋秘密鍵と node01_01 の公開鍵。
+    fn root_and_op_keys() -> (MatterCert, [u8; 32], [u8; 65]) {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        (root, root_priv, op_pub)
+    }
+
     #[test]
     fn parses_node_cert_ids() {
         let node = MatterCert::parse(NODE_CHIP).unwrap();
@@ -1143,16 +1157,7 @@ mod tests {
 
     #[test]
     fn issue_noc_produces_chain_valid_cert() {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        // 我々の operational 鍵ペア（テストではフィクスチャの node 鍵を流用）
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
+        let (root, root_priv, op_pub) = root_and_op_keys();
 
         let noc = issue_noc(
             &op_pub,
@@ -1298,13 +1303,9 @@ mod tests {
 
     #[test]
     fn rejects_icac_constraint_violations() {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let (root, root_priv, op_pub) = root_and_op_keys();
         let ica = MatterCert::parse(ICA_CHIP).unwrap();
         let node = MatterCert::parse(NODE_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
 
         // cA=false の ICAC
         let not_ca = mutate_and_resign(&ica, &root_priv, |exts| {
@@ -1363,10 +1364,6 @@ mod tests {
         ));
 
         // pathLen=0 自体は 2-cert チェーンでは合法
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
         let direct = issue_noc(&op_pub, 0x1B669, 1, &shallow_root, &root_priv, &[9]).unwrap();
         verify_noc_chain(&direct, None, &shallow_root).unwrap();
     }
@@ -1462,19 +1459,6 @@ mod tests {
         verify_noc_chain(&noc, None, &rcac).unwrap();
     }
     // --- CASE Authenticated Tags (spec §6.6.2.1.2 / §6.5.6.1) ---
-
-    fn root_and_op_keys() -> (MatterCert, [u8; 32], [u8; 65]) {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        (root, root_priv, op_pub)
-    }
 
     #[test]
     fn issue_noc_with_cats_round_trips_through_tlv_and_cats() {
