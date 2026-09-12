@@ -125,8 +125,6 @@ impl std::fmt::Debug for FabricCredentials {
 pub enum FabricError {
     /// Certificate parse/verification failure (own-chain sanity check).
     Cert(crate::cert::CertError),
-    /// Operational key pair generation failed (self-issued path only).
-    GenKey,
     /// Self-issued NOC failed to build or self-verify.
     SelfIssue(crate::cert::CertError),
 }
@@ -135,7 +133,6 @@ impl std::fmt::Display for FabricError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FabricError::Cert(e) => write!(f, "fabric credentials: {e}"),
-            FabricError::GenKey => write!(f, "operational key generation failed"),
             FabricError::SelfIssue(e) => write!(f, "self-issued NOC invalid: {e}"),
         }
     }
@@ -146,7 +143,6 @@ impl std::error::Error for FabricError {
         match self {
             FabricError::Cert(e) => Some(e),
             FabricError::SelfIssue(e) => Some(e),
-            FabricError::GenKey => None,
         }
     }
 }
@@ -161,23 +157,14 @@ impl FabricCredentials {
     /// Generate a fresh operational key, self-issue a NOC under the KVS root,
     /// and assemble credentials for CASE.
     pub fn from_self_issued(m: crate::kvs::SelfIssueMaterials) -> Result<Self, FabricError> {
-        use p256::elliptic_curve::sec1::ToSec1Point;
-
         // 1. new operational key pair.
         let sk = crate::case::random_p256_secret();
         let op_private_key: [u8; 32] = sk.to_bytes().into();
-        let op_public_key: [u8; 65] = sk
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .map_err(|_| FabricError::GenKey)?;
+        let op_public_key = crate::case::eph_pub_bytes(&sk);
 
         // 2. self-issue a NOC under the root.
         let rcac = crate::cert::MatterCert::parse(&m.rcac).map_err(FabricError::Cert)?;
-        let mut serial = [0u8; 8];
-        getrandom::fill(&mut serial).expect("os rng");
-        serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
+        let serial = crate::cert::random_serial();
         let noc = crate::cert::issue_noc(
             &op_public_key,
             m.node_id,

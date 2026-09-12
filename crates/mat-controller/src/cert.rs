@@ -8,8 +8,6 @@
 
 use crate::asn1;
 use crate::tlv::{Reader, Tag, Value, Writer};
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
 
 /// SubjectKeyIdentifier per Matter/X.509: SHA-1 of the 65-byte public key.
 pub fn subject_key_id(public_key: &[u8; 65]) -> [u8; 20] {
@@ -123,6 +121,17 @@ pub fn issue_noc_with_cats(
     Ok(noc)
 }
 
+/// 証明書 serial 用の乱数 8 バイト。先頭ビットを落として BER INTEGER の
+/// 最小正表現（`asn1::integer` に先頭 0x00 を足させない）を保つ。
+/// `generate_rcac` / `fabric::FabricCredentials::from_self_issued` /
+/// `commissioning::CommissioningFabric::issue_device_noc` が共有する。
+pub fn random_serial() -> [u8; 8] {
+    let mut serial = [0u8; 8];
+    getrandom::fill(&mut serial).expect("os rng");
+    serial[0] &= 0x7F;
+    serial
+}
+
 /// 使い捨て fabric 用の self-signed RCAC（root 証明書）を新規生成する。
 /// 発行者 DN・subject DN は同一（自己発行）で、subject の rcac-id
 /// (TLV tag 20) は乱数の u64。戻り値は `(RCAC, root 秘密鍵)` — 呼び出し側
@@ -134,15 +143,9 @@ pub fn issue_noc_with_cats(
 /// KeyUsage(keyCertSign|cRLSign) / SubjectKeyId(自身) /
 /// AuthorityKeyId(自身の SKID) — 自己署名なので issuer も自分。
 pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
-    use p256::elliptic_curve::sec1::ToSec1Point;
     let sk = crate::case::random_p256_secret();
     let private_key: [u8; 32] = sk.to_bytes().into();
-    let public_key: [u8; 65] = sk
-        .public_key()
-        .to_sec1_point(false)
-        .as_bytes()
-        .try_into()
-        .map_err(|_| CertError::Malformed("pubkey encode"))?;
+    let public_key = crate::case::eph_pub_bytes(&sk);
 
     let mut rcac_id_b = [0u8; 8];
     getrandom::fill(&mut rcac_id_b).expect("os rng");
@@ -163,9 +166,7 @@ pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
         CertExtension::AuthorityKeyId(skid),
     ];
 
-    let mut serial = [0u8; 8];
-    getrandom::fill(&mut serial).expect("os rng");
-    serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
+    let serial = random_serial();
 
     let mut rcac = MatterCert {
         serial: serial.to_vec(),
@@ -486,11 +487,13 @@ impl MatterCert {
 
     /// Verify this certificate's signature was produced by `issuer_public_key`.
     pub fn verify_signed_by(&self, issuer_public_key: &[u8; 65]) -> Result<(), CertError> {
-        let key = VerifyingKey::from_sec1_bytes(issuer_public_key)
-            .map_err(|_| CertError::BadPublicKey)?;
-        let sig = Signature::from_slice(&self.signature).map_err(|_| CertError::BadSignature)?;
-        key.verify(&self.tbs_der()?, &sig)
-            .map_err(|_| CertError::BadSignature)
+        let tbs = self.tbs_der()?;
+        crate::crypto::verify_ecdsa_p256(issuer_public_key, &tbs, &self.signature).map_err(|e| {
+            match e {
+                crate::crypto::CryptoError::BadKey => CertError::BadPublicKey,
+                _ => CertError::BadSignature,
+            }
+        })
     }
 
     /// Look up a Matter-id-valued subject DN attribute by TLV tag
@@ -1145,14 +1148,7 @@ mod tests {
         // 自己署名検証
         rcac.verify_signed_by(&rcac.pub_key).unwrap();
         // この root で NOC を発行してチェーン検証が通る
-        let op = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToSec1Point;
-        let op_pub: [u8; 65] = op
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let op_pub = crate::case::eph_pub_bytes(&crate::case::random_p256_secret());
         let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
         verify_noc_chain(&noc, None, &rcac).unwrap();
     }
@@ -1230,16 +1226,10 @@ mod tests {
 
     /// テスト用: 新規 RCAC とそこから発行した NOC、および双方の秘密鍵。
     fn fresh_chain() -> (MatterCert, [u8; 32], MatterCert, [u8; 32]) {
-        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, root_key) = generate_rcac().unwrap();
         let op = crate::case::random_p256_secret();
         let op_priv: [u8; 32] = op.to_bytes().into();
-        let op_pub: [u8; 65] = op
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let op_pub = crate::case::eph_pub_bytes(&op);
         let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
         (rcac, root_key, noc, op_priv)
     }
@@ -1262,15 +1252,9 @@ mod tests {
         // 監査 Tier1① の攻撃再現: fabric 内ノード A が自分の NOC_A を ICAC に
         // 仕立て、A の運用鍵で偽 NOC_X（subject=node X, issuer=NOC_A.subject）を
         // 発行して積む。CA 制約検査が無いと署名・DN・fabric-id 全てを通過する。
-        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, _root_key, noc_a, a_op_priv) = fresh_chain();
         let x = crate::case::random_p256_secret();
-        let x_pub: [u8; 65] = x
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let x_pub = crate::case::eph_pub_bytes(&x);
         // issue_noc は issuer の subject を偽 NOC の issuer に写すので、
         // NOC_A を「発行者」に渡すだけで攻撃チェーンが組み上がる。
         let fake_noc = issue_noc(&x_pub, 0xBEEF, 0xFAB1, &noc_a, &a_op_priv, &[7]).unwrap();

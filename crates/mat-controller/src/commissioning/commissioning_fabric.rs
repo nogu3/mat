@@ -103,12 +103,7 @@ impl CommissioningFabric {
         node_id: u64,
     ) -> Result<Vec<u8>, CommissionError> {
         let rcac = MatterCert::parse(&self.rcac_tlv)?;
-        let mut serial = [0u8; 8];
-        getrandom::fill(&mut serial).map_err(|_| CommissionError::Malformed {
-            step: "issue_device_noc",
-            detail: "os rng failure",
-        })?;
-        serial[0] &= 0x7F; // BER INTEGER の最小正表現を維持
+        let serial = cert::random_serial();
         let noc = cert::issue_noc(
             op_public_key,
             node_id,
@@ -273,13 +268,7 @@ mod tests {
         assert_eq!(creds.node_id, 0x1_0001);
         // デバイス NOC も同じ root でチェーン検証が通る
         let dev = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToSec1Point;
-        let dev_pub: [u8; 65] = dev
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let dev_pub = crate::case::eph_pub_bytes(&dev);
         let noc_tlv = fab.issue_device_noc(&dev_pub, 0x2_0001).unwrap();
         let noc = crate::cert::MatterCert::parse(&noc_tlv).unwrap();
         let rcac = crate::cert::MatterCert::parse(&fab.rcac_tlv).unwrap();

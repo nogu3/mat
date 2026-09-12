@@ -668,20 +668,8 @@ pub(crate) mod test_support {
         subject_vid_pid: Option<(u16, u16)>,
         key_usage: Option<u16>,
     ) -> Vec<u8> {
-        use p256::elliptic_curve::sec1::ToSec1Point;
-
-        let subject_pub: [u8; 65] = subject_key
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .expect("uncompressed p256 point is 65 bytes");
-        let signer_pub: [u8; 65] = signer_key
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .expect("uncompressed p256 point is 65 bytes");
+        let subject_pub = crate::case::eph_pub_bytes(subject_key);
+        let signer_pub = crate::case::eph_pub_bytes(signer_key);
         let subject_skid = crate::cert::subject_key_id(&subject_pub);
         let signer_skid = crate::cert::subject_key_id(&signer_pub);
 
@@ -731,14 +719,7 @@ pub(crate) mod test_support {
 
     /// 最小の自己署名 PKCS#10 CSR を合成する（DER バイト列）。
     pub(crate) fn make_test_csr(key: &p256::SecretKey) -> Vec<u8> {
-        use p256::elliptic_curve::sec1::ToSec1Point;
-
-        let pub_bytes: [u8; 65] = key
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .expect("uncompressed p256 point is 65 bytes");
+        let pub_bytes = crate::case::eph_pub_bytes(key);
 
         let version = asn1::integer(&[0x00]);
         let subject_name = build_name(b"csr", None);
