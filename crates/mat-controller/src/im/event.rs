@@ -1,7 +1,9 @@
 //! イベント関連の IM 型とコーデック（spec §8.9.2.2 EventPathIB / §8.9.2.4
 //! EventFilterIB / §8.9.2.6 EventDataIB / EventStatusIB）。
 use super::read::encode_attribute_report_ib;
-use super::{expect_struct_start, skip_container, ImError, ReportEntryOut, IM_REVISION};
+use super::{
+    expect_struct_start, put_status_ib, skip_container, ImError, ReportEntryOut, IM_REVISION,
+};
 use crate::tlv::{Reader, Tag, Value, Writer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,9 +426,7 @@ pub fn encode_report_data_full(
                             urgent: false,
                         },
                     );
-                    w.start_struct(Tag::Context(1)); // StatusIB
-                    w.put_uint(Tag::Context(0), u64::from(*status));
-                    w.end_container(); // StatusIB
+                    put_status_ib(&mut w, Tag::Context(1), *status, None); // StatusIB
                     w.end_container(); // EventStatusIB
                 }
             }

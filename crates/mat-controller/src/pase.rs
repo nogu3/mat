@@ -14,12 +14,16 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::case::{encode_status_report, parse_status_report, random_nonzero_u16};
+use crate::case::random_nonzero_u16;
 use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
+use crate::secure_channel::{
+    encode_status_report, parse_status_report, GENERAL_CODE_FAILURE,
+    SC_PROTOCOL_CODE_INVALID_PARAMETER,
+};
 use crate::session::{SecureSession, SessionKeys};
 use crate::spake2p::{self, SpakeError};
-use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
+use crate::tlv::{skip_container, Reader, StructFields, Tag, TlvError, Value, Writer};
 use crate::transport::Transport;
 
 /// PASE opcodes (spec §4.13.1.2): PBKDFParamRequest/Response and
@@ -40,13 +44,10 @@ pub const OPCODE_PASE_PAKE3: u8 = 0x24;
 /// `Context = Crypto_Hash("CHIP PAKE V1 Commissioning" || PBKDFParamRequest
 /// || PBKDFParamResponse)`.
 const PAKE_CONTEXT_PREFIX: &[u8] = b"CHIP PAKE V1 Commissioning";
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
-const STATUS_SUCCESS: (u16, u16) = (0, 0); // (general_code, protocol_code)
-/// SecureChannel protocol の `GeneralStatusCode::FAILURE`（spec §4.11.3 表）。
-const GENERAL_CODE_FAILURE: u16 = 1;
-/// SecureChannel protocol 固有コード `kInvalidParameter`（spec §4.11.3.1
-/// 表・SPAKE2+ 確認不一致など、handshake データ自体が拒否される場合）。
-const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
+/// StatusReport success check (general_code, protocol_code); `protocol_id`
+/// is ignored here (unlike `case::establish`'s 3-tuple check against
+/// `secure_channel::STATUS_REPORT_SUCCESS`).
+const STATUS_SUCCESS: (u16, u16) = (0, 0);
 
 /// spec §3.9 の PBKDF 制約（CRYPTO_PBKDF_ITERATIONS_MIN/MAX）。iterations の
 /// 範囲は commissioning.rs の open-window 引数検証も同じ値を参照する。
@@ -120,6 +121,28 @@ impl std::fmt::Display for PaseError {
 
 impl std::error::Error for PaseError {}
 
+/// `StructFields::open` の `Err` を `PaseError` に写す。`open` は「次の要素が
+/// struct ではない／入力が空」を番号 `InvalidType(0)` で返す（`Reader` は
+/// 予約型 `0x19..=0x1F` にしか `InvalidType` を出さないので衝突しない）ので
+/// それだけを `"top-level struct"` とし、本物の TLV デコードエラーは
+/// `"tlv"` に落とす —— 手書き走査時代のラベル分けそのまま。
+fn top_level_struct_err(e: TlvError) -> PaseError {
+    match e {
+        TlvError::InvalidType(0) => PaseError::Malformed("top-level struct"),
+        _ => PaseError::Malformed("tlv"),
+    }
+}
+
+/// struct フィールド走査（`StructFields::next_scalar` / `next_field`）の `Err`
+/// を `PaseError` に写す。`ContainerEnd` 到達前の入力終端は `truncated`
+/// （呼び出し元ごとのラベル）、それ以外は `"tlv"`。
+fn field_err(e: TlvError, truncated: &'static str) -> PaseError {
+    match e {
+        TlvError::Truncated => PaseError::Malformed(truncated),
+        _ => PaseError::Malformed("tlv"),
+    }
+}
+
 /// Encodes PBKDFParamRequest: `struct{1: initiatorRandom[32],
 /// 2: initiatorSessionId, 3: passcodeId=0, 4: hasPBKDFParameters=false}`.
 /// The optional SessionParams (tag 5) is never sent.
@@ -157,26 +180,14 @@ pub struct PbkdfParamRequest {
 /// `encode_pbkdf_param_request`.
 pub fn decode_pbkdf_param_request(payload: &[u8]) -> Result<PbkdfParamRequest, PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut initiator_random: Option<[u8; 32]> = None;
     let mut initiator_session_id: Option<u16> = None;
     let mut has_pbkdf_parameters: Option<bool> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 initiator_random = Some(
                     b.try_into()
@@ -189,9 +200,6 @@ pub fn decode_pbkdf_param_request(payload: &[u8]) -> Result<PbkdfParamRequest, P
             }
             Value::Bool(v) if el.tag == Tag::Context(4) => {
                 has_pbkdf_parameters = Some(v);
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {} // e.g. tag 3 (passcodeId): ignored
         }
@@ -251,53 +259,42 @@ pub fn encode_pbkdf_param_response(
 /// right after calling this function.
 pub fn decode_pbkdf_param_response(payload: &[u8]) -> Result<PbkdfParamResponse, PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    // tag 4 の入れ子 struct に降りる必要があるので、この decoder だけ
+    // `next_field`（container start も受け取る）。他 5 本は `next_scalar`。
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut responder_session_id: Option<u16> = None;
     let mut iterations: Option<u32> = None;
     let mut salt: Option<Vec<u8>> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_field().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Uint(v) if el.tag == Tag::Context(3) => {
                 responder_session_id = Some(
                     u16::try_from(v).map_err(|_| PaseError::Malformed("responder session id"))?,
                 );
             }
-            Value::StructStart if el.tag == Tag::Context(4) => loop {
-                let inner = r
-                    .next()
-                    .map_err(|_| PaseError::Malformed("tlv"))?
-                    .ok_or(PaseError::Malformed("truncated pbkdf parameters"))?;
-                match inner.value {
-                    Value::ContainerEnd => break,
-                    Value::Uint(v) if inner.tag == Tag::Context(1) => {
-                        iterations =
-                            Some(u32::try_from(v).map_err(|_| PaseError::Malformed("iterations"))?);
+            Value::StructStart if el.tag == Tag::Context(4) => {
+                let mut pbkdf = StructFields::inside(f.reader());
+                while let Some(inner) = pbkdf
+                    .next_scalar()
+                    .map_err(|e| field_err(e, "truncated pbkdf parameters"))?
+                {
+                    match inner.value {
+                        Value::Uint(v) if inner.tag == Tag::Context(1) => {
+                            iterations = Some(
+                                u32::try_from(v).map_err(|_| PaseError::Malformed("iterations"))?,
+                            );
+                        }
+                        Value::Bytes(b) if inner.tag == Tag::Context(2) => {
+                            salt = Some(b.to_vec());
+                        }
+                        _ => {} // e.g. tag 3 (bitrate for OWF hash, unused)
                     }
-                    Value::Bytes(b) if inner.tag == Tag::Context(2) => {
-                        salt = Some(b.to_vec());
-                    }
-                    Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                        skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
-                    }
-                    _ => {} // e.g. tag 3 (bitrate for OWF hash, unused)
                 }
-            },
+            }
             Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
+                skip_container(f.reader()).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {} // e.g. tags 1/2 (randoms): ignored
         }
@@ -334,32 +331,17 @@ pub fn encode_pake1(p_a: &[u8; 65]) -> Vec<u8> {
 /// `encode_pake1`.
 pub fn decode_pake1(payload: &[u8]) -> Result<[u8; 65], PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut p_a: Option<[u8; 65]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 p_a = Some(
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("pA length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -385,25 +367,13 @@ pub fn encode_pake2(p_b: &[u8; 65], c_b: &[u8; 32]) -> Vec<u8> {
 /// direction codec, widened for out-of-crate test scaffolding.
 pub fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut p_b: Option<[u8; 65]> = None;
     let mut c_b: Option<[u8; 32]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 p_b = Some(
                     b.try_into()
@@ -415,9 +385,6 @@ pub fn decode_pake2(payload: &[u8]) -> Result<([u8; 65], [u8; 32]), PaseError> {
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("cB length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -445,32 +412,17 @@ pub fn encode_pake3(c_a: &[u8; 32]) -> Vec<u8> {
 /// `encode_pake3`.
 pub fn decode_pake3(payload: &[u8]) -> Result<[u8; 32], PaseError> {
     let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| PaseError::Malformed("tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(PaseError::Malformed("top-level struct")),
-    }
+    let mut f = StructFields::open(&mut r).map_err(top_level_struct_err)?;
 
     let mut c_a: Option<[u8; 32]> = None;
 
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| PaseError::Malformed("tlv"))?
-            .ok_or(PaseError::Malformed("truncated"))?;
+    while let Some(el) = f.next_scalar().map_err(|e| field_err(e, "truncated"))? {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 c_a = Some(
                     b.try_into()
                         .map_err(|_| PaseError::Malformed("cA length"))?,
                 );
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| PaseError::Malformed("tlv"))?;
             }
             _ => {}
         }
@@ -491,6 +443,14 @@ pub fn pake_context(request_bytes: &[u8], response_bytes: &[u8]) -> [u8; 32] {
     hasher.update(request_bytes);
     hasher.update(response_bytes);
     hasher.finalize().into()
+}
+
+/// PASE session keys: `HKDF-SHA256(salt=[], ikm=Ke, info="SessionKeys")`
+/// split into I2R / R2I / AttestationChallenge (spec §4.13.2.3). `pub` so
+/// the responder role (`test_support::pase_responder_task`, mat-device's
+/// `core::pase`) derives the same keys through the same code.
+pub fn derive_session_keys(k_e: &[u8; 16]) -> SessionKeys {
+    crate::secure_channel::session_keys_from_hkdf(&[], k_e)
 }
 
 /// Runs the PASE initiator handshake against `peer` and returns the
@@ -655,18 +615,9 @@ pub async fn establish(
         });
     }
 
-    // 6. Session keys: HKDF-SHA256(salt=[], ikm=Ke, info="SessionKeys") 48B
-    // (spec §4.13.2.3) — note the ikm is Ke (16B, TT hash's second half),
-    // not the full SPAKE2+ shared secret.
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&[]), &shared.k_e);
-    let mut okm = [0u8; 48];
-    hk.expand(INFO_SESSION_KEYS, &mut okm)
-        .expect("valid length");
-    let keys = SessionKeys {
-        i2r: okm[..16].try_into().expect("16"),
-        r2i: okm[16..32].try_into().expect("16"),
-        attestation_challenge: okm[32..].try_into().expect("16"),
-    };
+    // 6. Session keys (spec §4.13.2.3) — ikm is Ke (16 B, TT hash's second
+    // half), not the full SPAKE2+ shared secret.
+    let keys = derive_session_keys(&shared.k_e);
 
     // 7. PASE sessions are unauthenticated: both sides use node id 0.
     Ok(SecureSession::new(
@@ -683,9 +634,9 @@ pub async fn establish(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Destination, MessageHeader, ProtocolHeader};
+    use crate::test_support::{build_unsecured, decode_unsecured, recv_dg};
     use crate::tlv::{Reader, Tag, Value};
-    use crate::transport::{UdpTransport, MAX_DATAGRAM};
+    use crate::transport::UdpTransport;
 
     fn fast_cfg() -> MrpConfig {
         MrpConfig {
@@ -695,55 +646,6 @@ mod tests {
             backoff: 1.0,
             jitter: 0.0,
         }
-    }
-
-    fn build_unsecured(
-        counter: u32,
-        opcode: u8,
-        exchange_id: u16,
-        acked_counter: Option<u32>,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let header = MessageHeader {
-            session_id: 0,
-            security_flags: 0,
-            message_counter: counter,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let proto = ProtocolHeader {
-            initiator: false,
-            needs_ack: false,
-            acked_counter,
-            opcode,
-            exchange_id,
-            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-            vendor_id: None,
-        };
-        let mut buf = header.encoded();
-        proto.encode(&mut buf);
-        buf.extend_from_slice(payload);
-        buf
-    }
-
-    async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (n, from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
-            .await
-            .expect("fake device timed out waiting for a datagram")
-            .expect("recv_from io error");
-        (buf[..n].to_vec(), from)
-    }
-
-    /// Decodes an unsecured (session id 0) datagram into its headers +
-    /// payload, or `None` if malformed.
-    fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Vec<u8>)> {
-        let (h, off) = MessageHeader::decode(buf).ok()?;
-        if h.session_id != 0 {
-            return None;
-        }
-        let (p, boff) = ProtocolHeader::decode(&buf[off..]).ok()?;
-        Some((h, p, buf[off + boff..].to_vec()))
     }
 
     #[test]
@@ -884,6 +786,7 @@ mod tests {
             OPCODE_PBKDF_PARAM_RESPONSE,
             req_proto.exchange_id,
             Some(req_header.message_counter),
+            false,
             &w.finish(),
         );
         responder_transport
@@ -909,6 +812,7 @@ mod tests {
             OPCODE_PASE_PAKE2,
             pake1_proto.exchange_id,
             Some(pake1_header.message_counter),
+            false,
             &w2.finish(),
         );
         responder_transport
@@ -1049,6 +953,7 @@ mod tests {
             OPCODE_PBKDF_PARAM_RESPONSE,
             req_proto.exchange_id,
             Some(req_header.message_counter),
+            false,
             &w.finish(),
         );
         responder_transport
@@ -1074,5 +979,209 @@ mod tests {
             result,
             Err(PaseError::Malformed("pbkdf iterations out of range"))
         ));
+    }
+
+    /// PASE SessionKeys golden (HKDF-SHA256, salt=[], ikm=Ke, "SessionKeys").
+    /// Computed once from the pre-refactor inline derivation; pins the
+    /// `derive_session_keys` extraction byte-for-byte.
+    #[test]
+    fn golden_pase_session_keys_are_stable() {
+        let k_e: [u8; 16] = core::array::from_fn(|i| 0x10 + i as u8);
+        let keys = derive_session_keys(&k_e);
+        assert_eq!(
+            keys.i2r,
+            [
+                0x87, 0x1e, 0x53, 0x79, 0xe8, 0xc1, 0xc6, 0x1d, 0x6a, 0x31, 0x8c, 0x9c, 0x40, 0x53,
+                0x22, 0xff,
+            ]
+        );
+        assert_eq!(
+            keys.r2i,
+            [
+                0x10, 0x98, 0x57, 0x34, 0x45, 0xc3, 0x28, 0xd4, 0x59, 0xfe, 0x0c, 0x7f, 0xe9, 0x24,
+                0xf7, 0x87,
+            ]
+        );
+        assert_eq!(
+            keys.attestation_challenge,
+            [
+                0x5e, 0x6a, 0x9b, 0x7f, 0x85, 0x94, 0xad, 0xbb, 0x29, 0x9b, 0xad, 0xb4, 0x61, 0x99,
+                0x89, 0x32,
+            ]
+        );
+    }
+
+    // --- Task 11: StructFields 置換後の Malformed ラベル固定 ---
+
+    /// `Malformed` のラベルを取り出す（`Ok` 型に `Debug` を要求しないよう
+    /// `unwrap_err` は使わない）。
+    fn label<T>(r: Result<T, PaseError>) -> &'static str {
+        match r {
+            Err(PaseError::Malformed(l)) => l,
+            Err(other) => panic!("expected Malformed, got {other}"),
+            Ok(_) => panic!("expected Err(Malformed), got Ok"),
+        }
+    }
+
+    /// `StructFields` 置換前の手書き走査と同じ `Malformed` ラベルを出すことを
+    /// 固定する。唯一の意図的な差分は「struct の中で *要素自体* が途中で
+    /// 切れている」ケース（下記 `accepted delta` 印）: 以前は Reader の
+    /// `Truncated` を `"tlv"` に畳んでいたが、`next_scalar` が入力終端と同じ
+    /// `Truncated` を返すため `"truncated"`（入れ子では
+    /// `"truncated pbkdf parameters"`）になる。
+    #[test]
+    fn decoder_malformed_labels_are_stable() {
+        // --- top-level struct の検査 ---
+        assert_eq!(label(decode_pake1(&[])), "top-level struct");
+        // uint / array は struct ではない
+        assert_eq!(label(decode_pake1(&[0x04, 0x2A])), "top-level struct");
+        assert_eq!(label(decode_pake1(&[0x16, 0x18])), "top-level struct");
+        // 予約 element type / tag バイト欠けは Reader エラー → "tlv"
+        assert_eq!(label(decode_pake1(&[0x19])), "tlv");
+        assert_eq!(label(decode_pake1(&[0x24])), "tlv");
+
+        // --- struct フィールド走査の終端 ---
+        // ContainerEnd なしで入力終端
+        assert_eq!(label(decode_pake1(&[0x15])), "truncated");
+        // 要素自体が途中で切れている (accepted delta: 以前は "tlv")
+        assert_eq!(label(decode_pake1(&[0x15, 0x04])), "truncated");
+        // struct の中の Reader エラーは "tlv" のまま
+        assert_eq!(label(decode_pake1(&[0x15, 0x19, 0x18])), "tlv");
+
+        // --- フィールド単位のラベル ---
+        let pake1_with = |tag: u8, len: usize| {
+            let mut w = crate::tlv::Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(tag), &vec![0u8; len]);
+            w.end_container();
+            w.finish()
+        };
+        assert_eq!(label(decode_pake1(&pake1_with(1, 64))), "pA length");
+        assert_eq!(label(decode_pake1(&pake1_with(9, 65))), "pA");
+        assert_eq!(label(decode_pake3(&pake1_with(1, 31))), "cA length");
+        assert_eq!(label(decode_pake3(&pake1_with(9, 32))), "cA");
+        assert_eq!(label(decode_pake2(&pake1_with(1, 64))), "pB length");
+        assert_eq!(label(decode_pake2(&pake1_with(2, 31))), "cB length");
+        assert_eq!(label(decode_pake2(&pake1_with(1, 65))), "cB");
+        assert_eq!(label(decode_pake2(&pake1_with(9, 65))), "pB");
+
+        // PBKDFParamRequest
+        let req = |f: &dyn Fn(&mut crate::tlv::Writer)| {
+            let mut w = crate::tlv::Writer::new();
+            w.start_struct(Tag::Anonymous);
+            f(&mut w);
+            w.end_container();
+            w.finish()
+        };
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_bytes(Tag::Context(1), &[0u8; 31])
+            ))),
+            "initiator random length"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_uint(Tag::Context(2), 0x1_0000)
+            ))),
+            "session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_uint(Tag::Context(3), 0)
+            ))),
+            "initiator random"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(
+                &|w| w.put_bytes(Tag::Context(1), &[0u8; 32])
+            ))),
+            "initiator session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_request(&req(&|w| {
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+                w.put_uint(Tag::Context(2), 1);
+            }))),
+            "has pbkdf parameters"
+        );
+        // 未知の入れ子コンテナ (tag 5 SessionParams) は丸ごと飛ばして成功する
+        let with_session_params = req(&|w| {
+            w.put_bytes(Tag::Context(1), &[0u8; 32]);
+            w.put_uint(Tag::Context(2), 1);
+            w.start_struct(Tag::Context(5));
+            w.put_uint(Tag::Context(1), 300);
+            w.start_array(Tag::Context(2));
+            w.put_uint(Tag::Anonymous, 7);
+            w.end_container();
+            w.end_container();
+            w.put_bool(Tag::Context(4), true);
+        });
+        let parsed = decode_pbkdf_param_request(&with_session_params).unwrap();
+        assert!(parsed.has_pbkdf_parameters);
+
+        // PBKDFParamResponse
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(
+                &|w| w.put_uint(Tag::Context(3), 0x1_0000)
+            ))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|_w| {}))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(
+                &|w| w.put_uint(Tag::Context(3), 1)
+            ))),
+            "iterations"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|w| {
+                w.put_uint(Tag::Context(3), 1);
+                w.start_struct(Tag::Context(4));
+                w.put_uint(Tag::Context(1), 0x1_0000_0000);
+                w.end_container();
+            }))),
+            "iterations"
+        );
+        assert_eq!(
+            label(decode_pbkdf_param_response(&req(&|w| {
+                w.put_uint(Tag::Context(3), 1);
+                w.start_struct(Tag::Context(4));
+                w.put_uint(Tag::Context(1), 1000);
+                w.end_container();
+            }))),
+            "salt"
+        );
+        // 入れ子 struct が ContainerEnd なしで終端 → 入れ子専用ラベル
+        let mut w = crate::tlv::Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(3), 1);
+        w.start_struct(Tag::Context(4));
+        w.put_uint(Tag::Context(1), 1000);
+        w.end_container();
+        w.end_container();
+        let full = w.finish();
+        let cut = &full[..full.len() - 2]; // 入れ子と外側の ContainerEnd を落とす
+        assert_eq!(
+            label(decode_pbkdf_param_response(cut)),
+            "truncated pbkdf parameters"
+        );
+        // 入れ子の中の未知コンテナ (tag 3) も飛ばして成功する
+        let nested_skip = req(&|w| {
+            w.put_uint(Tag::Context(3), 0xB0B1);
+            w.start_struct(Tag::Context(4));
+            w.put_uint(Tag::Context(1), 1000);
+            w.start_array(Tag::Context(3));
+            w.put_uint(Tag::Anonymous, 1);
+            w.end_container();
+            w.put_bytes(Tag::Context(2), b"0123456789abcdef");
+            w.end_container();
+        });
+        let resp = decode_pbkdf_param_response(&nested_skip).unwrap();
+        assert_eq!(resp.responder_session_id, 0xB0B1);
+        assert_eq!(resp.iterations, 1000);
+        assert_eq!(resp.salt, b"0123456789abcdef");
     }
 }

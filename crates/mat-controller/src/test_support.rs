@@ -25,8 +25,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use sha2::Sha256;
-
 use crate::case_responder::{
     CaseFabric, CaseOutput, CaseResponderCore, OPCODE_SIGMA1, OPCODE_SIGMA3,
 };
@@ -34,13 +32,11 @@ use crate::cert::MatterCert;
 use crate::crypto::{open_message, seal_message};
 use crate::exchange::MrpConfig;
 use crate::im;
-use crate::message::{Destination, MessageHeader, ProtocolHeader, OPCODE_STATUS_REPORT};
+use crate::message::{
+    Destination, MessageHeader, ProtocolHeader, OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL,
+};
 use crate::tlv::{Tag, Writer};
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
-
-const PROTO_SECURE_CHANNEL: u16 = 0x0000;
-/// spec §4.13.2.3 — mirror of the crate-private one in `pase.rs`.
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
 // Shared fabric material. IPK must be identical on both sides.
 pub const IPK: [u8; 16] = [0xCC; 16];
@@ -65,20 +61,13 @@ pub fn fast_cfg() -> MrpConfig {
     }
 }
 
-// --- crypto helper (still needed: PASE session keys below;
-// `case_responder::CaseResponderCore` handles CASE's own HKDF derivations
-// internally now) ---
-
-fn hkdf48(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 48] {
-    let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), shared);
-    let mut out = [0u8; 48];
-    hk.expand(info, &mut out).expect("valid length");
-    out
-}
-
 // --- unsecured framing helpers for the responder ---
 
-fn build_unsecured(
+/// Builds an *unsecured* (session id 0) datagram from the responder's side
+/// (`initiator: false`) on the secure-channel protocol — the framing every
+/// PASE/CASE handshake message rides before a session exists. Shared with
+/// `pase.rs`'s own unit tests, which build the same shape by hand otherwise.
+pub fn build_unsecured(
     counter: u32,
     opcode: u8,
     exchange_id: u16,
@@ -99,7 +88,7 @@ fn build_unsecured(
         acked_counter,
         opcode,
         exchange_id,
-        protocol_id: PROTO_SECURE_CHANNEL,
+        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
         vendor_id: None,
     };
     let mut buf = header.encoded();
@@ -108,7 +97,9 @@ fn build_unsecured(
     buf
 }
 
-async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
+/// Receives one datagram (5 s timeout) — the raw read every hand-rolled
+/// responder loop in this crate's tests starts from.
+pub async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0u8; MAX_DATAGRAM];
     let (n, from) = tokio::time::timeout(Duration::from_secs(5), t.recv_from(&mut buf))
         .await
@@ -117,15 +108,17 @@ async fn recv_dg(t: &UdpTransport) -> (Vec<u8>, SocketAddr) {
     (buf[..n].to_vec(), from)
 }
 
-/// Decodes an *unsecured* datagram (session id 0) into its protocol header
-/// and app payload, or `None` if it isn't a well-formed unsecured message.
-fn decode_unsecured(buf: &[u8]) -> Option<(ProtocolHeader, Vec<u8>)> {
+/// Decodes an *unsecured* datagram (session id 0) into its message header,
+/// protocol header and app payload, or `None` if it isn't a well-formed
+/// unsecured message. The message header comes back too because callers
+/// need its `message_counter` for the piggyback ack.
+pub fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Vec<u8>)> {
     let (h, off) = MessageHeader::decode(buf).ok()?;
     if h.session_id != 0 {
         return None;
     }
     let (p, boff) = ProtocolHeader::decode(&buf[off..]).ok()?;
-    Some((p, buf[off + boff..].to_vec()))
+    Some((h, p, buf[off + boff..].to_vec()))
 }
 
 /// Waits for the initiator's next *unsecured* message with `opcode` (skipping
@@ -138,13 +131,12 @@ async fn recv_unsecured(
 ) -> (ProtocolHeader, Vec<u8>, u32, SocketAddr) {
     loop {
         let (buf, from) = recv_dg(transport).await;
-        let Some((p, payload)) = decode_unsecured(&buf) else {
+        let Some((h, p, payload)) = decode_unsecured(&buf) else {
             continue;
         };
         if p.opcode != opcode || !p.initiator {
             continue;
         }
-        let (h, _) = MessageHeader::decode(&buf).unwrap();
         return (p, payload, h.message_counter, from);
     }
 }
@@ -469,9 +461,9 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
         .expect("send pase status report");
 
     // --- SessionKeys（spec §4.13.2.3: HKDF(salt=[], ikm=Ke, "SessionKeys")）---
-    let okm = hkdf48(&k_e, &[], INFO_SESSION_KEYS);
-    let i2r: [u8; 16] = okm[..16].try_into().unwrap();
-    let r2i: [u8; 16] = okm[16..32].try_into().unwrap();
+    let keys = pase::derive_session_keys(&k_e);
+    let i2r = keys.i2r;
+    let r2i = keys.r2i;
 
     // --- Serve one secured IM ReadRequest（PASE は両側 node id 0）---
     serve_one_read(
@@ -489,4 +481,118 @@ pub async fn pase_responder_task(transport: UdpTransport, passcode: u32) -> Sock
     )
     .await;
     initiator_addr
+}
+
+// ============================================================================
+// BTP fake peripheral（`btp.rs` の `#[cfg(test)]` と
+// `tests/btp_pase_plumbing.rs` が共有する GattLink の裏側役）
+// ============================================================================
+
+/// Test-only fake BTP peripheral + `fake_link` constructor shared by
+/// `btp.rs`'s tests and `tests/btp_pase_plumbing.rs`.
+pub mod btp_fake {
+    use crate::btp::{
+        encode_data_packet, encode_standalone_ack, handshake_request, segment_payload_capacity,
+        GattLink, Packet, Reassembler, SegmentPos, BTP_VERSION, PROPOSED_WINDOW,
+    };
+
+    /// テスト用 BTP peripheral。GattLink の裏側を演じる。
+    ///
+    /// A fake BTP peripheral driving the far side of a [`crate::btp::GattLink`]:
+    /// it answers the handshake, reassembles what the central writes, and
+    /// indicates frames back. `btp.rs`'s own unit tests and the cross-crate
+    /// `tests/btp_pase_plumbing.rs` share this one implementation.
+    ///
+    /// The three channel / reassembly fields are `pub` because several `btp.rs`
+    /// tests need frame-level access (they assert on individual frames, inject
+    /// out-of-order segments, or watch for silence); the four methods only cover
+    /// the well-behaved message-level cases.
+    pub struct FakePeripheral {
+        pub from_client: tokio::sync::mpsc::Receiver<Vec<u8>>, // C1 writes
+        pub to_client: tokio::sync::mpsc::Sender<Vec<u8>>,     // C2 indications
+        tx_seq: u8,
+        pub reasm: Reassembler,
+    }
+
+    pub fn fake_link() -> (GattLink, FakePeripheral) {
+        let (wtx, wrx) = tokio::sync::mpsc::channel(1);
+        let (itx, irx) = tokio::sync::mpsc::channel(8);
+        (
+            GattLink {
+                writes: wtx,
+                indications: irx,
+            },
+            FakePeripheral {
+                from_client: wrx,
+                to_client: itx,
+                // handshake response が seq 0 を暗黙消費済み → データは 1 始まり
+                tx_seq: 1,
+                reasm: Reassembler::new(),
+            },
+        )
+    }
+
+    impl FakePeripheral {
+        /// handshake request を受けて response を返す。
+        pub async fn do_handshake(&mut self, segment_size: u16, window: u8) {
+            let req = self.from_client.recv().await.expect("handshake request");
+            assert_eq!(req, handshake_request(PROPOSED_WINDOW));
+            let mut resp = vec![0x65, 0x6C, BTP_VERSION];
+            resp.extend_from_slice(&segment_size.to_le_bytes());
+            resp.push(window);
+            self.to_client.send(resp).await.unwrap();
+        }
+
+        /// client からの書き込みを 1 メッセージ再構成するまで読む。
+        /// 返り値: (メッセージ, 最後に受けた seq)
+        pub async fn recv_message(&mut self) -> (Vec<u8>, u8) {
+            loop {
+                let frame = self.from_client.recv().await.expect("frame");
+                let pkt = Packet::decode(&frame).unwrap();
+                let seq = pkt.seq;
+                if let Some(msg) = self.reasm.push(&pkt).unwrap() {
+                    return (msg, seq);
+                }
+            }
+        }
+
+        pub async fn send_ack(&mut self, ack: u8) {
+            let seq = self.tx_seq;
+            self.tx_seq = self.tx_seq.wrapping_add(1);
+            self.to_client
+                .send(encode_standalone_ack(seq, ack).to_vec())
+                .await
+                .unwrap();
+        }
+
+        /// メッセージを segment_size で分割して indication する（ack 相乗り付き）。
+        pub async fn send_message(&mut self, msg: &[u8], segment_size: u16, ack: Option<u8>) {
+            let mut off = 0usize;
+            let mut first = true;
+            while first || off < msg.len() {
+                let cap = segment_payload_capacity(segment_size, first, ack.is_some() && first);
+                let end = (off + cap).min(msg.len());
+                let ending = end == msg.len();
+                let pos = if first {
+                    SegmentPos::First { ending }
+                } else if ending {
+                    SegmentPos::Last
+                } else {
+                    SegmentPos::Middle
+                };
+                let seq = self.tx_seq;
+                self.tx_seq = self.tx_seq.wrapping_add(1);
+                let frame = encode_data_packet(
+                    seq,
+                    if first { ack } else { None },
+                    pos,
+                    if first { Some(msg.len() as u16) } else { None },
+                    &msg[off..end],
+                );
+                self.to_client.send(frame).await.unwrap();
+                off = end;
+                first = false;
+            }
+        }
+    }
 }

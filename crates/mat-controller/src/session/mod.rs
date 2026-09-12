@@ -232,6 +232,22 @@ impl SecureSession {
     }
 }
 
+impl crate::exchange::MrpEndpoint for SecureSession {
+    type Error = SessionError;
+    fn transport(&self) -> &Transport {
+        &self.transport
+    }
+    fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+    fn last_rx(&self) -> Option<Instant> {
+        self.last_rx
+    }
+    fn timeout_error() -> SessionError {
+        SessionError::Timeout
+    }
+}
+
 mod client;
 mod mrp;
 mod responder;

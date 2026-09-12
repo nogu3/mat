@@ -6,13 +6,16 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION;
 use crate::crypto::{open_message, seal_message, OpenError};
-use crate::exchange::{IncomingMessage, MrpConfig};
+use crate::exchange::{
+    boxed_screen, is_standalone_ack, mrp_send_loop, recv_until, IncomingMessage, MrpConfig, Verdict,
+};
 use crate::message::{
     Destination, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
     PROTOCOL_ID_SECURE_CHANNEL,
 };
-use crate::transport::MAX_DATAGRAM;
+use crate::secure_channel::{encode_status_report, GENERAL_CODE_SUCCESS};
 
 use super::{SecureSession, SessionError};
 
@@ -124,10 +127,10 @@ impl SecureSession {
     /// MRP に乗せない（teardown を ~4.7s の再送予算でブロックしない —
     /// pase.rs の abort StatusReport と同じ判断）。失敗は握りつぶす。
     pub async fn send_close_session(&mut self) {
-        let payload = crate::case::encode_status_report(
-            0,
+        let payload = encode_status_report(
+            GENERAL_CODE_SUCCESS,
             u32::from(PROTOCOL_ID_SECURE_CHANNEL),
-            crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION,
+            SC_PROTOCOL_CODE_CLOSE_SESSION,
         );
         let sealed = self.seal(
             Self::new_exchange_id(),
@@ -158,6 +161,17 @@ impl SecureSession {
     ) -> Result<Option<IncomingMessage>, SessionError> {
         self.screen_with(buf, from, ScreenFilter::OurExchange(exchange_id))
             .await
+    }
+
+    /// Buffers an already-acked peer-initiated message for the subscription /
+    /// request APIs, evicting the oldest when full (identical policy in
+    /// `screen_with`'s filter-miss path and `respond_status`'s ack wait).
+    pub(super) fn stash_peer_initiated(&mut self, msg: IncomingMessage) {
+        if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
+            tracing::warn!("peer-initiated report buffer full; dropping oldest");
+            self.peer_initiated.pop_front();
+        }
+        self.peer_initiated.push_back(msg);
     }
 
     /// Decrypts a datagram and screens it per `filter`. Returns `None` for
@@ -270,14 +284,8 @@ impl SecureSession {
             // 中身は別 exchange のケース）は ack 済みのまま黙って捨てられ、
             // ピアは再送しないため永久喪失していた（レビュー指摘: cross-
             // exchange secured request のack-then-drop）。
-            let is_standalone_ack = proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-            if proto.initiator && !is_standalone_ack {
-                if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
-                    tracing::warn!("peer-initiated report buffer full; dropping oldest");
-                    self.peer_initiated.pop_front();
-                }
-                self.peer_initiated.push_back(IncomingMessage {
+            if proto.initiator && !is_standalone_ack(&proto) {
+                self.stash_peer_initiated(IncomingMessage {
                     header,
                     proto,
                     payload,
@@ -316,48 +324,27 @@ impl SecureSession {
         }
         let (datagram, our_counter) =
             self.seal(exchange_id, true, protocol_id, opcode, true, None, payload)?;
-        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now()
-                + crate::exchange::jittered_interval(
-                    interval,
-                    cfg.jitter,
-                    crate::exchange::unit_random(),
-                );
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break; // interval 経過 → 再送
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self.screen(&buf[..n], from, exchange_id).await? else {
-                    continue;
-                };
-                let acks_us = msg.proto.acked_counter == Some(our_counter);
-                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-                if is_standalone_ack {
-                    if acks_us {
-                        return Ok(None);
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s.screen(buf, from, exchange_id).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    if is_standalone_ack(&msg.proto) {
+                        return Ok(if msg.proto.acked_counter == Some(our_counter) {
+                            Verdict::Done(None)
+                        } else {
+                            Verdict::Ignore
+                        });
                     }
-                    continue;
-                }
-                return Ok(Some(msg));
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(SessionError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+                    Ok(Verdict::Done(Some(msg)))
+                })
+            },
+        )
+        .await
     }
 
     /// Waits for the next real (non-ack) message on the given exchange.
@@ -366,53 +353,38 @@ impl SecureSession {
         exchange_id: u16,
         timeout: Duration,
     ) -> Result<IncomingMessage, SessionError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(SessionError::Timeout);
-            }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let Ok(recv) =
-                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-            else {
-                return Err(SessionError::Timeout);
-            };
-            let (n, from) = recv?;
-            let Some(msg) = self.screen(&buf[..n], from, exchange_id).await? else {
-                continue;
-            };
-            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            return Ok(msg);
-        }
+        recv_until(
+            self,
+            timeout,
+            || SessionError::Timeout,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s.screen(buf, from, exchange_id).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    Ok(if is_standalone_ack(&msg.proto) {
+                        Verdict::Ignore
+                    } else {
+                        Verdict::Done(msg)
+                    })
+                })
+            },
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_channel::parse_status_report;
     use crate::session::test_util::*;
-    use crate::transport::Transport;
+    use crate::transport::{Transport, MAX_DATAGRAM};
     use std::sync::Arc;
 
     #[tokio::test]
     async fn send_reliable_encrypts_and_completes_on_sealed_ack() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
         let ex = SecureSession::new_exchange_id();
 
         let dev = tokio::spawn(async move {
@@ -584,23 +556,15 @@ mod tests {
             // StatusReport をデバイス側から自分の exchange で送ってくる
             // ケース）。initiator: true はデバイスが「その exchange の」
             // initiator であることを示す。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 700,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: OPCODE_STATUS_REPORT,
-                exchange_id: foreign_ex,
-                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                vendor_id: None,
-            };
-            let msg = seal_message(&R2I, &header, &proto, b"foreign", DEV_NODE).unwrap();
+            let msg = device_initiated_datagram(
+                foreign_ex,
+                PROTOCOL_ID_SECURE_CHANNEL,
+                OPCODE_STATUS_REPORT,
+                None,
+                true,
+                700,
+                b"foreign",
+            );
             device.send_to(&msg, local).await.unwrap();
 
             // controller の standalone ack は、そのメッセージ自身の
@@ -628,18 +592,7 @@ mod tests {
     /// StatusReport(SUCCESS, secure channel, CloseSession=2) であること（Issue #20）。
     #[tokio::test]
     async fn close_session_sends_single_best_effort_status_report() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
         s.send_close_session().await;
         let mut buf = [0u8; MAX_DATAGRAM];
         let (n, _) = device.recv_from(&mut buf).await.unwrap();
@@ -647,7 +600,7 @@ mod tests {
         assert_eq!(proto.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
         assert_eq!(proto.opcode, OPCODE_STATUS_REPORT);
         assert!(!proto.needs_ack, "CloseSession must be best-effort");
-        let (general, proto_id, code) = crate::case::parse_status_report(&payload).unwrap();
+        let (general, proto_id, code) = parse_status_report(&payload).unwrap();
         assert_eq!((general, proto_id, code), (0, 0, 2));
         // 再送しないこと（MRP に乗せない）。
         let again =

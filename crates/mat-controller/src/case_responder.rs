@@ -19,12 +19,13 @@
 //! Productionizes `test_support::responder_task` (a hand-rolled test-only
 //! CASE responder proven against `case::establish` in
 //! `case_self_handshake.rs`, and itself migrated onto this module — see that
-//! function's doc comment): same wire constants (opcodes, TBE nonces, HKDF
-//! info strings), same TBS/TBE framing (sender-eph before receiver-eph in
-//! TBS2/TBS3), same transcript-hash boundaries (S2K salted with
-//! SHA256(sigma1) alone; S3K over SHA256(sigma1||sigma2); SessionKeys over
-//! SHA256(sigma1||sigma2||sigma3)) — ported by reusing the *same* HKDF
-//! helpers the production initiator (`case`) uses
+//! function's doc comment): the same wire constants (opcodes, TBE nonces,
+//! HKDF info strings) and the same TBS/TBE framing (sender-eph before
+//! receiver-eph in TBS2/TBS3) — literally the same code, since both roles
+//! now share `case::wire` — and the same transcript-hash boundaries (S2K
+//! salted with SHA256(sigma1) alone; S3K over SHA256(sigma1||sigma2);
+//! SessionKeys over SHA256(sigma1||sigma2||sigma3)) — ported by reusing the
+//! *same* HKDF helpers the production initiator (`case`) uses
 //! (`derive_sigma_key`/`derive_session_keys`), rather than an independent
 //! re-derivation, since both roles now live in the same crate.
 //!
@@ -53,27 +54,21 @@
 //! contract already means a core that returned `Err` is expected to be
 //! discarded by its caller, not resumed).
 
-use sha2::{Digest, Sha256};
-
-use crate::case::{
-    derive_session_keys, derive_sigma_key, encode_status_report, eph_pub_bytes, random_p256_secret,
+use crate::case::wire::{
+    ecdh, encode_sigma2, encode_tbe, encode_tbs, parse_sigma1, parse_sigma3, parse_tbe, s2k_salt,
+    s3k_salt, sha256, Tbe, INFO_S2K, INFO_S3K, TBE2_NONCE, TBE3_NONCE,
 };
+use crate::case::{derive_session_keys, derive_sigma_key, eph_pub_bytes, random_p256_secret};
 use crate::cert::{verify_noc_chain, CaseAuthTags, CertError, MatterCert};
 use crate::crypto::{decrypt_payload, encrypt_payload, sign_ecdsa_p256, verify_ecdsa_p256};
 use crate::fabric::case_destination_id;
 use crate::message::OPCODE_STATUS_REPORT;
 use crate::session::SessionKeys;
-use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 
-// Wire opcodes (spec §4.14) — mirror of the ones in `case.rs`.
-pub(crate) const OPCODE_SIGMA1: u8 = 0x30;
-pub(crate) const OPCODE_SIGMA2: u8 = 0x31;
-pub(crate) const OPCODE_SIGMA3: u8 = 0x32;
-
-const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
-const TBE3_NONCE: &[u8; 13] = b"NCASE_Sigma3N";
-const INFO_S2K: &[u8] = b"Sigma2";
-const INFO_S3K: &[u8] = b"Sigma3";
+// Wire opcodes (spec §4.14) — single definition in `secure_channel`;
+// re-exported crate-wide because `test_support` reads them from here.
+use crate::secure_channel::{encode_status_report, GENERAL_CODE_SUCCESS};
+pub(crate) use crate::secure_channel::{OPCODE_SIGMA1, OPCODE_SIGMA2, OPCODE_SIGMA3};
 
 /// The subset of a fabric's material CASE-as-responder needs: enough to
 /// answer `case_destination_id` for fabric selection, sign/verify TBS2/TBS3,
@@ -242,7 +237,7 @@ impl CaseResponderCore {
     }
 
     fn handle_sigma1(&mut self, payload: &[u8]) -> Result<CaseOutput, CaseCoreError> {
-        let sigma1 = parse_sigma1(payload)?;
+        let sigma1 = parse_sigma1(payload).map_err(CaseCoreError::Decode)?;
 
         let fabric = self
             .fabrics
@@ -264,15 +259,20 @@ impl CaseResponderCore {
         let mut responder_random = [0u8; 32];
         getrandom::fill(&mut responder_random).expect("os rng");
 
-        let shared = ecdh(&resp_secret, &sigma1.initiator_eph_pub)?;
+        let shared = ecdh(&resp_secret, &sigma1.initiator_eph_pub)
+            .ok_or(CaseCoreError::Decode("initiator ephemeral key"))?;
         let sigma1_hash = sha256(payload);
 
-        let mut s2k_salt = Vec::with_capacity(16 + 32 + 65 + 32);
-        s2k_salt.extend_from_slice(&fabric.ipk_operational);
-        s2k_salt.extend_from_slice(&responder_random);
-        s2k_salt.extend_from_slice(&responder_eph_pub);
-        s2k_salt.extend_from_slice(&sigma1_hash);
-        let s2k = derive_sigma_key(&shared, &s2k_salt, INFO_S2K);
+        let s2k = derive_sigma_key(
+            &shared,
+            &s2k_salt(
+                &fabric.ipk_operational,
+                &responder_random,
+                &responder_eph_pub,
+                &sigma1_hash,
+            ),
+            INFO_S2K,
+        );
 
         let tbs2 = encode_tbs(
             &fabric.noc_tlv,
@@ -337,20 +337,25 @@ impl CaseResponderCore {
             unreachable!("on_message only calls handle_sigma3 from AwaitSigma3");
         };
 
-        let encrypted3 = parse_sigma3(payload)?;
+        let encrypted3 = parse_sigma3(payload).map_err(CaseCoreError::Decode)?;
 
         let mut s1s2 = Vec::with_capacity(sigma1_payload.len() + sigma2_payload.len());
         s1s2.extend_from_slice(&sigma1_payload);
         s1s2.extend_from_slice(&sigma2_payload);
         let sigma12_hash = sha256(&s1s2);
-        let mut s3k_salt = Vec::with_capacity(16 + 32);
-        s3k_salt.extend_from_slice(&fabric.ipk_operational);
-        s3k_salt.extend_from_slice(&sigma12_hash);
-        let s3k = derive_sigma_key(&shared, &s3k_salt, INFO_S3K);
+        let s3k = derive_sigma_key(
+            &shared,
+            &s3k_salt(&fabric.ipk_operational, &sigma12_hash),
+            INFO_S3K,
+        );
 
         let tbe3 = decrypt_payload(&s3k, TBE3_NONCE, b"", &encrypted3)
             .map_err(|_| CaseCoreError::Tbe3DecryptFailed)?;
-        let (init_noc_tlv, init_icac_tlv, sig3) = parse_tbe(&tbe3)?;
+        let Tbe {
+            noc: init_noc_tlv,
+            icac: init_icac_tlv,
+            signature: sig3,
+        } = parse_tbe(&tbe3).map_err(CaseCoreError::Decode)?;
 
         let init_noc = MatterCert::parse(&init_noc_tlv).map_err(CaseCoreError::PeerCertInvalid)?;
         let init_icac = init_icac_tlv
@@ -390,7 +395,7 @@ impl CaseResponderCore {
         let keys = derive_session_keys(&shared, &fabric.ipk_operational, &final_hash);
 
         Ok(CaseOutput::Established {
-            reply: encode_status_report(0, 0, 0), // general=SUCCESS, protocol id=0, code=0
+            reply: encode_status_report(GENERAL_CODE_SUCCESS, 0, 0),
             opcode: OPCODE_STATUS_REPORT,
             keys,
             peer_session_id: initiator_session_id,
@@ -401,240 +406,11 @@ impl CaseResponderCore {
     }
 }
 
-// --- wire codecs (this module's own copies, byte-identical to `case.rs`'s
-// initiator-side Sigma1/Sigma3/TBE3 framing where the shapes coincide) ---
-
-struct Sigma1Fields {
-    initiator_random: [u8; 32],
-    initiator_session_id: u16,
-    dest_id: [u8; 32],
-    initiator_eph_pub: [u8; 65],
-}
-
-/// Parses Sigma1: `struct{1: random, 2: session_id, 3: dest_id, 4: eph_pub,
-/// ...}` (any optional fields past tag 4 — resumption, session params — are
-/// ignored; `case::encode_sigma1` never sends them). Resumption fields (tag
-/// 6/7) are deliberately tolerated and ignored — full-handshake fallback per
-/// spec §4.14.2; Sigma2Resume is out of M2 scope.
-fn parse_sigma1(payload: &[u8]) -> Result<Sigma1Fields, CaseCoreError> {
-    let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| CaseCoreError::Decode("sigma1 tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(CaseCoreError::Decode("sigma1 top-level struct")),
-    }
-    let mut random: Option<[u8; 32]> = None;
-    let mut session_id: Option<u16> = None;
-    let mut dest: Option<[u8; 32]> = None;
-    let mut eph: Option<[u8; 65]> = None;
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| CaseCoreError::Decode("sigma1 tlv"))?
-            .ok_or(CaseCoreError::Decode("sigma1 truncated"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => {
-                random = Some(
-                    b.try_into()
-                        .map_err(|_| CaseCoreError::Decode("sigma1 random length"))?,
-                );
-            }
-            (Tag::Context(2), Value::Uint(v)) => {
-                session_id =
-                    Some(u16::try_from(v).map_err(|_| CaseCoreError::Decode("sigma1 session id"))?);
-            }
-            // initiatorSessionParams（tag 5 の struct）等のネストは丸ごと
-            // 読み飛ばす — 中身の context tag をこのレベルの field と
-            // 誤読しない（matter.js は必ず sessionParams を含める）。
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("sigma1 tlv"))?;
-            }
-            (Tag::Context(3), Value::Bytes(b)) => {
-                dest = Some(
-                    b.try_into()
-                        .map_err(|_| CaseCoreError::Decode("sigma1 dest id length"))?,
-                );
-            }
-            (Tag::Context(4), Value::Bytes(b)) => {
-                eph = Some(
-                    b.try_into()
-                        .map_err(|_| CaseCoreError::Decode("sigma1 eph length"))?,
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(Sigma1Fields {
-        initiator_random: random.ok_or(CaseCoreError::Decode("sigma1 random"))?,
-        initiator_session_id: session_id.ok_or(CaseCoreError::Decode("sigma1 session id"))?,
-        dest_id: dest.ok_or(CaseCoreError::Decode("sigma1 dest id"))?,
-        initiator_eph_pub: eph.ok_or(CaseCoreError::Decode("sigma1 eph"))?,
-    })
-}
-
-/// Encodes Sigma2: `struct{1: responder_random, 2: responder_session_id,
-/// 3: responder_eph_pub, 4: encrypted2}`.
-fn encode_sigma2(random: &[u8; 32], session_id: u16, eph: &[u8; 65], encrypted2: &[u8]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), random);
-    w.put_uint(Tag::Context(2), u64::from(session_id));
-    w.put_bytes(Tag::Context(3), eph);
-    w.put_bytes(Tag::Context(4), encrypted2);
-    w.end_container();
-    w.finish()
-}
-
-/// Extracts the single context-1 byte string from a Sigma3 payload
-/// (`struct{1: encrypted3}`).
-fn parse_sigma3(payload: &[u8]) -> Result<Vec<u8>, CaseCoreError> {
-    let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| CaseCoreError::Decode("sigma3 tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(CaseCoreError::Decode("sigma3 top-level struct")),
-    }
-    let mut enc: Option<Vec<u8>> = None;
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| CaseCoreError::Decode("sigma3 tlv"))?
-            .ok_or(CaseCoreError::Decode("sigma3 truncated"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => enc = Some(b.to_vec()),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("sigma3 tlv"))?;
-            }
-            _ => {}
-        }
-    }
-    enc.ok_or(CaseCoreError::Decode("sigma3 missing encrypted3"))
-}
-
-/// `(noc_tlv, icac_tlv, signature)` — a decrypted TBE's fields.
-type ParsedTbe = (Vec<u8>, Option<Vec<u8>>, [u8; 64]);
-
-/// Parses a decrypted TBE payload: `struct{1: noc, [2: icac], 3: signature,
-/// ...}` (any trailing optional fields — e.g. resumption id — are ignored).
-fn parse_tbe(payload: &[u8]) -> Result<ParsedTbe, CaseCoreError> {
-    let mut r = Reader::new(payload);
-    match r
-        .next()
-        .map_err(|_| CaseCoreError::Decode("tbe tlv"))?
-        .map(|e| e.value)
-    {
-        Some(Value::StructStart) => {}
-        _ => return Err(CaseCoreError::Decode("tbe top-level struct")),
-    }
-    let mut noc: Option<Vec<u8>> = None;
-    let mut icac: Option<Vec<u8>> = None;
-    let mut sig: Option<[u8; 64]> = None;
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| CaseCoreError::Decode("tbe tlv"))?
-            .ok_or(CaseCoreError::Decode("tbe truncated"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => noc = Some(b.to_vec()),
-            (Tag::Context(2), Value::Bytes(b)) => icac = Some(b.to_vec()),
-            (Tag::Context(3), Value::Bytes(b)) => {
-                sig = Some(
-                    b.try_into()
-                        .map_err(|_| CaseCoreError::Decode("tbe signature length"))?,
-                );
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| CaseCoreError::Decode("tbe tlv"))?;
-            }
-            _ => {}
-        }
-    }
-    Ok((
-        noc.ok_or(CaseCoreError::Decode("tbe noc"))?,
-        icac,
-        sig.ok_or(CaseCoreError::Decode("tbe signature"))?,
-    ))
-}
-
-/// TBS payload signed over in Sigma2/Sigma3:
-/// `struct{1: noc, [2: icac], 3: sender_eph_pub, 4: receiver_eph_pub}`.
-/// Byte-identical to `case.rs`'s private `encode_tbs` (sender before
-/// receiver).
-fn encode_tbs(
-    noc: &[u8],
-    icac: Option<&[u8]>,
-    sender_eph: &[u8; 65],
-    receiver_eph: &[u8; 65],
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), noc);
-    if let Some(icac) = icac {
-        w.put_bytes(Tag::Context(2), icac);
-    }
-    w.put_bytes(Tag::Context(3), sender_eph);
-    w.put_bytes(Tag::Context(4), receiver_eph);
-    w.end_container();
-    w.finish()
-}
-
-/// TBE plaintext (encrypted into Sigma2's `encrypted2`):
-/// `struct{1: noc, [2: icac], 3: signature, [4: resumptionID]}` (spec
-/// §4.14.2). `resumption_id` is `Some` only for TBE2 (TBS3/TBE3 have no
-/// resumption id — the *initiator* builds TBE3 in `case.rs`, not this
-/// module, and never passes one). Byte-identical shape to `case.rs`'s
-/// private `encode_tbe3` when `resumption_id` is `None` (used there for
-/// TBE3).
-fn encode_tbe(
-    noc: &[u8],
-    icac: Option<&[u8]>,
-    sig: &[u8; 64],
-    resumption_id: Option<&[u8; 16]>,
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_bytes(Tag::Context(1), noc);
-    if let Some(icac) = icac {
-        w.put_bytes(Tag::Context(2), icac);
-    }
-    w.put_bytes(Tag::Context(3), sig);
-    if let Some(id) = resumption_id {
-        w.put_bytes(Tag::Context(4), id);
-    }
-    w.end_container();
-    w.finish()
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().into()
-}
-
-/// ECDH between our (responder) ephemeral secret and the initiator's
-/// ephemeral public key.
-fn ecdh(secret: &p256::SecretKey, peer_pub: &[u8; 65]) -> Result<[u8; 32], CaseCoreError> {
-    let pk = p256::PublicKey::from_sec1_bytes(peer_pub)
-        .map_err(|_| CaseCoreError::Decode("initiator ephemeral key"))?;
-    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), pk.as_affine());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(shared.raw_secret_bytes().as_slice());
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::case::encode_sigma1;
+    use crate::tlv::{Reader, Tag, Value, Writer};
 
     // Fixtures: node01_01 chained through ica01 to root01 (same fixtures
     // `test_support`/`case.rs`'s own tests use).
@@ -783,7 +559,7 @@ mod tests {
             }
         }
         let (rrand, reph, enc2) = (rrand.unwrap(), reph.unwrap(), enc2.unwrap());
-        let shared = ecdh(&initiator_secret, &reph).unwrap();
+        let shared = ecdh(&initiator_secret, &reph).expect("ecdh");
         let sigma1_hash = sha256(&sigma1);
         let mut s2k_salt = Vec::new();
         s2k_salt.extend_from_slice(&f.ipk_operational);
@@ -885,15 +661,6 @@ mod tests {
         ));
     }
 
-    /// Drives a *real* Sigma3 (correct S3K, correct TBS3 signature) whose
-    /// NOC chains cleanly to our root — `verify_noc_chain` alone would
-    /// accept it — but whose subject carries a *different* fabric id than
-    /// the fabric we selected in Sigma1/Sigma2. This is the case
-    /// `PeerFabricMismatch` exists for (new authorization-relevant logic,
-    /// not ported from `test_support`'s original hand-rolled responder — no
-    /// prior test exercised it). Everything up to the fabric-id comparison
-    /// must succeed for this test to be meaningful, so a broken/inverted
-    /// comparison would go undetected without it.
     /// Drives a full Sigma1 -> Sigma2 -> Sigma3 handshake against a fresh
     /// responder for fabric `f`, presenting `(init_noc, init_op_priv)` as
     /// the initiator's operational identity, and returns whatever the
@@ -976,6 +743,15 @@ mod tests {
         (noc, op_priv)
     }
 
+    /// Drives a *real* Sigma3 (correct S3K, correct TBS3 signature) whose
+    /// NOC chains cleanly to our root — `verify_noc_chain` alone would
+    /// accept it — but whose subject carries a *different* fabric id than
+    /// the fabric we selected in Sigma1/Sigma2. This is the case
+    /// `PeerFabricMismatch` exists for (new authorization-relevant logic,
+    /// not ported from `test_support`'s original hand-rolled responder — no
+    /// prior test exercised it). Everything up to the fabric-id comparison
+    /// must succeed for this test to be meaningful, so a broken/inverted
+    /// comparison would go undetected without it.
     #[test]
     fn rejects_peer_noc_chaining_to_our_root_with_a_different_fabric_id() {
         let f = fabric();

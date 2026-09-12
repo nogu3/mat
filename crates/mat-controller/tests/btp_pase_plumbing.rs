@@ -5,48 +5,32 @@
 //! (2) R フラグ（MRP）が立っていないこと、
 //! (3) peripheral が不正応答を返すと PaseError で終わること、を確認する。
 //!
-//! Task 3 の btp.rs 内部テストにある FakePeripheral と同型のヘルパをここで
-//! 再掲する——tests/ は別クレートなので btp.rs の `#[cfg(test)]` ヘルパは
-//! 使えない（M6b Task6 の brief どおり）。
+//! fake peripheral は `btp.rs` の `#[cfg(test)]` と共有の
+//! `mat_controller::test_support::btp_fake`（feature `test-responder`）。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use mat_controller::btp::{self, GattLink, Packet, Reassembler, SegmentPos};
 use mat_controller::exchange::MrpConfig;
-use mat_controller::{pase, transport};
+use mat_controller::test_support::btp_fake::fake_link;
+use mat_controller::{btp, pase, transport};
 
 #[tokio::test]
 async fn pase_over_btp_sends_unreliable_pbkdf_request() {
-    let (wtx, mut wrx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    let (itx, irx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-    let link = GattLink {
-        writes: wtx,
-        indications: irx,
-    };
+    let (link, mut p) = fake_link();
 
     let peripheral = tokio::spawn(async move {
-        // handshake
-        let req = wrx.recv().await.expect("handshake request");
-        assert_eq!(req[0], 0x65);
-        itx.send(vec![0x65, 0x6C, 4, 244, 0, 4]).await.unwrap();
+        p.do_handshake(244, 4).await;
         // PBKDFParamRequest を再構成
-        let mut reasm = Reassembler::new();
-        let msg = loop {
-            let frame = wrx.recv().await.expect("frame");
-            let pkt = Packet::decode(&frame).unwrap();
-            if let Some(m) = reasm.push(&pkt).unwrap() {
-                break m;
-            }
-        };
+        let (msg, _seq) = p.recv_message().await;
         // Matter message header を素で解いて R フラグ無しを確認
         use mat_controller::message::{MessageHeader, ProtocolHeader};
         let (h, off) = MessageHeader::decode(&msg).unwrap();
         assert_eq!(h.session_id, 0);
-        let (p, _) = ProtocolHeader::decode(&msg[off..]).unwrap();
-        assert!(!p.needs_ack, "MRP must be off over BTP");
+        let (proto, _) = ProtocolHeader::decode(&msg[off..]).unwrap();
+        assert!(!proto.needs_ack, "MRP must be off over BTP");
         assert_eq!(
-            p.opcode,
+            proto.opcode,
             pase::OPCODE_PBKDF_PARAM_REQUEST,
             "PBKDFParamRequest opcode"
         );
@@ -66,8 +50,8 @@ async fn pase_over_btp_sends_unreliable_pbkdf_request() {
                 needs_ack: false,
                 acked_counter: None,
                 opcode: pase::OPCODE_PBKDF_PARAM_RESPONSE,
-                exchange_id: p.exchange_id,
-                protocol_id: p.protocol_id,
+                exchange_id: proto.exchange_id,
+                protocol_id: proto.protocol_id,
                 vendor_id: None,
             };
             let mut b = rh.encoded();
@@ -76,14 +60,7 @@ async fn pase_over_btp_sends_unreliable_pbkdf_request() {
         };
         // 1 フレームで送る（BTP data packet, handshake response が seq 0 を
         // 暗黙消費するため、データフレームは seq 1 から）
-        let frame = btp::encode_data_packet(
-            1,
-            None,
-            SegmentPos::First { ending: true },
-            Some(reply.len() as u16),
-            &reply,
-        );
-        itx.send(frame).await.unwrap();
+        p.send_message(&reply, 244, None).await;
     });
 
     let (_params, t) = btp::connect(link, btp::PROPOSED_WINDOW).await.unwrap();

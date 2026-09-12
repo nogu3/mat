@@ -4,11 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
-use crate::exchange::{IncomingMessage, MrpConfig};
-use crate::message::{OPCODE_MRP_STANDALONE_ACK, PROTOCOL_ID_SECURE_CHANNEL};
-use crate::transport::MAX_DATAGRAM;
+use crate::exchange::{
+    boxed_screen, is_standalone_ack, mrp_send_loop, recv_until, IncomingMessage, MrpConfig, Verdict,
+};
 
 use super::mrp::{ScreenFilter, MAX_PEER_INITIATED_BUFFER};
 use super::{SecureSession, SessionError};
@@ -48,58 +46,37 @@ impl SecureSession {
             None,
             &payload,
         )?;
-        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now()
-                + crate::exchange::jittered_interval(
-                    interval,
-                    cfg.jitter,
-                    crate::exchange::unit_random(),
-                );
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self
-                    .screen_with(&buf[..n], from, ScreenFilter::PeerExchange(exchange_id))
-                    .await?
-                else {
-                    continue;
-                };
-                let acked = msg.proto.acked_counter == Some(our_counter);
-                // ack 待ち中に届いた続きチャンク（device 発 ReportData）は
-                // ack 照合の副産物として捨てない — screen_with のフィルタ落ち
-                // 待避と同じ規律で peer_initiated へ積み、購読 API が消費する
-                // （監査#1 経路B）。
-                if msg.proto.protocol_id == im::PROTOCOL_ID_IM
-                    && msg.proto.opcode == im::OPCODE_REPORT_DATA
-                {
-                    if self.peer_initiated.len() >= MAX_PEER_INITIATED_BUFFER {
-                        tracing::warn!("peer-initiated report buffer full; dropping oldest");
-                        self.peer_initiated.pop_front();
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s
+                        .screen_with(buf, from, ScreenFilter::PeerExchange(exchange_id))
+                        .await?
+                    else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    let acked = msg.proto.acked_counter == Some(our_counter);
+                    // ack 待ち中に届いた続きチャンク（device 発 ReportData）は
+                    // ack 照合の副産物として捨てない — screen_with のフィルタ落ち
+                    // 待避と同じ規律で peer_initiated へ積み、購読 API が消費する
+                    // （監査#1 経路B）。
+                    if msg.proto.protocol_id == im::PROTOCOL_ID_IM
+                        && msg.proto.opcode == im::OPCODE_REPORT_DATA
+                    {
+                        s.stash_peer_initiated(msg);
                     }
-                    self.peer_initiated.push_back(msg);
-                }
-                if acked {
-                    return Ok(());
-                }
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(SessionError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+                    Ok(if acked {
+                        Verdict::Done(())
+                    } else {
+                        Verdict::Ignore
+                    })
+                })
+            },
+        )
+        .await
     }
 
     /// デバイス役: peer-initiated のリクエストを 1 件受ける。ack 送出/重複排除は
@@ -134,9 +111,7 @@ impl SecureSession {
         else {
             return Ok(None);
         };
-        if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-            && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-        {
+        if is_standalone_ack(&msg.proto) {
             return Ok(None);
         }
         Ok(Some(msg))
@@ -149,32 +124,20 @@ impl SecureSession {
         if let Some(m) = self.peer_initiated.pop_front() {
             return Ok(m);
         }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(SessionError::Timeout);
-            }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let Ok(recv) =
-                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-            else {
-                return Err(SessionError::Timeout);
-            };
-            let (n, from) = recv?;
-            let Some(msg) = self
-                .screen_with(&buf[..n], from, ScreenFilter::AnyPeerInitiated)
-                .await?
-            else {
-                continue;
-            };
-            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            return Ok(msg);
-        }
+        recv_until(
+            self,
+            timeout,
+            || SessionError::Timeout,
+            |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    Ok(match s.deliver_request(buf, from).await? {
+                        Some(msg) => Verdict::Done(msg),
+                        None => Verdict::Ignore,
+                    })
+                })
+            },
+        )
+        .await
     }
 
     /// デバイス役: ソケットに触れずに `peer_initiated` から 1 件だけ取り出す
@@ -244,77 +207,55 @@ impl SecureSession {
         }
         let (datagram, our_counter) =
             self.seal(exchange_id, false, protocol_id, opcode, true, None, payload)?;
-        let mut interval = crate::exchange::retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now()
-                + crate::exchange::jittered_interval(
-                    interval,
-                    cfg.jitter,
-                    crate::exchange::unit_random(),
-                );
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self
-                    .screen_with(&buf[..n], from, ScreenFilter::PeerExchange(exchange_id))
-                    .await?
-                else {
-                    // フィルタ落ち（別 exchange 宛など）でも、その datagram の
-                    // ack フィールドは screen_with が exchange 不問で
-                    // `last_peer_ack` に記録済み。real controller/commissioner
-                    // が standalone ack を送らず次のリクエストに我々への ack
-                    // を piggyback しただけ、というケースをここで拾う
-                    // （そのリクエスト自体は `peer_initiated` に待避済み —
-                    // 呼び出し元が drain する）。
-                    if self.last_peer_ack == Some(our_counter) {
-                        return Ok(None);
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = s
+                        .screen_with(buf, from, ScreenFilter::PeerExchange(exchange_id))
+                        .await?
+                    else {
+                        // フィルタ落ち（別 exchange 宛など）でも、その datagram の
+                        // ack フィールドは screen_with が exchange 不問で
+                        // `last_peer_ack` に記録済み。real controller/commissioner
+                        // が standalone ack を送らず次のリクエストに我々への ack
+                        // を piggyback しただけ、というケースをここで拾う
+                        // （そのリクエスト自体は `peer_initiated` に待避済み —
+                        // 呼び出し元が drain する）。
+                        return Ok(if s.last_peer_ack == Some(our_counter) {
+                            Verdict::Done(None)
+                        } else {
+                            Verdict::Ignore
+                        });
+                    };
+                    let acked = msg.proto.acked_counter == Some(our_counter);
+                    if is_standalone_ack(&msg.proto) {
+                        return Ok(if acked {
+                            Verdict::Done(None)
+                        } else {
+                            Verdict::Ignore
+                        });
                     }
-                    continue;
-                };
-                let acked = msg.proto.acked_counter == Some(our_counter);
-                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-                if is_standalone_ack {
-                    if acked {
-                        return Ok(None);
-                    }
-                    continue;
-                }
-                return Ok(Some(msg));
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(SessionError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+                    Ok(Verdict::Done(Some(msg)))
+                })
+            },
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::seal_message;
-    use crate::message::{
-        Destination, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK,
-        PROTOCOL_ID_SECURE_CHANNEL,
-    };
+    use crate::message::{OPCODE_MRP_STANDALONE_ACK, PROTOCOL_ID_SECURE_CHANNEL};
     use crate::session::test_util::*;
     use crate::session::SessionKeys;
     use crate::transport::{ReliableChannel, Transport, MAX_DATAGRAM, RELIABLE_PEER};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::time::Instant;
 
     /// 実機バグの釘（secure 経路）: priming チャンク受信直後＝ピア active の
     /// 再送（respond_status / send_reliable 共通の base 選択）は active
@@ -322,18 +263,7 @@ mod tests {
     /// タイムアウトに負けて購読が 0x80 死する（2026-07-20 実機ワイヤ確認）。
     #[tokio::test]
     async fn respond_status_retransmits_fast_after_recent_peer_rx() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
         s.last_rx = Some(Instant::now()); // チャンク受信直後の状況を注入
         let cfg = MrpConfig {
             initial_interval: Duration::from_secs(5),
@@ -385,30 +315,15 @@ mod tests {
 
         // デバイス: report を送るが、以後一切 ack しない（無応答デバイス）。
         let dev = tokio::spawn(async move {
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 700,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x7777,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let d = seal_message(
-                &R2I,
-                &header,
-                &proto,
+            let d = device_initiated_datagram(
+                0x7777,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                true,
+                700,
                 &subscription_report_payload(9, true, false),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             device.send_to(&d, local).await.unwrap();
             // StatusResponse（+再送）を受けるが ack は返さない。
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -528,23 +443,15 @@ mod tests {
             // デバイス起点(initiator=true)の InvokeRequest を送る（recv_request の
             // 材料。ack は要求しない — このテストの主眼は応答側の再送なので、
             // リクエスト自体の MRP は関与させない）。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 100,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: im::OPCODE_INVOKE_REQUEST,
-                exchange_id: REQ_EXCHANGE,
-                protocol_id: im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            let req_dg = device_initiated_datagram(
+                REQ_EXCHANGE,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                None,
+                false,
+                100,
+                &[],
+            );
             device.send_to(&req_dg, s_addr).await.unwrap();
 
             // 1 発目: 受けるだけで ack しない（再送を誘発する）。
@@ -567,23 +474,16 @@ mod tests {
                 body2, body1,
                 "retransmission must resend the same datagram content"
             );
-            let ack_header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 101,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let ack_proto = ProtocolHeader {
-                initiator: true, // デバイスがこの exchange の initiator
-                needs_ack: false,
-                acked_counter: Some(h2.message_counter),
-                opcode: OPCODE_MRP_STANDALONE_ACK,
-                exchange_id: REQ_EXCHANGE,
-                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                vendor_id: None,
-            };
-            let ack_dg = seal_message(&R2I, &ack_header, &ack_proto, &[], DEV_NODE).unwrap();
+            // initiator=true: デバイスがこの exchange の initiator。
+            let ack_dg = device_initiated_datagram(
+                REQ_EXCHANGE,
+                PROTOCOL_ID_SECURE_CHANNEL,
+                OPCODE_MRP_STANDALONE_ACK,
+                Some(h2.message_counter),
+                false,
+                101,
+                &[],
+            );
             device.send_to(&ack_dg, from2).await.unwrap();
         });
 
@@ -637,23 +537,15 @@ mod tests {
         const REQ_EXCHANGE: u16 = 0xBEEF;
 
         let dev_task = tokio::spawn(async move {
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 200,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: im::OPCODE_INVOKE_REQUEST,
-                exchange_id: REQ_EXCHANGE,
-                protocol_id: im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            let req_dg = device_initiated_datagram(
+                REQ_EXCHANGE,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                None,
+                false,
+                200,
+                &[],
+            );
             device.send_to(&req_dg, s_addr).await.unwrap();
 
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -663,30 +555,15 @@ mod tests {
             assert_eq!(p.opcode, im::OPCODE_INVOKE_RESPONSE);
 
             // ack ではなく、同一 exchange へ実メッセージ（StatusResponse）を返す。
-            let real_header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 201,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let real_proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: im::OPCODE_STATUS_RESPONSE,
-                exchange_id: REQ_EXCHANGE,
-                protocol_id: im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let real_dg = seal_message(
-                &R2I,
-                &real_header,
-                &real_proto,
+            let real_dg = device_initiated_datagram(
+                REQ_EXCHANGE,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_STATUS_RESPONSE,
+                None,
+                false,
+                201,
                 &im::encode_status_response(0),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             device.send_to(&real_dg, from).await.unwrap();
         });
 
@@ -743,23 +620,15 @@ mod tests {
 
         let dev_task = tokio::spawn(async move {
             // デバイスが reply_reliable で応答することになる、最初のリクエスト。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 400,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: im::OPCODE_INVOKE_REQUEST,
-                exchange_id: REQ_EXCHANGE,
-                protocol_id: im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let req_dg = seal_message(&R2I, &header, &proto, &[], DEV_NODE).unwrap();
+            let req_dg = device_initiated_datagram(
+                REQ_EXCHANGE,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                None,
+                false,
+                400,
+                &[],
+            );
             device.send_to(&req_dg, s_addr).await.unwrap();
 
             // reply_reliable の応答を受け、その message_counter を控える。
@@ -772,23 +641,15 @@ mod tests {
 
             // standalone ack は送らない。代わりに別 exchange への新規リクエス
             // トの ack フィールドに、この応答への ack を piggyback する。
-            let header2 = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 401,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto2 = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: Some(h.message_counter),
-                opcode: im::OPCODE_INVOKE_REQUEST,
-                exchange_id: NEW_EXCHANGE,
-                protocol_id: im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let req2_dg = seal_message(&R2I, &header2, &proto2, &[], DEV_NODE).unwrap();
+            let req2_dg = device_initiated_datagram(
+                NEW_EXCHANGE,
+                im::PROTOCOL_ID_IM,
+                im::OPCODE_INVOKE_REQUEST,
+                Some(h.message_counter),
+                true,
+                401,
+                &[],
+            );
             device.send_to(&req2_dg, from).await.unwrap();
 
             // 新規リクエスト自体は needs_ack なので、我々からの standalone ack

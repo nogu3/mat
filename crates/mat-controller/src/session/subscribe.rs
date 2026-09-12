@@ -3,17 +3,14 @@
 //! pump。属性のみを見る旧 API（`subscribe_wildcard` /
 //! `next_subscription_report`）は、この 2 つの薄いラッパ。
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
-use crate::exchange::MrpConfig;
-use crate::message::{OPCODE_MRP_STANDALONE_ACK, PROTOCOL_ID_SECURE_CHANNEL};
-use crate::transport::MAX_DATAGRAM;
+use crate::exchange::{boxed_screen, is_standalone_ack, recv_until, MrpConfig, Verdict};
 
 use super::client::MAX_REPORT_CHUNKS;
 use super::mrp::ScreenFilter;
-use super::{SecureSession, SessionError, IM_RECV_TIMEOUT};
+use super::{SecureSession, SessionError};
 
 /// デコード失敗 payload の先頭を hex で（未知エンコーディングの事後診断用、
 /// debug ログ専用）。
@@ -49,6 +46,27 @@ fn decode_events_lossy(payload: &[u8], context: &'static str) -> Vec<crate::im::
     crate::im::decode_event_reports(payload).unwrap_or_else(|e| {
         tracing::debug!(error = %e, "{context}");
         Vec::new()
+    })
+}
+
+/// `decode_report_data_message` that never fails: an undecodable payload is
+/// logged (`warn!` with `exchange_id`/`payload_len`/`error`, then `debug!`
+/// with the hex head) and replaced by an empty report (audit ⑨).
+fn decode_report_data_lossy(
+    payload: &[u8],
+    exchange_id: u16,
+    warn_msg: &'static str,
+    debug_msg: &'static str,
+) -> crate::im::ReportDataMessage {
+    crate::im::decode_report_data_message(payload).unwrap_or_else(|e| {
+        tracing::warn!(exchange_id, payload_len = payload.len(), error = %e, "{warn_msg}");
+        tracing::debug!(payload_head = %payload_head_hex(payload), "{debug_msg}");
+        crate::im::ReportDataMessage {
+            reports: Vec::new(),
+            subscription_id: None,
+            more_chunks: false,
+            suppress_response: false,
+        }
     })
 }
 
@@ -97,19 +115,9 @@ impl SecureSession {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_subscribe_request_full(spec);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_SUBSCRIBE_REQUEST,
-                &req,
-                cfg,
-            )
+        let mut msg = self
+            .im_request(exchange_id, im::OPCODE_SUBSCRIBE_REQUEST, &req, cfg)
             .await?;
-        let mut msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
         let mut priming = Vec::new();
         let mut priming_events = Vec::new();
         loop {
@@ -120,27 +128,12 @@ impl SecureSession {
                     // チャンクの属性値だけ（matd の state cache は次のレポートで
                     // 自己回復）。空 rd を push するのは MAX_REPORT_CHUNKS の
                     // flood 防御を非デコード可能チャンクにも効かせるため。
-                    let rd = match im::decode_report_data_message(&msg.payload) {
-                        Ok(rd) => rd,
-                        Err(e) => {
-                            tracing::warn!(
-                                exchange_id,
-                                payload_len = msg.payload.len(),
-                                error = %e,
-                                "subscribe: undecodable priming chunk; acking and continuing"
-                            );
-                            tracing::debug!(
-                                payload_head = %payload_head_hex(&msg.payload),
-                                "undecodable priming chunk payload"
-                            );
-                            im::ReportDataMessage {
-                                reports: Vec::new(),
-                                subscription_id: None,
-                                more_chunks: false,
-                                suppress_response: false,
-                            }
-                        }
-                    };
+                    let rd = decode_report_data_lossy(
+                        &msg.payload,
+                        exchange_id,
+                        "subscribe: undecodable priming chunk; acking and continuing",
+                        "undecodable priming chunk payload",
+                    );
                     let events = decode_events_lossy(
                         &msg.payload,
                         "subscribe: undecodable priming event reports; collecting none",
@@ -162,19 +155,9 @@ impl SecureSession {
                     // priming の各チャンクに StatusResponse(0)。最終チャンク後は
                     // SubscribeResponse が同 exchange で続く。
                     let ok = im::encode_status_response(0);
-                    let resp = self
-                        .send_reliable(
-                            exchange_id,
-                            im::PROTOCOL_ID_IM,
-                            im::OPCODE_STATUS_RESPONSE,
-                            &ok,
-                            cfg,
-                        )
+                    msg = self
+                        .im_request(exchange_id, im::OPCODE_STATUS_RESPONSE, &ok, cfg)
                         .await?;
-                    msg = match resp {
-                        Some(m) => m,
-                        None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-                    };
                 }
                 im::OPCODE_SUBSCRIBE_RESPONSE => {
                     let sr =
@@ -232,33 +215,28 @@ impl SecureSession {
         let msg = if let Some(m) = self.peer_initiated.pop_front() {
             m
         } else {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(SessionError::Silence);
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    return Err(SessionError::Silence);
-                };
-                let (n, from) = recv?;
-                tracing::debug!(len = n, %from, "sub pump: datagram received");
-                let Some(m) = self
-                    .screen_with(&buf[..n], from, ScreenFilter::AnyPeerInitiated)
-                    .await?
-                else {
-                    continue;
-                };
-                if m.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && m.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-                {
-                    continue;
-                }
-                break m;
-            }
+            recv_until(
+                self,
+                timeout,
+                || SessionError::Silence,
+                |s: &mut Self, buf: &[u8], from: SocketAddr| {
+                    boxed_screen(async move {
+                        tracing::debug!(len = buf.len(), %from, "sub pump: datagram received");
+                        let Some(m) = s
+                            .screen_with(buf, from, ScreenFilter::AnyPeerInitiated)
+                            .await?
+                        else {
+                            return Ok(Verdict::Ignore);
+                        };
+                        Ok(if is_standalone_ack(&m.proto) {
+                            Verdict::Ignore
+                        } else {
+                            Verdict::Done(m)
+                        })
+                    })
+                },
+            )
+            .await?
         };
         if msg.proto.opcode != im::OPCODE_REPORT_DATA {
             return Err(SessionError::UnexpectedOpcode(msg.proto.opcode));
@@ -270,27 +248,12 @@ impl SecureSession {
         // （1.16.0 ワイヤ実測: 実デバイスの購読レポートは suppress=false +
         // StatusResponse 期待。suppress=true の相手への余計な SR は exchange
         // 終端で無害）。
-        let rd = match im::decode_report_data_message(&msg.payload) {
-            Ok(rd) => rd,
-            Err(e) => {
-                tracing::warn!(
-                    exchange_id = msg.proto.exchange_id,
-                    payload_len = msg.payload.len(),
-                    error = %e,
-                    "sub pump: undecodable report; delivering as empty"
-                );
-                tracing::debug!(
-                    payload_head = %payload_head_hex(&msg.payload),
-                    "undecodable report payload"
-                );
-                im::ReportDataMessage {
-                    reports: Vec::new(),
-                    subscription_id: None,
-                    more_chunks: false,
-                    suppress_response: false,
-                }
-            }
-        };
+        let rd = decode_report_data_lossy(
+            &msg.payload,
+            msg.proto.exchange_id,
+            "sub pump: undecodable report; delivering as empty",
+            "undecodable report payload",
+        );
         let events = decode_events_lossy(
             &msg.payload,
             "sub pump: undecodable event reports; delivering none",
@@ -318,7 +281,6 @@ impl SecureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::seal_message;
     use crate::exchange::IncomingMessage;
     use crate::message::{
         Destination, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK,
@@ -507,26 +469,16 @@ mod tests {
             data_tlv: None,
         })];
         let payload = crate::im::encode_report_data_full(&attrs, &events, false, Some(42), false);
-        // device 発の新 exchange（initiator=true）。既存の
-        // `next_subscription_report_receives_device_initiated_reports_and_keepalive`
-        // と同じ組み立て（`device_datagram` は initiator=false 固定なので直接 seal）。
-        let header = MessageHeader {
-            session_id: LOCAL_SID,
-            security_flags: 0,
-            message_counter: 9100,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let proto = ProtocolHeader {
-            initiator: true,
-            needs_ack: false,
-            acked_counter: None,
-            opcode: crate::im::OPCODE_REPORT_DATA,
-            exchange_id: 0x5001,
-            protocol_id: crate::im::PROTOCOL_ID_IM,
-            vendor_id: None,
-        };
-        let d = seal_message(&R2I, &header, &proto, &payload, DEV_NODE).unwrap();
+        // device 発の新 exchange（initiator=true）。
+        let d = device_initiated_datagram(
+            0x5001,
+            crate::im::PROTOCOL_ID_IM,
+            crate::im::OPCODE_REPORT_DATA,
+            None,
+            false,
+            9100,
+            &payload,
+        );
         dev.send_to(&d, RELIABLE_PEER).await.unwrap();
 
         let rep = s
@@ -730,30 +682,15 @@ mod tests {
 
         let dev_task = tokio::spawn(async move {
             // device 発の新 exchange。initiator=true（デバイスがその exchange の起点）。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 100,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x7777,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let d = seal_message(
-                &R2I,
-                &header,
-                &proto,
+            let d = device_initiated_datagram(
+                0x7777,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                100,
                 &subscription_report_payload(42, true, false),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             dev.send_to(&d, RELIABLE_PEER).await.unwrap();
             // StatusResponse(0) が device の exchange 上で、こちら=non-initiator として返る
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -764,11 +701,15 @@ mod tests {
             assert!(!p.initiator);
             assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
             // keep-alive（別 exchange）
-            let mut h2 = header;
-            h2.message_counter = 101;
-            let mut p2 = proto;
-            p2.exchange_id = 0x7778;
-            let d = seal_message(&R2I, &h2, &p2, &keepalive_payload(42), DEV_NODE).unwrap();
+            let d = device_initiated_datagram(
+                0x7778,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                101,
+                &keepalive_payload(42),
+            );
             dev.send_to(&d, RELIABLE_PEER).await.unwrap();
             let (n, _) = dev.recv_from(&mut buf).await.unwrap();
             let (_, p3, _) = open_from_controller(&buf[..n]);
@@ -798,24 +739,16 @@ mod tests {
         let (mut s, dev) = reliable_session_pair();
 
         let dev_task = tokio::spawn(async move {
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 200,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: false,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x7779,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
             // garbage report（struct start だけで途中切れ = デコード不能）
-            let d = seal_message(&R2I, &header, &proto, &[0x15], DEV_NODE).unwrap();
+            let d = device_initiated_datagram(
+                0x7779,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                200,
+                &[0x15],
+            );
             dev.send_to(&d, RELIABLE_PEER).await.unwrap();
             // StatusResponse(0) が同 exchange に返る
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -825,18 +758,15 @@ mod tests {
             assert_eq!(p.exchange_id, 0x7779);
             assert_eq!(crate::im::decode_status_response(&body).unwrap(), 0);
             // 正常 report（別 exchange）は通常配送される
-            let mut h2 = header;
-            h2.message_counter = 201;
-            let mut p2 = proto;
-            p2.exchange_id = 0x777a;
-            let d = seal_message(
-                &R2I,
-                &h2,
-                &p2,
+            let d = device_initiated_datagram(
+                0x777a,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                false,
+                201,
                 &subscription_report_payload(42, true, false),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             dev.send_to(&d, RELIABLE_PEER).await.unwrap();
             let (n, _) = dev.recv_from(&mut buf).await.unwrap();
             let (_, p3, _) = open_from_controller(&buf[..n]);
@@ -883,30 +813,15 @@ mod tests {
         const REPORT_COUNTER: u32 = 500;
         let dev_task = tokio::spawn(async move {
             // デバイス起点 exchange（initiator=true）の needs_ack ReportData。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: REPORT_COUNTER,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x7777,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let report = seal_message(
-                &R2I,
-                &header,
-                &proto,
+            let report = device_initiated_datagram(
+                0x7777,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                true,
+                REPORT_COUNTER,
                 &subscription_report_payload(42, true, false),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             device.send_to(&report, local).await.unwrap();
             // standalone ack と StatusResponse の両方が届く。SR を拾って
             // piggyback ack を検査し、SR には ack を返して exchange を閉じる。
@@ -923,23 +838,15 @@ mod tests {
                     "StatusResponse must piggyback the report's ack"
                 );
                 // SR への ack はデバイスが initiator の exchange 上で返す。
-                let ack_header = MessageHeader {
-                    session_id: LOCAL_SID,
-                    security_flags: 0,
-                    message_counter: REPORT_COUNTER + 1,
-                    source_node_id: None,
-                    destination: Destination::None,
-                };
-                let ack_proto = ProtocolHeader {
-                    initiator: true,
-                    needs_ack: false,
-                    acked_counter: Some(h.message_counter),
-                    opcode: OPCODE_MRP_STANDALONE_ACK,
-                    exchange_id: 0x7777,
-                    protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                    vendor_id: None,
-                };
-                let ack = seal_message(&R2I, &ack_header, &ack_proto, &[], DEV_NODE).unwrap();
+                let ack = device_initiated_datagram(
+                    0x7777,
+                    PROTOCOL_ID_SECURE_CHANNEL,
+                    OPCODE_MRP_STANDALONE_ACK,
+                    Some(h.message_counter),
+                    false,
+                    REPORT_COUNTER + 1,
+                    &[],
+                );
                 device.send_to(&ack, from).await.unwrap();
                 break;
             }
@@ -984,30 +891,15 @@ mod tests {
         );
 
         let dev = tokio::spawn(async move {
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 300,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x5555,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let d = seal_message(
-                &R2I,
-                &header,
-                &proto,
+            let d = device_initiated_datagram(
+                0x5555,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                true,
+                300,
                 &subscription_report_payload(9, true, false),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             device.send_to(&d, local).await.unwrap();
             // standalone ack と StatusResponse(needs_ack) が来る。StatusResponse は ack を返す。
             loop {
@@ -1028,26 +920,18 @@ mod tests {
                         9900,
                         &[],
                     );
-                    // device は自 exchange の initiator。ack の initiator は device 視点で true。
-                    // device_datagram は initiator=false 固定なので直接 seal する。
-                    let header2 = MessageHeader {
-                        session_id: LOCAL_SID,
-                        security_flags: 0,
-                        message_counter: 9900,
-                        source_node_id: None,
-                        destination: Destination::None,
-                    };
-                    let proto2 = ProtocolHeader {
-                        initiator: true,
-                        needs_ack: false,
-                        acked_counter: Some(h.message_counter),
-                        opcode: OPCODE_MRP_STANDALONE_ACK,
-                        exchange_id: p.exchange_id,
-                        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                        vendor_id: None,
-                    };
+                    // device は自 exchange の initiator。ack の initiator は device 視点で true
+                    // （`device_datagram` は initiator=false 固定）。
                     let _ = ack;
-                    let d2 = seal_message(&R2I, &header2, &proto2, &[], DEV_NODE).unwrap();
+                    let d2 = device_initiated_datagram(
+                        p.exchange_id,
+                        PROTOCOL_ID_SECURE_CHANNEL,
+                        OPCODE_MRP_STANDALONE_ACK,
+                        Some(h.message_counter),
+                        false,
+                        9900,
+                        &[],
+                    );
                     device.send_to(&d2, from).await.unwrap();
                     break;
                 }
@@ -1127,30 +1011,15 @@ mod tests {
 
         let dev = tokio::spawn(async move {
             // chunk A（more_chunks=true、needs_ack）。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 800,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: crate::im::OPCODE_REPORT_DATA,
-                exchange_id: 0x8888,
-                protocol_id: crate::im::PROTOCOL_ID_IM,
-                vendor_id: None,
-            };
-            let d = seal_message(
-                &R2I,
-                &header,
-                &proto,
+            let d = device_initiated_datagram(
+                0x8888,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                None,
+                true,
+                800,
                 &subscription_report_payload(11, true, true),
-                DEV_NODE,
-            )
-            .unwrap();
+            );
             device.send_to(&d, local).await.unwrap();
             // StatusResponse を待ち、chunk B（piggyback ack、needs_ack）で応える。
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -1160,30 +1029,15 @@ mod tests {
                 if p.opcode != crate::im::OPCODE_STATUS_RESPONSE {
                     continue; // standalone ack 等は読み飛ばす
                 }
-                let header2 = MessageHeader {
-                    session_id: LOCAL_SID,
-                    security_flags: 0,
-                    message_counter: 801,
-                    source_node_id: None,
-                    destination: Destination::None,
-                };
-                let proto2 = ProtocolHeader {
-                    initiator: true,
-                    needs_ack: true,
-                    acked_counter: Some(h.message_counter),
-                    opcode: crate::im::OPCODE_REPORT_DATA,
-                    exchange_id: 0x8888,
-                    protocol_id: crate::im::PROTOCOL_ID_IM,
-                    vendor_id: None,
-                };
-                let d2 = seal_message(
-                    &R2I,
-                    &header2,
-                    &proto2,
+                let d2 = device_initiated_datagram(
+                    0x8888,
+                    crate::im::PROTOCOL_ID_IM,
+                    crate::im::OPCODE_REPORT_DATA,
+                    Some(h.message_counter),
+                    true,
+                    801,
                     &subscription_report_payload(12, false, false),
-                    DEV_NODE,
-                )
-                .unwrap();
+                );
                 device.send_to(&d2, from).await.unwrap();
                 break;
             }
@@ -1197,23 +1051,15 @@ mod tests {
                 };
                 let (h, p, _) = open_from_controller(&buf[..n]);
                 if p.opcode == crate::im::OPCODE_STATUS_RESPONSE {
-                    let header3 = MessageHeader {
-                        session_id: LOCAL_SID,
-                        security_flags: 0,
-                        message_counter: 802,
-                        source_node_id: None,
-                        destination: Destination::None,
-                    };
-                    let proto3 = ProtocolHeader {
-                        initiator: true,
-                        needs_ack: false,
-                        acked_counter: Some(h.message_counter),
-                        opcode: OPCODE_MRP_STANDALONE_ACK,
-                        exchange_id: p.exchange_id,
-                        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                        vendor_id: None,
-                    };
-                    let d3 = seal_message(&R2I, &header3, &proto3, &[], DEV_NODE).unwrap();
+                    let d3 = device_initiated_datagram(
+                        p.exchange_id,
+                        PROTOCOL_ID_SECURE_CHANNEL,
+                        OPCODE_MRP_STANDALONE_ACK,
+                        Some(h.message_counter),
+                        false,
+                        802,
+                        &[],
+                    );
                     device.send_to(&d3, from).await.unwrap();
                     break;
                 }

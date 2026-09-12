@@ -206,15 +206,27 @@ impl Cursor<'_> {
     }
 
     fn u16(&mut self) -> Result<u16, MessageError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(
+            self.take(2)?
+                .try_into()
+                .expect("take(2) yields exactly 2 bytes"),
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, MessageError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("take(4) yields exactly 4 bytes"),
+        ))
     }
 
     fn u64(&mut self) -> Result<u64, MessageError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .expect("take(8) yields exactly 8 bytes"),
+        ))
     }
 }
 

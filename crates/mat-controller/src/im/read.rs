@@ -6,7 +6,8 @@ use crate::tlv::{Reader, Tag, Value, Writer};
 
 use super::json::tlv_element_to_json;
 use super::{
-    expect_struct_start, skip_container, value_to_im, ImError, ImValue, ReportData, IM_REVISION,
+    expect_struct_start, put_attribute_path, put_status_ib, skip_container, value_to_im, ImError,
+    ImValue, ReportData, IM_REVISION,
 };
 
 /// ReadRequestMessage (spec §8.9.2) for a single attribute path.
@@ -14,11 +15,7 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.start_array(Tag::Context(0)); // AttributeRequests
-    w.start_list(Tag::Anonymous); // AttributePathIB
-    w.put_uint(Tag::Context(2), u64::from(endpoint));
-    w.put_uint(Tag::Context(3), u64::from(cluster));
-    w.put_uint(Tag::Context(4), u64::from(attribute));
-    w.end_container(); // AttributePathIB
+    put_attribute_path(&mut w, Tag::Anonymous, endpoint, cluster, Some(attribute)); // AttributePathIB
     w.end_container(); // AttributeRequests
                        // IsFabricFiltered = true: matches chip-tool's read default. This is the
                        // precondition for mat-native's ACL / group-key-map read-merge-write
@@ -29,6 +26,31 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     w.put_uint(Tag::Context(255), u64::from(IM_REVISION));
     w.end_container(); // outer struct
     w.finish()
+}
+
+/// StatusIB (spec §8.9.2.3): `{0: status, [1: cluster_status]}`, returning
+/// only the (mandatory) status code. Assumes the caller already consumed the
+/// `StructStart` that opens this StatusIB. Shared by the attribute-status
+/// decoders below (`decode_attribute_status_ib` / `decode_attribute_status_ib_full`).
+pub(super) fn decode_status_ib_code(r: &mut Reader) -> Result<Option<u8>, ImError> {
+    let mut status = None;
+    loop {
+        let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+        match (e2.tag, e2.value) {
+            (_, Value::ContainerEnd) => break,
+            (Tag::Context(0), Value::Uint(v)) => {
+                status = Some(
+                    u8::try_from(v)
+                        .map_err(|_| ImError::Malformed("attribute status code out of range"))?,
+                );
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(r)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(status)
 }
 
 /// AttributeStatusIB (spec §8.9.2.2): `{0: Path, 1: StatusIB{0: status, ...}}`.
@@ -43,21 +65,8 @@ pub(super) fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> 
         match (el.tag, el.value) {
             (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::StructStart) => {
-                // StatusIB
-                loop {
-                    let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
-                    match (e2.tag, e2.value) {
-                        (_, Value::ContainerEnd) => break,
-                        (Tag::Context(0), Value::Uint(v)) => {
-                            status = Some(u8::try_from(v).map_err(|_| {
-                                ImError::Malformed("attribute status code out of range")
-                            })?);
-                        }
-                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                            skip_container(r)?;
-                        }
-                        _ => {}
-                    }
+                if let Some(s) = decode_status_ib_code(r)? {
+                    status = Some(s);
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
@@ -280,21 +289,8 @@ fn decode_attribute_status_ib_full(r: &mut Reader) -> Result<AttributeStatusFiel
                 attribute = attr;
             }
             (Tag::Context(1), Value::StructStart) => {
-                // StatusIB
-                loop {
-                    let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
-                    match (e2.tag, e2.value) {
-                        (_, Value::ContainerEnd) => break,
-                        (Tag::Context(0), Value::Uint(v)) => {
-                            status = Some(u8::try_from(v).map_err(|_| {
-                                ImError::Malformed("attribute status code out of range")
-                            })?);
-                        }
-                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                            skip_container(r)?;
-                        }
-                        _ => {}
-                    }
+                if let Some(s) = decode_status_ib_code(r)? {
+                    status = Some(s);
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
@@ -499,11 +495,13 @@ pub(super) fn encode_attribute_report_ib(w: &mut Writer, entry: &ReportEntryOut)
         ReportEntryOut::Data(report) => {
             w.start_struct(Tag::Context(1)); // AttributeDataIB
             w.put_uint(Tag::Context(0), u64::from(report.data_version)); // DataVersion
-            w.start_list(Tag::Context(1)); // Path
-            w.put_uint(Tag::Context(2), u64::from(report.endpoint));
-            w.put_uint(Tag::Context(3), u64::from(report.cluster));
-            w.put_uint(Tag::Context(4), u64::from(report.attribute));
-            w.end_container(); // Path
+            put_attribute_path(
+                w,
+                Tag::Context(1),
+                report.endpoint,
+                report.cluster,
+                Some(report.attribute),
+            ); // Path
             w.put_raw_element(Tag::Context(2), &report.value_tlv); // Data
             w.end_container(); // AttributeDataIB
         }
@@ -514,14 +512,8 @@ pub(super) fn encode_attribute_report_ib(w: &mut Writer, entry: &ReportEntryOut)
             status,
         } => {
             w.start_struct(Tag::Context(0)); // AttributeStatusIB
-            w.start_list(Tag::Context(0)); // Path
-            w.put_uint(Tag::Context(2), u64::from(*endpoint));
-            w.put_uint(Tag::Context(3), u64::from(*cluster));
-            w.put_uint(Tag::Context(4), u64::from(*attribute));
-            w.end_container(); // Path
-            w.start_struct(Tag::Context(1)); // StatusIB
-            w.put_uint(Tag::Context(0), u64::from(*status));
-            w.end_container(); // StatusIB
+            put_attribute_path(w, Tag::Context(0), *endpoint, *cluster, Some(*attribute)); // Path
+            put_status_ib(w, Tag::Context(1), *status, None); // StatusIB
             w.end_container(); // AttributeStatusIB
         }
     }
@@ -568,10 +560,7 @@ pub fn encode_read_request_cluster(endpoint: u16, cluster: u32) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
     w.start_array(Tag::Context(0)); // AttributeRequests
-    w.start_list(Tag::Anonymous); // AttributePathIB
-    w.put_uint(Tag::Context(2), u64::from(endpoint));
-    w.put_uint(Tag::Context(3), u64::from(cluster));
-    w.end_container(); // AttributePathIB
+    put_attribute_path(&mut w, Tag::Anonymous, endpoint, cluster, None); // AttributePathIB
     w.end_container(); // AttributeRequests
                        // IsFabricFiltered = true: matches chip-tool's read default. See
                        // encode_read_request's comment above for the rationale.

@@ -255,6 +255,81 @@ pub fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
     Ok(())
 }
 
+/// Cursor over the fields of a struct whose `StructStart` has already been
+/// consumed. `next_scalar` yields the next non-container field and returns
+/// `Ok(None)` at the matching `ContainerEnd`; nested containers are skipped
+/// whole (`skip_container`). Input ending before `ContainerEnd` is
+/// `Err(TlvError::Truncated)`. `next_field` is the same walk but hands
+/// nested container starts to the caller instead of skipping them.
+///
+/// Replaces the hand-rolled `loop { let el = r.next()?.ok_or(..)?; match
+/// el.value { ContainerEnd => break, .. } }` walk that every struct decoder
+/// would otherwise repeat, so the three easy-to-get-wrong parts —
+/// end-of-input vs `ContainerEnd`, and skipping unknown nested containers
+/// instead of mis-reading their fields as the struct's own — live in one
+/// place. Used by `pase`'s message decoders.
+pub struct StructFields<'r, 'a> {
+    r: &'r mut Reader<'a>,
+}
+
+impl<'r, 'a> StructFields<'r, 'a> {
+    /// Consumes the struct's opening element; `Err(TlvError::InvalidType(_))`
+    /// if the next element is not a `StructStart` (or the input is empty).
+    ///
+    /// That rejection is reported as the sentinel `InvalidType(0)`: `Reader`
+    /// does not expose the control byte, and `0x00` (signed int, 1 byte) is
+    /// a *valid* element type, so `Reader::next` never produces
+    /// `InvalidType(0)` itself (it only rejects the reserved types
+    /// `0x19..=0x1F`). Callers that need to distinguish "not a struct" from
+    /// a genuine decode error can therefore match on it.
+    pub fn open(r: &'r mut Reader<'a>) -> Result<Self, TlvError> {
+        match r.next()? {
+            Some(el) if el.value == Value::StructStart => Ok(Self { r }),
+            _ => Err(TlvError::InvalidType(0)),
+        }
+    }
+
+    /// Wraps a reader already positioned just after a `StructStart` — used to
+    /// descend into a nested struct that `next_field` surfaced.
+    pub fn inside(r: &'r mut Reader<'a>) -> Self {
+        Self { r }
+    }
+
+    /// The underlying reader, positioned inside the struct. Needed to consume
+    /// a container start that `next_field` handed over, either by descending
+    /// (`StructFields::inside`) or by skipping it (`skip_container`).
+    pub fn reader(&mut self) -> &mut Reader<'a> {
+        self.r
+    }
+
+    /// Next non-container field, `Ok(None)` at the struct's `ContainerEnd`.
+    /// Nested containers are skipped whole.
+    pub fn next_scalar(&mut self) -> Result<Option<Element<'a>>, TlvError> {
+        while let Some(el) = self.next_field()? {
+            match el.value {
+                Value::StructStart | Value::ArrayStart | Value::ListStart => {
+                    skip_container(self.r)?;
+                }
+                _ => return Ok(Some(el)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Next field of any kind, `Ok(None)` at the struct's `ContainerEnd`. A
+    /// returned container start is *not* consumed: the caller must descend
+    /// with `StructFields::inside(self.reader())` or drop it with
+    /// `skip_container(self.reader())` before the next call, or the walk
+    /// will read the nested container's fields as the struct's own.
+    pub fn next_field(&mut self) -> Result<Option<Element<'a>>, TlvError> {
+        let el = self.r.next()?.ok_or(TlvError::Truncated)?;
+        if el.value == Value::ContainerEnd {
+            return Ok(None);
+        }
+        Ok(Some(el))
+    }
+}
+
 impl Default for Writer {
     fn default() -> Self {
         Self::new()
@@ -328,15 +403,27 @@ impl<'a> Reader<'a> {
     }
 
     fn take_u16(&mut self) -> Result<u16, TlvError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(
+            self.take(2)?
+                .try_into()
+                .expect("take(2) yields exactly 2 bytes"),
+        ))
     }
 
     fn take_u32(&mut self) -> Result<u32, TlvError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("take(4) yields exactly 4 bytes"),
+        ))
     }
 
     fn take_u64(&mut self) -> Result<u64, TlvError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .expect("take(8) yields exactly 8 bytes"),
+        ))
     }
 
     fn read_tag(&mut self, control: u8) -> Result<Tag, TlvError> {
@@ -393,20 +480,36 @@ impl<'a> Reader<'a> {
         let value = match type_bits {
             0x00 => Value::Int(i64::from(self.take(1)?[0] as i8)),
             0x01 => Value::Int(i64::from(i16::from_le_bytes(
-                self.take(2)?.try_into().unwrap(),
+                self.take(2)?
+                    .try_into()
+                    .expect("take(2) yields exactly 2 bytes"),
             ))),
             0x02 => Value::Int(i64::from(i32::from_le_bytes(
-                self.take(4)?.try_into().unwrap(),
+                self.take(4)?
+                    .try_into()
+                    .expect("take(4) yields exactly 4 bytes"),
             ))),
-            0x03 => Value::Int(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            0x03 => Value::Int(i64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("take(8) yields exactly 8 bytes"),
+            )),
             0x04 => Value::Uint(u64::from(self.take(1)?[0])),
             0x05 => Value::Uint(u64::from(self.take_u16()?)),
             0x06 => Value::Uint(u64::from(self.take_u32()?)),
             0x07 => Value::Uint(self.take_u64()?),
             0x08 => Value::Bool(false),
             0x09 => Value::Bool(true),
-            0x0A => Value::F32(f32::from_le_bytes(self.take(4)?.try_into().unwrap())),
-            0x0B => Value::F64(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            0x0A => Value::F32(f32::from_le_bytes(
+                self.take(4)?
+                    .try_into()
+                    .expect("take(4) yields exactly 4 bytes"),
+            )),
+            0x0B => Value::F64(f64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("take(8) yields exactly 8 bytes"),
+            )),
             0x0C..=0x0F => {
                 let len = self.read_len(type_bits - 0x0C)?;
                 let bytes = self.take(len)?;
@@ -699,5 +802,173 @@ mod tests {
         );
         // tag バイトが足りない
         assert_eq!(Reader::new(&[0x24]).next(), Err(TlvError::Truncated));
+    }
+
+    // --- Task 11: StructFields cursor (RED) ---
+
+    /// `struct{1: uint, 2: struct{...}, 3: bytes}` — `next_scalar` walks the
+    /// scalar fields and swallows the nested struct whole.
+    #[test]
+    fn struct_fields_next_scalar_skips_nested_containers() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 42);
+        w.start_struct(Tag::Context(2));
+        w.put_uint(Tag::Context(1), 7);
+        w.start_array(Tag::Context(2));
+        w.put_bool(Tag::Anonymous, true);
+        w.end_container();
+        w.end_container();
+        w.put_bytes(Tag::Context(3), &[1, 2, 3]);
+        w.end_container();
+        let buf = w.finish();
+
+        let mut r = Reader::new(&buf);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        let mut seen = Vec::new();
+        while let Some(el) = f.next_scalar().expect("valid tlv") {
+            seen.push(el);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Element {
+                    tag: Tag::Context(1),
+                    value: Value::Uint(42)
+                },
+                Element {
+                    tag: Tag::Context(3),
+                    value: Value::Bytes(&[1, 2, 3])
+                },
+            ]
+        );
+    }
+
+    /// The same buffer via `next_field`: the nested `StructStart` is handed to
+    /// the caller, who descends with `StructFields::inside(f.reader())` and
+    /// then keeps walking the outer struct.
+    #[test]
+    fn struct_fields_next_field_surfaces_nested_containers() {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_uint(Tag::Context(1), 42);
+        w.start_struct(Tag::Context(2));
+        w.put_uint(Tag::Context(1), 7);
+        w.start_array(Tag::Context(2));
+        w.put_bool(Tag::Anonymous, true);
+        w.end_container();
+        w.end_container();
+        w.put_bytes(Tag::Context(3), &[1, 2, 3]);
+        w.end_container();
+        let buf = w.finish();
+
+        let mut r = Reader::new(&buf);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        let mut outer = Vec::new();
+        let mut inner_seen = Vec::new();
+        while let Some(el) = f.next_field().expect("valid tlv") {
+            outer.push(el);
+            if el.value == Value::StructStart {
+                // 入れ子は caller が消費する（ここでは中の scalar を拾う）
+                let mut inner = StructFields::inside(f.reader());
+                while let Some(iel) = inner.next_scalar().expect("valid tlv") {
+                    inner_seen.push(iel);
+                }
+            }
+        }
+        assert_eq!(
+            outer,
+            vec![
+                Element {
+                    tag: Tag::Context(1),
+                    value: Value::Uint(42)
+                },
+                Element {
+                    tag: Tag::Context(2),
+                    value: Value::StructStart
+                },
+                Element {
+                    tag: Tag::Context(3),
+                    value: Value::Bytes(&[1, 2, 3])
+                },
+            ]
+        );
+        // 入れ子の array (tag 2) は next_scalar が丸ごと飛ばす
+        assert_eq!(
+            inner_seen,
+            vec![Element {
+                tag: Tag::Context(1),
+                value: Value::Uint(7)
+            }]
+        );
+    }
+
+    /// Input ending before the matching `ContainerEnd` is `Truncated` — both
+    /// when the struct simply stops and when the last element itself is cut.
+    #[test]
+    fn struct_fields_truncated_before_container_end() {
+        // struct{1: 42} で ContainerEnd なしに入力終端
+        let buf = [0x15, 0x24, 0x01, 0x2A];
+        let mut r = Reader::new(&buf);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        assert_eq!(
+            f.next_scalar(),
+            Ok(Some(Element {
+                tag: Tag::Context(1),
+                value: Value::Uint(42)
+            }))
+        );
+        assert_eq!(f.next_scalar(), Err(TlvError::Truncated));
+        // next_field も同じ
+        let mut r = Reader::new(&buf);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        assert!(f.next_field().is_ok());
+        assert_eq!(f.next_field(), Err(TlvError::Truncated));
+        // 要素自体が途中で切れている場合も Truncated
+        let cut = [0x15, 0x24, 0x01];
+        let mut r = Reader::new(&cut);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        assert_eq!(f.next_scalar(), Err(TlvError::Truncated));
+    }
+
+    /// `open` requires a `StructStart`: a scalar, a non-struct container and
+    /// an empty input all come back as the `InvalidType(0)` sentinel.
+    #[test]
+    fn struct_fields_open_rejects_non_struct() {
+        let mut r = Reader::new(&[0x04, 0x2A]); // uint, not a struct
+        assert_eq!(
+            StructFields::open(&mut r).err(),
+            Some(TlvError::InvalidType(0))
+        );
+        let mut r = Reader::new(&[0x16, 0x18]); // array, not a struct
+        assert_eq!(
+            StructFields::open(&mut r).err(),
+            Some(TlvError::InvalidType(0))
+        );
+    }
+
+    #[test]
+    fn struct_fields_open_rejects_empty_input() {
+        let mut r = Reader::new(&[]);
+        assert_eq!(
+            StructFields::open(&mut r).err(),
+            Some(TlvError::InvalidType(0))
+        );
+    }
+
+    /// Reader-level decode errors pass through `open`/`next_scalar` unchanged
+    /// (so callers can tell them apart from the `InvalidType(0)` sentinel and
+    /// from `Truncated`).
+    #[test]
+    fn struct_fields_passes_reader_errors_through() {
+        let mut r = Reader::new(&[0x19]); // 予約 element type
+        assert_eq!(
+            StructFields::open(&mut r).err(),
+            Some(TlvError::InvalidType(0x19))
+        );
+        let buf = [0x15, 0x19]; // struct{ 予約型 }
+        let mut r = Reader::new(&buf);
+        let mut f = StructFields::open(&mut r).expect("top-level struct");
+        assert_eq!(f.next_scalar(), Err(TlvError::InvalidType(0x19)));
     }
 }

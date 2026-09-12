@@ -71,6 +71,37 @@ pub(super) fn device_datagram(
     seal_message(&R2I, &header, &proto, payload, DEV_NODE).unwrap()
 }
 
+/// デバイス*起点*（initiator=true）のセキュアデータグラム。購読 report や
+/// デバイス側リクエストが乗ってくる形（`device_datagram` は initiator=false
+/// 固定なので、その裏返しがこれ）。
+pub(super) fn device_initiated_datagram(
+    exchange_id: u16,
+    protocol_id: u16,
+    opcode: u8,
+    acked: Option<u32>,
+    needs_ack: bool,
+    counter: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let header = MessageHeader {
+        session_id: LOCAL_SID,
+        security_flags: 0,
+        message_counter: counter,
+        source_node_id: None,
+        destination: Destination::None,
+    };
+    let proto = ProtocolHeader {
+        initiator: true,
+        needs_ack,
+        acked_counter: acked,
+        opcode,
+        exchange_id,
+        protocol_id,
+        vendor_id: None,
+    };
+    seal_message(&R2I, &header, &proto, payload, DEV_NODE).unwrap()
+}
+
 /// デバイス側で受信 → 復号して (header, proto) を返す。
 pub(super) fn open_from_controller(buf: &[u8]) -> (MessageHeader, ProtocolHeader, Vec<u8>) {
     crate::crypto::open_message(&I2R, buf, OUR_NODE).unwrap()
@@ -291,6 +322,26 @@ pub(super) fn reliable_session_pair() -> (SecureSession, Transport) {
         DEV_NODE,
     );
     (s, b)
+}
+
+/// 新しいループバック UDP ソケット上の controller 役 `SecureSession` と、
+/// 生のデバイス側ソケットの組（`LOCAL_SID`/`PEER_SID`/`keys()`/`OUR_NODE`/
+/// `DEV_NODE`）。セッション側の transport は private field なので、
+/// `transport.local_addr()` が要る test はこのヘルパを使えない。
+pub(super) async fn udp_session_pair() -> (SecureSession, UdpTransport) {
+    let device = bind_local().await;
+    let peer = device.local_addr().unwrap();
+    let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
+    let s = SecureSession::new(
+        transport,
+        peer,
+        LOCAL_SID,
+        PEER_SID,
+        keys(),
+        OUR_NODE,
+        DEV_NODE,
+    );
+    (s, device)
 }
 
 /// 購読 priming 用 ReportData payload（subscription_id 付き、more 指定可）。
