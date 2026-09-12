@@ -1,14 +1,13 @@
 //! listen へ流す **イベント行**（デバイス発 EventReport 由来）と、属性行との
 //! 合流点 `Emitted`（spec 2026-09-06-events-subscribe-design §6.1）。
 //!
-//! 属性行（`super::Event`）は無改変で、イベント行は `attribute` の代わりに
+//! 属性行（[`Event`]）は無改変で、イベント行は `attribute` の代わりに
 //! `event` キーを持つのが消費者側の判別点。`recovered` は付けない —
 //! 属性のような差分推定ではなく EventNumber で欠落を回収するため
 //! （§6.2、再購読の EventMin）。
 
-use mat_controller::im::{EventPriority, EventReport, EventTimestamp};
-
-use super::Event;
+use mat_controller::im::{EventPriority, EventReport, EventTimestamp, ReportDataMessage};
+use mat_core::output::now_iso8601;
 
 /// listen へ配る 1 行。属性変化（既存の `Event`）とデバイスイベント
 /// （`EventItem`）が同じ broadcast に相乗りする。
@@ -201,10 +200,130 @@ pub fn events_from_event_reports(
     out
 }
 
+/// listen へ配る 1 イベント。cluster/attribute は数値で持ち、JSON 化時に
+/// chip-tool 記法へ名前化する（フィルタ照合は数値で行うため）。timestamp は
+/// report 受信時に一度だけ採取した値を保持する（listener ごと・emit 時刻での
+/// 再採取はしない — 同一 report 由来のイベントは全リスナーで同じ時刻を返す）。
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub timestamp: String,
+    pub node_id: u64,
+    pub endpoint: u16,
+    pub cluster: u32,
+    pub attribute: u32,
+    pub value: serde_json::Value,
+    pub priming: bool,
+    /// priming 差分回復で昇格したイベント（購読の盲目期間中に起きた実遷移を
+    /// 再購読時の priming から検出したもの）。`priming` と直交し、昇格時は
+    /// `priming: false` + `recovered: true` になる。timestamp は受信時刻で
+    /// あり、実際の遷移時刻ではない。
+    pub recovered: bool,
+}
+
+impl Event {
+    /// mat スキーマの NDJSON 1 行分。cluster/attribute は `mat-core::ids` に
+    /// あれば chip-tool 記法名、無ければ数値のまま（read と同じ規律）。
+    /// timestamp は report 受信時に採取済みの値をそのまま使う（emit 時刻の
+    /// 再採取はしない）。
+    pub fn to_json(&self) -> serde_json::Value {
+        let cluster = match mat_core::ids::find_cluster(self.cluster) {
+            Some(def) => serde_json::json!(def.name),
+            None => serde_json::json!(self.cluster),
+        };
+        let attribute = match mat_core::ids::find_cluster(self.cluster)
+            .and_then(|c| c.attrs.iter().find(|a| a.id == self.attribute))
+        {
+            Some(def) => serde_json::json!(def.name),
+            None => serde_json::json!(self.attribute),
+        };
+        serde_json::json!({
+            "timestamp": self.timestamp.clone(),
+            "node_id": self.node_id,
+            "endpoint": self.endpoint,
+            "cluster": cluster,
+            "attribute": attribute,
+            "value": self.value,
+            "priming": self.priming,
+            "recovered": self.recovered,
+        })
+    }
+}
+
+/// ReportDataMessage をイベント列へ。scalar 値のみイベント化し、list/struct
+/// （ACL・server-list 等 wildcard priming に混ざるもの）は debug ログで捨てる。
+/// これは **listen だけの制限**（generic read/write は list/struct を JSON で
+/// 扱う）: この経路は ReportData を 1 通ずつ処理しチャンク再組み立て
+/// （MoreChunkedMessages + ListIndex:null 追記列）を持たないので途中 list しか
+/// 作れず、list-diff priming recovery も要素追記を遷移と誤認する。path が欠けた
+/// report・status-only も捨てる。
+pub fn events_from_report(node_id: u64, msg: &ReportDataMessage, priming: bool) -> Vec<Event> {
+    // 1 report から生まれる全イベントで同じ受信時刻を共有する（listener ごと・
+    // emit 時刻での再採取はしない — 同時到着イベントは同じ timestamp が正しい）。
+    events_from_report_at(node_id, msg, priming, &now_iso8601())
+}
+
+/// `events_from_report` の受信時刻を呼び手が渡す版。同じ ReportData から
+/// 出る属性行とイベント行（`events_from_event_reports`）に同一の `timestamp`
+/// を持たせるために pump が使う（spec §6.2）。
+pub fn events_from_report_at(
+    node_id: u64,
+    msg: &ReportDataMessage,
+    priming: bool,
+    ts: &str,
+) -> Vec<Event> {
+    let mut out = Vec::new();
+    for rep in &msg.reports {
+        let (Some(endpoint), Some(cluster), Some(attribute)) =
+            (rep.endpoint, rep.cluster, rep.attribute)
+        else {
+            continue;
+        };
+        let Some(data) = &rep.data else { continue };
+        // list 属性は要素ごとに別々の report として届くことがある
+        // (AttributePathIB.ListIndex = null → デコーダは list_append: true)。
+        // その 1 要素は scalar なので下の is_array/is_object 判定を素通りして
+        // しまう — list_append 単体で落とす（list-diff priming recovery が
+        // 同一キーへの要素ごとの値変化を実遷移と誤認して recovered を大量発生
+        // させる害の元。README の「list/struct attributes are dropped」契約どおり）。
+        if rep.list_append {
+            tracing::debug!(
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+                "dropping list-append element report"
+            );
+            continue;
+        }
+        if data.is_array() || data.is_object() {
+            tracing::debug!(
+                node_id,
+                endpoint,
+                cluster,
+                attribute,
+                "dropping non-scalar report"
+            );
+            continue;
+        }
+        out.push(Event {
+            timestamp: ts.to_string(),
+            node_id,
+            endpoint,
+            cluster,
+            attribute,
+            value: data.clone(),
+            priming,
+            recovered: false,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
     use mat_controller::im::{EventData, EventPriority, EventReport, EventTimestamp};
+    use mat_native::test_support::onoff_report;
     use serde_json::json;
 
     fn item(cluster: u32, event: u32, data: serde_json::Value) -> EventItem {
@@ -395,5 +514,134 @@ mod tests {
         // 判別点は `attribute` / `event` キーの有無（spec §6.1）。
         assert!(attr.to_json().get("event").is_none());
         assert!(ev.to_json().get("attribute").is_none());
+    }
+
+    #[test]
+    fn event_json_uses_chip_tool_names_and_numeric_fallback() {
+        let ev = Event {
+            timestamp: "2026-07-20T00:00:00+09:00".to_string(),
+            node_id: 21,
+            endpoint: 1,
+            cluster: 0x0406,   // occupancysensing
+            attribute: 0x0000, // occupancy
+            value: json!(1),
+            priming: false,
+            recovered: false,
+        };
+        let j = ev.to_json();
+        assert_eq!(j["node_id"], 21);
+        assert_eq!(j["endpoint"], 1);
+        assert_eq!(j["cluster"], "occupancysensing");
+        assert_eq!(j["attribute"], "occupancy");
+        assert_eq!(j["value"], 1);
+        assert_eq!(j["priming"], false);
+        // 差分回復で昇格したイベントかどうかは常に載る（既定 false）。
+        assert_eq!(j["recovered"], false);
+        assert_eq!(j["timestamp"], "2026-07-20T00:00:00+09:00");
+
+        // ids テーブルに無いものは数値のまま。
+        let ev = Event {
+            cluster: 0xFFF1_0001,
+            attribute: 0x9999,
+            ..ev
+        };
+        let j = ev.to_json();
+        assert_eq!(j["cluster"], 0xFFF1_0001u32);
+        assert_eq!(j["attribute"], 0x9999);
+
+        // 昇格イベントは priming=false と recovered=true が同居する。
+        let ev = Event {
+            priming: false,
+            recovered: true,
+            ..ev
+        };
+        assert_eq!(ev.to_json()["recovered"], true);
+    }
+
+    #[test]
+    fn events_from_report_keeps_scalars_and_drops_containers() {
+        let mut msg = onoff_report(1, true);
+        // list 要素として届く scalar（AttributePathIB.ListIndex=null → デコーダは
+        // list_append: true として表現）はイベント化せず捨てる。値そのものは
+        // scalar（JSON array/object ではない）なので is_array/is_object 判定は
+        // 素通りしてしまう — list_append フラグでの判定が必要。
+        msg.reports.push(mat_controller::im::AttributeReport {
+            endpoint: Some(1),
+            cluster: Some(0x0008),
+            attribute: Some(0xFFFB), // attribute-list
+            list_append: true,
+            data: Some(json!(65531)),
+            status: None,
+        });
+        // list/struct（wildcard priming に混ざる ACL / server-list 等）は捨てる。
+        msg.reports.push(mat_controller::im::AttributeReport {
+            endpoint: Some(0),
+            cluster: Some(0x001F),
+            attribute: Some(0x0000),
+            list_append: false,
+            data: Some(json!([{ "1": 5 }])),
+            status: None,
+        });
+        // status-only / path 欠落も捨てる。
+        msg.reports.push(mat_controller::im::AttributeReport {
+            endpoint: None,
+            cluster: None,
+            attribute: None,
+            list_append: false,
+            data: None,
+            status: Some(0x7E),
+        });
+        let evs = events_from_report(7, &msg, true);
+        // 唯一残るのは onoff_report が積んだ通常の scalar（list_append: false）。
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].node_id, 7);
+        assert_eq!(evs[0].cluster, 0x0006);
+        assert_eq!(evs[0].value, json!(true));
+        assert!(evs[0].priming);
+    }
+
+    /// このバグが差分回復へ及ぼしていた害の釘打ち: list 属性は要素ごとに別々の
+    /// AttributeReport（list_append: true, data: scalar）として届き、同一キー
+    /// (node/endpoint/cluster/attribute) に対して値が要素ごとに違う。もし
+    /// list_append 要素をイベント化してしまうと、classify_against_cache が
+    /// 「値が変わった priming」と誤認して recovered: true を大量発生させる
+    /// （実機 node 13 の再購読 priming で観測: onoff/attribute-list 等）。
+    /// events_from_report が list_append 要素を落とす限り、SubHealth::observe
+    /// を通しても recovered イベントは 1 つも出ない。
+    #[test]
+    fn list_append_elements_never_produce_recovered_events() {
+        let health = SubHealth::new(None);
+        let round = |values: &[i64]| {
+            let msg = mat_controller::im::ReportDataMessage {
+                reports: values
+                    .iter()
+                    .map(|&v| mat_controller::im::AttributeReport {
+                        endpoint: Some(1),
+                        cluster: Some(0x0006),
+                        attribute: Some(0xFFFB), // attribute-list
+                        list_append: true,
+                        data: Some(json!(v)),
+                        status: None,
+                    })
+                    .collect(),
+                subscription_id: Some(1),
+                more_chunks: false,
+                suppress_response: false,
+            };
+            events_from_report(13, &msg, true)
+                .into_iter()
+                .map(|ev| health.observe(ev))
+                .collect::<Vec<_>>()
+        };
+        // 1 回目の priming（要素 0, 1）: 同一キーに異なる値が複数届く。
+        let first = round(&[0, 1]);
+        // 再購読後の 2 回目の priming（要素の値も変わり得る = list append の実態）。
+        let second = round(&[0, 1, 65533]);
+        assert!(
+            first.iter().all(|e| !e.recovered) && second.iter().all(|e| !e.recovered),
+            "list_append 要素起因の偽 recovered は出ない: first={first:?} second={second:?}"
+        );
+        // list_append 要素はそもそもイベント化されない（events_from_report の契約）。
+        assert!(first.is_empty() && second.is_empty());
     }
 }

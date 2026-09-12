@@ -904,11 +904,13 @@ version = "1.37.0"
 dependencies = [
  "chrono",
  "getrandom",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -960,7 +962,6 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
- "libc",
  "mat-controller",
  "mat-core",
  "mat-native",
@@ -982,7 +983,6 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
- "libc",
  "mat-controller",
  "mat-core",
  "mat-native",
@@ -991,7 +991,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

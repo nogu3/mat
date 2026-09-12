@@ -37,20 +37,22 @@ fn make_store() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// 1 接続で複数リクエスト行を送り、各行の応答 JSON を順に返す。
-async fn roundtrip(socket: &std::path::Path, requests: &[Value]) -> Vec<Value> {
-    // serve が bind するまで待つ。並列テスト（既定）でランタイムが飽和すると
-    // spawn した serve タスクの socket bind が遅れるので、窓は広め（250×20ms=5s）に
-    // 取る（テストの意味は不変、決定化のためだけ）。
-    let mut stream = None;
+/// serve が bind するまで待って connect する。並列テスト（既定）でランタイムが
+/// 飽和すると spawn した serve タスクの socket bind が遅れるので、窓は広め
+/// （250×20ms=5s）に取る（テストの意味は不変、決定化のためだけ）。
+async fn connect_with_retry(socket: &std::path::Path) -> UnixStream {
     for _ in 0..250 {
         if let Ok(s) = UnixStream::connect(socket).await {
-            stream = Some(s);
-            break;
+            return s;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let stream = stream.expect("could not connect to matd socket");
+    panic!("could not connect to matd socket");
+}
+
+/// 1 接続で複数リクエスト行を送り、各行の応答 JSON を順に返す。
+async fn roundtrip(socket: &std::path::Path, requests: &[Value]) -> Vec<Value> {
+    let stream = connect_with_retry(socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -270,15 +272,7 @@ async fn client_disconnect_aborts_op_and_drops_slot() {
     let (socket, handle) = start_matd_with_est(store_path, est).await;
 
     // conn A: read を送って 100ms で切断（mando が mat を kill する形の再現）。
-    let mut a = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            a = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut a = a.expect("could not connect to matd socket");
+    let mut a = connect_with_retry(&socket).await;
     a.write_all(
         b"{\"op\":\"read\",\"node_id\":1,\"endpoint\":1,\"cluster\":\"onoff\",\"attribute\":\"on-off\"}\n",
     )
@@ -315,15 +309,7 @@ async fn pipelined_second_request_is_buffered_not_lost() {
     let (_dir, store_path) = make_store();
     let (socket, handle) = start_matd_with_fake(store_path).await;
 
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("could not connect to matd socket");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -391,15 +377,7 @@ async fn invalid_request_json_is_parse_error() {
     let (_dir, store_path) = make_store();
     let (socket, handle) = start_matd_with_fake(store_path).await;
 
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("could not connect to matd socket");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -562,15 +540,7 @@ async fn listen_acks_then_streams_filtered_events() {
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
 
     // 接続して listen（node 21 のみ）
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("connect");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     write_half
@@ -607,15 +577,7 @@ async fn listen_with_event_wildcard_receives_only_event_lines() {
     let (socket, handle, tx, _health) =
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
 
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("connect");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     write_half
@@ -646,15 +608,7 @@ async fn listen_with_no_filter_receives_both_attribute_and_event_lines() {
     let (socket, handle, tx, _health) =
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
 
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("connect");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     write_half
@@ -686,15 +640,7 @@ async fn lagged_listener_gets_error_line_and_disconnect() {
     let (socket, handle, tx, _health) =
         start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 1).await;
 
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = UnixStream::connect(&socket).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stream = stream.expect("connect");
+    let stream = connect_with_retry(&socket).await;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     write_half

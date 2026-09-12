@@ -12,7 +12,6 @@ use mat_controller::commissioning::CommissioningFabric;
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::output;
 use mat_native::rotate_ipk::{self, RotateIpkParams, RotateMode, RotateStatus};
-use mat_native::NativeConfig;
 
 use crate::matd_client::MatdReload;
 
@@ -120,15 +119,9 @@ pub fn run_rotate_ipk(
     nodes: &[u64],
     catch_up: bool,
     abort: bool,
-    native: Option<&crate::native_direct::Config<'_>>,
+    cfg: &crate::native_direct::Config<'_>,
     op_timeout_ms: u64,
 ) -> Result<(), MatError> {
-    let cfg = native.ok_or_else(|| {
-        MatError::new(
-            ErrorKind::Other,
-            "rotate-ipk: native backend not configured (internal)",
-        )
-    })?;
     let store = mat_core::store::Store::open(store_path)?;
     let node_ids: Vec<u64> = if nodes.is_empty() {
         store.nodes().map(|n| n.node_id).collect()
@@ -150,20 +143,9 @@ pub fn run_rotate_ipk(
         mode,
         per_node_timeout_ms: op_timeout_ms,
     };
-    let native_cfg = NativeConfig {
-        store: store.root().to_path_buf(),
-        iface: cfg.iface.to_string(),
-        thread_iface: cfg.thread_iface.clone(),
-        fabric_index: cfg.fabric_index,
-        issuer_index: cfg.issuer_index,
-    };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| MatError::new(ErrorKind::Other, format!("tokio runtime: {e}")))?;
-    let outcome = rt
-        .block_on(rotate_ipk::run(&native_cfg, &params))
-        .map_err(crate::native_direct::map_engine_build_error)?;
+    let native_cfg = cfg.to_native(store.root());
+    let outcome = crate::native_direct::block_on(rotate_ipk::run(&native_cfg, &params))?
+        .map_err(MatError::with_fabric_init_hint)?;
     tracing::info!(
         status = outcome.status.as_str(),
         nodes = outcome.nodes.len(),

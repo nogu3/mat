@@ -20,9 +20,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-// module doc の [`UnixStream`] link を、実際の接続コードが stream.rs へ移った後も
-// 解決させる（rustdoc ビルド限定）。
-#[cfg(doc)]
 use std::os::unix::net::UnixStream;
 
 use serde_json::{json, Value};
@@ -37,7 +34,7 @@ mod stream;
 mod to_op;
 
 pub(crate) use hint::{hint_node_touched, hint_reload, MatdReload};
-pub use listen::dispatch_listen;
+pub use listen::{dispatch_listen, ListenParams};
 use stream::{connect_candidates, emit_response, exchange_on_stream};
 use to_op::to_op;
 
@@ -142,7 +139,7 @@ fn unsupported_detail(name: &str) -> String {
 /// alias / color spec 解決は `device_op::classify` が既に済ませているため、
 /// ここでの唯一の失敗理由は matd 非対応 op（`to_op` の `Err`）。
 pub fn dispatch(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> ExitCode {
-    let mut op_json = match to_op(op) {
+    let op_json = match to_op(op) {
         Ok(v) => v,
         // 非対応 op は CLI 利用誤り。kind=other(exit_code()=1) だが exit 2 を
         // 返すのは「2 = CLI 引数エラー」の documented シグナルを保つ意図的な
@@ -156,19 +153,26 @@ pub fn dispatch(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> ExitC
     let (stream, socket) = match connect_candidates(sockets) {
         Ok(s) => s,
         Err(detail) => {
-            MatError::new(ErrorKind::MatdUnavailable, &detail).emit();
-            return ExitCode::from(ErrorKind::MatdUnavailable.exit_code());
+            return MatError::new(ErrorKind::MatdUnavailable, &detail).emit_exit();
         }
     };
     tracing::info!(socket = %socket.display(), "using matd (forced)");
 
+    exchange_and_emit(stream, op_json, op, op_timeout_ms)
+}
+
+/// 接続済み stream で op を 1 往復して結果を出力する（`dispatch` / `dispatch_auto`
+/// の共通末尾）。予算対象 op には deadline_ms を付与し read timeout を掛ける。
+fn exchange_and_emit(
+    stream: UnixStream,
+    mut op_json: Value,
+    op: &DeviceOp,
+    op_timeout_ms: u64,
+) -> ExitCode {
     let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
     match exchange_on_stream(stream, &op_json, read_timeout) {
         Ok(resp) => emit_response(resp),
-        Err(e) => {
-            e.emit();
-            ExitCode::from(e.kind.exit_code())
-        }
+        Err(e) => e.emit_exit(),
     }
 }
 
@@ -180,7 +184,7 @@ pub fn dispatch(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> ExitC
 /// エラーとしてそのまま返し、直経路で再実行しない（write / invoke の二重実行防止）。
 pub fn dispatch_auto(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> Option<ExitCode> {
     // matd 非対応 op（open-window / diag thread / grant）は probe せず直経路。
-    let mut op_json = match to_op(op) {
+    let op_json = match to_op(op) {
         Ok(v) => v,
         Err(_) => return None,
     };
@@ -197,14 +201,7 @@ pub fn dispatch_auto(sockets: &[PathBuf], op: &DeviceOp, op_timeout_ms: u64) -> 
     };
     tracing::info!(socket = %socket.display(), "using matd (auto-detected)");
 
-    let read_timeout = attach_deadline(&mut op_json, op.budget_applies(), op_timeout_ms);
-    Some(match exchange_on_stream(stream, &op_json, read_timeout) {
-        Ok(resp) => emit_response(resp),
-        Err(e) => {
-            e.emit();
-            ExitCode::from(e.kind.exit_code())
-        }
-    })
+    Some(exchange_and_emit(stream, op_json, op, op_timeout_ms))
 }
 
 #[cfg(test)]

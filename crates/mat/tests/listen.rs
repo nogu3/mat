@@ -2,51 +2,38 @@
 //! count / timeout / exit code / matd 落ちの契約を釘打ちする（spec テスト方針 3）。
 //! 実 matd も実デバイスも不要。
 
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
+
+mod common;
+use common::{mat_listen, spawn_fake_matd};
 
 const ACK: &str = "{\"timestamp\":\"2026-07-20T00:00:00+09:00\",\"listening\":true}\n";
 const EVENT: &str = "{\"timestamp\":\"2026-07-20T00:00:01+09:00\",\"node_id\":21,\"endpoint\":1,\"cluster\":\"occupancysensing\",\"attribute\":\"occupancy\",\"value\":1,\"priming\":false}\n";
 
-fn mat_listen(socket: &std::path::Path, extra: &[&str]) -> Command {
-    let store = TempDir::new().unwrap();
-    let mut c = Command::cargo_bin("mat").unwrap();
-    c.env("MAT_IFACE", "lo")
-        .env("MAT_MATD_SOCKET", socket)
-        .env_remove("MAT_MATD")
-        .arg("--store")
-        .arg(store.keep()) // TempDir は listen 終了まで生かすため keep でリーク
-        .arg("listen")
-        .args(extra);
-    c
+/// ack + イベント N 行 を 1 接続で流す fake matd（`hold_ms` = 送信後の保持時間）。
+fn spawn_fake_matd_stream(socket: PathBuf, events: usize, hold_ms: u64) -> JoinHandle<Vec<String>> {
+    spawn_fake_matd_sessions(socket, vec![(events, hold_ms)])
 }
 
-/// fake matd: listen リクエスト 1 行を読み、ack + イベント N 行を返す。
-/// `hold` = 送信後も接続を開いたまま維持する秒数（timeout 系テスト用）。
-fn spawn_fake_matd_stream(socket: PathBuf, events: usize, hold_ms: u64) -> JoinHandle<String> {
-    let listener = UnixListener::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut req = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut req)
-            .unwrap();
-        stream.write_all(ACK.as_bytes()).unwrap();
-        for _ in 0..events {
-            stream.write_all(EVENT.as_bytes()).unwrap();
-        }
-        stream.flush().unwrap();
-        if hold_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-        }
-        req
-    })
+/// 接続ごとに (イベント数, hold_ms) を順に消費する fake matd。
+fn spawn_fake_matd_sessions(
+    socket: PathBuf,
+    sessions: Vec<(usize, u64)>,
+) -> JoinHandle<Vec<String>> {
+    let sessions = sessions
+        .into_iter()
+        .map(|(events, hold_ms)| {
+            let mut lines = vec![ACK];
+            lines.extend(std::iter::repeat_n(EVENT, events));
+            (lines, hold_ms)
+        })
+        .collect();
+    spawn_fake_matd(socket, sessions)
 }
 
 #[test]
@@ -60,7 +47,7 @@ fn listen_count_reached_exits_zero_with_events_on_stdout() {
         .success()
         .stdout(predicate::str::contains("\"occupancy\"").count(2));
 
-    let req = matd.join().unwrap();
+    let req = &matd.join().unwrap()[0];
     assert!(req.contains("\"op\":\"listen\""), "request line: {req}");
 }
 
@@ -84,7 +71,7 @@ fn listen_filters_are_forwarded_in_request() {
     .assert()
     .success();
 
-    let req = matd.join().unwrap();
+    let req = &matd.join().unwrap()[0];
     assert!(req.contains("\"node_id\":21"), "request line: {req}");
     assert!(
         req.contains("\"cluster\":\"occupancysensing\""),
@@ -210,30 +197,6 @@ fn listen_with_mat_matd_disabled_exits_13() {
         .assert()
         .code(13)
         .stderr(predicate::str::contains("matd_unavailable"));
-}
-
-/// fake matd（複数セッション版）: 接続ごとに (イベント数, hold_ms) を順に
-/// 消費し、各セッションで ack + イベントを流して切る。
-fn spawn_fake_matd_sessions(socket: PathBuf, sessions: Vec<(usize, u64)>) -> JoinHandle<()> {
-    let listener = UnixListener::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        for (events, hold_ms) in sessions {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut req = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut req)
-                .unwrap();
-            stream.write_all(ACK.as_bytes()).unwrap();
-            for _ in 0..events {
-                stream.write_all(EVENT.as_bytes()).unwrap();
-            }
-            stream.flush().unwrap();
-            if hold_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-            }
-            // drop(stream) = EOF
-        }
-    })
 }
 
 #[test]

@@ -256,6 +256,19 @@ impl AliasBook {
         Err(MatError::new(ErrorKind::Other, detail))
     }
 
+    /// node を解決してから、その node 文脈で endpoint を解決し、両方を `Id` に
+    /// 包んで返す。`mat` の CLI 層が node+endpoint を取る 10 サブコマンドで
+    /// 「解決 → 再包装」を毎回書かないためのまとめ。
+    pub fn resolve_node_endpoint(
+        &self,
+        node: &NodeRef,
+        endpoint: &EndpointRef,
+    ) -> Result<(NodeRef, EndpointRef), MatError> {
+        let n = self.resolve_node(node)?;
+        let e = self.resolve_endpoint(n, endpoint)?;
+        Ok((NodeRef::Id(n), EndpointRef::Id(e)))
+    }
+
     /// 色名を RGB へ確定する。`[colors]`（ユーザー定義）が組み込みテーブルを
     /// 上書きする。未知の名前は kind=Other（main が exit 2 に写す）で、既知の
     /// 名前（組み込み + ユーザー定義）を列挙して自己修復を助ける。
@@ -520,6 +533,30 @@ mod tests {
         );
         // 数値パススルー。
         assert_eq!(book.resolve_endpoint(5, &EndpointRef::Id(9)).unwrap(), 9);
+    }
+
+    #[test]
+    fn resolve_node_endpoint_returns_id_wrapped_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aliases.toml"),
+            "[nodes]\nliving-light = 5\n\n[endpoints.living-light]\nnight = 2\n",
+        )
+        .unwrap();
+        let book = AliasBook::load(dir.path()).unwrap();
+        let (n, e) = book
+            .resolve_node_endpoint(
+                &NodeRef::Alias("living-light".into()),
+                &EndpointRef::Alias("night".into()),
+            )
+            .unwrap();
+        assert_eq!(n, NodeRef::Id(5));
+        assert_eq!(e, EndpointRef::Id(2));
+        // 数値はパススルー。
+        let (n, e) = book
+            .resolve_node_endpoint(&NodeRef::Id(7), &EndpointRef::Id(1))
+            .unwrap();
+        assert_eq!((n, e), (NodeRef::Id(7), EndpointRef::Id(1)));
     }
 
     #[test]

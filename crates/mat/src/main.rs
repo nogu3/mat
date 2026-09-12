@@ -17,15 +17,22 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Command, DiagCommand, FabricAction, GroupCommand};
 use mat_core::error::{ErrorKind, MatError};
 use mat_core::store::Store;
 
 fn main() -> ExitCode {
-    reset_sigpipe();
-    init_tracing();
+    mat_core::log::reset_sigpipe();
+    // 対話 tty では色を許すが、パイプや mando 経由では ANSI を出さない
+    // （構造化ログを grep できる形に保つ）。`NO_COLOR` も尊重する —
+    // with_ansi はライブラリ既定の NO_COLOR 判定を無条件に上書きするので、
+    // ここで自分で見る必要がある（https://no-color.org/）。既定 level は warn。
+    mat_core::log::init_stderr(
+        "warn",
+        std::io::stderr().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+    );
 
     // 引数エラー（exit 2）は clap が直接処理する。
     let args = Cli::parse();
@@ -82,10 +89,7 @@ fn main() -> ExitCode {
         if let Some(result) = result {
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    e.emit();
-                    ExitCode::from(e.kind.exit_code())
-                }
+                Err(e) => e.emit_exit(),
             };
         }
     }
@@ -98,33 +102,64 @@ fn main() -> ExitCode {
     {
         return match commands::group::run_list(&store_path, args.fabric_index) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                e.emit();
-                ExitCode::from(e.kind.exit_code())
-            }
+            Err(e) => e.emit_exit(),
         };
     }
 
     // listen は初の matd 専用 op（direct fallback なし — 常駐なしに購読は成立
     // しない）。経路解決の socket だけ流用し、Direct（MAT_MATD=falsy）は
     // matd_unavailable で即エラー。
-    if let Command::Listen { .. } = &command {
+    if let Command::Listen {
+        node_id,
+        endpoint,
+        cluster,
+        attribute,
+        event,
+        count,
+        timeout_ms,
+        reconnect,
+    } = &command
+    {
+        // alias は resolve 層で Id に確定済み。ここで数値に落として listen 層へ
+        // フィールドで渡す（Command の再分解を listen 層に持ち込まない）。
+        let ids = node_id
+            .as_ref()
+            .map(mat_core::alias::NodeRef::id)
+            .transpose()
+            .and_then(|n| {
+                endpoint
+                    .as_ref()
+                    .map(mat_core::alias::EndpointRef::id)
+                    .transpose()
+                    .map(|e| (n, e))
+            });
+        let (node, endpoint) = match ids {
+            Ok(v) => v,
+            Err(e) => return e.emit_exit(),
+        };
+        let params = matd_client::ListenParams {
+            node,
+            endpoint,
+            cluster: cluster.clone(),
+            attribute: attribute.clone(),
+            event: event.clone(),
+            count: *count,
+            timeout_ms: *timeout_ms,
+            reconnect: *reconnect,
+        };
         return match matd_client::resolve_route(
             &args.matd,
             std::env::var_os("MAT_MATD_SOCKET"),
             std::env::var_os("MAT_MATD"),
         ) {
             matd_client::Route::Forced(sockets) | matd_client::Route::Auto(sockets) => {
-                matd_client::dispatch_listen(&sockets, &command)
+                matd_client::dispatch_listen(&sockets, &params)
             }
-            matd_client::Route::Direct => {
-                mat_core::error::MatError::new(
-                    ErrorKind::MatdUnavailable,
-                    "`mat listen` requires matd (MAT_MATD=0 disables it)",
-                )
-                .emit();
-                ExitCode::from(ErrorKind::MatdUnavailable.exit_code())
-            }
+            matd_client::Route::Direct => MatError::new(
+                ErrorKind::MatdUnavailable,
+                "`mat listen` requires matd (MAT_MATD=0 disables it)",
+            )
+            .emit_exit(),
         };
     }
 
@@ -132,10 +167,7 @@ fn main() -> ExitCode {
     // 未知名・符号化不能・不正 color spec は matd に触れる前に固有 kind で失敗）。
     let dispatch = match device_op::classify(&command) {
         Ok(d) => d,
-        Err(e) => {
-            e.emit();
-            return ExitCode::from(e.kind.exit_code());
-        }
+        Err(e) => return e.emit_exit(),
     };
     let device_op = match &dispatch {
         device_op::Dispatch::Device(op) => Some(op),
@@ -173,52 +205,30 @@ fn main() -> ExitCode {
     // native 直経路: MAT_IFACE 設定時はその iface、未設定なら自動検出
     // （M8c-3 native 既定化）。自動検出の候補 0 / 複数はハードエラー
     // （黙って落とさない — spec 設計 3）。
-    let iface_owned: String = match &args.iface {
-        Some(i) => i.clone(),
-        None => match mat_native::iface_select::autodetect() {
-            Ok(i) => {
-                tracing::info!(iface = %i, "iface auto-selected (native default)");
-                i
-            }
-            Err(e) => {
-                e.emit();
-                return ExitCode::from(e.kind.exit_code());
-            }
-        },
+    let iface_owned = match select_iface(&args.iface) {
+        Ok(i) => i,
+        Err(e) => return e.emit_exit(),
     };
-    // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
-    // 自動検出（失敗は warn のみ — LAN 単独送出にフォールバック、spec 設計 3）。
-    let thread_iface: Option<mat_native::ThreadIfaceChoice> = match &args.thread_iface {
-        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
-        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
-            tracing::info!(iface = %n, "thread iface auto-detected (groupcast egress)");
-            mat_native::ThreadIfaceChoice::Auto(n)
-        }),
-    };
-    let native_cfg = Some(native_direct::Config {
+    let thread_iface = select_thread_iface(&args.thread_iface);
+    let native_cfg = native_direct::Config {
         iface: &iface_owned,
         thread_iface,
         fabric_index: args.fabric_index,
         issuer_index: args.issuer_index,
-    });
-    if let Some(cfg) = &native_cfg {
-        if let Some(op) = device_op {
-            return match native_direct::run(op, &store_path, cfg, args.op_timeout_ms) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
-                    e.emit();
-                    ExitCode::from(e.kind.exit_code())
-                }
-            };
-        }
+    };
+    if let Some(op) = device_op {
+        return match native_direct::run(op, &store_path, &native_cfg, args.op_timeout_ms) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::debug!(kind = ?e.kind, detail = %e.detail, "native direct failed");
+                e.emit_exit()
+            }
+        };
     }
 
     // `Dispatch::Dedicated` の残り（fabric / listen は早期 return 済み）。
     let result = match &command {
-        Command::Discover { probe } => {
-            commands::discover::run(&store_path, *probe, native_cfg.as_ref())
-        }
+        Command::Discover { probe } => commands::discover::run(&store_path, *probe, &native_cfg),
         Command::Commission {
             setup_code,
             node_id,
@@ -230,18 +240,12 @@ fn main() -> ExitCode {
             setup_code,
             *node_id,
             alias.as_deref(),
-            native_cfg.as_ref(),
+            &native_cfg,
             thread_dataset.as_deref(),
             *transport,
         ),
         Command::Unpair { node_id, force } => node_id.id().and_then(|node| {
-            commands::unpair::run(
-                &store_path,
-                node,
-                *force,
-                native_cfg.as_ref(),
-                args.op_timeout_ms,
-            )
+            commands::unpair::run(&store_path, node, *force, &native_cfg, args.op_timeout_ms)
         }),
         Command::Diag {
             action:
@@ -251,9 +255,9 @@ fn main() -> ExitCode {
                     deep,
                 },
         } => node_id.id().and_then(|node| {
-            endpoint.id().and_then(|ep| {
-                commands::diag::node(&store_path, node, ep, *deep, native_cfg.as_ref())
-            })
+            endpoint
+                .id()
+                .and_then(|ep| commands::diag::node(&store_path, node, ep, *deep, &native_cfg))
         }),
         Command::Diag {
             action: DiagCommand::Mesh { nodes },
@@ -261,7 +265,7 @@ fn main() -> ExitCode {
             .iter()
             .map(mat_core::alias::NodeRef::id)
             .collect::<Result<Vec<u64>, MatError>>()
-            .and_then(|ids| commands::diag::mesh(&store_path, &ids, native_cfg.as_ref())),
+            .and_then(|ids| commands::diag::mesh(&store_path, &ids, &native_cfg)),
         Command::Fabric {
             action:
                 FabricAction::RotateIpk {
@@ -279,7 +283,7 @@ fn main() -> ExitCode {
                     &ids,
                     *catch_up,
                     *abort,
-                    native_cfg.as_ref(),
+                    &native_cfg,
                     args.op_timeout_ms,
                 )
             }),
@@ -296,46 +300,32 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::debug!(kind = ?e.kind, detail = %e.detail, "command failed");
-            e.emit();
-            ExitCode::from(e.kind.exit_code())
+            e.emit_exit()
         }
     }
 }
 
-/// SIGPIPE を既定動作（プロセス終了）に戻す。Rust の runtime は SIGPIPE を
-/// 無視して起動するので、`mat ... | head -1` のように stdout のパイプ先が先に
-/// 閉じると `println!` が EPIPE で panic し、stderr に "failed printing to
-/// stdout: Broken pipe" を吐いて exit 101 になる。通常の CLI と同じく黙って
-/// SIGPIPE で終わらせる（stderr のエラー JSON には影響しない — パイプ先が
-/// 閉じているのは stdout だけ）。unix 以外は no-op。
-fn reset_sigpipe() {
-    #[cfg(unix)]
-    // SAFETY: SIG_DFL の設定はプロセス起動直後・スレッド生成前の 1 回だけで、
-    // 副作用は「EPIPE の代わりに SIGPIPE で終了する」に限られる。
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+/// native の iface: 明示指定を優先、未設定なら自動検出。候補 0 / 複数は
+/// ハードエラー（黙って落とさない — spec 設計 3）。matd の main.rs と同型。
+fn select_iface(explicit: &Option<String>) -> Result<String, MatError> {
+    match explicit {
+        Some(i) => Ok(i.clone()),
+        None => {
+            let i = mat_native::iface_select::autodetect()?;
+            tracing::info!(iface = %i, "iface auto-selected (native default)");
+            Ok(i)
+        }
     }
 }
 
-/// 診断ログを stderr に出す。レベルは `MAT_LOG`（無ければ `RUST_LOG`）で制御、
-/// 既定は `warn`。stdout は JSON 専用なので絶対に汚さない。
-fn init_tracing() {
-    // 空文字は未設定扱い、パースできない指定は次の候補へ送る
-    // （`mat_core::log` 参照）。既定は warn。
-    let filter = mat_core::log::log_filter_candidates_from_env()
-        .into_iter()
-        .find_map(|s| EnvFilter::try_new(&s).ok())
-        .unwrap_or_else(|| EnvFilter::new("warn"));
-    fmt()
-        .with_env_filter(filter)
-        // 対話 tty では色を許すが、パイプや mando 経由では ANSI を出さない
-        // （構造化ログを grep できる形に保つ）。`NO_COLOR` も尊重する —
-        // with_ansi はライブラリ既定の NO_COLOR 判定を無条件に上書きするので、
-        // ここで自分で見る必要がある（https://no-color.org/）。
-        .with_ansi(
-            std::io::stderr().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+/// groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
+/// 自動検出（失敗は None のまま — LAN 単独送出）。matd と同型。
+fn select_thread_iface(explicit: &Option<String>) -> Option<mat_native::ThreadIfaceChoice> {
+    match explicit {
+        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
+        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
+            tracing::info!(iface = %n, "thread iface auto-detected (groupcast egress)");
+            mat_native::ThreadIfaceChoice::Auto(n)
+        }),
+    }
 }

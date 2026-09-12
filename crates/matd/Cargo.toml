@@ -14,7 +14,7 @@ name = "matd"
 path = "src/main.rs"
 
 [dependencies]
-mat-core.workspace = true
+mat-core = { workspace = true, features = ["log-init"] }
 mat-controller.workspace = true
 mat-native.workspace = true
 async-trait.workspace = true
@@ -23,7 +23,6 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -35,13 +34,11 @@ tokio = { version = "1", features = [
 ] }
 rustix = { version = "1", features = ["fs"] }
 
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
 [dev-dependencies]
 mat-native = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
+tracing-subscriber.workspace = true
 # start_paused=true（op 相関 / born-dead 検知テスト、Task 4）に必須。
 tokio = { version = "1", features = ["test-util"] }
