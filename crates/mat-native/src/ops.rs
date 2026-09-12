@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use mat_controller::group_settings::IPK_KEYSET_ID;
 use mat_controller::im::{
     encode_add_group_fields, encode_group_key_map_tlv, encode_key_set_write_fields,
     encode_key_set_write_fields_multi, ATTR_ACL, ATTR_GROUP_KEY_MAP, CLUSTER_ACCESS_CONTROL,
     CLUSTER_GROUPS, CLUSTER_GROUP_KEY_MANAGEMENT, CMD_ADD_GROUP, CMD_KEY_SET_WRITE,
+    CMD_REMOVE_GROUP,
 };
 use mat_controller::tlv::{Tag, Writer};
 use mat_core::acl::{entries_from_im_json, merge_group_entry, AclEntry};
@@ -408,9 +410,6 @@ pub(crate) fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
     w.finish()
 }
 
-/// IPK の KeySet id（spec §11.2.6.2）。
-pub const IPK_KEYSET_ID: u16 = 0;
-
 /// IPK keyset（keyset 0）へ `KeySetWrite` を 1 回打つ — `fabric rotate-ipk` の
 /// 配布 / catch-up の 1 ステップ。`epochs` は (epoch_key, start_time) 1〜3 本、
 /// start_time は単調増加かつ非 0（spec §11.2.8.1）。ep0、timed 無し。失敗は
@@ -521,9 +520,8 @@ pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<
     Ok(true)
 }
 
-/// Groups cluster RemoveGroup（spec §1.3.7.4）/ GroupKeyManagement KeySetRemove
-/// （§11.2.8.3）。`mat_controller::im` には足さずここで局所定義する。
-pub const CMD_REMOVE_GROUP: u32 = 0x03;
+/// GroupKeyManagement KeySetRemove（spec §11.2.8.3）。`mat_controller::im` に
+/// 無いのでここで局所定義する（`CMD_REMOVE_GROUP` は im 側にある）。
 pub const CMD_KEY_SET_REMOVE: u32 = 0x03;
 /// RemoveGroupResponse.status の NOT_FOUND（グループ未登録 — 冪等に続行）。
 const STATUS_NOT_FOUND: u8 = 0x8B;

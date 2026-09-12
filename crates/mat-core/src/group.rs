@@ -1,28 +1,11 @@
 //! group（groupcast）の共有ロジック。`mat group`（one-shot）と `matd` の group op が
-//! 同じ鍵生成・宛先 node-id 組み立てを使うよう、一箇所で保守する。
+//! 同じ epoch 鍵の検証・生成を使うよう、一箇所で保守する。
 //!
-//! group state（鍵束・GroupKeyMap）自体は `mat`/`matd` 独自台帳を持たず chip-tool の
-//! 永続ストレージに委ねる（設計ルール 4）。ここにあるのは値の検証・生成・整形だけ。
+//! group state（鍵束・GroupKeyMap）自体は `mat`/`matd` 独自台帳を持たず、mat が
+//! 所有する chip-tool INI 互換 KVS（`mat-controller::group_settings`）に置く
+//! （設計ルール 4）。ここにあるのは値の検証・生成・整形だけ。
 
 use crate::error::{ErrorKind, MatError};
-
-/// GroupKeySecurityPolicy。0 = TrustFirst（最初に来た鍵を信頼）。
-pub const KEY_SECURITY_POLICY: &str = "0";
-
-/// epoch 鍵の有効開始時刻（EpochStartTime0）。コントローラ側 groupsettings の
-/// `add-keysets <keysetId> <keyPolicy> <validityTime> <EpochKey>` の validityTime と、
-/// デバイス側 KeySetWrite の epochStartTime0 はこの値で一致させる必要がある
-/// （ずれると両者が選ぶ有効 epoch 鍵が食い違い groupcast が復号できない）。
-pub const EPOCH_START_TIME: &str = "1";
-
-/// group multicast 宛先の node-id ベース。実 node-id は `BASE | group_id`。
-/// 上位48bitが全1（`0xffffffffffff....`）なら group 宛と解釈される。
-const GROUP_NODE_ID_BASE: u64 = 0xffff_ffff_ffff_0000;
-
-/// group multicast 宛先の node-id を `0x...` 16桁 hex 文字列で組み立てる。
-pub fn group_node_id(group_id: u16) -> String {
-    format!("0x{:016x}", GROUP_NODE_ID_BASE | u64::from(group_id))
-}
 
 /// `--epoch-key` の妥当性検証（16バイト = 32桁 hex）。小文字へ正規化して返す。
 pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
@@ -58,13 +41,6 @@ pub fn resolve_epoch_key(epoch_key: Option<&str>) -> Result<String, MatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn group_node_id_packs_group_into_low_bits() {
-        assert_eq!(group_node_id(1), "0xffffffffffff0001");
-        assert_eq!(group_node_id(0x1234), "0xffffffffffff1234");
-        assert_eq!(group_node_id(0), "0xffffffffffff0000");
-    }
 
     #[test]
     fn validate_epoch_key_accepts_32_hex() {

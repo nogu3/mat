@@ -111,7 +111,7 @@ pub async fn provision(
     // keyset 0 = IPK。KVS（`k/0`）にも各ノードの keyset 0 にも触る前に拒む
     // （`write_group_provision` にも同じガードがあるが、そちらは KVS 層の
     // 防波堤 — ここで止めれば設定不備のエラーより先に引数の誤りが出る）。
-    if p.keyset_id == crate::ops::IPK_KEYSET_ID {
+    if p.keyset_id == mat_controller::group_settings::IPK_KEYSET_ID {
         return Err(crate::group_settings::ipk_keyset_reserved());
     }
     let Some(gs) = &engine.group_settings else {

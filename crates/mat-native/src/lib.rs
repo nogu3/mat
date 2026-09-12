@@ -224,22 +224,6 @@ pub trait SubscribeConn: Send {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<mat_controller::session::SubscriptionReport>, MatError>;
-    /// 属性のみを見る薄いラッパ（イベント無しの購読）。実装は
-    /// `subscribe` / `next_report_full` 側だけに置く。
-    async fn subscribe_wildcard(
-        &mut self,
-        clusters: &[u32],
-    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
-        let (info, priming, _events) = self.subscribe(clusters, &[], None).await?;
-        Ok((info, priming))
-    }
-    /// 次のデバイス発 report の属性側だけを待つ薄いラッパ。
-    async fn next_report(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
-        Ok(self.next_report_full(timeout).await?.map(|r| r.data))
-    }
     /// セッションを手放す直前の後始末。CloseSession を best-effort 送信する
     /// （Issue #20: 放置セッションが FP300 系の常駐購読を黙殺する）。fake は
     /// 既定 no-op で足りるよう default 実装を持つ。
@@ -1505,14 +1489,15 @@ mod tests {
         use crate::test_support::{FakeEstablisher, FakeSubConn};
         let est = FakeEstablisher::default();
         let mut conn = est.establish_subscription(5).await.unwrap();
-        let (info, priming) = conn.subscribe_wildcard(&[]).await.unwrap();
+        let (info, priming, _events) = conn.subscribe(&[], &[], None).await.unwrap();
         assert_eq!(info.max_interval_s, 60);
         assert_eq!(priming.len(), 1); // default fake は onoff=true の priming 1 チャンク
                                       // scripted report が尽きたら next_report は timeout まで待って Ok(None)（無音）。
         let silent = conn
-            .next_report(std::time::Duration::from_millis(50))
+            .next_report_full(std::time::Duration::from_millis(50))
             .await
-            .unwrap();
+            .unwrap()
+            .map(|r| r.data);
         assert!(silent.is_none());
         // 共有 live キューに積めば次の next_report が払い出す。
         est.sub_live
@@ -1520,9 +1505,10 @@ mod tests {
             .unwrap()
             .push_back(crate::test_support::onoff_report(1, false));
         let msg = conn
-            .next_report(std::time::Duration::from_millis(50))
+            .next_report_full(std::time::Duration::from_millis(50))
             .await
             .unwrap()
+            .map(|r| r.data)
             .expect("live report");
         assert_eq!(msg.reports.len(), 1);
         let _ = FakeSubConn::default(); // 型が公開されていること
@@ -1623,17 +1609,20 @@ mod tests {
 
         let est = FakeEstablisher::default();
         let mut conn = est.establish_subscription(5).await.unwrap();
-        conn.subscribe_wildcard(&[]).await.unwrap();
+        conn.subscribe(&[], &[], None).await.unwrap();
 
         est.fail_next_report.store(1, Ordering::SeqCst);
-        let err = match conn.next_report(std::time::Duration::from_millis(50)).await {
+        let err = match conn
+            .next_report_full(std::time::Duration::from_millis(50))
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("注入した 1 回は Err になるはず"),
         };
         assert_eq!(err.kind, ErrorKind::SessionFailed);
         // 尽きたら従来どおり無音 Ok(None)。
         assert!(conn
-            .next_report(std::time::Duration::from_millis(50))
+            .next_report_full(std::time::Duration::from_millis(50))
             .await
             .unwrap()
             .is_none());
