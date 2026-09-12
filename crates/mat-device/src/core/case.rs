@@ -109,6 +109,7 @@ mod tests {
     use mat_controller::case::{encode_sigma1, eph_pub_bytes, random_p256_secret};
     use mat_controller::cert::MatterCert;
     use mat_controller::fabric::case_destination_id;
+    use mat_controller::secure_channel::{OPCODE_SIGMA1, OPCODE_SIGMA2};
     use mat_controller::test_support::{ICA01, IPK, NODE01_NOC, NODE01_PRIV, ROOT01_CHIP};
     use mat_controller::tlv::{Reader, Tag, Value};
 
@@ -138,13 +139,6 @@ mod tests {
             label: String::new(),
         }
     }
-
-    // Sigma1/Sigma2 opcodes (spec §4.14). `case_responder::OPCODE_SIGMA1`/
-    // `OPCODE_SIGMA2` are `pub(crate)` to mat-controller (the net driver
-    // doesn't need them — see `net::case`'s doc comment), so this test uses
-    // the literal wire values directly.
-    const OPCODE_SIGMA1: u8 = 0x30;
-    const OPCODE_SIGMA2: u8 = 0x31;
 
     #[test]
     fn wraps_fabric_entry_and_answers_sigma1_with_sigma2() {

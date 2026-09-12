@@ -570,7 +570,7 @@ echo "==> waiting for mat listen to attach" >&2
 # (`crates/mat/src/matd_client.rs`'s `cmd_listen`: "ack 行 ... は出力せず
 # 読み捨てる"), never printed. So attachment is observed from matd's own
 # side instead: matd subscribes this client to its event bus *before*
-# sending that ack ("ack より先に subscribe" in `crates/matd/src/server.rs`),
+# sending that ack ("ack より先に subscribe" in `crates/matd/src/server/`),
 # then logs `listen client attached` at info level — which is what
 # `RUST_LOG=info` above is for.
 ACK=""

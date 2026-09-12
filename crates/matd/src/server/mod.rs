@@ -850,14 +850,7 @@ mod tests {
             _node_id: u64,
         ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
             Ok(Box::new(
-                crate::native::test_support::FakeConn::scripted()
-                    .with_read(0, 0x003F, 0x0000, json!([]))
-                    .with_read(
-                        0,
-                        0x001F,
-                        0x0000,
-                        json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                    ),
+                crate::native::test_support::FakeConn::with_group_provision_fixture(),
             ))
         }
     }

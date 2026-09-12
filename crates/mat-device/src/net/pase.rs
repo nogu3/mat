@@ -24,9 +24,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mat_controller::case::encode_status_report;
 use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
 use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
+use mat_controller::secure_channel::{
+    encode_status_report, GENERAL_CODE_FAILURE, SC_PROTOCOL_CODE_INVALID_PARAMETER,
+};
 use mat_controller::session::SessionKeys;
 use mat_controller::transport::{Transport, UdpTransport};
 
@@ -42,13 +44,6 @@ const SALT: &[u8; 16] = b"SPAKE2P Key Salt";
 /// handshake, so a collision-checked random value buys nothing here — same
 /// rationale as `test_support::pase_responder_task`.
 const RESPONDER_SESSION_ID: u16 = 0xB0B1;
-
-/// SecureChannel protocol `GeneralStatusCode::FAILURE` (spec §4.11.3).
-const GENERAL_CODE_FAILURE: u16 = 1;
-/// SecureChannel protocol-specific `kInvalidParameter` (spec §4.11.3.1) —
-/// mirrors what `mat_controller::pase::establish` sends/treats as failure
-/// on confirmation mismatch / bad PBKDF params.
-const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 
 /// Wait budget for `ex.recv(...)` once a reply has already been
 /// standalone-acked (i.e. the peer is actively working on the next real

@@ -17,25 +17,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mat_controller::case::encode_status_report;
 use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
 use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
+use mat_controller::secure_channel::{
+    encode_status_report, GENERAL_CODE_FAILURE, SC_PROTOCOL_CODE_INVALID_PARAMETER,
+    SC_PROTOCOL_CODE_NO_SHARED_TRUST_ROOTS,
+};
 use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, UdpTransport};
 
 use crate::core::case::{CaseCoreError, CaseOutput, CaseResponderCore};
 use crate::core::fabric_store::FabricEntry;
-
-/// SecureChannel protocol `GeneralStatusCode::FAILURE` (spec §4.11.3).
-const GENERAL_CODE_FAILURE: u16 = 1;
-/// SecureChannel protocol-specific `NO_SHARED_TRUST_ROOTS` (spec §4.11.3.1) —
-/// sent when Sigma1's destinationId matched none of our fabrics.
-const SC_PROTOCOL_CODE_NO_SHARED_TRUST_ROOTS: u16 = 1;
-/// SecureChannel protocol-specific `INVALID_PARAMETER` (spec §4.11.3.1) —
-/// the catch-all for every other protocol violation (malformed Sigma1/3,
-/// TBE3 decrypt failure, cert/signature failures), mirroring
-/// `net::pase::run_pase_once`'s use of the same code for its own catch-all.
-const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 
 /// Wait budget for `ex.recv(...)` once a reply has already been
 /// standalone-acked — same rationale/value as `net::pase`'s `RECV_TIMEOUT`.

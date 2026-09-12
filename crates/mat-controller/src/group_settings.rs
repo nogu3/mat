@@ -29,7 +29,7 @@ const INVALID_KEYSET_ID: u16 = 0xFFFF;
 const INVALID_ENDPOINT_ID: u16 = 0xFFFF;
 /// KeySetData の operational key 配列は常に 3 スロット（KeySet::kEpochKeysMax）。
 const KEYSET_SLOTS: usize = 3;
-/// デバイス側 epochStartTime0 と一致させる（mat-core::group::EPOCH_START_TIME = "1"）。
+/// デバイス側 epochStartTime0 と一致させる（`im::cmdfields::encode_key_set_write_fields` の 1）。
 pub(crate) const EPOCH_START_TIME: u64 = 1;
 /// GroupName の最大バイト数（上流 CHIP_CONFIG_MAX_GROUP_NAME_LENGTH）。
 const GROUP_NAME_MAX: usize = 16;

@@ -267,17 +267,13 @@ fn thread_egress_decision(
     }
 }
 
-/// chip-tool 互換 KVS の alpha INI 名。ctrl-store レーンが
-/// `mat_controller::kvs::ALPHA_INI_FILE` を足したらそちらへ差し替える。
-pub const ALPHA_INI_FILE: &str = "chip_tool_config.alpha.ini";
-
 /// KVS から自己発行資材（root CA 鍵・fabric id・node id）を読む。`Engine::build`
 /// / `commission` / `mat` の probe が同じ 1 本を通る。読めない = fabric 未
 /// bootstrap → `store_missing`（`mat fabric init` 誘導付き）。
 pub fn load_self_issue_materials(
     cfg: &NativeConfig,
 ) -> Result<mat_controller::kvs::SelfIssueMaterials, MatError> {
-    let alpha_ini = cfg.store.join(ALPHA_INI_FILE);
+    let alpha_ini = cfg.store.join(mat_controller::kvs::ALPHA_INI_FILE);
     let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
     mat_controller::kvs::read_self_issue_materials(
         &alpha_ini,

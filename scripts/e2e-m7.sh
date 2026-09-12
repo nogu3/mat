@@ -266,7 +266,7 @@ printf '%s\n' "$FULL_LOG" | grep "groupcast sent" || true   # 目視確認用の
 if printf '%s\n' "$FULL_LOG" | grep -q "falling back"; then
   echo "FAIL: matd ログに 'falling back' が出ている — このフェーズの group invoke の" >&2
   echo "      どちらか（または両方）が native を通らず chip-tool にフォールバックした。" >&2
-  echo "      (crates/matd/src/server.rs の 'native group send unavailable; falling" >&2
+  echo "      (crates/matd/src/server/ の 'native group send unavailable; falling" >&2
   echo "      back to chip-tool' 警告に対応)" >&2
   printf '%s\n' "$FULL_LOG" >&2
   exit 1

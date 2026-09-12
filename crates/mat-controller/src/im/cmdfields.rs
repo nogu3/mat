@@ -95,8 +95,8 @@ pub fn encode_key_set_write_fields_multi(keyset_id: u16, epochs: &[([u8; 16], u6
 
 /// Single-epoch form of [`encode_key_set_write_fields_multi`] with EpochStartTime0 = 1.
 /// Used by `group provision`. **Important:** the value 1 must remain in sync with
-/// `mat_core::group::EPOCH_START_TIME`, which the controller-side
-/// `groupsettings add-keysets` validity time must also match.
+/// `crate::group_settings::EPOCH_START_TIME`, which the controller-side
+/// keyset validity time must also match.
 pub fn encode_key_set_write_fields(keyset_id: u16, epoch_key: &[u8; 16]) -> Vec<u8> {
     encode_key_set_write_fields_multi(keyset_id, &[(*epoch_key, 1)])
 }

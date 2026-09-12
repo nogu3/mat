@@ -19,17 +19,13 @@
 //! never retries or recovers on its own.
 
 use mat_controller::message::OPCODE_STATUS_REPORT;
+use mat_controller::pase::derive_session_keys;
 use mat_controller::pase::{
     self, OPCODE_PASE_PAKE1, OPCODE_PASE_PAKE2, OPCODE_PASE_PAKE3, OPCODE_PBKDF_PARAM_REQUEST,
     OPCODE_PBKDF_PARAM_RESPONSE,
 };
 use mat_controller::session::SessionKeys;
 use mat_controller::spake2p::{Spake2pVerifier, SpakeError};
-
-/// HKDF info string for the post-PASE session key derivation (spec
-/// §4.13.2.3). Matches `mat_controller::pase::establish`'s constant of the
-/// same name.
-const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
 /// PASE の secret 供給源。`Passcode` は起動時窓（QR の passcode から
 /// w0/w1 を導出）、`VerifierMaterial` は ECM 窓（OpenCommissioningWindow が
@@ -248,24 +244,6 @@ impl PaseResponderCore {
             keys,
             peer_session_id,
         })
-    }
-}
-
-/// spec §4.13.2.3: HKDF-SHA256(salt=[], ikm=Ke(16B), info="SessionKeys")
-/// 48B -> i2r(16B) || r2i(16B) || attestation_challenge(16B). Replicated
-/// locally rather than reused — `mat_controller::pase::establish`'s copy of
-/// this expand call is private to that function, and
-/// `mat_controller::test_support::hkdf48` is behind the test-only
-/// `test-responder` feature — a production driver can't depend on either.
-fn derive_session_keys(k_e: &[u8; 16]) -> SessionKeys {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&[]), k_e);
-    let mut okm = [0u8; 48];
-    hk.expand(INFO_SESSION_KEYS, &mut okm)
-        .expect("48 bytes is a valid HKDF-SHA256 output length");
-    SessionKeys {
-        i2r: okm[..16].try_into().expect("16"),
-        r2i: okm[16..32].try_into().expect("16"),
-        attestation_challenge: okm[32..].try_into().expect("16"),
     }
 }
 

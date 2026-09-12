@@ -265,7 +265,7 @@ fn probe_error_kind(e: &MatError) -> Value {
     if e.kind == ErrorKind::ChildNotFound {
         Value::String("tool_missing".to_string())
     } else {
-        serde_json::to_value(e.kind).unwrap_or(Value::Null)
+        Value::String(e.kind.as_str().to_string())
     }
 }
 

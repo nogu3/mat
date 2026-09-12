@@ -616,7 +616,6 @@ mod tests {
         use mat_native::group_settings::GroupSettingsCtx;
         use mat_native::op::ProvisionParams;
         use mat_native::test_support::FakeConn;
-        use serde_json::json;
 
         struct ScriptedEstablisher;
         #[async_trait::async_trait]
@@ -625,16 +624,7 @@ mod tests {
                 &self,
                 _node_id: u64,
             ) -> Result<Box<dyn mat_native::NodeConn>, MatError> {
-                Ok(Box::new(
-                    FakeConn::scripted()
-                        .with_read(0, 0x003F, 0x0000, json!([]))
-                        .with_read(
-                            0,
-                            0x001F,
-                            0x0000,
-                            json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                        ),
-                ))
+                Ok(Box::new(FakeConn::with_group_provision_fixture()))
             }
         }
 
