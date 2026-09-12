@@ -18,25 +18,23 @@ use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::fabric::{case_destination_id, FabricCredentials};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use crate::race::race_staggered;
+use crate::secure_channel::{
+    StatusReportTruncated, OPCODE_SIGMA1, OPCODE_SIGMA2, OPCODE_SIGMA3, STATUS_REPORT_SUCCESS,
+};
 use crate::session::{SecureSession, SessionKeys};
 use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 use crate::transport::{Transport, UdpTransport};
 
-const OPCODE_CASE_SIGMA1: u8 = 0x30;
-const OPCODE_CASE_SIGMA2: u8 = 0x31;
-const OPCODE_CASE_SIGMA3: u8 = 0x32;
-// StatusReport は message::OPCODE_STATUS_REPORT (0x40)
+pub(crate) use crate::secure_channel::SC_PROTOCOL_CODE_CLOSE_SESSION;
+/// StatusReport codec — lives in [`crate::secure_channel`]; re-exported so
+/// mat-device's CASE/PASE net drivers keep importing it from here.
+pub use crate::secure_channel::{encode_status_report, parse_status_report};
 
 const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
 const TBE3_NONCE: &[u8; 13] = b"NCASE_Sigma3N";
 const INFO_S2K: &[u8] = b"Sigma2";
 const INFO_S3K: &[u8] = b"Sigma3";
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
-const STATUS_SUCCESS: (u16, u32, u16) = (0, 0, 0); // (general, protocol id, code)
-
-/// Secure Channel StatusReport の CloseSession protocol code（general=SUCCESS 側。
-/// 同値 2 の `SC_PROTOCOL_CODE_INVALID_PARAMETER` は general=FAILURE 側で別物）。
-pub(crate) const SC_PROTOCOL_CODE_CLOSE_SESSION: u16 = 2;
 
 /// CASE ハンドシェイク各往復の応答待ち。op 予算設計の成分。
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,6 +56,11 @@ pub enum CaseError {
     },
     Sigma2NotAcked,
     Sigma2Malformed(&'static str),
+    /// A StatusReport reply that was too short to decode. `stage` is the
+    /// message it answered (`"sigma1"` or `"sigma3"`).
+    StatusReportMalformed {
+        stage: &'static str,
+    },
     Tbe2DecryptFailed,
     PeerCertInvalid(crate::cert::CertError),
     PeerIdentityMismatch {
@@ -94,6 +97,9 @@ impl std::fmt::Display for CaseError {
             }
             CaseError::Sigma2Malformed(what) => {
                 write!(f, "case sigma2: malformed message ({what})")
+            }
+            CaseError::StatusReportMalformed { stage } => {
+                write!(f, "case {stage}: malformed StatusReport (truncated)")
             }
             CaseError::Tbe2DecryptFailed => write!(
                 f,
@@ -285,35 +291,6 @@ pub(crate) fn decrypt_tbe2(s2k: &[u8; 16], encrypted2: &[u8]) -> Result<Tbe2, Ca
     parse_tbe(&pt)
 }
 
-/// Parses a StatusReport payload: 8 bytes LE `{general_code: u16,
-/// protocol_id: u32, protocol_code: u16}` (spec §4.11.3). `pub` (Task 10):
-/// `mat-device`'s net CASE driver decodes/encodes StatusReport with this
-/// pair rather than a third hand-rolled copy.
-pub fn parse_status_report(payload: &[u8]) -> Result<(u16, u32, u16), CaseError> {
-    if payload.len() < 8 {
-        return Err(CaseError::Sigma2Malformed("status report truncated"));
-    }
-    let general_code = u16::from_le_bytes(payload[0..2].try_into().expect("2 bytes"));
-    let protocol_id = u32::from_le_bytes(payload[2..6].try_into().expect("4 bytes"));
-    let protocol_code = u16::from_le_bytes(payload[6..8].try_into().expect("2 bytes"));
-    Ok((general_code, protocol_id, protocol_code))
-}
-
-/// Encodes a StatusReport payload（[`parse_status_report`] の逆）: 8 バイト
-/// LE `{general_code, protocol_id, protocol_code}`。initiator 側から handshake
-/// を明示的に中断する（例: PASE 確認不一致）ときに使う — 送らずに黙って
-/// exchange を破棄すると、responder は Pake3/Sigma3 待ちのタイムアウトまで
-/// セッション確立スロットを保持し続けてしまう（spec §4.11.3 / §4.13.1.4）。
-/// `pub`（Task 10）: mat-device の CASE responder（net driver）が
-/// success/failure の StatusReport をこの関数で組む。
-pub fn encode_status_report(general_code: u16, protocol_id: u32, protocol_code: u16) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8);
-    buf.extend_from_slice(&general_code.to_le_bytes());
-    buf.extend_from_slice(&protocol_id.to_le_bytes());
-    buf.extend_from_slice(&protocol_code.to_le_bytes());
-    buf
-}
-
 /// `pub`（Task 10）: mat-device の CASE responder core が S2K/S3K をこの関数で
 /// 導出する（HKDF salt/info の取り違えを防ぐため initiator 側と同一実装を共有）。
 pub fn derive_sigma_key(shared: &[u8], salt: &[u8], info: &[u8]) -> [u8; 16] {
@@ -466,7 +443,7 @@ pub async fn establish(
 
     let mut ex = UnsecuredExchange::new(&transport, peer);
     let resp = ex
-        .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_CASE_SIGMA1, &sigma1, cfg)
+        .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_SIGMA1, &sigma1, cfg)
         .await
         .map_err(CaseError::Exchange)?;
     let msg = match resp {
@@ -486,9 +463,12 @@ pub async fn establish(
         }
     };
     match msg.proto.opcode {
-        OPCODE_CASE_SIGMA2 => {}
+        OPCODE_SIGMA2 => {}
         OPCODE_STATUS_REPORT => {
-            let (general_code, _protocol_id, protocol_code) = parse_status_report(&msg.payload)?;
+            let (general_code, _protocol_id, protocol_code) = parse_status_report(&msg.payload)
+                .map_err(|StatusReportTruncated| CaseError::StatusReportMalformed {
+                    stage: "sigma1",
+                })?;
             return Err(CaseError::PeerStatus {
                 stage: "sigma1",
                 general_code,
@@ -570,7 +550,7 @@ pub async fn establish(
     transcript.update(&sigma3);
 
     let resp = ex
-        .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_CASE_SIGMA3, &sigma3, cfg)
+        .send_reliable(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_SIGMA3, &sigma3, cfg)
         .await
         .map_err(CaseError::Exchange)?;
     let msg = match resp {
@@ -583,8 +563,9 @@ pub async fn establish(
             opcode: msg.proto.opcode,
         });
     }
-    let (general_code, _protocol_id, protocol_code) = parse_status_report(&msg.payload)?;
-    if (general_code, _protocol_id, protocol_code) != STATUS_SUCCESS {
+    let (general_code, _protocol_id, protocol_code) = parse_status_report(&msg.payload)
+        .map_err(|StatusReportTruncated| CaseError::StatusReportMalformed { stage: "sigma3" })?;
+    if (general_code, _protocol_id, protocol_code) != STATUS_REPORT_SUCCESS {
         return Err(CaseError::EstablishmentFailed {
             general_code,
             protocol_code,
@@ -786,20 +767,15 @@ mod tests {
         ));
     }
 
+    /// A truncated StatusReport after Sigma3 must be labelled with the
+    /// sigma3 stage, not "sigma2" (audit 2026-09-12 bug candidate).
     #[test]
-    fn parses_status_report() {
-        let ok = [0u8, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(parse_status_report(&ok).unwrap(), (0, 0, 0));
-        let busy = [1u8, 0, 0, 0, 0, 0, 4, 0]; // FAILURE / SC / BUSY
-        assert_eq!(parse_status_report(&busy).unwrap(), (1, 0, 4));
-        assert!(parse_status_report(&[0u8; 4]).is_err());
-    }
-
-    #[test]
-    fn encode_status_report_round_trips_through_parse() {
-        let buf = encode_status_report(1, 0, 4); // FAILURE / SC / BUSY
-        assert_eq!(buf, [1u8, 0, 0, 0, 0, 0, 4, 0]);
-        assert_eq!(parse_status_report(&buf).unwrap(), (1, 0, 4));
+    fn status_report_malformed_names_its_stage() {
+        let e = CaseError::StatusReportMalformed { stage: "sigma3" };
+        assert_eq!(
+            e.to_string(),
+            "case sigma3: malformed StatusReport (truncated)"
+        );
     }
 
     #[test]

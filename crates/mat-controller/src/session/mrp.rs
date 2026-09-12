@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION;
 use crate::crypto::{open_message, seal_message, OpenError};
 use crate::exchange::{IncomingMessage, MrpConfig};
 use crate::message::{
     Destination, MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
     PROTOCOL_ID_SECURE_CHANNEL,
 };
+use crate::secure_channel::{encode_status_report, GENERAL_CODE_SUCCESS};
 use crate::transport::MAX_DATAGRAM;
 
 use super::{SecureSession, SessionError};
@@ -124,10 +126,10 @@ impl SecureSession {
     /// MRP に乗せない（teardown を ~4.7s の再送予算でブロックしない —
     /// pase.rs の abort StatusReport と同じ判断）。失敗は握りつぶす。
     pub async fn send_close_session(&mut self) {
-        let payload = crate::case::encode_status_report(
-            0,
+        let payload = encode_status_report(
+            GENERAL_CODE_SUCCESS,
             u32::from(PROTOCOL_ID_SECURE_CHANNEL),
-            crate::case::SC_PROTOCOL_CODE_CLOSE_SESSION,
+            SC_PROTOCOL_CODE_CLOSE_SESSION,
         );
         let sealed = self.seal(
             Self::new_exchange_id(),
@@ -395,6 +397,7 @@ impl SecureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_channel::parse_status_report;
     use crate::session::test_util::*;
     use crate::transport::Transport;
     use std::sync::Arc;
@@ -647,7 +650,7 @@ mod tests {
         assert_eq!(proto.protocol_id, PROTOCOL_ID_SECURE_CHANNEL);
         assert_eq!(proto.opcode, OPCODE_STATUS_REPORT);
         assert!(!proto.needs_ack, "CloseSession must be best-effort");
-        let (general, proto_id, code) = crate::case::parse_status_report(&payload).unwrap();
+        let (general, proto_id, code) = parse_status_report(&payload).unwrap();
         assert_eq!((general, proto_id, code), (0, 0, 2));
         // 再送しないこと（MRP に乗せない）。
         let again =

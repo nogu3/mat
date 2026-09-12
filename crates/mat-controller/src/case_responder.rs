@@ -55,9 +55,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::case::{
-    derive_session_keys, derive_sigma_key, encode_status_report, eph_pub_bytes, random_p256_secret,
-};
+use crate::case::{derive_session_keys, derive_sigma_key, eph_pub_bytes, random_p256_secret};
 use crate::cert::{verify_noc_chain, CaseAuthTags, CertError, MatterCert};
 use crate::crypto::{decrypt_payload, encrypt_payload, sign_ecdsa_p256, verify_ecdsa_p256};
 use crate::fabric::case_destination_id;
@@ -65,10 +63,10 @@ use crate::message::OPCODE_STATUS_REPORT;
 use crate::session::SessionKeys;
 use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
 
-// Wire opcodes (spec §4.14) — mirror of the ones in `case.rs`.
-pub(crate) const OPCODE_SIGMA1: u8 = 0x30;
-pub(crate) const OPCODE_SIGMA2: u8 = 0x31;
-pub(crate) const OPCODE_SIGMA3: u8 = 0x32;
+// Wire opcodes (spec §4.14) — single definition in `secure_channel`;
+// re-exported crate-wide because `test_support` reads them from here.
+use crate::secure_channel::{encode_status_report, GENERAL_CODE_SUCCESS};
+pub(crate) use crate::secure_channel::{OPCODE_SIGMA1, OPCODE_SIGMA2, OPCODE_SIGMA3};
 
 const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
 const TBE3_NONCE: &[u8; 13] = b"NCASE_Sigma3N";
@@ -390,7 +388,7 @@ impl CaseResponderCore {
         let keys = derive_session_keys(&shared, &fabric.ipk_operational, &final_hash);
 
         Ok(CaseOutput::Established {
-            reply: encode_status_report(0, 0, 0), // general=SUCCESS, protocol id=0, code=0
+            reply: encode_status_report(GENERAL_CODE_SUCCESS, 0, 0),
             opcode: OPCODE_STATUS_REPORT,
             keys,
             peer_session_id: initiator_session_id,

@@ -34,11 +34,12 @@ use crate::cert::MatterCert;
 use crate::crypto::{open_message, seal_message};
 use crate::exchange::MrpConfig;
 use crate::im;
-use crate::message::{Destination, MessageHeader, ProtocolHeader, OPCODE_STATUS_REPORT};
+use crate::message::{
+    Destination, MessageHeader, ProtocolHeader, OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL,
+};
 use crate::tlv::{Tag, Writer};
 use crate::transport::{UdpTransport, MAX_DATAGRAM};
 
-const PROTO_SECURE_CHANNEL: u16 = 0x0000;
 /// spec §4.13.2.3 — mirror of the crate-private one in `pase.rs`.
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
 
@@ -99,7 +100,7 @@ fn build_unsecured(
         acked_counter,
         opcode,
         exchange_id,
-        protocol_id: PROTO_SECURE_CHANNEL,
+        protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
         vendor_id: None,
     };
     let mut buf = header.encoded();

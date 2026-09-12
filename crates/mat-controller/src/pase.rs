@@ -14,9 +14,13 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::case::{encode_status_report, parse_status_report, random_nonzero_u16};
+use crate::case::random_nonzero_u16;
 use crate::exchange::{ExchangeError, MrpConfig, UnsecuredExchange};
 use crate::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
+use crate::secure_channel::{
+    encode_status_report, parse_status_report, GENERAL_CODE_FAILURE,
+    SC_PROTOCOL_CODE_INVALID_PARAMETER,
+};
 use crate::session::{SecureSession, SessionKeys};
 use crate::spake2p::{self, SpakeError};
 use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
@@ -41,12 +45,10 @@ pub const OPCODE_PASE_PAKE3: u8 = 0x24;
 /// || PBKDFParamResponse)`.
 const PAKE_CONTEXT_PREFIX: &[u8] = b"CHIP PAKE V1 Commissioning";
 const INFO_SESSION_KEYS: &[u8] = b"SessionKeys";
-const STATUS_SUCCESS: (u16, u16) = (0, 0); // (general_code, protocol_code)
-/// SecureChannel protocol の `GeneralStatusCode::FAILURE`（spec §4.11.3 表）。
-const GENERAL_CODE_FAILURE: u16 = 1;
-/// SecureChannel protocol 固有コード `kInvalidParameter`（spec §4.11.3.1
-/// 表・SPAKE2+ 確認不一致など、handshake データ自体が拒否される場合）。
-const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
+/// StatusReport success check (general_code, protocol_code); `protocol_id`
+/// is ignored here (unlike `case::establish`'s 3-tuple check against
+/// `secure_channel::STATUS_REPORT_SUCCESS`).
+const STATUS_SUCCESS: (u16, u16) = (0, 0);
 
 /// spec §3.9 の PBKDF 制約（CRYPTO_PBKDF_ITERATIONS_MIN/MAX）。iterations の
 /// 範囲は commissioning.rs の open-window 引数検証も同じ値を参照する。
