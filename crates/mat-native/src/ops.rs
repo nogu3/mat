@@ -324,10 +324,7 @@ pub fn epoch_key_from_hex(hex: &str) -> Result<[u8; 16], MatError> {
 /// provision の 1 ステップに失敗した際、どのステップかを detail に残す
 /// （chip-tool 経路の `run_node_step` と同粒度 — `commands/group.rs` 参照）。
 fn provision_step_err(e: MatError, step: &str) -> MatError {
-    MatError::new(
-        e.kind,
-        format!("provision step '{step}' failed: {}", e.detail),
-    )
+    e.prefixed(format!("provision step '{step}' failed"))
 }
 
 /// group-key-map 属性（list of `GroupKeyMapStruct`）の read JSON を
@@ -427,7 +424,7 @@ pub async fn write_ipk_keyset(
         false,
     )
     .await
-    .map_err(|e| MatError::new(e.kind, format!("key-set-write (ipk): {}", e.detail)))
+    .map_err(|e| e.prefixed("key-set-write (ipk)"))
 }
 
 /// 1 ノード分のデバイス側 provision: KeySetWrite → group-key-map
@@ -546,7 +543,7 @@ pub struct RemoveGroupNodeReport {
 /// 撤収の 1 ステップに失敗した際、どのステップかを detail に残す
 /// （`provision_step_err` と同粒度）。
 fn remove_step_err(e: MatError, step: &str) -> MatError {
-    MatError::new(e.kind, format!("remove step '{step}' failed: {}", e.detail))
+    e.prefixed(format!("remove step '{step}' failed"))
 }
 
 /// provision の逆順: ACL の Group エントリ除去（read-merge-write、read 失敗時は

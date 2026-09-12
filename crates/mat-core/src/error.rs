@@ -71,6 +71,27 @@ impl ErrorKind {
             | ErrorKind::Other => 1,
         }
     }
+
+    /// serde の `snake_case` 表現（stdout の `kind` 文字列）。`to_value(..)
+    /// .unwrap_or(Null)` で黙殺していた箇所の置き換え先 — テストが serde と
+    /// 全変種一致を釘打ちする。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::StoreMissing => "store_missing",
+            ErrorKind::StoreParse => "store_parse",
+            ErrorKind::NodeNotCommissioned => "node_not_commissioned",
+            ErrorKind::ChildNotFound => "child_not_found",
+            ErrorKind::ChildFailed => "child_failed",
+            ErrorKind::CommissionFailed => "commission_failed",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::Unreachable => "unreachable",
+            ErrorKind::SessionFailed => "session_failed",
+            ErrorKind::DeviceRejected => "device_rejected",
+            ErrorKind::ParseError => "parse_error",
+            ErrorKind::MatdUnavailable => "matd_unavailable",
+            ErrorKind::Other => "other",
+        }
+    }
 }
 
 /// `mat` のエラー。`kind` で分岐、`detail` は AI がリカバリ判断できる粒度の説明。
@@ -110,6 +131,13 @@ impl MatError {
 
     pub fn parse_error(detail: impl Into<String>) -> Self {
         MatError::new(ErrorKind::ParseError, detail)
+    }
+
+    /// `detail` に文脈を前置する（`"{prefix}: {detail}"`、kind は不変）。
+    /// `node 5: …` / `provision step 'acl read' failed: …` のような手組みの
+    /// 一本化先。
+    pub fn prefixed(self, prefix: impl std::fmt::Display) -> Self {
+        MatError::new(self.kind, format!("{prefix}: {}", self.detail))
     }
 
     /// 名前解決できない op（未知の cluster/attribute/command 名、または非スカラー型）。
@@ -210,5 +238,41 @@ mod tests {
             MatError::unresolved_op().to_json().to_string(),
             r#"{"error":{"detail":"unknown cluster/attribute/command name (or unsupported non-scalar type); numeric IDs are accepted","kind":"parse_error"}}"#
         );
+    }
+
+    /// `as_str` は serde の snake_case 表現と 1 変種も違わない（黙殺していた
+    /// `to_value(..).unwrap_or(Null)` の置き換え先なので、ここでズレると
+    /// stdout の `kind` が変わる）。
+    #[test]
+    fn as_str_matches_serde_snake_case_for_every_variant() {
+        const ALL: [ErrorKind; 13] = [
+            ErrorKind::StoreMissing,
+            ErrorKind::StoreParse,
+            ErrorKind::NodeNotCommissioned,
+            ErrorKind::ChildNotFound,
+            ErrorKind::ChildFailed,
+            ErrorKind::CommissionFailed,
+            ErrorKind::Timeout,
+            ErrorKind::Unreachable,
+            ErrorKind::SessionFailed,
+            ErrorKind::DeviceRejected,
+            ErrorKind::ParseError,
+            ErrorKind::MatdUnavailable,
+            ErrorKind::Other,
+        ];
+        for k in ALL {
+            let via_serde = serde_json::to_value(k).unwrap();
+            assert_eq!(via_serde.as_str().unwrap(), k.as_str(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn prefixed_keeps_kind_and_prepends_colon_separated() {
+        let e = MatError::new(ErrorKind::Timeout, "fake send failure").prefixed("node 5");
+        assert_eq!(e.kind, ErrorKind::Timeout);
+        assert_eq!(e.detail, "node 5: fake send failure");
+        let e =
+            MatError::parse_error("x").prefixed(format!("provision step '{}' failed", "acl read"));
+        assert_eq!(e.detail, "provision step 'acl read' failed: x");
     }
 }

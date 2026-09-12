@@ -27,7 +27,7 @@ pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
 pub fn generate_epoch_key() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed to fill epoch key");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::hex::encode_lower(&bytes)
 }
 
 /// epoch key を決める: 明示指定があれば検証して採用、無ければランダム生成。

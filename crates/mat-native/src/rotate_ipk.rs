@@ -85,15 +85,6 @@ pub struct RotateOutcome {
     pub nodes: Vec<NodeOutcome>,
 }
 
-/// `ErrorKind` に `as_str` が無いための代替（`mat-core::body::diag_thread_success`
-/// と同じ手法 — serde の snake_case 表現をそのまま文字列化する）。
-fn kind_str(kind: ErrorKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
 impl RotateOutcome {
     /// stdout 用 body（`timestamp` は `output::emit` が付ける）。鍵素材は載せない。
     pub fn body(&self, fabric_index: u8) -> Value {
@@ -157,7 +148,7 @@ impl RotateOutcome {
         let (_, first) = failed.first()?;
         let list = failed
             .iter()
-            .map(|(n, e)| format!("node {}: {}", n.node_id, kind_str(e.kind)))
+            .map(|(n, e)| format!("node {}: {}", n.node_id, e.kind.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
         Some(MatError::new(
@@ -498,12 +489,11 @@ async fn one_node(
 }
 
 fn step_err(node_id: u64, step: &str, e: MatError) -> MatError {
-    let detail = if step.is_empty() {
-        format!("node {node_id}: {}", e.detail)
+    if step.is_empty() {
+        e.prefixed(format!("node {node_id}"))
     } else {
-        format!("node {node_id}: {step}: {}", e.detail)
-    };
-    MatError::new(e.kind, detail)
+        e.prefixed(format!("node {node_id}: {step}"))
+    }
 }
 
 #[cfg(test)]

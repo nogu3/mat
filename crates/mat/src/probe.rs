@@ -144,7 +144,7 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
 /// compressed fabric id → 16 桁大文字 hex（`MatterInstance::compressed_fabric`
 /// / diag の self-fabric 照合が期待する形）。
 fn cfid_hex(cfid: &[u8; 8]) -> String {
-    cfid.iter().map(|b| format!("{b:02X}")).collect()
+    mat_core::hex::encode_upper(cfid)
 }
 
 #[cfg(test)]

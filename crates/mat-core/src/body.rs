@@ -318,7 +318,7 @@ pub fn diag_thread_success(
             .map(|(attr, kind)| {
                 json!({
                     "attribute": attr,
-                    "kind": serde_json::to_value(kind).unwrap_or(Value::Null),
+                    "kind": kind.as_str(),
                 })
             })
             .collect();

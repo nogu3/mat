@@ -140,7 +140,7 @@ pub async fn provision(
             Box::pin(async move { crate::ops::provision_node(c.as_mut(), &np).await })
         })
         .await
-        .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+        .map_err(|e| e.prefixed(format!("node {node_id}")))?;
     }
     tracing::info!(
         group_id = p.group_id,
@@ -171,7 +171,7 @@ pub async fn grant(
                 Box::pin(async move { crate::ops::ensure_group_acl(c.as_mut(), group_id).await })
             })
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            .map_err(|e| e.prefixed(format!("node {node_id}")))?;
         if changed {
             updated.push(node_id);
         } else {
@@ -205,7 +205,7 @@ pub async fn remove_group(
                 Box::pin(async move { crate::ops::remove_group_node(c.as_mut(), &p).await })
             })
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            .map_err(|e| e.prefixed(format!("node {node_id}")))?;
         nodes.push((
             node_id,
             rep.acl_removed,
