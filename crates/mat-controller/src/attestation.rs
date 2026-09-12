@@ -474,7 +474,7 @@ fn verify_cd_signature_warn(signer_info: &Option<CdSignerInfo>, cd_signer_ders: 
         );
         return;
     };
-    let Ok(raw_sig) = der_ecdsa_sig_to_raw64(&signer_info.signature) else {
+    let Ok(raw_sig) = crate::x509::parse_ecdsa_der_signature(&signer_info.signature) else {
         tracing::warn!("certification declaration signature encoding unparseable — continuing");
         return;
     };
@@ -569,9 +569,6 @@ fn parse_cms_signed_data(der: &[u8]) -> Result<(Vec<u8>, Option<CdSignerInfo>), 
     Ok((cd_tlv, signer_info))
 }
 
-/// CMS messageDigest 属性 OID 1.2.840.113549.1.9.4（内容バイト）。
-const OID_CMS_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
-
 /// signedAttrs（[0] の中身 = SET OF Attribute の要素列）から messageDigest
 /// 属性を探し、`SHA-256(econtent)` と一致することを確認する（CMS §5.4:
 /// signedAttrs 使用時は messageDigest が eContent を署名に結合する。これが
@@ -584,7 +581,7 @@ fn verify_message_digest_attr(attrs: &[u8], econtent: &[u8]) -> Result<(), &'sta
         let oid = ar
             .expect(0x06)
             .map_err(|_| "bad signedAttrs attribute oid")?;
-        if oid != OID_CMS_MESSAGE_DIGEST {
+        if oid != crate::asn1::oids::CMS_MESSAGE_DIGEST {
             continue;
         }
         let vals = ar.expect(0x31).map_err(|_| "bad messageDigest value set")?;
@@ -632,32 +629,6 @@ fn parse_signer_info(content: &[u8], econtent: &[u8]) -> Result<CdSignerInfo, &'
         signed_bytes,
         signature: sig_bytes.to_vec(),
     })
-}
-
-/// DER `SEQ { r INTEGER, s INTEGER }` を raw r‖s（32B 左ゼロ詰め x2 = 64B）に
-/// 正規化する（x509.rs の同名ロジックの CMS 版 — signature フィールドは
-/// BIT STRING ではなく OCTET STRING の中身がそのまま DER SEQ）。
-fn der_ecdsa_sig_to_raw64(der: &[u8]) -> Result<[u8; 64], &'static str> {
-    let mut r = DerReader::new(der);
-    let seq = r.expect(0x30).map_err(|_| "signature not a der sequence")?;
-    let mut inner = DerReader::new(seq);
-    let r_bytes = inner.expect(0x02).map_err(|_| "signature missing r")?;
-    let s_bytes = inner.expect(0x02).map_err(|_| "signature missing s")?;
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&int_to_32(r_bytes)?);
-    out[32..].copy_from_slice(&int_to_32(s_bytes)?);
-    Ok(out)
-}
-
-/// DER INTEGER の中身（符号バイト付き・可変長）を 32B 左ゼロ詰め固定長にする。
-fn int_to_32(b: &[u8]) -> Result<[u8; 32], &'static str> {
-    let b = if b.len() > 1 && b[0] == 0 { &b[1..] } else { b };
-    if b.is_empty() || b.len() > 32 {
-        return Err("integer out of range");
-    }
-    let mut out = [0u8; 32];
-    out[32 - b.len()..].copy_from_slice(b);
-    Ok(out)
 }
 
 /// CD TLV `struct { 1: format_version, 2: vendor_id UINT, 3:
@@ -708,6 +679,7 @@ fn parse_cd_vid_pid(cd_tlv: &[u8]) -> Result<(Option<u16>, Vec<u16>), &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asn1::{self, oids};
     use crate::case::random_p256_secret;
     use crate::crypto::sign_ecdsa_p256;
     use crate::tlv::{Tag, Writer};
@@ -1445,20 +1417,15 @@ mod tests {
     /// SignerInfo DER を合成する（version=3, sid=SKID 風ダミー, digestAlg,
     /// signedAttrs（呼び出し側指定）, sigAlg, signature）。
     fn make_signer_info(signed_attrs: Option<&[u8]>) -> Vec<u8> {
-        use crate::asn1;
         let mut parts: Vec<Vec<u8>> = vec![
             asn1::integer(&[3]),
             asn1::octet_string(b"sid-dummy"), // SignerIdentifier（CHOICE、中身は読まれない）
-            asn1::seq(&[&asn1::oid(&[
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ])]), // sha256
+            asn1::seq(&[&asn1::oid(oids::SHA256)]),
         ];
         if let Some(attrs) = signed_attrs {
             parts.push(asn1::context_constructed(0, attrs));
         }
-        parts.push(asn1::seq(&[&asn1::oid(&[
-            0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,
-        ])])); // ecdsa-sha256
+        parts.push(asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]));
         parts.push(asn1::octet_string(&[0u8; 8])); // signature（形だけ）
         let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         // parse_signer_info は SEQ の**中身**を受け取る（呼び出し側で expect(0x30) 済み）
@@ -1467,9 +1434,8 @@ mod tests {
 
     /// messageDigest 属性 1 つだけの signedAttrs 内容（[0] の中身）を合成する。
     fn message_digest_attr(digest: &[u8]) -> Vec<u8> {
-        use crate::asn1;
         asn1::seq(&[
-            &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04]), // 1.2.840.113549.1.9.4
+            &asn1::oid(oids::CMS_MESSAGE_DIGEST),
             &asn1::set_of(&[&asn1::octet_string(digest)]),
         ])
     }
@@ -1522,7 +1488,6 @@ mod tests {
 
     #[test]
     fn signer_info_rejects_missing_message_digest() {
-        use crate::asn1;
         // signedAttrs はあるが messageDigest 属性が無い（contentType だけ）
         let attrs = asn1::seq(&[
             &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03]),

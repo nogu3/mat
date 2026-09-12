@@ -9,20 +9,7 @@
 //! 0x81 / 0x82 のみ受理し、それ以外・範囲外・truncated はすべて `Err` を返す
 //! （panic しない — asn1.rs の方針を踏襲）。
 
-use crate::asn1;
-
-// --- OID 定数（内容バイトのみ。タグ 0x06 は asn1::oid が付与する） ---
-
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]; // 1.2.840.10045.2.1
-const OID_PRIME256V1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
-const OID_ECDSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
-const OID_SKID: &[u8] = &[0x55, 0x1D, 0x0E]; // 2.5.29.14
-const OID_AKID: &[u8] = &[0x55, 0x1D, 0x23]; // 2.5.29.35
-const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13]; // 2.5.29.19
-const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F]; // 2.5.29.15
-const OID_CN: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
-const OID_MATTER_VID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x01]; // 1.3.6.1.4.1.37244.2.1
-const OID_MATTER_PID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x02]; // 1.3.6.1.4.1.37244.2.2
+use crate::asn1::{self, oids};
 
 /// X.509 / CSR 解析エラー。不正入力は必ず `Err`（panic しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,19 +226,19 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
                 er.expect(0x01)?; // critical BOOLEAN — 使わない
             }
             let value = er.expect(0x04)?;
-            if oid_bytes == OID_SKID {
+            if oid_bytes == oids::SUBJECT_KEY_ID {
                 let mut vr = DerReader::new(value);
                 skid = Some(vr.expect(0x04)?.to_vec());
-            } else if oid_bytes == OID_AKID {
+            } else if oid_bytes == oids::AUTHORITY_KEY_ID {
                 let mut vr = DerReader::new(value);
                 let seq_content = vr.expect(0x30)?;
                 let mut sr = DerReader::new(seq_content);
                 if sr.peek_tag() == Some(0x80) {
                     akid = Some(sr.expect(0x80)?.to_vec());
                 }
-            } else if oid_bytes == OID_BASIC_CONSTRAINTS {
+            } else if oid_bytes == oids::BASIC_CONSTRAINTS {
                 is_ca = Some(parse_basic_constraints(value)?);
-            } else if oid_bytes == OID_KEY_USAGE {
+            } else if oid_bytes == oids::KEY_USAGE {
                 key_usage = Some(parse_key_usage(value)?);
             }
             // 他の拡張は読み捨てる。
@@ -368,7 +355,7 @@ pub fn parse_csr(der: &[u8]) -> Result<[u8; 65], X509Error> {
 fn check_ecdsa_sha256_alg(content: &[u8]) -> Result<(), X509Error> {
     let mut r = DerReader::new(content);
     let oid_bytes = r.expect(0x06)?;
-    if oid_bytes != OID_ECDSA_SHA256 {
+    if oid_bytes != oids::ECDSA_WITH_SHA256 {
         return Err(X509Error::UnsupportedAlg);
     }
     Ok(())
@@ -381,11 +368,11 @@ fn parse_spki(content: &[u8]) -> Result<[u8; 65], X509Error> {
     let alg_seq = r.expect(0x30)?;
     let mut a = DerReader::new(alg_seq);
     let alg_oid = a.expect(0x06)?;
-    if alg_oid != OID_EC_PUBLIC_KEY {
+    if alg_oid != oids::EC_PUBLIC_KEY {
         return Err(X509Error::UnsupportedAlg);
     }
     let curve_oid = a.expect(0x06)?;
-    if curve_oid != OID_PRIME256V1 {
+    if curve_oid != oids::PRIME256V1 {
         return Err(X509Error::UnsupportedAlg);
     }
     let bits = r.expect(0x03)?;
@@ -405,7 +392,14 @@ fn parse_ecdsa_signature(bits: &[u8]) -> Result<[u8; 64], X509Error> {
     if *unused != 0 {
         return Err(X509Error::Der("unexpected unused bits in signature"));
     }
-    let mut r = DerReader::new(seq_bytes);
+    parse_ecdsa_der_signature(seq_bytes)
+}
+
+/// DER `SEQ { r INTEGER, s INTEGER }` を raw r‖s（64B）に正規化する。X.509 では
+/// BIT STRING の中身、CMS SignerInfo では OCTET STRING の中身がこの形
+/// （attestation.rs の CD 署名検証が共有する）。
+pub(crate) fn parse_ecdsa_der_signature(der: &[u8]) -> Result<[u8; 64], X509Error> {
+    let mut r = DerReader::new(der);
     let seq_content = r.expect(0x30)?;
     let mut inner = DerReader::new(seq_content);
     let r_bytes = inner.expect(0x02)?;
@@ -417,7 +411,7 @@ fn parse_ecdsa_signature(bits: &[u8]) -> Result<[u8; 64], X509Error> {
 }
 
 /// DER INTEGER の中身（符号バイト付き・可変長）を 32B 左ゼロ詰め固定長にする。
-fn int_to_32(b: &[u8]) -> Result<[u8; 32], X509Error> {
+pub(crate) fn int_to_32(b: &[u8]) -> Result<[u8; 32], X509Error> {
     let b = if b.len() > 1 && b[0] == 0 { &b[1..] } else { b };
     if b.is_empty() || b.len() > 32 {
         return Err(X509Error::Der("integer out of range"));
@@ -450,11 +444,11 @@ fn parse_vid_pid(name_content: &[u8]) -> Result<(Option<u16>, Option<u16>), X509
             let Ok(s) = std::str::from_utf8(val_content) else {
                 continue;
             };
-            if oid_bytes == OID_MATTER_VID {
+            if oid_bytes == oids::MATTER_VID {
                 vid = u16::from_str_radix(s, 16).ok();
-            } else if oid_bytes == OID_MATTER_PID {
+            } else if oid_bytes == oids::MATTER_PID {
                 pid = u16::from_str_radix(s, 16).ok();
-            } else if oid_bytes == OID_CN {
+            } else if oid_bytes == oids::COMMON_NAME {
                 cn = Some(s.to_string());
             }
         }
@@ -590,10 +584,8 @@ pub fn generate_csr(secret: &p256::SecretKey) -> Result<Vec<u8>, X509Error> {
 /// parse_csr）はここに一切依存しない。
 #[allow(dead_code)]
 pub(crate) mod test_support {
-    use super::{
-        asn1, OID_AKID, OID_BASIC_CONSTRAINTS, OID_CN, OID_ECDSA_SHA256, OID_EC_PUBLIC_KEY,
-        OID_KEY_USAGE, OID_MATTER_PID, OID_MATTER_VID, OID_PRIME256V1, OID_SKID,
-    };
+    use super::asn1;
+    use crate::asn1::oids;
 
     /// 合成する証明書の basicConstraints 拡張の出し方。Matter spec §6.2.2
     /// は attestation チェーンの役割ごとに違う形を要求し、chip の
@@ -675,7 +667,7 @@ pub(crate) mod test_support {
 
         let version = asn1::context_constructed(0, &asn1::integer(&[2])); // v3
         let serial = asn1::integer(&[0x01]);
-        let sig_alg = asn1::seq(&[&asn1::oid(OID_ECDSA_SHA256)]);
+        let sig_alg = asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]);
         let issuer_name = build_name(issuer, issuer_vid_pid);
         let validity = asn1::seq(&[
             &asn1::utc_time("260101000000Z"),
@@ -683,7 +675,10 @@ pub(crate) mod test_support {
         ]);
         let subject_name = build_name(subject, subject_vid_pid);
         let spki = asn1::seq(&[
-            &asn1::seq(&[&asn1::oid(OID_EC_PUBLIC_KEY), &asn1::oid(OID_PRIME256V1)]),
+            &asn1::seq(&[
+                &asn1::oid(oids::EC_PUBLIC_KEY),
+                &asn1::oid(oids::PRIME256V1),
+            ]),
             &asn1::bit_string(0, &subject_pub),
         ]);
 
@@ -724,13 +719,16 @@ pub(crate) mod test_support {
         let version = asn1::integer(&[0x00]);
         let subject_name = build_name(b"csr", None);
         let spki = asn1::seq(&[
-            &asn1::seq(&[&asn1::oid(OID_EC_PUBLIC_KEY), &asn1::oid(OID_PRIME256V1)]),
+            &asn1::seq(&[
+                &asn1::oid(oids::EC_PUBLIC_KEY),
+                &asn1::oid(oids::PRIME256V1),
+            ]),
             &asn1::bit_string(0, &pub_bytes),
         ]);
         let attributes = asn1::context_constructed(0, &[]); // [0] IMPLICIT SET OF Attribute（空）
         let cri = asn1::seq(&[&version, &subject_name, &spki, &attributes]);
 
-        let sig_alg = asn1::seq(&[&asn1::oid(OID_ECDSA_SHA256)]);
+        let sig_alg = asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]);
         let priv_bytes: [u8; 32] = key.to_bytes().into();
         let raw_sig = crate::crypto::sign_ecdsa_p256(&priv_bytes, &cri).expect("sign cri");
         let sig_bits = asn1::bit_string(0, &raw_sig_to_der(&raw_sig));
@@ -743,16 +741,16 @@ pub(crate) mod test_support {
     fn build_name(cn_bytes: &[u8], vid_pid: Option<(u16, u16)>) -> Vec<u8> {
         let cn_str = std::str::from_utf8(cn_bytes).expect("test cn is utf8");
         let mut rdns: Vec<Vec<u8>> = vec![asn1::set_of(&[&asn1::seq(&[
-            &asn1::oid(OID_CN),
+            &asn1::oid(oids::COMMON_NAME),
             &asn1::utf8_string(cn_str),
         ])])];
         if let Some((vid, pid)) = vid_pid {
             rdns.push(asn1::set_of(&[&asn1::seq(&[
-                &asn1::oid(OID_MATTER_VID),
+                &asn1::oid(oids::MATTER_VID),
                 &asn1::utf8_string(&format!("{vid:04X}")),
             ])]));
             rdns.push(asn1::set_of(&[&asn1::seq(&[
-                &asn1::oid(OID_MATTER_PID),
+                &asn1::oid(oids::MATTER_PID),
                 &asn1::utf8_string(&format!("{pid:04X}")),
             ])]));
         }
@@ -773,7 +771,7 @@ pub(crate) mod test_support {
         let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
         let value = asn1::seq(&refs);
         asn1::seq(&[
-            &asn1::oid(OID_BASIC_CONSTRAINTS),
+            &asn1::oid(oids::BASIC_CONSTRAINTS),
             &asn1::boolean(true), // critical
             &asn1::octet_string(&value),
         ])
@@ -785,7 +783,7 @@ pub(crate) mod test_support {
         let (unused, bytes) = crate::cert::key_usage_bits(bits);
         let value = asn1::bit_string(unused, &bytes);
         asn1::seq(&[
-            &asn1::oid(OID_KEY_USAGE),
+            &asn1::oid(oids::KEY_USAGE),
             &asn1::boolean(true),
             &asn1::octet_string(&value),
         ])
@@ -793,13 +791,19 @@ pub(crate) mod test_support {
 
     fn skid_ext(id: &[u8]) -> Vec<u8> {
         let inner = asn1::octet_string(id);
-        asn1::seq(&[&asn1::oid(OID_SKID), &asn1::octet_string(&inner)])
+        asn1::seq(&[
+            &asn1::oid(oids::SUBJECT_KEY_ID),
+            &asn1::octet_string(&inner),
+        ])
     }
 
     fn akid_ext(id: &[u8]) -> Vec<u8> {
         let key_id = asn1::context_primitive(0, id);
         let value_seq = asn1::seq(&[&key_id]);
-        asn1::seq(&[&asn1::oid(OID_AKID), &asn1::octet_string(&value_seq)])
+        asn1::seq(&[
+            &asn1::oid(oids::AUTHORITY_KEY_ID),
+            &asn1::octet_string(&value_seq),
+        ])
     }
 
     /// raw r||s（64B）を DER `SEQ { INTEGER r, INTEGER s }` に変換する
@@ -972,7 +976,7 @@ mod tests {
                     false
                 };
                 let value = er.expect(0x04).ok()?;
-                if oid == OID_BASIC_CONSTRAINTS {
+                if oid == oids::BASIC_CONSTRAINTS {
                     assert!(critical, "basicConstraints must be critical");
                     return Some(value.to_vec());
                 }
@@ -1057,9 +1061,9 @@ mod tests {
     #[test]
     fn parse_vid_pid_prefers_oid_rdns_and_accepts_printable_string() {
         let name = [
-            rdn(OID_CN, asn1::utf8_string("Mvid:1111 Mpid:2222")),
-            rdn(OID_MATTER_VID, asn1::utf8_string("FFF1")),
-            rdn(OID_MATTER_PID, asn1::printable_string("8001")),
+            rdn(oids::COMMON_NAME, asn1::utf8_string("Mvid:1111 Mpid:2222")),
+            rdn(oids::MATTER_VID, asn1::utf8_string("FFF1")),
+            rdn(oids::MATTER_PID, asn1::printable_string("8001")),
         ]
         .concat();
         assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF1), Some(0x8001)));
@@ -1067,28 +1071,31 @@ mod tests {
 
     #[test]
     fn parse_vid_pid_falls_back_to_cn_tags() {
-        let name = rdn(OID_CN, asn1::utf8_string("ACME Mvid:FFF2 Mpid:8002"));
+        let name = rdn(
+            oids::COMMON_NAME,
+            asn1::utf8_string("ACME Mvid:FFF2 Mpid:8002"),
+        );
         assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF2), Some(0x8002)));
         // CN に片方だけ → 片方だけ。
-        let name = rdn(OID_CN, asn1::utf8_string("Mvid:FFF3"));
+        let name = rdn(oids::COMMON_NAME, asn1::utf8_string("Mvid:FFF3"));
         assert_eq!(parse_vid_pid(&name).unwrap(), (Some(0xFFF3), None));
     }
 
     #[test]
     fn parse_vid_pid_ignores_unusable_values() {
         // 非 UTF-8 の UTF8String → skip
-        let name = rdn(OID_MATTER_VID, asn1::tlv(0x0C, &[0xFF, 0xFE]));
+        let name = rdn(oids::MATTER_VID, asn1::tlv(0x0C, &[0xFF, 0xFE]));
         assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
         // 文字列以外の値タグ（OCTET STRING）→ skip
-        let name = rdn(OID_MATTER_VID, asn1::octet_string(b"FFF1"));
+        let name = rdn(oids::MATTER_VID, asn1::octet_string(b"FFF1"));
         assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
         // OID RDN の hex 不正 → None（CN フォールバックも無い）
-        let name = rdn(OID_MATTER_VID, asn1::utf8_string("XYZ1"));
+        let name = rdn(oids::MATTER_VID, asn1::utf8_string("XYZ1"));
         assert_eq!(parse_vid_pid(&name).unwrap(), (None, None));
         // 空 Name → (None, None)
         assert_eq!(parse_vid_pid(&[]).unwrap(), (None, None));
         // 壊れた構造（SET でなく SEQ が来る）→ Err
-        let bad = asn1::seq(&[&asn1::oid(OID_CN)]);
+        let bad = asn1::seq(&[&asn1::oid(oids::COMMON_NAME)]);
         assert!(parse_vid_pid(&bad).is_err());
     }
 
@@ -1164,23 +1171,29 @@ mod tests {
     fn parse_spki_accepts_p256_and_rejects_other_shapes() {
         let key = [0x04u8; 65];
         assert_eq!(
-            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_PRIME256V1, 0, &key)).unwrap(),
+            parse_spki(&spki_content(
+                oids::EC_PUBLIC_KEY,
+                oids::PRIME256V1,
+                0,
+                &key
+            ))
+            .unwrap(),
             key
         );
-        const OID_SECP384R1: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
-        const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+        const SECP384R1_OID: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+        const RSA_ENCRYPTION_OID: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
         assert_eq!(
-            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_SECP384R1, 0, &key)),
+            parse_spki(&spki_content(oids::EC_PUBLIC_KEY, SECP384R1_OID, 0, &key)),
             Err(X509Error::UnsupportedAlg)
         );
         assert_eq!(
-            parse_spki(&spki_content(OID_RSA_ENCRYPTION, OID_PRIME256V1, 0, &key)),
+            parse_spki(&spki_content(RSA_ENCRYPTION_OID, oids::PRIME256V1, 0, &key)),
             Err(X509Error::UnsupportedAlg)
         );
         assert_eq!(
             parse_spki(&spki_content(
-                OID_EC_PUBLIC_KEY,
-                OID_PRIME256V1,
+                oids::EC_PUBLIC_KEY,
+                oids::PRIME256V1,
                 0,
                 &[0x02; 33]
             )),
@@ -1188,7 +1201,12 @@ mod tests {
             "圧縮点は拒否"
         );
         assert_eq!(
-            parse_spki(&spki_content(OID_EC_PUBLIC_KEY, OID_PRIME256V1, 1, &key)),
+            parse_spki(&spki_content(
+                oids::EC_PUBLIC_KEY,
+                oids::PRIME256V1,
+                1,
+                &key
+            )),
             Err(X509Error::BadPublicKey),
             "unused bits ≠ 0"
         );
@@ -1196,10 +1214,10 @@ mod tests {
 
     #[test]
     fn check_ecdsa_sha256_alg_rejects_other_algorithms() {
-        assert!(check_ecdsa_sha256_alg(&asn1::oid(OID_ECDSA_SHA256)).is_ok());
-        const OID_SHA256_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+        assert!(check_ecdsa_sha256_alg(&asn1::oid(oids::ECDSA_WITH_SHA256)).is_ok());
+        const SHA256_WITH_RSA_OID: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
         assert_eq!(
-            check_ecdsa_sha256_alg(&asn1::oid(OID_SHA256_WITH_RSA)),
+            check_ecdsa_sha256_alg(&asn1::oid(SHA256_WITH_RSA_OID)),
             Err(X509Error::UnsupportedAlg)
         );
         assert_eq!(

@@ -31,7 +31,7 @@
 //! して置くことに機密上の問題はない（出所:
 //! `credentials/test/certification-declaration/Chip-Test-CD-Signing-Key.pem`）。
 
-use crate::asn1;
+use crate::asn1::{self, oids};
 use crate::crypto::{sign_ecdsa_p256, CryptoError};
 use crate::tlv::{Tag, Writer};
 
@@ -88,12 +88,6 @@ const CERTIFICATE_ID: &str = "CSA00000SWC00000-00";
 /// （呼び出し側の `x509::generate_dev_attestation` 経由）を渡していたが、
 /// CD の中身としては無意味だったため引数ごと削除した。
 const DEVICE_TYPE_ID_IN_CD: u32 = 22;
-
-// CMS で使う OID（tag/len を除いた中身のバイト列）。
-const OID_PKCS7_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
-const OID_PKCS7_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
-const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
 
 /// CD の中身（spec §6.3.1 の `cd-struct` TLV）を組む。
 ///
@@ -158,16 +152,16 @@ pub fn cms_sign(
 ) -> Result<Vec<u8>, CryptoError> {
     let raw_sig = sign_ecdsa_p256(signer_private_key, cd_content)?;
 
-    let digest_algorithms = asn1::set_of(&[&asn1::seq(&[&asn1::oid(OID_SHA256)])]);
+    let digest_algorithms = asn1::set_of(&[&asn1::seq(&[&asn1::oid(oids::SHA256)])]);
     let encap_content_info = asn1::seq(&[
-        &asn1::oid(OID_PKCS7_DATA),
+        &asn1::oid(oids::PKCS7_DATA),
         &asn1::context_constructed(0, &asn1::octet_string(cd_content)),
     ]);
     let signer_infos = asn1::set_of(&[&asn1::seq(&[
         &asn1::integer(&[3]),
         &asn1::context_primitive(0, signer_key_id),
-        &asn1::seq(&[&asn1::oid(OID_SHA256)]),
-        &asn1::seq(&[&asn1::oid(OID_ECDSA_WITH_SHA256)]),
+        &asn1::seq(&[&asn1::oid(oids::SHA256)]),
+        &asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]),
         &asn1::octet_string(&asn1::ecdsa_signature(&raw_sig)),
     ])]);
     let signed_data = asn1::seq(&[
@@ -178,7 +172,7 @@ pub fn cms_sign(
     ]);
 
     Ok(asn1::seq(&[
-        &asn1::oid(OID_PKCS7_SIGNED_DATA),
+        &asn1::oid(oids::PKCS7_SIGNED_DATA),
         &asn1::context_constructed(0, &signed_data),
     ]))
 }
@@ -291,7 +285,7 @@ mod tests {
         let (tag, outer) = der_split(&cms);
         assert_eq!(tag, 0x30);
         let (tag, oid) = der_split(outer);
-        assert_eq!((tag, oid), (0x06, OID_PKCS7_SIGNED_DATA));
+        assert_eq!((tag, oid), (0x06, oids::PKCS7_SIGNED_DATA));
         let (tag, explicit) = der_split(&outer[2 + oid.len()..]);
         assert_eq!(tag, 0xA0);
         let (tag, signed_data) = der_split(explicit);
@@ -312,7 +306,7 @@ mod tests {
         assert_eq!(tag, 0x30);
         rest = &rest[2 + encap.len()..];
         let (tag, oid) = der_split(encap);
-        assert_eq!((tag, oid), (0x06, OID_PKCS7_DATA));
+        assert_eq!((tag, oid), (0x06, oids::PKCS7_DATA));
         let (tag, econtent_explicit) = der_split(&encap[2 + oid.len()..]);
         assert_eq!(tag, 0xA0);
         let (tag, econtent) = der_split(econtent_explicit);
