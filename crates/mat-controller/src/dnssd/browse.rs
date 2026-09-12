@@ -4,17 +4,17 @@
 //! （実機 2026-07 の 29+ instance 観測）。operational の到達性判定は browse
 //! ではなく `resolve_operational` の targeted resolve（mod.rs の doc 参照）。
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use super::codec::{
-    encode_ptr_query_with_known, encode_query, parse_message, txt_str, txt_u32, RData, Record,
+    addresses_for_target, encode_ptr_query_with_known, encode_query, parse_message, txt_str,
+    txt_u32, RData, Record,
 };
 use super::{
-    bind_mdns_socket, is_link_local, DnssdError, MDNS_GROUP, MDNS_PORT, QUERY_RESEND_INTERVAL,
-    TYPE_AAAA, TYPE_SRV, TYPE_TXT,
+    bind_mdns_socket, mdns_dest, DnssdError, QUERY_RESEND_INTERVAL, TYPE_AAAA, TYPE_SRV, TYPE_TXT,
 };
 
 /// browse の収集ウィンドウ。resolve と違い「全員から集める」ため早期 return
@@ -193,12 +193,7 @@ impl BrowseFold {
                 };
                 let mut addresses: Vec<Ipv6Addr> = Vec::new();
                 if let Some(t) = &target {
-                    for (n, a) in &pool {
-                        if n.eq_ignore_ascii_case(t) && !addresses.contains(a) {
-                            addresses.push(*a);
-                        }
-                    }
-                    addresses.sort_by_key(is_link_local);
+                    addresses = addresses_for_target(&pool, t);
                 }
                 FoldedInstance {
                     port,
@@ -221,7 +216,7 @@ async fn browse(
     window: Duration,
 ) -> Result<Vec<FoldedInstance>, DnssdError> {
     let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = mdns_dest(scope_id);
     let mut fold = BrowseFold::new(service);
     let deadline = Instant::now() + window;
     let mut next_send = Instant::now();

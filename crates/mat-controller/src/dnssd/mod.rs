@@ -182,6 +182,12 @@ fn bind_mdns_socket(scope_id: u32) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
+/// mDNS 問い合わせ／広告の宛先 `[ff02::fb]:5353`。multicast 宛先では
+/// `sin6_scope_id` が送出 iface を選ぶので `scope_id` を載せる。
+fn mdns_dest(scope_id: u32) -> SocketAddr {
+    SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id))
+}
+
 fn is_link_local(a: &Ipv6Addr) -> bool {
     (a.segments()[0] & 0xffc0) == 0xfe80
 }
@@ -197,6 +203,18 @@ pub struct ResolvedNode {
 }
 
 impl ResolvedNode {
+    /// SRV（port）+ target 一致 AAAA（`addresses`、呼び出し側でソート済み）+
+    /// TXT から組む。`SII` / `SAI` は TXT に無ければ `None`（`mrp_config` が
+    /// spec 既定へフォールバックする）。
+    pub(super) fn from_parts(port: u16, addresses: Vec<Ipv6Addr>, txt: &[Vec<u8>]) -> Self {
+        ResolvedNode {
+            port,
+            addresses,
+            session_idle_interval_ms: codec::txt_u32(txt, "SII"),
+            session_active_interval_ms: codec::txt_u32(txt, "SAI"),
+        }
+    }
+
     /// MRP config seeded from the device's advertised session *idle*
     /// interval (the session is idle until CASE completes), clamped to the
     /// spec ceiling; without TXT it falls back to the Matter default 500 ms.

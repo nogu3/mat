@@ -2,11 +2,11 @@
 //! 応答器）。`codec` / `resolve` / `browse` / `cache` の tests から使う。
 #![cfg(test)]
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 use super::codec::push_name;
-use super::{bind_mdns_socket, MDNS_GROUP, MDNS_PORT, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
+use super::{bind_mdns_socket, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
 
 /// `_matterc._udp.local` の browse / known-answer テスト共通の service 名
 /// （`codec` の known-answer テストと `browse` の browse テストの両方が使う —
@@ -108,7 +108,7 @@ pub(super) fn spawn_multicast_announcer(
     msg: Vec<u8>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let sock = bind_mdns_socket(scope_id)?;
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = super::mdns_dest(scope_id);
     Ok(tokio::spawn(async move {
         loop {
             let _ = sock.send_to(&msg, dest).await;
