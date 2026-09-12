@@ -645,6 +645,34 @@ impl Node {
             .collect()
     }
 
+    /// The bookkeeping every mutation path shares once a handler has run:
+    /// the bare attribute ids it pushed on `ctx.changed` become concrete
+    /// paths, this cluster's DataVersion is bumped once if anything
+    /// changed, and whatever it emitted goes into the event log
+    /// (`drain_events`). Returns `(changed_paths, event_numbers)`.
+    fn commit_changes(
+        &mut self,
+        endpoint: u16,
+        cluster: u32,
+        ctx: &mut InvokeCtx,
+        system_timestamp_ms: u64,
+    ) -> (Vec<(u16, u32, u32)>, Vec<u64>) {
+        let changed: Vec<(u16, u32, u32)> = ctx
+            .changed
+            .drain(..)
+            .map(|attribute| (endpoint, cluster, attribute))
+            .collect();
+        if !changed.is_empty() {
+            let version = self
+                .versions
+                .entry((endpoint, cluster))
+                .or_insert(self.version_base);
+            *version = version.wrapping_add(1);
+        }
+        let event_numbers = self.drain_events(endpoint, cluster, ctx, system_timestamp_ms);
+        (changed, event_numbers)
+    }
+
     /// Applies an external stimulus (`core::stimulus`) to `endpoint`: the
     /// first cluster there that claims it (`ClusterHandler::stimulate`
     /// answering anything but `Unsupported`) handles it, and whatever it
@@ -689,19 +717,8 @@ impl Node {
         let Some(cluster) = target else {
             return Err(StimulusError::Unsupported);
         };
-        let changed: Vec<(u16, u32, u32)> = ctx
-            .changed
-            .drain(..)
-            .map(|attribute| (endpoint, cluster, attribute))
-            .collect();
-        if !changed.is_empty() {
-            let version = self
-                .versions
-                .entry((endpoint, cluster))
-                .or_insert(self.version_base);
-            *version = version.wrapping_add(1);
-        }
-        let event_numbers = self.drain_events(endpoint, cluster, &mut ctx, system_timestamp_ms);
+        let (changed, event_numbers) =
+            self.commit_changes(endpoint, cluster, &mut ctx, system_timestamp_ms);
         Ok(StimulusOutcome {
             changed,
             event_numbers,
@@ -1356,12 +1373,7 @@ impl Node {
         fields_tlv: &[u8],
         ctx: &mut InvokeCtx,
     ) -> Result<InvokeOnEndpointOk, u8> {
-        let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint) else {
-            return Err(im::STATUS_UNSUPPORTED_ENDPOINT);
-        };
-        let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == cluster) else {
-            return Err(im::STATUS_UNSUPPORTED_CLUSTER);
-        };
+        let handler = handler_mut(&mut self.endpoints, endpoint, cluster)?;
         // ACL (spec §9.10): the command's required privilege comes from the
         // cluster (`invoke_privilege`, Operate unless overridden). Denied is
         // an `UNSUPPORTED_ACCESS` CommandStatusIB — same shape as the
@@ -1387,22 +1399,9 @@ impl Node {
         // The handler reports bare attribute ids (it only knows its own
         // cluster); pair them with the endpoint/cluster it was dispatched
         // to, and bump this cluster's DataVersion once if anything changed.
-        let changed: Vec<(u16, u32, u32)> = ctx
-            .changed
-            .drain(..)
-            .map(|attribute| (endpoint, cluster, attribute))
-            .collect();
-        if !changed.is_empty() {
-            let version = self
-                .versions
-                .entry((endpoint, cluster))
-                .or_insert(self.version_base);
-            *version = version.wrapping_add(1);
-        }
-        // Events the command emitted go into the log right here, next to
-        // the DataVersion bump. Timestamp 0: this dispatch has no clock —
-        // see `drain_events`' doc (no cluster emits from `invoke` yet).
-        let _ = self.drain_events(endpoint, cluster, ctx, 0);
+        // Timestamp 0: this dispatch has no clock — see `drain_events`' doc
+        // (no cluster emits from `invoke` yet).
+        let (changed, _) = self.commit_changes(endpoint, cluster, ctx, 0);
         Ok((reply, changed))
     }
 
@@ -1546,19 +1545,12 @@ impl Node {
                 ));
                 continue;
             };
-            let Some((_, clusters)) = self.endpoints.iter_mut().find(|(id, _)| *id == endpoint)
-            else {
-                results.push((
-                    endpoint,
-                    cluster,
-                    attribute,
-                    im::STATUS_UNSUPPORTED_ENDPOINT,
-                ));
-                continue;
-            };
-            let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == cluster) else {
-                results.push((endpoint, cluster, attribute, im::STATUS_UNSUPPORTED_CLUSTER));
-                continue;
+            let handler = match handler_mut(&mut self.endpoints, endpoint, cluster) {
+                Ok(handler) => handler,
+                Err(status) => {
+                    results.push((endpoint, cluster, attribute, status));
+                    continue;
+                }
             };
             // ACL (spec §9.10), per write entry: denied is this entry's own
             // `AttributeStatusIB(UNSUPPORTED_ACCESS)`, exactly like the
@@ -1585,22 +1577,10 @@ impl Node {
                 Ok(()) => im::STATUS_SUCCESS,
                 Err(status) => status,
             };
-            let entry_changed: Vec<(u16, u32, u32)> = ctx
-                .changed
-                .drain(..)
-                .map(|attr| (endpoint, cluster, attr))
-                .collect();
-            if !entry_changed.is_empty() {
-                let version = self
-                    .versions
-                    .entry((endpoint, cluster))
-                    .or_insert(self.version_base);
-                *version = version.wrapping_add(1);
-            }
             // Same as the invoke path: events emitted by this write land in
             // the log next to its DataVersion bump, timestamp 0 (no clock
             // here — see `drain_events`).
-            let _ = self.drain_events(endpoint, cluster, ctx, 0);
+            let (entry_changed, _) = self.commit_changes(endpoint, cluster, ctx, 0);
             changed.extend(entry_changed);
             results.push((endpoint, cluster, attribute, status));
         }
@@ -1616,6 +1596,25 @@ impl Default for Node {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolves `(endpoint, cluster)` to its handler for a mutation
+/// (`invoke_on_endpoint` / `handle_write`), with the IM status the caller
+/// reports when either half is missing. A free function over the
+/// `endpoints` field rather than a `Node` method so the caller can keep
+/// borrowing `self.acl` / `self.versions` alongside the returned handler.
+fn handler_mut(
+    endpoints: &mut [(u16, Vec<Box<dyn ClusterHandler>>)],
+    endpoint: u16,
+    cluster: u32,
+) -> Result<&mut dyn ClusterHandler, u8> {
+    let Some((_, clusters)) = endpoints.iter_mut().find(|(id, _)| *id == endpoint) else {
+        return Err(im::STATUS_UNSUPPORTED_ENDPOINT);
+    };
+    let Some(handler) = clusters.iter_mut().find(|h| h.cluster_id() == cluster) else {
+        return Err(im::STATUS_UNSUPPORTED_CLUSTER);
+    };
+    Ok(handler.as_mut())
 }
 
 /// The ACL decision every dispatch path funnels through (spec §9.10):

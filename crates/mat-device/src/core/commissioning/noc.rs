@@ -243,15 +243,7 @@ impl Inner {
         match self.store.remove(fabric_index) {
             Ok(true) => {
                 self.removed_fabric = Some(entry);
-                if let Some(store) = &self.acl_store {
-                    store.purge_fabric(fabric_index);
-                }
-                if let Some(store) = &self.group_key_store {
-                    store.purge_fabric(fabric_index);
-                }
-                if let Some(store) = &self.group_membership_store {
-                    store.purge_fabric(fabric_index);
-                }
+                self.purge_fabric_stores(fabric_index);
                 InvokeReply::Data {
                     response_command: RESP_NOC,
                     fields_tlv: encode_noc_response(NOC_STATUS_OK, Some(fabric_index)),
@@ -290,15 +282,7 @@ impl Inner {
             Err(e) => {
                 tracing::debug!(error = %e, fabric_index, "RemoveFabric: persist failed");
                 self.removed_fabric = Some(entry);
-                if let Some(store) = &self.acl_store {
-                    store.purge_fabric(fabric_index);
-                }
-                if let Some(store) = &self.group_key_store {
-                    store.purge_fabric(fabric_index);
-                }
-                if let Some(store) = &self.group_membership_store {
-                    store.purge_fabric(fabric_index);
-                }
+                self.purge_fabric_stores(fabric_index);
                 InvokeReply::Status(im::STATUS_FAILURE)
             }
         }

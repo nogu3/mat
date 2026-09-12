@@ -318,6 +318,26 @@ struct Inner {
     group_membership_store: Option<GroupMembershipStore>,
 }
 
+impl Inner {
+    /// Drops every per-fabric row `fabric_index` owns in the three shared
+    /// stores (ACL, group keys, group membership). Called wherever a fabric
+    /// leaves the store — `RemoveFabric` (both the persisted and the
+    /// persist-failed branch) and the fail-safe rollback — so a later
+    /// `AddNOC` reusing the index never inherits the previous occupant's
+    /// rows (cross-fabric leak; see `handle_remove_fabric`'s comment).
+    pub(super) fn purge_fabric_stores(&self, fabric_index: u8) {
+        if let Some(store) = &self.acl_store {
+            store.purge_fabric(fabric_index);
+        }
+        if let Some(store) = &self.group_key_store {
+            store.purge_fabric(fabric_index);
+        }
+        if let Some(store) = &self.group_membership_store {
+            store.purge_fabric(fabric_index);
+        }
+    }
+}
+
 /// Device-side commissioning server. Construct with `new`, then either call
 /// `into_cluster_handlers` to register it on a `Node`'s endpoint 0, or (in
 /// tests) dispatch commands directly.

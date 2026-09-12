@@ -117,15 +117,7 @@ impl Inner {
         // fire-and-forget housekeeping, not itself the response to a
         // command).
         let _ = self.store.remove(fabric_index);
-        if let Some(store) = &self.acl_store {
-            store.purge_fabric(fabric_index);
-        }
-        if let Some(store) = &self.group_key_store {
-            store.purge_fabric(fabric_index);
-        }
-        if let Some(store) = &self.group_membership_store {
-            store.purge_fabric(fabric_index);
-        }
+        self.purge_fabric_stores(fabric_index);
         removed
     }
 
