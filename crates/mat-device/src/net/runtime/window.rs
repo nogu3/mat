@@ -100,8 +100,9 @@ pub(super) fn apply_window_request(request: WindowRequest) -> CommissioningWindo
 /// actually reaches PASE — `admit_unsecured` already refused it — so this
 /// arm is only reached, in practice, for the still-open boot window), or the
 /// commissioner-supplied verifier material for `EnhancedOpen`.
-/// `responder_session_id` is per-attempt (`random_session_id`) and always
-/// passed through regardless of which window is active.
+/// `responder_session_id` is per-attempt
+/// (`mat_controller::case::random_nonzero_u16`) and always passed through
+/// regardless of which window is active.
 pub(super) fn pase_config_for_window(
     window: &CommissioningWindow,
     boot_passcode: u32,

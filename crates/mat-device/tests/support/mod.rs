@@ -433,6 +433,9 @@ pub struct RunningDevice {
     pub task: tokio::task::JoinHandle<()>,
 }
 
+/// Must be called from within a running tokio runtime (`Device::new`'s own
+/// requirement, plus the `tokio::spawn`) — every caller is a
+/// `#[tokio::test]`.
 #[allow(dead_code)]
 pub fn spawn_device(config: DeviceConfig) -> RunningDevice {
     let store_dir = config.store_dir.clone();

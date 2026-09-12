@@ -11,8 +11,10 @@ const MIN_MAX_INTERVAL_S: u16 = 3;
 const MAX_MAX_INTERVAL_S: u16 = 60;
 
 /// A random non-zero `SubscriptionId` (spec §8.10.3). Not collision-checked
-/// for the same reason `random_session_id` isn't: this runtime holds at most
-/// one subscription at a time, so there is nothing to collide with.
+/// for the same reason the runtime's session ids aren't (see the comment at
+/// the first `random_nonzero_u16()` call in `establish_session`): this
+/// runtime holds at most one subscription at a time, so there is nothing to
+/// collide with.
 fn random_subscription_id() -> u32 {
     loop {
         let mut b = [0u8; 4];

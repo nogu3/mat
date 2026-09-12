@@ -59,6 +59,10 @@ fn encode_full_wildcard_read_request() -> Vec<u8> {
     w.finish()
 }
 
+/// Tests move the controller half (`ctrl`, `dev_addr`) into a spawned task
+/// and keep using the device half (`dev_transport`, `session`) afterwards —
+/// that relies on per-field closure capture (edition 2021); adding a `Drop`
+/// impl to this struct would break it.
 struct DevicePair {
     ctrl: Arc<Transport>,
     dev_transport: Arc<Transport>,
