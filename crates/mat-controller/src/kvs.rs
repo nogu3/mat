@@ -833,11 +833,10 @@ mod tests {
     use crate::tlv::{Tag, Writer};
     use base64ct::{Base64, Encoding};
 
-    fn keyset_blob(key: &[u8; 16]) -> Vec<u8> {
-        keyset_blob_with_count(key, 1)
-    }
-
-    fn keyset_blob_with_count(key: &[u8; 16], keys_count: u64) -> Vec<u8> {
+    /// chip-tool `KeySetData` 互換の 3 スロット blob。slot 0 に `key`、
+    /// `hash` は `Some` なら slot 0 の ctx5 に書き `None` なら ctx5 を丸ごと
+    /// 省く（実機で観測された「hash 無し」形）。他スロットは 0 / 0 / ゼロ鍵。
+    fn keyset_blob_ext(key: &[u8; 16], keys_count: u64, hash: Option<u16>) -> Vec<u8> {
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
         w.put_uint(Tag::Context(1), 0); // policy
@@ -846,45 +845,59 @@ mod tests {
         for i in 0..3u8 {
             w.start_struct(Tag::Anonymous);
             w.put_uint(Tag::Context(4), 0); // start_time
-            w.put_uint(Tag::Context(5), 0x1234); // hash
+            if i == 0 {
+                if let Some(h) = hash {
+                    w.put_uint(Tag::Context(5), u64::from(h));
+                }
+            } else {
+                w.put_uint(Tag::Context(5), 0);
+            }
             w.put_bytes(Tag::Context(6), if i == 0 { key } else { &[0u8; 16] });
             w.end_container();
         }
         w.end_container();
-        w.put_uint(Tag::Context(7), 0xFFFF); // next keyset id (リンクリスト、無視される)
+        w.put_uint(Tag::Context(7), 0xFFFF); // next keyset id（リンクリスト、読み側は無視する）
         w.end_container();
         w.finish()
     }
 
-    fn write_ini(entries: &[(&str, &[u8])]) -> std::path::PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let mut body = String::from("[Default]\n");
-        for (k, v) in entries {
-            body.push_str(&format!("{} = {}\n", k, Base64::encode_string(v)));
-        }
-        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "mat-kvs-test-{}-{}-{}.ini",
-            std::process::id(),
-            entries.len(),
-            seq
-        ));
-        std::fs::write(&path, body).unwrap();
-        path
+    fn keyset_blob(key: &[u8; 16]) -> Vec<u8> {
+        keyset_blob_ext(key, 1, Some(0x1234))
     }
 
-    /// Like `write_ini`, but with a caller-chosen filename tag instead of a
-    /// counter, so two related fixtures (e.g. alpha + main ini) in the same
-    /// test are easy to tell apart in a failure message.
-    fn write_named_ini(tag: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+    fn keyset_blob_with_count(key: &[u8; 16], keys_count: u64) -> Vec<u8> {
+        keyset_blob_ext(key, keys_count, Some(0x1234))
+    }
+
+    fn keyset_blob_with_hash(key: &[u8; 16], hash: u16) -> Vec<u8> {
+        keyset_blob_ext(key, 1, Some(hash))
+    }
+
+    fn keyset_blob_no_hash(key: &[u8; 16]) -> Vec<u8> {
+        keyset_blob_ext(key, 1, None)
+    }
+
+    fn write_ini(entries: &[(&str, &[u8])]) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_named_ini("kvs", entries)
+    }
+
+    /// `tag` は失敗メッセージで alpha / main を見分けるためのファイル名。
+    fn write_named_ini(
+        tag: &str,
+        entries: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.ini"));
+        std::fs::write(&path, ini_body(entries)).unwrap();
+        (dir, path)
+    }
+
+    fn ini_body(entries: &[(&str, &[u8])]) -> String {
         let mut body = String::from("[Default]\n");
         for (k, v) in entries {
             body.push_str(&format!("{} = {}\n", k, Base64::encode_string(v)));
         }
-        let path =
-            std::env::temp_dir().join(format!("mat-kvs-test-{}-{tag}.ini", std::process::id()));
-        std::fs::write(&path, body).unwrap();
-        path
+        body
     }
 
     const IPK: [u8; 16] = [0xCC; 16];
@@ -899,29 +912,29 @@ mod tests {
     }
 
     /// `read_self_issue_materials` 用の最小フィクスチャ（alpha: root 鍵 97B、
-    /// main: rcac / node01_01 NOC / 指定 keyset blob）。戻りは (alpha, main)。
-    fn self_issue_fixture(tag: &str, ks: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+    /// main: rcac / node01_01 NOC / 指定 keyset blob）。戻りは (dir, alpha, main)。
+    fn self_issue_fixture(
+        tag: &str,
+        ks: &[u8],
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let mut root_key = vec![0xAA; 65];
         root_key.extend_from_slice(&[0xBB; 32]);
         let (noc, _, _) = noc_fixture();
-        let alpha = write_named_ini(
-            &format!("{tag}-alpha"),
-            &[("ExampleOpCredsCAKey0", &root_key)],
-        );
-        let main = write_named_ini(
-            &format!("{tag}-main"),
-            &[
-                ("f/1/r", b"rcac-tlv-bytes"),
-                ("f/1/n", noc),
-                ("f/1/k/0", ks),
-            ],
-        );
-        (alpha, main)
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join(format!("{tag}-alpha.ini"));
+        let main = dir.path().join(format!("{tag}-main.ini"));
+        std::fs::write(&alpha, ini_body(&[("ExampleOpCredsCAKey0", &root_key)])).unwrap();
+        std::fs::write(
+            &main,
+            ini_body(&[("f/1/r", b"rcac-tlv-bytes"), ("f/1/n", noc), ("f/1/k/0", ks)]),
+        )
+        .unwrap();
+        (dir, alpha, main)
     }
 
     #[test]
     fn lookup_skips_lines_without_equals_sign() {
-        let (alpha, main) = self_issue_fixture("noeq", &keyset_blob(&IPK));
+        let (_d, alpha, main) = self_issue_fixture("noeq", &keyset_blob(&IPK));
         // [Default] 直後に空行と '=' の無いコメント風の行を差し込む（実 chip-tool
         // ini の癖）。セクション走査が中断してはいけない。
         let text = std::fs::read_to_string(&main).unwrap();
@@ -934,24 +947,22 @@ mod tests {
         let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
         assert_eq!(m.rcac, b"rcac-tlv-bytes");
         assert_eq!(m.ipk_operational, IPK);
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     #[test]
     fn rejects_bad_base64_naming_the_key() {
-        let path = std::env::temp_dir().join(format!("mat-kvs-badb64-{}.ini", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badb64.ini");
         std::fs::write(&path, "[Default]\nf/1/r = !!notbase64!!\n").unwrap();
         assert!(matches!(
             read_rcac_pubkey(&path, 1).unwrap_err(),
             KvsError::BadBase64(k) if k == "f/1/r"
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn rejects_keyset_with_zero_keys_count() {
-        let (alpha, main) = self_issue_fixture("zero", &keyset_blob_with_count(&IPK, 0));
+        let (_d, alpha, main) = self_issue_fixture("zero", &keyset_blob_with_count(&IPK, 0));
         let err = read_self_issue_materials(&alpha, &main, 1, 0).unwrap_err();
         assert!(matches!(
             err,
@@ -964,8 +975,6 @@ mod tests {
             err.to_string().contains("f/1/k/0"),
             "error message should name the failing key: {err}"
         );
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     #[test]
@@ -977,8 +986,8 @@ mod tests {
         let ks = keyset_blob(&[0xCC; 16]);
         let (noc, node_id, fabric_id) = noc_fixture();
 
-        let alpha = write_named_ini("alpha", &[("ExampleOpCredsCAKey0", &root_key)]);
-        let main = write_named_ini(
+        let (_da, alpha) = write_named_ini("alpha", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let (_dm, main) = write_named_ini(
             "main",
             &[
                 // root cert (TLV form) と自 NOC は fabric table に入っている
@@ -994,8 +1003,6 @@ mod tests {
         assert_eq!(m.ipk_operational, [0xCC; 16]);
         assert_eq!(m.node_id, node_id);
         assert_eq!(m.fabric_id, fabric_id);
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     #[test]
@@ -1005,8 +1012,8 @@ mod tests {
         let ks = keyset_blob(&[0xCC; 16]);
         let (noc, node_id, fabric_id) = noc_fixture();
         // fabric テーブルの index 9 に置く — subject の id は 9 ではない
-        let alpha = write_named_ini("alpha-idx", &[("ExampleOpCredsCAKey0", &root_key)]);
-        let main = write_named_ini(
+        let (_da, alpha) = write_named_ini("alpha-idx", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let (_dm, main) = write_named_ini(
             "main-idx",
             &[("f/9/r", b"r"), ("f/9/n", noc), ("f/9/k/0", &ks)],
         );
@@ -1017,8 +1024,6 @@ mod tests {
         );
         assert_eq!(m.fabric_id, fabric_id);
         assert_eq!(m.node_id, node_id);
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     #[test]
@@ -1026,12 +1031,10 @@ mod tests {
         let mut root_key = vec![0xAA; 65];
         root_key.extend_from_slice(&[0xBB; 32]);
         let ks = keyset_blob(&[0xCC; 16]);
-        let alpha = write_named_ini("alpha-non", &[("ExampleOpCredsCAKey0", &root_key)]);
-        let main = write_named_ini("main-non", &[("f/1/r", b"r"), ("f/1/k/0", &ks)]);
+        let (_da, alpha) = write_named_ini("alpha-non", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let (_dm, main) = write_named_ini("main-non", &[("f/1/r", b"r"), ("f/1/k/0", &ks)]);
         let err = read_self_issue_materials(&alpha, &main, 1, 0).unwrap_err();
         assert!(matches!(err, KvsError::KeyMissing(k) if k == "f/1/n"));
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     #[test]
@@ -1039,8 +1042,8 @@ mod tests {
         let mut root_key = vec![0xAA; 65];
         root_key.extend_from_slice(&[0xBB; 32]);
         let ks = keyset_blob(&[0xCC; 16]);
-        let alpha = write_named_ini("alpha-bad", &[("ExampleOpCredsCAKey0", &root_key)]);
-        let main = write_named_ini(
+        let (_da, alpha) = write_named_ini("alpha-bad", &[("ExampleOpCredsCAKey0", &root_key)]);
+        let (_dm, main) = write_named_ini(
             "main-bad",
             &[
                 ("f/1/r", b"r"),
@@ -1060,8 +1063,6 @@ mod tests {
             err.to_string().contains("f/1/n"),
             "エラーは実キー名を名指しすること: {err}"
         );
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
     }
 
     fn keymap_blob(group_id: u16, keyset_id: u16, next: u16) -> Vec<u8> {
@@ -1070,48 +1071,6 @@ mod tests {
         w.put_uint(Tag::Context(1), u64::from(group_id));
         w.put_uint(Tag::Context(2), u64::from(keyset_id));
         w.put_uint(Tag::Context(3), u64::from(next));
-        w.end_container();
-        w.finish()
-    }
-
-    fn keyset_blob_with_hash(key: &[u8; 16], hash: u16) -> Vec<u8> {
-        // keyset_blob_with_count と同構造だが最初のエントリの ctx5 に hash を焼く
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_uint(Tag::Context(1), 0);
-        w.put_uint(Tag::Context(2), 1);
-        w.start_array(Tag::Context(3));
-        for i in 0..3u8 {
-            w.start_struct(Tag::Anonymous);
-            w.put_uint(Tag::Context(4), u64::from(i == 0));
-            w.put_uint(Tag::Context(5), if i == 0 { u64::from(hash) } else { 0 });
-            w.put_bytes(Tag::Context(6), if i == 0 { key } else { &[0u8; 16] });
-            w.end_container();
-        }
-        w.end_container();
-        w.put_uint(Tag::Context(7), 0);
-        w.end_container();
-        w.finish()
-    }
-
-    /// keyset_blob_with_hash と同構造だが、最初のエントリの ctx5（hash）を丸ごと
-    /// 書かない — 実機で観測された「hash 無し」keyset blob（M1〜M4 で許容して
-    /// いた形）を再現する。
-    fn keyset_blob_no_hash(key: &[u8; 16]) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_uint(Tag::Context(1), 0);
-        w.put_uint(Tag::Context(2), 1);
-        w.start_array(Tag::Context(3));
-        for i in 0..3u8 {
-            w.start_struct(Tag::Anonymous);
-            w.put_uint(Tag::Context(4), u64::from(i == 0));
-            // ctx5 (hash) は意図的に省略。
-            w.put_bytes(Tag::Context(6), if i == 0 { key } else { &[0u8; 16] });
-            w.end_container();
-        }
-        w.end_container();
-        w.put_uint(Tag::Context(7), 0);
         w.end_container();
         w.finish()
     }
@@ -1127,14 +1086,12 @@ mod tests {
         let ks_no_hash = keyset_blob_no_hash(&GROUP_KEY);
 
         // IPK 読み出し（read_self_issue_materials 経由）: hash 無しでも成功。
-        let (alpha, main) = self_issue_fixture("nohash", &ks_no_hash);
+        let (_d, alpha, main) = self_issue_fixture("nohash", &ks_no_hash);
         let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
         assert_eq!(m.ipk_operational, GROUP_KEY);
-        std::fs::remove_file(alpha).ok();
-        std::fs::remove_file(main).ok();
 
         // group 読み出し（read_group_credentials 経由）: hash が無いと拒否する。
-        let path2 = write_ini(&[
+        let (_d2, path2) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 1)[..]),
             ("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..]),
             ("f/2/k/3c", &ks_no_hash[..]),
@@ -1150,7 +1107,6 @@ mod tests {
             ),
             "unexpected error: {err}"
         );
-        std::fs::remove_file(&path2).ok();
     }
 
     /// `f/<idx>/g`（FabricData、group_settings::FabricData::serialize と同形の
@@ -1177,7 +1133,7 @@ mod tests {
         // 読み側が数値走査 1..=0xff だとそのエントリが不可視になり
         // GroupNotFound になる（M8c-2 latent）。チェーン（first_map→next）を
         // 辿れば id の大きさに関係なく見つかることを固定する。
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(0x100, 1)[..]),
             ("f/2/gk/100", &keymap_blob(10, 0x3c, 0)[..]),
             ("f/2/k/3c", &keyset_blob_with_hash(&GROUP_KEY, 0x855f)[..]),
@@ -1185,7 +1141,6 @@ mod tests {
         let c = read_group_credentials(&path, 2, 10).unwrap();
         assert_eq!(c.session_id, 0x855f);
         assert_eq!(c.encryption_key, GROUP_KEY);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1194,7 +1149,7 @@ mod tests {
         // GroupNotFound（panic やハードエラーにしない）。実 store では
         // gk があれば必ず f/<idx>/g も書かれている（上流も mat 書き側も
         // FabricData を常時維持する）ため、これは corrupt 系の防衛線。
-        let path = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
+        let (_d, path) = write_ini(&[("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..])]);
         assert!(matches!(
             read_group_credentials(&path, 2, 10),
             Err(KvsError::GroupNotFound {
@@ -1202,14 +1157,13 @@ mod tests {
                 group_id: 10
             })
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn dangling_chain_link_is_group_not_found() {
         // first_map / next が実在しないレコードを指していても走査を打ち切り
         // GroupNotFound（gk/1 の next=7 が欠損 → 本命 gk/4 には届かない）。
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 2)[..]),
             ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 7)[..]),
             ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
@@ -1222,7 +1176,6 @@ mod tests {
                 group_id: 10
             })
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1230,7 +1183,7 @@ mod tests {
         // 実機と同形: chip-tool 組み込みサンプル (0x101→0x1a1) が先に居て、
         // 本命 (group 10 → keyset 0x3c) が gk/4 に居る（id は除去で sparse、
         // チェーンは gk/1 → gk/4 と繋がっている）。
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 2)[..]),
             ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 4)[..]),
             ("f/2/gk/4", &keymap_blob(10, 0x3c, 0)[..]),
@@ -1240,12 +1193,11 @@ mod tests {
         let c = read_group_credentials(&path, 2, 10).unwrap();
         assert_eq!(c.session_id, 0x855f);
         assert_eq!(c.encryption_key, GROUP_KEY);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn group_not_in_keymap_is_group_not_found() {
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 1)[..]),
             ("f/2/gk/1", &keymap_blob(0x101, 0x1a1, 0)[..]),
         ]);
@@ -1256,12 +1208,11 @@ mod tests {
                 group_id: 10
             })
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn keymap_hit_without_keyset_blob_is_key_missing() {
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 1)[..]),
             ("f/2/gk/1", &keymap_blob(10, 0x3c, 0)[..]),
         ]);
@@ -1269,7 +1220,6 @@ mod tests {
             read_group_credentials(&path, 2, 10),
             Err(KvsError::KeyMissing(k)) if k == "f/2/k/3c"
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1278,7 +1228,7 @@ mod tests {
         // （panic せず GroupNotFound に落ちる）。旧・数値走査は壊れたエントリを
         // 飛ばして後続を拾えたが、チェーン走査ではリンクが切れた時点で
         // 後続には構造的に到達できない。
-        let path = write_ini(&[
+        let (_d, path) = write_ini(&[
             ("f/2/g", &fabric_data_blob(1, 2)[..]),
             ("f/2/gk/1", &[0xFF, 0x00][..]),
             ("f/2/gk/2", &keymap_blob(10, 0x3c, 0)[..]),
@@ -1291,27 +1241,23 @@ mod tests {
                 group_id: 10
             })
         ));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn reads_group_data_counter_u32_le() {
-        let path = write_ini(&[("g/gdc", &175851168u32.to_le_bytes()[..])]);
+        let (_d, path) = write_ini(&[("g/gdc", &175851168u32.to_le_bytes()[..])]);
         assert_eq!(read_group_data_counter(&path).unwrap(), Some(175851168));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn missing_gdc_is_none_and_bad_length_is_error() {
-        let none = write_ini(&[("f/2/n", &[0u8][..])]);
+        let (_dn, none) = write_ini(&[("f/2/n", &[0u8][..])]);
         assert_eq!(read_group_data_counter(&none).unwrap(), None);
-        std::fs::remove_file(&none).ok();
-        let bad = write_ini(&[("g/gdc", &[1u8, 2, 3][..])]);
+        let (_db, bad) = write_ini(&[("g/gdc", &[1u8, 2, 3][..])]);
         assert!(matches!(
             read_group_data_counter(&bad),
             Err(KvsError::BadCounter(_))
         ));
-        std::fs::remove_file(bad).ok();
     }
 
     // ---- M8c-2: KvsTxn ----
