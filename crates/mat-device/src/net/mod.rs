@@ -13,11 +13,26 @@ pub mod subscription;
 
 use std::net::SocketAddr;
 
-use mat_controller::exchange::IncomingMessage;
+use mat_controller::exchange::{IncomingMessage, MrpConfig};
 use mat_controller::message::{
     MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, PROTOCOL_ID_SECURE_CHANNEL,
 };
 use mat_controller::transport::{Transport, MAX_DATAGRAM};
+
+/// The loopback MRP regime every in-crate driver and test uses: 50 ms
+/// intervals, no jitter, four retries with mild backoff — fast enough for
+/// a unit test, tolerant enough for a real one-shot handshake driver
+/// (`net::pase` / `net::case`). One definition so the six former copies
+/// cannot drift apart again.
+pub fn fast_cfg() -> MrpConfig {
+    MrpConfig {
+        initial_interval: std::time::Duration::from_millis(50),
+        active_interval: std::time::Duration::from_millis(50),
+        max_retries: 4,
+        backoff: 1.2,
+        jitter: 0.0,
+    }
+}
 
 /// Reads the very first unsecured datagram from any sender — there's no
 /// `ResponderExchange` yet to hand this off to (that's what `adopt` is

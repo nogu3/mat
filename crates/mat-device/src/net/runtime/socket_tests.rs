@@ -1,6 +1,175 @@
 use super::tests::test_config;
 use super::*;
 
+use mat_controller::crypto::{open_message, seal_message};
+use mat_controller::message::Destination;
+use mat_controller::session::SessionKeys;
+use mat_controller::tlv::{Tag, Writer};
+use mat_controller::transport::UdpTransport;
+
+use crate::core::datamodel::{ClusterHandler, InvokeReply};
+use crate::core::fabric_store::FabricStore;
+
+const LOCAL_SID: u16 = 0xAAAA; // device's own session id
+const PEER_SID: u16 = 0xBBBB; // controller's session id
+const CTRL_NODE: u64 = 1;
+const DEV_NODE: u64 = 2;
+const I2R: [u8; 16] = [0x11; 16];
+const R2I: [u8; 16] = [0x22; 16];
+
+/// 600-byte `bytes` attribute so two of them exceed `REPORT_CHUNK_BUDGET`;
+/// cluster ids far outside any real range.
+struct FatHandler {
+    cluster: u32,
+}
+impl ClusterHandler for FatHandler {
+    fn cluster_id(&self) -> u32 {
+        self.cluster
+    }
+    fn attributes(&self) -> Vec<u32> {
+        vec![1]
+    }
+    fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
+        if attribute != 1 {
+            return None;
+        }
+        let mut w = Writer::new();
+        w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
+        Some(w.finish())
+    }
+    fn invoke(&mut self, _command: u32, _fields_tlv: &[u8], _ctx: &mut InvokeCtx) -> InvokeReply {
+        InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
+    }
+}
+
+/// Full-wildcard ReadRequest (every field of the one AttributePathIB
+/// omitted) — `mat_controller::im` has no public encoder for this shape
+/// (its `encode_read_request*` helpers all pin at least endpoint+cluster),
+/// so built by hand the same way `datamodel.rs`'s test-only
+/// `encode_read_request_paths` does.
+fn encode_full_wildcard_read_request() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    w.start_array(Tag::Context(0)); // AttributeRequests
+    w.start_list(Tag::Anonymous); // AttributePathIB, all wildcard
+    w.end_container();
+    w.end_container(); // AttributeRequests
+    w.put_bool(Tag::Context(3), true); // IsFabricFiltered
+    w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
+    w.end_container();
+    w.finish()
+}
+
+struct DevicePair {
+    ctrl: Arc<Transport>,
+    dev_transport: Arc<Transport>,
+    dev_addr: SocketAddr,
+    /// Device-role session already pointed at the controller's address.
+    session: SecureSession,
+}
+
+/// Two loopback UDP sockets plus the device-role `SecureSession` every
+/// socket test starts from (`SessionKeys` are the fixed `I2R`/`R2I`).
+async fn device_pair() -> DevicePair {
+    let bind = || async {
+        Arc::new(Transport::Udp(Arc::new(
+            UdpTransport::bind_addr("[::1]:0".parse().unwrap())
+                .await
+                .unwrap(),
+        )))
+    };
+    let ctrl = bind().await;
+    let ctrl_addr = ctrl.local_addr().unwrap();
+    let dev_transport = bind().await;
+    let dev_addr = dev_transport.local_addr().unwrap();
+    let session = SecureSession::new_device_role(
+        Arc::clone(&dev_transport),
+        ctrl_addr,
+        LOCAL_SID,
+        PEER_SID,
+        SessionKeys {
+            i2r: I2R,
+            r2i: R2I,
+            attestation_challenge: [0; 16],
+        },
+        DEV_NODE,
+        CTRL_NODE,
+    );
+    DevicePair {
+        ctrl,
+        dev_transport,
+        dev_addr,
+        session,
+    }
+}
+
+/// Controller role: mirror image of the device's ids (see
+/// `SecureSession::new_device_role`'s doc for the key swap).
+fn controller_session(pair: &DevicePair) -> SecureSession {
+    SecureSession::new(
+        Arc::clone(&pair.ctrl),
+        pair.dev_addr,
+        PEER_SID,
+        LOCAL_SID,
+        SessionKeys {
+            i2r: I2R,
+            r2i: R2I,
+            attestation_challenge: [0; 16],
+        },
+        CTRL_NODE,
+        DEV_NODE,
+    )
+}
+
+fn root_node_with_fat_clusters(n: u32) -> Node {
+    let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
+    for i in 0..n {
+        node.add_cluster(
+            0,
+            Box::new(FatHandler {
+                cluster: 0x9999_0000 + i,
+            }),
+        );
+    }
+    node
+}
+
+fn empty_comm_server() -> CommissioningServer {
+    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+    CommissioningServer::new(dev, FabricStore::new())
+}
+
+/// One controller-sealed datagram (`session_id = LOCAL_SID`, initiator
+/// side), bumping `counter` — what the two hand-rolled `send` closures did.
+fn seal_from_controller(
+    counter: &mut u32,
+    opcode: u8,
+    protocol_id: u16,
+    exchange_id: u16,
+    needs_ack: bool,
+    acked: Option<u32>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let header = MessageHeader {
+        session_id: LOCAL_SID,
+        security_flags: 0,
+        message_counter: *counter,
+        source_node_id: None,
+        destination: Destination::None,
+    };
+    let proto = ProtocolHeader {
+        initiator: true,
+        needs_ack,
+        acked_counter: acked,
+        opcode,
+        exchange_id,
+        protocol_id,
+        vendor_id: None,
+    };
+    *counter += 1;
+    seal_message(&I2R, &header, &proto, payload, CTRL_NODE).unwrap()
+}
+
 // ── review fix: cross-exchange piggyback ack must not lose a request ──
 
 /// Runtime-level companion to `mat_controller::session`'s
@@ -14,49 +183,12 @@ use super::*;
 /// hand the same way `on_secured_datagram` calls it.
 #[tokio::test]
 async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() {
-    use mat_controller::crypto::{open_message, seal_message};
-    use mat_controller::message::Destination;
-    use mat_controller::session::SessionKeys;
-    use mat_controller::transport::UdpTransport;
-
-    use crate::core::fabric_store::FabricStore;
-
-    const LOCAL_SID: u16 = 0xAAAA; // device's own session id
-    const PEER_SID: u16 = 0xBBBB; // controller's session id
-    const CTRL_NODE: u64 = 1;
-    const DEV_NODE: u64 = 2;
-    const I2R: [u8; 16] = [0x11; 16];
-    const R2I: [u8; 16] = [0x22; 16];
     const REQ_EXCHANGE: u16 = 0x10;
     const NEW_EXCHANGE: u16 = 0x20;
 
-    let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-        .await
-        .unwrap();
-    let ctrl_addr = controller.local_addr().unwrap();
-    let dev_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let dev_addr = dev_transport.local_addr().unwrap();
-
-    let mut session = SecureSession::new_device_role(
-        Arc::clone(&dev_transport),
-        ctrl_addr,
-        LOCAL_SID,
-        PEER_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        DEV_NODE,
-        CTRL_NODE,
-    );
+    let mut pair = device_pair().await;
     let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
-    let comm_server = CommissioningServer::new(dev, FabricStore::new());
+    let comm_server = empty_comm_server();
 
     // Controller side, run concurrently with `serve_secured` below: send
     // the first ReadRequest, wait for its reply, then — instead of a
@@ -64,32 +196,25 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
     // exchange that piggybacks the first reply's ack, and finally wait
     // for its own reply too.
     let ctrl_task = tokio::spawn(async move {
+        let mut counter = 10u32;
         let req1 = im::encode_read_request(
             0,
             mat_controller::im::CLUSTER_BASIC_INFORMATION,
             mat_controller::im::ATTR_DATA_MODEL_REVISION,
         );
-        let header1 = MessageHeader {
-            session_id: LOCAL_SID,
-            security_flags: 0,
-            message_counter: 10,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let proto1 = ProtocolHeader {
-            initiator: true,
-            needs_ack: false,
-            acked_counter: None,
-            opcode: im::OPCODE_READ_REQUEST,
-            exchange_id: REQ_EXCHANGE,
-            protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
-            vendor_id: None,
-        };
-        let dg1 = seal_message(&I2R, &header1, &proto1, &req1, CTRL_NODE).unwrap();
-        controller.send_to(&dg1, dev_addr).await.unwrap();
+        let dg1 = seal_from_controller(
+            &mut counter,
+            im::OPCODE_READ_REQUEST,
+            PROTOCOL_ID_INTERACTION_MODEL,
+            REQ_EXCHANGE,
+            false,
+            None,
+            &req1,
+        );
+        pair.ctrl.send_to(&dg1, pair.dev_addr).await.unwrap();
 
         let mut buf = [0u8; MAX_DATAGRAM];
-        let (n1, from) = controller.recv_from(&mut buf).await.unwrap();
+        let (n1, from) = pair.ctrl.recv_from(&mut buf).await.unwrap();
         let (h1, p1, _) = open_message(&R2I, &buf[..n1], DEV_NODE).unwrap();
         assert_eq!(p1.exchange_id, REQ_EXCHANGE);
         assert_eq!(p1.opcode, im::OPCODE_REPORT_DATA);
@@ -100,29 +225,21 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
             mat_controller::im::CLUSTER_BASIC_INFORMATION,
             mat_controller::im::ATTR_VENDOR_ID,
         );
-        let header2 = MessageHeader {
-            session_id: LOCAL_SID,
-            security_flags: 0,
-            message_counter: 11,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let proto2 = ProtocolHeader {
-            initiator: true,
-            needs_ack: false,
-            acked_counter: Some(h1.message_counter), // piggyback: acks dg1's reply
-            opcode: im::OPCODE_READ_REQUEST,
-            exchange_id: NEW_EXCHANGE,
-            protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
-            vendor_id: None,
-        };
-        let dg2 = seal_message(&I2R, &header2, &proto2, &req2, CTRL_NODE).unwrap();
-        controller.send_to(&dg2, from).await.unwrap();
+        let dg2 = seal_from_controller(
+            &mut counter,
+            im::OPCODE_READ_REQUEST,
+            PROTOCOL_ID_INTERACTION_MODEL,
+            NEW_EXCHANGE,
+            false,
+            Some(h1.message_counter), // piggyback: acks dg1's reply
+            &req2,
+        );
+        pair.ctrl.send_to(&dg2, from).await.unwrap();
 
         // Proof the drain loop actually served dg2 (not just buffered
         // it): a real ReportData for VendorID must arrive on
         // NEW_EXCHANGE.
-        let (n2, from2) = controller.recv_from(&mut buf).await.unwrap();
+        let (n2, from2) = pair.ctrl.recv_from(&mut buf).await.unwrap();
         let (h2, p2, payload2) = open_message(&R2I, &buf[..n2], DEV_NODE).unwrap();
         assert_eq!(p2.exchange_id, NEW_EXCHANGE);
         assert_eq!(p2.opcode, im::OPCODE_REPORT_DATA);
@@ -136,24 +253,16 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
         // Ack this second reply too, so `serve_secured`'s own
         // `reply_reliable` for it completes promptly instead of
         // exhausting `MrpConfig::default()`'s retry budget.
-        let ack_header = MessageHeader {
-            session_id: LOCAL_SID,
-            security_flags: 0,
-            message_counter: 12,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let ack_proto = ProtocolHeader {
-            initiator: true,
-            needs_ack: false,
-            acked_counter: Some(h2.message_counter),
-            opcode: OPCODE_MRP_STANDALONE_ACK,
-            exchange_id: NEW_EXCHANGE,
-            protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-            vendor_id: None,
-        };
-        let ack_dg = seal_message(&I2R, &ack_header, &ack_proto, &[], CTRL_NODE).unwrap();
-        controller.send_to(&ack_dg, from2).await.unwrap();
+        let ack_dg = seal_from_controller(
+            &mut counter,
+            OPCODE_MRP_STANDALONE_ACK,
+            PROTOCOL_ID_SECURE_CHANNEL,
+            NEW_EXCHANGE,
+            false,
+            Some(h2.message_counter),
+            &[],
+        );
+        pair.ctrl.send_to(&ack_dg, from2).await.unwrap();
     });
 
     // Device side: read dg1 off the (real) socket exactly like `run`'s
@@ -162,11 +271,11 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
     // socket and resolves it via the cross-exchange piggyback ack,
     // which is what makes the drain loop kick in afterward.
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+    let (n, from) = pair.dev_transport.recv_from(&mut buf).await.unwrap();
     serve_secured(
         &buf[..n],
         from,
-        &mut session,
+        &mut pair.session,
         0,
         &mut ServeState {
             node: &mut node,
@@ -202,96 +311,9 @@ async fn serve_secured_drains_and_serves_a_cross_exchange_piggybacked_request() 
 /// (`mat_controller::session::subscribe::subscribe_wildcard`).
 #[tokio::test]
 async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
-    use mat_controller::crypto::{open_message, seal_message};
-    use mat_controller::message::Destination;
-    use mat_controller::session::SessionKeys;
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_controller::transport::UdpTransport;
-
-    use crate::core::datamodel::{ClusterHandler, InvokeReply};
-    use crate::core::fabric_store::FabricStore;
-
-    const LOCAL_SID: u16 = 0xAAAA;
-    const PEER_SID: u16 = 0xBBBB;
-    const CTRL_NODE: u64 = 1;
-    const DEV_NODE: u64 = 2;
-    const I2R: [u8; 16] = [0x11; 16];
-    const R2I: [u8; 16] = [0x22; 16];
     const REQ_EXCHANGE: u16 = 0x30;
 
-    /// Test-only cluster exposing one ~600B attribute — two of these
-    /// registered on the node force `read_chunks` to split (two
-    /// together exceed `REPORT_CHUNK_BUDGET`, though neither alone
-    /// does). Cluster id is far outside any real cluster id range.
-    struct FatHandler {
-        cluster: u32,
-    }
-    impl ClusterHandler for FatHandler {
-        fn cluster_id(&self) -> u32 {
-            self.cluster
-        }
-        fn attributes(&self) -> Vec<u32> {
-            vec![1]
-        }
-        fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
-            if attribute != 1 {
-                return None;
-            }
-            let mut w = Writer::new();
-            w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
-            Some(w.finish())
-        }
-        fn invoke(
-            &mut self,
-            _command: u32,
-            _fields_tlv: &[u8],
-            _ctx: &mut InvokeCtx,
-        ) -> InvokeReply {
-            InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
-        }
-    }
-
-    /// Full-wildcard ReadRequest (every field of the one
-    /// AttributePathIB omitted) — `mat_controller::im` has no public
-    /// encoder for this shape (its `encode_read_request*` helpers all
-    /// pin at least endpoint+cluster), so built by hand the same way
-    /// `datamodel.rs`'s test-only `encode_read_request_paths` does.
-    fn encode_full_wildcard_read_request() -> Vec<u8> {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.start_array(Tag::Context(0)); // AttributeRequests
-        w.start_list(Tag::Anonymous); // AttributePathIB, all wildcard
-        w.end_container();
-        w.end_container(); // AttributeRequests
-        w.put_bool(Tag::Context(3), true); // IsFabricFiltered
-        w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
-        w.end_container();
-        w.finish()
-    }
-
-    let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-        .await
-        .unwrap();
-    let dev_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let dev_addr = dev_transport.local_addr().unwrap();
-
-    let mut session = SecureSession::new_device_role(
-        Arc::clone(&dev_transport),
-        controller.local_addr().unwrap(),
-        LOCAL_SID,
-        PEER_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        DEV_NODE,
-        CTRL_NODE,
-    );
+    let mut pair = device_pair().await;
     let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
     node.add_cluster(
         0,
@@ -305,35 +327,26 @@ async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
             cluster: 0x9999_0002,
         }),
     );
-    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
-    let comm_server = CommissioningServer::new(dev, FabricStore::new());
+    let comm_server = empty_comm_server();
 
     let ctrl_task = tokio::spawn(async move {
+        let mut counter = 10u32;
         let req = encode_full_wildcard_read_request();
-        let header = MessageHeader {
-            session_id: LOCAL_SID,
-            security_flags: 0,
-            message_counter: 10,
-            source_node_id: None,
-            destination: Destination::None,
-        };
-        let proto = ProtocolHeader {
-            initiator: true,
-            needs_ack: false,
-            acked_counter: None,
-            opcode: im::OPCODE_READ_REQUEST,
-            exchange_id: REQ_EXCHANGE,
-            protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
-            vendor_id: None,
-        };
-        let dg = seal_message(&I2R, &header, &proto, &req, CTRL_NODE).unwrap();
-        controller.send_to(&dg, dev_addr).await.unwrap();
+        let dg = seal_from_controller(
+            &mut counter,
+            im::OPCODE_READ_REQUEST,
+            PROTOCOL_ID_INTERACTION_MODEL,
+            REQ_EXCHANGE,
+            false,
+            None,
+            &req,
+        );
+        pair.ctrl.send_to(&dg, pair.dev_addr).await.unwrap();
 
-        let mut counter = 11u32;
         let mut chunk_count = 0usize;
         let mut buf = [0u8; MAX_DATAGRAM];
         loop {
-            let (n, from) = controller.recv_from(&mut buf).await.unwrap();
+            let (n, from) = pair.ctrl.recv_from(&mut buf).await.unwrap();
             let peer = from;
             let (h, p, payload) = open_message(&R2I, &buf[..n], DEV_NODE).unwrap();
             assert_eq!(p.exchange_id, REQ_EXCHANGE);
@@ -352,49 +365,32 @@ async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
                 // is what the runtime's `session.recv` StatusResponse
                 // wait is looking for.
                 let ok = im::encode_status_response(0);
-                let resp_header = MessageHeader {
-                    session_id: LOCAL_SID,
-                    security_flags: 0,
-                    message_counter: counter,
-                    source_node_id: None,
-                    destination: Destination::None,
-                };
-                let resp_proto = ProtocolHeader {
-                    initiator: true,
-                    needs_ack: false,
-                    acked_counter: Some(h.message_counter),
-                    opcode: im::OPCODE_STATUS_RESPONSE,
-                    exchange_id: REQ_EXCHANGE,
-                    protocol_id: PROTOCOL_ID_INTERACTION_MODEL,
-                    vendor_id: None,
-                };
-                let dg = seal_message(&I2R, &resp_header, &resp_proto, &ok, CTRL_NODE).unwrap();
-                controller.send_to(&dg, peer).await.unwrap();
-                counter += 1;
+                let dg = seal_from_controller(
+                    &mut counter,
+                    im::OPCODE_STATUS_RESPONSE,
+                    PROTOCOL_ID_INTERACTION_MODEL,
+                    REQ_EXCHANGE,
+                    false,
+                    Some(h.message_counter),
+                    &ok,
+                );
+                pair.ctrl.send_to(&dg, peer).await.unwrap();
             } else {
                 assert!(rd.suppress_response);
                 // Final chunk: no StatusResponse expected from us, but
                 // still ack it (standalone) so the runtime's own
                 // `reply_reliable` for this last send completes
                 // promptly instead of exhausting its retry budget.
-                let ack_header = MessageHeader {
-                    session_id: LOCAL_SID,
-                    security_flags: 0,
-                    message_counter: counter,
-                    source_node_id: None,
-                    destination: Destination::None,
-                };
-                let ack_proto = ProtocolHeader {
-                    initiator: true,
-                    needs_ack: false,
-                    acked_counter: Some(h.message_counter),
-                    opcode: OPCODE_MRP_STANDALONE_ACK,
-                    exchange_id: REQ_EXCHANGE,
-                    protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                    vendor_id: None,
-                };
-                let ack_dg = seal_message(&I2R, &ack_header, &ack_proto, &[], CTRL_NODE).unwrap();
-                controller.send_to(&ack_dg, peer).await.unwrap();
+                let ack_dg = seal_from_controller(
+                    &mut counter,
+                    OPCODE_MRP_STANDALONE_ACK,
+                    PROTOCOL_ID_SECURE_CHANNEL,
+                    REQ_EXCHANGE,
+                    false,
+                    Some(h.message_counter),
+                    &[],
+                );
+                pair.ctrl.send_to(&ack_dg, peer).await.unwrap();
                 break;
             }
         }
@@ -402,11 +398,11 @@ async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
     });
 
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+    let (n, from) = pair.dev_transport.recv_from(&mut buf).await.unwrap();
     serve_secured(
         &buf[..n],
         from,
-        &mut session,
+        &mut pair.session,
         0,
         &mut ServeState {
             node: &mut node,
@@ -444,113 +440,14 @@ async fn read_request_chunked_flow_round_trips_two_or_more_chunks() {
 /// `subscribe_loop.rs`'s job); everything above the session is real.
 #[tokio::test]
 async fn subscription_priming_round_trips_multiple_chunks() {
-    use mat_controller::session::SessionKeys;
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_controller::transport::UdpTransport;
+    let mut pair = device_pair().await;
+    let mut ctrl = controller_session(&pair);
 
-    use crate::core::datamodel::{ClusterHandler, InvokeReply};
-    use crate::core::fabric_store::FabricStore;
-
-    const DEV_SID: u16 = 0xAAAA; // device's own session id
-    const CTRL_SID: u16 = 0xBBBB; // controller's session id
-    const CTRL_NODE: u64 = 1;
-    const DEV_NODE: u64 = 2;
-    const I2R: [u8; 16] = [0x11; 16];
-    const R2I: [u8; 16] = [0x22; 16];
-
-    /// One ~600B attribute per instance — three of them force priming
-    /// past `REPORT_CHUNK_BUDGET`. Cluster ids are far outside any real
-    /// range (same fixture idea as `datamodel`'s own chunking tests).
-    struct FatHandler {
-        cluster: u32,
-    }
-    impl ClusterHandler for FatHandler {
-        fn cluster_id(&self) -> u32 {
-            self.cluster
-        }
-        fn attributes(&self) -> Vec<u32> {
-            vec![1]
-        }
-        fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
-            if attribute != 1 {
-                return None;
-            }
-            let mut w = Writer::new();
-            w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
-            Some(w.finish())
-        }
-        fn invoke(
-            &mut self,
-            _command: u32,
-            _fields_tlv: &[u8],
-            _ctx: &mut InvokeCtx,
-        ) -> InvokeReply {
-            InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
-        }
-    }
-
-    let ctrl_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let ctrl_addr = ctrl_transport.local_addr().unwrap();
-    let dev_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let dev_addr = dev_transport.local_addr().unwrap();
-
-    let mut session = SecureSession::new_device_role(
-        Arc::clone(&dev_transport),
-        ctrl_addr,
-        DEV_SID,
-        CTRL_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        DEV_NODE,
-        CTRL_NODE,
-    );
-    // Controller role: mirror image of the device's ids (see
-    // `SecureSession::new_device_role`'s doc for the key swap).
-    let mut ctrl = SecureSession::new(
-        Arc::clone(&ctrl_transport),
-        dev_addr,
-        CTRL_SID,
-        DEV_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        CTRL_NODE,
-        DEV_NODE,
-    );
-
-    let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-    for i in 0..3u32 {
-        node.add_cluster(
-            0,
-            Box::new(FatHandler {
-                cluster: 0x9999_0000 + i,
-            }),
-        );
-    }
-    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
-    let comm_server = CommissioningServer::new(dev, FabricStore::new());
+    let mut node = root_node_with_fat_clusters(3);
+    let comm_server = empty_comm_server();
 
     let ctrl_task = tokio::spawn(async move {
-        let cfg = MrpConfig {
-            initial_interval: Duration::from_millis(50),
-            active_interval: Duration::from_millis(50),
-            max_retries: 4,
-            backoff: 1.2,
-            jitter: 0.0,
-        };
+        let cfg = crate::net::fast_cfg();
         // Full wildcard (`clusters` empty) so every fat attribute is
         // primed.
         ctrl.subscribe_wildcard(0, 30, false, &[], &cfg).await
@@ -561,11 +458,11 @@ async fn subscription_priming_round_trips_multiple_chunks() {
     // reading the controller's StatusResponses off the socket itself.
     let mut subscription: Option<ActiveSubscription> = None;
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+    let (n, from) = pair.dev_transport.recv_from(&mut buf).await.unwrap();
     serve_secured(
         &buf[..n],
         from,
-        &mut session,
+        &mut pair.session,
         0,
         &mut ServeState {
             node: &mut node,
@@ -628,88 +525,10 @@ async fn subscription_priming_round_trips_multiple_chunks() {
 /// "device went silent" timeout rather than a passing test.
 #[tokio::test]
 async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
-    use mat_controller::crypto::{open_message, seal_message};
-    use mat_controller::message::Destination;
-    use mat_controller::session::SessionKeys;
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_controller::transport::UdpTransport;
-
-    use crate::core::datamodel::{ClusterHandler, InvokeReply};
-    use crate::core::fabric_store::FabricStore;
-
-    const LOCAL_SID: u16 = 0xAAAA;
-    const PEER_SID: u16 = 0xBBBB;
-    const CTRL_NODE: u64 = 1;
-    const DEV_NODE: u64 = 2;
-    const I2R: [u8; 16] = [0x11; 16];
-    const R2I: [u8; 16] = [0x22; 16];
     const EX_READ: u16 = 0x40;
     const EX_OTHER: u16 = 0x41;
 
-    struct FatHandler {
-        cluster: u32,
-    }
-    impl ClusterHandler for FatHandler {
-        fn cluster_id(&self) -> u32 {
-            self.cluster
-        }
-        fn attributes(&self) -> Vec<u32> {
-            vec![1]
-        }
-        fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
-            if attribute != 1 {
-                return None;
-            }
-            let mut w = Writer::new();
-            w.put_bytes(Tag::Anonymous, &[0xCD; 600]);
-            Some(w.finish())
-        }
-        fn invoke(
-            &mut self,
-            _command: u32,
-            _fields_tlv: &[u8],
-            _ctx: &mut InvokeCtx,
-        ) -> InvokeReply {
-            InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
-        }
-    }
-
-    fn encode_full_wildcard_read_request() -> Vec<u8> {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.start_array(Tag::Context(0));
-        w.start_list(Tag::Anonymous);
-        w.end_container();
-        w.end_container();
-        w.put_bool(Tag::Context(3), true);
-        w.put_uint(Tag::Context(255), u64::from(im::IM_REVISION));
-        w.end_container();
-        w.finish()
-    }
-
-    let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-        .await
-        .unwrap();
-    let dev_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let dev_addr = dev_transport.local_addr().unwrap();
-
-    let mut session = SecureSession::new_device_role(
-        Arc::clone(&dev_transport),
-        controller.local_addr().unwrap(),
-        LOCAL_SID,
-        PEER_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        DEV_NODE,
-        CTRL_NODE,
-    );
+    let mut pair = device_pair().await;
     let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
     node.add_cluster(
         0,
@@ -723,38 +542,13 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
             cluster: 0x9999_0002,
         }),
     );
-    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
-    let comm_server = CommissioningServer::new(dev, FabricStore::new());
+    let comm_server = empty_comm_server();
 
     let ctrl_task = tokio::spawn(async move {
         let mut counter = 10u32;
-        let mut send = |opcode: u8,
-                        protocol_id: u16,
-                        exchange_id: u16,
-                        needs_ack: bool,
-                        acked: Option<u32>,
-                        payload: &[u8]| {
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: counter,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack,
-                acked_counter: acked,
-                opcode,
-                exchange_id,
-                protocol_id,
-                vendor_id: None,
-            };
-            counter += 1;
-            seal_message(&I2R, &header, &proto, payload, CTRL_NODE).unwrap()
-        };
 
-        let dg = send(
+        let dg = seal_from_controller(
+            &mut counter,
             im::OPCODE_READ_REQUEST,
             PROTOCOL_ID_INTERACTION_MODEL,
             EX_READ,
@@ -762,7 +556,7 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
             None,
             &encode_full_wildcard_read_request(),
         );
-        controller.send_to(&dg, dev_addr).await.unwrap();
+        pair.ctrl.send_to(&dg, pair.dev_addr).await.unwrap();
 
         let mut buf = [0u8; MAX_DATAGRAM];
         let mut chunks = 0usize;
@@ -776,7 +570,7 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
         // that ordering.
         while !(read_done && interleaved_answered) {
             let (n, from) =
-                tokio::time::timeout(Duration::from_secs(20), controller.recv_from(&mut buf))
+                tokio::time::timeout(Duration::from_secs(20), pair.ctrl.recv_from(&mut buf))
                     .await
                     .expect("device went silent")
                     .unwrap();
@@ -794,7 +588,8 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
                     "the interleaved read must be answered, not dropped"
                 );
                 interleaved_answered = true;
-                let ack = send(
+                let ack = seal_from_controller(
+                    &mut counter,
                     OPCODE_MRP_STANDALONE_ACK,
                     PROTOCOL_ID_SECURE_CHANNEL,
                     EX_OTHER,
@@ -802,7 +597,7 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
                     Some(h.message_counter),
                     &[],
                 );
-                controller.send_to(&ack, from).await.unwrap();
+                pair.ctrl.send_to(&ack, from).await.unwrap();
                 continue;
             }
 
@@ -813,7 +608,8 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
             // Always a *standalone* ack first — never a piggybacked
             // StatusResponse — so the device has to take
             // `await_peer_status_ok`'s fallback wait.
-            let ack = send(
+            let ack = seal_from_controller(
+                &mut counter,
                 OPCODE_MRP_STANDALONE_ACK,
                 PROTOCOL_ID_SECURE_CHANNEL,
                 EX_READ,
@@ -821,7 +617,7 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
                 Some(h.message_counter),
                 &[],
             );
-            controller.send_to(&ack, from).await.unwrap();
+            pair.ctrl.send_to(&ack, from).await.unwrap();
 
             if !rd.more_chunks {
                 read_done = true;
@@ -832,7 +628,8 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
             // squeezed in while the device is inside that wait.
             if !interleaved_sent {
                 interleaved_sent = true;
-                let other = send(
+                let other = seal_from_controller(
+                    &mut counter,
                     im::OPCODE_READ_REQUEST,
                     PROTOCOL_ID_INTERACTION_MODEL,
                     EX_OTHER,
@@ -844,10 +641,11 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
                         mat_controller::im::ATTR_VENDOR_ID,
                     ),
                 );
-                controller.send_to(&other, from).await.unwrap();
+                pair.ctrl.send_to(&other, from).await.unwrap();
             }
 
-            let ok = send(
+            let ok = seal_from_controller(
+                &mut counter,
                 im::OPCODE_STATUS_RESPONSE,
                 PROTOCOL_ID_INTERACTION_MODEL,
                 EX_READ,
@@ -855,17 +653,17 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
                 None,
                 &im::encode_status_response(0),
             );
-            controller.send_to(&ok, from).await.unwrap();
+            pair.ctrl.send_to(&ok, from).await.unwrap();
         }
         (chunks, interleaved_answered)
     });
 
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+    let (n, from) = pair.dev_transport.recv_from(&mut buf).await.unwrap();
     serve_secured(
         &buf[..n],
         from,
-        &mut session,
+        &mut pair.session,
         0,
         &mut ServeState {
             node: &mut node,
@@ -899,72 +697,14 @@ async fn a_request_interleaved_into_a_chunk_status_wait_is_not_lost() {
 /// （2026-08-18 実測）。
 #[tokio::test]
 async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
-    use mat_controller::crypto::{open_message, seal_message};
-    use mat_controller::message::Destination;
-    use mat_controller::session::SessionKeys;
-    use mat_controller::tlv::{Tag, Writer};
-    use mat_controller::transport::UdpTransport;
-
-    use crate::core::fabric_store::FabricStore;
-
-    const LOCAL_SID: u16 = 0xAAAA;
-    const PEER_SID: u16 = 0xBBBB;
-    const CTRL_NODE: u64 = 1;
-    const DEV_NODE: u64 = 2;
-    const I2R: [u8; 16] = [0x11; 16];
-    const R2I: [u8; 16] = [0x22; 16];
     const EX: u16 = 0x50;
 
-    let controller = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-        .await
-        .unwrap();
-    let dev_transport = Arc::new(Transport::Udp(Arc::new(
-        UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-            .await
-            .unwrap(),
-    )));
-    let dev_addr = dev_transport.local_addr().unwrap();
-
-    let mut session = SecureSession::new_device_role(
-        Arc::clone(&dev_transport),
-        controller.local_addr().unwrap(),
-        LOCAL_SID,
-        PEER_SID,
-        SessionKeys {
-            i2r: I2R,
-            r2i: R2I,
-            attestation_challenge: [0; 16],
-        },
-        DEV_NODE,
-        CTRL_NODE,
-    );
+    let mut pair = device_pair().await;
     let mut node = Node::with_root_endpoint(0xFFF1, 0x8000);
-    let dev = mat_controller::x509::generate_dev_attestation(0xFFF1, 0x8000).unwrap();
-    let comm_server = CommissioningServer::new(dev, FabricStore::new());
+    let comm_server = empty_comm_server();
 
     let ctrl_task = tokio::spawn(async move {
         let mut counter = 10u32;
-        let mut send =
-            |opcode: u8, protocol_id: u16, needs_ack: bool, acked: Option<u32>, payload: &[u8]| {
-                let header = MessageHeader {
-                    session_id: LOCAL_SID,
-                    security_flags: 0,
-                    message_counter: counter,
-                    source_node_id: None,
-                    destination: Destination::None,
-                };
-                let proto = ProtocolHeader {
-                    initiator: true,
-                    needs_ack,
-                    acked_counter: acked,
-                    opcode,
-                    exchange_id: EX,
-                    protocol_id,
-                    vendor_id: None,
-                };
-                counter += 1;
-                seal_message(&I2R, &header, &proto, payload, CTRL_NODE).unwrap()
-            };
 
         // TimedRequest: struct{0: timeout-ms, 255: revision}
         let timed_payload = {
@@ -975,20 +715,22 @@ async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
             w.end_container();
             w.finish()
         };
-        let dg = send(
+        let dg = seal_from_controller(
+            &mut counter,
             im::OPCODE_TIMED_REQUEST,
             PROTOCOL_ID_INTERACTION_MODEL,
+            EX,
             true,
             None,
             &timed_payload,
         );
-        controller.send_to(&dg, dev_addr).await.unwrap();
+        pair.ctrl.send_to(&dg, pair.dev_addr).await.unwrap();
 
         let mut buf = [0u8; MAX_DATAGRAM];
         let mut invoke_sent = false;
         loop {
             let (n, from) =
-                tokio::time::timeout(Duration::from_secs(20), controller.recv_from(&mut buf))
+                tokio::time::timeout(Duration::from_secs(20), pair.ctrl.recv_from(&mut buf))
                     .await
                     .expect("device went silent — the timed invoke was probably dropped")
                     .unwrap();
@@ -1006,14 +748,16 @@ async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
                 // 後続の timed invoke: 同一 exchange、StatusResponse への
                 // ack を piggyback（standalone ack は送らない — 実機の
                 // chip スタックの挙動に合わせる）。
-                let invoke = send(
+                let invoke = seal_from_controller(
+                    &mut counter,
                     im::OPCODE_INVOKE_REQUEST,
                     PROTOCOL_ID_INTERACTION_MODEL,
+                    EX,
                     true,
                     Some(h.message_counter),
                     &im::encode_invoke_request(0, im::CLUSTER_BASIC_INFORMATION, 0x7F, None),
                 );
-                controller.send_to(&invoke, from).await.unwrap();
+                pair.ctrl.send_to(&invoke, from).await.unwrap();
                 continue;
             }
             assert_eq!(
@@ -1023,24 +767,26 @@ async fn a_timed_invoke_on_the_same_exchange_is_served_not_dropped() {
             );
             let out = im::decode_invoke_response(&payload).unwrap();
             assert_eq!(out.status, im::STATUS_UNSUPPORTED_COMMAND);
-            let ack = send(
+            let ack = seal_from_controller(
+                &mut counter,
                 OPCODE_MRP_STANDALONE_ACK,
                 PROTOCOL_ID_SECURE_CHANNEL,
+                EX,
                 false,
                 Some(h.message_counter),
                 &[],
             );
-            controller.send_to(&ack, from).await.unwrap();
+            pair.ctrl.send_to(&ack, from).await.unwrap();
             return;
         }
     });
 
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, from) = dev_transport.recv_from(&mut buf).await.unwrap();
+    let (n, from) = pair.dev_transport.recv_from(&mut buf).await.unwrap();
     serve_secured(
         &buf[..n],
         from,
-        &mut session,
+        &mut pair.session,
         0,
         &mut ServeState {
             node: &mut node,

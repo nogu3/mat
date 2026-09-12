@@ -28,7 +28,6 @@ use mat_controller::commissioning::{
     CMD_ADD_TRUSTED_ROOT, CMD_ARM_FAIL_SAFE, CMD_ATTESTATION_REQUEST, CMD_CERT_CHAIN_REQUEST,
     CMD_COMMISSIONING_COMPLETE, CMD_CSR_REQUEST,
 };
-use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::FabricCredentials;
 use mat_controller::pase;
 use mat_controller::session::SecureSession;
@@ -58,15 +57,7 @@ pub const PRODUCT_ID: u16 = 0x8000;
 pub const DEVICE_NODE_ID: u64 = 1;
 pub const ADMIN_VENDOR_ID: u16 = 0xFFF1;
 
-pub fn fast_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 4,
-        backoff: 1.2,
-        jitter: 0.0,
-    }
-}
+pub use mat_device::net::fast_cfg;
 
 /// A `Device` bound on loopback-only (`iface = "lo"`) with an ephemeral
 /// port — no mDNS discovery needed by these tests, but `Device::run` still

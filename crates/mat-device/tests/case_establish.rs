@@ -20,32 +20,17 @@ use std::time::Duration;
 
 use mat_controller::case;
 use mat_controller::commissioning::CommissioningFabric;
-use mat_controller::exchange::MrpConfig;
 use mat_controller::im::{self, ImValue};
 use mat_controller::tlv::{Tag, Writer};
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_device::core::fabric_store::FabricEntry;
 use mat_device::net::case::run_case_once;
+use mat_device::net::fast_cfg;
 
 const ADMIN_NODE_ID: u64 = 0x1;
 const FABRIC_ID: u64 = 0xFAB10;
 const DEVICE_NODE_ID: u64 = 0x5001;
 const RESPONDER_SESSION_ID: u16 = 0xC0C1;
-
-/// `MrpConfig` with fast retry intervals and no jitter — same values as
-/// `mat_controller::test_support::fast_cfg` / `mat-device`'s
-/// `pase_establish.rs` (not reused directly: pulling in `test_support`
-/// would require enabling mat-controller's `test-responder` feature for a
-/// single trivial struct literal).
-fn fast_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 /// ReportData for onoff `OnOff` = false, `SuppressResponse` = true (so the
 /// initiator's `read_attribute` won't send a closing StatusResponse).

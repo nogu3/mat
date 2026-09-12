@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mat_controller::case::encode_status_report;
-use mat_controller::exchange::{ExchangeError, IncomingMessage, MrpConfig, ResponderExchange};
+use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
 use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use mat_controller::session::SessionKeys;
 use mat_controller::transport::{Transport, UdpTransport};
@@ -57,18 +57,6 @@ const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 /// other code depends on (contrast `mat_controller::pase::RECV_TIMEOUT`,
 /// which the real controller's op-budget accounting is built around).
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Same values as `mat_controller::test_support::fast_cfg` — 50ms
-/// intervals, no jitter.
-fn retry_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 /// Errors from driving one PASE responder handshake over the network.
 /// Malformed/foreign datagrams aren't an error variant here — `recv_first`
@@ -158,7 +146,7 @@ pub(crate) async fn drive_established(
     first: IncomingMessage,
     config: PaseVerifierConfig,
 ) -> Result<(SessionKeys, u16), NetPaseError> {
-    let cfg = retry_cfg();
+    let cfg = crate::net::fast_cfg();
     let mut core = PaseResponderCore::new(config);
 
     // One `ResponderExchange` for the whole handshake — see the module doc

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mat_controller::case::encode_status_report;
-use mat_controller::exchange::{ExchangeError, IncomingMessage, MrpConfig, ResponderExchange};
+use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
 use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use mat_controller::session::SecureSession;
 use mat_controller::transport::{Transport, UdpTransport};
@@ -40,18 +40,6 @@ const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 /// Wait budget for `ex.recv(...)` once a reply has already been
 /// standalone-acked — same rationale/value as `net::pase`'s `RECV_TIMEOUT`.
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Same values as `mat_controller::test_support::fast_cfg` / `net::pase`'s
-/// `retry_cfg` — 50ms intervals, no jitter.
-fn retry_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 /// Errors from driving one CASE responder handshake over the network.
 /// Malformed/foreign datagrams aren't an error variant here (screened out
@@ -153,7 +141,7 @@ pub(crate) async fn drive_established(
     // Kept for the post-`Established` `local_node_id` lookup below —
     // `CaseResponderCore::new` takes ownership of `fabrics` itself.
     let fabrics_snapshot = fabrics.clone();
-    let cfg = retry_cfg();
+    let cfg = crate::net::fast_cfg();
 
     let mut core = CaseResponderCore::new(fabrics, responder_session_id);
 
