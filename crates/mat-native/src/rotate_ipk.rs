@@ -192,7 +192,13 @@ pub async fn run(cfg: &NativeConfig, p: &RotateIpkParams) -> Result<RotateOutcom
     let make = move |epoch: &[u8; 16]| {
         let mut c = creds.clone();
         c.ipk_operational = fabric::derive_ipk_operational(epoch, &cfid);
-        crate::case_establisher(&cfg, c, Arc::clone(&resolver))
+        let scope_id = crate::op_scope_id(&cfg)?;
+        Ok(crate::case_establisher(
+            &cfg,
+            c,
+            Arc::clone(&resolver),
+            scope_id,
+        ))
     };
     let ctx = RotateCtx {
         main_ini,

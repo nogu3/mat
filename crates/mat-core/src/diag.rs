@@ -420,5 +420,4 @@ mod tests {
         };
         assert_eq!(derive_verdict(&c).verdict, VerdictKind::Unknown);
     }
-
 }

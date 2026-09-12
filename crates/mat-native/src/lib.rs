@@ -396,13 +396,19 @@ impl Resolver for CachingResolver {
     }
 }
 
-/// KVS から fabric 資格情報を組み立てる（`Engine::build` の前半）。`fabric
-/// rotate-ipk` も同じ経路で読む（epoch を差し替えた別 IPK の確立器を作るため）。
-/// KVS 読み取り失敗は一律 `store_missing`、NOC 自己発行の失敗は `store_parse`。
-pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, MatError> {
-    let alpha_ini = cfg.store.join("chip_tool_config.alpha.ini");
+/// chip-tool 互換 KVS の alpha INI 名。ctrl-store レーンが
+/// `mat_controller::kvs::ALPHA_INI_FILE` を足したらそちらへ差し替える。
+pub const ALPHA_INI_FILE: &str = "chip_tool_config.alpha.ini";
+
+/// KVS から自己発行資材（root CA 鍵・fabric id・node id）を読む。`Engine::build`
+/// / `commission` / `mat` の probe が同じ 1 本を通る。読めない = fabric 未
+/// bootstrap → `store_missing`（`mat fabric init` 誘導付き）。
+pub fn load_self_issue_materials(
+    cfg: &NativeConfig,
+) -> Result<mat_controller::kvs::SelfIssueMaterials, MatError> {
+    let alpha_ini = cfg.store.join(ALPHA_INI_FILE);
     let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
-    let materials = mat_controller::kvs::read_self_issue_materials(
+    mat_controller::kvs::read_self_issue_materials(
         &alpha_ini,
         &main_ini,
         cfg.fabric_index,
@@ -411,37 +417,55 @@ pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, 
     .map_err(|e| {
         MatError::new(
             ErrorKind::StoreMissing,
-            format!("native: read KVS credentials: {e}"),
+            format!("native: read KVS credentials: {e} — run `mat fabric init`"),
         )
-    })?;
+    })
+}
+
+/// 資材から NOC を自己発行して `FabricCredentials` を組む。資材はあるが
+/// NOC を組めない = 壊れた / 不整合な store → `store_parse`。
+pub fn self_issue_credentials(
+    materials: mat_controller::kvs::SelfIssueMaterials,
+) -> Result<FabricCredentials, MatError> {
     FabricCredentials::from_self_issued(materials).map_err(|e| {
         MatError::new(
             ErrorKind::StoreParse,
-            format!("native: self-issue NOC: {e}"),
+            format!("native: self-issue NOC: {e} — run `mat fabric init`"),
+        )
+    })
+}
+
+/// KVS から fabric 資格情報を組み立てる（`Engine::build` の前半）。`fabric
+/// rotate-ipk` も同じ経路で読む（epoch を差し替えた別 IPK の確立器を作るため）。
+pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, MatError> {
+    self_issue_credentials(load_self_issue_materials(cfg)?)
+}
+
+/// 運用 iface（`cfg.iface`）の scope_id（ifindex）。解決失敗は `other`。
+pub fn op_scope_id(cfg: &NativeConfig) -> Result<u32, MatError> {
+    mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("native: resolve iface {:?} index: {e}", cfg.iface),
         )
     })
 }
 
 /// 資格情報から実確立器（mDNS 解決 → CASE）を作る（`Engine::build` の後半）。
 /// `creds.ipk_operational` を差し替えて渡せば別 epoch の IPK で CASE を張る
-/// 確立器になる（rotate-ipk の受理実証）。
+/// 確立器になる（rotate-ipk の受理実証）。`scope_id` は `op_scope_id(cfg)`。
 pub fn case_establisher(
     cfg: &NativeConfig,
     creds: FabricCredentials,
     resolver: Arc<dyn Resolver>,
-) -> Result<Box<dyn Establisher>, MatError> {
-    let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
-        MatError::new(
-            ErrorKind::Other,
-            format!("native: resolve iface {:?} index: {e}", cfg.iface),
-        )
-    })?;
-    Ok(Box::new(CaseEstablisher {
+    scope_id: u32,
+) -> Box<dyn Establisher> {
+    Box::new(CaseEstablisher {
         creds: std::sync::RwLock::new(Arc::new(creds)),
         scope_id,
         resolver,
         cfg: cfg.clone(),
-    }))
+    })
 }
 
 impl Engine {
@@ -461,12 +485,7 @@ impl Engine {
     ) -> Result<Self, MatError> {
         let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
         let creds = load_fabric_credentials(cfg)?;
-        let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
-            MatError::new(
-                ErrorKind::Other,
-                format!("native: resolve iface {:?} index: {e}", cfg.iface),
-            )
-        })?;
+        let scope_id = op_scope_id(cfg)?;
         let transport = UdpTransport::bind().await.map_err(|e| {
             MatError::new(ErrorKind::Other, format!("native: bind udp transport: {e}"))
         })?;
@@ -534,7 +553,7 @@ impl Engine {
         // build が bind する共有 UdpTransport は group multicast 送信専用。
         // op / 購読の unicast セッションはノードごとに専用ソケットを bind する
         // （監査#3 / 購読 spec）。
-        let establisher = case_establisher(cfg, creds, resolver)?;
+        let establisher = case_establisher(cfg, creds, resolver, scope_id);
         Ok(Self {
             establisher,
             group: Some(group),
@@ -1317,6 +1336,51 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::StoreMissing);
         // Clone できる（rotate-ipk が確立器生成クロージャへ move する）。
         let _ = cfg.clone();
+    }
+
+    /// 3 経路（Engine::build / commission / probe）が同じ 1 本を通るので、
+    /// 文言の `mat fabric init` ヒントと kind をここで釘打ちする。
+    #[test]
+    fn load_self_issue_materials_hints_fabric_init_on_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NativeConfig {
+            store: dir.path().to_path_buf(),
+            iface: "lo".into(),
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        let err = load_self_issue_materials(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StoreMissing);
+        assert!(
+            err.detail.starts_with("native: read KVS credentials: "),
+            "{}",
+            err.detail
+        );
+        assert!(
+            err.detail.ends_with(" — run `mat fabric init`"),
+            "{}",
+            err.detail
+        );
+    }
+
+    #[test]
+    fn op_scope_id_maps_unknown_iface_to_other() {
+        let cfg = NativeConfig {
+            store: std::path::PathBuf::from("/nonexistent"),
+            iface: "no-such-iface-at-all".into(),
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        let err = op_scope_id(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(
+            err.detail
+                .starts_with("native: resolve iface \"no-such-iface-at-all\" index: "),
+            "{}",
+            err.detail
+        );
     }
 
     /// resolve が実際に multicast 送受信できる iface の index を1つ探す。
