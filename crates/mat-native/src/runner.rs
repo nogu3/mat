@@ -296,16 +296,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::Establisher for ScriptedEstablisher {
         async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-            Ok(Box::new(
-                FakeConn::scripted()
-                    .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
-                    .with_read(
-                        0,
-                        0x001F,
-                        0x0000,
-                        serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                    ),
-            ))
+            Ok(Box::new(FakeConn::with_group_provision_fixture()))
         }
     }
 
@@ -408,14 +399,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::Establisher for ScriptedFailingEstablisher {
         async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-            let mut conn = FakeConn::scripted()
-                .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
-                .with_read(
-                    0,
-                    0x001F,
-                    0x0000,
-                    serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                );
+            let mut conn = FakeConn::with_group_provision_fixture();
             conn.fail_at = Some(1);
             conn.fail_kind = ErrorKind::DeviceRejected;
             Ok(Box::new(conn))

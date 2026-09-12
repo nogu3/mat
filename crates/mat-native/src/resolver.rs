@@ -97,61 +97,18 @@ mod tests {
     }
 
     /// resolve が実際に multicast 送受信できる iface の index を1つ探す。
-    /// `crate::iface_select`（M8c-3 iface 自動検出）と同じ適格条件 — up・
-    /// MULTICAST・非 loopback・非 POINTOPOINT・IPv6 link-local 保有 — を使う
-    /// が、こちらは複数候補でも先頭を採用する（本番の autodetect は曖昧なら
+    /// `crate::iface_select`（M8c-3 iface 自動検出）と同じ適格条件を使うが、
+    /// こちらは複数候補でも先頭を採用する（本番の autodetect は曖昧なら
     /// ハードエラーだが、このテストは delegation の検証に使える iface が
-    /// 1つあれば十分）。単純に `flags`/`lo` だけで判定すると、この sandbox
-    /// のような環境で `docker0` / `loopback0`（`lo` とは別名の仮想 NIC）/
-    /// `tailscale0` を拾って `bind_mdns_socket` の send が `ENETUNREACH` で
-    /// 即死し、意図した Timeout 経路を検証できなくなる。
+    /// 1つあれば十分）。`flags`/`lo` だけで判定すると sandbox の `docker0` /
+    /// `loopback0` / `tailscale0` を拾って send が `ENETUNREACH` で即死し、
+    /// 意図した Timeout 経路を検証できなくなる。
     fn multicast_capable_iface_index() -> Option<u32> {
-        const IFF_UP: u32 = 0x1;
-        const IFF_LOOPBACK: u32 = 0x8;
-        const IFF_POINTOPOINT: u32 = 0x10;
-        const IFF_MULTICAST: u32 = 0x1000;
-        let mut ll_names = std::collections::HashSet::new();
-        for line in std::fs::read_to_string("/proc/net/if_inet6").ok()?.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 6 && cols[3] == "20" {
-                ll_names.insert(cols[5].to_string());
-            }
-        }
-        let mut entries: Vec<_> = std::fs::read_dir("/sys/class/net")
+        crate::iface_select::scan()
             .ok()?
-            .filter_map(Result::ok)
-            .collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !ll_names.contains(&name) {
-                continue;
-            }
-            let base = entry.path();
-            let flags = std::fs::read_to_string(base.join("flags"))
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            let operstate_up = std::fs::read_to_string(base.join("operstate"))
-                .map(|s| s.trim() == "up")
-                .unwrap_or(false);
-            let eligible = operstate_up
-                && flags & IFF_UP != 0
-                && flags & IFF_MULTICAST != 0
-                && flags & IFF_LOOPBACK == 0
-                && flags & IFF_POINTOPOINT == 0;
-            if !eligible {
-                continue;
-            }
-            if let Ok(idx) = std::fs::read_to_string(base.join("ifindex"))
-                .unwrap_or_default()
-                .trim()
-                .parse::<u32>()
-            {
-                return Some(idx);
-            }
-        }
-        None
+            .into_iter()
+            .find(|i| crate::iface_select::eligible(i) && i.index != 0)
+            .map(|i| i.index)
     }
 
     #[tokio::test]

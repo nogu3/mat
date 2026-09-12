@@ -22,6 +22,8 @@ pub struct IfaceInfo {
     pub flags: u32,
     pub operstate_up: bool,
     pub has_ipv6_ll: bool,
+    /// `/sys/class/net/<name>/ifindex`（読めなければ 0 — Linux の ifindex は 1 始まり）。
+    pub index: u32,
 }
 
 #[derive(Debug)]
@@ -30,7 +32,9 @@ pub enum SelectError {
     Ambiguous(Vec<String>),
 }
 
-fn eligible(i: &IfaceInfo) -> bool {
+/// autodetect の適格条件（up・MULTICAST・非 loopback・非 POINTOPOINT・
+/// IPv6 link-local）。テスト基盤も同じ条件で multicast 可能 iface を選ぶ。
+pub fn eligible(i: &IfaceInfo) -> bool {
     i.operstate_up
         && i.has_ipv6_ll
         && i.flags & IFF_UP != 0
@@ -96,7 +100,10 @@ pub fn autodetect() -> Result<String, MatError> {
     })
 }
 
-fn scan() -> std::io::Result<Vec<IfaceInfo>> {
+/// `/sys/class/net` + `/proc/net/if_inet6` を走査して iface 情報を集める。
+/// 本番 `autodetect` とテスト基盤（`test_support::multicast_capable_interfaces`、
+/// resolver テスト）の共有スキャナ。
+pub fn scan() -> std::io::Result<Vec<IfaceInfo>> {
     // IPv6 link-local を持つ iface 名の集合: /proc/net/if_inet6 の各行は
     // "<addr32hex> <ifindex> <prefixlen> <scope> <flags> <name>"。scope 0x20 = link-local。
     let mut ll_names = std::collections::HashSet::new();
@@ -121,11 +128,16 @@ fn scan() -> std::io::Result<Vec<IfaceInfo>> {
         let operstate_up = std::fs::read_to_string(base.join("operstate"))
             .map(|s| s.trim() == "up")
             .unwrap_or(false);
+        let index = std::fs::read_to_string(base.join("ifindex"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
         infos.push(IfaceInfo {
             has_ipv6_ll: ll_names.contains(&name),
             name,
             flags,
             operstate_up,
+            index,
         });
     }
     Ok(infos)
@@ -141,7 +153,18 @@ mod tests {
             flags,
             operstate_up: up,
             has_ipv6_ll: ll,
+            index: 0,
         }
+    }
+
+    /// `scan()` は実環境依存だが、少なくとも `lo` は index 付きで列挙される
+    /// （テスト基盤が multicast 可能 iface を index で選ぶための前提）。
+    #[test]
+    fn scan_lists_loopback_with_index() {
+        let infos = scan().expect("linux sysfs");
+        let lo = infos.iter().find(|i| i.name == "lo").expect("lo exists");
+        assert!(lo.index >= 1, "ifindex is 1-based");
+        assert!(!eligible(lo), "loopback is never eligible");
     }
 
     // flags: IFF_UP=0x1, IFF_LOOPBACK=0x8, IFF_POINTOPOINT=0x10, IFF_MULTICAST=0x1000

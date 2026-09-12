@@ -941,15 +941,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_node_runs_steps_in_order() {
-        let mut conn = FakeConn::scripted()
-            .with_read(0, 0x003F, 0x0000, serde_json::json!([])) // group-key-map read
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([ // acl read（管理者のみ）
-                    {"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-            );
+        // group-key-map = 空リスト / acl = 管理者のみ
+        let mut conn = FakeConn::with_group_provision_fixture();
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,
@@ -993,19 +986,12 @@ mod tests {
     async fn provision_node_replaces_existing_mapping_for_same_group() {
         // 既存 map に groupId=10→keyset 50 がある状態で keyset 60 を provision:
         // 書かれた map は 10→60 の1件（置換、重複しない）。
-        let mut conn = FakeConn::scripted()
-            .with_read(
-                0,
-                0x003F,
-                0x0000,
-                serde_json::json!([{"1": 10, "2": 50}]), // 既存 10→50
-            )
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
-            );
+        let mut conn = FakeConn::with_group_provision_fixture().with_read(
+            0,
+            0x003F,
+            0x0000,
+            serde_json::json!([{"1": 10, "2": 50}]), // 既存 10→50（fixture の空リストを上書き）
+        );
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,
@@ -1033,19 +1019,12 @@ mod tests {
     async fn provision_node_preserves_other_groups_mappings() {
         // 既存 map に groupId=11→keyset 61 がある状態で groupId=10/keyset 60 を provision:
         // 書かれた map は {11→61, 10→60} の2件（他グループ温存）。
-        let mut conn = FakeConn::scripted()
-            .with_read(
-                0,
-                0x003F,
-                0x0000,
-                serde_json::json!([{"1": 11, "2": 61}]), // 既存 11→61
-            )
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
-            );
+        let mut conn = FakeConn::with_group_provision_fixture().with_read(
+            0,
+            0x003F,
+            0x0000,
+            serde_json::json!([{"1": 11, "2": 61}]), // 既存 11→61（fixture の空リストを上書き）
+        );
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,
