@@ -140,7 +140,7 @@ pub struct Packet {
     pub beginning: bool,
     pub ending: bool,
     pub ack: Option<u8>,
-    pub seq: Option<u8>,
+    pub seq: u8,
     pub msg_len: Option<u16>,
     pub payload: Vec<u8>,
 }
@@ -177,7 +177,7 @@ impl Packet {
             beginning,
             ending: flags & FLAG_E != 0,
             ack,
-            seq: Some(seq),
+            seq,
             msg_len,
             payload: buf[i..].to_vec(),
         })
@@ -324,21 +324,20 @@ fn process_incoming(pkt: &Packet, st: &mut SessionState) -> Result<Option<Vec<u8
         st.unacked -= newly;
         st.peer_acked = a;
     }
-    if let Some(s) = pkt.seq {
-        // indication は順序保証されるため連番以外は破損 — spec 準拠で close。
-        if s != st.last_rx_seq.wrapping_add(1) {
-            return Err(BtpError::Protocol("out-of-order seq"));
-        }
-        st.last_rx_seq = s;
-        st.pending_ack = true;
-        // payload が空 = standalone ack/keepalive（Reassembler::push と同じ
-        // 判定基準）。実データを運ぶ segment だけを積算対象にする — でない
-        // と「ack への ack」が無限に連鎖してしまう（純粋な ack 交換は
-        // 完了/keepalive 任せのままでよい。brief の対象は複数segmentに
-        // またがる実メッセージの詰まり）。
-        if !pkt.payload.is_empty() {
-            st.segs_since_ack = st.segs_since_ack.saturating_add(1);
-        }
+    let s = pkt.seq;
+    // indication は順序保証されるため連番以外は破損 — spec 準拠で close。
+    if s != st.last_rx_seq.wrapping_add(1) {
+        return Err(BtpError::Protocol("out-of-order seq"));
+    }
+    st.last_rx_seq = s;
+    st.pending_ack = true;
+    // payload が空 = standalone ack/keepalive（Reassembler::push と同じ
+    // 判定基準）。実データを運ぶ segment だけを積算対象にする — でない
+    // と「ack への ack」が無限に連鎖してしまう（純粋な ack 交換は
+    // 完了/keepalive 任せのままでよい。brief の対象は複数segmentに
+    // またがる実メッセージの詰まり）。
+    if !pkt.payload.is_empty() {
+        st.segs_since_ack = st.segs_since_ack.saturating_add(1);
     }
     st.reasm.push(pkt)
 }
@@ -379,7 +378,7 @@ async fn run_session(
                     break;
                 };
                 tracing::debug!(
-                    bytes = frame.len(), seq = ?pkt.seq, ack = ?pkt.ack,
+                    bytes = frame.len(), seq = pkt.seq, ack = ?pkt.ack,
                     beg = pkt.beginning, end = pkt.ending, payload = pkt.payload.len(),
                     "btp rx frame"
                 );
@@ -590,7 +589,7 @@ mod tests {
         assert_eq!(&bytes[4..], b"hello");
         let pkt = Packet::decode(&bytes).unwrap();
         assert!(pkt.beginning && pkt.ending);
-        assert_eq!(pkt.seq, Some(0));
+        assert_eq!(pkt.seq, 0);
         assert_eq!(pkt.msg_len, Some(5));
         assert_eq!(pkt.payload, b"hello");
     }
@@ -752,7 +751,7 @@ mod tests {
             beginning: false,
             ending: false,
             ack: Some(1),
-            seq: Some(1),
+            seq: 1,
             msg_len: None,
             payload: vec![],
         };
@@ -775,7 +774,7 @@ mod tests {
             beginning: false,
             ending: false,
             ack: Some(0),
-            seq: Some(1),
+            seq: 1,
             msg_len: None,
             payload: vec![],
         };
@@ -794,7 +793,7 @@ mod tests {
             beginning: false,
             ending: false,
             ack: None,
-            seq: Some(s),
+            seq: s,
             msg_len: None,
             payload: vec![],
         };
@@ -882,7 +881,7 @@ mod tests {
             loop {
                 let frame = self.from_client.recv().await.expect("frame");
                 let pkt = Packet::decode(&frame).unwrap();
-                let seq = pkt.seq.unwrap();
+                let seq = pkt.seq;
                 if let Some(msg) = self.reasm.push(&pkt).unwrap() {
                     return (msg, seq);
                 }
@@ -983,7 +982,7 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_millis(300), p.from_client.recv())
                     .await;
             assert!(blocked.is_err(), "third frame must wait for ack");
-            let s2 = Packet::decode(&f2).unwrap().seq.unwrap();
+            let s2 = Packet::decode(&f2).unwrap().seq;
             p.send_ack(s2).await;
             let f3 = p.from_client.recv().await.unwrap();
             for f in [f1, f2, f3] {
@@ -1050,7 +1049,7 @@ mod tests {
             p.do_handshake(30, 2).await;
             let f1 = p.from_client.recv().await.unwrap();
             let f2 = p.from_client.recv().await.unwrap();
-            let s2 = Packet::decode(&f2).unwrap().seq.unwrap();
+            let s2 = Packet::decode(&f2).unwrap().seq;
             // 単発 ack の代わりに、ack 相乗りの完全なメッセージを送る。
             p.send_message(b"unsolicited", 244, Some(s2)).await;
             // client が返す standalone ack（これもウィンドウを消費する）。
@@ -1058,7 +1057,7 @@ mod tests {
             let client_ack_pkt = Packet::decode(&client_ack).unwrap();
             assert!(client_ack_pkt.payload.is_empty(), "expected standalone ack");
             // それに ack を返してやって初めてウィンドウが解放される。
-            p.send_ack(client_ack_pkt.seq.unwrap()).await;
+            p.send_ack(client_ack_pkt.seq).await;
             // ここでようやく 3 枚目（元メッセージの最終セグメント）が届く。
             let f3 = p.from_client.recv().await.unwrap();
             let mut completed = None;
@@ -1098,7 +1097,7 @@ mod tests {
         let peripheral = tokio::spawn(async move {
             p.do_handshake(30, 1).await;
             let f1 = p.from_client.recv().await.unwrap();
-            let s1 = Packet::decode(&f1).unwrap().seq.unwrap();
+            let s1 = Packet::decode(&f1).unwrap().seq;
             // ack を積まない完全なメッセージ → client のウィンドウは満杯のまま
             p.send_message(b"hi", 30, None).await;
             // 満杯の間は standalone ack を含む一切のフレームが来てはならない
@@ -1118,7 +1117,7 @@ mod tests {
                 if !pkt.payload.is_empty() {
                     break;
                 }
-                p.send_ack(pkt.seq.unwrap()).await;
+                p.send_ack(pkt.seq).await;
             }
         });
         let (_, t) = connect(link, PROPOSED_WINDOW).await.unwrap();

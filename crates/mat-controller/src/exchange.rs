@@ -383,8 +383,6 @@ pub struct ResponderExchange<'t> {
     last_peer_counter: u32,
     /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
     last_rx: Option<Instant>,
-    /// adopt 時点の最初のメッセージが needs_ack を立てていれば、その counter。
-    first_needs_ack: Option<u32>,
 }
 
 impl<'t> ResponderExchange<'t> {
@@ -395,10 +393,6 @@ impl<'t> ResponderExchange<'t> {
     pub fn adopt(transport: &'t Transport, peer: SocketAddr, first: &IncomingMessage) -> Self {
         let mut rx_window = RxWindow::new();
         rx_window.check_and_commit(first.header.message_counter);
-        let first_needs_ack = first
-            .proto
-            .needs_ack
-            .then_some(first.header.message_counter);
         Self {
             transport,
             peer,
@@ -408,16 +402,7 @@ impl<'t> ResponderExchange<'t> {
             peer_ephemeral_node_id: first.header.source_node_id,
             last_peer_counter: first.header.message_counter,
             last_rx: Some(Instant::now()),
-            first_needs_ack,
         }
-    }
-
-    /// adopt 時点のメッセージが ack を要求していた場合、その counter。
-    /// 最初の応答（`reply_reliable`/`reply_final`）自体が ack を piggyback
-    /// するので通常は不要だが、応答までに時間がかかる呼び出し側が先に
-    /// standalone ack を出す判断材料として公開する。
-    pub fn first_needs_ack(&self) -> Option<u32> {
-        self.first_needs_ack
     }
 
     /// unsecured セッションの応答メッセージを組む。
@@ -1221,7 +1206,6 @@ mod tests {
 
         let first = adopted_first(exchange_id, 500, true);
         let mut re = ResponderExchange::adopt(&transport, peer_addr, &first);
-        assert_eq!(re.first_needs_ack(), Some(500));
 
         let peer_task = tokio::spawn(async move {
             // resp1（ack piggyback 済み）の初回送出を受ける

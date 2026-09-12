@@ -4,7 +4,7 @@
 use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
 
 use super::read::{decode_attribute_path_ib, decode_attribute_status_ib};
-use super::{encode_im_value, expect_struct_start, skip_container, ImError, ImValue, IM_REVISION};
+use super::{expect_struct_start, skip_container, ImError, IM_REVISION};
 
 /// WriteRequestMessage (spec §8.9.2.4) の共通本体。`timed` が TimedRequest
 /// フィールドの値になる。公開関数 `encode_write_request_tlv` /
@@ -61,17 +61,6 @@ pub fn encode_write_request_tlv_timed(
     data_tlv: &[u8],
 ) -> Vec<u8> {
     encode_write_request_inner(endpoint, cluster, attribute, data_tlv, true)
-}
-
-/// Scalar sugar over `encode_write_request_tlv`: encodes `value` as TLV and
-/// splices it in as the `Data` element. M2-scope values only (see `ImValue`).
-pub fn encode_write_request(
-    endpoint: u16,
-    cluster: u32,
-    attribute: u32,
-    value: &ImValue,
-) -> Vec<u8> {
-    encode_write_request_tlv(endpoint, cluster, attribute, &encode_im_value(value))
 }
 
 /// Decoded AttributeDataIB (spec §8.9.2.2) from a WriteRequest's
@@ -292,7 +281,9 @@ mod tests {
 
     #[test]
     fn write_request_roundtrip_scalar() {
-        let b = encode_write_request(1, 0x0008, 0x0011, &ImValue::Uint(128));
+        let mut dw = Writer::new();
+        dw.put_uint(Tag::Anonymous, 128);
+        let b = encode_write_request_tlv(1, 0x0008, 0x0011, &dw.finish());
         // 形の検証: WriteRequests(2) 配列の中に AttributeDataIB があり、
         // path(ep=1, cluster=8, attr=0x11) と Data(Context2)=128 を含む。
         let mut r = Reader::new(&b);

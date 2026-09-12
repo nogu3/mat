@@ -55,7 +55,7 @@ impl std::error::Error for SpakeError {}
 
 /// 40 バイト big-endian を曲線位数 n で還元して Scalar にする。
 /// (Scalar 演算は mod n なので、バイトごとの畳み込みで正確に還元できる)
-pub(crate) fn scalar_from_be_bytes_mod_n(bytes: &[u8]) -> Scalar {
+fn scalar_from_be_bytes_mod_n(bytes: &[u8]) -> Scalar {
     let b256 = Scalar::from(256u64);
     bytes.iter().fold(Scalar::ZERO, |acc, b| {
         acc * b256 + Scalar::from(u64::from(*b))
@@ -84,9 +84,7 @@ pub fn compute_verifier(passcode: u32, salt: &[u8], iterations: u32) -> [u8; 97]
     out
 }
 
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to decode pA / the SPAKE_M/SPAKE_N constants.
-pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
+fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
     let ep = Sec1Point::from_bytes(bytes).map_err(|_| SpakeError::BadPoint)?;
     let ap = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&ep))
         .ok_or(SpakeError::BadPoint)?;
@@ -97,9 +95,7 @@ pub(crate) fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> 
     Ok(p)
 }
 
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to encode pB.
-pub(crate) fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
+fn encode_point(p: &ProjectivePoint) -> [u8; 65] {
     p.to_affine()
         .to_sec1_point(false)
         .as_bytes()
@@ -117,10 +113,8 @@ fn tt_elem(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Context, idProver, idVerifier, M, N, pA, pB, Z, V, w0。
 /// prover / verifier どちらの役でも Z・V さえ計算できれば同じ TT になる —
 /// 自己整合性テスト (verifier 役) から直接呼べるようフリー関数にしてある。
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to build TT with the verifier-side Z/V.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_transcript(
+fn build_transcript(
     context: &[u8],
     id_p: &[u8],
     id_v: &[u8],
@@ -148,9 +142,7 @@ pub(crate) fn build_transcript(
 
 /// SHA256(TT) を Ka(前半16B) / Ke(後半16B) に分割する。Matter 固有の分割
 /// (spec §3.10.3) — RFC 9383 本体の K_main/K_confirmP/K_confirmV とは異なる。
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to split TT's hash into Ka/Ke.
-pub(crate) fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
+fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
     let hash = Sha256::digest(tt);
     let mut k_a = [0u8; 16];
     let mut k_e = [0u8; 16];
@@ -161,9 +153,7 @@ pub(crate) fn split_hash(tt: &[u8]) -> ([u8; 16], [u8; 16]) {
 
 /// HKDF-SHA256(salt=[], ikm=Ka, info="ConfirmationKeys") 32B
 /// → KcA(前半16B) / KcB(後半16B)（spec §3.10.3）。
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to derive KcA/KcB.
-pub(crate) fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
+fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     let hk = Hkdf::<Sha256>::new(Some(&[]), k_a);
     let mut kc = [0u8; 32];
     hk.expand(b"ConfirmationKeys", &mut kc)
@@ -175,9 +165,7 @@ pub(crate) fn confirmation_keys(k_a: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     (kc_a, kc_b)
 }
 
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) to compute cB / verify cA.
-pub(crate) fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
+fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(msg);
     mac.finalize().into_bytes().into()
@@ -185,9 +173,7 @@ pub(crate) fn hmac32(key: &[u8; 16], msg: &[u8]) -> [u8; 32] {
 
 /// `case::random_p256_secret` と同じ乱数源から Scalar を得る（0 は
 /// `random_p256_secret` 側で引き直し済み、ここでは Deref するだけ）。
-/// `pub(crate)`: also used by `test_support`'s PASE verifier responder
-/// (audit Tier 5) for its own ephemeral `y`.
-pub(crate) fn random_scalar() -> Scalar {
+fn random_scalar() -> Scalar {
     *random_p256_secret().to_nonzero_scalar()
 }
 
@@ -219,7 +205,7 @@ impl Spake2pProver {
     }
 
     /// `x` を固定して prover を作る。RFC 9383 のテストベクタ検証専用。
-    pub(crate) fn new_with_x(w0: Scalar, w1: Scalar, x: Scalar) -> Self {
+    fn new_with_x(w0: Scalar, w1: Scalar, x: Scalar) -> Self {
         Self { w0, w1, x }
     }
 
@@ -232,7 +218,7 @@ impl Spake2pProver {
 
     /// TT (transcript) を計算する内部関数。RFC 9383 ベクタ検証のため
     /// クレート内に公開する（ハッシュ前の生バイト列を直接比較したいので）。
-    pub(crate) fn transcript(
+    fn transcript(
         &self,
         p_b: &[u8],
         context: &[u8],
@@ -360,7 +346,7 @@ impl Spake2pVerifier {
     /// `p_b()` 同士は比較できない。代わりに `w0`/`L`（内部の秘密材料）の
     /// 一致で `from_passcode` と `from_verifier_material` の等価性を検証する。
     #[cfg(test)]
-    pub(crate) fn w0_l_bytes(&self) -> ([u8; 32], [u8; 65]) {
+    fn w0_l_bytes(&self) -> ([u8; 32], [u8; 65]) {
         (self.w0.to_bytes().into(), encode_point(&self.l))
     }
 }

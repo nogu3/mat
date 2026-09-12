@@ -9,7 +9,7 @@
 //! Timed / StatusResponse), `write`, `cmdfields` (per-command CommandFields
 //! encoders) and `json` (TLV → JSON).
 
-use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+use crate::tlv::{Reader, TlvError, Value};
 
 pub const PROTOCOL_ID_IM: u16 = crate::message::PROTOCOL_ID_INTERACTION_MODEL;
 pub const OPCODE_STATUS_RESPONSE: u8 = 0x01;
@@ -40,7 +40,6 @@ pub const ATTR_DATA_MODEL_REVISION: u32 = 0x0000;
 pub const CLUSTER_COLOR_CONTROL: u32 = 0x0300;
 pub const ATTR_CURRENT_HUE: u32 = 0x0000;
 pub const ATTR_CURRENT_SATURATION: u32 = 0x0001;
-pub const ATTR_COLOR_TEMPERATURE_MIREDS: u32 = 0x0007;
 pub const CMD_MOVE_TO_HUE_AND_SATURATION: u32 = 0x06;
 pub const CMD_MOVE_TO_COLOR_TEMPERATURE: u32 = 0x0A;
 pub const CLUSTER_LEVEL_CONTROL: u32 = 0x0008;
@@ -178,7 +177,6 @@ pub const ATTR_SWITCH_NUMBER_OF_POSITIONS: u32 = 0x0000;
 pub const ATTR_SWITCH_CURRENT_POSITION: u32 = 0x0001;
 pub const ATTR_SWITCH_MULTI_PRESS_MAX: u32 = 0x0002;
 /// Switch cluster events (spec §1.13.6).
-pub const EVENT_SWITCH_SWITCH_LATCHED: u32 = 0x00;
 pub const EVENT_SWITCH_INITIAL_PRESS: u32 = 0x01;
 pub const EVENT_SWITCH_LONG_PRESS: u32 = 0x02;
 pub const EVENT_SWITCH_SHORT_RELEASE: u32 = 0x03;
@@ -186,7 +184,6 @@ pub const EVENT_SWITCH_LONG_RELEASE: u32 = 0x04;
 pub const EVENT_SWITCH_MULTI_PRESS_ONGOING: u32 = 0x05;
 pub const EVENT_SWITCH_MULTI_PRESS_COMPLETE: u32 = 0x06;
 /// Switch cluster `FeatureMap` bits (spec §1.13.4).
-pub const SWITCH_FEATURE_LATCHING: u32 = 0x01;
 pub const SWITCH_FEATURE_MOMENTARY: u32 = 0x02;
 pub const SWITCH_FEATURE_MOMENTARY_RELEASE: u32 = 0x04;
 pub const SWITCH_FEATURE_MOMENTARY_LONG_PRESS: u32 = 0x08;
@@ -409,27 +406,10 @@ fn value_to_im(v: Value) -> Result<ImValue, ImError> {
     }
 }
 
-/// Encodes an `ImValue` scalar as one standalone, well-formed TLV element
-/// (tag is discarded by the caller — `encode_write_request` immediately
-/// splices it via `Writer::put_raw_element`).
-fn encode_im_value(value: &ImValue) -> Vec<u8> {
-    let mut w = Writer::new();
-    match value {
-        ImValue::Bool(b) => w.put_bool(Tag::Anonymous, *b),
-        ImValue::Uint(u) => w.put_uint(Tag::Anonymous, *u),
-        ImValue::Int(i) => w.put_int(Tag::Anonymous, *i),
-        ImValue::F32(f) => w.put_f32(Tag::Anonymous, *f),
-        ImValue::F64(f) => w.put_f64(Tag::Anonymous, *f),
-        ImValue::Utf8(s) => w.put_str(Tag::Anonymous, s),
-        ImValue::Bytes(b) => w.put_bytes(Tag::Anonymous, b),
-        ImValue::Null => w.put_null(Tag::Anonymous),
-    }
-    w.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tlv::{Tag, Writer};
 
     #[test]
     fn move_fields_splice_into_invoke_request() {
@@ -479,14 +459,15 @@ mod tests {
 
     #[test]
     fn im_value_floats_roundtrip_through_encode_and_decode() {
-        for v in [ImValue::F32(1.5), ImValue::F64(-2.25)] {
-            let tlv = encode_im_value(&v);
+        let mut w32 = Writer::new();
+        w32.put_f32(Tag::Anonymous, 1.5);
+        let mut w64 = Writer::new();
+        w64.put_f64(Tag::Anonymous, -2.25);
+        for (tlv, v, expect) in [
+            (w32.finish(), ImValue::F32(1.5), 0x0A),
+            (w64.finish(), ImValue::F64(-2.25), 0x0B),
+        ] {
             // 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte だけ）。
-            let expect = if matches!(v, ImValue::F32(_)) {
-                0x0A
-            } else {
-                0x0B
-            };
             assert_eq!(tlv[0] & 0x1F, expect, "{v:?}");
             let mut r = Reader::new(&tlv);
             let el = r.next().unwrap().unwrap();
