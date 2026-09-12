@@ -148,6 +148,43 @@ fn decode_b64(section: &str, key: &str) -> Result<Option<Vec<u8>>, KvsError> {
     }
 }
 
+/// Like [`decode_b64`], but a missing/empty key is `KeyMissing(key)`.
+fn must_b64(section: &str, key: &str) -> Result<Vec<u8>, KvsError> {
+    decode_b64(section, key)?.ok_or_else(|| KvsError::KeyMissing(key.to_string()))
+}
+
+/// Reads `path` and hands its `[Default]` section body to `f`. Every reader
+/// below starts this way; the ini is re-read per call on purpose (design
+/// rule 4: no state between runs).
+fn with_default_section<T>(
+    path: &Path,
+    f: impl FnOnce(&str) -> Result<T, KvsError>,
+) -> Result<T, KvsError> {
+    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
+    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
+    f(section)
+}
+
+/// `f/<idx>/n`（fabric table の自 NOC、Matter-TLV）の subject から
+/// `(node_id, fabric_id)` を読む。`read_self_issue_materials` と
+/// `read_noc_identity` が共有する。
+fn noc_identity_in(section: &str, fabric_index: u8) -> Result<(u64, u64), KvsError> {
+    let noc_tlv = must_b64(section, &format!("f/{fabric_index}/n"))?;
+    let noc = crate::cert::MatterCert::parse(&noc_tlv).map_err(|_| KvsError::BadNoc {
+        fabric_index,
+        reason: "unparseable matter-tlv certificate",
+    })?;
+    let node_id = noc.node_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing node id (tag 17)",
+    })?;
+    let fabric_id = noc.fabric_id().ok_or(KvsError::BadNoc {
+        fabric_index,
+        reason: "subject missing fabric id (tag 21)",
+    })?;
+    Ok((node_id, fabric_id))
+}
+
 /// Reads the next TLV element, mapping decode/EOF errors to `BadKeyset`.
 fn next_keyset_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a>, KvsError> {
     r.next()
@@ -338,115 +375,79 @@ pub fn read_self_issue_materials(
     issuer_index: u8,
 ) -> Result<SelfIssueMaterials, KvsError> {
     // --- alpha ini: root CA key pair ---
-    let alpha_text = std::fs::read_to_string(alpha_ini).map_err(KvsError::Io)?;
-    let alpha_sec = default_section(&alpha_text).ok_or(KvsError::SectionMissing)?;
-    let cakey_key = format!("ExampleOpCredsCAKey{issuer_index}");
-    let ca_key = decode_b64(alpha_sec, &cakey_key)?.ok_or(KvsError::KeyMissing(cakey_key))?;
-    if ca_key.len() != 97 {
-        return Err(KvsError::BadCaKey(
-            "root ca key must be 97 raw bytes (pub65||priv32)",
-        ));
-    }
-    // Only the private half is needed; the root public key is taken from the
-    // parsed RCAC (single source of truth for `case_destination_id`).
-    let root_private_key: [u8; 32] = ca_key[65..].try_into().expect("32");
+    let root_private_key = with_default_section(alpha_ini, |sec| {
+        let ca_key = must_b64(sec, &format!("ExampleOpCredsCAKey{issuer_index}"))?;
+        if ca_key.len() != 97 {
+            return Err(KvsError::BadCaKey(
+                "root ca key must be 97 raw bytes (pub65||priv32)",
+            ));
+        }
+        // Only the private half is needed; the root public key is taken from the
+        // parsed RCAC (single source of truth for `case_destination_id`).
+        Ok::<[u8; 32], KvsError>(ca_key[65..].try_into().expect("32"))
+    })?;
 
     // --- main ini: root cert (TLV), IPK, node id ---
-    let main_text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
-    let main_sec = default_section(&main_text).ok_or(KvsError::SectionMissing)?;
-    // The root cert in operational Matter-TLV form lives in the *main* KVS
-    // fabric table (`f/<idx>/r`). alpha's `ExampleCARootCert<issuer>` is stored
-    // as X.509 DER, which our Matter-TLV cert parser does not accept — read the
-    // TLV form here instead. Both encode the same root key (verified: the
-    // 65-byte pubkey from `ExampleOpCredsCAKey<issuer>` appears in `f/<idx>/r`).
-    let rcac_key = format!("f/{fabric_index}/r");
-    let rcac = decode_b64(main_sec, &rcac_key)?.ok_or(KvsError::KeyMissing(rcac_key))?;
-    let ipk_operational = parse_keyset(
-        &decode_b64(main_sec, &format!("f/{fabric_index}/k/0"))?
-            .ok_or_else(|| KvsError::KeyMissing(format!("f/{fabric_index}/k/0")))?,
-        fabric_index,
-    )?;
+    with_default_section(main_ini, |sec| {
+        // The root cert in operational Matter-TLV form lives in the *main* KVS
+        // fabric table (`f/<idx>/r`). alpha's `ExampleCARootCert<issuer>` is stored
+        // as X.509 DER, which our Matter-TLV cert parser does not accept — read the
+        // TLV form here instead. Both encode the same root key (verified: the
+        // 65-byte pubkey from `ExampleOpCredsCAKey<issuer>` appears in `f/<idx>/r`).
+        let rcac = must_b64(sec, &format!("f/{fabric_index}/r"))?;
+        let ipk_operational =
+            parse_keyset(&must_b64(sec, &format!("f/{fabric_index}/k/0"))?, fabric_index)?;
 
-    // node id / fabric id come from the subject of chip-tool's own
-    // operational NOC in the fabric table (`f/<idx>/n`, Matter-TLV): the
-    // device ACLs admit exactly the identity in that cert, and its subject
-    // carries the *operational* fabric id — the KVS index is just a table
-    // slot and differs from the fabric id on any non-alpha fabric.
-    let noc_key = format!("f/{fabric_index}/n");
-    let noc_tlv = decode_b64(main_sec, &noc_key)?.ok_or(KvsError::KeyMissing(noc_key))?;
-    let noc = crate::cert::MatterCert::parse(&noc_tlv).map_err(|_| KvsError::BadNoc {
-        fabric_index,
-        reason: "unparseable matter-tlv certificate",
-    })?;
-    let node_id = noc.node_id().ok_or(KvsError::BadNoc {
-        fabric_index,
-        reason: "subject missing node id (tag 17)",
-    })?;
-    let fabric_id = noc.fabric_id().ok_or(KvsError::BadNoc {
-        fabric_index,
-        reason: "subject missing fabric id (tag 21)",
-    })?;
-
-    Ok(SelfIssueMaterials {
-        rcac,
-        root_private_key,
-        ipk_operational,
-        node_id,
-        fabric_id,
+        // node id / fabric id come from the subject of chip-tool's own
+        // operational NOC in the fabric table (`f/<idx>/n`, Matter-TLV): the
+        // device ACLs admit exactly the identity in that cert, and its subject
+        // carries the *operational* fabric id — the KVS index is just a table
+        // slot and differs from the fabric id on any non-alpha fabric.
+        let (node_id, fabric_id) = noc_identity_in(sec, fabric_index)?;
+        Ok(SelfIssueMaterials {
+            rcac,
+            root_private_key,
+            ipk_operational,
+            node_id,
+            fabric_id,
+        })
     })
 }
 
 /// main KVS の `[Default]` から `f/<n>/n`（fabric table の NOC）を持つ index を
 /// 昇順で列挙する。`mat fabric list` 用。
 pub fn list_fabric_indices(main_ini: &Path) -> Result<Vec<u8>, KvsError> {
-    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
-    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let mut out: Vec<u8> = sec
-        .lines()
-        .filter_map(|line| line.split_once('=').map(|(k, _)| k.trim()))
-        .filter_map(|k| {
-            k.strip_prefix("f/")
-                .and_then(|rest| rest.strip_suffix("/n"))
-                .and_then(|n| n.parse::<u8>().ok())
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
+    with_default_section(main_ini, |sec| {
+        let mut out: Vec<u8> = sec
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(k, _)| k.trim()))
+            .filter_map(|k| {
+                k.strip_prefix("f/")
+                    .and_then(|rest| rest.strip_suffix("/n"))
+                    .and_then(|n| n.parse::<u8>().ok())
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    })
 }
 
 /// `f/<idx>/n` の NOC subject から `(node_id, fabric_id)` を読む（alpha.ini 不要）。
 pub fn read_noc_identity(main_ini: &Path, fabric_index: u8) -> Result<(u64, u64), KvsError> {
-    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
-    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let noc_key = format!("f/{fabric_index}/n");
-    let noc_tlv = decode_b64(sec, &noc_key)?.ok_or(KvsError::KeyMissing(noc_key))?;
-    let noc = crate::cert::MatterCert::parse(&noc_tlv).map_err(|_| KvsError::BadNoc {
-        fabric_index,
-        reason: "unparseable matter-tlv certificate",
-    })?;
-    let node_id = noc.node_id().ok_or(KvsError::BadNoc {
-        fabric_index,
-        reason: "subject missing node id (tag 17)",
-    })?;
-    let fabric_id = noc.fabric_id().ok_or(KvsError::BadNoc {
-        fabric_index,
-        reason: "subject missing fabric id (tag 21)",
-    })?;
-    Ok((node_id, fabric_id))
+    with_default_section(main_ini, |sec| noc_identity_in(sec, fabric_index))
 }
 
 /// `f/<idx>/r` の RCAC 公開鍵（compressed fabric id の導出用）。
 pub fn read_rcac_pubkey(main_ini: &Path, fabric_index: u8) -> Result<[u8; 65], KvsError> {
-    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
-    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let key = format!("f/{fabric_index}/r");
-    let rcac = decode_b64(sec, &key)?.ok_or(KvsError::KeyMissing(key))?;
-    let cert = crate::cert::MatterCert::parse(&rcac).map_err(|_| KvsError::BadNoc {
-        fabric_index,
-        reason: "unparseable rcac",
-    })?;
-    Ok(cert.pub_key)
+    with_default_section(main_ini, |sec| {
+        let rcac = must_b64(sec, &format!("f/{fabric_index}/r"))?;
+        let cert = crate::cert::MatterCert::parse(&rcac).map_err(|_| KvsError::BadNoc {
+            fabric_index,
+            reason: "unparseable rcac",
+        })?;
+        Ok(cert.pub_key)
+    })
 }
 
 /// Group send credentials from the GroupKeyMap + keyset blob: the group
@@ -483,52 +484,51 @@ pub fn read_group_credentials(
     fabric_index: u8,
     group_id: u16,
 ) -> Result<GroupCredentials, KvsError> {
-    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
-    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let mut keyset_id = None;
-    if let Some(fabric) = decode_b64(section, &format!("f/{fabric_index}/g"))?
-        .and_then(|b| crate::group_settings::parse_fabric_data(&b))
-    {
-        let mut cur = fabric.first_map;
-        for _ in 0..fabric.map_count {
-            let Some(blob) = decode_b64(section, &format!("f/{fabric_index}/gk/{cur:x}"))? else {
-                break;
-            };
-            let Some(km) = crate::group_settings::parse_keymap(&blob) else {
-                break;
-            };
-            if km.group_id == group_id {
-                keyset_id = Some(km.keyset_id);
-                break;
+    with_default_section(path, |section| {
+        let mut keyset_id = None;
+        if let Some(fabric) = decode_b64(section, &format!("f/{fabric_index}/g"))?
+            .and_then(|b| crate::group_settings::parse_fabric_data(&b))
+        {
+            let mut cur = fabric.first_map;
+            for _ in 0..fabric.map_count {
+                let Some(blob) = decode_b64(section, &format!("f/{fabric_index}/gk/{cur:x}"))?
+                else {
+                    break;
+                };
+                let Some(km) = crate::group_settings::parse_keymap(&blob) else {
+                    break;
+                };
+                if km.group_id == group_id {
+                    keyset_id = Some(km.keyset_id);
+                    break;
+                }
+                cur = km.next;
             }
-            cur = km.next;
         }
-    }
-    let keyset_id = keyset_id.ok_or(KvsError::GroupNotFound {
-        fabric_index,
-        group_id,
-    })?;
-    let key = format!("f/{fabric_index}/k/{keyset_id:x}");
-    let blob = decode_b64(section, &key)?.ok_or(KvsError::KeyMissing(key))?;
-    // parse_keyset と同じ枠組みで最初の key entry の (key, hash) を取る。ただし
-    // group 送信は hash（= 群 session id、ワイヤに乗る値）が必須 — IPK 読み出し
-    // と違い None を許容しない。
-    let (encryption_key, session_id) = parse_keyset_first_entry(&blob, fabric_index)?;
-    let session_id = session_id.ok_or(KvsError::BadKeyset {
-        fabric_index,
-        reason: "missing key hash",
-    })?;
-    Ok(GroupCredentials {
-        session_id,
-        encryption_key,
+        let keyset_id = keyset_id.ok_or(KvsError::GroupNotFound {
+            fabric_index,
+            group_id,
+        })?;
+        let key = format!("f/{fabric_index}/k/{keyset_id:x}");
+        let blob = must_b64(section, &key)?;
+        // parse_keyset と同じ枠組みで最初の key entry の (key, hash) を取る。ただし
+        // group 送信は hash（= 群 session id、ワイヤに乗る値）が必須 — IPK 読み出し
+        // と違い None を許容しない。
+        let (encryption_key, session_id) = parse_keyset_first_entry(&blob, fabric_index)?;
+        let session_id = session_id.ok_or(KvsError::BadKeyset {
+            fabric_index,
+            reason: "missing key hash",
+        })?;
+        Ok(GroupCredentials {
+            session_id,
+            encryption_key,
+        })
     })
 }
 
 /// Reads chip-tool's persisted Global Group Data Counter (`g/gdc`, u32 LE).
 pub fn read_group_data_counter(path: &Path) -> Result<Option<u32>, KvsError> {
-    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
-    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    match decode_b64(section, "g/gdc")? {
+    with_default_section(path, |section| match decode_b64(section, "g/gdc")? {
         None => Ok(None),
         Some(b) => {
             let arr: [u8; 4] = b
@@ -537,7 +537,7 @@ pub fn read_group_data_counter(path: &Path) -> Result<Option<u32>, KvsError> {
                 .map_err(|_| KvsError::BadCounter("g/gdc must be 4 bytes"))?;
             Ok(Some(u32::from_le_bytes(arr)))
         }
-    }
+    })
 }
 
 /// chip-tool INI KVS への書込トランザクション（M8c-2）。
@@ -560,27 +560,65 @@ pub struct KvsTxn {
     _lock: std::fs::File,
 }
 
-/// sidecar `<path>.lock` を advisory flock（NonBlocking exclusive）する。
-/// `open` / `create` 共通の手順を括り出したもの。
+/// flock 排他 + tmp/rename 原子置換。`KvsTxn`（chip-tool INI）と
+/// `group::PersistedGroupCounter`（group data counter）が同じ規律を共有する。
+/// `lib.rs` は他レーンの担当なので独立ファイルにせず `kvs` 配下に置く。
+pub(crate) mod fs_util {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// `path` の隣の sidecar `<path>.lock` を advisory flock（NonBlocking
+    /// exclusive）する。本体は tmp+rename で置換されるので本体 fd への flock は
+    /// rename 後に無効化される — 安定した別ファイルに取り、戻り値の `File` を
+    /// 持っている間だけロックが生きる（Drop で OS が解放）。競合は
+    /// `io::ErrorKind::WouldBlock`。
+    pub(crate) fn take_lock(path: &Path) -> io::Result<std::fs::File> {
+        use rustix::fs::{flock, FlockOperation};
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))?;
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            if e == rustix::io::Errno::WOULDBLOCK {
+                io::Error::new(io::ErrorKind::WouldBlock, "locked by another process")
+            } else {
+                io::Error::other(e)
+            }
+        })?;
+        Ok(lock)
+    }
+
+    /// `<path>.tmp`（ファイル名末尾に付加 — `with_extension` の stem 衝突
+    /// （`a.ini` と `a.counter` が同じ `a.tmp` を取り合う）を避ける）へ書き、
+    /// `sync_all` してから `rename` で置換する。クラッシュしても途中書きの
+    /// 本体は残らない。
+    pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// sidecar `<path>.lock` を advisory flock する（[`fs_util::take_lock`]）。
+/// `open` / `create` 共通。競合は `KvsError::Locked`。
 fn take_lock(path: &Path) -> Result<std::fs::File, KvsError> {
-    use rustix::fs::{flock, FlockOperation};
-    let mut lock_path = path.as_os_str().to_owned();
-    lock_path.push(".lock");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(std::path::PathBuf::from(lock_path))
-        .map_err(KvsError::Io)?;
-    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-        if e == rustix::io::Errno::WOULDBLOCK {
+    fs_util::take_lock(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
             KvsError::Locked
         } else {
-            KvsError::Io(std::io::Error::other(e))
+            KvsError::Io(e)
         }
-    })?;
-    Ok(lock)
+    })
 }
 
 impl KvsTxn {
@@ -699,20 +737,15 @@ impl KvsTxn {
         }
     }
 
-    /// tmp + fsync + rename の原子置換（`group.rs` counter の persist と同流儀）。
-    /// 末尾改行スタイルを元ファイルに合わせる（CRLF/LF/no-newline を保全）。
+    /// tmp + fsync + rename の原子置換（`fs_util::atomic_replace`、`group.rs`
+    /// counter の persist と同流儀）。末尾改行スタイルを元ファイルに合わせる
+    /// （CRLF/LF/no-newline を保全）。
     pub fn commit(self) -> Result<(), KvsError> {
-        use std::io::Write;
-        let tmp = self.path.with_extension("ini.tmp");
-        let mut f = std::fs::File::create(&tmp).map_err(KvsError::Io)?;
         let mut body = self.lines.join("\n");
         if self.trailing_newline && !self.lines.is_empty() {
             body.push('\n');
         }
-        f.write_all(body.as_bytes()).map_err(KvsError::Io)?;
-        f.sync_all().map_err(KvsError::Io)?;
-        std::fs::rename(&tmp, &self.path).map_err(KvsError::Io)?;
-        Ok(())
+        fs_util::atomic_replace(&self.path, body.as_bytes()).map_err(KvsError::Io)
     }
 }
 
@@ -760,18 +793,18 @@ pub fn read_mat_ipk_epoch_slot(
     fabric_index: u8,
     slot: IpkEpochSlot,
 ) -> Result<Option<[u8; 16]>, KvsError> {
-    let text = std::fs::read_to_string(main_ini).map_err(KvsError::Io)?;
-    let sec = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    match decode_b64(sec, &mat_ipk_epoch_slot_key(fabric_index, slot))? {
-        None => Ok(None),
-        Some(v) => {
-            let arr: [u8; 16] = v.try_into().map_err(|_| KvsError::BadKeyset {
-                fabric_index,
-                reason: "mat ipk epoch must be 16 bytes",
-            })?;
-            Ok(Some(arr))
+    with_default_section(main_ini, |sec| {
+        match decode_b64(sec, &mat_ipk_epoch_slot_key(fabric_index, slot))? {
+            None => Ok(None),
+            Some(v) => {
+                let arr: [u8; 16] = v.try_into().map_err(|_| KvsError::BadKeyset {
+                    fabric_index,
+                    reason: "mat ipk epoch must be 16 bytes",
+                })?;
+                Ok(Some(arr))
+            }
         }
-    }
+    })
 }
 
 /// mat が永続した epoch IPK を読む。キー無し = `Ok(None)`（未採用 —

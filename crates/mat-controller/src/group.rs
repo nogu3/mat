@@ -50,23 +50,14 @@ impl PersistedGroupCounter {
     /// persists the new ceiling before returning. A corrupt counter file is
     /// an error (starting low would get every send dropped by receivers).
     pub fn load(path: &Path, chip_tool_gdc: u32) -> io::Result<Self> {
-        use rustix::fs::{flock, FlockOperation};
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(PathBuf::from(lock_path))?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == rustix::io::Errno::WOULDBLOCK {
+        let lock = crate::kvs::fs_util::take_lock(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "group counter is locked by another process (matd running?)",
                 )
             } else {
-                io::Error::other(e)
+                e
             }
         })?;
         let persisted = match std::fs::read_to_string(path) {
@@ -112,15 +103,10 @@ impl PersistedGroupCounter {
         Ok((from, to))
     }
 
-    /// Atomic write (tmp + fsync + rename) so a crash never leaves a
-    /// truncated value behind.
+    /// Atomic write (tmp + fsync + rename, [`crate::kvs::fs_util::atomic_replace`])
+    /// so a crash never leaves a truncated value behind.
     fn persist(&mut self, ceiling: u32) -> io::Result<()> {
-        use std::io::Write;
-        let tmp = self.path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(format!("{ceiling}\n").as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)?;
+        crate::kvs::fs_util::atomic_replace(&self.path, format!("{ceiling}\n").as_bytes())?;
         self.ceiling = ceiling;
         Ok(())
     }
