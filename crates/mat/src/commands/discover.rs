@@ -119,13 +119,11 @@ fn native_commissionables(
     iface: &str,
 ) -> Result<Vec<DiscoveredDevice>, Box<dyn std::error::Error>> {
     let scope_id = mat_controller::dnssd::iface_index(iface)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let list = rt.block_on(mat_controller::dnssd::browse_commissionable(
+    let list = crate::native_direct::block_on(mat_controller::dnssd::browse_commissionable(
         scope_id,
         mat_controller::dnssd::BROWSE_WINDOW,
-    ))?;
+    ))
+    .map_err(|e| Box::<dyn std::error::Error>::from(e.detail))??;
     tracing::info!(devices = list.len(), "discover executed (native browse)");
     Ok(list.into_iter().map(to_discovered).collect())
 }

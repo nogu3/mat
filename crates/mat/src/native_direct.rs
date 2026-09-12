@@ -25,6 +25,54 @@ pub(crate) struct Config<'a> {
     pub issuer_index: u8,
 }
 
+impl Config<'_> {
+    /// `mat-native` の `NativeConfig` へ写す（store root は呼び手が持つ）。
+    pub(crate) fn to_native(&self, store_root: &Path) -> NativeConfig {
+        NativeConfig {
+            store: store_root.to_path_buf(),
+            iface: self.iface.to_string(),
+            thread_iface: self.thread_iface.clone(),
+            fabric_index: self.fabric_index,
+            issuer_index: self.issuer_index,
+        }
+    }
+}
+
+/// one-shot CLI 用の current-thread tokio runtime で future を完走させる。
+/// runtime 構築失敗のみ Err（`Other`, "tokio runtime: …"）。
+pub(crate) fn block_on<T>(fut: impl std::future::Future<Output = T>) -> Result<T, MatError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            MatError::new(
+                mat_core::error::ErrorKind::Other,
+                format!("tokio runtime: {e}"),
+            )
+        })?;
+    Ok(rt.block_on(fut))
+}
+
+/// engine を 1 度構築して `f` に渡す（直経路の共通足場）。構築失敗は
+/// `MatError::with_fabric_init_hint` で store_missing に `mat fabric init`
+/// 誘導を付す（M8c-3: chip-tool フォールバック撤去後のハードエラー化）。
+pub(crate) fn with_engine<T, Fut>(
+    cfg: &Config<'_>,
+    store_root: &Path,
+    f: impl FnOnce(Engine) -> Fut,
+) -> Result<T, MatError>
+where
+    Fut: std::future::Future<Output = Result<T, MatError>>,
+{
+    let native_cfg = cfg.to_native(store_root);
+    block_on(async {
+        let engine = Engine::build(&native_cfg)
+            .await
+            .map_err(MatError::with_fabric_init_hint)?;
+        f(engine).await
+    })?
+}
+
 /// `node_touched` ヒントを撃ってはいけない op か。
 ///
 /// `unpair`（`RemoveFabric`）だけが該当する。ヒントは matd に「このノードを
@@ -101,36 +149,12 @@ pub(crate) fn execute(
             mat_core::group::resolve_epoch_key(Some(k))?;
         }
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            MatError::new(
-                mat_core::error::ErrorKind::Other,
-                format!("tokio runtime: {e}"),
-            )
-        })?;
-    let body = rt.block_on(async {
-        let native_cfg = NativeConfig {
-            store: store.root().to_path_buf(),
-            iface: cfg.iface.to_string(),
-            thread_iface: cfg.thread_iface.clone(),
-            fabric_index: cfg.fabric_index,
-            issuer_index: cfg.issuer_index,
-        };
-        let engine = Engine::build(&native_cfg)
-            .await
-            .map_err(map_engine_build_error)?;
+    let hint = hint_for(op);
+    let body = with_engine(cfg, store.root(), |engine| async move {
         let budget = op.budget_applies();
         if budget && op_timeout_ms > 0 {
             // 直経路にも matd 経路と同じ予算セマンティクス（exit 3）。
-            run_op_with_deadline(
-                run_with_engine(&engine, op),
-                op_timeout_ms,
-                node_id,
-                hint_for(op),
-            )
-            .await
+            run_op_with_deadline(run_with_engine(&engine, op), op_timeout_ms, node_id, hint).await
         } else {
             run_with_engine(&engine, op).await
         }
@@ -210,20 +234,6 @@ where
     }
 }
 
-/// エンジン構築失敗（M8c-3: chip-tool フォールバック撤去後のハードエラー化）。
-/// `Engine::build` は KVS 資材の読取失敗を `store_missing` に写す（`mat-native`
-/// 参照 — Io/NotFound と parse の細分化は将来）。ここでは store_missing に
-/// 「`mat fabric init` で資材を作れ」の誘導を足して返す。他 kind はそのまま伝播。
-pub(crate) fn map_engine_build_error(mut e: MatError) -> MatError {
-    if e.kind == mat_core::error::ErrorKind::StoreMissing && !e.detail.contains("mat fabric init") {
-        e.detail = format!(
-            "{} — run `mat fabric init` to bootstrap the credential store",
-            e.detail
-        );
-    }
-    e
-}
-
 /// `mat diag node` の IM 部分（operational チェック + thread シグナル）を
 /// native で実行した結果（M8c-2）。CFID はログパースではなく fabric 資材
 /// から直接計算するため、native 経路では cfid_unavailable の系が消える。
@@ -235,7 +245,7 @@ pub(crate) struct DiagImProbe {
 }
 
 /// `diag_im_probe` の入口。M8c-3（chip-tool 撤去）: エンジン構築失敗は
-/// フォールバックせずハードエラー化（`run` の build 失敗と同じ写像 —
+/// フォールバックせずハードエラー化（`with_engine` と同じ写像 —
 /// store_missing に `mat fabric init` 誘導を付す）。
 pub(crate) fn diag_im_probe(
     cfg: &Config<'_>,
@@ -243,26 +253,7 @@ pub(crate) fn diag_im_probe(
     node_id: u64,
     endpoint: u16,
 ) -> Result<DiagImProbe, MatError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            MatError::new(
-                mat_core::error::ErrorKind::Other,
-                format!("tokio runtime: {e}"),
-            )
-        })?;
-    rt.block_on(async {
-        let native_cfg = NativeConfig {
-            store: store_root.to_path_buf(),
-            iface: cfg.iface.to_string(),
-            thread_iface: cfg.thread_iface.clone(),
-            fabric_index: cfg.fabric_index,
-            issuer_index: cfg.issuer_index,
-        };
-        let engine = Engine::build(&native_cfg)
-            .await
-            .map_err(map_engine_build_error)?;
+    with_engine(cfg, store_root, |engine| async move {
         Ok(diag_im_with_engine(&engine, node_id, endpoint).await)
     })
 }
@@ -330,26 +321,7 @@ pub(crate) fn diag_mesh_probe(
     store_root: &Path,
     targets: &[u64],
 ) -> Result<Vec<MeshProbeItem>, MatError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            MatError::new(
-                mat_core::error::ErrorKind::Other,
-                format!("tokio runtime: {e}"),
-            )
-        })?;
-    rt.block_on(async {
-        let native_cfg = NativeConfig {
-            store: store_root.to_path_buf(),
-            iface: cfg.iface.to_string(),
-            thread_iface: cfg.thread_iface.clone(),
-            fabric_index: cfg.fabric_index,
-            issuer_index: cfg.issuer_index,
-        };
-        let engine = Engine::build(&native_cfg)
-            .await
-            .map_err(map_engine_build_error)?;
+    with_engine(cfg, store_root, |engine| async move {
         let mut out = Vec::new();
         for &node_id in targets {
             let result = mesh_probe_one(&engine, node_id).await;
@@ -400,6 +372,47 @@ async fn mesh_probe_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Config::to_native` は store root と CLI 由来 4 フィールドをそのまま写す。
+    #[test]
+    fn config_to_native_copies_every_field() {
+        let cfg = Config {
+            iface: "lo",
+            thread_iface: Some(mat_native::ThreadIfaceChoice::Explicit("wpan0".into())),
+            fabric_index: 2,
+            issuer_index: 1,
+        };
+        let n = cfg.to_native(std::path::Path::new("/tmp/store"));
+        assert_eq!(n.store, std::path::PathBuf::from("/tmp/store"));
+        assert_eq!(n.iface, "lo");
+        assert!(
+            matches!(n.thread_iface, Some(mat_native::ThreadIfaceChoice::Explicit(ref s)) if s == "wpan0")
+        );
+        assert_eq!(n.fabric_index, 2);
+        assert_eq!(n.issuer_index, 1);
+    }
+
+    /// `block_on` は current-thread runtime で future を完走させる。
+    #[test]
+    fn block_on_runs_future_to_completion() {
+        assert_eq!(block_on(async { 41 + 1 }).unwrap(), 42);
+    }
+
+    /// `with_engine` の build 失敗は store_missing + `mat fabric init` 誘導。
+    #[test]
+    fn with_engine_maps_build_failure_with_fabric_init_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            iface: "lo",
+            thread_iface: None,
+            fabric_index: 1,
+            issuer_index: 0,
+        };
+        let err =
+            with_engine(&cfg, dir.path(), |_engine| async { Ok::<(), MatError>(()) }).unwrap_err();
+        assert_eq!(err.kind, mat_core::error::ErrorKind::StoreMissing);
+        assert!(err.detail.contains("mat fabric init"), "{}", err.detail);
+    }
 
     /// `diag_im_with_engine` の scripted establisher: parts-list（descriptor,
     /// ep0）は既定応答（`FakeConn` の未登録フォールバック `json!(1)`）で

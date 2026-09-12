@@ -63,18 +63,8 @@ fn native_commission(
         cd_signer_dir: cd_signer_store_path(store.root()),
         transport: transport.to_native(),
     };
-    let ncfg = mat_native::NativeConfig {
-        store: store.root().to_path_buf(),
-        iface: cfg.iface.to_string(),
-        thread_iface: cfg.thread_iface.clone(),
-        fabric_index: cfg.fabric_index,
-        issuer_index: cfg.issuer_index,
-    };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| MatError::new(ErrorKind::Other, format!("tokio runtime: {e}")))?;
-    rt.block_on(mat_native::commission::commission(&ncfg, &req))
+    let ncfg = cfg.to_native(store.root());
+    crate::native_direct::block_on(mat_native::commission::commission(&ncfg, &req))?
 }
 
 /// 台帳 upsert + alias + JSON 出力。
