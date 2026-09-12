@@ -367,8 +367,7 @@ mod tests {
     use super::*;
     use crate::message::OPCODE_MRP_STANDALONE_ACK;
     use crate::session::test_util::*;
-    use crate::transport::{Transport, MAX_DATAGRAM};
-    use std::sync::Arc;
+    use crate::transport::MAX_DATAGRAM;
     use std::time::Duration;
 
     #[test]
@@ -412,18 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_attribute_roundtrip() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -464,18 +452,7 @@ mod tests {
     /// already-successful read into a `Timeout` error.
     #[tokio::test]
     async fn read_attribute_succeeds_even_if_closing_status_response_unacked() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         // Fast MRP so the unacked closing send exhausts its retry budget
         // quickly instead of stalling the test.
@@ -535,18 +512,7 @@ mod tests {
     /// the IM status and (when present) the cluster-specific status.
     #[tokio::test]
     async fn invoke_maps_nonzero_status_to_command_status_error() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -589,18 +555,7 @@ mod tests {
     async fn invoke_roundtrip_and_status_response_error() {
         // Scenario 1: InvokeRequest -> InvokeResponse(status 0) -> Ok.
         {
-            let device = bind_local().await;
-            let peer = device.local_addr().unwrap();
-            let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-            let mut s = SecureSession::new(
-                Arc::clone(&transport),
-                peer,
-                LOCAL_SID,
-                PEER_SID,
-                keys(),
-                OUR_NODE,
-                DEV_NODE,
-            );
+            let (mut s, device) = udp_session_pair().await;
 
             let dev = tokio::spawn(async move {
                 let mut buf = [0u8; MAX_DATAGRAM];
@@ -637,18 +592,7 @@ mod tests {
 
         // Scenario 2: ReadRequest -> StatusResponse(0x7E ACCESS_DENIED) -> Err.
         {
-            let device = bind_local().await;
-            let peer = device.local_addr().unwrap();
-            let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-            let mut s = SecureSession::new(
-                Arc::clone(&transport),
-                peer,
-                LOCAL_SID,
-                PEER_SID,
-                keys(),
-                OUR_NODE,
-                DEV_NODE,
-            );
+            let (mut s, device) = udp_session_pair().await;
 
             let dev = tokio::spawn(async move {
                 let mut buf = [0u8; MAX_DATAGRAM];
@@ -691,18 +635,7 @@ mod tests {
     /// `InvokeOutcome` cannot represent.
     #[tokio::test]
     async fn invoke_for_data_untimed_returns_command_fields() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -762,18 +695,7 @@ mod tests {
     /// the InvokeRequest with its TimedRequest flag set (spec §8.5.1).
     #[tokio::test]
     async fn invoke_for_data_timed_sends_timed_request_then_invoke_with_flag() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             // 1. TimedRequest -> StatusResponse(0)
@@ -850,18 +772,7 @@ mod tests {
     /// never send the InvokeRequest.
     #[tokio::test]
     async fn invoke_for_data_timed_request_rejected_aborts_before_invoke() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -916,18 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_attribute_reports_status_zero_as_ok() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -966,18 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_attribute_maps_nonzero_status_to_attribute_status_error() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         let dev = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -1022,18 +911,7 @@ mod tests {
     /// `collect_reports` はエラーで打ち切る（無限拘束防止）。
     #[tokio::test]
     async fn read_cluster_json_aborts_on_endless_chunks() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         const ATTR: u32 = 0x0005;
 
@@ -1111,18 +989,7 @@ mod tests {
     /// merge the resulting reports across chunks via `im::merge_reports`.
     #[tokio::test]
     async fn read_cluster_json_merges_two_chunks() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
 
         const ATTR_A: u32 = 0x0005;
         const ATTR_B: u32 = 0x0006;

@@ -549,6 +549,7 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::btp_fake::fake_link;
 
     #[test]
     fn handshake_request_bytes() {
@@ -837,96 +838,8 @@ mod tests {
     }
 
     // --- Session actor: fake peripheral + connect() tests (Task 3) ---
-
-    /// テスト用 BTP peripheral。GattLink の裏側を演じる。
-    struct FakePeripheral {
-        from_client: tokio::sync::mpsc::Receiver<Vec<u8>>, // C1 writes
-        to_client: tokio::sync::mpsc::Sender<Vec<u8>>,     // C2 indications
-        tx_seq: u8,
-        reasm: Reassembler,
-    }
-
-    fn fake_link() -> (GattLink, FakePeripheral) {
-        let (wtx, wrx) = tokio::sync::mpsc::channel(1);
-        let (itx, irx) = tokio::sync::mpsc::channel(8);
-        (
-            GattLink {
-                writes: wtx,
-                indications: irx,
-            },
-            FakePeripheral {
-                from_client: wrx,
-                to_client: itx,
-                // handshake response が seq 0 を暗黙消費済み → データは 1 始まり
-                tx_seq: 1,
-                reasm: Reassembler::new(),
-            },
-        )
-    }
-
-    impl FakePeripheral {
-        /// handshake request を受けて response を返す。
-        async fn do_handshake(&mut self, segment_size: u16, window: u8) {
-            let req = self.from_client.recv().await.expect("handshake request");
-            assert_eq!(req, handshake_request(PROPOSED_WINDOW));
-            let mut resp = vec![0x65, 0x6C, BTP_VERSION];
-            resp.extend_from_slice(&segment_size.to_le_bytes());
-            resp.push(window);
-            self.to_client.send(resp).await.unwrap();
-        }
-
-        /// client からの書き込みを 1 メッセージ再構成するまで読む。
-        /// 返り値: (メッセージ, 最後に受けた seq)
-        async fn recv_message(&mut self) -> (Vec<u8>, u8) {
-            loop {
-                let frame = self.from_client.recv().await.expect("frame");
-                let pkt = Packet::decode(&frame).unwrap();
-                let seq = pkt.seq;
-                if let Some(msg) = self.reasm.push(&pkt).unwrap() {
-                    return (msg, seq);
-                }
-            }
-        }
-
-        async fn send_ack(&mut self, ack: u8) {
-            let seq = self.tx_seq;
-            self.tx_seq = self.tx_seq.wrapping_add(1);
-            self.to_client
-                .send(encode_standalone_ack(seq, ack).to_vec())
-                .await
-                .unwrap();
-        }
-
-        /// メッセージを segment_size で分割して indication する（ack 相乗り付き）。
-        async fn send_message(&mut self, msg: &[u8], segment_size: u16, ack: Option<u8>) {
-            let mut off = 0usize;
-            let mut first = true;
-            while first || off < msg.len() {
-                let cap = segment_payload_capacity(segment_size, first, ack.is_some() && first);
-                let end = (off + cap).min(msg.len());
-                let ending = end == msg.len();
-                let pos = if first {
-                    SegmentPos::First { ending }
-                } else if ending {
-                    SegmentPos::Last
-                } else {
-                    SegmentPos::Middle
-                };
-                let seq = self.tx_seq;
-                self.tx_seq = self.tx_seq.wrapping_add(1);
-                let frame = encode_data_packet(
-                    seq,
-                    if first { ack } else { None },
-                    pos,
-                    if first { Some(msg.len() as u16) } else { None },
-                    &msg[off..end],
-                );
-                self.to_client.send(frame).await.unwrap();
-                off = end;
-                first = false;
-            }
-        }
-    }
+    // The fake peripheral itself lives in `test_support::btp_fake` so that
+    // `tests/btp_pase_plumbing.rs` (a separate crate) can drive the same one.
 
     #[tokio::test]
     async fn btp_connect_handshakes_and_roundtrips_small_message() {

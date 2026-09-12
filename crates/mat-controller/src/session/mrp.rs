@@ -384,18 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_reliable_encrypts_and_completes_on_sealed_ack() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
         let ex = SecureSession::new_exchange_id();
 
         let dev = tokio::spawn(async move {
@@ -567,23 +556,15 @@ mod tests {
             // StatusReport をデバイス側から自分の exchange で送ってくる
             // ケース）。initiator: true はデバイスが「その exchange の」
             // initiator であることを示す。
-            let header = MessageHeader {
-                session_id: LOCAL_SID,
-                security_flags: 0,
-                message_counter: 700,
-                source_node_id: None,
-                destination: Destination::None,
-            };
-            let proto = ProtocolHeader {
-                initiator: true,
-                needs_ack: true,
-                acked_counter: None,
-                opcode: OPCODE_STATUS_REPORT,
-                exchange_id: foreign_ex,
-                protocol_id: PROTOCOL_ID_SECURE_CHANNEL,
-                vendor_id: None,
-            };
-            let msg = seal_message(&R2I, &header, &proto, b"foreign", DEV_NODE).unwrap();
+            let msg = device_initiated_datagram(
+                foreign_ex,
+                PROTOCOL_ID_SECURE_CHANNEL,
+                OPCODE_STATUS_REPORT,
+                None,
+                true,
+                700,
+                b"foreign",
+            );
             device.send_to(&msg, local).await.unwrap();
 
             // controller の standalone ack は、そのメッセージ自身の
@@ -611,18 +592,7 @@ mod tests {
     /// StatusReport(SUCCESS, secure channel, CloseSession=2) であること（Issue #20）。
     #[tokio::test]
     async fn close_session_sends_single_best_effort_status_report() {
-        let device = bind_local().await;
-        let peer = device.local_addr().unwrap();
-        let transport = Arc::new(Transport::Udp(Arc::new(bind_local().await)));
-        let mut s = SecureSession::new(
-            Arc::clone(&transport),
-            peer,
-            LOCAL_SID,
-            PEER_SID,
-            keys(),
-            OUR_NODE,
-            DEV_NODE,
-        );
+        let (mut s, device) = udp_session_pair().await;
         s.send_close_session().await;
         let mut buf = [0u8; MAX_DATAGRAM];
         let (n, _) = device.recv_from(&mut buf).await.unwrap();
