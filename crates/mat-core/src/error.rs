@@ -71,6 +71,24 @@ impl ErrorKind {
             | ErrorKind::Other => 1,
         }
     }
+
+    /// matd 応答 / admin 応答の `error.kind` を `ErrorKind` へ逆引きする。
+    /// 未知の kind（新しい matd / 壊れた応答）は warn を 1 行出して `Other`
+    /// （exit 1）に倒す。`mat` の `matd_client::emit_response` と `matd` の
+    /// `admin_response_to_result` が同じ規律を共有する（逐語コピーの一本化）。
+    pub fn from_wire(kind: Option<&serde_json::Value>) -> ErrorKind {
+        match kind.and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok()) {
+            Some(k) => k,
+            None => {
+                let raw_kind = kind.cloned().unwrap_or(serde_json::Value::Null);
+                tracing::warn!(
+                    kind = %raw_kind,
+                    "unknown error kind from matd; mapping to `other` for the exit code"
+                );
+                ErrorKind::Other
+            }
+        }
+    }
 }
 
 /// `mat` のエラー。`kind` で分岐、`detail` は AI がリカバリ判断できる粒度の説明。
@@ -146,6 +164,26 @@ impl MatError {
     pub fn emit(&self) {
         eprintln!("{}", self.to_json());
     }
+
+    /// `emit()` して、この kind の exit code を `ExitCode` で返す。CLI の
+    /// `Err(e) => { e.emit(); ExitCode::from(e.kind.exit_code()) }` の定型を畳む。
+    pub fn emit_exit(&self) -> std::process::ExitCode {
+        self.emit();
+        std::process::ExitCode::from(self.kind.exit_code())
+    }
+
+    /// エンジン構築失敗の写像: `store_missing` に「`mat fabric init` で資材を
+    /// 作れ」の誘導を足す（二重付与はしない）。他 kind はそのまま。`mat` の
+    /// 直経路と `matd` 起動時の両方が使う。
+    pub fn with_fabric_init_hint(mut self) -> Self {
+        if self.kind == ErrorKind::StoreMissing && !self.detail.contains("mat fabric init") {
+            self.detail = format!(
+                "{} — run `mat fabric init` to bootstrap the credential store",
+                self.detail
+            );
+        }
+        self
+    }
 }
 
 impl std::fmt::Display for MatError {
@@ -190,6 +228,44 @@ mod tests {
             serde_json::to_string(&ErrorKind::MatdUnavailable).unwrap(),
             "\"matd_unavailable\""
         );
+    }
+
+    #[test]
+    fn emit_exit_maps_kind_to_exit_code() {
+        let e = MatError::new(ErrorKind::NodeNotCommissioned, "x");
+        assert_eq!(e.emit_exit(), std::process::ExitCode::from(11));
+        assert_eq!(
+            MatError::new(ErrorKind::Timeout, "x").emit_exit(),
+            std::process::ExitCode::from(3)
+        );
+    }
+
+    #[test]
+    fn fabric_init_hint_is_added_once_and_only_for_store_missing() {
+        let e = MatError::store_missing("no KVS").with_fabric_init_hint();
+        assert_eq!(
+            e.detail,
+            "no KVS — run `mat fabric init` to bootstrap the credential store"
+        );
+        // idempotent: a detail that already carries the hint is left alone.
+        let again = e.clone().with_fabric_init_hint();
+        assert_eq!(again.detail, e.detail);
+        // other kinds are untouched.
+        let other = MatError::new(ErrorKind::Unreachable, "node 5").with_fabric_init_hint();
+        assert_eq!(other.detail, "node 5");
+    }
+
+    #[test]
+    fn from_wire_decodes_known_kind_and_falls_back_to_other() {
+        assert_eq!(
+            ErrorKind::from_wire(Some(&serde_json::json!("store_missing"))),
+            ErrorKind::StoreMissing
+        );
+        assert_eq!(
+            ErrorKind::from_wire(Some(&serde_json::json!("not_a_kind_we_know"))),
+            ErrorKind::Other
+        );
+        assert_eq!(ErrorKind::from_wire(None), ErrorKind::Other);
     }
 
     #[test]
