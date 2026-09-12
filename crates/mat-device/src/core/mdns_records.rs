@@ -190,41 +190,137 @@ fn encode_message(answers: &[Rr], additionals: &[Rr], unicast: bool) -> Vec<u8> 
     out
 }
 
-struct CommissionableNames {
-    service: String,
-    long_subtype: String,
-    short_subtype: String,
+/// Everything one advertised service contributes to a response or an
+/// announcement: the PTR owners it answers under (`_matterc._udp.local`
+/// plus the two discriminator subtypes for commissionable; the bare
+/// `_matter._tcp.local` for operational), its SRV/TXT owner, its AAAA
+/// owner, and the SRV/TXT/AAAA payloads. Built per advert by
+/// `commissionable_records` / `operational_records`; the record *order*
+/// (PTRs in `ptr_owners` order, then SRV, TXT, AAAA) is what the
+/// byte-pinning tests below assert, so keep it.
+struct ServiceRecords {
+    ptr_owners: Vec<String>,
     instance_full: String,
     host_full: String,
+    port: u16,
+    txt: Vec<String>,
+    addr_v6: Ipv6Addr,
 }
 
 /// Long-discriminator subtype (spec §4.3.1: `_L<discriminator>._sub.
 /// _matterc._udp.local`, decimal, no zero padding) and short-discriminator
 /// subtype (`_S<short>._sub...`, `short` = top 4 bits of the 12-bit
 /// discriminator — same derivation as `commissioning::manual_pairing_code`
-/// and `mat-native::commission`'s short-code matcher).
-fn commissionable_names(ad: &CommissionableAdvert) -> CommissionableNames {
+/// and `mat-native::commission`'s short-code matcher). TXT: `D`
+/// (discriminator), `VP` (`<vendor>+<product>`), `CM`/`SII`/`SAI`.
+fn commissionable_records(ad: &CommissionableAdvert) -> ServiceRecords {
     let short = (ad.discriminator >> 8) as u8;
-    CommissionableNames {
-        service: "_matterc._udp.local".to_string(),
-        long_subtype: format!("_L{}._sub._matterc._udp.local", ad.discriminator),
-        short_subtype: format!("_S{short}._sub._matterc._udp.local"),
+    ServiceRecords {
+        ptr_owners: vec![
+            "_matterc._udp.local".to_string(),
+            format!("_L{}._sub._matterc._udp.local", ad.discriminator),
+            format!("_S{short}._sub._matterc._udp.local"),
+        ],
         instance_full: format!("{}._matterc._udp.local", ad.instance),
         host_full: format!("{}.local", ad.hostname),
+        port: ad.port,
+        txt: vec![
+            format!("D={}", ad.discriminator),
+            format!("VP={}+{}", ad.vendor_id, ad.product_id),
+            format!("CM={}", ad.cm),
+            "SII=300".to_string(),
+            "SAI=300".to_string(),
+        ],
+        addr_v6: ad.addr_v6,
     }
 }
 
-/// TXT record content the querier (`mat_controller::dnssd`) actually reads:
-/// `D` (discriminator), `VP` (`<vendor>+<product>`), plus `CM`/`SII`/`SAI`
-/// per the brief.
-fn commissionable_txt(ad: &CommissionableAdvert) -> Vec<String> {
-    vec![
-        format!("D={}", ad.discriminator),
-        format!("VP={}+{}", ad.vendor_id, ad.product_id),
-        format!("CM={}", ad.cm),
-        "SII=300".to_string(),
-        "SAI=300".to_string(),
-    ]
+/// Operational service: no subtypes (spec §4.3.1 has none for
+/// `_matter._tcp`), TXT `SII`/`SAI` only — the querier's
+/// `resolve_operational` reads just those two keys.
+fn operational_records(ad: &OperationalAdvert) -> ServiceRecords {
+    let instance = operational_instance(&ad.compressed_fabric_id, ad.node_id);
+    ServiceRecords {
+        ptr_owners: vec!["_matter._tcp.local".to_string()],
+        instance_full: format!("{instance}._matter._tcp.local"),
+        host_full: format!("{}.local", ad.hostname),
+        port: ad.port,
+        txt: vec!["SII=300".to_string(), "SAI=300".to_string()],
+        addr_v6: ad.addr_v6,
+    }
+}
+
+impl ServiceRecords {
+    fn srv(&self, ttl: u32) -> Rr {
+        Rr::Srv {
+            owner: self.instance_full.clone(),
+            target: self.host_full.clone(),
+            port: self.port,
+            ttl,
+        }
+    }
+    fn txt(&self, ttl: u32) -> Rr {
+        Rr::Txt {
+            owner: self.instance_full.clone(),
+            strings: self.txt.clone(),
+            ttl,
+        }
+    }
+    fn aaaa(&self, ttl: u32) -> Rr {
+        Rr::Aaaa {
+            owner: self.host_full.clone(),
+            addr: self.addr_v6,
+            ttl,
+        }
+    }
+
+    /// Answers one question, if `q_name` is something this service can
+    /// answer: a PTR owner → PTR (answer) + SRV/TXT/AAAA (additional); the
+    /// instance's own name → SRV/TXT (answer) + AAAA (additional); the
+    /// hostname → AAAA (answer). `None` = not for us.
+    fn respond(&self, q_name: &str, unicast: bool) -> Option<Vec<u8>> {
+        let (srv, txt, aaaa) = (
+            self.srv(HOST_TTL),
+            self.txt(PTR_TXT_TTL),
+            self.aaaa(HOST_TTL),
+        );
+        if self
+            .ptr_owners
+            .iter()
+            .any(|o| q_name.eq_ignore_ascii_case(o))
+        {
+            let ptr = Rr::Ptr {
+                owner: q_name.to_string(),
+                target: self.instance_full.clone(),
+                ttl: PTR_TXT_TTL,
+            };
+            return Some(encode_message(&[ptr], &[srv, txt, aaaa], unicast));
+        }
+        if q_name.eq_ignore_ascii_case(&self.instance_full) {
+            return Some(encode_message(&[srv, txt], &[aaaa], unicast));
+        }
+        if q_name.eq_ignore_ascii_case(&self.host_full) {
+            return Some(encode_message(&[aaaa], &[], unicast));
+        }
+        None
+    }
+
+    /// Every record of this service, announcement order: one PTR per
+    /// owner, then SRV, TXT, AAAA. `ttl` maps each record type's normal
+    /// TTL to the one to emit (identity for an announcement, `|_| 0` for a
+    /// goodbye).
+    fn push_all(&self, answers: &mut Vec<Rr>, ttl: &dyn Fn(u32) -> u32) {
+        for owner in &self.ptr_owners {
+            answers.push(Rr::Ptr {
+                owner: owner.clone(),
+                target: self.instance_full.clone(),
+                ttl: ttl(PTR_TXT_TTL),
+            });
+        }
+        answers.push(self.srv(ttl(HOST_TTL)));
+        answers.push(self.txt(ttl(PTR_TXT_TTL)));
+        answers.push(self.aaaa(ttl(HOST_TTL)));
+    }
 }
 
 /// Answers one question for the commissionable service, if `q_name`
@@ -240,64 +336,7 @@ pub fn encode_commissionable_response(
     ad: &CommissionableAdvert,
     unicast: bool,
 ) -> Option<Vec<u8>> {
-    let names = commissionable_names(ad);
-    let srv = Rr::Srv {
-        owner: names.instance_full.clone(),
-        target: names.host_full.clone(),
-        port: ad.port,
-        ttl: HOST_TTL,
-    };
-    let txt = Rr::Txt {
-        owner: names.instance_full.clone(),
-        strings: commissionable_txt(ad),
-        ttl: PTR_TXT_TTL,
-    };
-    let aaaa = Rr::Aaaa {
-        owner: names.host_full.clone(),
-        addr: ad.addr_v6,
-        ttl: HOST_TTL,
-    };
-
-    if q_name.eq_ignore_ascii_case(&names.service)
-        || q_name.eq_ignore_ascii_case(&names.long_subtype)
-        || q_name.eq_ignore_ascii_case(&names.short_subtype)
-    {
-        let ptr = Rr::Ptr {
-            owner: q_name.to_string(),
-            target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
-        };
-        return Some(encode_message(&[ptr], &[srv, txt, aaaa], unicast));
-    }
-    if q_name.eq_ignore_ascii_case(&names.instance_full) {
-        return Some(encode_message(&[srv, txt], &[aaaa], unicast));
-    }
-    if q_name.eq_ignore_ascii_case(&names.host_full) {
-        return Some(encode_message(&[aaaa], &[], unicast));
-    }
-    None
-}
-
-struct OperationalNames {
-    service: String,
-    instance_full: String,
-    host_full: String,
-}
-
-fn operational_names(ad: &OperationalAdvert) -> OperationalNames {
-    let instance = operational_instance(&ad.compressed_fabric_id, ad.node_id);
-    OperationalNames {
-        service: "_matter._tcp.local".to_string(),
-        instance_full: format!("{instance}._matter._tcp.local"),
-        host_full: format!("{}.local", ad.hostname),
-    }
-}
-
-/// Operational TXT: `SII`/`SAI` only — the querier's `resolve_operational`
-/// only reads those two keys (no `D`/`VP`/`CM`, which are commissioning-only
-/// concepts).
-fn operational_txt() -> Vec<String> {
-    vec!["SII=300".to_string(), "SAI=300".to_string()]
+    commissionable_records(ad).respond(q_name, unicast)
 }
 
 /// Same shape as [`encode_commissionable_response`], for the operational
@@ -307,39 +346,7 @@ pub fn encode_operational_response(
     ad: &OperationalAdvert,
     unicast: bool,
 ) -> Option<Vec<u8>> {
-    let names = operational_names(ad);
-    let srv = Rr::Srv {
-        owner: names.instance_full.clone(),
-        target: names.host_full.clone(),
-        port: ad.port,
-        ttl: HOST_TTL,
-    };
-    let txt = Rr::Txt {
-        owner: names.instance_full.clone(),
-        strings: operational_txt(),
-        ttl: PTR_TXT_TTL,
-    };
-    let aaaa = Rr::Aaaa {
-        owner: names.host_full.clone(),
-        addr: ad.addr_v6,
-        ttl: HOST_TTL,
-    };
-
-    if q_name.eq_ignore_ascii_case(&names.service) {
-        let ptr = Rr::Ptr {
-            owner: q_name.to_string(),
-            target: names.instance_full.clone(),
-            ttl: PTR_TXT_TTL,
-        };
-        return Some(encode_message(&[ptr], &[srv, txt, aaaa], unicast));
-    }
-    if q_name.eq_ignore_ascii_case(&names.instance_full) {
-        return Some(encode_message(&[srv, txt], &[aaaa], unicast));
-    }
-    if q_name.eq_ignore_ascii_case(&names.host_full) {
-        return Some(encode_message(&[aaaa], &[], unicast));
-    }
-    None
+    operational_records(ad).respond(q_name, unicast)
 }
 
 /// Builds one unsolicited multicast announcement (RFC 6762 §8.3) containing
@@ -386,62 +393,10 @@ fn encode_announcement_or_goodbye(
     let ttl = |normal: u32| ttl_override.unwrap_or(normal);
     let mut answers = Vec::new();
     if let Some(ad) = commissionable {
-        let names = commissionable_names(ad);
-        answers.push(Rr::Ptr {
-            owner: names.service.clone(),
-            target: names.instance_full.clone(),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Ptr {
-            owner: names.long_subtype.clone(),
-            target: names.instance_full.clone(),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Ptr {
-            owner: names.short_subtype.clone(),
-            target: names.instance_full.clone(),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Srv {
-            owner: names.instance_full.clone(),
-            target: names.host_full.clone(),
-            port: ad.port,
-            ttl: ttl(HOST_TTL),
-        });
-        answers.push(Rr::Txt {
-            owner: names.instance_full.clone(),
-            strings: commissionable_txt(ad),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Aaaa {
-            owner: names.host_full.clone(),
-            addr: ad.addr_v6,
-            ttl: ttl(HOST_TTL),
-        });
+        commissionable_records(ad).push_all(&mut answers, &ttl);
     }
     for ad in operational {
-        let names = operational_names(ad);
-        answers.push(Rr::Ptr {
-            owner: names.service.clone(),
-            target: names.instance_full.clone(),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Srv {
-            owner: names.instance_full.clone(),
-            target: names.host_full.clone(),
-            port: ad.port,
-            ttl: ttl(HOST_TTL),
-        });
-        answers.push(Rr::Txt {
-            owner: names.instance_full.clone(),
-            strings: operational_txt(),
-            ttl: ttl(PTR_TXT_TTL),
-        });
-        answers.push(Rr::Aaaa {
-            owner: names.host_full.clone(),
-            addr: ad.addr_v6,
-            ttl: ttl(HOST_TTL),
-        });
+        operational_records(ad).push_all(&mut answers, &ttl);
     }
     encode_message(&answers, &[], false)
 }
