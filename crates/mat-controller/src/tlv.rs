@@ -328,15 +328,27 @@ impl<'a> Reader<'a> {
     }
 
     fn take_u16(&mut self) -> Result<u16, TlvError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(
+            self.take(2)?
+                .try_into()
+                .expect("take(2) yields exactly 2 bytes"),
+        ))
     }
 
     fn take_u32(&mut self) -> Result<u32, TlvError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("take(4) yields exactly 4 bytes"),
+        ))
     }
 
     fn take_u64(&mut self) -> Result<u64, TlvError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .expect("take(8) yields exactly 8 bytes"),
+        ))
     }
 
     fn read_tag(&mut self, control: u8) -> Result<Tag, TlvError> {
@@ -393,20 +405,36 @@ impl<'a> Reader<'a> {
         let value = match type_bits {
             0x00 => Value::Int(i64::from(self.take(1)?[0] as i8)),
             0x01 => Value::Int(i64::from(i16::from_le_bytes(
-                self.take(2)?.try_into().unwrap(),
+                self.take(2)?
+                    .try_into()
+                    .expect("take(2) yields exactly 2 bytes"),
             ))),
             0x02 => Value::Int(i64::from(i32::from_le_bytes(
-                self.take(4)?.try_into().unwrap(),
+                self.take(4)?
+                    .try_into()
+                    .expect("take(4) yields exactly 4 bytes"),
             ))),
-            0x03 => Value::Int(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            0x03 => Value::Int(i64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("take(8) yields exactly 8 bytes"),
+            )),
             0x04 => Value::Uint(u64::from(self.take(1)?[0])),
             0x05 => Value::Uint(u64::from(self.take_u16()?)),
             0x06 => Value::Uint(u64::from(self.take_u32()?)),
             0x07 => Value::Uint(self.take_u64()?),
             0x08 => Value::Bool(false),
             0x09 => Value::Bool(true),
-            0x0A => Value::F32(f32::from_le_bytes(self.take(4)?.try_into().unwrap())),
-            0x0B => Value::F64(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            0x0A => Value::F32(f32::from_le_bytes(
+                self.take(4)?
+                    .try_into()
+                    .expect("take(4) yields exactly 4 bytes"),
+            )),
+            0x0B => Value::F64(f64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("take(8) yields exactly 8 bytes"),
+            )),
             0x0C..=0x0F => {
                 let len = self.read_len(type_bits - 0x0C)?;
                 let bytes = self.take(len)?;
