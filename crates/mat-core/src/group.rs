@@ -51,7 +51,8 @@ pub fn resolve_epoch_key_bytes(epoch_key: Option<&str>) -> Result<[u8; 16], MatE
         Some(k) => {
             let hex = validate_epoch_key(k)?;
             let bytes = crate::hex::decode(&hex).expect("validated as 32 hex chars");
-            Ok(<[u8; 16]>::try_from(bytes).expect("32 hex chars = 16 bytes"))
+            <[u8; 16]>::try_from(bytes)
+                .map_err(|_| MatError::new(ErrorKind::Other, "epoch key decode (internal)"))
         }
         None => Ok(generate_epoch_key_bytes()),
     }

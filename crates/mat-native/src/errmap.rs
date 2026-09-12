@@ -33,9 +33,10 @@ pub(crate) fn map_establish_err(
     e: case::EstablishAnyError,
 ) -> MatError {
     use case::EstablishAnyError as E;
-    let (bind_role, fail_prefix) = match role {
-        EstablishRole::Op => ("op", ""),
-        EstablishRole::Subscription => ("subscription", "subscription "),
+    let bind_role = role.log_label();
+    let fail_prefix = match role {
+        EstablishRole::Op => "",
+        EstablishRole::Subscription => "subscription ",
     };
     match &e {
         E::NoAddresses => MatError::new(
@@ -182,6 +183,40 @@ mod tests {
             cluster_status: None,
         }));
         assert_eq!(e.kind, ErrorKind::DeviceRejected);
+    }
+
+    #[test]
+    fn map_establish_err_wordings_per_role() {
+        // finding 1: bind_role は EstablishRole::log_label() 由来（"op"/"subscription"）
+        // に一本化した。detail 文言は逐次ループ時代のワーディングと byte-identical。
+        use case::EstablishAnyError;
+        let e = map_establish_err(5, EstablishRole::Op, EstablishAnyError::NoAddresses);
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert_eq!(e.detail, "native: no addresses resolved for node 5");
+
+        let e = map_establish_err(
+            5,
+            EstablishRole::Subscription,
+            EstablishAnyError::NoAddresses,
+        );
+        assert_eq!(e.kind, ErrorKind::Unreachable);
+        assert_eq!(e.detail, "native: no addresses resolved for node 5");
+
+        let e = map_establish_err(
+            5,
+            EstablishRole::Op,
+            EstablishAnyError::Bind(std::io::Error::other("x")),
+        );
+        assert_eq!(e.kind, ErrorKind::Other);
+        assert_eq!(e.detail, "native: bind op udp: x");
+
+        let e = map_establish_err(
+            5,
+            EstablishRole::Subscription,
+            EstablishAnyError::Bind(std::io::Error::other("x")),
+        );
+        assert_eq!(e.kind, ErrorKind::Other);
+        assert_eq!(e.detail, "native: bind subscription udp: x");
     }
 
     #[test]

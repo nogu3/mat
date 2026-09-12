@@ -41,9 +41,11 @@ async fn node_and_group_shortcuts_share_wire() {
         GroupOpKind::color_temp(Some(2700), None, 3).wire(),
         GroupOpKind::level(50, 3).wire(),
     ];
+    assert_eq!(conn.invoked_fields.len(), 3);
     for (i, (cluster, command, fields)) in group.into_iter().enumerate() {
         let (ep, c, cmd, f) = &conn.invoked_fields[i];
         assert_eq!((*ep, *c, *cmd), (1, cluster, command));
+        assert!(!f.is_empty());
         assert_eq!(f, &fields.unwrap_or_default());
     }
 }

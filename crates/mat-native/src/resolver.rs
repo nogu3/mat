@@ -9,7 +9,7 @@ use mat_controller::dnssd;
 
 /// establish の mDNS 解決を差し替え可能にする抽象。`mat`（一発）は
 /// [`OneShotResolver`]（キャッシュ無し＝設計ルール4）、`matd` は
-/// `CachingResolver`（常駐キャッシュ、Task 5）を注入する。
+/// [`CachingResolver`]（常駐キャッシュ）を注入する。
 #[async_trait]
 pub trait Resolver: Send + Sync {
     async fn resolve(
