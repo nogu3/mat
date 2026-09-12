@@ -616,6 +616,45 @@ impl CaseEstablisher {
         *slot = Arc::new(fresh);
         changed
     }
+
+    /// mDNS 解決 → 専用 UdpTransport + CASE（`case::establish_any` の
+    /// staggered race）。op / 購読の違いはエラー detail とログの前置きだけ。
+    async fn establish_raw(
+        &self,
+        node_id: u64,
+        role: EstablishRole,
+    ) -> Result<SessionConn, MatError> {
+        // 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を recv して
+        // screen で捨てる（監査#3）。購読も op 用 transport と recv を奪い合わ
+        // ないようノードごとに専用（spec 構造判断）。試行ごとの bind と候補
+        // アドレスの staggered race（Happy Eyeballs）は `case::establish_any`
+        // が一括して行う。
+        let creds = self.creds();
+        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+        let resolved = self
+            .resolver
+            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
+            .await
+            .map_err(|e| map_resolve_err(node_id, e))?;
+        let mrp = resolved.mrp_config();
+        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
+        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
+            .await
+            .map_err(|e| map_establish_err(node_id, role, e))?;
+        // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
+        // 確立ごとに可視化する（op / 購読で同形）。
+        tracing::info!(
+            node_id,
+            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
+            peer = %est.peer,
+            "{} transport bound (dedicated socket + CASE)",
+            role.log_label()
+        );
+        Ok(SessionConn {
+            session: est.session,
+            mrp,
+        })
+    }
 }
 
 /// reload の identity 照合: fabric_id / node_id / root 公開鍵が起動時と違う
@@ -640,65 +679,19 @@ pub(crate) fn check_identity(
 #[async_trait]
 impl Establisher for CaseEstablisher {
     async fn establish(&self, node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-        // op 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を
-        // recv して screen で捨てる（監査#3）。試行ごとの専用 UdpTransport の
-        // bind と候補アドレスの staggered race（Happy Eyeballs）は
-        // `case::establish_any` が一括して行う。
-        let creds = self.creds();
-        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
-        let resolved = self
-            .resolver
-            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
-            .await
-            .map_err(|e| map_resolve_err(node_id, e))?;
-        let mrp = resolved.mrp_config();
-        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
-            .await
-            .map_err(|e| map_establish_err(node_id, EstablishRole::Op, e))?;
-        // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
-        // 確立ごとに可視化する（購読側の同名ログと対）。
-        tracing::info!(
-            node_id,
-            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
-            peer = %est.peer,
-            "op transport bound (dedicated socket + CASE)"
-        );
-        Ok(Box::new(SessionConn {
-            session: est.session,
-            mrp,
-        }))
+        Ok(Box::new(
+            self.establish_raw(node_id, EstablishRole::Op).await?,
+        ))
     }
 
     async fn establish_subscription(
         &self,
         node_id: u64,
     ) -> Result<Box<dyn SubscribeConn>, MatError> {
-        // 購読専用ソケット: op 用の transport と recv を奪い合わないよう、
-        // ノードごとに専用 UdpTransport + 専用 CASE（spec 構造判断）。bind と
-        // 候補レースは op 側と同じく `case::establish_any`。
-        let creds = self.creds();
-        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
-        let resolved = self
-            .resolver
-            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
-            .await
-            .map_err(|e| map_resolve_err(node_id, e))?;
-        let mrp = resolved.mrp_config();
-        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
-            .await
-            .map_err(|e| map_establish_err(node_id, EstablishRole::Subscription, e))?;
-        tracing::info!(
-            node_id,
-            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
-            peer = %est.peer,
-            "subscription transport bound (dedicated socket + CASE)"
-        );
-        Ok(Box::new(SubscriptionSession {
-            session: est.session,
-            mrp,
-        }))
+        Ok(Box::new(
+            self.establish_raw(node_id, EstablishRole::Subscription)
+                .await?,
+        ))
     }
 
     fn reload_credentials(&self) -> Result<bool, MatError> {
@@ -714,6 +707,16 @@ impl Establisher for CaseEstablisher {
 enum EstablishRole {
     Op,
     Subscription,
+}
+
+impl EstablishRole {
+    /// "op transport bound …" / "subscription transport bound …" のログ用。
+    fn log_label(self) -> &'static str {
+        match self {
+            EstablishRole::Op => "op",
+            EstablishRole::Subscription => "subscription",
+        }
+    }
 }
 
 /// `case::establish_any` の失敗を mat のエラー種別へ写す。種別の対応は
@@ -742,20 +745,16 @@ fn map_establish_err(node_id: u64, role: EstablishRole, e: case::EstablishAnyErr
     }
 }
 
-/// 実セッション: SecureSession + そのノードの MRP 設定。
+/// 実セッション: SecureSession + そのノードの MRP 設定。op（`NodeConn`）と
+/// 購読（`SubscribeConn`）は同じ型で、確立時の役割（専用ソケット + 専用
+/// CASE）が違うだけ。
 struct SessionConn {
     session: mat_controller::session::SecureSession,
     mrp: MrpConfig,
 }
 
-/// 購読専用の実セッション。
-struct SubscriptionSession {
-    session: mat_controller::session::SecureSession,
-    mrp: MrpConfig,
-}
-
 #[async_trait]
-impl SubscribeConn for SubscriptionSession {
+impl SubscribeConn for SessionConn {
     async fn subscribe(
         &mut self,
         clusters: &[u32],
@@ -959,7 +958,7 @@ fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
     match e {
         // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
         SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
-        // 購読の無音 deadline 切れ。通常は SubscriptionSession::next_report が
+        // 購読の無音 deadline 切れ。通常は SessionConn::next_report_full が
         // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
         SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
         // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
