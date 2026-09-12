@@ -10,7 +10,7 @@ use crate::exchange::{boxed_screen, is_standalone_ack, recv_until, MrpConfig, Ve
 
 use super::client::MAX_REPORT_CHUNKS;
 use super::mrp::ScreenFilter;
-use super::{SecureSession, SessionError, IM_RECV_TIMEOUT};
+use super::{SecureSession, SessionError};
 
 /// デコード失敗 payload の先頭を hex で（未知エンコーディングの事後診断用、
 /// debug ログ専用）。
@@ -46,6 +46,27 @@ fn decode_events_lossy(payload: &[u8], context: &'static str) -> Vec<crate::im::
     crate::im::decode_event_reports(payload).unwrap_or_else(|e| {
         tracing::debug!(error = %e, "{context}");
         Vec::new()
+    })
+}
+
+/// `decode_report_data_message` that never fails: an undecodable payload is
+/// logged (`warn!` with `exchange_id`/`payload_len`/`error`, then `debug!`
+/// with the hex head) and replaced by an empty report (audit ⑨).
+fn decode_report_data_lossy(
+    payload: &[u8],
+    exchange_id: u16,
+    warn_msg: &'static str,
+    debug_msg: &'static str,
+) -> crate::im::ReportDataMessage {
+    crate::im::decode_report_data_message(payload).unwrap_or_else(|e| {
+        tracing::warn!(exchange_id, payload_len = payload.len(), error = %e, "{warn_msg}");
+        tracing::debug!(payload_head = %payload_head_hex(payload), "{debug_msg}");
+        crate::im::ReportDataMessage {
+            reports: Vec::new(),
+            subscription_id: None,
+            more_chunks: false,
+            suppress_response: false,
+        }
     })
 }
 
@@ -94,19 +115,9 @@ impl SecureSession {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_subscribe_request_full(spec);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_SUBSCRIBE_REQUEST,
-                &req,
-                cfg,
-            )
+        let mut msg = self
+            .im_request(exchange_id, im::OPCODE_SUBSCRIBE_REQUEST, &req, cfg)
             .await?;
-        let mut msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
         let mut priming = Vec::new();
         let mut priming_events = Vec::new();
         loop {
@@ -117,27 +128,12 @@ impl SecureSession {
                     // チャンクの属性値だけ（matd の state cache は次のレポートで
                     // 自己回復）。空 rd を push するのは MAX_REPORT_CHUNKS の
                     // flood 防御を非デコード可能チャンクにも効かせるため。
-                    let rd = match im::decode_report_data_message(&msg.payload) {
-                        Ok(rd) => rd,
-                        Err(e) => {
-                            tracing::warn!(
-                                exchange_id,
-                                payload_len = msg.payload.len(),
-                                error = %e,
-                                "subscribe: undecodable priming chunk; acking and continuing"
-                            );
-                            tracing::debug!(
-                                payload_head = %payload_head_hex(&msg.payload),
-                                "undecodable priming chunk payload"
-                            );
-                            im::ReportDataMessage {
-                                reports: Vec::new(),
-                                subscription_id: None,
-                                more_chunks: false,
-                                suppress_response: false,
-                            }
-                        }
-                    };
+                    let rd = decode_report_data_lossy(
+                        &msg.payload,
+                        exchange_id,
+                        "subscribe: undecodable priming chunk; acking and continuing",
+                        "undecodable priming chunk payload",
+                    );
                     let events = decode_events_lossy(
                         &msg.payload,
                         "subscribe: undecodable priming event reports; collecting none",
@@ -159,19 +155,9 @@ impl SecureSession {
                     // priming の各チャンクに StatusResponse(0)。最終チャンク後は
                     // SubscribeResponse が同 exchange で続く。
                     let ok = im::encode_status_response(0);
-                    let resp = self
-                        .send_reliable(
-                            exchange_id,
-                            im::PROTOCOL_ID_IM,
-                            im::OPCODE_STATUS_RESPONSE,
-                            &ok,
-                            cfg,
-                        )
+                    msg = self
+                        .im_request(exchange_id, im::OPCODE_STATUS_RESPONSE, &ok, cfg)
                         .await?;
-                    msg = match resp {
-                        Some(m) => m,
-                        None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-                    };
                 }
                 im::OPCODE_SUBSCRIBE_RESPONSE => {
                     let sr =
@@ -262,27 +248,12 @@ impl SecureSession {
         // （1.16.0 ワイヤ実測: 実デバイスの購読レポートは suppress=false +
         // StatusResponse 期待。suppress=true の相手への余計な SR は exchange
         // 終端で無害）。
-        let rd = match im::decode_report_data_message(&msg.payload) {
-            Ok(rd) => rd,
-            Err(e) => {
-                tracing::warn!(
-                    exchange_id = msg.proto.exchange_id,
-                    payload_len = msg.payload.len(),
-                    error = %e,
-                    "sub pump: undecodable report; delivering as empty"
-                );
-                tracing::debug!(
-                    payload_head = %payload_head_hex(&msg.payload),
-                    "undecodable report payload"
-                );
-                im::ReportDataMessage {
-                    reports: Vec::new(),
-                    subscription_id: None,
-                    more_chunks: false,
-                    suppress_response: false,
-                }
-            }
-        };
+        let rd = decode_report_data_lossy(
+            &msg.payload,
+            msg.proto.exchange_id,
+            "sub pump: undecodable report; delivering as empty",
+            "undecodable report payload",
+        );
         let events = decode_events_lossy(
             &msg.payload,
             "sub pump: undecodable event reports; delivering none",

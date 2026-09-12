@@ -11,6 +11,42 @@ use super::{SecureSession, SessionError, IM_RECV_TIMEOUT};
 pub(super) const MAX_REPORT_CHUNKS: usize = 64;
 
 impl SecureSession {
+    /// Sends one IM message on `exchange_id` reliably and returns the peer's
+    /// first real reply: the one piggybacked on the ack, or — after a
+    /// standalone ack — the next message within `IM_RECV_TIMEOUT`.
+    pub(super) async fn im_request(
+        &mut self,
+        exchange_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<IncomingMessage, SessionError> {
+        let resp = self
+            .send_reliable(exchange_id, crate::im::PROTOCOL_ID_IM, opcode, payload, cfg)
+            .await?;
+        match resp {
+            Some(m) => Ok(m),
+            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await,
+        }
+    }
+}
+
+/// Checks an IM reply's opcode: `expected` → `Ok(payload)`; `StatusResponse`
+/// → `Err(Im(StatusResponse(status)))` (decode error → `Err(Im(..))`);
+/// anything else → `Err(UnexpectedOpcode(op))`.
+pub(super) fn expect_im(msg: &IncomingMessage, expected: u8) -> Result<&[u8], SessionError> {
+    use crate::im::{self, ImError};
+    match msg.proto.opcode {
+        op if op == expected => Ok(&msg.payload),
+        im::OPCODE_STATUS_RESPONSE => {
+            let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
+            Err(SessionError::Im(ImError::StatusResponse(s)))
+        }
+        op => Err(SessionError::UnexpectedOpcode(op)),
+    }
+}
+
+impl SecureSession {
     /// Reads a single attribute over the Interaction Model (spec §8.9.2).
     /// If the device's ReportData doesn't suppress the response, this also
     /// sends back the required StatusResponse(SUCCESS) — best-effort: the
@@ -26,50 +62,32 @@ impl SecureSession {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_read_request(endpoint, cluster, attribute);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_READ_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_READ_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
-        match msg.proto.opcode {
-            im::OPCODE_REPORT_DATA => {
-                let rd = im::decode_report_data(&msg.payload).map_err(SessionError::Im)?;
-                if !rd.suppress_response {
-                    // Best-effort close: the read already succeeded (we
-                    // have `rd` in hand), so a lost ack on this trailing
-                    // StatusResponse must not turn it into an error here —
-                    // it's the peer's retransmit problem, not ours.
-                    let ok = im::encode_status_response(0);
-                    let _ = self
-                        .send_reliable(
-                            exchange_id,
-                            im::PROTOCOL_ID_IM,
-                            im::OPCODE_STATUS_RESPONSE,
-                            &ok,
-                            cfg,
-                        )
-                        .await;
-                }
-                if let Some(status) = rd.status {
-                    return Err(SessionError::Im(ImError::AttributeStatus(status)));
-                }
-                rd.value
-                    .ok_or(SessionError::Im(ImError::Malformed("no value")))
-            }
-            im::OPCODE_STATUS_RESPONSE => {
-                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
-                Err(SessionError::Im(ImError::StatusResponse(s)))
-            }
-            op => Err(SessionError::UnexpectedOpcode(op)),
+        let rd = im::decode_report_data(expect_im(&msg, im::OPCODE_REPORT_DATA)?)
+            .map_err(SessionError::Im)?;
+        if !rd.suppress_response {
+            // Best-effort close: the read already succeeded (we
+            // have `rd` in hand), so a lost ack on this trailing
+            // StatusResponse must not turn it into an error here —
+            // it's the peer's retransmit problem, not ours.
+            let ok = im::encode_status_response(0);
+            let _ = self
+                .send_reliable(
+                    exchange_id,
+                    im::PROTOCOL_ID_IM,
+                    im::OPCODE_STATUS_RESPONSE,
+                    &ok,
+                    cfg,
+                )
+                .await;
         }
+        if let Some(status) = rd.status {
+            return Err(SessionError::Im(ImError::AttributeStatus(status)));
+        }
+        rd.value
+            .ok_or(SessionError::Im(ImError::Malformed("no value")))
     }
 
     /// Invokes a single command over the Interaction Model (spec §8.9.4).
@@ -91,36 +109,18 @@ impl SecureSession {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_invoke_request(endpoint, cluster, command, fields_tlv);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_INVOKE_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_INVOKE_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
-        match msg.proto.opcode {
-            im::OPCODE_INVOKE_RESPONSE => {
-                let outcome = im::decode_invoke_response(&msg.payload).map_err(SessionError::Im)?;
-                if outcome.status != 0 {
-                    return Err(SessionError::Im(ImError::CommandStatus {
-                        status: outcome.status,
-                        cluster_status: outcome.cluster_status,
-                    }));
-                }
-                Ok(outcome)
-            }
-            im::OPCODE_STATUS_RESPONSE => {
-                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
-                Err(SessionError::Im(ImError::StatusResponse(s)))
-            }
-            op => Err(SessionError::UnexpectedOpcode(op)),
+        let outcome = im::decode_invoke_response(expect_im(&msg, im::OPCODE_INVOKE_RESPONSE)?)
+            .map_err(SessionError::Im)?;
+        if outcome.status != 0 {
+            return Err(SessionError::Im(ImError::CommandStatus {
+                status: outcome.status,
+                cluster_status: outcome.cluster_status,
+            }));
         }
+        Ok(outcome)
     }
 
     /// Invokes a single command over the Interaction Model, optionally as a
@@ -160,37 +160,18 @@ impl SecureSession {
         } else {
             im::encode_invoke_request(endpoint, cluster, command, fields_tlv)
         };
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_INVOKE_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_INVOKE_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
-        match msg.proto.opcode {
-            im::OPCODE_INVOKE_RESPONSE => {
-                let data =
-                    im::decode_invoke_response_data(&msg.payload).map_err(SessionError::Im)?;
-                if data.status != 0 {
-                    return Err(SessionError::Im(ImError::CommandStatus {
-                        status: data.status,
-                        cluster_status: data.cluster_status,
-                    }));
-                }
-                Ok(data)
-            }
-            im::OPCODE_STATUS_RESPONSE => {
-                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
-                Err(SessionError::Im(ImError::StatusResponse(s)))
-            }
-            op => Err(SessionError::UnexpectedOpcode(op)),
+        let data = im::decode_invoke_response_data(expect_im(&msg, im::OPCODE_INVOKE_RESPONSE)?)
+            .map_err(SessionError::Im)?;
+        if data.status != 0 {
+            return Err(SessionError::Im(ImError::CommandStatus {
+                status: data.status,
+                cluster_status: data.cluster_status,
+            }));
         }
+        Ok(data)
     }
 
     /// Sends `TimedRequest(timeout_ms)` on `exchange_id` and waits for its
@@ -206,19 +187,9 @@ impl SecureSession {
     ) -> Result<(), SessionError> {
         use crate::im::{self, ImError};
         let timed_req = im::encode_timed_request(timeout_ms);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_TIMED_REQUEST,
-                &timed_req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_TIMED_REQUEST, &timed_req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
         match msg.proto.opcode {
             im::OPCODE_STATUS_RESPONSE => {
                 let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
@@ -262,19 +233,9 @@ impl SecureSession {
                         // Chunk continuation: a StatusResponse(0) prompts
                         // the device to send the next chunk.
                         let ok = im::encode_status_response(0);
-                        let resp = self
-                            .send_reliable(
-                                exchange_id,
-                                im::PROTOCOL_ID_IM,
-                                im::OPCODE_STATUS_RESPONSE,
-                                &ok,
-                                cfg,
-                            )
+                        msg = self
+                            .im_request(exchange_id, im::OPCODE_STATUS_RESPONSE, &ok, cfg)
                             .await?;
-                        msg = match resp {
-                            Some(m) => m,
-                            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-                        };
                         continue;
                     }
                     if !suppress {
@@ -321,19 +282,9 @@ impl SecureSession {
         use crate::im::{self, ImError};
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_read_request(endpoint, cluster, attribute);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_READ_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_READ_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
         let msgs = self.collect_reports(exchange_id, msg, cfg).await?;
         if let Some((_, value)) = im::merge_reports(&msgs).into_iter().next() {
             return Ok(value);
@@ -363,19 +314,9 @@ impl SecureSession {
         use crate::im;
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_read_request_cluster(endpoint, cluster);
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_READ_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_READ_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
         let msgs = self.collect_reports(exchange_id, msg, cfg).await?;
         Ok(im::merge_reports(&msgs))
     }
@@ -409,33 +350,15 @@ impl SecureSession {
         } else {
             im::encode_write_request_tlv(endpoint, cluster, attribute, data_tlv)
         };
-        let resp = self
-            .send_reliable(
-                exchange_id,
-                im::PROTOCOL_ID_IM,
-                im::OPCODE_WRITE_REQUEST,
-                &req,
-                cfg,
-            )
+        let msg = self
+            .im_request(exchange_id, im::OPCODE_WRITE_REQUEST, &req, cfg)
             .await?;
-        let msg = match resp {
-            Some(m) => m,
-            None => self.recv(exchange_id, IM_RECV_TIMEOUT).await?,
-        };
-        match msg.proto.opcode {
-            im::OPCODE_WRITE_RESPONSE => {
-                let status = im::decode_write_response(&msg.payload).map_err(SessionError::Im)?;
-                if status != 0 {
-                    return Err(SessionError::Im(ImError::AttributeStatus(status)));
-                }
-                Ok(())
-            }
-            im::OPCODE_STATUS_RESPONSE => {
-                let s = im::decode_status_response(&msg.payload).map_err(SessionError::Im)?;
-                Err(SessionError::Im(ImError::StatusResponse(s)))
-            }
-            op => Err(SessionError::UnexpectedOpcode(op)),
+        let status = im::decode_write_response(expect_im(&msg, im::OPCODE_WRITE_RESPONSE)?)
+            .map_err(SessionError::Im)?;
+        if status != 0 {
+            return Err(SessionError::Im(ImError::AttributeStatus(status)));
         }
+        Ok(())
     }
 }
 
@@ -447,6 +370,45 @@ mod tests {
     use crate::transport::{Transport, MAX_DATAGRAM};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn expect_im_maps_status_response_and_unexpected_opcode() {
+        use crate::message::{Destination, MessageHeader, ProtocolHeader};
+        let mk = |opcode: u8, payload: Vec<u8>| IncomingMessage {
+            header: MessageHeader {
+                session_id: 1,
+                security_flags: 0,
+                message_counter: 1,
+                source_node_id: None,
+                destination: Destination::None,
+            },
+            proto: ProtocolHeader {
+                initiator: false,
+                needs_ack: false,
+                acked_counter: None,
+                opcode,
+                exchange_id: 1,
+                protocol_id: crate::im::PROTOCOL_ID_IM,
+                vendor_id: None,
+            },
+            payload,
+        };
+        let ok = mk(crate::im::OPCODE_REPORT_DATA, b"x".to_vec());
+        assert_eq!(expect_im(&ok, crate::im::OPCODE_REPORT_DATA).unwrap(), b"x");
+        let sr = mk(
+            crate::im::OPCODE_STATUS_RESPONSE,
+            crate::im::encode_status_response(0x7E),
+        );
+        assert!(matches!(
+            expect_im(&sr, crate::im::OPCODE_REPORT_DATA),
+            Err(SessionError::Im(crate::im::ImError::StatusResponse(0x7E)))
+        ));
+        let other = mk(0x33, Vec::new());
+        assert!(matches!(
+            expect_im(&other, crate::im::OPCODE_REPORT_DATA),
+            Err(SessionError::UnexpectedOpcode(0x33))
+        ));
+    }
 
     #[tokio::test]
     async fn read_attribute_roundtrip() {
