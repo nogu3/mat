@@ -417,12 +417,7 @@ fn keyset_with_next(blob: &[u8], next: u16) -> Option<Vec<u8>> {
 /// 元の slot 0 に ctx4/5/6 のどれかが無ければ末尾に補う（mat / chip-tool どちらの
 /// 書き手も 3 つ揃えるので実運用では起きない）。外側が struct でない / ctx3 が無い /
 /// 先頭要素が struct でない / 途中で切れている blob は `None`。
-pub(crate) fn keyset_with_slot0(
-    blob: &[u8],
-    start_time: u64,
-    hash: u16,
-    key: &[u8; 16],
-) -> Option<Vec<u8>> {
+fn keyset_with_slot0(blob: &[u8], start_time: u64, hash: u16, key: &[u8; 16]) -> Option<Vec<u8>> {
     let mut r = Reader::new(blob);
     if r.next().ok()??.value != Value::StructStart {
         return None;

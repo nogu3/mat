@@ -1,14 +1,14 @@
 //! Minimal reader for chip-tool's Linux ini KVS (connectedhomeip v1.4.2.0).
 //!
-//! Two readers: [`read_fabric_credentials`] (a full credential set including
-//! the operational key, keys `f/<index>/{r,i,n,o}` and `f/<index>/k/0` —
-//! chip-tool does not persist its *own* op key, so this path serves fixtures
-//! and non-chip-tool stores), and [`read_self_issue_materials`] (what
-//! self-issuing our own NOC needs: the root CA key from the alpha ini; the
-//! root cert, our node/fabric id, and the IPK from the main ini fabric
-//! table). Format facts (verified against SDK v1.4.2.0): `[Default]`
-//! section, base64 values; the keyset stores the already derived
-//! *operational* group key, not the epoch key.
+//! Readers: [`read_self_issue_materials`] (what self-issuing our own NOC
+//! needs: the root CA key from the alpha ini; the root cert, our node/fabric
+//! id, and the IPK from the main ini fabric table), the `mat fabric list`
+//! helpers ([`list_fabric_indices`] / [`read_noc_identity`] /
+//! [`read_rcac_pubkey`]), the group-send credentials
+//! ([`read_group_credentials`]) and the persisted counters / mat-only epoch
+//! keys. Format facts (verified against SDK v1.4.2.0): `[Default]` section,
+//! base64 values; the keyset stores the already derived *operational* group
+//! key, not the epoch key.
 
 use std::path::Path;
 
@@ -19,34 +19,9 @@ use crate::tlv::{Element, Reader, Tag, Value};
 /// chip-tool 互換 main KVS のファイル名（store ルート直下）。
 pub const MAIN_INI_FILE: &str = "chip_tool_config.ini";
 
-/// Fabric credentials read from chip-tool's ini KVS, still in raw form
-/// (opaque certs, unparsed keys) as CASE needs them.
-#[derive(Clone)]
-pub struct RawFabricCredentials {
-    pub rcac: Vec<u8>,
-    pub icac: Option<Vec<u8>>,
-    pub noc: Vec<u8>,
-    pub op_public_key: [u8; 65],
-    pub op_private_key: [u8; 32],
-    pub ipk_operational: [u8; 16],
-}
-
-/// Manual `Debug`: this struct carries the operational private key and the
-/// fabric's identity-protection key, both secret. Never derive `Debug` here
-/// again — certs/keys are logged incidentally via `{:?}` (error contexts,
-/// test failure output, etc.) and this repo is public.
-impl std::fmt::Debug for RawFabricCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawFabricCredentials")
-            .field("rcac_len", &self.rcac.len())
-            .field("icac_len", &self.icac.as_ref().map(Vec::len))
-            .field("noc_len", &self.noc.len())
-            .field("op_public_key_len", &self.op_public_key.len())
-            .field("op_private_key", &"[REDACTED]")
-            .field("ipk_operational", &"[REDACTED]")
-            .finish()
-    }
-}
+/// chip-tool 互換 alpha KVS（CA 鍵ペア `ExampleOpCredsCAKey<n>` を持つ）の
+/// ファイル名（store ルート直下）。
+pub const ALPHA_INI_FILE: &str = "chip_tool_config.alpha.ini";
 
 /// KVS read/parse error. `Display` names the offending key and reason so an
 /// AI or operator can decide recovery without opening the ini file.
@@ -56,10 +31,6 @@ pub enum KvsError {
     SectionMissing,
     KeyMissing(String),
     BadBase64(String),
-    BadOpKey {
-        fabric_index: u8,
-        reason: &'static str,
-    },
     BadKeyset {
         fabric_index: u8,
         reason: &'static str,
@@ -86,12 +57,6 @@ impl std::fmt::Display for KvsError {
             KvsError::SectionMissing => write!(f, "kvs: missing [Default] section"),
             KvsError::KeyMissing(k) => write!(f, "kvs key \"{k}\": missing"),
             KvsError::BadBase64(k) => write!(f, "kvs key \"{k}\": invalid base64"),
-            KvsError::BadOpKey {
-                fabric_index,
-                reason,
-            } => {
-                write!(f, "kvs key \"f/{fabric_index}/o\": bad op key: {reason}")
-            }
             KvsError::BadKeyset {
                 fabric_index,
                 reason,
@@ -183,73 +148,6 @@ fn decode_b64(section: &str, key: &str) -> Result<Option<Vec<u8>>, KvsError> {
     }
 }
 
-/// Reads the next TLV element, mapping decode/EOF errors to `BadOpKey`.
-fn next_opkey_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a>, KvsError> {
-    r.next()
-        .map_err(|_| KvsError::BadOpKey {
-            fabric_index,
-            reason: "malformed tlv",
-        })?
-        .ok_or(KvsError::BadOpKey {
-            fabric_index,
-            reason: "malformed tlv",
-        })
-}
-
-/// Parses the chip-tool `OperationalKeypair` TLV blob (version + 97-byte
-/// SEC1-uncompressed-pubkey||privkey pair) into its two halves.
-fn parse_opkey(blob: &[u8], fabric_index: u8) -> Result<([u8; 65], [u8; 32]), KvsError> {
-    let mut r = Reader::new(blob);
-
-    let el = next_opkey_el(&mut r, fabric_index)?;
-    if el.value != Value::StructStart {
-        return Err(KvsError::BadOpKey {
-            fabric_index,
-            reason: "malformed tlv",
-        });
-    }
-
-    let el = next_opkey_el(&mut r, fabric_index)?;
-    let version = match (el.tag, el.value) {
-        (Tag::Context(0), Value::Uint(v)) => v,
-        _ => {
-            return Err(KvsError::BadOpKey {
-                fabric_index,
-                reason: "malformed tlv",
-            })
-        }
-    };
-    if version != 1 {
-        return Err(KvsError::BadOpKey {
-            fabric_index,
-            reason: "unsupported version",
-        });
-    }
-
-    let el = next_opkey_el(&mut r, fabric_index)?;
-    let keypair = match (el.tag, el.value) {
-        (Tag::Context(1), Value::Bytes(b)) => b,
-        _ => {
-            return Err(KvsError::BadOpKey {
-                fabric_index,
-                reason: "malformed tlv",
-            })
-        }
-    };
-    if keypair.len() != 97 {
-        return Err(KvsError::BadOpKey {
-            fabric_index,
-            reason: "keypair must be 97 bytes",
-        });
-    }
-
-    let mut pubkey = [0u8; 65];
-    let mut privkey = [0u8; 32];
-    pubkey.copy_from_slice(&keypair[..65]);
-    privkey.copy_from_slice(&keypair[65..]);
-    Ok((pubkey, privkey))
-}
-
 /// Reads the next TLV element, mapping decode/EOF errors to `BadKeyset`.
 fn next_keyset_el<'a>(r: &mut Reader<'a>, fabric_index: u8) -> Result<Element<'a>, KvsError> {
     r.next()
@@ -290,7 +188,7 @@ fn skip_rest_of_container(r: &mut Reader, fabric_index: u8) -> Result<(), KvsErr
 /// 16-bit hash (the group session id, aka GKH), if present.
 ///
 /// The hash (Context(5)) is `Option`: the IPK read path
-/// ([`parse_keyset`]/[`read_fabric_credentials`], used by M4 CASE) never
+/// ([`parse_keyset`]/[`read_self_issue_materials`], used by M4 CASE) never
 /// needed it and the pre-M5 parser tolerated its absence — restore that
 /// tolerance here. Only the group-send path
 /// ([`parse_keyset_first_entry`]/[`read_group_credentials`]) actually needs
@@ -407,37 +305,6 @@ fn parse_keyset(blob: &[u8], fabric_index: u8) -> Result<[u8; 16], KvsError> {
     parse_keyset_first_entry(blob, fabric_index).map(|(key, _hash)| key)
 }
 
-/// Reads the five fabric credentials chip-tool's CASE implementation needs
-/// (RCAC, optional ICAC, NOC, operational keypair, operational group key)
-/// out of its Linux ini KVS file, for the given `fabric_index`.
-pub fn read_fabric_credentials(
-    path: &Path,
-    fabric_index: u8,
-) -> Result<RawFabricCredentials, KvsError> {
-    let text = std::fs::read_to_string(path).map_err(KvsError::Io)?;
-    let section = default_section(&text).ok_or(KvsError::SectionMissing)?;
-    let get = |key: String| -> Result<Option<Vec<u8>>, KvsError> { decode_b64(section, &key) };
-    let must = |key: String| -> Result<Vec<u8>, KvsError> {
-        get(key.clone())?.ok_or(KvsError::KeyMissing(key))
-    };
-
-    let rcac = must(format!("f/{fabric_index}/r"))?;
-    let icac = get(format!("f/{fabric_index}/i"))?;
-    let noc = must(format!("f/{fabric_index}/n"))?;
-    let (op_public_key, op_private_key) =
-        parse_opkey(&must(format!("f/{fabric_index}/o"))?, fabric_index)?;
-    let ipk_operational = parse_keyset(&must(format!("f/{fabric_index}/k/0"))?, fabric_index)?;
-
-    Ok(RawFabricCredentials {
-        rcac,
-        icac,
-        noc,
-        op_public_key,
-        op_private_key,
-        ipk_operational,
-    })
-}
-
 /// CA materials chip-tool persists, needed to self-issue a NOC without going
 /// through chip-tool. `root_private_key` comes from the *alpha* KVS (the CA's
 /// own key pair); `rcac` (root cert, Matter-TLV form — its parsed public key is
@@ -455,8 +322,8 @@ pub struct SelfIssueMaterials {
 }
 
 /// Manual `Debug`: carries the root CA's private key and the fabric's
-/// identity-protection key, both secret. See `RawFabricCredentials`'s `Debug`
-/// impl for the same rationale.
+/// identity-protection key, both secret. See `crate::fabric::FabricCredentials`'s
+/// `Debug` impl for the same rationale.
 impl std::fmt::Debug for SelfIssueMaterials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SelfIssueMaterials")
@@ -599,7 +466,8 @@ pub struct GroupCredentials {
 }
 
 /// Manual `Debug`: carries the operational group encryption key, a secret.
-/// See `RawFabricCredentials`'s `Debug` impl for the same rationale.
+/// See `crate::fabric::FabricCredentials`'s `Debug` impl for the same
+/// rationale.
 impl std::fmt::Debug for GroupCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupCredentials")
@@ -940,18 +808,6 @@ mod tests {
     use crate::tlv::{Tag, Writer};
     use base64ct::{Base64, Encoding};
 
-    fn opkey_blob(pubkey: &[u8; 65], privkey: &[u8; 32]) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_uint(Tag::Context(0), 1); // version
-        let mut kp = Vec::with_capacity(97);
-        kp.extend_from_slice(pubkey);
-        kp.extend_from_slice(privkey);
-        w.put_bytes(Tag::Context(1), &kp);
-        w.end_container();
-        w.finish()
-    }
-
     fn keyset_blob(key: &[u8; 16]) -> Vec<u8> {
         keyset_blob_with_count(key, 1)
     }
@@ -1006,8 +862,6 @@ mod tests {
         path
     }
 
-    const PUB: [u8; 65] = [0xAA; 65];
-    const PRIV: [u8; 32] = [0xBB; 32];
     const IPK: [u8; 16] = [0xCC; 16];
 
     /// node01_01 フィクスチャ（chip SDK テスト証明書）とその subject の実 id。
@@ -1019,118 +873,61 @@ mod tests {
         (bytes, cert.node_id().unwrap(), cert.fabric_id().unwrap())
     }
 
-    #[test]
-    fn reads_all_five_items() {
-        let op = opkey_blob(&PUB, &PRIV);
-        let ks = keyset_blob(&IPK);
-        let path = write_ini(&[
-            ("f/1/r", b"rcac-bytes"),
-            ("f/1/i", b"icac-bytes"),
-            ("f/1/n", b"noc-bytes"),
-            ("f/1/o", &op),
-            ("f/1/k/0", &ks),
-        ]);
-        let c = read_fabric_credentials(&path, 1).unwrap();
-        assert_eq!(c.rcac, b"rcac-bytes");
-        assert_eq!(c.icac.as_deref(), Some(b"icac-bytes".as_slice()));
-        assert_eq!(c.noc, b"noc-bytes");
-        assert_eq!(c.op_public_key, PUB);
-        assert_eq!(c.op_private_key, PRIV);
-        assert_eq!(c.ipk_operational, IPK);
-        std::fs::remove_file(path).ok();
+    /// `read_self_issue_materials` 用の最小フィクスチャ（alpha: root 鍵 97B、
+    /// main: rcac / node01_01 NOC / 指定 keyset blob）。戻りは (alpha, main)。
+    fn self_issue_fixture(tag: &str, ks: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut root_key = vec![0xAA; 65];
+        root_key.extend_from_slice(&[0xBB; 32]);
+        let (noc, _, _) = noc_fixture();
+        let alpha = write_named_ini(
+            &format!("{tag}-alpha"),
+            &[("ExampleOpCredsCAKey0", &root_key)],
+        );
+        let main = write_named_ini(
+            &format!("{tag}-main"),
+            &[
+                ("f/1/r", b"rcac-tlv-bytes"),
+                ("f/1/n", noc),
+                ("f/1/k/0", ks),
+            ],
+        );
+        (alpha, main)
     }
 
     #[test]
     fn lookup_skips_lines_without_equals_sign() {
-        let op = opkey_blob(&PUB, &PRIV);
-        let ks = keyset_blob(&IPK);
-        let path = write_ini(&[
-            ("f/1/r", b"rcac-bytes"),
-            ("f/1/n", b"noc-bytes"),
-            ("f/1/o", &op),
-            ("f/1/k/0", &ks),
-        ]);
-        // Inject a blank line and a comment-ish line without '=' between the
-        // [Default] header and the target keys, simulating real chip-tool
-        // ini quirks that must not abort the section scan.
-        let text = std::fs::read_to_string(&path).unwrap();
+        let (alpha, main) = self_issue_fixture("noeq", &keyset_blob(&IPK));
+        // [Default] 直後に空行と '=' の無いコメント風の行を差し込む（実 chip-tool
+        // ini の癖）。セクション走査が中断してはいけない。
+        let text = std::fs::read_to_string(&main).unwrap();
         let text = text.replacen(
             "[Default]\n",
             "[Default]\n\n; a comment without an equals sign\n",
             1,
         );
-        std::fs::write(&path, text).unwrap();
-
-        let c = read_fabric_credentials(&path, 1).unwrap();
-        assert_eq!(c.rcac, b"rcac-bytes");
-        assert_eq!(c.noc, b"noc-bytes");
-        std::fs::remove_file(path).ok();
+        std::fs::write(&main, text).unwrap();
+        let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
+        assert_eq!(m.rcac, b"rcac-tlv-bytes");
+        assert_eq!(m.ipk_operational, IPK);
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
     }
 
     #[test]
-    fn missing_icac_is_none_but_missing_noc_is_error() {
-        let op = opkey_blob(&PUB, &PRIV);
-        let ks = keyset_blob(&IPK);
-        let path = write_ini(&[
-            ("f/1/r", b"rcac-bytes"),
-            ("f/1/n", b"noc-bytes"),
-            ("f/1/o", &op),
-            ("f/1/k/0", &ks),
-        ]);
-        let c = read_fabric_credentials(&path, 1).unwrap();
-        assert_eq!(c.icac, None);
-        std::fs::remove_file(&path).ok();
-
-        let path = write_ini(&[("f/1/r", b"rcac-bytes")]);
-        let err = read_fabric_credentials(&path, 1).unwrap_err();
-        assert!(matches!(err, KvsError::KeyMissing(k) if k == "f/1/n"));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn rejects_bad_opkey_version_and_bad_base64() {
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_uint(Tag::Context(0), 2); // 未知バージョン
-        w.put_bytes(Tag::Context(1), &[0u8; 97]);
-        w.end_container();
-        let bad_op = w.finish();
-        let ks = keyset_blob(&IPK);
-        let path = write_ini(&[
-            ("f/1/r", b"r"),
-            ("f/1/n", b"n"),
-            ("f/1/o", &bad_op),
-            ("f/1/k/0", &ks),
-        ]);
-        assert!(matches!(
-            read_fabric_credentials(&path, 1).unwrap_err(),
-            KvsError::BadOpKey {
-                fabric_index: 1,
-                ..
-            }
-        ));
-        std::fs::remove_file(&path).ok();
-
+    fn rejects_bad_base64_naming_the_key() {
         let path = std::env::temp_dir().join(format!("mat-kvs-badb64-{}.ini", std::process::id()));
         std::fs::write(&path, "[Default]\nf/1/r = !!notbase64!!\n").unwrap();
         assert!(matches!(
-            read_fabric_credentials(&path, 1).unwrap_err(),
-            KvsError::BadBase64(_)
+            read_rcac_pubkey(&path, 1).unwrap_err(),
+            KvsError::BadBase64(k) if k == "f/1/r"
         ));
         std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn rejects_keyset_with_zero_keys_count() {
-        let op = opkey_blob(&PUB, &PRIV);
-        let ks = keyset_blob_with_count(&IPK, 0);
-        let path = write_ini(&[
-            ("f/1/r", b"r"),
-            ("f/1/n", b"n"),
-            ("f/1/o", &op),
-            ("f/1/k/0", &ks),
-        ]);
-        let err = read_fabric_credentials(&path, 1).unwrap_err();
+        let (alpha, main) = self_issue_fixture("zero", &keyset_blob_with_count(&IPK, 0));
+        let err = read_self_issue_materials(&alpha, &main, 1, 0).unwrap_err();
         assert!(matches!(
             err,
             KvsError::BadKeyset {
@@ -1142,7 +939,8 @@ mod tests {
             err.to_string().contains("f/1/k/0"),
             "error message should name the failing key: {err}"
         );
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
     }
 
     #[test]
@@ -1303,17 +1101,12 @@ mod tests {
         // ことを確認する。
         let ks_no_hash = keyset_blob_no_hash(&GROUP_KEY);
 
-        // IPK 読み出し（read_fabric_credentials 経由）: hash 無しでも成功。
-        let op = opkey_blob(&PUB, &PRIV);
-        let path = write_ini(&[
-            ("f/1/r", b"r"),
-            ("f/1/n", b"n"),
-            ("f/1/o", &op),
-            ("f/1/k/0", &ks_no_hash),
-        ]);
-        let c = read_fabric_credentials(&path, 1).unwrap();
-        assert_eq!(c.ipk_operational, GROUP_KEY);
-        std::fs::remove_file(&path).ok();
+        // IPK 読み出し（read_self_issue_materials 経由）: hash 無しでも成功。
+        let (alpha, main) = self_issue_fixture("nohash", &ks_no_hash);
+        let m = read_self_issue_materials(&alpha, &main, 1, 0).unwrap();
+        assert_eq!(m.ipk_operational, GROUP_KEY);
+        std::fs::remove_file(alpha).ok();
+        std::fs::remove_file(main).ok();
 
         // group 読み出し（read_group_credentials 経由）: hash が無いと拒否する。
         let path2 = write_ini(&[

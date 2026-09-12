@@ -120,20 +120,11 @@ impl std::fmt::Debug for FabricCredentials {
     }
 }
 
-/// `FabricCredentials::from_raw` / `from_self_issued` error.
+/// `FabricCredentials::from_self_issued` error.
 #[derive(Debug)]
 pub enum FabricError {
     /// Certificate parse/verification failure (own-chain sanity check).
     Cert(crate::cert::CertError),
-    /// NOC subject is missing node id and/or fabric id. Defensive only: for
-    /// both constructors the NOC has already passed through
-    /// `verify_noc_chain`, which itself requires both ids to be present, so
-    /// this variant is not reachable from `from_raw` or `from_self_issued`
-    /// today. Kept as a belt-and-suspenders guard against a future
-    /// `verify_noc_chain` change that relaxes that guarantee.
-    NocMissingIds,
-    /// KVS operational public key does not match the NOC's public key.
-    OpKeyMismatch,
     /// Operational key pair generation failed (self-issued path only).
     GenKey,
     /// Self-issued NOC failed to build or self-verify.
@@ -144,13 +135,6 @@ impl std::fmt::Display for FabricError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FabricError::Cert(e) => write!(f, "fabric credentials: {e}"),
-            FabricError::NocMissingIds => {
-                write!(f, "fabric credentials: NOC subject missing node/fabric id")
-            }
-            FabricError::OpKeyMismatch => write!(
-                f,
-                "fabric credentials: operational key does not match NOC public key"
-            ),
             FabricError::GenKey => write!(f, "operational key generation failed"),
             FabricError::SelfIssue(e) => write!(f, "self-issued NOC invalid: {e}"),
         }
@@ -162,7 +146,7 @@ impl std::error::Error for FabricError {
         match self {
             FabricError::Cert(e) => Some(e),
             FabricError::SelfIssue(e) => Some(e),
-            FabricError::NocMissingIds | FabricError::OpKeyMismatch | FabricError::GenKey => None,
+            FabricError::GenKey => None,
         }
     }
 }
@@ -174,41 +158,6 @@ impl From<crate::cert::CertError> for FabricError {
 }
 
 impl FabricCredentials {
-    /// Parse RCAC/ICAC/NOC, verify the own-fabric chain is internally
-    /// consistent (fail fast, before CASE), and cross-check the KVS
-    /// operational public key against the NOC's public key.
-    pub fn from_raw(raw: crate::kvs::RawFabricCredentials) -> Result<Self, FabricError> {
-        let rcac_cert = crate::cert::MatterCert::parse(&raw.rcac)?;
-        let icac_cert = raw
-            .icac
-            .as_deref()
-            .map(crate::cert::MatterCert::parse)
-            .transpose()?;
-        let noc_cert = crate::cert::MatterCert::parse(&raw.noc)?;
-
-        crate::cert::verify_noc_chain(&noc_cert, icac_cert.as_ref(), &rcac_cert)?;
-
-        let node_id = noc_cert.node_id().ok_or(FabricError::NocMissingIds)?;
-        let fabric_id = noc_cert.fabric_id().ok_or(FabricError::NocMissingIds)?;
-        let root_public_key = rcac_cert.pub_key;
-
-        if raw.op_public_key != noc_cert.pub_key {
-            return Err(FabricError::OpKeyMismatch);
-        }
-
-        Ok(FabricCredentials {
-            rcac_tlv: raw.rcac,
-            icac_tlv: raw.icac,
-            noc_tlv: raw.noc,
-            op_public_key: raw.op_public_key,
-            op_private_key: raw.op_private_key,
-            ipk_operational: raw.ipk_operational,
-            node_id,
-            fabric_id,
-            root_public_key,
-        })
-    }
-
     /// Generate a fresh operational key, self-issue a NOC under the KVS root,
     /// and assemble credentials for CASE.
     pub fn from_self_issued(m: crate::kvs::SelfIssueMaterials) -> Result<Self, FabricError> {
@@ -303,36 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_credentials_from_fixture_chain() {
-        let noc = include_bytes!("../tests/fixtures/node01_01_chip.bin").to_vec();
-        let icac = include_bytes!("../tests/fixtures/ica01_chip.bin").to_vec();
-        let rcac = include_bytes!("../tests/fixtures/root01_chip.bin").to_vec();
-        let node_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let node_priv: [u8; 32] = include_bytes!("../tests/fixtures/node01_01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let raw = crate::kvs::RawFabricCredentials {
-            rcac,
-            icac: Some(icac),
-            noc,
-            op_public_key: node_pub,
-            op_private_key: node_priv,
-            ipk_operational: [0xCC; 16],
-        };
-        let creds = FabricCredentials::from_raw(raw).unwrap();
-        assert_ne!(creds.node_id, 0);
-        assert_ne!(creds.fabric_id, 0);
-        assert_eq!(
-            creds.root_public_key.as_slice(),
-            include_bytes!("../tests/fixtures/root01_pubkey.bin")
-        );
-    }
-
-    #[test]
     fn from_self_issued_builds_case_ready_credentials() {
         // Treat the root01 fixtures as the KVS's self-issue materials.
         let rcac = include_bytes!("../tests/fixtures/root01_chip.bin").to_vec();
@@ -371,22 +290,6 @@ mod tests {
         let c = derive_ipk_operational(&[1u8; 16], &[3u8; 8]);
         assert_eq!(a, b);
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn rejects_opkey_not_matching_noc() {
-        let raw = crate::kvs::RawFabricCredentials {
-            rcac: include_bytes!("../tests/fixtures/root01_chip.bin").to_vec(),
-            icac: Some(include_bytes!("../tests/fixtures/ica01_chip.bin").to_vec()),
-            noc: include_bytes!("../tests/fixtures/node01_01_chip.bin").to_vec(),
-            op_public_key: [0xAA; 65], // NOC の公開鍵と不一致
-            op_private_key: [0xBB; 32],
-            ipk_operational: [0xCC; 16],
-        };
-        assert!(matches!(
-            FabricCredentials::from_raw(raw),
-            Err(FabricError::OpKeyMismatch)
-        ));
     }
 
     #[test]
