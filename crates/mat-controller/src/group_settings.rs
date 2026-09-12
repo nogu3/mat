@@ -119,6 +119,29 @@ fn skip_container(r: &mut Reader) -> Option<()> {
     crate::tlv::skip_container(r).ok()
 }
 
+/// フラットな struct（直下に leaf だけ、未知のネストは読み飛ばす）を 1 段
+/// 走査し、context-tag 付き leaf を `on_field(tag, value)` に渡す。先頭が
+/// struct start でない / 途中で切れている / TLV 不正なら `None`。
+/// `FabricData` / `GroupData` / `KeyMap` / `FabricList` / `keyset_next` の
+/// 5 パーサが共有する骨格。
+fn walk_flat_struct(blob: &[u8], mut on_field: impl FnMut(u8, Value<'_>)) -> Option<()> {
+    let mut r = Reader::new(blob);
+    if r.next().ok()??.value != Value::StructStart {
+        return None;
+    }
+    loop {
+        let el = r.next().ok()??;
+        match (el.tag, el.value) {
+            (_, Value::ContainerEnd) => return Some(()),
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(&mut r)?
+            }
+            (Tag::Context(t), v) => on_field(t, v),
+            _ => {}
+        }
+    }
+}
+
 /// GroupName を `GROUP_NAME_MAX` バイト以内へ char 境界で切り詰める。上流は
 /// バイト単位で切るが、ここでは UTF-8 を割らない方へ倒す（chip-tool の
 /// group name は基本 ASCII なので互換上の実害はない）。
@@ -172,31 +195,25 @@ impl FabricData {
 }
 
 pub(crate) fn parse_fabric_data(blob: &[u8]) -> Option<FabricData> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
     let (mut first_group, mut group_count) = (None, None);
     let (mut first_map, mut map_count) = (None, None);
     let (mut first_keyset, mut keyset_count) = (None, None);
     let mut next = None;
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Uint(v)) => first_group = u16::try_from(v).ok(),
-            (Tag::Context(2), Value::Uint(v)) => group_count = u16::try_from(v).ok(),
-            (Tag::Context(3), Value::Uint(v)) => first_map = u16::try_from(v).ok(),
-            (Tag::Context(4), Value::Uint(v)) => map_count = u16::try_from(v).ok(),
-            (Tag::Context(5), Value::Uint(v)) => first_keyset = u16::try_from(v).ok(),
-            (Tag::Context(6), Value::Uint(v)) => keyset_count = u16::try_from(v).ok(),
-            (Tag::Context(7), Value::Uint(v)) => next = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
+    walk_flat_struct(blob, |tag, v| {
+        if let Value::Uint(v) = v {
+            let v = u16::try_from(v).ok();
+            match tag {
+                1 => first_group = v,
+                2 => group_count = v,
+                3 => first_map = v,
+                4 => map_count = v,
+                5 => first_keyset = v,
+                6 => keyset_count = v,
+                7 => next = v,
+                _ => {}
             }
-            _ => {}
         }
-    }
+    })?;
     Some(FabricData {
         first_group: first_group?,
         group_count: group_count?,
@@ -231,25 +248,14 @@ impl GroupData {
 }
 
 fn parse_group_data(blob: &[u8]) -> Option<GroupData> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
     let (mut name, mut first_endpoint, mut endpoint_count, mut next) = (None, None, None, None);
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Utf8(s)) => name = Some(s.to_string()),
-            (Tag::Context(2), Value::Uint(v)) => first_endpoint = u16::try_from(v).ok(),
-            (Tag::Context(3), Value::Uint(v)) => endpoint_count = u16::try_from(v).ok(),
-            (Tag::Context(4), Value::Uint(v)) => next = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
-            }
-            _ => {}
-        }
-    }
+    walk_flat_struct(blob, |tag, v| match (tag, v) {
+        (1, Value::Utf8(s)) => name = Some(s.to_string()),
+        (2, Value::Uint(v)) => first_endpoint = u16::try_from(v).ok(),
+        (3, Value::Uint(v)) => endpoint_count = u16::try_from(v).ok(),
+        (4, Value::Uint(v)) => next = u16::try_from(v).ok(),
+        _ => {}
+    })?;
     Some(GroupData {
         name: name?,
         first_endpoint: first_endpoint?,
@@ -281,24 +287,18 @@ impl KeyMap {
 }
 
 pub(crate) fn parse_keymap(blob: &[u8]) -> Option<KeyMap> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
     let (mut group_id, mut keyset_id, mut next) = (None, None, None);
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Uint(v)) => group_id = u16::try_from(v).ok(),
-            (Tag::Context(2), Value::Uint(v)) => keyset_id = u16::try_from(v).ok(),
-            (Tag::Context(3), Value::Uint(v)) => next = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
+    walk_flat_struct(blob, |tag, v| {
+        if let Value::Uint(v) = v {
+            let v = u16::try_from(v).ok();
+            match tag {
+                1 => group_id = v,
+                2 => keyset_id = v,
+                3 => next = v,
+                _ => {}
             }
-            _ => {}
         }
-    }
+    })?;
     Some(KeyMap {
         group_id: group_id?,
         keyset_id: keyset_id?,
@@ -345,22 +345,12 @@ pub(crate) fn serialize_keyset(
 /// KeySetData の ctx7（チェーン内 next）だけを読む。既存 keyset を上書きする
 /// ときにリンクを保つために使う。
 fn keyset_next(blob: &[u8]) -> Option<u16> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
     let mut next = None;
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(7), Value::Uint(v)) => next = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
-            }
-            _ => {}
+    walk_flat_struct(blob, |tag, v| {
+        if let (7, Value::Uint(v)) = (tag, v) {
+            next = u16::try_from(v).ok();
         }
-    }
+    })?;
     next
 }
 
@@ -490,23 +480,17 @@ impl FabricList {
 }
 
 fn parse_fabric_list(blob: &[u8]) -> Option<FabricList> {
-    let mut r = Reader::new(blob);
-    if r.next().ok()??.value != Value::StructStart {
-        return None;
-    }
     let (mut first_entry, mut entry_count) = (None, None);
-    loop {
-        let el = r.next().ok()??;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Uint(v)) => first_entry = u16::try_from(v).ok(),
-            (Tag::Context(2), Value::Uint(v)) => entry_count = u16::try_from(v).ok(),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
+    walk_flat_struct(blob, |tag, v| {
+        if let Value::Uint(v) = v {
+            let v = u16::try_from(v).ok();
+            match tag {
+                1 => first_entry = v,
+                2 => entry_count = v,
+                _ => {}
             }
-            _ => {}
         }
-    }
+    })?;
     Some(FabricList {
         first_entry: first_entry?,
         entry_count: entry_count?,
