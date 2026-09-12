@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::group_membership::GroupMembershipStore;
+use crate::core::tlv_value;
 
 /// `MaxGroupsPerFabric`/`MaxGroupKeysPerFabric` (spec §11.2.7.5) — 固定値を
 /// 返すのみで実容量は追跡しない（`AccessControlHandler`の容量属性と同じ
@@ -456,15 +457,9 @@ impl ClusterHandler for GroupKeyManagementHandler {
                 w.end_container();
                 Some(w.finish())
             }
-            im::ATTR_MAX_GROUPS_PER_FABRIC => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, MAX_GROUPS_PER_FABRIC);
-                Some(w.finish())
-            }
+            im::ATTR_MAX_GROUPS_PER_FABRIC => Some(tlv_value::uint(MAX_GROUPS_PER_FABRIC)),
             im::ATTR_MAX_GROUP_KEYS_PER_FABRIC => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, MAX_GROUP_KEYS_PER_FABRIC as u64);
-                Some(w.finish())
+                Some(tlv_value::uint(MAX_GROUP_KEYS_PER_FABRIC as u64))
             }
             _ => None,
         }

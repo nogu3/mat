@@ -35,7 +35,6 @@ use mat_controller::commissioning::{
 #[cfg(test)]
 use mat_controller::im;
 use mat_controller::sync::locked;
-use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::DevAttestation;
 
 use crate::core::access_control::AclStore;
@@ -515,30 +514,4 @@ impl CommissioningServer {
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_CLUSTER),
         }
     }
-}
-
-/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
-/// (the `ClusterHandler::read` contract) — same convention as
-/// `datamodel::uint_value`, duplicated here since that one is private to its
-/// own module.
-fn uint_value(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
-}
-
-fn bool_value(v: bool) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_bool(Tag::Anonymous, v);
-    w.finish()
-}
-
-/// A standalone, `Tag::Anonymous`-tagged TLV `null` element — for nullable
-/// attributes (e.g. `AdminFabricIndex`/`AdminVendorID` while the
-/// Administrator Commissioning window is closed) that must read back
-/// distinct from a valid `0`.
-fn null_value() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_null(Tag::Anonymous);
-    w.finish()
 }

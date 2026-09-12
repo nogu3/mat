@@ -15,25 +15,9 @@
 //! Reachable (spec §9.13.4) は M3 では常に true 固定 — mando 側の不達
 //! 判定（本当に reachable かどうかの追跡）は M4 スコープ。
 use mat_controller::im;
-use mat_controller::tlv::{Tag, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
-
-/// Encodes a standalone, `Tag::Anonymous`-tagged TLV string element (the
-/// `ClusterHandler::read` contract) — mirrors `datamodel::str_value`, which
-/// is private to that module.
-fn str_value(v: &str) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_str(Tag::Anonymous, v);
-    w.finish()
-}
-
-/// Encodes a standalone, `Tag::Anonymous`-tagged TLV bool element.
-fn bool_value(v: bool) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_bool(Tag::Anonymous, v);
-    w.finish()
-}
+use crate::core::tlv_value;
 
 pub struct BridgedDeviceBasicInformationHandler {
     node_label: String,
@@ -70,9 +54,9 @@ impl ClusterHandler for BridgedDeviceBasicInformationHandler {
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_BI_NODE_LABEL => Some(str_value(&self.node_label)),
-            im::ATTR_BDBI_REACHABLE => Some(bool_value(true)),
-            im::ATTR_BI_UNIQUE_ID => Some(str_value(&self.unique_id)),
+            im::ATTR_BI_NODE_LABEL => Some(tlv_value::str(&self.node_label)),
+            im::ATTR_BDBI_REACHABLE => Some(tlv_value::bool(true)),
+            im::ATTR_BI_UNIQUE_ID => Some(tlv_value::str(&self.unique_id)),
             _ => None,
         }
     }
@@ -167,7 +151,7 @@ mod tests {
     #[test]
     fn write_is_rejected_by_default() {
         let mut h = BridgedDeviceBasicInformationHandler::new("living-light", "unique-abc123");
-        let data = str_value("new-name");
+        let data = tlv_value::str("new-name");
         assert_eq!(
             h.write(
                 im::ATTR_BI_NODE_LABEL,

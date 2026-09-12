@@ -11,6 +11,7 @@ use mat_controller::tlv::{Reader, Tag, Value, Writer};
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::group_membership::{GroupMembershipStore, GROUP_TABLE_CAPACITY};
 use crate::core::identify::IdentifyState;
+use crate::core::tlv_value;
 
 const RESP_ADD_GROUP: u32 = 0x00;
 const RESP_VIEW_GROUP: u32 = 0x01;
@@ -84,11 +85,7 @@ impl ClusterHandler for GroupsHandler {
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_GROUPS_NAME_SUPPORT => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, 0);
-                Some(w.finish())
-            }
+            im::ATTR_GROUPS_NAME_SUPPORT => Some(tlv_value::uint(0)),
             _ => None,
         }
     }

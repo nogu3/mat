@@ -27,6 +27,7 @@ use mat_controller::tlv::{Reader, Tag, Value, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::tlv_value;
 
 /// `AccessControlEntryPrivilegeEnum` (spec §11.1.7.1) の全値。`check` の
 /// privilege lattice（`privilege_grants`）と AddNOC 自動 admin エントリの
@@ -380,9 +381,9 @@ impl ClusterHandler for AccessControlHandler {
             im::ATTR_ACL => Some(encode_acl_entries(
                 &self.store.entries_for(ctx.fabric_index),
             )),
-            im::ATTR_ACL_SUBJECTS_PER_ENTRY => Some(uint_value(ACL_SUBJECTS_PER_ENTRY)),
-            im::ATTR_ACL_TARGETS_PER_ENTRY => Some(uint_value(ACL_TARGETS_PER_ENTRY)),
-            im::ATTR_ACL_ENTRIES_PER_FABRIC => Some(uint_value(ACL_ENTRIES_PER_FABRIC as u64)),
+            im::ATTR_ACL_SUBJECTS_PER_ENTRY => Some(tlv_value::uint(ACL_SUBJECTS_PER_ENTRY)),
+            im::ATTR_ACL_TARGETS_PER_ENTRY => Some(tlv_value::uint(ACL_TARGETS_PER_ENTRY)),
+            im::ATTR_ACL_ENTRIES_PER_FABRIC => Some(tlv_value::uint(ACL_ENTRIES_PER_FABRIC as u64)),
             _ => None,
         }
     }
@@ -477,16 +478,6 @@ impl ClusterHandler for AccessControlHandler {
     fn write_privilege(&self, _attribute: u32) -> u8 {
         PRIVILEGE_ADMINISTER
     }
-}
-
-/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
-/// (the `ClusterHandler::read` contract) — same convention as
-/// `datamodel::uint_value`, duplicated locally since that one is private to
-/// `datamodel`.
-fn uint_value(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
 }
 
 /// `AccessControlEntryStruct` 列を array の Data TLV へ (spec §11.1.7.1,

@@ -9,9 +9,12 @@ use std::time::{Duration, Instant};
 
 use mat_controller::im;
 use mat_controller::sync::locked;
-use mat_controller::tlv::{Reader, Tag, Value, Writer};
+#[cfg(test)]
+use mat_controller::tlv::Writer;
+use mat_controller::tlv::{Reader, Tag, Value};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::tlv_value;
 
 /// IdentifyType = None (spec §1.2.5.2): no visible/audible identification
 /// output — the honest answer for a headless virtual device.
@@ -73,9 +76,7 @@ impl ClusterHandler for IdentifyHandler {
             im::ATTR_IDENTIFY_TYPE => IDENTIFY_TYPE_NONE,
             _ => return None,
         };
-        let mut w = Writer::new();
-        w.put_uint(Tag::Anonymous, value);
-        Some(w.finish())
+        Some(tlv_value::uint(value))
     }
 
     fn invoke(&mut self, command: u32, fields_tlv: &[u8], ctx: &mut InvokeCtx) -> InvokeReply {

@@ -19,11 +19,12 @@ use mat_controller::tlv::{Tag, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
+use crate::core::tlv_value;
 
 use super::{
-    bool_value, null_value, uint_value, Inner, ATTR_AC_ADMIN_FABRIC_INDEX, ATTR_AC_ADMIN_VENDOR_ID,
-    ATTR_AC_WINDOW_STATUS, ATTR_GC_BASIC_COMMISSIONING_INFO, ATTR_GC_BREADCRUMB,
-    ATTR_GC_LOCATION_CAPABILITY, ATTR_GC_REGULATORY_CONFIG, ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION,
+    Inner, ATTR_AC_ADMIN_FABRIC_INDEX, ATTR_AC_ADMIN_VENDOR_ID, ATTR_AC_WINDOW_STATUS,
+    ATTR_GC_BASIC_COMMISSIONING_INFO, ATTR_GC_BREADCRUMB, ATTR_GC_LOCATION_CAPABILITY,
+    ATTR_GC_REGULATORY_CONFIG, ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION,
     ATTR_OC_COMMISSIONED_FABRICS, ATTR_OC_CURRENT_FABRIC_INDEX, ATTR_OC_FABRICS, ATTR_OC_NOCS,
     ATTR_OC_SUPPORTED_FABRICS, ATTR_OC_TRUSTED_ROOT_CERTIFICATES, FAIL_SAFE_EXPIRY_LENGTH_SECONDS,
     FAIL_SAFE_MAX_CUMULATIVE_SECONDS, RESP_ARM_FAIL_SAFE, RESP_ATTESTATION, RESP_CERT_CHAIN,
@@ -248,7 +249,7 @@ impl Inner {
     /// fixed set chip-tool/Echo read during and right after commissioning.
     fn read_general_commissioning(&self, attribute: u32) -> Option<Vec<u8>> {
         match attribute {
-            ATTR_GC_BREADCRUMB => Some(uint_value(0)),
+            ATTR_GC_BREADCRUMB => Some(tlv_value::uint(0)),
             ATTR_GC_BASIC_COMMISSIONING_INFO => {
                 let mut w = Writer::new();
                 w.start_struct(Tag::Anonymous);
@@ -257,9 +258,9 @@ impl Inner {
                 w.end_container();
                 Some(w.finish())
             }
-            ATTR_GC_REGULATORY_CONFIG => Some(uint_value(0)),
-            ATTR_GC_LOCATION_CAPABILITY => Some(uint_value(2)),
-            ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION => Some(bool_value(true)),
+            ATTR_GC_REGULATORY_CONFIG => Some(tlv_value::uint(0)),
+            ATTR_GC_LOCATION_CAPABILITY => Some(tlv_value::uint(2)),
+            ATTR_GC_SUPPORTS_CONCURRENT_CONNECTION => Some(tlv_value::bool(true)),
             _ => None,
         }
     }
@@ -277,10 +278,12 @@ impl Inner {
         match attribute {
             ATTR_OC_NOCS => Some(self.encode_nocs(ctx)),
             ATTR_OC_FABRICS => Some(self.encode_fabrics(ctx)),
-            ATTR_OC_SUPPORTED_FABRICS => Some(uint_value(u64::from(SUPPORTED_FABRICS))),
-            ATTR_OC_COMMISSIONED_FABRICS => Some(uint_value(self.store.entries().len() as u64)),
+            ATTR_OC_SUPPORTED_FABRICS => Some(tlv_value::uint(u64::from(SUPPORTED_FABRICS))),
+            ATTR_OC_COMMISSIONED_FABRICS => {
+                Some(tlv_value::uint(self.store.entries().len() as u64))
+            }
             ATTR_OC_TRUSTED_ROOT_CERTIFICATES => Some(self.encode_trusted_root_certificates(ctx)),
-            ATTR_OC_CURRENT_FABRIC_INDEX => Some(uint_value(u64::from(ctx.fabric_index))),
+            ATTR_OC_CURRENT_FABRIC_INDEX => Some(tlv_value::uint(u64::from(ctx.fabric_index))),
             _ => None,
         }
     }
@@ -292,16 +295,18 @@ impl Inner {
     /// (never a real fabric index) or vendor id 0 (unassigned but legal).
     fn read_admin_commissioning(&self, attribute: u32) -> Option<Vec<u8>> {
         match attribute {
-            ATTR_AC_WINDOW_STATUS => {
-                Some(uint_value(if self.admin_window.is_some() { 1 } else { 0 }))
-            }
+            ATTR_AC_WINDOW_STATUS => Some(tlv_value::uint(if self.admin_window.is_some() {
+                1
+            } else {
+                0
+            })),
             ATTR_AC_ADMIN_FABRIC_INDEX => Some(match self.admin_window {
-                Some(w) => uint_value(u64::from(w.fabric_index)),
-                None => null_value(),
+                Some(w) => tlv_value::uint(u64::from(w.fabric_index)),
+                None => tlv_value::null(),
             }),
             ATTR_AC_ADMIN_VENDOR_ID => Some(match self.admin_window {
-                Some(w) => uint_value(u64::from(w.vendor_id)),
-                None => null_value(),
+                Some(w) => tlv_value::uint(u64::from(w.vendor_id)),
+                None => tlv_value::null(),
             }),
             _ => None,
         }

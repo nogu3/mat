@@ -28,6 +28,7 @@ use mat_controller::im::{
 use crate::core::access_control::Subject;
 use crate::core::events::{EmittedEvent, EventLog, StoredEvent};
 use crate::core::stimulus::{Stimulus, StimulusError, StimulusOutcome, StimulusReply};
+use crate::core::tlv_value;
 use mat_controller::tlv::{Reader, Tag, Value, Writer};
 
 /// The DataVersion (spec §7.10.3) every `(endpoint, cluster)` starts at,
@@ -1329,8 +1330,8 @@ impl Node {
             return Some(encode_parts_list(&self.endpoints));
         }
         match attribute {
-            im::ATTR_CLUSTER_REVISION => Some(uint_value(u64::from(handler.revision()))),
-            im::ATTR_FEATURE_MAP => Some(uint_value(u64::from(handler.feature_map()))),
+            im::ATTR_CLUSTER_REVISION => Some(tlv_value::uint(u64::from(handler.revision()))),
+            im::ATTR_FEATURE_MAP => Some(tlv_value::uint(u64::from(handler.feature_map()))),
             im::ATTR_ATTRIBUTE_LIST => Some(encode_attribute_list(handler)),
             im::ATTR_ACCEPTED_COMMAND_LIST => {
                 Some(encode_command_list(&handler.accepted_commands()))
@@ -1678,20 +1679,6 @@ fn read_privilege_for(handler: &dyn ClusterHandler, attribute: u32) -> u8 {
     }
 }
 
-/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
-/// (the `ClusterHandler::read` contract).
-fn uint_value(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
-}
-
-fn str_value(v: &str) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_str(Tag::Anonymous, v);
-    w.finish()
-}
-
 /// Encodes the Descriptor cluster's `ServerList` (spec §9.5) from the
 /// clusters actually registered on the endpoint — see
 /// `Node::read_attribute_value`'s override for why this lives here rather
@@ -1995,21 +1982,21 @@ impl ClusterHandler for BasicInformationHandler {
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_DATA_MODEL_REVISION => Some(uint_value(DATA_MODEL_REVISION)),
-            im::ATTR_VENDOR_ID => Some(uint_value(u64::from(self.vendor_id))),
-            im::ATTR_PRODUCT_ID => Some(uint_value(u64::from(self.product_id))),
-            im::ATTR_VENDOR_NAME => Some(str_value("mat")),
-            im::ATTR_PRODUCT_NAME => Some(str_value("matv")),
-            im::ATTR_BI_NODE_LABEL => Some(str_value(&self.node_label)),
-            im::ATTR_BI_LOCATION => Some(str_value(&self.location)),
-            im::ATTR_BI_HARDWARE_VERSION => Some(uint_value(1)),
-            im::ATTR_BI_HARDWARE_VERSION_STRING => Some(str_value("matv")),
-            im::ATTR_BI_SOFTWARE_VERSION => Some(uint_value(1)),
-            im::ATTR_BI_SOFTWARE_VERSION_STRING => Some(str_value(env!("CARGO_PKG_VERSION"))),
-            im::ATTR_BI_UNIQUE_ID => Some(str_value(&self.unique_id)),
+            im::ATTR_DATA_MODEL_REVISION => Some(tlv_value::uint(DATA_MODEL_REVISION)),
+            im::ATTR_VENDOR_ID => Some(tlv_value::uint(u64::from(self.vendor_id))),
+            im::ATTR_PRODUCT_ID => Some(tlv_value::uint(u64::from(self.product_id))),
+            im::ATTR_VENDOR_NAME => Some(tlv_value::str("mat")),
+            im::ATTR_PRODUCT_NAME => Some(tlv_value::str("matv")),
+            im::ATTR_BI_NODE_LABEL => Some(tlv_value::str(&self.node_label)),
+            im::ATTR_BI_LOCATION => Some(tlv_value::str(&self.location)),
+            im::ATTR_BI_HARDWARE_VERSION => Some(tlv_value::uint(1)),
+            im::ATTR_BI_HARDWARE_VERSION_STRING => Some(tlv_value::str("matv")),
+            im::ATTR_BI_SOFTWARE_VERSION => Some(tlv_value::uint(1)),
+            im::ATTR_BI_SOFTWARE_VERSION_STRING => Some(tlv_value::str(env!("CARGO_PKG_VERSION"))),
+            im::ATTR_BI_UNIQUE_ID => Some(tlv_value::str(&self.unique_id)),
             im::ATTR_BI_CAPABILITY_MINIMA => Some(encode_capability_minima()),
-            im::ATTR_BI_SPECIFICATION_VERSION => Some(uint_value(SPECIFICATION_VERSION)),
-            im::ATTR_BI_MAX_PATHS_PER_INVOKE => Some(uint_value(1)),
+            im::ATTR_BI_SPECIFICATION_VERSION => Some(tlv_value::uint(SPECIFICATION_VERSION)),
+            im::ATTR_BI_MAX_PATHS_PER_INVOKE => Some(tlv_value::uint(1)),
             _ => None,
         }
     }
@@ -3930,7 +3917,11 @@ mod tests {
         );
         match &entries[..] {
             [ReportEntryOut::Data(r)] => {
-                assert_eq!(r.value_tlv, str_value(""), "NodeLabel must be untouched")
+                assert_eq!(
+                    r.value_tlv,
+                    tlv_value::str(""),
+                    "NodeLabel must be untouched"
+                )
             }
             other => panic!("expected a NodeLabel data report, got {other:?}"),
         }
@@ -3992,11 +3983,7 @@ mod tests {
             vec![0]
         }
         fn read(&self, a: u32, _: &ReadCtx) -> Option<Vec<u8>> {
-            (a == 0).then(|| {
-                let mut w = Writer::new();
-                w.put_bool(Tag::Anonymous, self.state);
-                w.finish()
-            })
+            (a == 0).then(|| tlv_value::bool(self.state))
         }
         fn invoke(&mut self, _: u32, _: &[u8], _: &mut InvokeCtx) -> InvokeReply {
             InvokeReply::Status(im::STATUS_UNSUPPORTED_COMMAND)
