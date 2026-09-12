@@ -395,8 +395,10 @@ pub fn read_self_issue_materials(
         // TLV form here instead. Both encode the same root key (verified: the
         // 65-byte pubkey from `ExampleOpCredsCAKey<issuer>` appears in `f/<idx>/r`).
         let rcac = must_b64(sec, &format!("f/{fabric_index}/r"))?;
-        let ipk_operational =
-            parse_keyset(&must_b64(sec, &format!("f/{fabric_index}/k/0"))?, fabric_index)?;
+        let ipk_operational = parse_keyset(
+            &must_b64(sec, &format!("f/{fabric_index}/k/0"))?,
+            fabric_index,
+        )?;
 
         // node id / fabric id come from the subject of chip-tool's own
         // operational NOC in the fabric table (`f/<idx>/n`, Matter-TLV): the
@@ -926,7 +928,11 @@ mod tests {
         std::fs::write(&alpha, ini_body(&[("ExampleOpCredsCAKey0", &root_key)])).unwrap();
         std::fs::write(
             &main,
-            ini_body(&[("f/1/r", b"rcac-tlv-bytes"), ("f/1/n", noc), ("f/1/k/0", ks)]),
+            ini_body(&[
+                ("f/1/r", b"rcac-tlv-bytes"),
+                ("f/1/n", noc),
+                ("f/1/k/0", ks),
+            ]),
         )
         .unwrap();
         (dir, alpha, main)
