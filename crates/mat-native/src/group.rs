@@ -154,6 +154,18 @@ fn group_send_error(group_id: u16, e: mat_controller::group::GroupSendError) -> 
     MatError::new(kind, format!("groupcast send to group {group_id}: {e}"))
 }
 
+/// 名前解決済み iface へ groupcast egress を 1 本張る（専用 UdpTransport の
+/// bind + `GroupEgress` 構築）。build 時（`Engine::build_with_resolver`）と
+/// 送信時後付け（`acquire_late_thread_egress`）が共有する。
+pub(crate) async fn open_egress(name: &str, scope_id: u32) -> Result<GroupEgress, std::io::Error> {
+    let transport = UdpTransport::bind().await?;
+    Ok(GroupEgress {
+        iface: name.to_string(),
+        transport: Arc::new(transport),
+        scope_id,
+    })
+}
+
 /// thread egress の後付け確立 (issue #23 起動順の罠)。best-effort: どの
 /// 失敗も warn + LAN 単独継続で、次回送信でまた試す。`detected` は
 /// `detect_thread_iface_auto()` の結果を呼び出し側が渡す (テスト注入点)。
@@ -177,19 +189,15 @@ async fn acquire_late_thread_egress(
             return;
         }
     };
-    let transport = match UdpTransport::bind().await {
-        Ok(t) => t,
+    let egress = match open_egress(&name, scope_id).await {
+        Ok(e) => e,
         Err(e) => {
             tracing::warn!(iface = %name, error = %e,
                 "late thread egress socket bind failed; groupcast stays LAN-only");
             return;
         }
     };
-    match sender.add_egress(GroupEgress {
-        iface: name.clone(),
-        transport: Arc::new(transport),
-        scope_id,
-    }) {
+    match sender.add_egress(egress) {
         Ok(()) => {
             tracing::info!(iface = %name, scope_id, "groupcast thread egress acquired late")
         }

@@ -19,15 +19,24 @@ use mat_controller::{case, dnssd};
 use mat_core::error::{ErrorKind, MatError};
 
 pub mod commission;
+mod errmap;
 pub mod group;
 pub mod group_settings;
 pub mod iface_select;
 pub mod op;
 pub mod ops;
+pub mod resolver;
 pub mod rotate_ipk;
 pub mod runner;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+pub use op::{arg_value_to_tlv, encode_command_fields, put_value};
+pub use resolver::{CachingResolver, OneShotResolver, Resolver, CACHE_MISS_TIMEOUT};
+
+use errmap::{
+    map_commission_err, map_establish_err, map_resolve_err, map_session_err, EstablishRole,
+};
 
 /// Thread iface の決定結果。明示（解決失敗=ハードエラー）と自動検出
 /// （解決失敗=warn+劣化続行）で失敗時の規律が違う（spec 設計 3）。
@@ -116,65 +125,6 @@ pub trait NodeConn: Send {
 /// timed リクエストに使う既定タイムアウト（open-window 等の既存値と同じ 10 秒）。
 const TIMED_REQUEST_MS: u16 = 10_000;
 
-/// 値ツリー（`mat_core::ids::ArgValue`）を 1 要素の TLV として `w` に書く。
-/// List → TLV Array（属性 list の型。TLV List 0x17 は path 専用）、Struct →
-/// TLV Struct（context tag = fieldId、呼び出し側で id 昇順整列済み）。
-pub fn put_value(
-    w: &mut mat_controller::tlv::Writer,
-    tag: mat_controller::tlv::Tag,
-    v: &mat_core::ids::ArgValue,
-) {
-    use mat_controller::tlv::Tag;
-    use mat_core::ids::ArgValue as V;
-    match v {
-        V::Bool(b) => w.put_bool(tag, *b),
-        V::UInt(n) => w.put_uint(tag, *n),
-        V::Int(n) => w.put_int(tag, *n),
-        V::F32(f) => w.put_f32(tag, *f),
-        V::F64(f) => w.put_f64(tag, *f),
-        V::Str(s) => w.put_str(tag, s),
-        V::Bytes(b) => w.put_bytes(tag, b),
-        V::Null => w.put_null(tag),
-        V::List(items) => {
-            w.start_array(tag);
-            for item in items {
-                put_value(w, Tag::Anonymous, item);
-            }
-            w.end_container();
-        }
-        V::Struct(fields) => {
-            w.start_struct(tag);
-            for (id, val) in fields {
-                put_value(w, Tag::Context(*id), val);
-            }
-            w.end_container();
-        }
-    }
-}
-
-/// `ArgValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
-/// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
-pub fn arg_value_to_tlv(v: &mat_core::ids::ArgValue) -> Vec<u8> {
-    let mut w = mat_controller::tlv::Writer::new();
-    put_value(&mut w, mat_controller::tlv::Tag::Anonymous, v);
-    w.finish()
-}
-
-/// invoke のコマンド引数（値ツリーの列）を CommandFields TLV へ。context tag は
-/// 引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` のコメント
-/// 参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`) の両方が使う
-/// 共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
-pub fn encode_command_fields(args: &[mat_core::ids::ArgValue]) -> Vec<u8> {
-    use mat_controller::tlv::{Tag, Writer};
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    for (i, v) in args.iter().enumerate() {
-        put_value(&mut w, Tag::Context(i as u8), v);
-    }
-    w.end_container();
-    w.finish()
-}
-
 /// 購読パラメータ: 人感の即応性優先で floor 0、再購読時に古い購読を掃除するため
 /// KeepSubscriptions=false。ceiling は当初 3600s（電池優先）だったが、実機 E2E で
 /// 「flaky リンクのデバイスがレポート配送失敗時に購読を黙って破棄 → こちらは
@@ -224,22 +174,6 @@ pub trait SubscribeConn: Send {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<mat_controller::session::SubscriptionReport>, MatError>;
-    /// 属性のみを見る薄いラッパ（イベント無しの購読）。実装は
-    /// `subscribe` / `next_report_full` 側だけに置く。
-    async fn subscribe_wildcard(
-        &mut self,
-        clusters: &[u32],
-    ) -> Result<(SubscriptionInfo, Vec<mat_controller::im::ReportDataMessage>), MatError> {
-        let (info, priming, _events) = self.subscribe(clusters, &[], None).await?;
-        Ok((info, priming))
-    }
-    /// 次のデバイス発 report の属性側だけを待つ薄いラッパ。
-    async fn next_report(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<mat_controller::im::ReportDataMessage>, MatError> {
-        Ok(self.next_report_full(timeout).await?.map(|r| r.data))
-    }
     /// セッションを手放す直前の後始末。CloseSession を best-effort 送信する
     /// （Issue #20: 放置セッションが FP300 系の常駐購読を黙殺する）。fake は
     /// 既定 no-op で足りるよう default 実装を持つ。
@@ -333,92 +267,19 @@ fn thread_egress_decision(
     }
 }
 
-/// establish の mDNS 解決を差し替え可能にする抽象。`mat`（一発）は
-/// [`OneShotResolver`]（キャッシュ無し＝設計ルール4）、`matd` は
-/// `CachingResolver`（常駐キャッシュ、Task 5）を注入する。
-#[async_trait]
-pub trait Resolver: Send + Sync {
-    async fn resolve(
-        &self,
-        scope_id: u32,
-        cfid: [u8; 8],
-        node_id: u64,
-        timeout: Duration,
-    ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError>;
-}
+/// chip-tool 互換 KVS の alpha INI 名。ctrl-store レーンが
+/// `mat_controller::kvs::ALPHA_INI_FILE` を足したらそちらへ差し替える。
+pub const ALPHA_INI_FILE: &str = "chip_tool_config.alpha.ini";
 
-/// 既定のリゾルバ: 一発 legacy multicast resolve を毎回実行する（キャッシュ
-/// を持たない）。`mat` 一発直経路が使う。
-pub struct OneShotResolver;
-
-#[async_trait]
-impl Resolver for OneShotResolver {
-    async fn resolve(
-        &self,
-        scope_id: u32,
-        cfid: [u8; 8],
-        node_id: u64,
-        timeout: Duration,
-    ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError> {
-        dnssd::resolve_operational(scope_id, &cfid, node_id, timeout).await
-    }
-}
-
-/// matd 用リゾルバ: 常駐 mDNS キャッシュ（[`dnssd::OperationalCache`]）を参照し、
-/// ヒットは即返し、ミス時は provoke してリスナの次アナウンスを
-/// `CACHE_MISS_TIMEOUT` まで待つ。establish から渡される `timeout`（8s）ではなく
-/// この内部定数を使う理由は spec 参照（`mat` 一発を無変更に保つため窓を分離）。
-pub struct CachingResolver {
-    cache: dnssd::OperationalCache,
-}
-
-/// cache miss 時にリスナの次アナウンス（周期~30s）を確実に跨ぐ待ち窓。op 予算設計の成分（Issue #16）。
-pub const CACHE_MISS_TIMEOUT: Duration = Duration::from_secs(35);
-/// キャッシュ充填の poll 間隔（Notify を使わず単純 poll で取りこぼしを防ぐ）。
-const CACHE_POLL: Duration = Duration::from_millis(500);
-
-impl CachingResolver {
-    pub fn new(cache: dnssd::OperationalCache) -> Self {
-        Self { cache }
-    }
-}
-
-#[async_trait]
-impl Resolver for CachingResolver {
-    async fn resolve(
-        &self,
-        _scope_id: u32,
-        cfid: [u8; 8],
-        node_id: u64,
-        _timeout: Duration,
-    ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError> {
-        let instance = format!(
-            "{}._matter._tcp.local",
-            dnssd::operational_instance(&cfid, node_id)
-        );
-        if let Some(n) = self.cache.get(&instance) {
-            return Ok(n);
-        }
-        // ミス: listener に provoke クエリを依頼し、次アナウンス/応答を待つ。
-        self.cache.request(instance.clone());
-        let deadline = tokio::time::Instant::now() + CACHE_MISS_TIMEOUT;
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(CACHE_POLL).await;
-            if let Some(n) = self.cache.get(&instance) {
-                return Ok(n);
-            }
-        }
-        Err(dnssd::DnssdError::Timeout { instance })
-    }
-}
-
-/// KVS から fabric 資格情報を組み立てる（`Engine::build` の前半）。`fabric
-/// rotate-ipk` も同じ経路で読む（epoch を差し替えた別 IPK の確立器を作るため）。
-/// KVS 読み取り失敗は一律 `store_missing`、NOC 自己発行の失敗は `store_parse`。
-pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, MatError> {
-    let alpha_ini = cfg.store.join("chip_tool_config.alpha.ini");
+/// KVS から自己発行資材（root CA 鍵・fabric id・node id）を読む。`Engine::build`
+/// / `commission` / `mat` の probe が同じ 1 本を通る。読めない = fabric 未
+/// bootstrap → `store_missing`（`mat fabric init` 誘導付き）。
+pub fn load_self_issue_materials(
+    cfg: &NativeConfig,
+) -> Result<mat_controller::kvs::SelfIssueMaterials, MatError> {
+    let alpha_ini = cfg.store.join(ALPHA_INI_FILE);
     let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
-    let materials = mat_controller::kvs::read_self_issue_materials(
+    mat_controller::kvs::read_self_issue_materials(
         &alpha_ini,
         &main_ini,
         cfg.fabric_index,
@@ -427,37 +288,55 @@ pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, 
     .map_err(|e| {
         MatError::new(
             ErrorKind::StoreMissing,
-            format!("native: read KVS credentials: {e}"),
+            format!("native: read KVS credentials: {e} — run `mat fabric init`"),
         )
-    })?;
+    })
+}
+
+/// 資材から NOC を自己発行して `FabricCredentials` を組む。資材はあるが
+/// NOC を組めない = 壊れた / 不整合な store → `store_parse`。
+pub fn self_issue_credentials(
+    materials: mat_controller::kvs::SelfIssueMaterials,
+) -> Result<FabricCredentials, MatError> {
     FabricCredentials::from_self_issued(materials).map_err(|e| {
         MatError::new(
             ErrorKind::StoreParse,
-            format!("native: self-issue NOC: {e}"),
+            format!("native: self-issue NOC: {e} — run `mat fabric init`"),
+        )
+    })
+}
+
+/// KVS から fabric 資格情報を組み立てる（`Engine::build` の前半）。`fabric
+/// rotate-ipk` も同じ経路で読む（epoch を差し替えた別 IPK の確立器を作るため）。
+pub fn load_fabric_credentials(cfg: &NativeConfig) -> Result<FabricCredentials, MatError> {
+    self_issue_credentials(load_self_issue_materials(cfg)?)
+}
+
+/// 運用 iface（`cfg.iface`）の scope_id（ifindex）。解決失敗は `other`。
+pub fn op_scope_id(cfg: &NativeConfig) -> Result<u32, MatError> {
+    mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("native: resolve iface {:?} index: {e}", cfg.iface),
         )
     })
 }
 
 /// 資格情報から実確立器（mDNS 解決 → CASE）を作る（`Engine::build` の後半）。
 /// `creds.ipk_operational` を差し替えて渡せば別 epoch の IPK で CASE を張る
-/// 確立器になる（rotate-ipk の受理実証）。
+/// 確立器になる（rotate-ipk の受理実証）。`scope_id` は `op_scope_id(cfg)`。
 pub fn case_establisher(
     cfg: &NativeConfig,
     creds: FabricCredentials,
     resolver: Arc<dyn Resolver>,
-) -> Result<Box<dyn Establisher>, MatError> {
-    let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
-        MatError::new(
-            ErrorKind::Other,
-            format!("native: resolve iface {:?} index: {e}", cfg.iface),
-        )
-    })?;
-    Ok(Box::new(CaseEstablisher {
+    scope_id: u32,
+) -> Box<dyn Establisher> {
+    Box::new(CaseEstablisher {
         creds: std::sync::RwLock::new(Arc::new(creds)),
         scope_id,
         resolver,
         cfg: cfg.clone(),
-    }))
+    })
 }
 
 impl Engine {
@@ -477,12 +356,7 @@ impl Engine {
     ) -> Result<Self, MatError> {
         let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
         let creds = load_fabric_credentials(cfg)?;
-        let scope_id = mat_controller::dnssd::iface_index(&cfg.iface).map_err(|e| {
-            MatError::new(
-                ErrorKind::Other,
-                format!("native: resolve iface {:?} index: {e}", cfg.iface),
-            )
-        })?;
+        let scope_id = op_scope_id(cfg)?;
         let transport = UdpTransport::bind().await.map_err(|e| {
             MatError::new(ErrorKind::Other, format!("native: bind udp transport: {e}"))
         })?;
@@ -506,14 +380,10 @@ impl Engine {
         }) {
             Ok(Some((name, tsid))) => {
                 // Thread egress は専用 socket（LAN 側の IPV6_MULTICAST_IF と独立）。
-                match UdpTransport::bind().await {
-                    Ok(t) => {
+                match group::open_egress(&name, tsid).await {
+                    Ok(e) => {
                         tracing::info!(iface = %name, "groupcast thread egress enabled");
-                        egress.push(mat_controller::group::GroupEgress {
-                            iface: name,
-                            transport: Arc::new(t),
-                            scope_id: tsid,
-                        });
+                        egress.push(e);
                     }
                     Err(e) => match &cfg.thread_iface {
                         Some(ThreadIfaceChoice::Explicit(_)) => {
@@ -550,7 +420,7 @@ impl Engine {
         // build が bind する共有 UdpTransport は group multicast 送信専用。
         // op / 購読の unicast セッションはノードごとに専用ソケットを bind する
         // （監査#3 / 購読 spec）。
-        let establisher = case_establisher(cfg, creds, resolver)?;
+        let establisher = case_establisher(cfg, creds, resolver, scope_id);
         Ok(Self {
             establisher,
             group: Some(group),
@@ -613,6 +483,45 @@ impl CaseEstablisher {
         *slot = Arc::new(fresh);
         changed
     }
+
+    /// mDNS 解決 → 専用 UdpTransport + CASE（`case::establish_any` の
+    /// staggered race）。op / 購読の違いはエラー detail とログの前置きだけ。
+    async fn establish_raw(
+        &self,
+        node_id: u64,
+        role: EstablishRole,
+    ) -> Result<SessionConn, MatError> {
+        // 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を recv して
+        // screen で捨てる（監査#3）。購読も op 用 transport と recv を奪い合わ
+        // ないようノードごとに専用（spec 構造判断）。試行ごとの bind と候補
+        // アドレスの staggered race（Happy Eyeballs）は `case::establish_any`
+        // が一括して行う。
+        let creds = self.creds();
+        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
+        let resolved = self
+            .resolver
+            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
+            .await
+            .map_err(|e| map_resolve_err(node_id, e))?;
+        let mrp = resolved.mrp_config();
+        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
+        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
+            .await
+            .map_err(|e| map_establish_err(node_id, role, e))?;
+        // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
+        // 確立ごとに可視化する（op / 購読で同形）。
+        tracing::info!(
+            node_id,
+            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
+            peer = %est.peer,
+            "{} transport bound (dedicated socket + CASE)",
+            role.log_label()
+        );
+        Ok(SessionConn {
+            session: est.session,
+            mrp,
+        })
+    }
 }
 
 /// reload の identity 照合: fabric_id / node_id / root 公開鍵が起動時と違う
@@ -637,65 +546,19 @@ pub(crate) fn check_identity(
 #[async_trait]
 impl Establisher for CaseEstablisher {
     async fn establish(&self, node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-        // op 専用ソケット: 共有ソケットでは並行 op が他ノード宛の応答を
-        // recv して screen で捨てる（監査#3）。試行ごとの専用 UdpTransport の
-        // bind と候補アドレスの staggered race（Happy Eyeballs）は
-        // `case::establish_any` が一括して行う。
-        let creds = self.creds();
-        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
-        let resolved = self
-            .resolver
-            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
-            .await
-            .map_err(|e| map_resolve_err(node_id, e))?;
-        let mrp = resolved.mrp_config();
-        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
-            .await
-            .map_err(|e| map_establish_err(node_id, EstablishRole::Op, e))?;
-        // local port は実機切り分け（ss -uanp / tcpdump 突合）の鍵なので
-        // 確立ごとに可視化する（購読側の同名ログと対）。
-        tracing::info!(
-            node_id,
-            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
-            peer = %est.peer,
-            "op transport bound (dedicated socket + CASE)"
-        );
-        Ok(Box::new(SessionConn {
-            session: est.session,
-            mrp,
-        }))
+        Ok(Box::new(
+            self.establish_raw(node_id, EstablishRole::Op).await?,
+        ))
     }
 
     async fn establish_subscription(
         &self,
         node_id: u64,
     ) -> Result<Box<dyn SubscribeConn>, MatError> {
-        // 購読専用ソケット: op 用の transport と recv を奪い合わないよう、
-        // ノードごとに専用 UdpTransport + 専用 CASE（spec 構造判断）。bind と
-        // 候補レースは op 側と同じく `case::establish_any`。
-        let creds = self.creds();
-        let cfid = compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
-        let resolved = self
-            .resolver
-            .resolve(self.scope_id, cfid, node_id, RESOLVE_TIMEOUT)
-            .await
-            .map_err(|e| map_resolve_err(node_id, e))?;
-        let mrp = resolved.mrp_config();
-        let peers: Vec<SocketAddr> = resolved.socket_addrs(self.scope_id);
-        let est = case::establish_any(&peers, &creds, node_id, &mrp, case::RACE_STAGGER)
-            .await
-            .map_err(|e| map_establish_err(node_id, EstablishRole::Subscription, e))?;
-        tracing::info!(
-            node_id,
-            local = %est.local.map(|a| a.to_string()).unwrap_or_default(),
-            peer = %est.peer,
-            "subscription transport bound (dedicated socket + CASE)"
-        );
-        Ok(Box::new(SubscriptionSession {
-            session: est.session,
-            mrp,
-        }))
+        Ok(Box::new(
+            self.establish_raw(node_id, EstablishRole::Subscription)
+                .await?,
+        ))
     }
 
     fn reload_credentials(&self) -> Result<bool, MatError> {
@@ -705,54 +568,16 @@ impl Establisher for CaseEstablisher {
     }
 }
 
-/// `map_establish_err` の detail 前置き分岐（op / 購読でログ・detail の
-/// 文言を従来どおり出し分ける）。
-#[derive(Clone, Copy)]
-enum EstablishRole {
-    Op,
-    Subscription,
-}
-
-/// `case::establish_any` の失敗を mat のエラー種別へ写す。種別の対応は
-/// 逐次ループ時代と同じ: 候補ゼロ = unreachable、CASE 全滅 = session_failed、
-/// bind 失敗 = other。detail は全候補のエラーを列挙する（旧実装は最後の
-/// 1 本だけだった）。
-fn map_establish_err(node_id: u64, role: EstablishRole, e: case::EstablishAnyError) -> MatError {
-    use case::EstablishAnyError as E;
-    let (bind_role, fail_prefix) = match role {
-        EstablishRole::Op => ("op", ""),
-        EstablishRole::Subscription => ("subscription", "subscription "),
-    };
-    match &e {
-        E::NoAddresses => MatError::new(
-            ErrorKind::Unreachable,
-            format!("native: no addresses resolved for node {node_id}"),
-        ),
-        E::Bind(err) => MatError::new(
-            ErrorKind::Other,
-            format!("native: bind {bind_role} udp: {err}"),
-        ),
-        E::AllFailed(_) => MatError::new(
-            ErrorKind::SessionFailed,
-            format!("native: {fail_prefix}{e}"),
-        ),
-    }
-}
-
-/// 実セッション: SecureSession + そのノードの MRP 設定。
+/// 実セッション: SecureSession + そのノードの MRP 設定。op（`NodeConn`）と
+/// 購読（`SubscribeConn`）は同じ型で、確立時の役割（専用ソケット + 専用
+/// CASE）が違うだけ。
 struct SessionConn {
     session: mat_controller::session::SecureSession,
     mrp: MrpConfig,
 }
 
-/// 購読専用の実セッション。
-struct SubscriptionSession {
-    session: mat_controller::session::SecureSession,
-    mrp: MrpConfig,
-}
-
 #[async_trait]
-impl SubscribeConn for SubscriptionSession {
+impl SubscribeConn for SessionConn {
     async fn subscribe(
         &mut self,
         clusters: &[u32],
@@ -934,1098 +759,5 @@ impl NodeConn for SessionConn {
     }
 }
 
-/// operational mDNS resolve のエラーを mat の ErrorKind へ写像する。
-/// Timeout は「窓内に広告が取れなかっただけ」（OTBR proxy の ~30s 周期広告は
-/// リトライで跨げば通ることが多い）→ `timeout`(exit 3)。それ以外
-/// （socket I/O 等の構造的失敗）→ `unreachable`(exit 5)。mat 直経路と matd
-/// （常駐キャッシュのミス）は同じ establish を通るので分類は経路で割れない。
-fn map_resolve_err(node_id: u64, e: dnssd::DnssdError) -> MatError {
-    let kind = match e {
-        dnssd::DnssdError::Timeout { .. } => ErrorKind::Timeout,
-        // 非 timeout は構造的失敗 → unreachable。variant 追加時にここで分類を
-        // 決めさせるため wildcard にしない。
-        dnssd::DnssdError::Io(_) | dnssd::DnssdError::Malformed(_) => ErrorKind::Unreachable,
-    };
-    MatError::new(kind, format!("native: mDNS resolve node {node_id}: {e}"))
-}
-
-/// SecureSession のエラーを mat の ErrorKind へ写像する（経路によらず分類を揃える）。
-fn map_session_err(e: mat_controller::session::SessionError) -> MatError {
-    use mat_controller::im::ImError;
-    use mat_controller::session::SessionError;
-    match e {
-        // MRP 再送尽き。session が死んでいる兆候 → 上位が1回だけ再確立を試みる。
-        SessionError::Timeout => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
-        // 購読の無音 deadline 切れ。通常は SubscriptionSession::next_report が
-        // Ok(None) に写像するのでここへは来ないが、防御的に Timeout kind へ。
-        SessionError::Silence => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
-        // デバイスがコマンド/読みを IM ステータスで拒否 → コマンドは届いた。
-        // デコード失敗（Tlv/Malformed/UnsupportedValue）は「応答は来たが解釈
-        // 不能」= parse_error（Message(_) と同じ規律）。内側 match は wildcard
-        // なしの全 variant 列挙 — ImError の variant 追加時にここがコンパイル
-        // エラーになり分類を決めさせる（外側の `_` に黙って落とさない）。
-        SessionError::Im(ref im) => {
-            let kind = match im {
-                ImError::StatusResponse(_)
-                | ImError::AttributeStatus(_)
-                | ImError::CommandStatus { .. } => ErrorKind::DeviceRejected,
-                ImError::Tlv(_) | ImError::Malformed(_) | ImError::UnsupportedValue => {
-                    ErrorKind::ParseError
-                }
-            };
-            MatError::new(kind, format!("native: {e}"))
-        }
-        SessionError::Io(_) => MatError::new(ErrorKind::Unreachable, format!("native: {e}")),
-        // ピアの応答がメッセージ層で壊れている → 応答は来た（不達ではない）が
-        // 解釈不能 = parse_error（v1 品質修正 4）。
-        SessionError::Message(_) => MatError::new(ErrorKind::ParseError, format!("native: {e}")),
-        _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
-    }
-}
-
-/// `open_commissioning_window`（既存 CASE セッション上の invoke）のエラーを
-/// mat の ErrorKind へ写像する。実質的な失敗経路は `Session`（invoke の
-/// SessionError と同分類）と `CommandStatus`（デバイスが拒否）に限られる
-/// （PASE/attestation 等は既存 operational セッション上では発生しない）が、
-/// 網羅性のため他 variant も `Other` へ落とす。
-fn map_commission_err(e: mat_controller::commissioning::CommissionError) -> MatError {
-    use mat_controller::commissioning::CommissionError;
-    match e {
-        CommissionError::Session(se) => map_session_err(se),
-        CommissionError::CommandStatus { .. } => {
-            MatError::new(ErrorKind::DeviceRejected, format!("native: {e}"))
-        }
-        CommissionError::Timeout(_) => MatError::new(ErrorKind::Timeout, format!("native: {e}")),
-        CommissionError::InvalidArgument { .. } => {
-            MatError::new(ErrorKind::ParseError, format!("native: {e}"))
-        }
-        _ => MatError::new(ErrorKind::Other, format!("native: {e}")),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn thread_egress_explicit_failure_is_hard_error() {
-        let r = thread_egress_decision(
-            "eth0",
-            &Some(ThreadIfaceChoice::Explicit("wpan9".into())),
-            |_| Err("no such iface".into()),
-        );
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn thread_egress_auto_failure_degrades_to_lan_only() {
-        let r = thread_egress_decision(
-            "eth0",
-            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
-            |_| Err("no such iface".into()),
-        );
-        assert_eq!(r.unwrap(), None);
-    }
-
-    #[test]
-    fn thread_egress_resolved_returns_scope() {
-        let r = thread_egress_decision(
-            "eth0",
-            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
-            |_| Ok(7),
-        );
-        assert_eq!(r.unwrap(), Some(("wpan0".into(), 7)));
-    }
-
-    #[test]
-    fn thread_egress_none_is_lan_only() {
-        let r = thread_egress_decision("eth0", &None, |_| unreachable!());
-        assert_eq!(r.unwrap(), None);
-    }
-
-    /// 監査 Minor-1: 運用 iface（`cfg.iface`）と thread iface が同名なら
-    /// `resolve` すら呼ばず第 2 egress を張らない（`MAT_IFACE=wpan0` +
-    /// wpan0 自動検出の同一 iface 二重送出を回避）。`resolve` を
-    /// `unreachable!()` にして「呼ばれないこと」自体を固定する。
-    #[test]
-    fn thread_egress_same_as_op_iface_is_skipped_without_resolving_auto() {
-        let r = thread_egress_decision(
-            "wpan0",
-            &Some(ThreadIfaceChoice::Auto("wpan0".into())),
-            |_| unreachable!("resolve must not be called when thread iface == op iface"),
-        );
-        assert_eq!(r.unwrap(), None);
-    }
-
-    /// 同上、explicit 指定でも同じ規律（同一 iface はハードエラーにせず
-    /// 単に第 2 egress を張らない）。
-    #[test]
-    fn thread_egress_same_as_op_iface_is_skipped_without_resolving_explicit() {
-        let r = thread_egress_decision(
-            "wpan0",
-            &Some(ThreadIfaceChoice::Explicit("wpan0".into())),
-            |_| unreachable!("resolve must not be called when thread iface == op iface"),
-        );
-        assert_eq!(r.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn generic_read_write_via_fake() {
-        use crate::test_support::FakeEstablisher;
-        let engine = Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let mut conn = engine.establisher.establish(5).await.unwrap();
-        // fake は read_json に固定値を返す（test_support 拡張で定義）。
-        let v = conn.read_json(1, 0x0008, 0x0000).await.unwrap();
-        assert!(v.is_number());
-        conn.write_tlv(
-            1,
-            0x0008,
-            0x0011,
-            arg_value_to_tlv(&mat_core::ids::ArgValue::UInt(128)),
-            false,
-        )
-        .await
-        .unwrap();
-        let all = conn.read_cluster(1, 0x0006).await.unwrap();
-        assert!(!all.is_empty());
-    }
-
-    #[test]
-    fn resolve_timeout_maps_to_timeout_kind() {
-        // resolve timeout は「時間内に広告が取れなかっただけ」（OTBR proxy の
-        // ~30s 周期広告はリトライで跨げば通ることが多い）→ timeout(exit 3)。
-        // socket I/O 等の構造的失敗は unreachable(exit 5) のまま。
-        use mat_controller::dnssd::DnssdError;
-        let e = map_resolve_err(
-            5,
-            DnssdError::Timeout {
-                instance: "x".into(),
-            },
-        );
-        assert_eq!(e.kind, ErrorKind::Timeout);
-        assert!(e.detail.contains("node 5"), "detail: {}", e.detail);
-        let e = map_resolve_err(5, DnssdError::Io(std::io::Error::other("boom")));
-        assert_eq!(e.kind, ErrorKind::Unreachable);
-        let e = map_resolve_err(5, DnssdError::Malformed("bad"));
-        assert_eq!(e.kind, ErrorKind::Unreachable);
-    }
-
-    #[test]
-    fn cache_miss_timeout_is_pinned() {
-        // Issue #16: op 予算設計（最悪 45〜60s の導出成分）の釘打ち。
-        assert_eq!(CACHE_MISS_TIMEOUT.as_secs(), 35);
-    }
-
-    #[test]
-    fn map_session_err_maps_malformed_message_to_parse_error() {
-        // v1 品質修正 4: ピアの壊れた応答（Message 層のパース失敗）は「応答は来た
-        // が解釈不能」= `parse_error`。旧実装は catch-all で `other` に落ちていた。
-        let e = map_session_err(mat_controller::session::SessionError::Message(
-            mat_controller::message::MessageError::Truncated,
-        ));
-        assert_eq!(e.kind, ErrorKind::ParseError);
-    }
-
-    #[test]
-    fn map_session_err_splits_im_decode_failure_from_device_rejection() {
-        // 監査⑨: デコード失敗（Tlv/Malformed/UnsupportedValue）は「応答は来たが
-        // 解釈不能」= parse_error（Message(_) と同じ規律）。device_rejected は
-        // 本当のデバイス拒否（StatusResponse/AttributeStatus/CommandStatus）だけ。
-        use mat_controller::im::ImError;
-        use mat_controller::session::SessionError;
-        let e = map_session_err(SessionError::Im(ImError::Malformed(
-            "truncated report data",
-        )));
-        assert_eq!(e.kind, ErrorKind::ParseError);
-        let e = map_session_err(SessionError::Im(ImError::UnsupportedValue));
-        assert_eq!(e.kind, ErrorKind::ParseError);
-        let e = map_session_err(SessionError::Im(ImError::Tlv(
-            mat_controller::tlv::TlvError::InvalidType(0xFF),
-        )));
-        assert_eq!(e.kind, ErrorKind::ParseError);
-        let e = map_session_err(SessionError::Im(ImError::StatusResponse(0x80)));
-        assert_eq!(e.kind, ErrorKind::DeviceRejected);
-        let e = map_session_err(SessionError::Im(ImError::AttributeStatus(0x86)));
-        assert_eq!(e.kind, ErrorKind::DeviceRejected);
-        let e = map_session_err(SessionError::Im(ImError::CommandStatus {
-            status: 0x01,
-            cluster_status: None,
-        }));
-        assert_eq!(e.kind, ErrorKind::DeviceRejected);
-    }
-
-    #[test]
-    fn invalid_argument_maps_to_parse_error() {
-        let e = map_commission_err(
-            mat_controller::commissioning::CommissionError::InvalidArgument {
-                what: "iterations must be in 1000..=100000",
-            },
-        );
-        assert_eq!(e.kind, ErrorKind::ParseError);
-    }
-
-    #[test]
-    fn arg_value_conversions() {
-        use mat_core::ids::ArgValue as V;
-        // arg_value_to_tlv は Reader で読み戻して値一致を確認。
-        let b = arg_value_to_tlv(&V::Str("x".into()));
-        let mut r = mat_controller::tlv::Reader::new(&b);
-        assert!(matches!(
-            r.next().unwrap().unwrap().value,
-            mat_controller::tlv::Value::Utf8("x")
-        ));
-
-        let b = arg_value_to_tlv(&V::F64(0.5));
-        let mut r = mat_controller::tlv::Reader::new(&b);
-        assert!(matches!(
-            r.next().unwrap().unwrap().value,
-            mat_controller::tlv::Value::F64(f) if f == 0.5
-        ));
-
-        // write 経路の float 要素型: single = 0x0A, double = 0x0B（anonymous tag → control byte のみ）。
-        assert_eq!(arg_value_to_tlv(&V::F32(1.5))[0] & 0x1F, 0x0A);
-        assert_eq!(arg_value_to_tlv(&V::F64(1.5))[0] & 0x1F, 0x0B);
-    }
-
-    #[test]
-    fn put_value_encodes_list_of_struct_as_tlv_array_and_roundtrips_to_read_json() {
-        use mat_core::ids::{parse_value_typed, resolve_attribute};
-        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
-        let v = parse_value_typed(
-            r#"[{"privilege":5,"auth-mode":2,"subjects":[112233],"targets":null,"fabric-index":1}]"#,
-            &ty,
-        )
-        .unwrap();
-        let tlv = arg_value_to_tlv(&v);
-        // 先頭要素は TLV Array（0x16、anonymous）。
-        assert_eq!(tlv[0], 0x16);
-        // read 側の JSON 化（番号キー）に戻ると同じ内容。
-        let j = mat_controller::im::tlv_to_json(&tlv).unwrap();
-        assert_eq!(
-            j,
-            serde_json::json!([{"1":5,"2":2,"3":[112233],"4":null,"254":1}])
-        );
-    }
-
-    #[test]
-    fn generic_acl_encoding_matches_dedicated_encoder() {
-        use mat_core::acl::{AclEntry, AclTarget};
-        use mat_core::ids::{parse_value_typed, resolve_attribute};
-        let entries = vec![
-            AclEntry {
-                privilege: 5,
-                auth_mode: 2,
-                subjects: vec![112233, 0x1122],
-                targets: None,
-                fabric_index: 1,
-            },
-            AclEntry {
-                privilege: 3,
-                auth_mode: 3,
-                subjects: vec![0xFFFF_FFFF_FFFF_0001],
-                targets: Some(vec![AclTarget {
-                    cluster: Some(6),
-                    endpoint: None,
-                    device_type: None,
-                }]),
-                fabric_index: 1,
-            },
-        ];
-        let dedicated = crate::ops::encode_acl_entries_tlv(&entries);
-        let ty = resolve_attribute(0x001F, "acl").unwrap().def.unwrap().ty;
-        let generic = arg_value_to_tlv(
-            &parse_value_typed(
-                r#"[
-                  {"privilege":5,"auth-mode":2,"subjects":[112233,4386],"targets":null,"fabric-index":1},
-                  {"privilege":3,"auth-mode":3,"subjects":["0xFFFFFFFFFFFF0001"],
-                   "targets":[{"cluster":6,"endpoint":null,"device-type":null}],"fabric-index":1}
-                ]"#,
-                &ty,
-            )
-            .unwrap(),
-        );
-        assert_eq!(generic, dedicated);
-    }
-
-    #[test]
-    fn generic_group_key_map_encoding_matches_dedicated_encoder() {
-        use mat_core::ids::{parse_value_typed, resolve_attribute};
-        let dedicated = mat_controller::im::encode_group_key_map_tlv(&[(1, 2), (0x0101, 7)]);
-        let ty = resolve_attribute(0x003F, "group-key-map")
-            .unwrap()
-            .def
-            .unwrap()
-            .ty;
-        let generic = arg_value_to_tlv(
-            &parse_value_typed(
-                r#"[{"group-id":1,"group-key-set-id":2},{"1":257,"2":7}]"#,
-                &ty,
-            )
-            .unwrap(),
-        );
-        assert_eq!(generic, dedicated);
-    }
-
-    #[test]
-    fn generic_key_set_write_encoding_matches_dedicated_encoder() {
-        use mat_core::ids::{classify_invoke, InvokeClass};
-        let key: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-        let dedicated = mat_controller::im::encode_key_set_write_fields(1, &key);
-        let j = r#"{"group-key-set-id":1,"group-key-security-policy":0,"epoch-key0":"hex:00112233445566778899aabbccddeeff","epoch-start-time0":1,"epoch-key1":null,"epoch-start-time1":null,"epoch-key2":null,"epoch-start-time2":null}"#;
-        let InvokeClass::Native { fields, .. } =
-            classify_invoke("groupkeymanagement", "key-set-write", &[j.into()])
-        else {
-            panic!("expected Native");
-        };
-        assert_eq!(encode_command_fields(&fields), dedicated);
-    }
-
-    #[test]
-    fn encode_command_fields_uses_positional_context_tags() {
-        use mat_core::ids::ArgValue as V;
-        let tlv = encode_command_fields(&[V::UInt(128), V::UInt(0)]);
-        let mut r = mat_controller::tlv::Reader::new(&tlv);
-        let el = r.next().unwrap().unwrap();
-        assert!(matches!(el.value, mat_controller::tlv::Value::StructStart));
-        // 空引数は空 struct（要素 0 個）にエンコードされる。
-        let empty = encode_command_fields(&[]);
-        let mut r2 = mat_controller::tlv::Reader::new(&empty);
-        assert!(r2.next().unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn build_fails_cleanly_without_kvs() {
-        // KVS が無いディレクトリでは store_missing 相当のエラーで即失敗し、
-        // panic しない（matd 起動時に安全フォールバックへ落とす判断材料）。
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = NativeConfig {
-            store: dir.path().to_path_buf(),
-            iface: "lo".to_string(),
-            thread_iface: None,
-            fabric_index: 1,
-            issuer_index: 0,
-        };
-        let err = Engine::build(&cfg).await.expect_err("no KVS present");
-        assert!(
-            matches!(
-                err.kind,
-                ErrorKind::StoreMissing | ErrorKind::StoreParse | ErrorKind::Other
-            ),
-            "unexpected kind: {:?}",
-            err.kind
-        );
-    }
-
-    #[test]
-    fn load_fabric_credentials_maps_missing_store_to_store_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = NativeConfig {
-            store: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            thread_iface: None,
-            fabric_index: 1,
-            issuer_index: 0,
-        };
-        let err = load_fabric_credentials(&cfg).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::StoreMissing);
-        // Clone できる（rotate-ipk が確立器生成クロージャへ move する）。
-        let _ = cfg.clone();
-    }
-
-    /// resolve が実際に multicast 送受信できる iface の index を1つ探す。
-    /// `crate::iface_select`（M8c-3 iface 自動検出）と同じ適格条件 — up・
-    /// MULTICAST・非 loopback・非 POINTOPOINT・IPv6 link-local 保有 — を使う
-    /// が、こちらは複数候補でも先頭を採用する（本番の autodetect は曖昧なら
-    /// ハードエラーだが、このテストは delegation の検証に使える iface が
-    /// 1つあれば十分）。単純に `flags`/`lo` だけで判定すると、この sandbox
-    /// のような環境で `docker0` / `loopback0`（`lo` とは別名の仮想 NIC）/
-    /// `tailscale0` を拾って `bind_mdns_socket` の send が `ENETUNREACH` で
-    /// 即死し、意図した Timeout 経路を検証できなくなる。
-    fn multicast_capable_iface_index() -> Option<u32> {
-        const IFF_UP: u32 = 0x1;
-        const IFF_LOOPBACK: u32 = 0x8;
-        const IFF_POINTOPOINT: u32 = 0x10;
-        const IFF_MULTICAST: u32 = 0x1000;
-        let mut ll_names = std::collections::HashSet::new();
-        for line in std::fs::read_to_string("/proc/net/if_inet6").ok()?.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 6 && cols[3] == "20" {
-                ll_names.insert(cols[5].to_string());
-            }
-        }
-        let mut entries: Vec<_> = std::fs::read_dir("/sys/class/net")
-            .ok()?
-            .filter_map(Result::ok)
-            .collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !ll_names.contains(&name) {
-                continue;
-            }
-            let base = entry.path();
-            let flags = std::fs::read_to_string(base.join("flags"))
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            let operstate_up = std::fs::read_to_string(base.join("operstate"))
-                .map(|s| s.trim() == "up")
-                .unwrap_or(false);
-            let eligible = operstate_up
-                && flags & IFF_UP != 0
-                && flags & IFF_MULTICAST != 0
-                && flags & IFF_LOOPBACK == 0
-                && flags & IFF_POINTOPOINT == 0;
-            if !eligible {
-                continue;
-            }
-            if let Ok(idx) = std::fs::read_to_string(base.join("ifindex"))
-                .unwrap_or_default()
-                .trim()
-                .parse::<u32>()
-            {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    #[tokio::test]
-    async fn oneshot_resolver_times_out_without_responder() {
-        // 応答者のいない iface で resolve すると Timeout（委譲先
-        // resolve_operational の契約）。無応答→Timeout は不変。
-        let Some(scope) = multicast_capable_iface_index() else {
-            eprintln!(
-                "skipping oneshot_resolver test: no eligible multicast-capable IPv6 interface"
-            );
-            return;
-        };
-        let r = OneShotResolver;
-        let out = r
-            .resolve(scope, [0u8; 8], 5, std::time::Duration::from_millis(300))
-            .await;
-        assert!(matches!(
-            out,
-            Err(mat_controller::dnssd::DnssdError::Timeout { .. })
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn caching_resolver_returns_cached_hit_immediately() {
-        use mat_controller::dnssd;
-        let (cache, _rx) = dnssd::OperationalCache::new();
-        let inst = dnssd::operational_instance(&[0xAB; 8], 5) + "._matter._tcp.local";
-        cache.insert(
-            inst,
-            dnssd::ResolvedNode {
-                port: 5540,
-                addresses: vec!["fd00::1".parse().unwrap()],
-                session_idle_interval_ms: None,
-                session_active_interval_ms: None,
-            },
-            std::time::Duration::from_secs(60),
-        );
-        let r = CachingResolver::new(cache);
-        let n = r
-            .resolve(1, [0xAB; 8], 5, std::time::Duration::from_secs(8))
-            .await
-            .expect("hit");
-        assert_eq!(n.port, 5540);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn caching_resolver_awaits_listener_fill_then_returns() {
-        use mat_controller::dnssd;
-        let (cache, mut rx) = dnssd::OperationalCache::new();
-        let inst = dnssd::operational_instance(&[0xAB; 8], 7) + "._matter._tcp.local";
-        let filler = cache.clone();
-        let inst2 = inst.clone();
-        // 別タスクが少し後に埋める（リスナ相当）。
-        tokio::spawn(async move {
-            // provoke request が届くはず。
-            let got = rx.recv().await.unwrap();
-            assert_eq!(got, inst2);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            filler.insert(
-                inst2,
-                dnssd::ResolvedNode {
-                    port: 5541,
-                    addresses: vec!["fd00::2".parse().unwrap()],
-                    session_idle_interval_ms: None,
-                    session_active_interval_ms: None,
-                },
-                std::time::Duration::from_secs(60),
-            );
-        });
-        let r = CachingResolver::new(cache);
-        let n = r
-            .resolve(1, [0xAB; 8], 7, std::time::Duration::from_secs(8))
-            .await
-            .expect("fill");
-        assert_eq!(n.port, 5541);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn caching_resolver_times_out_when_never_filled() {
-        use mat_controller::dnssd;
-        let (cache, _rx) = dnssd::OperationalCache::new();
-        let r = CachingResolver::new(cache);
-        let out = r
-            .resolve(1, [0xAB; 8], 9, std::time::Duration::from_secs(8))
-            .await;
-        assert!(matches!(out, Err(dnssd::DnssdError::Timeout { .. })));
-    }
-
-    #[tokio::test]
-    async fn default_establisher_rejects_subscription() {
-        // Establisher trait の default 実装は購読非対応（CaseEstablisher だけが上書き）。
-        struct NoSub;
-        #[async_trait]
-        impl Establisher for NoSub {
-            async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-                Err(MatError::new(ErrorKind::Other, "unused"))
-            }
-        }
-        // `.unwrap_err()` would require `Box<dyn SubscribeConn>: Debug`, which
-        // `SubscribeConn` deliberately doesn't require (mirrors `Engine`'s
-        // manual, secret-hiding `Debug` — see its impl above): match instead.
-        let err = match NoSub.establish_subscription(1).await {
-            Err(e) => e,
-            Ok(_) => panic!("default establish_subscription must reject"),
-        };
-        assert_eq!(err.kind, ErrorKind::Other);
-        assert!(err.detail.contains("subscription"));
-    }
-
-    #[tokio::test]
-    async fn fake_establisher_serves_scripted_subscription() {
-        use crate::test_support::{FakeEstablisher, FakeSubConn};
-        let est = FakeEstablisher::default();
-        let mut conn = est.establish_subscription(5).await.unwrap();
-        let (info, priming) = conn.subscribe_wildcard(&[]).await.unwrap();
-        assert_eq!(info.max_interval_s, 60);
-        assert_eq!(priming.len(), 1); // default fake は onoff=true の priming 1 チャンク
-                                      // scripted report が尽きたら next_report は timeout まで待って Ok(None)（無音）。
-        let silent = conn
-            .next_report(std::time::Duration::from_millis(50))
-            .await
-            .unwrap();
-        assert!(silent.is_none());
-        // 共有 live キューに積めば次の next_report が払い出す。
-        est.sub_live
-            .lock()
-            .unwrap()
-            .push_back(crate::test_support::onoff_report(1, false));
-        let msg = conn
-            .next_report(std::time::Duration::from_millis(50))
-            .await
-            .unwrap()
-            .expect("live report");
-        assert_eq!(msg.reports.len(), 1);
-        let _ = FakeSubConn::default(); // 型が公開されていること
-    }
-
-    /// イベント付き購読（フェーズ B）: `subscribe` が受けた event_paths /
-    /// event_min を fake が記録し、priming イベントを払い出す。
-    #[tokio::test]
-    async fn fake_sub_conn_records_event_scope_and_serves_priming_events() {
-        use crate::test_support::{switch_press_event, FakeEstablisher};
-        let est = FakeEstablisher::default();
-        *est.sub_priming_events.lock().unwrap() = vec![switch_press_event(7, 1)];
-        let mut conn = est.establish_subscription(5).await.unwrap();
-        let paths = vec![mat_controller::im::EventPathIn::WILDCARD_URGENT];
-        let (info, priming, priming_events) =
-            conn.subscribe(&[0x0006], &paths, Some(42)).await.unwrap();
-        assert_eq!(info.max_interval_s, 60);
-        assert_eq!(priming.len(), 1);
-        assert_eq!(priming_events, vec![switch_press_event(7, 1)]);
-        assert_eq!(*est.sub_clusters.lock().unwrap(), vec![0x0006]);
-        assert_eq!(*est.sub_event_paths.lock().unwrap(), paths);
-        assert_eq!(*est.sub_event_min.lock().unwrap(), Some(42));
-    }
-
-    /// `next_report_full`: 属性キューとイベントキューは独立に払い出される
-    /// （属性のみ / イベントのみ / 両方 の 3 形をテストが作れる）。
-    #[tokio::test]
-    async fn fake_sub_conn_next_report_full_serves_live_events() {
-        use crate::test_support::{onoff_report, switch_press_event, FakeEstablisher};
-        let slice = std::time::Duration::from_millis(50);
-        let est = FakeEstablisher::default();
-        let mut conn = est.establish_subscription(5).await.unwrap();
-        conn.subscribe(&[], &[], None).await.unwrap();
-        assert!(conn.next_report_full(slice).await.unwrap().is_none());
-
-        // 属性 + イベントが同じ report に同居する形。
-        est.sub_live
-            .lock()
-            .unwrap()
-            .push_back(onoff_report(1, false));
-        est.sub_live_events
-            .lock()
-            .unwrap()
-            .push_back(vec![switch_press_event(9, 1)]);
-        let r = conn
-            .next_report_full(slice)
-            .await
-            .unwrap()
-            .expect("live report");
-        assert_eq!(r.data.reports.len(), 1);
-        assert_eq!(r.events, vec![switch_press_event(9, 1)]);
-
-        // イベントだけの report（属性キューは空）。
-        est.sub_live_events
-            .lock()
-            .unwrap()
-            .push_back(vec![switch_press_event(10, 1)]);
-        let r = conn
-            .next_report_full(slice)
-            .await
-            .unwrap()
-            .expect("event-only report");
-        assert!(r.data.reports.is_empty());
-        assert_eq!(r.events.len(), 1);
-    }
-
-    /// fake の失敗カウンタ: 残り回数だけ失敗し、尽きたら成功する
-    /// （matd の再確立ラダーを回すための足場）。既定 0 = 常に成功なので
-    /// 既存テストの挙動は変わらない。
-    #[tokio::test]
-    async fn fake_establisher_fails_subscription_n_times_then_succeeds() {
-        use crate::test_support::FakeEstablisher;
-        use std::sync::atomic::Ordering;
-
-        let est = FakeEstablisher::default();
-        est.fail_subscription.store(2, Ordering::SeqCst);
-        for attempt in 1..=2 {
-            let err = match est.establish_subscription(5).await {
-                Err(e) => e,
-                Ok(_) => panic!("attempt {attempt} は失敗するはず"),
-            };
-            assert_eq!(err.kind, ErrorKind::Timeout, "既定 fail_kind を使う");
-        }
-        assert!(
-            est.establish_subscription(5).await.is_ok(),
-            "カウンタが尽きたら成功する"
-        );
-        // 失敗も試行として数える（matd 側テストが calls で試行回数を主張できる）。
-        assert_eq!(est.calls.load(Ordering::SeqCst), 3);
-    }
-
-    /// 確立の**あと**に注入した fail_next_report が pump 側（FakeSubConn）へ効く。
-    /// Arc 共有でないとこの順序が表現できない。
-    #[tokio::test]
-    async fn fake_sub_conn_next_report_fails_when_injected_after_establish() {
-        use crate::test_support::FakeEstablisher;
-        use std::sync::atomic::Ordering;
-
-        let est = FakeEstablisher::default();
-        let mut conn = est.establish_subscription(5).await.unwrap();
-        conn.subscribe_wildcard(&[]).await.unwrap();
-
-        est.fail_next_report.store(1, Ordering::SeqCst);
-        let err = match conn.next_report(std::time::Duration::from_millis(50)).await {
-            Err(e) => e,
-            Ok(_) => panic!("注入した 1 回は Err になるはず"),
-        };
-        assert_eq!(err.kind, ErrorKind::SessionFailed);
-        // 尽きたら従来どおり無音 Ok(None)。
-        assert!(conn
-            .next_report(std::time::Duration::from_millis(50))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn establisher_reload_is_unsupported_by_default() {
-        use crate::test_support::FakeEstablisher;
-        let engine = Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let err = engine.reload_credentials().unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Other);
-        assert!(
-            err.detail.contains("not supported"),
-            "detail={}",
-            err.detail
-        );
-    }
-
-    #[test]
-    fn check_identity_accepts_same_fabric_and_rejects_changes() {
-        let a = fake_creds([0xCC; 16], 0x1234, 0x1B669, [0xAA; 65]);
-        // 同じ identity、IPK だけ違う = OK（ローテーション後の姿）。
-        let b = fake_creds([0xDD; 16], 0x1234, 0x1B669, [0xAA; 65]);
-        check_identity(&a, &b).expect("ipk change alone is fine");
-        // fabric_id / node_id / root 公開鍵のどれが変わっても other で拒否。
-        for (label, other) in [
-            (
-                "fabric_id",
-                fake_creds([0xCC; 16], 0x9999, 0x1B669, [0xAA; 65]),
-            ),
-            ("node_id", fake_creds([0xCC; 16], 0x1234, 0x77, [0xAA; 65])),
-            (
-                "root key",
-                fake_creds([0xCC; 16], 0x1234, 0x1B669, [0xAB; 65]),
-            ),
-        ] {
-            let err = check_identity(&a, &other).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::Other, "{label}");
-            assert!(
-                err.detail.contains("restart matd"),
-                "{label}: {}",
-                err.detail
-            );
-        }
-    }
-
-    /// テスト用: 証明書無しの `FabricCredentials`（identity 照合と swap だけに使う）。
-    fn fake_creds(
-        ipk: [u8; 16],
-        fabric_id: u64,
-        node_id: u64,
-        root_public_key: [u8; 65],
-    ) -> FabricCredentials {
-        FabricCredentials {
-            rcac_tlv: Vec::new(),
-            icac_tlv: None,
-            noc_tlv: Vec::new(),
-            op_public_key: [0u8; 65],
-            op_private_key: [0u8; 32],
-            ipk_operational: ipk,
-            node_id,
-            fabric_id,
-            root_public_key,
-        }
-    }
-
-    #[test]
-    fn case_establisher_swap_reports_ipk_change() {
-        let est = CaseEstablisher {
-            creds: std::sync::RwLock::new(Arc::new(fake_creds([0xCC; 16], 1, 2, [0xAA; 65]))),
-            scope_id: 0,
-            resolver: Arc::new(OneShotResolver),
-            cfg: NativeConfig {
-                store: std::path::PathBuf::from("/nonexistent"),
-                iface: "lo".into(),
-                thread_iface: None,
-                fabric_index: 1,
-                issuer_index: 0,
-            },
-        };
-        // 同じ IPK → false、違う IPK → true、その後は新しい値が見える。
-        assert!(!est.swap_credentials(fake_creds([0xCC; 16], 1, 2, [0xAA; 65])));
-        assert!(est.swap_credentials(fake_creds([0xDD; 16], 1, 2, [0xAA; 65])));
-        assert_eq!(est.creds().ipk_operational, [0xDD; 16]);
-    }
-
-    /// KVS が無い store で reload すると store_missing（`load_fabric_credentials`
-    /// と同じ写像）。swap は起きない。
-    #[test]
-    fn case_establisher_reload_maps_missing_store_to_store_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let est = CaseEstablisher {
-            creds: std::sync::RwLock::new(Arc::new(fake_creds([0xCC; 16], 1, 2, [0xAA; 65]))),
-            scope_id: 0,
-            resolver: Arc::new(OneShotResolver),
-            cfg: NativeConfig {
-                store: dir.path().to_path_buf(),
-                iface: "lo".into(),
-                thread_iface: None,
-                fabric_index: 1,
-                issuer_index: 0,
-            },
-        };
-        let err = est.reload_credentials().unwrap_err();
-        assert_eq!(err.kind, ErrorKind::StoreMissing);
-        assert_eq!(est.creds().ipk_operational, [0xCC; 16]);
-    }
-
-    /// 実 KVS のフィクスチャ: 新しい fabric を bootstrap した store（chip-tool
-    /// INI 互換の alpha + main）と、それを指す `NativeConfig`。TempDir は
-    /// 呼び手が生かし続ける（drop でストアごと消える）。
-    fn bootstrapped_store(fabric_id: u64, node_id: u64) -> (tempfile::TempDir, NativeConfig) {
-        let dir = tempfile::tempdir().unwrap();
-        let fab = mat_controller::commissioning::CommissioningFabric::generate(fabric_id, node_id)
-            .unwrap();
-        fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
-        let cfg = NativeConfig {
-            store: dir.path().to_path_buf(),
-            iface: "lo".into(),
-            thread_iface: None,
-            fabric_index: 1,
-            issuer_index: 0,
-        };
-        (dir, cfg)
-    }
-
-    /// `case_establisher` と同じ形の確立器を、iface 解決を挟まずに組む
-    /// （テストに実 iface は要らない — reload は KVS しか触らない）。
-    fn establisher_over_store(
-        creds_cfg: &NativeConfig,
-        reload_cfg: &NativeConfig,
-    ) -> CaseEstablisher {
-        let creds = load_fabric_credentials(creds_cfg).expect("bootstrapped store loads");
-        CaseEstablisher {
-            creds: std::sync::RwLock::new(Arc::new(creds)),
-            scope_id: 0,
-            resolver: Arc::new(OneShotResolver),
-            cfg: reload_cfg.clone(),
-        }
-    }
-
-    /// (a) ストアが変わっていなければ reload は `Ok(false)`、IPK も据え置き。
-    #[test]
-    fn case_establisher_reload_over_real_kvs_is_false_when_unchanged() {
-        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
-        let est = establisher_over_store(&cfg, &cfg);
-        let before = est.creds().ipk_operational;
-        assert!(
-            !est.reload_credentials()
-                .expect("reload over an intact store"),
-            "unchanged store must report ipk unchanged"
-        );
-        assert_eq!(est.creds().ipk_operational, before);
-    }
-
-    /// (b) `f/<idx>/k/0` を別 epoch で書き換える（rotate-ipk の commit と同じ
-    /// 経路）と reload は `Ok(true)`、新 epoch の運用鍵が入る。
-    #[test]
-    fn case_establisher_reload_over_real_kvs_picks_up_a_rotated_ipk() {
-        let (_dir, cfg) = bootstrapped_store(0x1234, 112233);
-        let est = establisher_over_store(&cfg, &cfg);
-        let before = est.creds();
-        let cfid = compressed_fabric_id(&before.root_public_key, before.fabric_id);
-        let main_ini = cfg.store.join(mat_controller::kvs::MAIN_INI_FILE);
-        let cur = mat_controller::kvs::read_mat_ipk_epoch(&main_ini, cfg.fabric_index)
-            .unwrap()
-            .expect("bootstrap persists the current epoch");
-        let next = [0x5A; 16];
-        assert_ne!(cur, next, "the fixture epoch must differ from the new one");
-        mat_controller::group_settings::begin_ipk_rotation(&main_ini, cfg.fabric_index, &next)
-            .unwrap();
-        mat_controller::group_settings::commit_ipk_rotation(
-            &main_ini,
-            cfg.fabric_index,
-            &cfid,
-            &cur,
-            &next,
-        )
-        .unwrap();
-
-        assert!(
-            est.reload_credentials().expect("reload after a commit"),
-            "a rotated IPK must report changed"
-        );
-        assert_eq!(
-            est.creds().ipk_operational,
-            mat_controller::fabric::derive_ipk_operational(&next, &cfid),
-            "the new epoch's operational key must be installed"
-        );
-    }
-
-    /// (c) 別 fabric の store を指した reload は `other` で拒否され、資格情報は
-    /// 一切差し替わらない（restart 案内）。
-    #[test]
-    fn case_establisher_reload_over_real_kvs_rejects_a_different_fabric() {
-        let (_dir_a, cfg_a) = bootstrapped_store(0x1234, 112233);
-        let (_dir_b, cfg_b) = bootstrapped_store(0x9999, 112233);
-        // 起動時の資格情報は A、reload が読むのは B（= 取り違えた store）。
-        let est = establisher_over_store(&cfg_a, &cfg_b);
-        let before = est.creds().ipk_operational;
-
-        let err = est.reload_credentials().unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Other);
-        assert!(err.detail.contains("restart matd"), "detail={}", err.detail);
-        assert_eq!(est.creds().ipk_operational, before, "no swap on rejection");
-    }
-}
-
-#[cfg(test)]
-mod dedicated_op_socket_tests {
-    use super::*;
-    use mat_controller::cert::MatterCert;
-    use mat_controller::kvs::SelfIssueMaterials;
-    use mat_controller::test_support as case_ts;
-    use mat_controller::transport::UdpTransport;
-    use std::net::Ipv6Addr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// 呼び出し順に固定ポートを払い出す fake resolver。2 応答器が同一
-    /// fixture 識別（同一 node_id）なので、どちらの establish がどちらの
-    /// 応答器に着いても対称で問題ない。
-    struct FixedPortResolver {
-        ports: Vec<u16>,
-        next: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl Resolver for FixedPortResolver {
-        async fn resolve(
-            &self,
-            _scope_id: u32,
-            _cfid: [u8; 8],
-            _node_id: u64,
-            _timeout: Duration,
-        ) -> Result<dnssd::ResolvedNode, dnssd::DnssdError> {
-            let i = self.next.fetch_add(1, Ordering::SeqCst);
-            Ok(dnssd::ResolvedNode {
-                port: self.ports[i],
-                addresses: vec![Ipv6Addr::LOCALHOST],
-                session_idle_interval_ms: Some(50),
-                session_active_interval_ms: Some(50),
-            })
-        }
-    }
-
-    /// 監査#3 の釘打ち: 異なるノードへの並行 op が互いの応答を吸わない。
-    /// ループバックに CASE 応答器を 2 つ立て、並行 establish + read が両方
-    /// 成功し、応答器の観測した initiator ソースポートが異なる（= ノード
-    /// ごとの専用ソケット）ことを assert する。共有ソケットに退行すると
-    /// ポートが一致して確実に落ちる。
-    #[tokio::test]
-    async fn concurrent_establishes_use_dedicated_sockets() {
-        let noc = MatterCert::parse(case_ts::NODE01_NOC).expect("parse fixture NOC");
-        let responder_node_id = noc.node_id().expect("node id");
-        let fabric_id = noc.fabric_id().expect("fabric id");
-        let op_priv: [u8; 32] = case_ts::NODE01_PRIV.try_into().unwrap();
-
-        // 応答器 2 つ（同一識別・別ポート）。
-        let mut handles = Vec::new();
-        let mut ports = Vec::new();
-        for _ in 0..2 {
-            let t = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-                .await
-                .unwrap();
-            ports.push(t.local_addr().unwrap().port());
-            handles.push(tokio::spawn(case_ts::responder_task(
-                t,
-                case_ts::INITIATOR_NODE_ID,
-                responder_node_id,
-                case_ts::NODE01_NOC.to_vec(),
-                case_ts::ICA01.to_vec(),
-                op_priv,
-                case_ts::ROOT01_CHIP.to_vec(),
-            )));
-        }
-
-        let materials = SelfIssueMaterials {
-            rcac: case_ts::ROOT01_CHIP.to_vec(),
-            root_private_key: case_ts::ROOT01_PRIV.try_into().unwrap(),
-            ipk_operational: case_ts::IPK,
-            node_id: case_ts::INITIATOR_NODE_ID,
-            fabric_id,
-        };
-        let creds = FabricCredentials::from_self_issued(materials).expect("creds");
-        let est = CaseEstablisher {
-            creds: std::sync::RwLock::new(Arc::new(creds)),
-            scope_id: 0,
-            resolver: Arc::new(FixedPortResolver {
-                ports,
-                next: AtomicUsize::new(0),
-            }),
-            cfg: NativeConfig {
-                store: std::path::PathBuf::from("/nonexistent"),
-                iface: "lo".into(),
-                thread_iface: None,
-                fabric_index: 1,
-                issuer_index: 0,
-            },
-        };
-
-        let (a, b) = tokio::join!(
-            est.establish(responder_node_id),
-            est.establish(responder_node_id)
-        );
-        let mut a = a.expect("establish 1");
-        let mut b = b.expect("establish 2");
-        let (ra, rb) = tokio::join!(a.read_onoff(1), b.read_onoff(1));
-        // 応答器は on-off=false を返す（clippy: bool_assert_comparison を避け assert! で）。
-        assert!(!ra.expect("read 1"));
-        assert!(!rb.expect("read 2"));
-
-        let sa = handles.pop().unwrap().await.expect("responder 2");
-        let sb = handles.pop().unwrap().await.expect("responder 1");
-        assert_ne!(
-            sa.port(),
-            sb.port(),
-            "op sockets must be dedicated per establish (audit #3)"
-        );
-    }
-
-    /// reload の釘打ち: 間違った IPK で建てた確立器は CASE に失敗し、正しい
-    /// 資格情報へ swap した直後の establish は成功する（進行中セッション無し
-    /// の最小形 — swap が「次の確立から効く」ことを実 CASE で確認する）。
-    #[tokio::test]
-    async fn swapped_credentials_are_used_by_the_next_establish() {
-        let noc = MatterCert::parse(case_ts::NODE01_NOC).expect("parse fixture NOC");
-        let responder_node_id = noc.node_id().expect("node id");
-        let fabric_id = noc.fabric_id().expect("fabric id");
-        let op_priv: [u8; 32] = case_ts::NODE01_PRIV.try_into().unwrap();
-
-        // 応答器 2 つ（1 回目の失敗で 1 つ目が終わっても 2 回目が着く先を持つ）。
-        let mut handles = Vec::new();
-        let mut ports = Vec::new();
-        for _ in 0..2 {
-            let t = UdpTransport::bind_addr("[::1]:0".parse().unwrap())
-                .await
-                .unwrap();
-            ports.push(t.local_addr().unwrap().port());
-            handles.push(tokio::spawn(case_ts::responder_task(
-                t,
-                case_ts::INITIATOR_NODE_ID,
-                responder_node_id,
-                case_ts::NODE01_NOC.to_vec(),
-                case_ts::ICA01.to_vec(),
-                op_priv,
-                case_ts::ROOT01_CHIP.to_vec(),
-            )));
-        }
-
-        let materials = |ipk: [u8; 16]| SelfIssueMaterials {
-            rcac: case_ts::ROOT01_CHIP.to_vec(),
-            root_private_key: case_ts::ROOT01_PRIV.try_into().unwrap(),
-            ipk_operational: ipk,
-            node_id: case_ts::INITIATOR_NODE_ID,
-            fabric_id,
-        };
-        let wrong = FabricCredentials::from_self_issued(materials([0xDD; 16])).expect("creds");
-        let right = FabricCredentials::from_self_issued(materials(case_ts::IPK)).expect("creds");
-        let est = CaseEstablisher {
-            creds: std::sync::RwLock::new(Arc::new(wrong)),
-            scope_id: 0,
-            resolver: Arc::new(FixedPortResolver {
-                ports,
-                next: AtomicUsize::new(0),
-            }),
-            cfg: NativeConfig {
-                store: std::path::PathBuf::from("/nonexistent"),
-                iface: "lo".into(),
-                thread_iface: None,
-                fabric_index: 1,
-                issuer_index: 0,
-            },
-        };
-
-        // `expect_err` は `Box<dyn NodeConn>: Debug` を要求してしまう（未実装）
-        // ので、既存の `fake_sub_conn_next_report_fails_when_injected_after_establish`
-        // と同じ match で取り出す。
-        let err = match est.establish(responder_node_id).await {
-            Err(e) => e,
-            Ok(_) => panic!("wrong IPK must not establish"),
-        };
-        assert_eq!(err.kind, ErrorKind::SessionFailed, "detail={}", err.detail);
-
-        assert!(est.swap_credentials(right), "IPK differs → changed");
-        let mut conn = est
-            .establish(responder_node_id)
-            .await
-            .expect("establish with the swapped credentials");
-        assert!(!conn.read_onoff(1).await.expect("read after swap"));
-
-        for h in handles {
-            h.abort();
-        }
-    }
-}
+mod tests;

@@ -22,6 +22,65 @@ use crate::Engine;
 /// 足さない）。
 const ATTR_CURRENT_FABRIC_INDEX: u32 = 0x0005;
 
+/// 値ツリー（`mat_core::ids::ArgValue`）を 1 要素の TLV として `w` に書く。
+/// List → TLV Array（属性 list の型。TLV List 0x17 は path 専用）、Struct →
+/// TLV Struct（context tag = fieldId、呼び出し側で id 昇順整列済み）。
+pub fn put_value(
+    w: &mut mat_controller::tlv::Writer,
+    tag: mat_controller::tlv::Tag,
+    v: &mat_core::ids::ArgValue,
+) {
+    use mat_controller::tlv::Tag;
+    use mat_core::ids::ArgValue as V;
+    match v {
+        V::Bool(b) => w.put_bool(tag, *b),
+        V::UInt(n) => w.put_uint(tag, *n),
+        V::Int(n) => w.put_int(tag, *n),
+        V::F32(f) => w.put_f32(tag, *f),
+        V::F64(f) => w.put_f64(tag, *f),
+        V::Str(s) => w.put_str(tag, s),
+        V::Bytes(b) => w.put_bytes(tag, b),
+        V::Null => w.put_null(tag),
+        V::List(items) => {
+            w.start_array(tag);
+            for item in items {
+                put_value(w, Tag::Anonymous, item);
+            }
+            w.end_container();
+        }
+        V::Struct(fields) => {
+            w.start_struct(tag);
+            for (id, val) in fields {
+                put_value(w, Tag::Context(*id), val);
+            }
+            w.end_container();
+        }
+    }
+}
+
+/// `ArgValue` を Anonymous タグの単一 TLV 要素へ（`write_tlv`/
+/// `write_attribute_tlv` に渡す形。呼び出し側がトップレベルタグを再付与する）。
+pub fn arg_value_to_tlv(v: &mat_core::ids::ArgValue) -> Vec<u8> {
+    let mut w = mat_controller::tlv::Writer::new();
+    put_value(&mut w, mat_controller::tlv::Tag::Anonymous, v);
+    w.finish()
+}
+
+/// invoke のコマンド引数（値ツリーの列）を CommandFields TLV へ。context tag は
+/// 引数添字（0-based、`CmdDef::fields` の添字と一致 — `mat_core::ids` のコメント
+/// 参照）。mat 直経路 (`native_direct`) / matd (`server::native_op`) の両方が使う
+/// 共有ヘルパ（M8a Task10 で mat 側から移設・一本化）。
+pub fn encode_command_fields(args: &[mat_core::ids::ArgValue]) -> Vec<u8> {
+    use mat_controller::tlv::{Tag, Writer};
+    let mut w = Writer::new();
+    w.start_struct(Tag::Anonymous);
+    for (i, v) in args.iter().enumerate() {
+        put_value(&mut w, Tag::Context(i as u8), v);
+    }
+    w.end_container();
+    w.finish()
+}
+
 /// 経路非依存の入力換算（CLI 入力 → Matter 生値）。旧 `mat/src/units.rs`。
 pub(crate) mod units {
     /// `--kelvin` / `--mireds`（排他・どちらか必須）を `(mireds, kelvin)` に
@@ -145,7 +204,7 @@ fn resolve_invoke(
             let fields_tlv = if fields.is_empty() {
                 None
             } else {
-                Some(crate::encode_command_fields(&fields))
+                Some(encode_command_fields(&fields))
             };
             Ok((cluster, command, fields_tlv, timed))
         }
@@ -372,6 +431,44 @@ pub struct ProvisionParams {
     pub rebind: bool,
 }
 
+/// ショートカット op（color / color-temp / level）の (cluster, command,
+/// CommandFields) 三つ組。単一ノード（`run_node_op`）と groupcast
+/// （`GroupOpKind::wire`）が同じワイヤを出すことをここで保証する。
+pub(crate) mod shortcut {
+    use mat_controller::im;
+    use mat_core::color::ResolvedColor;
+
+    pub fn color(color: &ResolvedColor, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(im::encode_move_to_hue_and_saturation_fields(
+                color.hue_raw,
+                color.sat_raw,
+                transition,
+            )),
+        )
+    }
+
+    pub fn color_temp(mireds: u16, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(im::encode_move_to_color_temperature_fields(
+                mireds, transition,
+            )),
+        )
+    }
+
+    pub fn level(level: u8, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_LEVEL_CONTROL,
+            im::CMD_MOVE_TO_LEVEL,
+            Some(im::encode_move_to_level_fields(level, transition)),
+        )
+    }
+}
+
 /// 単一ノード op を 1 回実行し、成功 body（timestamp 抜き）を返す。
 /// op → NodeConn 呼び出し（TLV 符号化）→ body 組立はここだけ。セッションの
 /// 取得・後始末は呼び出し側（`runner`）の責務。
@@ -405,19 +502,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             color,
             transition,
         } => {
-            let fields = im::encode_move_to_hue_and_saturation_fields(
-                color.hue_raw,
-                color.sat_raw,
-                *transition,
-            );
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::color(color, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::color_success(node_id, *endpoint, color, *transition)
         }
         NodeOpKind::ColorTemp {
@@ -426,15 +513,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             mireds,
             transition,
         } => {
-            let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::color_temp(*mireds, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::color_temp_success(node_id, *endpoint, *kelvin, *mireds, *transition)
         }
         NodeOpKind::Level {
@@ -443,15 +524,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             level,
             transition,
         } => {
-            let fields = im::encode_move_to_level_fields(*level, *transition);
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::level(*level, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::level_success(
                 node_id,
                 *endpoint,
@@ -500,7 +575,7 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
                 *endpoint,
                 *cluster,
                 *attribute,
-                crate::arg_value_to_tlv(value),
+                arg_value_to_tlv(value),
                 *timed,
             )
             .await?;
@@ -590,32 +665,13 @@ impl GroupOpKind {
                 fields_tlv,
                 ..
             } => (*cluster, *command, fields_tlv.clone()),
-            GroupOpKind::Color { color, transition } => (
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(im::encode_move_to_hue_and_saturation_fields(
-                    color.hue_raw,
-                    color.sat_raw,
-                    *transition,
-                )),
-            ),
+            GroupOpKind::Color { color, transition } => shortcut::color(color, *transition),
             GroupOpKind::ColorTemp {
                 mireds, transition, ..
-            } => (
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(im::encode_move_to_color_temperature_fields(
-                    *mireds,
-                    *transition,
-                )),
-            ),
+            } => shortcut::color_temp(*mireds, *transition),
             GroupOpKind::Level {
                 level, transition, ..
-            } => (
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(im::encode_move_to_level_fields(*level, *transition)),
-            ),
+            } => shortcut::level(*level, *transition),
         }
     }
 }
@@ -696,677 +752,4 @@ pub async fn run_group_bump(engine: &Engine) -> Result<Value, MatError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::FakeConn;
-    use mat_controller::im::{self, CLUSTER_ON_OFF, CMD_ON_OFF_ON, CMD_ON_OFF_TOGGLE};
-    use mat_core::error::ErrorKind;
-    use serde_json::json;
-
-    fn node(kind: NodeOpKind) -> NodeOp {
-        NodeOp { node_id: 5, kind }
-    }
-
-    #[test]
-    fn kelvin_2700_converts_to_370_mireds() {
-        assert_eq!(units::resolve_color_temp(Some(2700), None), (370, 2700));
-    }
-
-    #[test]
-    fn kelvin_6500_rounds_to_154_mireds() {
-        assert_eq!(units::resolve_color_temp(Some(6500), None), (154, 6500));
-    }
-
-    #[test]
-    fn mireds_direct_computes_kelvin_echo() {
-        assert_eq!(units::resolve_color_temp(None, Some(370)), (370, 2703));
-    }
-
-    #[test]
-    fn resolve_level_rounds_percent_to_254_scale() {
-        assert_eq!(units::resolve_level(0), 0);
-        assert_eq!(units::resolve_level(1), 3);
-        assert_eq!(units::resolve_level(50), 127);
-        assert_eq!(units::resolve_level(100), 254);
-    }
-
-    #[test]
-    fn read_resolves_names_and_numeric_ids() {
-        let k = NodeOpKind::read(1, "levelcontrol", "current-level").unwrap();
-        assert!(matches!(
-            k,
-            NodeOpKind::Read {
-                endpoint: 1,
-                cluster: 0x0008,
-                attribute: 0x0000,
-                ..
-            }
-        ));
-        let k = NodeOpKind::read(1, "0x0008", "0").unwrap();
-        assert!(matches!(
-            k,
-            NodeOpKind::Read {
-                cluster: 0x0008,
-                attribute: 0,
-                ..
-            }
-        ));
-        let err = NodeOpKind::read(1, "nosuchcluster", "x").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(
-            err.detail.contains("numeric IDs are accepted"),
-            "{}",
-            err.detail
-        );
-    }
-
-    #[test]
-    fn write_scalar_ok_bad_json_shape_rejected_unknown_unresolved() {
-        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap();
-        assert!(matches!(
-            k,
-            NodeOpKind::Write {
-                cluster: 0x0008,
-                value: ArgValue::UInt(128),
-                timed: false,
-                ..
-            }
-        ));
-        let err = NodeOpKind::write(1, "accesscontrol", "acl", "{}", false).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        assert!(
-            err.detail.contains("expected a JSON array"),
-            "{}",
-            err.detail
-        );
-        let err = NodeOpKind::write(1, "nosuch", "x", "1", false).unwrap_err();
-        assert!(
-            err.detail.contains("numeric IDs are accepted"),
-            "{}",
-            err.detail
-        );
-    }
-
-    #[test]
-    fn invoke_scalar_args_ok_struct_args_rejected() {
-        let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
-        let k = NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args, false).unwrap();
-        assert!(matches!(
-            k,
-            NodeOpKind::Invoke {
-                cluster: 0x0008,
-                fields_tlv: Some(_),
-                ..
-            }
-        ));
-        let k = NodeOpKind::invoke(1, "onoff", "on", &[], false).unwrap();
-        assert!(matches!(
-            k,
-            NodeOpKind::Invoke {
-                cluster: CLUSTER_ON_OFF,
-                command: CMD_ON_OFF_ON,
-                fields_tlv: None,
-                ..
-            }
-        ));
-        let err = NodeOpKind::invoke(
-            1,
-            "groupkeymanagement",
-            "key-set-write",
-            &["{}".into()],
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-    }
-
-    #[test]
-    fn timed_override_forces_true_but_never_false() {
-        // 表 false + override → true。
-        let k = NodeOpKind::invoke(1, "onoff", "on", &[], true).unwrap();
-        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
-        // 数値 ID（表なし）+ override → true。
-        let k = NodeOpKind::invoke(1, "6", "1", &[], true).unwrap();
-        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
-        // 表 true は override false でも true のまま。
-        let k = NodeOpKind::invoke(
-            0,
-            "administratorcommissioning",
-            "revoke-commissioning",
-            &[],
-            false,
-        )
-        .unwrap();
-        assert!(matches!(k, NodeOpKind::Invoke { timed: true, .. }));
-        // write も同じ。
-        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", true).unwrap();
-        assert!(matches!(k, NodeOpKind::Write { timed: true, .. }));
-        let k = NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap();
-        assert!(matches!(k, NodeOpKind::Write { timed: false, .. }));
-    }
-
-    #[test]
-    fn group_invoke_resolves_like_node_invoke() {
-        let k = GroupOpKind::invoke("onoff", "toggle", &[]).unwrap();
-        assert!(matches!(
-            k,
-            GroupOpKind::Invoke {
-                cluster: CLUSTER_ON_OFF,
-                command: CMD_ON_OFF_TOGGLE,
-                fields_tlv: None,
-                ..
-            }
-        ));
-        let err = GroupOpKind::invoke("onoff", "on", &["1".into()]).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-        let err = GroupOpKind::invoke("onoff", "foo", &[]).unwrap_err();
-        assert!(
-            err.detail.contains("numeric IDs are accepted"),
-            "{}",
-            err.detail
-        );
-    }
-
-    #[test]
-    fn color_temp_and_level_constructors_convert_units() {
-        assert_eq!(
-            NodeOpKind::color_temp(1, Some(2700), None, 0),
-            NodeOpKind::ColorTemp {
-                endpoint: 1,
-                kelvin: 2700,
-                mireds: 370,
-                transition: 0
-            }
-        );
-        assert_eq!(
-            NodeOpKind::level(1, 50, 0),
-            NodeOpKind::Level {
-                endpoint: 1,
-                percent: 50,
-                level: 127,
-                transition: 0
-            }
-        );
-        assert_eq!(
-            GroupOpKind::color_temp(None, Some(370), 5),
-            GroupOpKind::ColorTemp {
-                kelvin: 2703,
-                mireds: 370,
-                transition: 5
-            }
-        );
-        assert_eq!(
-            GroupOpKind::level(100, 0),
-            GroupOpKind::Level {
-                percent: 100,
-                level: 254,
-                transition: 0
-            }
-        );
-    }
-
-    #[test]
-    fn budget_applies_only_to_single_node_hotpath_ops() {
-        assert!(NodeOpKind::On { endpoint: 1 }.budget_applies());
-        assert!(NodeOpKind::Off { endpoint: 1 }.budget_applies());
-        assert!(NodeOpKind::level(1, 1, 0).budget_applies());
-        assert!(NodeOpKind::color_temp(1, Some(2700), None, 0).budget_applies());
-        assert!(NodeOpKind::read(1, "onoff", "on-off")
-            .unwrap()
-            .budget_applies());
-        assert!(NodeOpKind::write(1, "onoff", "on-off", "true", false)
-            .unwrap()
-            .budget_applies());
-        assert!(NodeOpKind::invoke(1, "onoff", "on", &[], false)
-            .unwrap()
-            .budget_applies());
-        assert!(NodeOpKind::Describe.budget_applies());
-        assert!(!NodeOpKind::DiagThread { endpoint: 0 }.budget_applies());
-        assert!(!NodeOpKind::OpenWindow {
-            timeout: 180,
-            iteration: 1000,
-            discriminator: 1
-        }
-        .budget_applies());
-    }
-
-    #[test]
-    fn names_are_snake_case_wire_tags() {
-        assert_eq!(NodeOpKind::On { endpoint: 1 }.name(), "on");
-        assert_eq!(
-            NodeOpKind::color_temp(1, Some(2700), None, 0).name(),
-            "color_temp"
-        );
-        assert_eq!(
-            NodeOpKind::OpenWindow {
-                timeout: 1,
-                iteration: 1,
-                discriminator: 1
-            }
-            .name(),
-            "open_window"
-        );
-        assert_eq!(GroupOpKind::level(1, 0).name(), "group_level");
-    }
-
-    #[tokio::test]
-    async fn on_off_invoke_onoff_and_build_invoke_body() {
-        let mut conn = FakeConn::default();
-        let body = run_node_op(&mut conn, &node(NodeOpKind::On { endpoint: 1 }))
-            .await
-            .unwrap();
-        assert_eq!(body, mat_core::body::invoke_success(5, 1, "onoff", "on"));
-        let body = run_node_op(&mut conn, &node(NodeOpKind::Off { endpoint: 1 }))
-            .await
-            .unwrap();
-        assert_eq!(body, mat_core::body::invoke_success(5, 1, "onoff", "off"));
-        assert_eq!(
-            conn.calls(),
-            &[
-                format!(
-                    "invoke(1,{:#06X},{:#06X})",
-                    im::CLUSTER_ON_OFF,
-                    im::CMD_ON_OFF_ON
-                ),
-                format!(
-                    "invoke(1,{:#06X},{:#06X})",
-                    im::CLUSTER_ON_OFF,
-                    im::CMD_ON_OFF_OFF
-                ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn color_color_temp_level_send_expected_commands() {
-        let mut conn = FakeConn::default();
-        let color = ResolvedColor {
-            hue_raw: 233,
-            sat_raw: 203,
-            hue: 330,
-            sat: 80,
-            name: None,
-            rgb: None,
-        };
-        let body = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::Color {
-                endpoint: 1,
-                color: color.clone(),
-                transition: 30,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(body, mat_core::body::color_success(5, 1, &color, 30));
-        let body = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::color_temp(1, Some(2700), None, 0)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(body, mat_core::body::color_temp_success(5, 1, 2700, 370, 0));
-        let body = run_node_op(&mut conn, &node(NodeOpKind::level(1, 50, 0)))
-            .await
-            .unwrap();
-        assert_eq!(
-            body,
-            mat_core::body::level_success(
-                5,
-                1,
-                mat_core::body::LevelEcho {
-                    percent: 50,
-                    level: 127
-                },
-                0
-            )
-        );
-        assert_eq!(
-            conn.calls(),
-            &[
-                format!(
-                    "invoke(1,{:#06X},{:#06X})",
-                    im::CLUSTER_COLOR_CONTROL,
-                    im::CMD_MOVE_TO_HUE_AND_SATURATION
-                ),
-                format!(
-                    "invoke(1,{:#06X},{:#06X})",
-                    im::CLUSTER_COLOR_CONTROL,
-                    im::CMD_MOVE_TO_COLOR_TEMPERATURE
-                ),
-                format!(
-                    "invoke(1,{:#06X},{:#06X})",
-                    im::CLUSTER_LEVEL_CONTROL,
-                    im::CMD_MOVE_TO_LEVEL
-                ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn read_onoff_uses_bool_fast_path_and_generic_read_uses_json() {
-        // FakeConn::read_onoff は常に true、read_json は登録値（未登録は 1）。
-        let mut conn = FakeConn::scripted().with_read(1, 0x0008, 0x0000, json!(200));
-        let body = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::read(1, "onoff", "on-off").unwrap()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            body,
-            mat_core::body::read_success(5, 1, "onoff", "on-off", json!(true))
-        );
-        let body = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::read(1, "levelcontrol", "current-level").unwrap()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(body["value"], json!(200));
-        assert_eq!(body["cluster"], "levelcontrol");
-        assert_eq!(body["attribute"], "current-level");
-    }
-
-    #[tokio::test]
-    async fn write_encodes_scalar_tlv_and_echoes_normalized_value() {
-        let mut conn = FakeConn::default();
-        let op = node(NodeOpKind::write(1, "levelcontrol", "on-level", "128", false).unwrap());
-        let body = run_node_op(&mut conn, &op).await.unwrap();
-        assert_eq!(
-            body,
-            mat_core::body::write_success(5, 1, "levelcontrol", "on-level", "128")
-        );
-        let (ep, cluster, attr, tlv) = &conn.written_tlv()[0];
-        assert_eq!((*ep, *cluster, *attr), (1, 0x0008, 0x0011));
-        assert_eq!(tlv, &crate::arg_value_to_tlv(&ArgValue::UInt(128)));
-    }
-
-    #[tokio::test]
-    async fn invoke_generic_forwards_ids_and_builds_body() {
-        let mut conn = FakeConn::default();
-        let args: Vec<String> = vec!["128".into(), "0".into(), "0".into(), "0".into()];
-        let op =
-            node(NodeOpKind::invoke(1, "levelcontrol", "move-to-level", &args, false).unwrap());
-        let body = run_node_op(&mut conn, &op).await.unwrap();
-        assert_eq!(
-            body,
-            mat_core::body::invoke_success(5, 1, "levelcontrol", "move-to-level")
-        );
-        assert_eq!(
-            conn.calls(),
-            &[format!(
-                "invoke(1,{:#06X},{:#06X})",
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL
-            )]
-        );
-    }
-
-    #[tokio::test]
-    async fn describe_diag_thread_and_open_window_build_bodies() {
-        let mut conn = FakeConn::scripted().with_cluster(
-            0,
-            0x0035,
-            vec![(0x0007, json!([{"5": 200}, {"5": 100}]))],
-        );
-        let body = run_node_op(&mut conn, &node(NodeOpKind::Describe))
-            .await
-            .unwrap();
-        assert_eq!(body["node_id"], 5);
-        assert!(body["endpoints"].is_array());
-
-        let body = run_node_op(&mut conn, &node(NodeOpKind::DiagThread { endpoint: 0 }))
-            .await
-            .unwrap();
-        assert_eq!(body["endpoint"], 0);
-        assert!(body["thread"].is_object());
-
-        let body = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::OpenWindow {
-                timeout: 180,
-                iteration: 1000,
-                discriminator: 3840,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(body["manual_code"], "34970112332");
-        assert!(body["qr_payload"].as_str().unwrap().starts_with("MT:"));
-        assert!(body["expires_at"].is_string());
-    }
-
-    fn noc_response_tlv(status: u8, fabric_index: Option<u8>) -> Vec<u8> {
-        use mat_controller::tlv::{Tag, Writer};
-        let mut w = Writer::new();
-        w.start_struct(Tag::Anonymous);
-        w.put_uint(Tag::Context(0), u64::from(status));
-        if let Some(idx) = fabric_index {
-            w.put_uint(Tag::Context(1), u64::from(idx));
-        }
-        w.end_container();
-        w.finish()
-    }
-
-    #[tokio::test]
-    async fn remove_fabric_reads_current_index_then_invokes_and_reports_it() {
-        let mut conn = FakeConn::scripted()
-            .with_read(0, 0x003E, 0x0005, serde_json::json!(2))
-            .with_invoke_response(0, 0x003E, 0x0A, noc_response_tlv(0, Some(2)));
-        let body = run_node_op(&mut conn, &node(NodeOpKind::RemoveFabric))
-            .await
-            .unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "removed": true, "fabric_index": 2 })
-        );
-        assert_eq!(
-            conn.calls(),
-            &["invoke_for_data(0,0x003E,0x000A)".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_fabric_non_zero_status_is_device_rejected() {
-        let mut conn = FakeConn::scripted()
-            .with_read(0, 0x003E, 0x0005, serde_json::json!(2))
-            .with_invoke_response(0, 0x003E, 0x0A, noc_response_tlv(0x0B, None));
-        let err = run_node_op(&mut conn, &node(NodeOpKind::RemoveFabric))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::DeviceRejected);
-        assert!(err.detail.contains("0x0b"), "{}", err.detail);
-    }
-
-    #[test]
-    fn remove_fabric_name_and_budget() {
-        assert_eq!(NodeOpKind::RemoveFabric.name(), "remove_fabric");
-        assert!(NodeOpKind::RemoveFabric.budget_applies());
-    }
-
-    #[tokio::test]
-    async fn conn_error_propagates_unchanged() {
-        let mut conn = FakeConn {
-            fail_first_send: true,
-            fail_kind: ErrorKind::Timeout,
-            ..FakeConn::default()
-        };
-        let err = run_node_op(
-            &mut conn,
-            &node(NodeOpKind::read(1, "onoff", "on-off").unwrap()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Timeout);
-    }
-
-    #[test]
-    fn group_wire_and_sent_body_for_shortcuts() {
-        let ct = GroupOp {
-            group_id: 10,
-            endpoint: 1,
-            kind: GroupOpKind::color_temp(Some(2702), None, 0),
-        };
-        let (cluster, command, fields) = ct.kind.wire();
-        assert_eq!(
-            (cluster, command),
-            (im::CLUSTER_COLOR_CONTROL, im::CMD_MOVE_TO_COLOR_TEMPERATURE)
-        );
-        assert_eq!(
-            fields.unwrap(),
-            im::encode_move_to_color_temperature_fields(370, 0)
-        );
-        assert_eq!(
-            ct.sent_body(&["eth0".into()]),
-            mat_core::body::group_color_temp_sent(10, 2702, 370, 0, 1, &["eth0".to_string()])
-        );
-
-        let lv = GroupOp {
-            group_id: 10,
-            endpoint: 1,
-            kind: GroupOpKind::level(100, 0),
-        };
-        let (cluster, command, fields) = lv.kind.wire();
-        assert_eq!(
-            (cluster, command),
-            (im::CLUSTER_LEVEL_CONTROL, im::CMD_MOVE_TO_LEVEL)
-        );
-        assert_eq!(fields.unwrap(), im::encode_move_to_level_fields(254, 0));
-
-        let color = ResolvedColor {
-            hue_raw: 180,
-            sat_raw: 200,
-            hue: 254,
-            sat: 78,
-            name: None,
-            rgb: None,
-        };
-        let c = GroupOp {
-            group_id: 10,
-            endpoint: 1,
-            kind: GroupOpKind::Color {
-                color: color.clone(),
-                transition: 0,
-            },
-        };
-        let (cluster, command, fields) = c.kind.wire();
-        assert_eq!(
-            (cluster, command),
-            (
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION
-            )
-        );
-        assert_eq!(
-            fields.unwrap(),
-            im::encode_move_to_hue_and_saturation_fields(180, 200, 0)
-        );
-        assert_eq!(
-            c.sent_body(&[]),
-            mat_core::body::group_color_sent(10, &color, 0, 1, &[])
-        );
-
-        let inv = GroupOp {
-            group_id: 10,
-            endpoint: 1,
-            kind: GroupOpKind::invoke("onoff", "on", &[]).unwrap(),
-        };
-        assert_eq!(
-            inv.kind.wire(),
-            (im::CLUSTER_ON_OFF, im::CMD_ON_OFF_ON, None)
-        );
-        assert_eq!(
-            inv.sent_body(&[]),
-            mat_core::body::group_invoke_sent(10, "onoff", "on", 1, &[])
-        );
-    }
-
-    #[tokio::test]
-    async fn group_op_hard_errors_when_engine_group_ctx_unconfigured() {
-        use crate::test_support::FakeEstablisher;
-        let engine = crate::Engine::with_parts(Box::new(FakeEstablisher::default()), None);
-        let op = GroupOp {
-            group_id: 10,
-            endpoint: 1,
-            kind: GroupOpKind::invoke("onoff", "toggle", &[]).unwrap(),
-        };
-        let err = run_group_op(&engine, &op)
-            .await
-            .expect_err("group ctx unconfigured must hard-error");
-        assert_eq!(err.kind, ErrorKind::Other);
-        let err = run_group_bump(&engine)
-            .await
-            .expect_err("bump without ctx must hard-error");
-        assert_eq!(err.kind, ErrorKind::Other);
-    }
-
-    #[tokio::test]
-    async fn group_bump_advances_counter_via_engine() {
-        // 旧 native_direct::tests::group_bump_advances_counter_via_engine の移植。
-        use crate::group::GroupCtx;
-        use crate::test_support::{write_group_fixture_ini, FakeEstablisher};
-        use mat_controller::transport::UdpTransport;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-
-        let dir = tempfile::tempdir().unwrap();
-        let ini = dir.path().join("chip_tool_config.ini");
-        write_group_fixture_ini(&ini);
-        let counter_path = dir.path().join("native_group_counter");
-        let transport = Arc::new(UdpTransport::bind().await.unwrap());
-        let group_ctx = GroupCtx {
-            main_ini: ini,
-            counter_path: counter_path.clone(),
-            fabric_index: 2,
-            fabric_id: 1,
-            node_id: 0x0001_0001,
-            egress: vec![mat_controller::group::GroupEgress {
-                iface: "lo".into(),
-                transport,
-                scope_id: 1,
-            }],
-            dest_port: 5540,
-            op_iface: "lo".into(),
-            thread_retry: false,
-            sender: Mutex::new(None),
-        };
-        let engine =
-            crate::Engine::with_parts(Box::new(FakeEstablisher::default()), Some(group_ctx));
-        assert!(!counter_path.exists());
-        let body = run_group_bump(&engine)
-            .await
-            .expect("bump must succeed when ctx is configured");
-        assert!(body["group_counter"]["from"].is_number());
-        assert!(body["group_counter"]["to"].is_number());
-        assert!(
-            counter_path.exists(),
-            "counter file must be created/advanced by bump"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_cluster_maps_rows_to_attributes_object() {
-        let mut conn = FakeConn::scripted().with_cluster(
-            1,
-            0x0006,
-            vec![
-                (0x0000, serde_json::json!(true)),
-                (0x4000, serde_json::json!(false)),
-            ],
-        );
-        let k = NodeOpKind::read_cluster(1, "onoff").unwrap();
-        assert_eq!(k.name(), "read_cluster");
-        let body = run_node_op(&mut conn, &node(k)).await.unwrap();
-        assert_eq!(body["cluster"], "onoff");
-        assert_eq!(body["attributes"]["on-off"], true);
-        assert_eq!(body["attributes"]["global-scene-control"], false);
-        assert!(body.get("attribute").is_none());
-    }
-
-    #[test]
-    fn read_cluster_unknown_name_is_unresolved_op() {
-        let err = NodeOpKind::read_cluster(1, "nosuchcluster").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ParseError);
-    }
-}
+mod tests;

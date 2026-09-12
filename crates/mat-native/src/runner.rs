@@ -111,14 +111,13 @@ pub async fn provision(
     // keyset 0 = IPK。KVS（`k/0`）にも各ノードの keyset 0 にも触る前に拒む
     // （`write_group_provision` にも同じガードがあるが、そちらは KVS 層の
     // 防波堤 — ここで止めれば設定不備のエラーより先に引数の誤りが出る）。
-    if p.keyset_id == crate::ops::IPK_KEYSET_ID {
+    if p.keyset_id == mat_controller::group_settings::IPK_KEYSET_ID {
         return Err(crate::group_settings::ipk_keyset_reserved());
     }
     let Some(gs) = &engine.group_settings else {
         return Err(MatError::group_ctx_unconfigured());
     };
-    let epoch_key_hex = mat_core::group::resolve_epoch_key(p.epoch_key.as_deref())?;
-    let epoch_key = crate::ops::epoch_key_from_hex(&epoch_key_hex)?;
+    let epoch_key = mat_core::group::resolve_epoch_key_bytes(p.epoch_key.as_deref())?;
     crate::group_settings::write_group_provision(
         gs,
         p.group_id,
@@ -140,7 +139,7 @@ pub async fn provision(
             Box::pin(async move { crate::ops::provision_node(c.as_mut(), &np).await })
         })
         .await
-        .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+        .map_err(|e| e.prefixed(format!("node {node_id}")))?;
     }
     tracing::info!(
         group_id = p.group_id,
@@ -171,7 +170,7 @@ pub async fn grant(
                 Box::pin(async move { crate::ops::ensure_group_acl(c.as_mut(), group_id).await })
             })
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            .map_err(|e| e.prefixed(format!("node {node_id}")))?;
         if changed {
             updated.push(node_id);
         } else {
@@ -205,7 +204,7 @@ pub async fn remove_group(
                 Box::pin(async move { crate::ops::remove_group_node(c.as_mut(), &p).await })
             })
             .await
-            .map_err(|e| MatError::new(e.kind, format!("node {node_id}: {}", e.detail)))?;
+            .map_err(|e| e.prefixed(format!("node {node_id}")))?;
         nodes.push((
             node_id,
             rep.acl_removed,
@@ -297,16 +296,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::Establisher for ScriptedEstablisher {
         async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-            Ok(Box::new(
-                FakeConn::scripted()
-                    .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
-                    .with_read(
-                        0,
-                        0x001F,
-                        0x0000,
-                        serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                    ),
-            ))
+            Ok(Box::new(FakeConn::with_group_provision_fixture()))
         }
     }
 
@@ -409,14 +399,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::Establisher for ScriptedFailingEstablisher {
         async fn establish(&self, _node_id: u64) -> Result<Box<dyn NodeConn>, MatError> {
-            let mut conn = FakeConn::scripted()
-                .with_read(0, 0x003F, 0x0000, serde_json::json!([]))
-                .with_read(
-                    0,
-                    0x001F,
-                    0x0000,
-                    serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-                );
+            let mut conn = FakeConn::with_group_provision_fixture();
             conn.fail_at = Some(1);
             conn.fail_kind = ErrorKind::DeviceRejected;
             Ok(Box::new(conn))

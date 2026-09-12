@@ -1,28 +1,11 @@
 //! group（groupcast）の共有ロジック。`mat group`（one-shot）と `matd` の group op が
-//! 同じ鍵生成・宛先 node-id 組み立てを使うよう、一箇所で保守する。
+//! 同じ epoch 鍵の検証・生成を使うよう、一箇所で保守する。
 //!
-//! group state（鍵束・GroupKeyMap）自体は `mat`/`matd` 独自台帳を持たず chip-tool の
-//! 永続ストレージに委ねる（設計ルール 4）。ここにあるのは値の検証・生成・整形だけ。
+//! group state（鍵束・GroupKeyMap）自体は `mat`/`matd` 独自台帳を持たず、mat が
+//! 所有する chip-tool INI 互換 KVS（`mat-controller::group_settings`）に置く
+//! （設計ルール 4）。ここにあるのは値の検証・生成・整形だけ。
 
 use crate::error::{ErrorKind, MatError};
-
-/// GroupKeySecurityPolicy。0 = TrustFirst（最初に来た鍵を信頼）。
-pub const KEY_SECURITY_POLICY: &str = "0";
-
-/// epoch 鍵の有効開始時刻（EpochStartTime0）。コントローラ側 groupsettings の
-/// `add-keysets <keysetId> <keyPolicy> <validityTime> <EpochKey>` の validityTime と、
-/// デバイス側 KeySetWrite の epochStartTime0 はこの値で一致させる必要がある
-/// （ずれると両者が選ぶ有効 epoch 鍵が食い違い groupcast が復号できない）。
-pub const EPOCH_START_TIME: &str = "1";
-
-/// group multicast 宛先の node-id ベース。実 node-id は `BASE | group_id`。
-/// 上位48bitが全1（`0xffffffffffff....`）なら group 宛と解釈される。
-const GROUP_NODE_ID_BASE: u64 = 0xffff_ffff_ffff_0000;
-
-/// group multicast 宛先の node-id を `0x...` 16桁 hex 文字列で組み立てる。
-pub fn group_node_id(group_id: u16) -> String {
-    format!("0x{:016x}", GROUP_NODE_ID_BASE | u64::from(group_id))
-}
 
 /// `--epoch-key` の妥当性検証（16バイト = 32桁 hex）。小文字へ正規化して返す。
 pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
@@ -40,11 +23,17 @@ pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
     }
 }
 
-/// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す。
-pub fn generate_epoch_key() -> String {
+/// ランダムな 16 バイトの epoch key。
+pub fn generate_epoch_key_bytes() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed to fill epoch key");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes
+}
+
+/// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す（CLI 表示・
+/// ワイヤ用。バイト列が要る呼び手は [`generate_epoch_key_bytes`]）。
+pub fn generate_epoch_key() -> String {
+    crate::hex::encode_lower(&generate_epoch_key_bytes())
 }
 
 /// epoch key を決める: 明示指定があれば検証して採用、無ければランダム生成。
@@ -55,16 +44,23 @@ pub fn resolve_epoch_key(epoch_key: Option<&str>) -> Result<String, MatError> {
     }
 }
 
+/// [`resolve_epoch_key`] のバイト列版。hex → bytes の往復を呼び手（provision /
+/// rotate-ipk）が各自やっていたのを一本化する。
+pub fn resolve_epoch_key_bytes(epoch_key: Option<&str>) -> Result<[u8; 16], MatError> {
+    match epoch_key {
+        Some(k) => {
+            let hex = validate_epoch_key(k)?;
+            let bytes = crate::hex::decode(&hex).expect("validated as 32 hex chars");
+            <[u8; 16]>::try_from(bytes)
+                .map_err(|_| MatError::new(ErrorKind::Other, "epoch key decode (internal)"))
+        }
+        None => Ok(generate_epoch_key_bytes()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn group_node_id_packs_group_into_low_bits() {
-        assert_eq!(group_node_id(1), "0xffffffffffff0001");
-        assert_eq!(group_node_id(0x1234), "0xffffffffffff1234");
-        assert_eq!(group_node_id(0), "0xffffffffffff0000");
-    }
 
     #[test]
     fn validate_epoch_key_accepts_32_hex() {
@@ -95,5 +91,39 @@ mod tests {
         assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
         // 2回生成して異なる（乱数であること）。
         assert_ne!(k, generate_epoch_key());
+    }
+
+    #[test]
+    fn generated_epoch_key_bytes_are_random_and_hex_form_matches() {
+        let a = generate_epoch_key_bytes();
+        let b = generate_epoch_key_bytes();
+        assert_ne!(a, b);
+        // string 版は bytes 版の小文字 hex（両 API の一致を釘打ち）。
+        let s = generate_epoch_key();
+        assert_eq!(s.len(), 32);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn resolve_epoch_key_bytes_decodes_explicit_key_and_normalizes_case() {
+        let k = resolve_epoch_key_bytes(Some("0x00112233445566778899AABBCCDDEEFF")).unwrap();
+        assert_eq!(
+            k,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
+        );
+        assert_eq!(
+            resolve_epoch_key_bytes(Some("dead")).unwrap_err().kind,
+            ErrorKind::Other
+        );
+        // None = 生成（2 回で異なる）。
+        assert_ne!(
+            resolve_epoch_key_bytes(None).unwrap(),
+            resolve_epoch_key_bytes(None).unwrap()
+        );
     }
 }

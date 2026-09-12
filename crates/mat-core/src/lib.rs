@@ -12,6 +12,7 @@ pub mod diag;
 pub mod error;
 pub mod fsatomic;
 pub mod group;
+pub mod hex;
 pub mod ids;
 mod ids_gen;
 pub mod log;

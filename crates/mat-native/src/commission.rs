@@ -535,43 +535,15 @@ pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(
     let code = parse_code(&req.setup_code)?;
 
     // 資材構築（ローカル — M8c-3 で失敗は種別ごとのハードエラー）。
-    let scope_id = dnssd::iface_index(&cfg.iface).map_err(|e| {
-        MatError::new(
-            ErrorKind::Other,
-            format!("native commissioning: resolve iface {:?}: {e}", cfg.iface),
-        )
-    })?;
-    let alpha = cfg.store.join("chip_tool_config.alpha.ini");
-    let main_ini = cfg.store.join("chip_tool_config.ini");
-    let materials =
-        match kvs::read_self_issue_materials(&alpha, &main_ini, cfg.fabric_index, cfg.issuer_index)
-        {
-            Ok(m) => m,
-            // KVS 資材が読めない = fabric 未 bootstrap → store_missing。
-            Err(e) => {
-                return Err(MatError::new(
-                    ErrorKind::StoreMissing,
-                    format!(
-                        "native commissioning: read KVS credentials: {e} — run `mat fabric init`"
-                    ),
-                ))
-            }
-        };
+    let scope_id = crate::op_scope_id(cfg)?;
+    let main_ini = cfg.store.join(kvs::MAIN_INI_FILE);
+    let materials = crate::load_self_issue_materials(cfg)?;
     // epoch IPK 解決（M8c-3）には fabric の root 公開鍵が要るため一度
     // `FabricCredentials` を組む——`kvs::SelfIssueMaterials` は既に
     // `#[derive(Clone)]` 済み（秘密鍵を持つ型に Clone をここで新規に足す
     // わけではない）ので、安価な INI 再読みではなく `materials.clone()`
     // で賄う。
-    let creds = match fabric::FabricCredentials::from_self_issued(materials.clone()) {
-        Ok(c) => c,
-        // 資材はあるが NOC を組めない = 壊れた/不整合な store → store_parse。
-        Err(e) => {
-            return Err(MatError::new(
-                ErrorKind::StoreParse,
-                format!("native commissioning: self-issue NOC: {e}"),
-            ))
-        }
-    };
+    let creds = crate::self_issue_credentials(materials.clone())?;
     // 不一致（非 chip-tool fabric / IPK ローテーション済み）は Err —
     // フォールバックしない（resolve_ipk_epoch のドキュメント参照）。
     let ipk_epoch = resolve_ipk_epoch(&main_ini, cfg.fabric_index, &creds)?;

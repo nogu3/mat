@@ -26,7 +26,7 @@
 //! 同一ポート多重 bind の 1 ソケットにしか配達されないため、ノード毎
 //! ソケットでは他ノード宛の答えが黙殺され健全ノードを誤報していた。
 
-use mat_controller::{dnssd, fabric, kvs};
+use mat_controller::{dnssd, fabric};
 use mat_core::diag::MatterInstance;
 use mat_core::error::{ErrorKind, MatError};
 
@@ -43,9 +43,10 @@ pub struct NativeProbe<'a> {
 /// `_matter._tcp` の到達性を判定する。native の targeted resolve を並行実行
 /// する。結果 0 件は正常（Ok(vec![])）。失敗はそのままエラーを返す
 /// （フォールバック先が無い — Task 11）。失敗源ごとに ErrorKind を作り分ける
-/// （Task 11 レビュー修正）: iface 解決失敗は `Other`、KVS 資材の読み取り /
-/// NOC 自己発行失敗は `StoreMissing`（`mat fabric init` 未実施のヒント付き）、
-/// ソケット bind/send の I/O 失敗（全ノード共倒れ）は `Unreachable`。
+/// （Task 11 レビュー修正）: iface 解決失敗は `Other`、KVS 資材の読み取り失敗は
+/// `StoreMissing`、NOC 自己発行失敗は `StoreParse`（いずれも `mat fabric init`
+/// 未実施のヒント付き）、ソケット bind/send の I/O 失敗（全ノード共倒れ）は
+/// `Unreachable`。
 pub fn mdns(p: NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatError> {
     resolve_ledger_nodes(&p)
 }
@@ -59,31 +60,18 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
         return Ok(vec![]);
     }
 
-    let scope_id = dnssd::iface_index(p.iface).map_err(|e| {
-        MatError::new(
-            ErrorKind::Other,
-            format!("native mDNS probe: resolve iface {:?} index: {e}", p.iface),
-        )
-    })?;
-
-    let materials = kvs::read_self_issue_materials(
-        &p.store_root.join("chip_tool_config.alpha.ini"),
-        &p.store_root.join("chip_tool_config.ini"),
-        p.fabric_index,
-        p.issuer_index,
-    )
-    .map_err(|e| {
-        MatError::new(
-            ErrorKind::StoreMissing,
-            format!("native mDNS probe: read KVS credentials: {e} — run `mat fabric init`"),
-        )
-    })?;
-    let creds = fabric::FabricCredentials::from_self_issued(materials).map_err(|e| {
-        MatError::new(
-            ErrorKind::StoreMissing,
-            format!("native mDNS probe: self-issue NOC: {e} — run `mat fabric init`"),
-        )
-    })?;
+    // 資材・iface 解決は mat-native の 1 本（Engine::build / commission と
+    // 同じ写像: iface 解決失敗 = other、KVS 読み取り失敗 = store_missing、
+    // NOC 自己発行失敗 = store_parse、いずれも `mat fabric init` 誘導付き）。
+    let cfg = mat_native::NativeConfig {
+        store: p.store_root.to_path_buf(),
+        iface: p.iface.to_string(),
+        thread_iface: None,
+        fabric_index: p.fabric_index,
+        issuer_index: p.issuer_index,
+    };
+    let scope_id = mat_native::op_scope_id(&cfg)?;
+    let creds = mat_native::load_fabric_credentials(&cfg)?;
     let cfid = fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -144,7 +132,7 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
 /// compressed fabric id → 16 桁大文字 hex（`MatterInstance::compressed_fabric`
 /// / diag の self-fabric 照合が期待する形）。
 fn cfid_hex(cfid: &[u8; 8]) -> String {
-    cfid.iter().map(|b| format!("{b:02X}")).collect()
+    mat_core::hex::encode_upper(cfid)
 }
 
 #[cfg(test)]

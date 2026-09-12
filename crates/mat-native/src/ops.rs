@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use mat_controller::group_settings::IPK_KEYSET_ID;
 use mat_controller::im::{
     encode_add_group_fields, encode_group_key_map_tlv, encode_key_set_write_fields,
     encode_key_set_write_fields_multi, ATTR_ACL, ATTR_GROUP_KEY_MAP, CLUSTER_ACCESS_CONTROL,
     CLUSTER_GROUPS, CLUSTER_GROUP_KEY_MANAGEMENT, CMD_ADD_GROUP, CMD_KEY_SET_WRITE,
+    CMD_REMOVE_GROUP,
 };
 use mat_controller::tlv::{Tag, Writer};
 use mat_core::acl::{entries_from_im_json, merge_group_entry, AclEntry};
@@ -300,32 +302,10 @@ pub struct ProvisionNodeParams {
     pub epoch_key: [u8; 16],
 }
 
-/// `mat_core::group::resolve_epoch_key` が返す 32 桁 hex 文字列（16 バイト）を
-/// `[u8;16]` へ。呼び出し前提は「resolve_epoch_key が返した値そのもの」（検証
-/// 済み・小文字 32 桁）だが、形式が崩れていた場合は呼び出し側のバグとして
-/// `ParseError` を返す（panic させない）。
-pub fn epoch_key_from_hex(hex: &str) -> Result<[u8; 16], MatError> {
-    if hex.len() != 32 {
-        return Err(MatError::parse_error(format!(
-            "epoch key must be 32 hex chars (16 bytes), got {} chars",
-            hex.len()
-        )));
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| MatError::parse_error(format!("invalid epoch key hex: {hex}")))?;
-    }
-    Ok(out)
-}
-
 /// provision の 1 ステップに失敗した際、どのステップかを detail に残す
 /// （chip-tool 経路の `run_node_step` と同粒度 — `commands/group.rs` 参照）。
 fn provision_step_err(e: MatError, step: &str) -> MatError {
-    MatError::new(
-        e.kind,
-        format!("provision step '{step}' failed: {}", e.detail),
-    )
+    e.prefixed(format!("provision step '{step}' failed"))
 }
 
 /// group-key-map 属性（list of `GroupKeyMapStruct`）の read JSON を
@@ -408,9 +388,6 @@ pub(crate) fn encode_acl_entries_tlv(entries: &[AclEntry]) -> Vec<u8> {
     w.finish()
 }
 
-/// IPK の KeySet id（spec §11.2.6.2）。
-pub const IPK_KEYSET_ID: u16 = 0;
-
 /// IPK keyset（keyset 0）へ `KeySetWrite` を 1 回打つ — `fabric rotate-ipk` の
 /// 配布 / catch-up の 1 ステップ。`epochs` は (epoch_key, start_time) 1〜3 本、
 /// start_time は単調増加かつ非 0（spec §11.2.8.1）。ep0、timed 無し。失敗は
@@ -428,7 +405,7 @@ pub async fn write_ipk_keyset(
         false,
     )
     .await
-    .map_err(|e| MatError::new(e.kind, format!("key-set-write (ipk): {}", e.detail)))
+    .map_err(|e| e.prefixed("key-set-write (ipk)"))
 }
 
 /// 1 ノード分のデバイス側 provision: KeySetWrite → group-key-map
@@ -521,9 +498,8 @@ pub async fn ensure_group_acl(conn: &mut dyn NodeConn, group_id: u16) -> Result<
     Ok(true)
 }
 
-/// Groups cluster RemoveGroup（spec §1.3.7.4）/ GroupKeyManagement KeySetRemove
-/// （§11.2.8.3）。`mat_controller::im` には足さずここで局所定義する。
-pub const CMD_REMOVE_GROUP: u32 = 0x03;
+/// GroupKeyManagement KeySetRemove（spec §11.2.8.3）。`mat_controller::im` に
+/// 無いのでここで局所定義する（`CMD_REMOVE_GROUP` は im 側にある）。
 pub const CMD_KEY_SET_REMOVE: u32 = 0x03;
 /// RemoveGroupResponse.status の NOT_FOUND（グループ未登録 — 冪等に続行）。
 const STATUS_NOT_FOUND: u8 = 0x8B;
@@ -548,7 +524,7 @@ pub struct RemoveGroupNodeReport {
 /// 撤収の 1 ステップに失敗した際、どのステップかを detail に残す
 /// （`provision_step_err` と同粒度）。
 fn remove_step_err(e: MatError, step: &str) -> MatError {
-    MatError::new(e.kind, format!("remove step '{step}' failed: {}", e.detail))
+    e.prefixed(format!("remove step '{step}' failed"))
 }
 
 /// provision の逆順: ACL の Group エントリ除去（read-merge-write、read 失敗時は
@@ -587,7 +563,7 @@ pub async fn remove_group_node(
             p.endpoint,
             CLUSTER_GROUPS,
             CMD_REMOVE_GROUP,
-            Some(encode_remove_group_fields(p.group_id)),
+            Some(encode_ctx0_u16(p.group_id)),
             false,
         )
         .await
@@ -647,7 +623,7 @@ pub async fn remove_group_node(
             0,
             CLUSTER_GROUP_KEY_MANAGEMENT,
             CMD_KEY_SET_REMOVE,
-            Some(encode_key_set_remove_fields(ks)),
+            Some(encode_ctx0_u16(ks)),
             false,
         )
         .await
@@ -662,20 +638,12 @@ pub async fn remove_group_node(
     })
 }
 
-/// RemoveGroup `{0: groupID}`。
-fn encode_remove_group_fields(group_id: u16) -> Vec<u8> {
+/// `{0: <u16>}` 形の CommandFields（RemoveGroup `{0: groupID}` / KeySetRemove
+/// `{0: groupKeySetID}` は同形）。
+fn encode_ctx0_u16(value: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(0), u64::from(group_id));
-    w.end_container();
-    w.finish()
-}
-
-/// KeySetRemove `{0: groupKeySetID}`。
-fn encode_key_set_remove_fields(keyset_id: u16) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.put_uint(Tag::Context(0), u64::from(value));
     w.end_container();
     w.finish()
 }
@@ -973,15 +941,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_node_runs_steps_in_order() {
-        let mut conn = FakeConn::scripted()
-            .with_read(0, 0x003F, 0x0000, serde_json::json!([])) // group-key-map read
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([ // acl read（管理者のみ）
-                    {"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]),
-            );
+        // group-key-map = 空リスト / acl = 管理者のみ
+        let mut conn = FakeConn::with_group_provision_fixture();
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,
@@ -1025,19 +986,12 @@ mod tests {
     async fn provision_node_replaces_existing_mapping_for_same_group() {
         // 既存 map に groupId=10→keyset 50 がある状態で keyset 60 を provision:
         // 書かれた map は 10→60 の1件（置換、重複しない）。
-        let mut conn = FakeConn::scripted()
-            .with_read(
-                0,
-                0x003F,
-                0x0000,
-                serde_json::json!([{"1": 10, "2": 50}]), // 既存 10→50
-            )
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
-            );
+        let mut conn = FakeConn::with_group_provision_fixture().with_read(
+            0,
+            0x003F,
+            0x0000,
+            serde_json::json!([{"1": 10, "2": 50}]), // 既存 10→50（fixture の空リストを上書き）
+        );
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,
@@ -1065,19 +1019,12 @@ mod tests {
     async fn provision_node_preserves_other_groups_mappings() {
         // 既存 map に groupId=11→keyset 61 がある状態で groupId=10/keyset 60 を provision:
         // 書かれた map は {11→61, 10→60} の2件（他グループ温存）。
-        let mut conn = FakeConn::scripted()
-            .with_read(
-                0,
-                0x003F,
-                0x0000,
-                serde_json::json!([{"1": 11, "2": 61}]), // 既存 11→61
-            )
-            .with_read(
-                0,
-                0x001F,
-                0x0000,
-                serde_json::json!([{"1": 5, "2": 2, "3": [1], "4": null, "254": 2}]), // 管理者のみ
-            );
+        let mut conn = FakeConn::with_group_provision_fixture().with_read(
+            0,
+            0x003F,
+            0x0000,
+            serde_json::json!([{"1": 11, "2": 61}]), // 既存 11→61（fixture の空リストを上書き）
+        );
         let p = ProvisionNodeParams {
             group_id: 10,
             keyset_id: 60,

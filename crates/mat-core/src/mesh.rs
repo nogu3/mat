@@ -272,6 +272,15 @@ struct Part {
     route_router_id: Option<u64>,
 }
 
+/// エッジ 1 本に集約した双方向の実測値（`build_graph` フェーズ 4）。
+#[derive(Default)]
+struct EdgeAcc {
+    a_sees_b: Option<LinkMetrics>,
+    b_sees_a: Option<LinkMetrics>,
+    route_a: Option<RouteMetrics>,
+    route_b: Option<RouteMetrics>,
+}
+
 /// per-node 収集結果からグラフを組み立てる（純関数）。
 ///
 /// - 参加者は ExtAddress（正準 16 桁大文字 hex）キーで台帳化。fabric ノードの
@@ -282,6 +291,51 @@ struct Part {
 ///   できなければ `node:<node_id>` を頂点として張る（同定不能でも観測は有効）。
 pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String>) -> MeshGraph {
     // 1. network サマリ（最初に読めた値を採用）+ mesh-local-prefix。
+    let net = scan_network(inputs);
+    // 2. fabric ノードの自己同定（node_id → 正準 ext hex / rloc16）。
+    let (mut self_ext, mut self_rloc) = identify_fabric_nodes(inputs, net.ml_prefix.as_deref());
+    // 2b. 自己同定できなかった probed ノードの救済（issue #13）。
+    let ident_by = rescue_identities(inputs, &net.partition_ids, &mut self_ext, &mut self_rloc);
+    // 3. 参加者台帳（ext hex → 証拠）。
+    let parts = collect_participants(inputs);
+    // 4. エッジ集約（無向、キーは辞書順ペア）。
+    let edges = collect_edges(inputs, &self_ext);
+    // 5. ノード出力: fabric ノード（入力順）→ 未知参加者（ext 昇順）。
+    let nodes = emit_nodes(
+        inputs,
+        &self_ext,
+        &self_rloc,
+        &parts,
+        &ident_by,
+        thread_labels,
+        net.leader_router_id,
+    );
+    // 6. エッジ出力（キー昇順、route は a 視点優先）。
+    let edges = emit_edges(edges);
+
+    MeshGraph {
+        network: NetworkSummary {
+            name: net.name,
+            channel: net.channel,
+            partition_ids: net.partition_ids,
+            leader_router_id: net.leader_router_id,
+        },
+        nodes,
+        edges,
+    }
+}
+
+/// `build_graph` フェーズ 1 の結果（network サマリ + mesh-local-prefix）。
+struct NetworkScan {
+    name: Option<String>,
+    channel: Option<u64>,
+    leader_router_id: Option<u64>,
+    ml_prefix: Option<String>,
+    partition_ids: Vec<u64>,
+}
+
+/// `build_graph` フェーズ 1: network サマリ（最初に読めた値を採用）+ mesh-local-prefix。
+fn scan_network(inputs: &[NodeInput]) -> NetworkScan {
     let mut name = None;
     let mut channel = None;
     let mut leader_router_id = None;
@@ -316,7 +370,20 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
     }
     partition_ids.sort_unstable();
 
-    // 2. fabric ノードの自己同定（node_id → 正準 ext hex / rloc16）。
+    NetworkScan {
+        name,
+        channel,
+        leader_router_id,
+        ml_prefix,
+        partition_ids,
+    }
+}
+
+/// `build_graph` フェーズ 2: fabric ノードの自己同定（node_id → 正準 ext hex / rloc16）。
+fn identify_fabric_nodes(
+    inputs: &[NodeInput],
+    ml_prefix: Option<&str>,
+) -> (BTreeMap<u64, String>, BTreeMap<u64, u16>) {
     // RLOC16 の IPv6 由来導出は ExtAddress 正準化の成否と独立に行う
     // （issue #13: ext が偽でも IPv6Addresses は実デバイス固有なので、
     // rloc 相関による救済の入力になる）。
@@ -335,7 +402,7 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             .get("mesh_local_prefix")
             .and_then(Value::as_str)
             .and_then(canon_ml_prefix)
-            .or_else(|| ml_prefix.clone());
+            .or_else(|| ml_prefix.map(str::to_string));
         if let Some(pref) = &prefix {
             if let Some(r) = derive_rloc16(pref, &id.ipv6) {
                 self_rloc.insert(inp.node_id, r);
@@ -352,7 +419,16 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
     retain_unique_values(&mut self_ext);
     retain_unique_values(&mut self_rloc);
 
-    // 2b. 自己同定できなかった probed ノードの救済（issue #13）。
+    (self_ext, self_rloc)
+}
+
+/// `build_graph` フェーズ 2b: 自己同定できなかった probed ノードの救済（issue #13）。
+fn rescue_identities(
+    inputs: &[NodeInput],
+    partition_ids: &[u64],
+    self_ext: &mut BTreeMap<u64, String>,
+    self_rloc: &mut BTreeMap<u64, u16>,
+) -> BTreeMap<u64, &'static str> {
     // 実機観測 (2026-09-01): router / leader の route-table には自分自身の行が
     // 入り、NextHop=63(invalid) + PathCost=0 + Age≈0 の形で載る（3 ベンダー
     // 確認。63/0 は経路喪失ルーター行と共通のため Age 上限で切り分ける）。
@@ -471,9 +547,13 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
     // （従来どおり node: 頂点は rloc16 を持たない）。救済で持ち込まれた rloc が
     // 既存の主張と衝突した場合も表示だけ取り下げる（ext 同定自体は維持）。
     self_rloc.retain(|n, _| self_ext.contains_key(n));
-    retain_unique_values(&mut self_rloc);
+    retain_unique_values(self_rloc);
 
-    // 3. 参加者台帳（ext hex → 証拠）。
+    ident_by
+}
+
+/// `build_graph` フェーズ 3: 参加者台帳（ext hex → 証拠）。
+fn collect_participants(inputs: &[NodeInput]) -> BTreeMap<String, Part> {
     let mut parts: BTreeMap<String, Part> = BTreeMap::new();
     for inp in inputs {
         let Ok(p) = &inp.probe else { continue };
@@ -514,21 +594,21 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
         }
     }
 
-    // 4. エッジ集約（無向、キーは辞書順ペア）。
-    #[derive(Default)]
-    struct EdgeAcc {
-        a_sees_b: Option<LinkMetrics>,
-        b_sees_a: Option<LinkMetrics>,
-        route_a: Option<RouteMetrics>,
-        route_b: Option<RouteMetrics>,
-    }
+    parts
+}
+
+/// `build_graph` フェーズ 4: エッジ集約（無向、キーは辞書順ペア）。
+fn collect_edges(
+    inputs: &[NodeInput],
+    self_ext: &BTreeMap<u64, String>,
+) -> BTreeMap<(String, String), EdgeAcc> {
     let mut edges: BTreeMap<(String, String), EdgeAcc> = BTreeMap::new();
     for inp in inputs {
         let Ok(p) = &inp.probe else { continue };
         // 自己同定できていれば ext:、できなくても node:<id> で自視点のエッジを張る
         // （2026-07-23 実機 E2E 対応: 以前は自己同定不能ノードはエッジを持てな
         // かったが、テーブル行自体は有効な観測なので node: 頂点に付け替える）。
-        let my_id = fabric_vertex_id(inp.node_id, &self_ext);
+        let my_id = fabric_vertex_id(inp.node_id, self_ext);
         let my_ext = self_ext.get(&inp.node_id);
         for row in table_rows(&p.thread, "neighbor_table") {
             // 実機で ExtAddress=0 のゴミ行を観測することがあるため除外。
@@ -583,7 +663,19 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
         }
     }
 
-    // 5. ノード出力: fabric ノード（入力順）→ 未知参加者（ext 昇順）。
+    edges
+}
+
+/// `build_graph` フェーズ 5: ノード出力: fabric ノード（入力順）→ 未知参加者（ext 昇順）。
+fn emit_nodes(
+    inputs: &[NodeInput],
+    self_ext: &BTreeMap<u64, String>,
+    self_rloc: &BTreeMap<u64, u16>,
+    parts: &BTreeMap<String, Part>,
+    ident_by: &BTreeMap<u64, &'static str>,
+    thread_labels: &BTreeMap<String, String>,
+    leader_router_id: Option<u64>,
+) -> Vec<MeshNode> {
     let mut nodes: Vec<MeshNode> = Vec::new();
     let mut consumed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for inp in inputs {
@@ -607,7 +699,7 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
         };
         // ext が確定しなければ常に node:<id>（rloc16 が導出できていても、
         // 頂点キーとしては再アタッチで変わる rloc より node_id が安定）。
-        let id = fabric_vertex_id(inp.node_id, &self_ext);
+        let id = fabric_vertex_id(inp.node_id, self_ext);
         nodes.push(MeshNode {
             id,
             ext_address: ext.clone(),
@@ -625,7 +717,7 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             }),
         });
     }
-    for (ext, part) in &parts {
+    for (ext, part) in parts {
         if consumed.contains(ext) {
             continue;
         }
@@ -668,9 +760,13 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
         });
     }
 
-    // 6. エッジ出力（キー昇順、route は a 視点優先）。キーは既に完全な id
-    // 文字列（`ext:…` / `node:…`）なので再プレフィックスしない。
-    let edges = edges
+    nodes
+}
+
+/// `build_graph` フェーズ 6: エッジ出力（キー昇順、route は a 視点優先）。
+fn emit_edges(edges: BTreeMap<(String, String), EdgeAcc>) -> Vec<MeshEdge> {
+    // キーは既に完全な id 文字列（`ext:…` / `node:…`）なので再プレフィックスしない。
+    edges
         .into_iter()
         .map(|((a, b), acc)| MeshEdge {
             a,
@@ -679,18 +775,7 @@ pub fn build_graph(inputs: &[NodeInput], thread_labels: &BTreeMap<String, String
             b_sees_a: acc.b_sees_a,
             route: acc.route_a.or(acc.route_b),
         })
-        .collect();
-
-    MeshGraph {
-        network: NetworkSummary {
-            name,
-            channel,
-            partition_ids,
-            leader_router_id,
-        },
-        nodes,
-        edges,
-    }
+        .collect()
 }
 
 /// RLOC16 から RouterId。router アドレス（下位 10bit = 0）のみ Some。

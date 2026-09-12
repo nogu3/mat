@@ -85,15 +85,6 @@ pub struct RotateOutcome {
     pub nodes: Vec<NodeOutcome>,
 }
 
-/// `ErrorKind` に `as_str` が無いための代替（`mat-core::body::diag_thread_success`
-/// と同じ手法 — serde の snake_case 表現をそのまま文字列化する）。
-fn kind_str(kind: ErrorKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
 impl RotateOutcome {
     /// stdout 用 body（`timestamp` は `output::emit` が付ける）。鍵素材は載せない。
     pub fn body(&self, fabric_index: u8) -> Value {
@@ -157,7 +148,7 @@ impl RotateOutcome {
         let (_, first) = failed.first()?;
         let list = failed
             .iter()
-            .map(|(n, e)| format!("node {}: {}", n.node_id, kind_str(e.kind)))
+            .map(|(n, e)| format!("node {}: {}", n.node_id, e.kind.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
         Some(MatError::new(
@@ -201,7 +192,13 @@ pub async fn run(cfg: &NativeConfig, p: &RotateIpkParams) -> Result<RotateOutcom
     let make = move |epoch: &[u8; 16]| {
         let mut c = creds.clone();
         c.ipk_operational = fabric::derive_ipk_operational(epoch, &cfid);
-        crate::case_establisher(&cfg, c, Arc::clone(&resolver))
+        let scope_id = crate::op_scope_id(&cfg)?;
+        Ok(crate::case_establisher(
+            &cfg,
+            c,
+            Arc::clone(&resolver),
+            scope_id,
+        ))
     };
     let ctx = RotateCtx {
         main_ini,
@@ -257,35 +254,14 @@ fn map_gs_err(e: GroupSettingsError) -> MatError {
     }
 }
 
-/// CSPRNG の新 epoch（現行と一致したら引き直す）。
-///
-/// 鍵素材は format! に渡さない: `crate::ops::epoch_key_from_hex` のエラー経路
-/// は不正 hex をそのまま detail に埋め込む（呼び出し側のバグ検出用に鍵を
-/// 見せる設計）ため、生成直後の内部鍵の decode には使わず、ここで自前に
-/// decode して失敗時は固定文言のみを返す。
-fn fresh_epoch(cur: &[u8; 16]) -> Result<[u8; 16], MatError> {
+/// CSPRNG の新 epoch（現行と一致したら引き直す）。鍵素材は format! に渡さない。
+fn fresh_epoch(cur: &[u8; 16]) -> [u8; 16] {
     loop {
-        let e = decode_generated_epoch_hex(&mat_core::group::generate_epoch_key())?;
+        let e = mat_core::group::generate_epoch_key_bytes();
         if e != *cur {
-            return Ok(e);
+            return e;
         }
     }
-}
-
-/// `generate_epoch_key` が返す 32 桁 hex を `[u8;16]` へ。壊れているのは
-/// 呼び出し側（mat-core 側の生成ロジック）のバグだが、鍵バイトそのものは
-/// 絶対に detail へ出さない（固定文言のみ）。
-fn decode_generated_epoch_hex(hex: &str) -> Result<[u8; 16], MatError> {
-    const BAD_HEX: &str = "generated epoch key is not 32 hex chars (internal)";
-    if hex.len() != 32 {
-        return Err(MatError::new(ErrorKind::Other, BAD_HEX));
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| MatError::new(ErrorKind::Other, BAD_HEX))?;
-    }
-    Ok(out)
 }
 
 async fn rotate(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome, MatError> {
@@ -298,7 +274,7 @@ async fn rotate(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome, M
             n
         }
         None => {
-            let n = fresh_epoch(&ctx.cur_epoch)?;
+            let n = fresh_epoch(&ctx.cur_epoch);
             group_settings::begin_ipk_rotation(&ctx.main_ini, ctx.fabric_index, &n)
                 .map_err(map_gs_err)?;
             tracing::info!(
@@ -498,12 +474,11 @@ async fn one_node(
 }
 
 fn step_err(node_id: u64, step: &str, e: MatError) -> MatError {
-    let detail = if step.is_empty() {
-        format!("node {node_id}: {}", e.detail)
+    if step.is_empty() {
+        e.prefixed(format!("node {node_id}"))
     } else {
-        format!("node {node_id}: {step}: {}", e.detail)
-    };
-    MatError::new(e.kind, detail)
+        e.prefixed(format!("node {node_id}: {step}"))
+    }
 }
 
 #[cfg(test)]
@@ -721,7 +696,7 @@ mod tests {
         assert!(body["note"].as_str().unwrap().contains("matd reload"));
         assert!(out.partial_error().is_none());
         // 鍵素材は body に出ない。
-        let next_hex: String = next.iter().map(|b| format!("{b:02x}")).collect();
+        let next_hex = mat_core::hex::encode_lower(&next);
         assert!(!body.to_string().to_lowercase().contains(&next_hex));
     }
 
