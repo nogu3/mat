@@ -16,37 +16,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-/// テスト用の `mat` コマンド。store は与えられた dir。
-///
-/// `MAT_IFACE=lo` を固定する: Task4（native 既定化）で `MAT_IFACE` 未設定は
-/// 自動検出に切り替わるため、先にこのテストスイート側を「明示 iface 指定」の
-/// 形に揃えておく（`lo` は実在するが KVS 資材が無いので native 経路は必ず
-/// warn + フォールスルーし、store/require_node チェックはこれまでどおり
-/// コマンド層 or native_direct::run() の同一ロジックで exit 10/11 を出す
-/// （`run` は `Store::open` + `require_node` を engine 構築より前に行う）
-/// — 詳細は native_direct.rs の `run()` の doc コメント参照）。
-/// `MAT_MATD=0` で直経路に固定する（matd 自動検出が既定のため、開発機で実
-/// matd が動いていても拾わない）。
-fn mat(store: &std::path::Path) -> Command {
-    let mut c = Command::cargo_bin("mat").unwrap();
-    c.env("MAT_IFACE", "lo")
-        .env("MAT_MATD", "0")
-        .arg("--store")
-        .arg(store);
-    c
-}
-
-/// node 5 が commission 済みのストアを直接構築する（chip-tool を経由しない —
-/// `mat_core::store::Store` の `nodes.json` スキーマに直接書く）。
-fn store_with_node5() -> TempDir {
-    let store = TempDir::new().unwrap();
-    std::fs::write(
-        store.path().join("nodes.json"),
-        r#"{"version":1,"nodes":{"5":{"node_id":5,"address":"192.0.2.10","commissioned_at":"2026-01-01T00:00:00+09:00"}}}"#,
-    )
-    .unwrap();
-    store
-}
+mod common;
+use common::{mat, store_with_node5};
 
 // ── CLI 引数エラー（clap レベル、exit 2、バックエンド不到達）───────────────
 
