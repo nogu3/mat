@@ -51,11 +51,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             cluster,
             attribute,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::Read {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 cluster,
                 attribute,
             }
@@ -68,11 +67,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             value,
             timed,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::Write {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 cluster,
                 attribute,
                 value,
@@ -87,11 +85,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             args,
             timed,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::Invoke {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 cluster,
                 command,
                 args,
@@ -102,20 +99,12 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             node_id: NodeRef::Id(book.resolve_node(&node_id)?),
         },
         Command::On { node_id, endpoint } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
-            Command::On {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
-            }
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
+            Command::On { node_id, endpoint }
         }
         Command::Off { node_id, endpoint } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
-            Command::Off {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
-            }
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
+            Command::Off { node_id, endpoint }
         }
         Command::ColorTemp {
             node_id,
@@ -124,11 +113,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             mireds,
             transition,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::ColorTemp {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 kelvin,
                 mireds,
                 transition,
@@ -140,11 +128,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             percent,
             transition,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::Level {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 percent,
                 transition,
             }
@@ -155,11 +142,10 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
             spec,
             transition,
         } => {
-            let node = book.resolve_node(&node_id)?;
-            let ep = book.resolve_endpoint(node, &endpoint)?;
+            let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
             Command::Color {
-                node_id: NodeRef::Id(node),
-                endpoint: EndpointRef::Id(ep),
+                node_id,
+                endpoint,
                 spec: resolve_color_spec(&book, spec)?,
                 transition,
             }
@@ -311,23 +297,18 @@ pub fn resolve_command(command: Command, store_root: &Path) -> Result<Command, M
         Command::Diag { action } => Command::Diag {
             action: match action {
                 DiagCommand::Thread { node_id, endpoint } => {
-                    let node = book.resolve_node(&node_id)?;
-                    let ep = book.resolve_endpoint(node, &endpoint)?;
-                    DiagCommand::Thread {
-                        node_id: NodeRef::Id(node),
-                        endpoint: EndpointRef::Id(ep),
-                    }
+                    let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
+                    DiagCommand::Thread { node_id, endpoint }
                 }
                 DiagCommand::Node {
                     node_id,
                     endpoint,
                     deep,
                 } => {
-                    let node = book.resolve_node(&node_id)?;
-                    let ep = book.resolve_endpoint(node, &endpoint)?;
+                    let (node_id, endpoint) = book.resolve_node_endpoint(&node_id, &endpoint)?;
                     DiagCommand::Node {
-                        node_id: NodeRef::Id(node),
-                        endpoint: EndpointRef::Id(ep),
+                        node_id,
+                        endpoint,
                         deep,
                     }
                 }
