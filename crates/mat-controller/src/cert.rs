@@ -6,10 +6,8 @@
 //! This module parses the TLV form, rebuilds the DER `TBSCertificate` byte
 //! for byte, and verifies signatures / chains against it.
 
-use crate::asn1;
+use crate::asn1::{self, oids};
 use crate::tlv::{Reader, Tag, Value, Writer};
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
 
 /// SubjectKeyIdentifier per Matter/X.509: SHA-1 of the 65-byte public key.
 pub fn subject_key_id(public_key: &[u8; 65]) -> [u8; 20] {
@@ -123,6 +121,17 @@ pub fn issue_noc_with_cats(
     Ok(noc)
 }
 
+/// 証明書 serial 用の乱数 8 バイト。先頭ビットを落として BER INTEGER の
+/// 最小正表現（`asn1::integer` に先頭 0x00 を足させない）を保つ。
+/// `generate_rcac` / `fabric::FabricCredentials::from_self_issued` /
+/// `commissioning::CommissioningFabric::issue_device_noc` が共有する。
+pub fn random_serial() -> [u8; 8] {
+    let mut serial = [0u8; 8];
+    getrandom::fill(&mut serial).expect("os rng");
+    serial[0] &= 0x7F;
+    serial
+}
+
 /// 使い捨て fabric 用の self-signed RCAC（root 証明書）を新規生成する。
 /// 発行者 DN・subject DN は同一（自己発行）で、subject の rcac-id
 /// (TLV tag 20) は乱数の u64。戻り値は `(RCAC, root 秘密鍵)` — 呼び出し側
@@ -134,15 +143,9 @@ pub fn issue_noc_with_cats(
 /// KeyUsage(keyCertSign|cRLSign) / SubjectKeyId(自身) /
 /// AuthorityKeyId(自身の SKID) — 自己署名なので issuer も自分。
 pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
-    use p256::elliptic_curve::sec1::ToSec1Point;
     let sk = crate::case::random_p256_secret();
     let private_key: [u8; 32] = sk.to_bytes().into();
-    let public_key: [u8; 65] = sk
-        .public_key()
-        .to_sec1_point(false)
-        .as_bytes()
-        .try_into()
-        .map_err(|_| CertError::Malformed("pubkey encode"))?;
+    let public_key = crate::case::eph_pub_bytes(&sk);
 
     let mut rcac_id_b = [0u8; 8];
     getrandom::fill(&mut rcac_id_b).expect("os rng");
@@ -163,9 +166,7 @@ pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
         CertExtension::AuthorityKeyId(skid),
     ];
 
-    let mut serial = [0u8; 8];
-    getrandom::fill(&mut serial).expect("os rng");
-    serial[0] &= 0x7F; // keep the BER INTEGER's minimal positive form
+    let serial = random_serial();
 
     let mut rcac = MatterCert {
         serial: serial.to_vec(),
@@ -183,37 +184,6 @@ pub fn generate_rcac() -> Result<(MatterCert, [u8; 32]), CertError> {
         crate::crypto::sign_ecdsa_p256(&private_key, &tbs).map_err(|_| CertError::BadSignature)?;
     Ok((rcac, private_key))
 }
-
-// --- Pre-computed OID constants (DER bytes, tag 0x06 included) ---
-
-const OID_ECDSA_WITH_SHA256: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]; // 1.2.840.10045.2.1
-const OID_PRIME256V1: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
-const OID_COMMON_NAME: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03]; // 2.5.4.3
-                                                                // Matter arc 1.3.6.1.4.1.37244.1.x -> 2B 06 01 04 01 82 A2 7C 01 xx
-const OID_MATTER_NODE_ID: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x01,
-];
-const OID_MATTER_FIRMWARE_SIGNING_ID: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x02,
-];
-const OID_MATTER_ICAC_ID: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x03,
-];
-const OID_MATTER_RCAC_ID: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x04,
-];
-const OID_MATTER_FABRIC_ID: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x05,
-];
-const OID_MATTER_NOC_CAT: &[u8] = &[
-    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x06,
-];
-const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x13]; // 2.5.29.19
-const OID_EXT_KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x0F]; // 2.5.29.15
-const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x25]; // 2.5.29.37
-const OID_EXT_SUBJECT_KEY_ID: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x0E]; // 2.5.29.14
-const OID_EXT_AUTHORITY_KEY_ID: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x23]; // 2.5.29.35
 
 /// `CertError::Malformed` detail for every CASE Authenticated Tag rule
 /// violation (`CaseAuthTags::new` / `MatterCert::cats`).
@@ -468,14 +438,17 @@ impl MatterCert {
         let extensions_seq = asn1::seq(&ext_refs);
 
         let spki = asn1::seq(&[
-            &asn1::seq(&[OID_EC_PUBLIC_KEY, OID_PRIME256V1]),
+            &asn1::seq(&[
+                &asn1::oid(oids::EC_PUBLIC_KEY),
+                &asn1::oid(oids::PRIME256V1),
+            ]),
             &asn1::bit_string(0, &self.pub_key),
         ]);
 
         Ok(asn1::seq(&[
             &asn1::context_constructed(0, &asn1::integer(&[2])), // version v3
             &asn1::integer(&self.serial),
-            &asn1::seq(&[OID_ECDSA_WITH_SHA256]),
+            &asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]),
             &issuer,
             &asn1::seq(&[&not_before, &not_after]),
             &subject,
@@ -486,11 +459,13 @@ impl MatterCert {
 
     /// Verify this certificate's signature was produced by `issuer_public_key`.
     pub fn verify_signed_by(&self, issuer_public_key: &[u8; 65]) -> Result<(), CertError> {
-        let key = VerifyingKey::from_sec1_bytes(issuer_public_key)
-            .map_err(|_| CertError::BadPublicKey)?;
-        let sig = Signature::from_slice(&self.signature).map_err(|_| CertError::BadSignature)?;
-        key.verify(&self.tbs_der()?, &sig)
-            .map_err(|_| CertError::BadSignature)
+        let tbs = self.tbs_der()?;
+        crate::crypto::verify_ecdsa_p256(issuer_public_key, &tbs, &self.signature).map_err(|e| {
+            match e {
+                crate::crypto::CryptoError::BadKey => CertError::BadPublicKey,
+                _ => CertError::BadSignature,
+            }
+        })
     }
 
     /// Look up a Matter-id-valued subject DN attribute by TLV tag
@@ -719,16 +694,6 @@ pub fn verify_noc_chain(
     Ok(())
 }
 
-/// True if `matter_epoch_now` falls within `cert`'s `[not_before, not_after]`
-/// validity window (`not_after == 0` means no expiry). `verify_noc_chain`
-/// itself does not check validity — the time source (wall clock vs. some
-/// other reference) is a decision for the CASE call site / M4, not this
-/// module — so callers that need a validity check call this separately.
-pub fn cert_time_valid(cert: &MatterCert, matter_epoch_now: u32) -> bool {
-    matter_epoch_now >= cert.not_before
-        && (cert.not_after == 0 || matter_epoch_now <= cert.not_after)
-}
-
 /// Parse a DN (issuer/subject) TLV list until its `ContainerEnd`.
 fn parse_dn(r: &mut Reader<'_>) -> Result<Vec<DnAttr>, CertError> {
     let mut attrs = Vec::new();
@@ -833,21 +798,31 @@ fn dn_name(attrs: &[DnAttr]) -> Result<Vec<u8>, CertError> {
     for attr in attrs {
         let base_tag = attr.tlv_tag & 0x7F;
         let atv = match (base_tag, &attr.value) {
-            (17, DnValue::MatterId(id)) => asn1::seq(&[OID_MATTER_NODE_ID, &hex16(*id)]),
-            (18, DnValue::MatterId(id)) => {
-                asn1::seq(&[OID_MATTER_FIRMWARE_SIGNING_ID, &hex16(*id)])
+            (17, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_NODE_ID), &hex16(*id)])
             }
-            (19, DnValue::MatterId(id)) => asn1::seq(&[OID_MATTER_ICAC_ID, &hex16(*id)]),
-            (20, DnValue::MatterId(id)) => asn1::seq(&[OID_MATTER_RCAC_ID, &hex16(*id)]),
-            (21, DnValue::MatterId(id)) => asn1::seq(&[OID_MATTER_FABRIC_ID, &hex16(*id)]),
-            (22, DnValue::MatterId(id)) => asn1::seq(&[OID_MATTER_NOC_CAT, &hex8(*id)]),
+            (18, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_FIRMWARE_SIGNING_ID), &hex16(*id)])
+            }
+            (19, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_ICAC_ID), &hex16(*id)])
+            }
+            (20, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_RCAC_ID), &hex16(*id)])
+            }
+            (21, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_FABRIC_ID), &hex16(*id)])
+            }
+            (22, DnValue::MatterId(id)) => {
+                asn1::seq(&[&asn1::oid(oids::MATTER_NOC_CAT), &hex8(*id)])
+            }
             (1, DnValue::Text(s)) => {
                 let value = if attr.tlv_tag & 0x80 != 0 {
                     asn1::printable_string(s)
                 } else {
                     asn1::utf8_string(s)
                 };
-                asn1::seq(&[OID_COMMON_NAME, &value])
+                asn1::seq(&[&asn1::oid(oids::COMMON_NAME), &value])
             }
             _ => return Err(CertError::UnsupportedDnAttr(attr.tlv_tag)),
         };
@@ -882,7 +857,7 @@ fn extension_der(ext: &CertExtension) -> Result<Vec<u8>, CertError> {
             let inner_refs: Vec<&[u8]> = inner.iter().map(Vec::as_slice).collect();
             let value = asn1::seq(&inner_refs);
             asn1::seq(&[
-                OID_EXT_BASIC_CONSTRAINTS,
+                &asn1::oid(oids::BASIC_CONSTRAINTS),
                 &asn1::boolean(true),
                 &asn1::octet_string(&value),
             ])
@@ -891,31 +866,37 @@ fn extension_der(ext: &CertExtension) -> Result<Vec<u8>, CertError> {
             let (unused, bytes) = key_usage_bits(*bits);
             let value = asn1::bit_string(unused, &bytes);
             asn1::seq(&[
-                OID_EXT_KEY_USAGE,
+                &asn1::oid(oids::KEY_USAGE),
                 &asn1::boolean(true),
                 &asn1::octet_string(&value),
             ])
         }
         CertExtension::ExtendedKeyUsage(vals) => {
-            let mut oids = Vec::with_capacity(vals.len());
+            let mut eku_oids = Vec::with_capacity(vals.len());
             for v in vals {
-                oids.push(eku_oid(*v)?);
+                eku_oids.push(eku_oid(*v)?);
             }
-            let oid_refs: Vec<&[u8]> = oids.iter().map(Vec::as_slice).collect();
+            let oid_refs: Vec<&[u8]> = eku_oids.iter().map(Vec::as_slice).collect();
             let value = asn1::seq(&oid_refs);
             asn1::seq(&[
-                OID_EXT_EXTENDED_KEY_USAGE,
+                &asn1::oid(oids::EXTENDED_KEY_USAGE),
                 &asn1::boolean(true),
                 &asn1::octet_string(&value),
             ])
         }
         CertExtension::SubjectKeyId(id) => {
             let value = asn1::octet_string(id);
-            asn1::seq(&[OID_EXT_SUBJECT_KEY_ID, &asn1::octet_string(&value)])
+            asn1::seq(&[
+                &asn1::oid(oids::SUBJECT_KEY_ID),
+                &asn1::octet_string(&value),
+            ])
         }
         CertExtension::AuthorityKeyId(id) => {
             let value = asn1::seq(&[&asn1::context_primitive(0, id)]);
-            asn1::seq(&[OID_EXT_AUTHORITY_KEY_ID, &asn1::octet_string(&value)])
+            asn1::seq(&[
+                &asn1::oid(oids::AUTHORITY_KEY_ID),
+                &asn1::octet_string(&value),
+            ])
         }
     })
 }
@@ -956,9 +937,9 @@ fn eku_oid(v: u64) -> Result<Vec<u8>, CertError> {
         6 => 0x09,
         _ => return Err(CertError::Malformed("unsupported extended-key-usage value")),
     };
-    Ok(vec![
-        0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, x,
-    ])
+    let mut content = oids::ID_KP_PREFIX.to_vec();
+    content.push(x);
+    Ok(asn1::oid(&content))
 }
 
 /// Matter epoch (seconds since 2000-01-01T00:00:00Z) -> DER time value.
@@ -1037,6 +1018,20 @@ mod tests {
             }
             (1 + n, len)
         }
+    }
+
+    /// テスト用フィクスチャ: root01 の証明書＋秘密鍵と node01_01 の公開鍵。
+    fn root_and_op_keys() -> (MatterCert, [u8; 32], [u8; 65]) {
+        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
+            .as_slice()
+            .try_into()
+            .unwrap();
+        (root, root_priv, op_pub)
     }
 
     #[test]
@@ -1147,32 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn cert_time_valid_checks_notbefore_notafter_window() {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let noc = issue_noc(&op_pub, 0x1B669, 1, &root, &root_priv, &[0x05]).unwrap();
-
-        // 10-year validity window starting 2021-01-01: valid throughout, i.e.
-        // both endpoints and a point strictly inside are valid.
-        assert!(cert_time_valid(&noc, MATTER_EPOCH_2021));
-        assert!(cert_time_valid(&noc, noc.not_after));
-        assert!(cert_time_valid(
-            &noc,
-            MATTER_EPOCH_2021 + NOC_VALIDITY_SECS / 2 // roughly 2026
-        ));
-        // Before not-before, and past not-after (roughly 2032), are invalid.
-        assert!(!cert_time_valid(&noc, MATTER_EPOCH_2021 - 1));
-        assert!(!cert_time_valid(&noc, noc.not_after + 1));
-    }
-
-    #[test]
     fn generate_rcac_is_self_signed_and_issues_valid_noc() {
         let (rcac, root_key) = generate_rcac().unwrap();
         // TLV 往復
@@ -1181,30 +1150,14 @@ mod tests {
         // 自己署名検証
         rcac.verify_signed_by(&rcac.pub_key).unwrap();
         // この root で NOC を発行してチェーン検証が通る
-        let op = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToSec1Point;
-        let op_pub: [u8; 65] = op
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let op_pub = crate::case::eph_pub_bytes(&crate::case::random_p256_secret());
         let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
         verify_noc_chain(&noc, None, &rcac).unwrap();
     }
 
     #[test]
     fn issue_noc_produces_chain_valid_cert() {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        // 我々の operational 鍵ペア（テストではフィクスチャの node 鍵を流用）
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
+        let (root, root_priv, op_pub) = root_and_op_keys();
 
         let noc = issue_noc(
             &op_pub,
@@ -1266,16 +1219,10 @@ mod tests {
 
     /// テスト用: 新規 RCAC とそこから発行した NOC、および双方の秘密鍵。
     fn fresh_chain() -> (MatterCert, [u8; 32], MatterCert, [u8; 32]) {
-        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, root_key) = generate_rcac().unwrap();
         let op = crate::case::random_p256_secret();
         let op_priv: [u8; 32] = op.to_bytes().into();
-        let op_pub: [u8; 65] = op
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let op_pub = crate::case::eph_pub_bytes(&op);
         let noc = issue_noc(&op_pub, 0x1_0001, 0xFAB1, &rcac, &root_key, &[1]).unwrap();
         (rcac, root_key, noc, op_priv)
     }
@@ -1298,15 +1245,9 @@ mod tests {
         // 監査 Tier1① の攻撃再現: fabric 内ノード A が自分の NOC_A を ICAC に
         // 仕立て、A の運用鍵で偽 NOC_X（subject=node X, issuer=NOC_A.subject）を
         // 発行して積む。CA 制約検査が無いと署名・DN・fabric-id 全てを通過する。
-        use p256::elliptic_curve::sec1::ToSec1Point;
         let (rcac, _root_key, noc_a, a_op_priv) = fresh_chain();
         let x = crate::case::random_p256_secret();
-        let x_pub: [u8; 65] = x
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let x_pub = crate::case::eph_pub_bytes(&x);
         // issue_noc は issuer の subject を偽 NOC の issuer に写すので、
         // NOC_A を「発行者」に渡すだけで攻撃チェーンが組み上がる。
         let fake_noc = issue_noc(&x_pub, 0xBEEF, 0xFAB1, &noc_a, &a_op_priv, &[7]).unwrap();
@@ -1362,13 +1303,9 @@ mod tests {
 
     #[test]
     fn rejects_icac_constraint_violations() {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
+        let (root, root_priv, op_pub) = root_and_op_keys();
         let ica = MatterCert::parse(ICA_CHIP).unwrap();
         let node = MatterCert::parse(NODE_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
 
         // cA=false の ICAC
         let not_ca = mutate_and_resign(&ica, &root_priv, |exts| {
@@ -1427,10 +1364,6 @@ mod tests {
         ));
 
         // pathLen=0 自体は 2-cert チェーンでは合法
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
         let direct = issue_noc(&op_pub, 0x1B669, 1, &shallow_root, &root_priv, &[9]).unwrap();
         verify_noc_chain(&direct, None, &shallow_root).unwrap();
     }
@@ -1526,19 +1459,6 @@ mod tests {
         verify_noc_chain(&noc, None, &rcac).unwrap();
     }
     // --- CASE Authenticated Tags (spec §6.6.2.1.2 / §6.5.6.1) ---
-
-    fn root_and_op_keys() -> (MatterCert, [u8; 32], [u8; 65]) {
-        let root = MatterCert::parse(ROOT_CHIP).unwrap();
-        let root_priv: [u8; 32] = include_bytes!("../tests/fixtures/root01_privkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let op_pub: [u8; 65] = include_bytes!("../tests/fixtures/node01_01_pubkey.bin")
-            .as_slice()
-            .try_into()
-            .unwrap();
-        (root, root_priv, op_pub)
-    }
 
     #[test]
     fn issue_noc_with_cats_round_trips_through_tlv_and_cats() {

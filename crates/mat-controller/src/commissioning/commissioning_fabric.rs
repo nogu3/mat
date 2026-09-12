@@ -103,12 +103,7 @@ impl CommissioningFabric {
         node_id: u64,
     ) -> Result<Vec<u8>, CommissionError> {
         let rcac = MatterCert::parse(&self.rcac_tlv)?;
-        let mut serial = [0u8; 8];
-        getrandom::fill(&mut serial).map_err(|_| CommissionError::Malformed {
-            step: "issue_device_noc",
-            detail: "os rng failure",
-        })?;
-        serial[0] &= 0x7F; // BER INTEGER の最小正表現を維持
+        let serial = cert::random_serial();
         let noc = cert::issue_noc(
             op_public_key,
             node_id,
@@ -137,8 +132,8 @@ impl CommissioningFabric {
         issuer_index: u8,
     ) -> Result<(), crate::kvs::KvsError> {
         use crate::kvs::KvsTxn;
-        let alpha_path = store.join("chip_tool_config.alpha.ini");
-        let main_path = store.join("chip_tool_config.ini");
+        let alpha_path = store.join(crate::kvs::ALPHA_INI_FILE);
+        let main_path = store.join(crate::kvs::MAIN_INI_FILE);
         // どちらか一方でも実在したら拒否（中途半端な store を悪化させない）。
         if alpha_path.exists() || main_path.exists() {
             return Err(crate::kvs::KvsError::AlreadyExists);
@@ -211,8 +206,8 @@ mod tests {
         fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
         // 既存リーダで読み戻せる = chip-tool INI 互換形式の証明
         let m = crate::kvs::read_self_issue_materials(
-            &dir.path().join("chip_tool_config.alpha.ini"),
-            &dir.path().join("chip_tool_config.ini"),
+            &dir.path().join(crate::kvs::ALPHA_INI_FILE),
+            &dir.path().join(crate::kvs::MAIN_INI_FILE),
             1,
             0,
         )
@@ -221,7 +216,7 @@ mod tests {
         assert_eq!(m.node_id, 112233);
         // epoch → operational の導出チェーンが KVS の中身と一致
         let creds = crate::fabric::FabricCredentials::from_self_issued(m.clone()).unwrap();
-        let epoch = crate::kvs::read_mat_ipk_epoch(&dir.path().join("chip_tool_config.ini"), 1)
+        let epoch = crate::kvs::read_mat_ipk_epoch(&dir.path().join(crate::kvs::MAIN_INI_FILE), 1)
             .unwrap()
             .expect("epoch persisted");
         let cfid = crate::fabric::compressed_fabric_id(&creds.root_public_key, creds.fabric_id);
@@ -243,7 +238,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fab = CommissioningFabric::generate(7, 112233).unwrap();
         fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
-        let ini = dir.path().join("chip_tool_config.ini");
+        let ini = dir.path().join(crate::kvs::MAIN_INI_FILE);
         assert_eq!(crate::kvs::list_fabric_indices(&ini).unwrap(), vec![1]);
         assert_eq!(crate::kvs::read_noc_identity(&ini, 1).unwrap(), (112233, 7));
         let pk = crate::kvs::read_rcac_pubkey(&ini, 1).unwrap();
@@ -259,7 +254,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fab = CommissioningFabric::generate(1, 112233).unwrap();
         fab.write_kvs_bootstrap(dir.path(), 1, 0).unwrap();
-        let gdc = crate::kvs::read_group_data_counter(&dir.path().join("chip_tool_config.ini"))
+        let gdc = crate::kvs::read_group_data_counter(&dir.path().join(crate::kvs::MAIN_INI_FILE))
             .unwrap()
             .expect("g/gdc persisted by bootstrap");
         assert!((1..=(1u32 << 28)).contains(&gdc), "gdc: {gdc}");
@@ -273,13 +268,7 @@ mod tests {
         assert_eq!(creds.node_id, 0x1_0001);
         // デバイス NOC も同じ root でチェーン検証が通る
         let dev = crate::case::random_p256_secret();
-        use p256::elliptic_curve::sec1::ToSec1Point;
-        let dev_pub: [u8; 65] = dev
-            .public_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .try_into()
-            .unwrap();
+        let dev_pub = crate::case::eph_pub_bytes(&dev);
         let noc_tlv = fab.issue_device_noc(&dev_pub, 0x2_0001).unwrap();
         let noc = crate::cert::MatterCert::parse(&noc_tlv).unwrap();
         let rcac = crate::cert::MatterCert::parse(&fab.rcac_tlv).unwrap();

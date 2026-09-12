@@ -42,7 +42,7 @@ mat 自身（`issue_noc` / `generate_rcac`）か chip-tool（採用 fabric）の
 
 - criticality 検査 — Matter TLV cert 形式に criticality フラグは存在しない
   （DER 変換時に spec が固定）。
-- 有効期間 — `cert_time_valid` に分離済みの意図的設計（監査でも棄却済み論点）。
+- 有効期間 — `verify_noc_chain` では検証しない意図的設計（監査でも棄却済み論点。旧 `cert_time_valid` は呼び手ゼロのため 2026-09-12 のリファクタで削除）。
 - RCAC/ICAC への EKU「存在禁止」検査、cRLSign の CA 側要否 — 攻撃面に
   寄与しない cosmetic な制約は追わない（YAGNI）。
 - name constraints / policy / revocation — Matter TLV cert に存在しない。

@@ -232,8 +232,7 @@ pub(super) async fn run_credential_steps(
     // NOCSR 署名も DAC 鍵で elements||challenge に対して（spec §11.17.5.6）。
     {
         let dac_cert = x509::parse_x509(&dac).map_err(|_| CommissionError::Csr("dac reparse"))?;
-        let mut msg = nocsr_elements.clone();
-        msg.extend_from_slice(&challenge);
+        let msg = attestation::attestation_tbs(&nocsr_elements, &challenge);
         crypto::verify_ecdsa_p256(&dac_cert.public_key, &msg, &nocsr_sig)
             .map_err(|_| CommissionError::Csr("nocsr signature"))?;
     }

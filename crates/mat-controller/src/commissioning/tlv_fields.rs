@@ -37,16 +37,15 @@ pub(super) fn expect_struct(r: &mut Reader, step: &'static str) -> Result<(), Co
 
 /// 未知のタグに付随するコンテナを、対応する `ContainerEnd` まで読み飛ばす
 /// （深さ 1 の状態、つまり start 要素は読み終わっている前提）。
+/// [`crate::tlv::skip_container`] に委譲し、[`next_el`] と同じ文言へ写す。
 pub(super) fn skip_container(r: &mut Reader, step: &'static str) -> Result<(), CommissionError> {
-    let mut depth = 1usize;
-    while depth > 0 {
-        match next_el(r, step)?.value {
-            Value::StructStart | Value::ArrayStart | Value::ListStart => depth += 1,
-            Value::ContainerEnd => depth -= 1,
-            _ => {}
-        }
-    }
-    Ok(())
+    crate::tlv::skip_container(r).map_err(|e| CommissionError::Malformed {
+        step,
+        detail: match e {
+            crate::tlv::TlvError::Truncated => "truncated",
+            _ => "tlv decode error",
+        },
+    })
 }
 
 /// [`scan_struct_fields`] が集める TLV leaf 要素の値。以下の decoder が読む
@@ -94,18 +93,18 @@ pub(super) fn scan_struct_fields(
     Ok(out)
 }
 
-/// `map` からタグ `tag` を u8 として取り出す。タグが無い、または値が
-/// `Uint` 以外の型なら「無かった」扱いで `Ok(None)`（旧実装で型不一致の
-/// 分岐が黙って読み捨てられていたのと同じ）。`Uint` ではあるが u8 に収まら
-/// ない場合だけ `range_detail` で `Malformed` を返す。
-pub(super) fn take_u8(
+/// `map` からタグ `tag` を整数 `T`（u8 / u16 / u32）として取り出す。タグが
+/// 無い、または値が `Uint` 以外の型なら「無かった」扱いで `Ok(None)`（旧
+/// 実装で型不一致の分岐が黙って読み捨てられていたのと同じ）。`Uint` では
+/// あるが `T` に収まらない場合だけ `range_detail` で `Malformed` を返す。
+pub(super) fn take_uint<T: TryFrom<u64>>(
     map: &mut BTreeMap<u8, FieldValue>,
     tag: u8,
     step: &'static str,
     range_detail: &'static str,
-) -> Result<Option<u8>, CommissionError> {
+) -> Result<Option<T>, CommissionError> {
     match map.remove(&tag) {
-        Some(FieldValue::Uint(v)) => Ok(Some(u8::try_from(v).map_err(|_| {
+        Some(FieldValue::Uint(v)) => Ok(Some(T::try_from(v).map_err(|_| {
             CommissionError::Malformed {
                 step,
                 detail: range_detail,
@@ -115,8 +114,19 @@ pub(super) fn take_u8(
     }
 }
 
+/// 必須フィールドの欠落を `Malformed { step, detail }` にする（`detail` は
+/// `"missing …"`）。各 decoder の `.ok_or(CommissionError::Malformed { .. })`
+/// 25 箇所の置き換え。
+pub(super) fn required<T>(
+    value: Option<T>,
+    step: &'static str,
+    detail: &'static str,
+) -> Result<T, CommissionError> {
+    value.ok_or(CommissionError::Malformed { step, detail })
+}
+
 /// `map` からタグ `tag` を `Vec<u8>` として取り出す（型不一致は「無かっ
-/// た」扱い、[`take_u8`] と同じ方針）。
+/// た」扱い、[`take_uint`] と同じ方針）。
 pub(super) fn take_bytes(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<Vec<u8>> {
     match map.remove(&tag) {
         Some(FieldValue::Bytes(b)) => Some(b),
@@ -125,7 +135,7 @@ pub(super) fn take_bytes(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<
 }
 
 /// `map` からタグ `tag` を `String` として取り出す（型不一致は「無かっ
-/// た」扱い、[`take_u8`] と同じ方針）。
+/// た」扱い、[`take_uint`] と同じ方針）。
 pub(super) fn take_utf8(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<String> {
     match map.remove(&tag) {
         Some(FieldValue::Utf8(s)) => Some(s),
@@ -133,46 +143,8 @@ pub(super) fn take_utf8(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<S
     }
 }
 
-/// [`take_u8`] の u16 版（Task 9 のデバイス側 decoder が使う——
-/// ExpiryLengthSeconds / AdminVendorId は u16 幅）。
-pub(super) fn take_u16(
-    map: &mut BTreeMap<u8, FieldValue>,
-    tag: u8,
-    step: &'static str,
-    range_detail: &'static str,
-) -> Result<Option<u16>, CommissionError> {
-    match map.remove(&tag) {
-        Some(FieldValue::Uint(v)) => Ok(Some(u16::try_from(v).map_err(|_| {
-            CommissionError::Malformed {
-                step,
-                detail: range_detail,
-            }
-        })?)),
-        _ => Ok(None),
-    }
-}
-
-/// [`take_u8`] の u32 版（`OpenCommissioningWindow` の Iterations は u32
-/// 幅）。
-pub(super) fn take_u32(
-    map: &mut BTreeMap<u8, FieldValue>,
-    tag: u8,
-    step: &'static str,
-    range_detail: &'static str,
-) -> Result<Option<u32>, CommissionError> {
-    match map.remove(&tag) {
-        Some(FieldValue::Uint(v)) => Ok(Some(u32::try_from(v).map_err(|_| {
-            CommissionError::Malformed {
-                step,
-                detail: range_detail,
-            }
-        })?)),
-        _ => Ok(None),
-    }
-}
-
 /// `map` からタグ `tag` を `u64` として取り出す（型不一致は「無かった」
-/// 扱い、[`take_u8`] と同じ方針。u64 はそのままなので範囲チェック不要）。
+/// 扱い、[`take_uint`] と同じ方針。u64 はそのままなので範囲チェック不要）。
 pub(super) fn take_u64(map: &mut BTreeMap<u8, FieldValue>, tag: u8) -> Option<u64> {
     match map.remove(&tag) {
         Some(FieldValue::Uint(v)) => Some(v),
@@ -280,7 +252,7 @@ mod tests {
 
     #[test]
     fn take_helpers_reject_out_of_range_uints() {
-        // take_u8 経由: statusCode = 256
+        // take_uint::<u8> 経由: statusCode = 256
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
         w.put_uint(Tag::Context(0), 256);
@@ -291,7 +263,7 @@ mod tests {
             }
             other => panic!("expected Malformed, got {other:?}"),
         }
-        // take_u16 経由: expiry = 65536
+        // take_uint::<u16> 経由: expiry = 65536
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
         w.put_uint(Tag::Context(0), 65_536);

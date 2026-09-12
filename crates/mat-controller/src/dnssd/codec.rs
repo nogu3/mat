@@ -254,6 +254,20 @@ pub(super) fn prune_aaaa(aaaa: &mut Vec<(String, Ipv6Addr)>, target: &str) {
     aaaa.retain(|(n, _)| n.eq_ignore_ascii_case(target));
 }
 
+/// SRV target に一致する AAAA を出現順に dedup して集め、非 link-local を
+/// 先頭に並べる（stable sort なので同クラス内は応答順のまま）。
+/// resolve（operational / commissionable）と browse の `finish` が共有する。
+pub(super) fn addresses_for_target(aaaa: &[(String, Ipv6Addr)], target: &str) -> Vec<Ipv6Addr> {
+    let mut addresses: Vec<Ipv6Addr> = Vec::new();
+    for (name, addr) in aaaa {
+        if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
+            addresses.push(*addr);
+        }
+    }
+    addresses.sort_by_key(super::is_link_local);
+    addresses
+}
+
 fn be16(buf: &[u8], pos: usize) -> Result<u16, DnssdError> {
     let b = buf
         .get(pos..pos + 2)

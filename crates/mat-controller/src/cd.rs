@@ -31,7 +31,7 @@
 //! して置くことに機密上の問題はない（出所:
 //! `credentials/test/certification-declaration/Chip-Test-CD-Signing-Key.pem`）。
 
-use crate::asn1;
+use crate::asn1::{self, oids};
 use crate::crypto::{sign_ecdsa_p256, CryptoError};
 use crate::tlv::{Tag, Writer};
 
@@ -88,12 +88,6 @@ const CERTIFICATE_ID: &str = "CSA00000SWC00000-00";
 /// （呼び出し側の `x509::generate_dev_attestation` 経由）を渡していたが、
 /// CD の中身としては無意味だったため引数ごと削除した。
 const DEVICE_TYPE_ID_IN_CD: u32 = 22;
-
-// CMS で使う OID（tag/len を除いた中身のバイト列）。
-const OID_PKCS7_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
-const OID_PKCS7_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
-const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
 
 /// CD の中身（spec §6.3.1 の `cd-struct` TLV）を組む。
 ///
@@ -158,16 +152,16 @@ pub fn cms_sign(
 ) -> Result<Vec<u8>, CryptoError> {
     let raw_sig = sign_ecdsa_p256(signer_private_key, cd_content)?;
 
-    let digest_algorithms = asn1::set_of(&[&asn1::seq(&[&asn1::oid(OID_SHA256)])]);
+    let digest_algorithms = asn1::set_of(&[&asn1::seq(&[&asn1::oid(oids::SHA256)])]);
     let encap_content_info = asn1::seq(&[
-        &asn1::oid(OID_PKCS7_DATA),
+        &asn1::oid(oids::PKCS7_DATA),
         &asn1::context_constructed(0, &asn1::octet_string(cd_content)),
     ]);
     let signer_infos = asn1::set_of(&[&asn1::seq(&[
         &asn1::integer(&[3]),
         &asn1::context_primitive(0, signer_key_id),
-        &asn1::seq(&[&asn1::oid(OID_SHA256)]),
-        &asn1::seq(&[&asn1::oid(OID_ECDSA_WITH_SHA256)]),
+        &asn1::seq(&[&asn1::oid(oids::SHA256)]),
+        &asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]),
         &asn1::octet_string(&asn1::ecdsa_signature(&raw_sig)),
     ])]);
     let signed_data = asn1::seq(&[
@@ -178,7 +172,7 @@ pub fn cms_sign(
     ]);
 
     Ok(asn1::seq(&[
-        &asn1::oid(OID_PKCS7_SIGNED_DATA),
+        &asn1::oid(oids::PKCS7_SIGNED_DATA),
         &asn1::context_constructed(0, &signed_data),
     ]))
 }
@@ -215,8 +209,11 @@ mod tests {
         0xD6, 0x51, 0x9D, 0xEC, 0xBA,
     ];
 
-    /// DER の 1 要素を `(tag, content)` に割る（テスト用の最小パーサ）。
-    fn der_split(buf: &[u8]) -> (u8, &[u8]) {
+    /// DER の 1 要素を `(tag, content, rest)` に割る（テスト用の最小パーサ）。
+    /// short / long-form どちらの長さも読み、`rest` は要素の直後 — 呼び出し側が
+    /// ヘッダ長を 2 バイト固定で足していた旧版は、CD が育って long-form に
+    /// なると黙って誤解析した。
+    fn der_split(buf: &[u8]) -> (u8, &[u8], &[u8]) {
         let tag = buf[0];
         let first = buf[1];
         let (len, off) = if first & 0x80 == 0 {
@@ -229,7 +226,8 @@ mod tests {
             }
             (v, 2 + n)
         };
-        (tag, &buf[off..off + len])
+        assert!(off + len <= buf.len(), "der element overruns buffer");
+        (tag, &buf[off..off + len], &buf[off + len..])
     }
 
     #[test]
@@ -288,60 +286,49 @@ mod tests {
         let cms = generate_dev_certification_declaration(0xFFF1, 0x8000).unwrap();
 
         // SEQUENCE { OID signedData, [0] { SignedData } }
-        let (tag, outer) = der_split(&cms);
+        let (tag, outer, _) = der_split(&cms);
         assert_eq!(tag, 0x30);
-        let (tag, oid) = der_split(outer);
-        assert_eq!((tag, oid), (0x06, OID_PKCS7_SIGNED_DATA));
-        let (tag, explicit) = der_split(&outer[2 + oid.len()..]);
+        let (tag, oid, after_oid) = der_split(outer);
+        assert_eq!((tag, oid), (0x06, oids::PKCS7_SIGNED_DATA));
+        let (tag, explicit, _) = der_split(after_oid);
         assert_eq!(tag, 0xA0);
-        let (tag, signed_data) = der_split(explicit);
+        let (tag, signed_data, _) = der_split(explicit);
         assert_eq!(tag, 0x30);
 
         // version INTEGER 3
-        let (tag, version) = der_split(signed_data);
+        let (tag, version, rest) = der_split(signed_data);
         assert_eq!((tag, version), (0x02, &[3u8][..]));
-        let mut rest = &signed_data[2 + version.len()..];
-
-        // digestAlgorithms SET { SEQUENCE { sha256 } }
-        let (tag, digest_algs) = der_split(rest);
+        let (tag, _digest_algs, rest) = der_split(rest);
         assert_eq!(tag, 0x31);
-        rest = &rest[2 + digest_algs.len()..];
-
-        // encapContentInfo SEQUENCE { OID id-data, [0] { OCTET STRING } }
-        let (tag, encap) = der_split(rest);
+        let (tag, encap, rest) = der_split(rest);
         assert_eq!(tag, 0x30);
-        rest = &rest[2 + encap.len()..];
-        let (tag, oid) = der_split(encap);
-        assert_eq!((tag, oid), (0x06, OID_PKCS7_DATA));
-        let (tag, econtent_explicit) = der_split(&encap[2 + oid.len()..]);
+        let (tag, oid, after_oid) = der_split(encap);
+        assert_eq!((tag, oid), (0x06, oids::PKCS7_DATA));
+        let (tag, econtent_explicit, _) = der_split(after_oid);
         assert_eq!(tag, 0xA0);
-        let (tag, econtent) = der_split(econtent_explicit);
+        let (tag, econtent, _) = der_split(econtent_explicit);
         assert_eq!(tag, 0x04);
         assert_eq!(econtent, content, "eContent は CD の生バイト列そのもの");
 
         // signerInfos SET { SEQUENCE { 3, [0] keyid, sha256, ecdsa, sig } }
-        let (tag, signer_infos) = der_split(rest);
+        let (tag, signer_infos, _) = der_split(rest);
         assert_eq!(tag, 0x31);
-        let (tag, si) = der_split(signer_infos);
+        let (tag, si, _) = der_split(signer_infos);
         assert_eq!(tag, 0x30);
-        let (_, si_version) = der_split(si);
-        let si_rest = &si[2 + si_version.len()..];
-        let (tag, key_id) = der_split(si_rest);
+        let (_, _si_version, si_rest) = der_split(si);
+        let (tag, key_id, si_rest) = der_split(si_rest);
         assert_eq!(tag, 0x80, "signer key id は [0] IMPLICIT OCTET STRING");
         assert_eq!(key_id, TEST_CD_SIGNING_KEY_ID);
 
         // 署名は eContent（= CD 本体）に対する ECDSA-P256/SHA-256。
-        let mut si_tail = &si_rest[2 + key_id.len()..];
-        for _ in 0..2 {
-            let (_, alg) = der_split(si_tail);
-            si_tail = &si_tail[2 + alg.len()..];
-        }
-        let (tag, sig_der) = der_split(si_tail);
+        let (_, _digest_alg, si_rest) = der_split(si_rest);
+        let (_, _sig_alg, si_rest) = der_split(si_rest);
+        let (tag, sig_der, _) = der_split(si_rest);
         assert_eq!(tag, 0x04);
-        let (tag, sig_seq) = der_split(sig_der);
+        let (tag, sig_seq, _) = der_split(sig_der);
         assert_eq!(tag, 0x30);
-        let (_, r) = der_split(sig_seq);
-        let (_, s) = der_split(&sig_seq[2 + r.len()..]);
+        let (_, r, after_r) = der_split(sig_seq);
+        let (_, s, _) = der_split(after_r);
         let mut raw = [0u8; 64];
         raw[32 - r.len().min(32)..32].copy_from_slice(&r[r.len().saturating_sub(32)..]);
         raw[64 - s.len().min(32)..].copy_from_slice(&s[s.len().saturating_sub(32)..]);

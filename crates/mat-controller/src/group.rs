@@ -50,23 +50,14 @@ impl PersistedGroupCounter {
     /// persists the new ceiling before returning. A corrupt counter file is
     /// an error (starting low would get every send dropped by receivers).
     pub fn load(path: &Path, chip_tool_gdc: u32) -> io::Result<Self> {
-        use rustix::fs::{flock, FlockOperation};
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(PathBuf::from(lock_path))?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == rustix::io::Errno::WOULDBLOCK {
+        let lock = crate::kvs::fs_util::take_lock(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "group counter is locked by another process (matd running?)",
                 )
             } else {
-                io::Error::other(e)
+                e
             }
         })?;
         let persisted = match std::fs::read_to_string(path) {
@@ -112,15 +103,10 @@ impl PersistedGroupCounter {
         Ok((from, to))
     }
 
-    /// Atomic write (tmp + fsync + rename) so a crash never leaves a
-    /// truncated value behind.
+    /// Atomic write (tmp + fsync + rename, [`crate::kvs::fs_util::atomic_replace`])
+    /// so a crash never leaves a truncated value behind.
     fn persist(&mut self, ceiling: u32) -> io::Result<()> {
-        use std::io::Write;
-        let tmp = self.path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(format!("{ceiling}\n").as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)?;
+        crate::kvs::fs_util::atomic_replace(&self.path, format!("{ceiling}\n").as_bytes())?;
         self.ceiling = ceiling;
         Ok(())
     }
@@ -594,60 +580,6 @@ mod tests {
         );
     }
 
-    /// A network interface eligible to try as the multicast join/egress
-    /// interface for the test below.
-    struct McastCandidate {
-        name: String,
-        index: u32,
-    }
-
-    /// Enumerates interfaces that advertise `IFF_UP | IFF_MULTICAST` via
-    /// `/sys/class/net/*/flags`, excluding `lo` (which lacks the MULTICAST
-    /// flag on Linux — IPv6 multicast never delivers through it, in any
-    /// environment). Interfaces reporting `operstate == "up"` are tried
-    /// first, since flags alone (as seen on some bridge/veth interfaces)
-    /// don't guarantee delivery.
-    fn multicast_capable_interfaces() -> Vec<McastCandidate> {
-        const IFF_UP: u32 = 0x1;
-        const IFF_MULTICAST: u32 = 0x1000;
-        let mut up_first = Vec::new();
-        let mut rest = Vec::new();
-        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-            return Vec::new();
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "lo" {
-                continue;
-            }
-            let base = entry.path();
-            let flags = std::fs::read_to_string(base.join("flags"))
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
-                continue;
-            }
-            let Some(index) = std::fs::read_to_string(base.join("ifindex"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
-            let candidate = McastCandidate { name, index };
-            if operstate.trim() == "up" {
-                up_first.push(candidate);
-            } else {
-                rest.push(candidate);
-            }
-        }
-        up_first.sort_by_key(|c| c.index);
-        rest.sort_by_key(|c| c.index);
-        up_first.extend(rest);
-        up_first
-    }
-
     #[tokio::test]
     async fn group_sender_pins_multicast_egress_interface() {
         use crate::transport::UdpTransport;
@@ -675,25 +607,25 @@ mod tests {
         let addr = group_multicast_addr(1, 10);
         let mut tried = Vec::new();
 
-        for cand in multicast_capable_interfaces() {
+        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
             // Fresh receiver per candidate: a socket can only join a given
             // multicast group once per interface, and candidates that fail
             // to join must not poison the next attempt.
             let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             let port = recv.local_addr().unwrap().port();
-            if recv.join_multicast_v6(&addr, cand.index).is_err() {
-                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+            if recv.join_multicast_v6(&addr, index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", name, index));
                 continue;
             }
 
-            let p = tmp_counter_path(&format!("sender-{}", cand.index));
+            let p = tmp_counter_path(&format!("sender-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
             let egress = vec![GroupEgress {
-                iface: cand.name.clone(),
+                iface: name.clone(),
                 transport,
-                scope_id: cand.index,
+                scope_id: index,
             }];
             let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
             // Send failures must not poison the run either: docker0 / veth* /
@@ -708,10 +640,7 @@ mod tests {
                 Ok((c, _sent)) => c,
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
-                    tried.push(format!(
-                        "{}(idx={}): send failed: {e:?}",
-                        cand.name, cand.index
-                    ));
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
                     continue;
                 }
             };
@@ -731,7 +660,7 @@ mod tests {
                     assert_eq!(header.message_counter, sent_counter);
                     return; // first delivering interface is enough — PASS.
                 }
-                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+                _ => tried.push(format!("{}(idx={}): no delivery", name, index)),
             }
         }
 
@@ -746,7 +675,7 @@ mod tests {
     /// egress へ同一 datagram を送出する。`lo` は multicast join できないため、
     /// 2 egress とも同じ iface（同じ scope_id）を使い、独立ソケット 1 本で
     /// 同一バイト列が 2 回届くことで「egress ごとに 1 回送出された」ことを
-    /// 固定する。join できる候補は `multicast_capable_interfaces` の走査で
+    /// 固定する。join できる候補は `multicast_ifaces` の走査で
     /// 探す（`group_sender_multicast_loops_back_locally` と同じ流儀 —
     /// docker0/veth* 等 join はできても send が ENETUNREACH/EADDRNOTAVAIL で
     /// 落ちる候補があるため、送出失敗も次候補へ送る）。
@@ -755,10 +684,10 @@ mod tests {
         let addr = group_multicast_addr(1, 10);
         let mut tried = Vec::new();
 
-        for cand in multicast_capable_interfaces() {
+        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
             let recv1 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
-            if recv1.join_multicast_v6(&addr, cand.index).is_err() {
-                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+            if recv1.join_multicast_v6(&addr, index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", name, index));
                 continue;
             }
             let port = recv1.local_addr().unwrap().port();
@@ -766,14 +695,14 @@ mod tests {
             let e1 = GroupEgress {
                 iface: "egress-a".into(),
                 transport: Arc::new(UdpTransport::bind().await.unwrap()),
-                scope_id: cand.index,
+                scope_id: index,
             };
             let e2 = GroupEgress {
                 iface: "egress-b".into(),
                 transport: Arc::new(UdpTransport::bind().await.unwrap()),
-                scope_id: cand.index,
+                scope_id: index,
             };
-            let p = tmp_counter_path(&format!("dual-egress-{}", cand.index));
+            let p = tmp_counter_path(&format!("dual-egress-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let creds = test_creds();
@@ -782,10 +711,7 @@ mod tests {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
-                    tried.push(format!(
-                        "{}(idx={}): send failed: {e:?}",
-                        cand.name, cand.index
-                    ));
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
                     continue;
                 }
             };
@@ -811,7 +737,7 @@ mod tests {
                     assert_eq!(&buf1[..n1], &buf2[..n2], "同一 counter の同一 datagram");
                     return; // 配達できる iface が見つかった時点で PASS。
                 }
-                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+                _ => tried.push(format!("{}(idx={}): no delivery", name, index)),
             }
         }
 
@@ -834,7 +760,7 @@ mod tests {
     /// を持つ iface は書き換え後も無条件で成功する）。iface 再作成そのもの
     /// はテストでは作れない（CAP_NET_ADMIN 不可）ため、代わりに **`new()`
     /// 呼び出し時点の scope_id を `lo`（ifindex はほぼ必ず 1、multicast 不可
-    /// と `multicast_capable_interfaces` のコメントで既知）にして** sockopt
+    /// と `multicast_ifaces` のコメントで既知）にして** sockopt
     /// 自体を最初から stale にする。`lo` 経由の送出は実測で
     /// ENETUNREACH(101) を返す（2026-08-31 の実発生と同じ errno）。
     #[tokio::test]
@@ -849,29 +775,29 @@ mod tests {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1);
 
-        for cand in multicast_capable_interfaces() {
+        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
             let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             let port = recv.local_addr().unwrap().port();
-            if recv.join_multicast_v6(&addr, cand.index).is_err() {
-                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+            if recv.join_multicast_v6(&addr, index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", name, index));
                 continue;
             }
 
-            let p = tmp_counter_path(&format!("heal-{}", cand.index));
+            let p = tmp_counter_path(&format!("heal-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
-            // otbr 再起動相当: iface 名は実物の cand.name のまま、new() 時点で
+            // otbr 再起動相当: iface 名は実物の name のまま、new() 時点で
             // 既に stale な scope_id (lo) を持つ egress として構成する。
             let egress = vec![GroupEgress {
-                iface: cand.name.clone(),
+                iface: name.clone(),
                 transport,
                 scope_id: stale_idx,
             }];
             let mut s = GroupSender::new(egress, port, 1, 0x0001_0001, counter).unwrap();
             assert_eq!(s.egress[0].scope_id, stale_idx);
 
-            let good = cand.index;
+            let good = index;
             s.iface_resolver = Box::new(move |_| Ok(good));
 
             let (sent_counter, sent) = match s
@@ -881,22 +807,16 @@ mod tests {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
-                    tried.push(format!(
-                        "{}(idx={}): send failed: {e:?}",
-                        cand.name, cand.index
-                    ));
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
                     continue;
                 }
             };
             assert_eq!(
                 sent,
-                vec![cand.name.clone()],
+                vec![name.clone()],
                 "healed egress must be counted as sent"
             );
-            assert_eq!(
-                s.egress[0].scope_id, cand.index,
-                "scope_id must be refreshed"
-            );
+            assert_eq!(s.egress[0].scope_id, index, "scope_id must be refreshed");
 
             let mut buf = [0u8; 1280];
             let result = tokio::time::timeout(
@@ -912,7 +832,7 @@ mod tests {
                     assert_eq!(header.message_counter, sent_counter);
                     return; // 配達できる iface が 1 本見つかれば PASS
                 }
-                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+                _ => tried.push(format!("{}(idx={}): no delivery", name, index)),
             }
         }
         panic!("no candidate healed+delivered; tried: {tried:?}");
@@ -935,10 +855,10 @@ mod tests {
         let mut tried = Vec::new();
         const BOGUS_SCOPE_ID: u32 = 0x7fff_fffe;
 
-        for cand in multicast_capable_interfaces() {
+        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
             let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
-            if recv.join_multicast_v6(&addr, cand.index).is_err() {
-                tried.push(format!("{}(idx={}): join failed", cand.name, cand.index));
+            if recv.join_multicast_v6(&addr, index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", name, index));
                 continue;
             }
             let port = recv.local_addr().unwrap().port();
@@ -950,7 +870,7 @@ mod tests {
                 tried.push(format!(
                     "{}(idx={}): bogus scope_id {BOGUS_SCOPE_ID} accepted by this \
                      environment, cannot exercise the failure path",
-                    cand.name, cand.index
+                    name, index
                 ));
                 continue;
             }
@@ -958,7 +878,7 @@ mod tests {
             let good = GroupEgress {
                 iface: "egress-good".into(),
                 transport: Arc::new(UdpTransport::bind().await.unwrap()),
-                scope_id: cand.index,
+                scope_id: index,
             };
             let bad = GroupEgress {
                 iface: "egress-bad".into(),
@@ -966,7 +886,7 @@ mod tests {
                 scope_id: BOGUS_SCOPE_ID,
             };
 
-            let p = tmp_counter_path(&format!("bad-egress-drop-{}", cand.index));
+            let p = tmp_counter_path(&format!("bad-egress-drop-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let mut s = GroupSender::new(vec![good, bad], port, 1, 0x0001_0001, counter)
@@ -983,10 +903,7 @@ mod tests {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
-                    tried.push(format!(
-                        "{}(idx={}): send failed: {e:?}",
-                        cand.name, cand.index
-                    ));
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
                     continue;
                 }
             };
@@ -1005,7 +922,7 @@ mod tests {
             let _ = std::fs::remove_file(&p);
             match result {
                 Ok(Ok(_)) => return, // 配達確認まで取れた時点で PASS。
-                _ => tried.push(format!("{}(idx={}): no delivery", cand.name, cand.index)),
+                _ => tried.push(format!("{}(idx={}): no delivery", name, index)),
             }
         }
         eprintln!(
@@ -1054,15 +971,15 @@ mod tests {
         use crate::transport::UdpTransport;
 
         let mut tried = Vec::new();
-        for cand in multicast_capable_interfaces() {
-            let p = tmp_counter_path(&format!("late-{}", cand.index));
+        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+            let p = tmp_counter_path(&format!("late-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();
             let transport = std::sync::Arc::new(UdpTransport::bind().await.unwrap());
             let egress = vec![GroupEgress {
-                iface: cand.name.clone(),
+                iface: name.clone(),
                 transport,
-                scope_id: cand.index,
+                scope_id: index,
             }];
             // 受信はしない (送出成功の iface 名リストだけ固定する) が、宛先 port
             // は実 5540 を避けエフェメラルにする (LAN へ流れても無害な宛先)。
@@ -1075,11 +992,11 @@ mod tests {
             s.add_egress(GroupEgress {
                 iface: "late0".into(),
                 transport: std::sync::Arc::clone(&t2),
-                scope_id: cand.index, // 同一 iface の独立 socket (2 本目の実 iface は環境に無い前提)
+                scope_id: index, // 同一 iface の独立 socket (2 本目の実 iface は環境に無い前提)
             })
             .unwrap();
             assert_eq!(s.egress_count(), 2);
-            assert_eq!(t2.multicast_if_v6().unwrap(), cand.index);
+            assert_eq!(t2.multicast_if_v6().unwrap(), index);
 
             match s
                 .send_invoke(&test_creds(), 10, CLUSTER_ON_OFF, CMD_ON_OFF_ON, None)
@@ -1087,15 +1004,12 @@ mod tests {
             {
                 Ok((_c, sent)) => {
                     let _ = std::fs::remove_file(&p);
-                    assert_eq!(sent, vec![cand.name.clone(), "late0".to_string()]);
+                    assert_eq!(sent, vec![name.clone(), "late0".to_string()]);
                     return;
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&p);
-                    tried.push(format!(
-                        "{}(idx={}): send failed: {e:?}",
-                        cand.name, cand.index
-                    ));
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
                     continue; // docker0/veth 等の EADDRNOTAVAIL は次候補へ
                 }
             }

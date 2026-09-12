@@ -113,6 +113,60 @@ pub fn ecdsa_signature(sig: &[u8; 64]) -> Vec<u8> {
     seq(&[&uint_integer(&sig[..32]), &uint_integer(&sig[32..])])
 }
 
+/// このクレートが DER に書く／読む OID の内容バイト（タグ `0x06` と長さは
+/// 含まない — [`oid`] が付与する）。cert.rs（Matter TLV → DER TBS 再構築）、
+/// x509.rs（DAC/PAI/PAA・CSR 解析と test fixture 合成）、cd.rs / attestation.rs
+/// （CMS SignedData）が共有する唯一の表。
+pub mod oids {
+    /// 1.2.840.10045.2.1 id-ecPublicKey
+    pub const EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    /// 1.2.840.10045.3.1.7 prime256v1
+    pub const PRIME256V1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    /// 1.2.840.10045.4.3.2 ecdsa-with-SHA256
+    pub const ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+    /// 2.16.840.1.101.3.4.2.1 sha256
+    pub const SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    /// 2.5.4.3 commonName
+    pub const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    // Matter arc 1.3.6.1.4.1.37244.1.x -> 2B 06 01 04 01 82 A2 7C 01 xx
+    /// 1.3.6.1.4.1.37244.1.1 matter-node-id
+    pub const MATTER_NODE_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x01];
+    /// 1.3.6.1.4.1.37244.1.2 matter-firmware-signing-id
+    pub const MATTER_FIRMWARE_SIGNING_ID: &[u8] =
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x02];
+    /// 1.3.6.1.4.1.37244.1.3 matter-icac-id
+    pub const MATTER_ICAC_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x03];
+    /// 1.3.6.1.4.1.37244.1.4 matter-rcac-id
+    pub const MATTER_RCAC_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x04];
+    /// 1.3.6.1.4.1.37244.1.5 matter-fabric-id
+    pub const MATTER_FABRIC_ID: &[u8] =
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x05];
+    /// 1.3.6.1.4.1.37244.1.6 matter-noc-cat
+    pub const MATTER_NOC_CAT: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x06];
+    /// 1.3.6.1.4.1.37244.2.1 matter-vid（DAC/PAI subject）
+    pub const MATTER_VID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x01];
+    /// 1.3.6.1.4.1.37244.2.2 matter-pid（DAC/PAI subject）
+    pub const MATTER_PID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x02, 0x02];
+    /// 2.5.29.19 basicConstraints
+    pub const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13];
+    /// 2.5.29.15 keyUsage
+    pub const KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F];
+    /// 2.5.29.37 extKeyUsage
+    pub const EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
+    /// 2.5.29.14 subjectKeyIdentifier
+    pub const SUBJECT_KEY_ID: &[u8] = &[0x55, 0x1D, 0x0E];
+    /// 2.5.29.35 authorityKeyIdentifier
+    pub const AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1D, 0x23];
+    /// 1.3.6.1.5.5.7.3 id-kp（末尾 1 バイトの purpose を足して EKU OID になる）
+    pub const ID_KP_PREFIX: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03];
+    /// 1.2.840.113549.1.7.1 pkcs7-data
+    pub const PKCS7_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+    /// 1.2.840.113549.1.7.2 pkcs7-signedData
+    pub const PKCS7_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+    /// 1.2.840.113549.1.9.4 messageDigest（CMS signedAttrs）
+    pub const CMS_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

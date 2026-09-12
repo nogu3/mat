@@ -3,15 +3,17 @@
 //! （`_L<disc>._sub._matterc._udp` の PTR → SRV/TXT/AAAA）。SRV + target
 //! 一致 AAAA が揃った時点で早期 return する（browse と違い全員は集めない）。
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::codec::{encode_query, parse_message, prune_aaaa, push_aaaa, txt_u32, RData};
+use super::codec::{
+    addresses_for_target, encode_query, parse_message, prune_aaaa, push_aaaa, txt_u32, RData,
+};
 use super::{
-    bind_mdns_socket, is_link_local, operational_instance, DnssdError, ResolvedNode, MDNS_GROUP,
-    MDNS_PORT, QUERY_RESEND_INTERVAL, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT,
+    bind_mdns_socket, mdns_dest, operational_instance, DnssdError, ResolvedNode,
+    QUERY_RESEND_INTERVAL, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT,
 };
 
 /// [`resolve_operational_many`] の per-node fold 状態。単発 resolver が
@@ -35,25 +37,12 @@ impl OperationalQuery {
         let Some((port, target)) = &self.srv else {
             return;
         };
-        let mut addresses: Vec<Ipv6Addr> = Vec::new();
-        for (name, addr) in &self.aaaa {
-            if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
-                addresses.push(*addr);
-            }
-        }
+        let addresses = addresses_for_target(&self.aaaa, target);
         if addresses.is_empty() {
             return;
         }
-        // Non-link-local first (stable sort keeps response order within
-        // each class).
-        addresses.sort_by_key(is_link_local);
         let strings = self.txt.as_deref().unwrap_or(&[]);
-        self.resolved = Some(ResolvedNode {
-            port: *port,
-            addresses,
-            session_idle_interval_ms: txt_u32(strings, "SII"),
-            session_active_interval_ms: txt_u32(strings, "SAI"),
-        });
+        self.resolved = Some(ResolvedNode::from_parts(*port, addresses, strings));
     }
 }
 
@@ -82,7 +71,7 @@ pub async fn resolve_operational_many(
         return Ok(Vec::new());
     }
     let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = mdns_dest(scope_id);
     let mut queries: Vec<OperationalQuery> = node_ids
         .iter()
         .map(|&node_id| OperationalQuery {
@@ -230,23 +219,11 @@ fn build_commissionable(
     if txt_u32(txt, "D") != Some(u32::from(long_discriminator)) {
         return None;
     }
-    let mut addresses: Vec<Ipv6Addr> = Vec::new();
-    for (name, addr) in aaaa {
-        if name.eq_ignore_ascii_case(target) && !addresses.contains(addr) {
-            addresses.push(*addr);
-        }
-    }
+    let addresses = addresses_for_target(aaaa, target);
     if addresses.is_empty() {
         return None;
     }
-    // 非 link-local 優先（同じクラス内では応答順を安定に保つ）。
-    addresses.sort_by_key(is_link_local);
-    Some(ResolvedNode {
-        port,
-        addresses,
-        session_idle_interval_ms: txt_u32(txt, "SII"),
-        session_active_interval_ms: txt_u32(txt, "SAI"),
-    })
+    Some(ResolvedNode::from_parts(port, addresses, txt))
 }
 
 /// 1 個の DNS メッセージ単体から commissionable node を抽出する（PTR→
@@ -296,7 +273,7 @@ pub async fn resolve_commissionable(
 ) -> Result<ResolvedNode, DnssdError> {
     let subtype = long_discriminator_subtype(long_discriminator);
     let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = mdns_dest(scope_id);
 
     let mut instance: Option<String> = None;
     let mut srv: Option<(u16, String)> = None;

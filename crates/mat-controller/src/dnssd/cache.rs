@@ -4,7 +4,7 @@
 //! （設計ルール 4: 状態を持たない）。
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -12,10 +12,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::codec::{encode_query, parse_message, txt_u32, RData, Record};
-use super::{
-    bind_mdns_socket, is_link_local, ResolvedNode, MDNS_GROUP, MDNS_PORT, TYPE_SRV, TYPE_TXT,
-};
+use super::codec::{encode_query, parse_message, RData, Record};
+use super::{bind_mdns_socket, is_link_local, mdns_dest, ResolvedNode, TYPE_SRV, TYPE_TXT};
 
 /// キャッシュ上限（偽装 flood でメモリを伸ばさない — MAX_INSTANCES と同思想）。
 const MAX_CACHE: usize = 256;
@@ -243,12 +241,7 @@ fn fold_operational_into_cache(
         entries.sort_by_key(|(a, seen)| (is_link_local(a), std::cmp::Reverse(*seen)));
         let addresses: Vec<Ipv6Addr> = entries.into_iter().map(|(a, _)| a).collect();
         let txt = fold.txt.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
-        let node = ResolvedNode {
-            port: *port,
-            addresses,
-            session_idle_interval_ms: txt_u32(txt, "SII"),
-            session_active_interval_ms: txt_u32(txt, "SAI"),
-        };
+        let node = ResolvedNode::from_parts(*port, addresses, txt);
         // TTL 0（goodbye）は即時失効相当なので短く。通常は広告 TTL を尊重。
         cache.insert(inst.clone(), node, Duration::from_secs(u64::from(*ttl)));
     }
@@ -263,7 +256,7 @@ async fn run_operational_cache(
     mut requests: mpsc::UnboundedReceiver<String>,
     scope_id: u32,
 ) {
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = mdns_dest(scope_id);
     let mut fold = OperationalFold::default();
     // browse と同様、複数 instance の additional 同梱に備え広めに取る。
     let mut buf = vec![0u8; 9000];
@@ -306,9 +299,8 @@ pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCach
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssd::codec::push_name;
     use crate::dnssd::test_util::{
-        synth_aaaa_class, synth_commissionable_response, synth_response,
+        synth_aaaa_class, synth_commissionable_response, synth_response, MsgBuilder,
     };
     use crate::dnssd::{iface_index, CLASS_IN};
     use std::net::Ipv6Addr;
@@ -441,30 +433,10 @@ mod tests {
     /// AAAA 到着時に target 一致で touched になり完成する (最終レビュー #1,
     /// step 4 の target→touched 走査)。
     fn synth_srv_txt_only(service: &str, target: &str, port: u16, txt: &[&str]) -> Vec<u8> {
-        let mut m = Vec::new();
-        m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
-        m.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]); // qd 0, an 2 (SRV+TXT)
-        push_name(&mut m, service);
-        m.extend_from_slice(&TYPE_SRV.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl 120
-        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
-        rdata.extend_from_slice(&port.to_be_bytes());
-        let mut tname = Vec::new();
-        push_name(&mut tname, target);
-        rdata.extend_from_slice(&tname);
-        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        m.extend_from_slice(&rdata);
-        push_name(&mut m, service);
-        m.extend_from_slice(&TYPE_TXT.to_be_bytes());
-        m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-        let mut rdata = Vec::new();
-        for s in txt {
-            rdata.push(s.len() as u8);
-            rdata.extend_from_slice(s.as_bytes());
-        }
-        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        m.extend_from_slice(&rdata);
-        m
+        MsgBuilder::new()
+            .srv(service, port, target)
+            .txt(service, txt)
+            .finish()
     }
 
     fn synth_aaaa_only(name: &str, ttl: u32, addr: Ipv6Addr) -> Vec<u8> {

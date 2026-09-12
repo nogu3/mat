@@ -2,16 +2,120 @@
 //! 応答器）。`codec` / `resolve` / `browse` / `cache` の tests から使う。
 #![cfg(test)]
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 use super::codec::push_name;
-use super::{bind_mdns_socket, MDNS_GROUP, MDNS_PORT, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
+use super::{bind_mdns_socket, CLASS_IN, TYPE_AAAA, TYPE_PTR, TYPE_SRV, TYPE_TXT};
 
 /// `_matterc._udp.local` の browse / known-answer テスト共通の service 名
 /// （`codec` の known-answer テストと `browse` の browse テストの両方が使う —
 /// cross-submodule test 定数なのでここに置く）。
 pub(super) const MC: &str = "_matterc._udp.local";
+
+/// 合成 mDNS 応答（QR|AA、id 0、question 無し）のビルダ。`synth_*` 各関数と
+/// browse / cache の合成ヘルパはすべてこれで組む。
+pub(crate) struct MsgBuilder {
+    buf: Vec<u8>,
+    an: u16,
+    /// 直前の `srv` が書いた target 名のメッセージ内オフセット
+    /// （`aaaa_ptr_srv_target` が圧縮ポインタで指す）。
+    srv_target_off: Option<usize>,
+}
+
+impl MsgBuilder {
+    pub(crate) fn new() -> Self {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // qd 0, an (後で埋める), ns/ar 0
+        MsgBuilder {
+            buf,
+            an: 0,
+            srv_target_off: None,
+        }
+    }
+
+    fn header(&mut self, rtype: u16, class: u16, ttl: u32) {
+        self.buf.extend_from_slice(&rtype.to_be_bytes());
+        self.buf.extend_from_slice(&class.to_be_bytes());
+        self.buf.extend_from_slice(&ttl.to_be_bytes());
+        self.an += 1;
+    }
+
+    fn rdata(&mut self, rdata: &[u8]) {
+        self.buf
+            .extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        self.buf.extend_from_slice(rdata);
+    }
+
+    /// PTR（class IN — PTR は cache-flush を立てないのが通例）。
+    pub(crate) fn ptr(mut self, name: &str, instance: &str) -> Self {
+        push_name(&mut self.buf, name);
+        self.header(TYPE_PTR, CLASS_IN, 120);
+        let mut rdata = Vec::new();
+        push_name(&mut rdata, instance);
+        self.rdata(&rdata);
+        self
+    }
+
+    /// SRV（cache-flush|IN）。target 名の位置を記憶する。
+    pub(crate) fn srv(mut self, name: &str, port: u16, target: &str) -> Self {
+        push_name(&mut self.buf, name);
+        self.header(TYPE_SRV, FLUSH_IN, 120);
+        let mut rdata = vec![0, 0, 0, 0]; // priority, weight
+        rdata.extend_from_slice(&port.to_be_bytes());
+        push_name(&mut rdata, target);
+        self.srv_target_off = Some(self.buf.len() + 2 + 6); // rdlength(2) + prio/weight/port(6)
+        self.rdata(&rdata);
+        self
+    }
+
+    /// TXT（cache-flush|IN）。
+    pub(crate) fn txt(mut self, name: &str, strings: &[&str]) -> Self {
+        push_name(&mut self.buf, name);
+        self.header(TYPE_TXT, FLUSH_IN, 120);
+        let mut rdata = Vec::new();
+        for s in strings {
+            rdata.push(s.len() as u8);
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        self.rdata(&rdata);
+        self
+    }
+
+    /// AAAA（cache-flush|IN、TTL 120）。
+    pub(crate) fn aaaa(self, name: &str, addr: Ipv6Addr) -> Self {
+        self.aaaa_class(name, 120, addr, FLUSH_IN)
+    }
+
+    /// class / TTL 指定の AAAA（cache-flush ビット検証用）。
+    pub(crate) fn aaaa_class(mut self, name: &str, ttl: u32, addr: Ipv6Addr, class: u16) -> Self {
+        push_name(&mut self.buf, name);
+        self.header(TYPE_AAAA, class, ttl);
+        self.rdata(&addr.octets());
+        self
+    }
+
+    /// 名前を直前の `srv` の target への圧縮ポインタで書く AAAA（実 mDNS
+    /// 応答の形 — `parse_message` の名前圧縮解決を踏ませる）。
+    pub(crate) fn aaaa_ptr_srv_target(mut self, addr: Ipv6Addr) -> Self {
+        let off = self
+            .srv_target_off
+            .expect("srv() must precede aaaa_ptr_srv_target()");
+        self.buf
+            .extend_from_slice(&[0xC0 | (off >> 8) as u8, (off & 0xFF) as u8]);
+        self.header(TYPE_AAAA, FLUSH_IN, 120);
+        self.rdata(&addr.octets());
+        self
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        self.buf[6..8].copy_from_slice(&self.an.to_be_bytes());
+        self.buf
+    }
+}
+
+const FLUSH_IN: u16 = 0x8000 | CLASS_IN;
 
 /// SRV + TXT + AAAA を 1 メッセージに合成。AAAA のレコード名は SRV rdata
 /// 内の target 名への圧縮ポインタで書き、クラスには cache-flush bit を
@@ -23,45 +127,17 @@ pub(super) fn synth_response(
     txt: &[&str],
     addr: Ipv6Addr,
 ) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
-    m.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 0]); // qd 0, an 3, ns/ar 0
-                                                    // --- SRV ---
-    push_name(&mut m, service);
-    m.extend_from_slice(&TYPE_SRV.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl
-    let mut rdata = vec![0, 0, 0, 0]; // priority, weight
-    rdata.extend_from_slice(&port.to_be_bytes());
-    let mut tname = Vec::new();
-    push_name(&mut tname, target);
-    rdata.extend_from_slice(&tname);
-    m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    let target_off = m.len() + 6; // rdata 先頭から 6B 目が target 名
-    m.extend_from_slice(&rdata);
-    // --- TXT ---
-    push_name(&mut m, service);
-    m.extend_from_slice(&TYPE_TXT.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-    let mut rdata = Vec::new();
-    for s in txt {
-        rdata.push(s.len() as u8);
-        rdata.extend_from_slice(s.as_bytes());
-    }
-    m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    m.extend_from_slice(&rdata);
-    // --- AAAA（名前は SRV target への圧縮ポインタ）---
-    m.extend_from_slice(&[0xC0 | (target_off >> 8) as u8, (target_off & 0xFF) as u8]);
-    m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-    m.extend_from_slice(&16u16.to_be_bytes());
-    m.extend_from_slice(&addr.octets());
-    m
+    MsgBuilder::new()
+        .srv(service, port, target)
+        .txt(service, txt)
+        .aaaa_ptr_srv_target(addr)
+        .finish()
 }
 
 /// `IFF_UP|IFF_MULTICAST` な iface（lo 以外、`operstate == "up"` 優先）。
-/// group.rs のテストと同じ実行時発見方式 — lo は IFF_MULTICAST を持たず
-/// IPv6 マルチキャストが絶対に届かないため除外。
-pub(super) fn multicast_ifaces() -> Vec<(String, u32)> {
+/// group.rs のテストもこれを使う — lo は IFF_MULTICAST を持たず IPv6
+/// マルチキャストが絶対に届かないため除外。
+pub(crate) fn multicast_ifaces() -> Vec<(String, u32)> {
     const IFF_UP: u32 = 0x1;
     const IFF_MULTICAST: u32 = 0x1000;
     let mut up_first = Vec::new();
@@ -95,6 +171,8 @@ pub(super) fn multicast_ifaces() -> Vec<(String, u32)> {
             rest.push((name, index));
         }
     }
+    up_first.sort_by_key(|(_, idx)| *idx);
+    rest.sort_by_key(|(_, idx)| *idx);
     up_first.extend(rest);
     up_first
 }
@@ -108,7 +186,7 @@ pub(super) fn spawn_multicast_announcer(
     msg: Vec<u8>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let sock = bind_mdns_socket(scope_id)?;
-    let dest = SocketAddr::V6(SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, scope_id));
+    let dest = super::mdns_dest(scope_id);
     Ok(tokio::spawn(async move {
         loop {
             let _ = sock.send_to(&msg, dest).await;
@@ -162,59 +240,17 @@ pub(super) fn synth_commissionable_response(
     txt: &[&str],
     addr: Ipv6Addr,
 ) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
-    m.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]); // qd 0, an 4, ns/ar 0
-                                                    // --- PTR ---
-    push_name(&mut m, subtype);
-    m.extend_from_slice(&TYPE_PTR.to_be_bytes());
-    m.extend_from_slice(&[0, 1, 0, 0, 0, 120]); // IN（PTR は cache-flush 立てないのが通例）, ttl
-    let mut rdata = Vec::new();
-    push_name(&mut rdata, instance);
-    m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    m.extend_from_slice(&rdata);
-    // --- SRV ---
-    push_name(&mut m, instance);
-    m.extend_from_slice(&TYPE_SRV.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]); // cache-flush|IN, ttl
-    let mut rdata = vec![0, 0, 0, 0]; // priority, weight
-    rdata.extend_from_slice(&port.to_be_bytes());
-    let mut tname = Vec::new();
-    push_name(&mut tname, target);
-    rdata.extend_from_slice(&tname);
-    m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    let target_off = m.len() + 6; // rdata 先頭から 6B 目が target 名
-    m.extend_from_slice(&rdata);
-    // --- TXT ---
-    push_name(&mut m, instance);
-    m.extend_from_slice(&TYPE_TXT.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-    let mut rdata = Vec::new();
-    for s in txt {
-        rdata.push(s.len() as u8);
-        rdata.extend_from_slice(s.as_bytes());
-    }
-    m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    m.extend_from_slice(&rdata);
-    // --- AAAA（名前は SRV target への圧縮ポインタ）---
-    m.extend_from_slice(&[0xC0 | (target_off >> 8) as u8, (target_off & 0xFF) as u8]);
-    m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-    m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-    m.extend_from_slice(&16u16.to_be_bytes());
-    m.extend_from_slice(&addr.octets());
-    m
+    MsgBuilder::new()
+        .ptr(subtype, instance)
+        .srv(instance, port, target)
+        .txt(instance, txt)
+        .aaaa_ptr_srv_target(addr)
+        .finish()
 }
 
 /// class を指定できる AAAA 単独メッセージ（cache-flush ビット検証用）。
 pub(super) fn synth_aaaa_class(name: &str, ttl: u32, addr: Ipv6Addr, class: u16) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(&[0, 0, 0x84, 0x00]); // id 0, QR|AA
-    m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]); // qd 0, an 1
-    push_name(&mut m, name);
-    m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
-    m.extend_from_slice(&class.to_be_bytes());
-    m.extend_from_slice(&ttl.to_be_bytes());
-    m.extend_from_slice(&16u16.to_be_bytes());
-    m.extend_from_slice(&addr.octets());
-    m
+    MsgBuilder::new()
+        .aaaa_class(name, ttl, addr, class)
+        .finish()
 }

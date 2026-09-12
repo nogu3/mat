@@ -380,28 +380,31 @@ fn parse_elements(elements: &[u8]) -> Result<(Vec<u8>, [u8; 32]), AttestationErr
 
     let mut cd: Option<Vec<u8>> = None;
     let mut nonce: Option<[u8; 32]> = None;
-    let mut depth = 0usize; // 深さ 0 = AttestationElements 直下
     loop {
         let el = r
             .next()
             .map_err(|_| AttestationError::Elements("tlv parse error"))?
             .ok_or(AttestationError::Elements("truncated elements"))?;
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
+            (_, Value::ContainerEnd) => break,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                // vendor-reserved のネストは丸ごと読み飛ばす（中の Context(2) を
+                // nonce と誤認しない）。
+                crate::tlv::skip_container(&mut r).map_err(|e| match e {
+                    crate::tlv::TlvError::Truncated => {
+                        AttestationError::Elements("truncated elements")
+                    }
+                    _ => AttestationError::Elements("tlv parse error"),
+                })?;
             }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => depth += 1,
-            (Tag::Context(1), Value::Bytes(b)) if depth == 0 => cd = Some(b.to_vec()),
-            (Tag::Context(2), Value::Bytes(b)) if depth == 0 => {
+            (Tag::Context(1), Value::Bytes(b)) => cd = Some(b.to_vec()),
+            (Tag::Context(2), Value::Bytes(b)) => {
                 nonce = Some(
                     b.try_into()
                         .map_err(|_| AttestationError::Elements("nonce wrong length"))?,
                 );
             }
-            _ => {} // timestamp / firmware_information / ネスト内要素は素通り
+            _ => {} // timestamp / firmware_information は素通り
         }
     }
 
@@ -474,7 +477,7 @@ fn verify_cd_signature_warn(signer_info: &Option<CdSignerInfo>, cd_signer_ders: 
         );
         return;
     };
-    let Ok(raw_sig) = der_ecdsa_sig_to_raw64(&signer_info.signature) else {
+    let Ok(raw_sig) = crate::x509::parse_ecdsa_der_signature(&signer_info.signature) else {
         tracing::warn!("certification declaration signature encoding unparseable — continuing");
         return;
     };
@@ -569,9 +572,6 @@ fn parse_cms_signed_data(der: &[u8]) -> Result<(Vec<u8>, Option<CdSignerInfo>), 
     Ok((cd_tlv, signer_info))
 }
 
-/// CMS messageDigest 属性 OID 1.2.840.113549.1.9.4（内容バイト）。
-const OID_CMS_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
-
 /// signedAttrs（[0] の中身 = SET OF Attribute の要素列）から messageDigest
 /// 属性を探し、`SHA-256(econtent)` と一致することを確認する（CMS §5.4:
 /// signedAttrs 使用時は messageDigest が eContent を署名に結合する。これが
@@ -584,7 +584,7 @@ fn verify_message_digest_attr(attrs: &[u8], econtent: &[u8]) -> Result<(), &'sta
         let oid = ar
             .expect(0x06)
             .map_err(|_| "bad signedAttrs attribute oid")?;
-        if oid != OID_CMS_MESSAGE_DIGEST {
+        if oid != crate::asn1::oids::CMS_MESSAGE_DIGEST {
             continue;
         }
         let vals = ar.expect(0x31).map_err(|_| "bad messageDigest value set")?;
@@ -632,32 +632,6 @@ fn parse_signer_info(content: &[u8], econtent: &[u8]) -> Result<CdSignerInfo, &'
         signed_bytes,
         signature: sig_bytes.to_vec(),
     })
-}
-
-/// DER `SEQ { r INTEGER, s INTEGER }` を raw r‖s（32B 左ゼロ詰め x2 = 64B）に
-/// 正規化する（x509.rs の同名ロジックの CMS 版 — signature フィールドは
-/// BIT STRING ではなく OCTET STRING の中身がそのまま DER SEQ）。
-fn der_ecdsa_sig_to_raw64(der: &[u8]) -> Result<[u8; 64], &'static str> {
-    let mut r = DerReader::new(der);
-    let seq = r.expect(0x30).map_err(|_| "signature not a der sequence")?;
-    let mut inner = DerReader::new(seq);
-    let r_bytes = inner.expect(0x02).map_err(|_| "signature missing r")?;
-    let s_bytes = inner.expect(0x02).map_err(|_| "signature missing s")?;
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&int_to_32(r_bytes)?);
-    out[32..].copy_from_slice(&int_to_32(s_bytes)?);
-    Ok(out)
-}
-
-/// DER INTEGER の中身（符号バイト付き・可変長）を 32B 左ゼロ詰め固定長にする。
-fn int_to_32(b: &[u8]) -> Result<[u8; 32], &'static str> {
-    let b = if b.len() > 1 && b[0] == 0 { &b[1..] } else { b };
-    if b.is_empty() || b.len() > 32 {
-        return Err("integer out of range");
-    }
-    let mut out = [0u8; 32];
-    out[32 - b.len()..].copy_from_slice(b);
-    Ok(out)
 }
 
 /// CD TLV `struct { 1: format_version, 2: vendor_id UINT, 3:
@@ -708,6 +682,7 @@ fn parse_cd_vid_pid(cd_tlv: &[u8]) -> Result<(Option<u16>, Vec<u16>), &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asn1::{self, oids};
     use crate::case::random_p256_secret;
     use crate::crypto::sign_ecdsa_p256;
     use crate::tlv::{Tag, Writer};
@@ -762,10 +737,31 @@ mod tests {
         encode_attestation_elements(b"fake-cd", nonce, 0)
     }
 
-    fn sign(fix: &Fixture, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
+    /// `elements ‖ challenge` に DAC 鍵で署名する。
+    fn sign_with(dac_key: &p256::SecretKey, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
         let msg = attestation_tbs(elements, challenge);
-        let priv_bytes: [u8; 32] = fix.dac_key.to_bytes().into();
+        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
         sign_ecdsa_p256(&priv_bytes, &msg).unwrap()
+    }
+
+    fn sign(fix: &Fixture, elements: &[u8], challenge: &[u8; 16]) -> [u8; 64] {
+        sign_with(&fix.dac_key, elements, challenge)
+    }
+
+    /// 固定 nonce / challenge / 偽 CD で `verify_device_attestation` を呼ぶ。
+    /// `rejects_*` 系（チェーン制約の分岐だけを踏ませたいテスト）の共通足場。
+    fn verify_chain(
+        dac: &[u8],
+        pai: &[u8],
+        paa: &[u8],
+        dac_key: &p256::SecretKey,
+    ) -> Result<(), AttestationError> {
+        let nonce = [5u8; 32];
+        let challenge = [6u8; 16];
+        let el = elements(&nonce);
+        let sig = sign_with(dac_key, &el, &challenge);
+        let paa_ders = [paa.to_vec()];
+        verify_device_attestation(dac, pai, &paa_ders, &[], &el, &sig, &nonce, &challenge)
     }
 
     #[test]
@@ -886,24 +882,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac/pai vid mismatch")
@@ -942,24 +921,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &fake_pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &fake_pai, &paa, &dac_key).unwrap_err();
         // メッセージまで固定: 手前のチェック（issuer/subject 照合など）で
         // 落ちて分岐がマスクされる退行を検出できるように。
         assert!(matches!(
@@ -999,24 +961,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac must not be a ca certificate")
@@ -1047,24 +992,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("paa is not a ca certificate")
@@ -1136,24 +1064,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("pai keyusage missing keycertsign")
@@ -1192,24 +1103,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("paa keyusage missing keycertsign")
@@ -1241,24 +1135,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             Some(0x0021), // digitalSignature|keyCertSign
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("dac keyusage must not sign certificates")
@@ -1290,24 +1167,7 @@ mod tests {
             Some((0xFFF1, 0x8001)),
             None, // keyUsage 拡張なし
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap();
+        verify_chain(&dac, &pai, &paa, &dac_key).unwrap();
     }
 
     // --- Task 3: VID スコープ PAA / DAC PID 必須 ---
@@ -1347,24 +1207,7 @@ mod tests {
             false,
             Some((0xFFF1, 0x8001)),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(
             err,
             AttestationError::Chain("vid-scoped paa/pai vid mismatch")
@@ -1398,24 +1241,7 @@ mod tests {
             None,
             Some(0x0001),
         );
-        let nonce = [5u8; 32];
-        let challenge = [6u8; 16];
-        let el = elements(&nonce);
-        let priv_bytes: [u8; 32] = dac_key.to_bytes().into();
-        let mut msg = el.clone();
-        msg.extend_from_slice(&challenge);
-        let sig = sign_ecdsa_p256(&priv_bytes, &msg).unwrap();
-        let err = verify_device_attestation(
-            &dac,
-            &pai,
-            std::slice::from_ref(&paa),
-            &[],
-            &el,
-            &sig,
-            &nonce,
-            &challenge,
-        )
-        .unwrap_err();
+        let err = verify_chain(&dac, &pai, &paa, &dac_key).unwrap_err();
         assert!(matches!(err, AttestationError::Chain("dac missing pid")));
     }
 
@@ -1445,20 +1271,15 @@ mod tests {
     /// SignerInfo DER を合成する（version=3, sid=SKID 風ダミー, digestAlg,
     /// signedAttrs（呼び出し側指定）, sigAlg, signature）。
     fn make_signer_info(signed_attrs: Option<&[u8]>) -> Vec<u8> {
-        use crate::asn1;
         let mut parts: Vec<Vec<u8>> = vec![
             asn1::integer(&[3]),
             asn1::octet_string(b"sid-dummy"), // SignerIdentifier（CHOICE、中身は読まれない）
-            asn1::seq(&[&asn1::oid(&[
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ])]), // sha256
+            asn1::seq(&[&asn1::oid(oids::SHA256)]),
         ];
         if let Some(attrs) = signed_attrs {
             parts.push(asn1::context_constructed(0, attrs));
         }
-        parts.push(asn1::seq(&[&asn1::oid(&[
-            0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,
-        ])])); // ecdsa-sha256
+        parts.push(asn1::seq(&[&asn1::oid(oids::ECDSA_WITH_SHA256)]));
         parts.push(asn1::octet_string(&[0u8; 8])); // signature（形だけ）
         let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         // parse_signer_info は SEQ の**中身**を受け取る（呼び出し側で expect(0x30) 済み）
@@ -1467,9 +1288,8 @@ mod tests {
 
     /// messageDigest 属性 1 つだけの signedAttrs 内容（[0] の中身）を合成する。
     fn message_digest_attr(digest: &[u8]) -> Vec<u8> {
-        use crate::asn1;
         asn1::seq(&[
-            &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04]), // 1.2.840.113549.1.9.4
+            &asn1::oid(oids::CMS_MESSAGE_DIGEST),
             &asn1::set_of(&[&asn1::octet_string(digest)]),
         ])
     }
@@ -1522,7 +1342,6 @@ mod tests {
 
     #[test]
     fn signer_info_rejects_missing_message_digest() {
-        use crate::asn1;
         // signedAttrs はあるが messageDigest 属性が無い（contentType だけ）
         let attrs = asn1::seq(&[
             &asn1::oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03]),
