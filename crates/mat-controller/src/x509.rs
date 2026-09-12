@@ -411,7 +411,7 @@ pub(crate) fn parse_ecdsa_der_signature(der: &[u8]) -> Result<[u8; 64], X509Erro
 }
 
 /// DER INTEGER の中身（符号バイト付き・可変長）を 32B 左ゼロ詰め固定長にする。
-pub(crate) fn int_to_32(b: &[u8]) -> Result<[u8; 32], X509Error> {
+fn int_to_32(b: &[u8]) -> Result<[u8; 32], X509Error> {
     let b = if b.len() > 1 && b[0] == 0 { &b[1..] } else { b };
     if b.is_empty() || b.len() > 32 {
         return Err(X509Error::Der("integer out of range"));
