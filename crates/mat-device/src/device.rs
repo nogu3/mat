@@ -245,6 +245,320 @@ pub struct Device {
     endpoint_by_device: HashMap<String, u16>,
 }
 
+/// Phase 1 of `Device::new`: builds the dev attestation chain and persists
+/// the PAA DER to `<store_dir>/paa/paa.der`.
+fn build_attestation(config: &DeviceConfig) -> Result<x509::DevAttestation, DeviceError> {
+    // CD（Certification Declaration）の vendor_id/product_id はここの
+    // `config.vendor_id`/`config.product_id` と一致させる（コミッショナ
+    // が CD の vendor_id/product_id を Basic Information と突き合わせる
+    // ため）。`device_type_id` は CD 側では matter.js の正典値に固定
+    // されている（`mat_controller::cd::DEVICE_TYPE_ID_IN_CD` の doc
+    // 参照 — CD の突き合わせ対象ではないため、この node がアプリ
+    // endpoint 1 に載せている device type と揃える意味が無くなった）。
+    //
+    // Task 10: `ChipTest` mode bypasses this entirely in favor of the
+    // vendored canonical chain (fixed VID FFF1/PID 8000 — matv.toml's
+    // vendor_id/product_id must match for the CD's baked-in VID/PID to
+    // line up with Basic Information; see chip_test_attestation's
+    // module doc).
+    let dev = match config.attestation {
+        AttestationMode::Self_ => {
+            x509::generate_dev_attestation(config.vendor_id, config.product_id)
+                .map_err(DeviceError::Attestation)?
+        }
+        AttestationMode::ChipTest => crate::chip_test_attestation::dev_attestation(),
+    };
+    let paa_dir = config.store_dir.join("paa");
+    std::fs::create_dir_all(&paa_dir).map_err(DeviceError::Io)?;
+    std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;
+    Ok(dev)
+}
+
+/// The three per-device stores shared between `CommissioningServer` (which
+/// writes them on AddNOC / RemoveFabric / fail-safe rollback) and the EP0
+/// cluster handlers (which read/write them) — see `build_shared_stores`'s
+/// doc comments for the wiring each field carries.
+struct SharedStores {
+    acl: crate::core::access_control::AclStore,
+    gk: crate::core::group_key_management::GroupKeyStore,
+    membership: crate::core::group_membership::GroupMembershipStore,
+}
+
+/// Phase 2 of `Device::new`: builds the AccessControl / GroupKeyManagement /
+/// Groups shared stores and wires each into `comm_server`.
+fn build_shared_stores(
+    config: &DeviceConfig,
+    comm_server: &mut CommissioningServer,
+) -> SharedStores {
+    // AccessControl（spec §11.1）の共有ストア: AddNOC の自動 admin
+    // エントリ / RemoveFabric・fail-safe rollback の purge は
+    // `CommissioningServer` が書き、EP0 の `AccessControlHandler` が
+    // 読み書きする — `set_acl_store` は `into_cluster_handlers` より
+    // 前に呼ぶ必要がある（後続のコミッショニングコマンドがこのストア
+    // を触れるようにするため）。永続化は `<store_dir>/acl.json`
+    // （`FabricStore`と同じ「ディレクトリを渡して file-backed persist
+    // を注入する」配線）。
+    let acl_store = crate::core::access_control::AclStore::with_persist(Box::new(
+        crate::net::store::acl_store_in_dir(&config.store_dir),
+    ));
+    comm_server.set_acl_store(acl_store.clone());
+
+    // GroupKeyManagement（spec §11.2）の共有ストア: `AclStore` と同じ
+    // 「RemoveFabric・fail-safe rollback の purge は
+    // `CommissioningServer` が書き、EP0 のクラスタハンドラが読み書き
+    // する」配線（`set_acl_store`の doc 参照）。`<store_dir>/
+    // group_keys.json` に永続化（`AclStore` と同じ file-backed persist
+    // 注入）。
+    let gk_store = crate::core::group_key_management::GroupKeyStore::with_persist(Box::new(
+        crate::net::store::group_key_store_in_dir(&config.store_dir),
+    ));
+    comm_server.set_group_key_store(gk_store.clone());
+
+    // Groups（spec §1.3）の共有 membership 帳簿: 全 bridged endpoint の
+    // `GroupsHandler` がこの 1 つの store に委譲する（同じ group への
+    // AddGroup が endpoint 横断で見える — groupcast のディスパッチ先を
+    // 引くのに使う）。`RemoveFabric`・fail-safe rollback の purge も
+    // `AclStore`/`GroupKeyStore` と同じ配線。永続化は `<store_dir>/
+    // groups.json`。
+    let membership = crate::core::group_membership::GroupMembershipStore::with_persist(Box::new(
+        crate::net::store::group_membership_in_dir(&config.store_dir),
+    ));
+    comm_server.set_group_membership_store(membership.clone());
+
+    SharedStores {
+        acl: acl_store,
+        gk: gk_store,
+        membership,
+    }
+}
+
+/// Phase 3 of `Device::new`: builds the root `Node` (EP0 basic info + data
+/// version seed + ACL enforcement + the 7 root-endpoint cluster handlers).
+fn build_root_node(
+    config: &DeviceConfig,
+    comm_server: &CommissioningServer,
+    stores: &SharedStores,
+    unique_id: &str,
+) -> Result<Node, DeviceError> {
+    // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
+    // 保存値（無ければ spec default の ("", "XX")）を初期値として渡し、
+    // 以降の write は `basic_info_in_dir` へ save される
+    // （`FabricStore`/`AclStore` と同じ「ディレクトリを渡して
+    // file-backed persist を注入する」配線）。
+    let (node_label, location) = load_basic_info(&config.store_dir);
+    let mut node = Node::with_root_endpoint_persisted(
+        config.vendor_id,
+        config.product_id,
+        unique_id,
+        node_label,
+        location,
+        Box::new(basic_info_in_dir(&config.store_dir)),
+    );
+    // DataVersion のブート時乱数初期化 (spec §7.10.3) — `core` は乱数源
+    // を持ち込まないので、`getrandom` はここ（呼び出し側）で引いて
+    // `Node` に渡す。node 単位の共通 base で十分（`set_data_version_
+    // base`のdoc参照）: 目的は前ブートのキャッシュ済み DataVersion との
+    // 偶然一致の排除であり、クラスタごとに独立させる必要はない。
+    let mut version_seed = [0u8; 4];
+    getrandom::fill(&mut version_seed)
+        .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
+    node.set_data_version_base(u32::from_le_bytes(version_seed));
+    // ACL enforcement (spec §9.10) を有効化する唯一の呼び出し —
+    // `Node::set_acl_store` を呼ばない `Node`（テストが組む素の Node）は
+    // 全許可のまま（`Node::acl`の doc 参照）。クラスタ登録より前に
+    // 置く必要は無いが、「この Node は enforcement する」という宣言を
+    // 組み立ての先頭にまとめておく。
+    node.set_acl_store(stores.acl.clone());
+    let (general_commissioning, operational_credentials, admin_commissioning) =
+        comm_server.into_cluster_handlers();
+    node.add_cluster(0, general_commissioning);
+    node.add_cluster(0, operational_credentials);
+    node.add_cluster(0, admin_commissioning);
+    node.add_cluster(
+        0,
+        Box::new(crate::core::access_control::AccessControlHandler::new(
+            stores.acl.clone(),
+        )),
+    );
+
+    // NetworkCommissioning / GeneralDiagnostics / GroupKeyManagement
+    // (Task 4): RootNode デバイスタイプの必須クラスタ（Device Library
+    // §9.2.2）— AccessControl と同じ「Apple Home の commissioning 直後
+    // interview 対策」。`config.iface` を唯一の "network"/interface 名
+    // としてそのまま渡す（mDNS が同じ interface で egress する実体と
+    // 一致させる）。
+    node.add_cluster(
+        0,
+        Box::new(
+            crate::core::network_commissioning::NetworkCommissioningHandler::new(&config.iface),
+        ),
+    );
+    node.add_cluster(
+        0,
+        Box::new(crate::core::general_diagnostics::GeneralDiagnosticsHandler::new(&config.iface)),
+    );
+    node.add_cluster(
+        0,
+        Box::new(
+            crate::core::group_key_management::GroupKeyManagementHandler::new(
+                stores.gk.clone(),
+                stores.membership.clone(),
+            ),
+        ),
+    );
+
+    Ok(node)
+}
+
+/// The bridge-side outputs of `build_bridge`: `Device::states` (kept for a
+/// future consumer, see that field's doc) and `Device::endpoint_by_device`
+/// (stimulus destination lookup).
+struct BridgeLayout {
+    states: Vec<(String, crate::core::bridge::BridgedState)>,
+    endpoint_by_device: HashMap<String, u16>,
+}
+
+/// Phase 4 of `Device::new`: assigns/persists bridged endpoint numbers,
+/// prunes stale group membership, then registers EP1 (Aggregator) and every
+/// bridged endpoint, and seeds the event log last (it must stay after every
+/// endpoint touches `node`).
+fn build_bridge(
+    config: &DeviceConfig,
+    node: &mut Node,
+    membership: &crate::core::group_membership::GroupMembershipStore,
+    unique_id: &str,
+) -> Result<BridgeLayout, DeviceError> {
+    // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
+    // 設定ファイルの `[[device]]` 1 件ずつに対応する bridged endpoint。
+    // M2 までの「EP1 に OnOff Light 直付け」は廃止 — matv は純粋な
+    // bridge になった。
+    //
+    // 採番はまず全 device 分を宣言順に台帳から引き当ててから 1 回だけ
+    // save する（device ごとに save すると途中で失敗したときに台帳と
+    // 実際に生えた endpoint が食い違う）。台帳は既知 id に同じ endpoint
+    // を返し続けるので、設定の増減を跨いで endpoint が安定する。
+    let mut ledger = crate::net::endpoint_ledger::EndpointLedger::load(&config.store_dir)
+        .map_err(DeviceError::Io)?;
+    let bridged_eps: Vec<u16> = config
+        .devices
+        .iter()
+        .map(|d| ledger.assign(&d.id))
+        .collect();
+    ledger.save().map_err(DeviceError::Io)?;
+
+    // 設定から外した `[[device]]` の membership 残骸を掃除する。台帳は
+    // tombstone で endpoint を保持する（再追加で同じ endpoint が戻る）が、
+    // membership は戻さない — 存在しない endpoint を GroupTable / multicast
+    // join / group dispatch に晒さない方を優先する（再追加後は
+    // `mat group provision` で登録し直す）。
+    let pruned = membership.retain_endpoints(&bridged_eps);
+    if pruned > 0 {
+        tracing::info!(
+            removed = pruned,
+            "group membership: pruned rows for endpoints no longer in config"
+        );
+    }
+
+    // EP1 は bridged endpoint 群より先に登録する — EP0 の PartsList は
+    // `Node` が登録順に registry から導出するので、この順序がそのまま
+    // `[1, 2, 3, ...]` という昇順の composition tree になる。
+    node.add_endpoint(
+        1,
+        vec![Box::new(
+            DescriptorHandler::for_device(mat_controller::im::DEVICE_TYPE_AGGREGATOR)
+                .with_parts(bridged_eps.clone()),
+        )],
+    );
+
+    let mut states = Vec::with_capacity(config.devices.len());
+    for (device, endpoint) in config.devices.iter().zip(&bridged_eps) {
+        let built = crate::core::bridge::build_bridged_endpoint(
+            device.kind,
+            &device.name,
+            &bridged_unique_id(unique_id, &device.id),
+            *endpoint,
+            membership,
+        );
+        node.add_endpoint(*endpoint, built.clusters);
+        states.push((device.id.clone(), built.state));
+    }
+
+    // 刺激（`net::stimulus`）の宛先解決表: 設定の `id` → 台帳が
+    // 採番した endpoint。`states` と同じ zip なので順序も対応する。
+    let endpoint_by_device: HashMap<String, u16> = config
+        .devices
+        .iter()
+        .map(|d| d.id.clone())
+        .zip(bridged_eps.iter().copied())
+        .collect();
+
+    // イベントの採番はブート毎に「今の壁時計（ms）」から始める
+    // （`Node::set_event_log` の doc — 前回ブートの EventMin を
+    // 抱えた購読者が今回のイベントを黙って飲み込まないため）。
+    // 時計が UNIX epoch より前を指す異常系は 1 に落とす（0 は
+    // 「まだ 1 件も無い」を表す EventMin と紛れないよう避ける）。
+    let first_event_number = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+    node.set_event_log(EventLog::new(first_event_number, EventLog::DEFAULT_CAP));
+
+    Ok(BridgeLayout {
+        states,
+        endpoint_by_device,
+    })
+}
+
+/// Phase 5 of `Device::new`: binds the unicast UDP transport and the
+/// (best-effort) groupcast receive socket.
+fn bind_sockets(
+    config: &DeviceConfig,
+    stores: &SharedStores,
+) -> Result<(Arc<Transport>, SocketAddr, crate::net::group_rx::GroupRx), DeviceError> {
+    let bind_addr: SocketAddr = format!("[::]:{}", config.port)
+        .parse()
+        .expect("well-formed IPv6 wildcard address");
+    let std_socket = std::net::UdpSocket::bind(bind_addr).map_err(DeviceError::Io)?;
+    let udp = UdpTransport::from_std(std_socket).map_err(DeviceError::Io)?;
+    let local_addr = udp.local_addr().map_err(DeviceError::Io)?;
+    let transport = Arc::new(Transport::Udp(Arc::new(udp)));
+
+    let iface_index = mat_controller::dnssd::iface_index(&config.iface).unwrap_or_else(|e| {
+        tracing::warn!(iface = %config.iface, error = %e, "groupcast: interface index unknown; joining on the kernel default");
+        0
+    });
+    // `port == group_port` (both nonzero) would make the group bind
+    // race the unicast one for the exact same `[::]:port` — and giving
+    // the *unicast* socket SO_REUSEPORT to dodge that is not a fix
+    // (`DeviceConfig::group_port`'s doc): the kernel would then be free
+    // to hash some unicast (CASE/IM) traffic onto the group socket
+    // instead. So this is refused up front rather than attempting the
+    // bind and letting it fail with a bare `EADDRINUSE`.
+    let group_socket = if config.port != 0 && config.port == config.group_port {
+        tracing::warn!(
+            port = config.port,
+            group_port = config.group_port,
+            "unicast port equals group_port; groupcast disabled — set port to 0 or another value"
+        );
+        None
+    } else {
+        match crate::net::group_rx::GroupSocket::bind(config.group_port, iface_index) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
+                None
+            }
+        }
+    };
+    let group = crate::net::group_rx::GroupRx {
+        socket: group_socket,
+        gk_store: stores.gk.clone(),
+        membership: stores.membership.clone(),
+    };
+
+    Ok((transport, local_addr, group))
+}
+
 impl Device {
     /// Builds a device: generates a fresh dev DAC/PAI/PAA attestation chain
     /// (spec-irrelevant after commissioning completes — see
@@ -261,257 +575,21 @@ impl Device {
     /// `tokio::net::UdpSocket::from_std` itself).
     pub fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
         std::fs::create_dir_all(&config.store_dir).map_err(DeviceError::Io)?;
-
-        // CD（Certification Declaration）の vendor_id/product_id はここの
-        // `config.vendor_id`/`config.product_id` と一致させる（コミッショナ
-        // が CD の vendor_id/product_id を Basic Information と突き合わせる
-        // ため）。`device_type_id` は CD 側では matter.js の正典値に固定
-        // されている（`mat_controller::cd::DEVICE_TYPE_ID_IN_CD` の doc
-        // 参照 — CD の突き合わせ対象ではないため、この node がアプリ
-        // endpoint 1 に載せている device type と揃える意味が無くなった）。
-        //
-        // Task 10: `ChipTest` mode bypasses this entirely in favor of the
-        // vendored canonical chain (fixed VID FFF1/PID 8000 — matv.toml's
-        // vendor_id/product_id must match for the CD's baked-in VID/PID to
-        // line up with Basic Information; see chip_test_attestation's
-        // module doc).
-        let dev = match config.attestation {
-            AttestationMode::Self_ => {
-                x509::generate_dev_attestation(config.vendor_id, config.product_id)
-                    .map_err(DeviceError::Attestation)?
-            }
-            AttestationMode::ChipTest => crate::chip_test_attestation::dev_attestation(),
-        };
-        let paa_dir = config.store_dir.join("paa");
-        std::fs::create_dir_all(&paa_dir).map_err(DeviceError::Io)?;
-        std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;
+        let dev = build_attestation(&config)?;
 
         let fabric_store = FabricStore::with_persist(Box::new(store_in_dir(&config.store_dir)));
         let mut comm_server = CommissioningServer::new(dev, fabric_store);
-
-        // AccessControl（spec §11.1）の共有ストア: AddNOC の自動 admin
-        // エントリ / RemoveFabric・fail-safe rollback の purge は
-        // `CommissioningServer` が書き、EP0 の `AccessControlHandler` が
-        // 読み書きする — `set_acl_store` は `into_cluster_handlers` より
-        // 前に呼ぶ必要がある（後続のコミッショニングコマンドがこのストア
-        // を触れるようにするため）。永続化は `<store_dir>/acl.json`
-        // （`FabricStore`と同じ「ディレクトリを渡して file-backed persist
-        // を注入する」配線）。
-        let acl_store = crate::core::access_control::AclStore::with_persist(Box::new(
-            crate::net::store::acl_store_in_dir(&config.store_dir),
-        ));
-        comm_server.set_acl_store(acl_store.clone());
-
-        // GroupKeyManagement（spec §11.2）の共有ストア: `AclStore` と同じ
-        // 「RemoveFabric・fail-safe rollback の purge は
-        // `CommissioningServer` が書き、EP0 のクラスタハンドラが読み書き
-        // する」配線（`set_acl_store`の doc 参照）。`<store_dir>/
-        // group_keys.json` に永続化（`AclStore` と同じ file-backed persist
-        // 注入）。
-        let gk_store = crate::core::group_key_management::GroupKeyStore::with_persist(Box::new(
-            crate::net::store::group_key_store_in_dir(&config.store_dir),
-        ));
-        comm_server.set_group_key_store(gk_store.clone());
-
-        // Groups（spec §1.3）の共有 membership 帳簿: 全 bridged endpoint の
-        // `GroupsHandler` がこの 1 つの store に委譲する（同じ group への
-        // AddGroup が endpoint 横断で見える — groupcast のディスパッチ先を
-        // 引くのに使う）。`RemoveFabric`・fail-safe rollback の purge も
-        // `AclStore`/`GroupKeyStore` と同じ配線。永続化は `<store_dir>/
-        // groups.json`。
-        let membership =
-            crate::core::group_membership::GroupMembershipStore::with_persist(Box::new(
-                crate::net::store::group_membership_in_dir(&config.store_dir),
-            ));
-        comm_server.set_group_membership_store(membership.clone());
+        let stores = build_shared_stores(&config, &mut comm_server);
 
         let unique_id = load_or_create_unique_id(&config.store_dir).map_err(DeviceError::Io)?;
-        // NodeLabel/Location (spec §11.1.6.2/§11.1.6.6) の永続化 — 前回
-        // 保存値（無ければ spec default の ("", "XX")）を初期値として渡し、
-        // 以降の write は `basic_info_in_dir` へ save される
-        // （`FabricStore`/`AclStore` と同じ「ディレクトリを渡して
-        // file-backed persist を注入する」配線）。
-        let (node_label, location) = load_basic_info(&config.store_dir);
-        let mut node = Node::with_root_endpoint_persisted(
-            config.vendor_id,
-            config.product_id,
-            &unique_id,
-            node_label,
-            location,
-            Box::new(basic_info_in_dir(&config.store_dir)),
-        );
-        // DataVersion のブート時乱数初期化 (spec §7.10.3) — `core` は乱数源
-        // を持ち込まないので、`getrandom` はここ（呼び出し側）で引いて
-        // `Node` に渡す。node 単位の共通 base で十分（`set_data_version_
-        // base`のdoc参照）: 目的は前ブートのキャッシュ済み DataVersion との
-        // 偶然一致の排除であり、クラスタごとに独立させる必要はない。
-        let mut version_seed = [0u8; 4];
-        getrandom::fill(&mut version_seed)
-            .map_err(|e| DeviceError::Io(std::io::Error::other(format!("os rng: {e}"))))?;
-        node.set_data_version_base(u32::from_le_bytes(version_seed));
-        // ACL enforcement (spec §9.10) を有効化する唯一の呼び出し —
-        // `Node::set_acl_store` を呼ばない `Node`（テストが組む素の Node）は
-        // 全許可のまま（`Node::acl`の doc 参照）。クラスタ登録より前に
-        // 置く必要は無いが、「この Node は enforcement する」という宣言を
-        // 組み立ての先頭にまとめておく。
-        node.set_acl_store(acl_store.clone());
-        let (general_commissioning, operational_credentials, admin_commissioning) =
-            comm_server.into_cluster_handlers();
-        node.add_cluster(0, general_commissioning);
-        node.add_cluster(0, operational_credentials);
-        node.add_cluster(0, admin_commissioning);
-        node.add_cluster(
-            0,
-            Box::new(crate::core::access_control::AccessControlHandler::new(
-                acl_store,
-            )),
-        );
-
-        // NetworkCommissioning / GeneralDiagnostics / GroupKeyManagement
-        // (Task 4): RootNode デバイスタイプの必須クラスタ（Device Library
-        // §9.2.2）— AccessControl と同じ「Apple Home の commissioning 直後
-        // interview 対策」。`config.iface` を唯一の "network"/interface 名
-        // としてそのまま渡す（mDNS が同じ interface で egress する実体と
-        // 一致させる）。
-        node.add_cluster(
-            0,
-            Box::new(
-                crate::core::network_commissioning::NetworkCommissioningHandler::new(&config.iface),
-            ),
-        );
-        node.add_cluster(
-            0,
-            Box::new(
-                crate::core::general_diagnostics::GeneralDiagnosticsHandler::new(&config.iface),
-            ),
-        );
-        node.add_cluster(
-            0,
-            Box::new(
-                crate::core::group_key_management::GroupKeyManagementHandler::new(
-                    gk_store.clone(),
-                    membership.clone(),
-                ),
-            ),
-        );
-
-        // M3: endpoint 1 = Aggregator (spec §9.12)、その配下 EP2.. が
-        // 設定ファイルの `[[device]]` 1 件ずつに対応する bridged endpoint。
-        // M2 までの「EP1 に OnOff Light 直付け」は廃止 — matv は純粋な
-        // bridge になった。
-        //
-        // 採番はまず全 device 分を宣言順に台帳から引き当ててから 1 回だけ
-        // save する（device ごとに save すると途中で失敗したときに台帳と
-        // 実際に生えた endpoint が食い違う）。台帳は既知 id に同じ endpoint
-        // を返し続けるので、設定の増減を跨いで endpoint が安定する。
-        let mut ledger = crate::net::endpoint_ledger::EndpointLedger::load(&config.store_dir)
-            .map_err(DeviceError::Io)?;
-        let bridged_eps: Vec<u16> = config
-            .devices
-            .iter()
-            .map(|d| ledger.assign(&d.id))
-            .collect();
-        ledger.save().map_err(DeviceError::Io)?;
-
-        // 設定から外した `[[device]]` の membership 残骸を掃除する。台帳は
-        // tombstone で endpoint を保持する（再追加で同じ endpoint が戻る）が、
-        // membership は戻さない — 存在しない endpoint を GroupTable / multicast
-        // join / group dispatch に晒さない方を優先する（再追加後は
-        // `mat group provision` で登録し直す）。
-        let pruned = membership.retain_endpoints(&bridged_eps);
-        if pruned > 0 {
-            tracing::info!(
-                removed = pruned,
-                "group membership: pruned rows for endpoints no longer in config"
-            );
-        }
-
-        // EP1 は bridged endpoint 群より先に登録する — EP0 の PartsList は
-        // `Node` が登録順に registry から導出するので、この順序がそのまま
-        // `[1, 2, 3, ...]` という昇順の composition tree になる。
-        node.add_endpoint(
-            1,
-            vec![Box::new(
-                DescriptorHandler::for_device(mat_controller::im::DEVICE_TYPE_AGGREGATOR)
-                    .with_parts(bridged_eps.clone()),
-            )],
-        );
-
-        let mut states = Vec::with_capacity(config.devices.len());
-        for (device, endpoint) in config.devices.iter().zip(&bridged_eps) {
-            let built = crate::core::bridge::build_bridged_endpoint(
-                device.kind,
-                &device.name,
-                &bridged_unique_id(&unique_id, &device.id),
-                *endpoint,
-                &membership,
-            );
-            node.add_endpoint(*endpoint, built.clusters);
-            states.push((device.id.clone(), built.state));
-        }
-
-        // 刺激（`net::stimulus`）の宛先解決表: 設定の `id` → 台帳が
-        // 採番した endpoint。`states` と同じ zip なので順序も対応する。
-        let endpoint_by_device: HashMap<String, u16> = config
-            .devices
-            .iter()
-            .map(|d| d.id.clone())
-            .zip(bridged_eps.iter().copied())
-            .collect();
-
-        // イベントの採番はブート毎に「今の壁時計（ms）」から始める
-        // （`Node::set_event_log` の doc — 前回ブートの EventMin を
-        // 抱えた購読者が今回のイベントを黙って飲み込まないため）。
-        // 時計が UNIX epoch より前を指す異常系は 1 に落とす（0 は
-        // 「まだ 1 件も無い」を表す EventMin と紛れないよう避ける）。
-        let first_event_number = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
-        node.set_event_log(EventLog::new(first_event_number, EventLog::DEFAULT_CAP));
+        let mut node = build_root_node(&config, &comm_server, &stores, &unique_id)?;
+        let BridgeLayout {
+            states,
+            endpoint_by_device,
+        } = build_bridge(&config, &mut node, &stores.membership, &unique_id)?;
 
         let (stimulus_handle, stimuli) = StimulusHandle::channel(STIMULUS_CHANNEL_CAPACITY);
-
-        let bind_addr: SocketAddr = format!("[::]:{}", config.port)
-            .parse()
-            .expect("well-formed IPv6 wildcard address");
-        let std_socket = std::net::UdpSocket::bind(bind_addr).map_err(DeviceError::Io)?;
-        let udp = UdpTransport::from_std(std_socket).map_err(DeviceError::Io)?;
-        let local_addr = udp.local_addr().map_err(DeviceError::Io)?;
-        let transport = Arc::new(Transport::Udp(Arc::new(udp)));
-
-        let iface_index = mat_controller::dnssd::iface_index(&config.iface).unwrap_or_else(|e| {
-            tracing::warn!(iface = %config.iface, error = %e, "groupcast: interface index unknown; joining on the kernel default");
-            0
-        });
-        // `port == group_port` (both nonzero) would make the group bind
-        // race the unicast one for the exact same `[::]:port` — and giving
-        // the *unicast* socket SO_REUSEPORT to dodge that is not a fix
-        // (`DeviceConfig::group_port`'s doc): the kernel would then be free
-        // to hash some unicast (CASE/IM) traffic onto the group socket
-        // instead. So this is refused up front rather than attempting the
-        // bind and letting it fail with a bare `EADDRINUSE`.
-        let group_socket = if config.port != 0 && config.port == config.group_port {
-            tracing::warn!(
-                port = config.port,
-                group_port = config.group_port,
-                "unicast port equals group_port; groupcast disabled — set port to 0 or another value"
-            );
-            None
-        } else {
-            match crate::net::group_rx::GroupSocket::bind(config.group_port, iface_index) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::warn!(port = config.group_port, error = %e, "groupcast receive socket did not bind — device serves unicast only");
-                    None
-                }
-            }
-        };
-        let group = crate::net::group_rx::GroupRx {
-            socket: group_socket,
-            gk_store: gk_store.clone(),
-            membership: membership.clone(),
-        };
+        let (transport, local_addr, group) = bind_sockets(&config, &stores)?;
 
         Ok(Self {
             config,
