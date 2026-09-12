@@ -117,8 +117,7 @@ pub async fn provision(
     let Some(gs) = &engine.group_settings else {
         return Err(MatError::group_ctx_unconfigured());
     };
-    let epoch_key_hex = mat_core::group::resolve_epoch_key(p.epoch_key.as_deref())?;
-    let epoch_key = crate::ops::epoch_key_from_hex(&epoch_key_hex)?;
+    let epoch_key = mat_core::group::resolve_epoch_key_bytes(p.epoch_key.as_deref())?;
     crate::group_settings::write_group_provision(
         gs,
         p.group_id,

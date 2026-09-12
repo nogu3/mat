@@ -23,11 +23,17 @@ pub fn validate_epoch_key(key: &str) -> Result<String, MatError> {
     }
 }
 
-/// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す。
-pub fn generate_epoch_key() -> String {
+/// ランダムな 16 バイトの epoch key。
+pub fn generate_epoch_key_bytes() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed to fill epoch key");
-    crate::hex::encode_lower(&bytes)
+    bytes
+}
+
+/// ランダムな 16 バイトの epoch key を生成し 32桁 hex で返す（CLI 表示・
+/// ワイヤ用。バイト列が要る呼び手は [`generate_epoch_key_bytes`]）。
+pub fn generate_epoch_key() -> String {
+    crate::hex::encode_lower(&generate_epoch_key_bytes())
 }
 
 /// epoch key を決める: 明示指定があれば検証して採用、無ければランダム生成。
@@ -35,6 +41,19 @@ pub fn resolve_epoch_key(epoch_key: Option<&str>) -> Result<String, MatError> {
     match epoch_key {
         Some(k) => validate_epoch_key(k),
         None => Ok(generate_epoch_key()),
+    }
+}
+
+/// [`resolve_epoch_key`] のバイト列版。hex → bytes の往復を呼び手（provision /
+/// rotate-ipk）が各自やっていたのを一本化する。
+pub fn resolve_epoch_key_bytes(epoch_key: Option<&str>) -> Result<[u8; 16], MatError> {
+    match epoch_key {
+        Some(k) => {
+            let hex = validate_epoch_key(k)?;
+            let bytes = crate::hex::decode(&hex).expect("validated as 32 hex chars");
+            Ok(<[u8; 16]>::try_from(bytes).expect("32 hex chars = 16 bytes"))
+        }
+        None => Ok(generate_epoch_key_bytes()),
     }
 }
 
@@ -71,5 +90,39 @@ mod tests {
         assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
         // 2回生成して異なる（乱数であること）。
         assert_ne!(k, generate_epoch_key());
+    }
+
+    #[test]
+    fn generated_epoch_key_bytes_are_random_and_hex_form_matches() {
+        let a = generate_epoch_key_bytes();
+        let b = generate_epoch_key_bytes();
+        assert_ne!(a, b);
+        // string 版は bytes 版の小文字 hex（両 API の一致を釘打ち）。
+        let s = generate_epoch_key();
+        assert_eq!(s.len(), 32);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn resolve_epoch_key_bytes_decodes_explicit_key_and_normalizes_case() {
+        let k = resolve_epoch_key_bytes(Some("0x00112233445566778899AABBCCDDEEFF")).unwrap();
+        assert_eq!(
+            k,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
+        );
+        assert_eq!(
+            resolve_epoch_key_bytes(Some("dead")).unwrap_err().kind,
+            ErrorKind::Other
+        );
+        // None = 生成（2 回で異なる）。
+        assert_ne!(
+            resolve_epoch_key_bytes(None).unwrap(),
+            resolve_epoch_key_bytes(None).unwrap()
+        );
     }
 }

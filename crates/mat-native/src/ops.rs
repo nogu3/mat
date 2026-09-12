@@ -302,25 +302,6 @@ pub struct ProvisionNodeParams {
     pub epoch_key: [u8; 16],
 }
 
-/// `mat_core::group::resolve_epoch_key` が返す 32 桁 hex 文字列（16 バイト）を
-/// `[u8;16]` へ。呼び出し前提は「resolve_epoch_key が返した値そのもの」（検証
-/// 済み・小文字 32 桁）だが、形式が崩れていた場合は呼び出し側のバグとして
-/// `ParseError` を返す（panic させない）。
-pub fn epoch_key_from_hex(hex: &str) -> Result<[u8; 16], MatError> {
-    if hex.len() != 32 {
-        return Err(MatError::parse_error(format!(
-            "epoch key must be 32 hex chars (16 bytes), got {} chars",
-            hex.len()
-        )));
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| MatError::parse_error(format!("invalid epoch key hex: {hex}")))?;
-    }
-    Ok(out)
-}
-
 /// provision の 1 ステップに失敗した際、どのステップかを detail に残す
 /// （chip-tool 経路の `run_node_step` と同粒度 — `commands/group.rs` 参照）。
 fn provision_step_err(e: MatError, step: &str) -> MatError {
@@ -582,7 +563,7 @@ pub async fn remove_group_node(
             p.endpoint,
             CLUSTER_GROUPS,
             CMD_REMOVE_GROUP,
-            Some(encode_remove_group_fields(p.group_id)),
+            Some(encode_ctx0_u16(p.group_id)),
             false,
         )
         .await
@@ -642,7 +623,7 @@ pub async fn remove_group_node(
             0,
             CLUSTER_GROUP_KEY_MANAGEMENT,
             CMD_KEY_SET_REMOVE,
-            Some(encode_key_set_remove_fields(ks)),
+            Some(encode_ctx0_u16(ks)),
             false,
         )
         .await
@@ -657,20 +638,12 @@ pub async fn remove_group_node(
     })
 }
 
-/// RemoveGroup `{0: groupID}`。
-fn encode_remove_group_fields(group_id: u16) -> Vec<u8> {
+/// `{0: <u16>}` 形の CommandFields（RemoveGroup `{0: groupID}` / KeySetRemove
+/// `{0: groupKeySetID}` は同形）。
+fn encode_ctx0_u16(value: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(0), u64::from(group_id));
-    w.end_container();
-    w.finish()
-}
-
-/// KeySetRemove `{0: groupKeySetID}`。
-fn encode_key_set_remove_fields(keyset_id: u16) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(0), u64::from(keyset_id));
+    w.put_uint(Tag::Context(0), u64::from(value));
     w.end_container();
     w.finish()
 }

@@ -372,6 +372,44 @@ pub struct ProvisionParams {
     pub rebind: bool,
 }
 
+/// ショートカット op（color / color-temp / level）の (cluster, command,
+/// CommandFields) 三つ組。単一ノード（`run_node_op`）と groupcast
+/// （`GroupOpKind::wire`）が同じワイヤを出すことをここで保証する。
+pub(crate) mod shortcut {
+    use mat_controller::im;
+    use mat_core::color::ResolvedColor;
+
+    pub fn color(color: &ResolvedColor, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_HUE_AND_SATURATION,
+            Some(im::encode_move_to_hue_and_saturation_fields(
+                color.hue_raw,
+                color.sat_raw,
+                transition,
+            )),
+        )
+    }
+
+    pub fn color_temp(mireds: u16, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_COLOR_CONTROL,
+            im::CMD_MOVE_TO_COLOR_TEMPERATURE,
+            Some(im::encode_move_to_color_temperature_fields(
+                mireds, transition,
+            )),
+        )
+    }
+
+    pub fn level(level: u8, transition: u16) -> (u32, u32, Option<Vec<u8>>) {
+        (
+            im::CLUSTER_LEVEL_CONTROL,
+            im::CMD_MOVE_TO_LEVEL,
+            Some(im::encode_move_to_level_fields(level, transition)),
+        )
+    }
+}
+
 /// 単一ノード op を 1 回実行し、成功 body（timestamp 抜き）を返す。
 /// op → NodeConn 呼び出し（TLV 符号化）→ body 組立はここだけ。セッションの
 /// 取得・後始末は呼び出し側（`runner`）の責務。
@@ -405,19 +443,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             color,
             transition,
         } => {
-            let fields = im::encode_move_to_hue_and_saturation_fields(
-                color.hue_raw,
-                color.sat_raw,
-                *transition,
-            );
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::color(color, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::color_success(node_id, *endpoint, color, *transition)
         }
         NodeOpKind::ColorTemp {
@@ -426,15 +454,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             mireds,
             transition,
         } => {
-            let fields = im::encode_move_to_color_temperature_fields(*mireds, *transition);
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::color_temp(*mireds, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::color_temp_success(node_id, *endpoint, *kelvin, *mireds, *transition)
         }
         NodeOpKind::Level {
@@ -443,15 +465,9 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             level,
             transition,
         } => {
-            let fields = im::encode_move_to_level_fields(*level, *transition);
-            conn.invoke(
-                *endpoint,
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(fields),
-                false,
-            )
-            .await?;
+            let (cluster, command, fields) = shortcut::level(*level, *transition);
+            conn.invoke(*endpoint, cluster, command, fields, false)
+                .await?;
             body::level_success(
                 node_id,
                 *endpoint,
@@ -590,32 +606,13 @@ impl GroupOpKind {
                 fields_tlv,
                 ..
             } => (*cluster, *command, fields_tlv.clone()),
-            GroupOpKind::Color { color, transition } => (
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_HUE_AND_SATURATION,
-                Some(im::encode_move_to_hue_and_saturation_fields(
-                    color.hue_raw,
-                    color.sat_raw,
-                    *transition,
-                )),
-            ),
+            GroupOpKind::Color { color, transition } => shortcut::color(color, *transition),
             GroupOpKind::ColorTemp {
                 mireds, transition, ..
-            } => (
-                im::CLUSTER_COLOR_CONTROL,
-                im::CMD_MOVE_TO_COLOR_TEMPERATURE,
-                Some(im::encode_move_to_color_temperature_fields(
-                    *mireds,
-                    *transition,
-                )),
-            ),
+            } => shortcut::color_temp(*mireds, *transition),
             GroupOpKind::Level {
                 level, transition, ..
-            } => (
-                im::CLUSTER_LEVEL_CONTROL,
-                im::CMD_MOVE_TO_LEVEL,
-                Some(im::encode_move_to_level_fields(*level, *transition)),
-            ),
+            } => shortcut::level(*level, *transition),
         }
     }
 }
@@ -705,6 +702,46 @@ mod tests {
 
     fn node(kind: NodeOpKind) -> NodeOp {
         NodeOp { node_id: 5, kind }
+    }
+
+    /// 単一ノードと groupcast のショートカットは同じワイヤ（監査 Tier 3）。
+    #[tokio::test]
+    async fn node_and_group_shortcuts_share_wire() {
+        let color = mat_core::color::from_hue_sat(0, 100);
+        let mut conn = FakeConn::default();
+        run_node_op(
+            &mut conn,
+            &node(NodeOpKind::Color {
+                endpoint: 1,
+                color: color.clone(),
+                transition: 3,
+            }),
+        )
+        .await
+        .unwrap();
+        run_node_op(
+            &mut conn,
+            &node(NodeOpKind::color_temp(1, Some(2700), None, 3)),
+        )
+        .await
+        .unwrap();
+        run_node_op(&mut conn, &node(NodeOpKind::level(1, 50, 3)))
+            .await
+            .unwrap();
+        let group = [
+            GroupOpKind::Color {
+                color,
+                transition: 3,
+            }
+            .wire(),
+            GroupOpKind::color_temp(Some(2700), None, 3).wire(),
+            GroupOpKind::level(50, 3).wire(),
+        ];
+        for (i, (cluster, command, fields)) in group.into_iter().enumerate() {
+            let (ep, c, cmd, f) = &conn.invoked_fields[i];
+            assert_eq!((*ep, *c, *cmd), (1, cluster, command));
+            assert_eq!(f, &fields.unwrap_or_default());
+        }
     }
 
     #[test]

@@ -254,35 +254,14 @@ fn map_gs_err(e: GroupSettingsError) -> MatError {
     }
 }
 
-/// CSPRNG の新 epoch（現行と一致したら引き直す）。
-///
-/// 鍵素材は format! に渡さない: `crate::ops::epoch_key_from_hex` のエラー経路
-/// は不正 hex をそのまま detail に埋め込む（呼び出し側のバグ検出用に鍵を
-/// 見せる設計）ため、生成直後の内部鍵の decode には使わず、ここで自前に
-/// decode して失敗時は固定文言のみを返す。
-fn fresh_epoch(cur: &[u8; 16]) -> Result<[u8; 16], MatError> {
+/// CSPRNG の新 epoch（現行と一致したら引き直す）。鍵素材は format! に渡さない。
+fn fresh_epoch(cur: &[u8; 16]) -> [u8; 16] {
     loop {
-        let e = decode_generated_epoch_hex(&mat_core::group::generate_epoch_key())?;
+        let e = mat_core::group::generate_epoch_key_bytes();
         if e != *cur {
-            return Ok(e);
+            return e;
         }
     }
-}
-
-/// `generate_epoch_key` が返す 32 桁 hex を `[u8;16]` へ。壊れているのは
-/// 呼び出し側（mat-core 側の生成ロジック）のバグだが、鍵バイトそのものは
-/// 絶対に detail へ出さない（固定文言のみ）。
-fn decode_generated_epoch_hex(hex: &str) -> Result<[u8; 16], MatError> {
-    const BAD_HEX: &str = "generated epoch key is not 32 hex chars (internal)";
-    if hex.len() != 32 {
-        return Err(MatError::new(ErrorKind::Other, BAD_HEX));
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| MatError::new(ErrorKind::Other, BAD_HEX))?;
-    }
-    Ok(out)
 }
 
 async fn rotate(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome, MatError> {
@@ -295,7 +274,7 @@ async fn rotate(ctx: &RotateCtx, p: &RotateIpkParams) -> Result<RotateOutcome, M
             n
         }
         None => {
-            let n = fresh_epoch(&ctx.cur_epoch)?;
+            let n = fresh_epoch(&ctx.cur_epoch);
             group_settings::begin_ipk_rotation(&ctx.main_ini, ctx.fabric_index, &n)
                 .map_err(map_gs_err)?;
             tracing::info!(
@@ -717,7 +696,7 @@ mod tests {
         assert!(body["note"].as_str().unwrap().contains("matd reload"));
         assert!(out.partial_error().is_none());
         // 鍵素材は body に出ない。
-        let next_hex: String = next.iter().map(|b| format!("{b:02x}")).collect();
+        let next_hex = mat_core::hex::encode_lower(&next);
         assert!(!body.to_string().to_lowercase().contains(&next_hex));
     }
 

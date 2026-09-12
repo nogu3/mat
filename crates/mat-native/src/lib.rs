@@ -509,14 +509,10 @@ impl Engine {
         }) {
             Ok(Some((name, tsid))) => {
                 // Thread egress は専用 socket（LAN 側の IPV6_MULTICAST_IF と独立）。
-                match UdpTransport::bind().await {
-                    Ok(t) => {
+                match group::open_egress(&name, tsid).await {
+                    Ok(e) => {
                         tracing::info!(iface = %name, "groupcast thread egress enabled");
-                        egress.push(mat_controller::group::GroupEgress {
-                            iface: name,
-                            transport: Arc::new(t),
-                            scope_id: tsid,
-                        });
+                        egress.push(e);
                     }
                     Err(e) => match &cfg.thread_iface {
                         Some(ThreadIfaceChoice::Explicit(_)) => {
