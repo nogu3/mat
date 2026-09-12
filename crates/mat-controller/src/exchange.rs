@@ -125,44 +125,201 @@ pub struct IncomingMessage {
     pub payload: Vec<u8>,
 }
 
-/// One unsecured (session id 0) exchange, this side as initiator, with MRP.
-pub struct UnsecuredExchange<'t> {
+/// `true` for an MRP standalone ack (SecureChannel `0x10`), which carries no
+/// payload and is never a "real" reply.
+pub(crate) fn is_standalone_ack(proto: &ProtocolHeader) -> bool {
+    proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL && proto.opcode == OPCODE_MRP_STANDALONE_ACK
+}
+
+/// Screening outcome for one received datagram inside [`mrp_send_loop`] /
+/// [`recv_until`]: keep waiting, or finish with a value.
+pub(crate) enum Verdict<T> {
+    Ignore,
+    Done(T),
+}
+
+/// The future a screening callback hands back to [`mrp_send_loop`] /
+/// [`recv_until`], boxed.
+///
+/// **Why boxed and not `AsyncFnMut`**: the natural spelling
+/// `impl AsyncFnMut(&mut E, &[u8], SocketAddr) -> ...` does not type-check
+/// once the endpoint type carries a lifetime (`ExchangeCore<'t>`) and the
+/// resulting future is `tokio::spawn`ed, as `pase`'s self-handshake test and
+/// `mat-device` both do: rustc universally quantifies the endpoint's own
+/// lifetime while checking the spawned future's auto traits and reports
+/// "implementation of `AsyncFnMut` is not general enough" (it wants the impl
+/// for `&mut ExchangeCore<'1>` for *any* `'1`). A `dyn Future` erases the
+/// closure's higher-ranked signature, so the check succeeds. The allocation
+/// is one `Box` per received datagram — irrelevant next to a UDP round trip.
+pub(crate) type BoxScreen<'a, T, Er> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Verdict<T>, Er>> + Send + 'a>>;
+
+/// Boxes a screening future for [`BoxScreen`] (keeps call sites free of
+/// `Box::pin(..) as _` coercions).
+pub(crate) fn boxed_screen<'a, T, Er>(
+    fut: impl std::future::Future<Output = Result<Verdict<T>, Er>> + Send + 'a,
+) -> BoxScreen<'a, T, Er> {
+    Box::pin(fut)
+}
+
+/// What the generic MRP loops need from an endpoint — implemented by
+/// [`ExchangeCore`] (unsecured) and `session::SecureSession` (secured). The
+/// per-call screening logic stays with the caller (closure), so the loops
+/// only own the retransmit schedule / deadline arithmetic.
+pub(crate) trait MrpEndpoint {
+    type Error: From<std::io::Error>;
+    fn transport(&self) -> &Transport;
+    fn peer(&self) -> SocketAddr;
+    /// Time of the last valid message from the peer (spec 4.12.8 active/idle).
+    fn last_rx(&self) -> Option<Instant>;
+    /// The endpoint's "MRP retry budget exhausted" error.
+    fn timeout_error() -> Self::Error;
+}
+
+/// MRP retransmission loop (spec §4.12): sends `datagram` once, then again
+/// after each (jittered, backed-off) interval until `on_datagram` reports
+/// `Done` or `max_retries` retransmissions have gone unanswered
+/// (`E::timeout_error()`). `on_datagram` is called for every datagram read
+/// off the socket and is expected to do the screening (decode / dedup /
+/// ack) itself.
+pub(crate) async fn mrp_send_loop<E: MrpEndpoint, T>(
+    ep: &mut E,
+    datagram: &[u8],
+    cfg: &MrpConfig,
+    mut on_datagram: impl for<'a> FnMut(&'a mut E, &'a [u8], SocketAddr) -> BoxScreen<'a, T, E::Error>,
+) -> Result<T, E::Error> {
+    let mut interval = retrans_base(ep.last_rx(), cfg);
+    let mut attempts = 0u32;
+    loop {
+        ep.transport().send_to(datagram, ep.peer()).await?;
+        let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let Ok(recv) =
+                tokio::time::timeout(remaining, ep.transport().recv_from(&mut buf)).await
+            else {
+                break; // interval 経過 → 再送
+            };
+            let (n, from) = recv?;
+            if let Verdict::Done(v) = on_datagram(ep, &buf[..n], from).await? {
+                return Ok(v);
+            }
+        }
+        attempts += 1;
+        if attempts > cfg.max_retries {
+            return Err(E::timeout_error());
+        }
+        interval = interval.mul_f64(cfg.backoff);
+    }
+}
+
+/// Receive loop with a fixed deadline: reads datagrams until `on_datagram`
+/// reports `Done`; returns `on_timeout()` once `timeout` has elapsed.
+pub(crate) async fn recv_until<E: MrpEndpoint, T>(
+    ep: &mut E,
+    timeout: Duration,
+    on_timeout: impl Fn() -> E::Error,
+    mut on_datagram: impl for<'a> FnMut(&'a mut E, &'a [u8], SocketAddr) -> BoxScreen<'a, T, E::Error>,
+) -> Result<T, E::Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(on_timeout());
+        }
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let Ok(recv) = tokio::time::timeout(remaining, ep.transport().recv_from(&mut buf)).await
+        else {
+            return Err(on_timeout());
+        };
+        let (n, from) = recv?;
+        if let Verdict::Done(v) = on_datagram(ep, &buf[..n], from).await? {
+            return Ok(v);
+        }
+    }
+}
+
+/// Which side of the unsecured exchange we are (spec §4.6.1 / §4.4.1.2).
+/// The role decides three things: the `I` flag on what we send, which
+/// `I` flag we accept on what we receive, and where the initiator's
+/// ephemeral node id is carried (initiator: `source`; responder:
+/// `destination`).
+enum Role {
+    /// We opened the exchange (`UnsecuredExchange::new`).
+    Initiator { source_node_id: u64 },
+    /// The peer opened it (`ResponderExchange::adopt`).
+    Responder {
+        /// initiator が名乗った ephemeral node id（unsecured セッションの
+        /// 最初のメッセージの source node id）。応答では **destination** に
+        /// 載せ替える（spec §4.4.1.2 / §4.6.1.5）。`build` の doc 参照。
+        /// `None` は相手が source を載せていない場合 — 両方省略する。
+        peer_ephemeral_node_id: Option<u64>,
+        /// 直近に受理した peer メッセージの counter。応答の ack piggyback に使う。
+        last_peer_counter: u32,
+    },
+}
+
+/// One unsecured (session id 0) exchange with MRP, either role. The public
+/// API is the two newtypes below; this is the single implementation.
+struct ExchangeCore<'t> {
     transport: &'t Transport,
     peer: SocketAddr,
     exchange_id: u16,
-    source_node_id: u64,
     counter: TxCounter,
     rx_window: RxWindow,
     last_sent_counter: Option<u32>,
     /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
     last_rx: Option<Instant>,
+    role: Role,
 }
 
-impl<'t> UnsecuredExchange<'t> {
-    pub fn new(transport: &'t Transport, peer: SocketAddr) -> Self {
-        let mut b = [0u8; 10];
-        getrandom::fill(&mut b).expect("os rng");
-        Self {
-            transport,
-            peer,
-            exchange_id: u16::from_le_bytes([b[0], b[1]]),
-            source_node_id: u64::from_le_bytes(b[2..10].try_into().expect("8 bytes")),
-            counter: TxCounter::new_random(),
-            rx_window: RxWindow::new(),
-            last_sent_counter: None,
-            last_rx: None,
+impl MrpEndpoint for ExchangeCore<'_> {
+    type Error = ExchangeError;
+    fn transport(&self) -> &Transport {
+        self.transport
+    }
+    fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+    fn last_rx(&self) -> Option<Instant> {
+        self.last_rx
+    }
+    fn timeout_error() -> ExchangeError {
+        ExchangeError::Timeout
+    }
+}
+
+impl<'t> ExchangeCore<'t> {
+    fn is_initiator(&self) -> bool {
+        matches!(self.role, Role::Initiator { .. })
+    }
+
+    /// ack to piggyback on our next send: the responder always acks the
+    /// latest accepted peer message; the initiator piggybacks nothing.
+    fn piggyback_ack(&self) -> Option<u32> {
+        match self.role {
+            Role::Initiator { .. } => None,
+            Role::Responder {
+                last_peer_counter, ..
+            } => Some(last_peer_counter),
         }
     }
 
-    pub fn exchange_id(&self) -> u16 {
-        self.exchange_id
-    }
-
-    /// The message counter used by the most recent `send_reliable` call, if any.
-    pub fn last_sent_counter(&self) -> Option<u32> {
-        self.last_sent_counter
-    }
-
+    /// unsecured セッションのメッセージを組む。
+    ///
+    /// **ヘッダのアドレス指定**: unsecured セッションでは initiator の
+    /// ephemeral node id をメッセージ 1 通につきちょうど 1 箇所に載せる
+    /// （spec §4.4.1.2 / §4.6.1.5）。initiator は source に、responder は
+    /// destination に載せる。両方載せる／両方省くのはプロトコル違反で、
+    /// 参照実装（chip の `SessionManager::UnauthenticatedMessageDispatch`）
+    /// はその場でデータグラムを捨てる — 応答が「届いているのに無かったこと
+    /// にされる」ので、症状は上位プロトコルのエラーではなく無言のタイムアウト
+    /// になる。M2 ゲート 1 で実際にこれを踏んだ（`docs/superpowers/plans/
+    /// m2-chip-tool-probe.md`）。
     fn build(
         &mut self,
         protocol_id: u16,
@@ -173,15 +330,26 @@ impl<'t> UnsecuredExchange<'t> {
     ) -> (Vec<u8>, u32) {
         let needs_ack = needs_ack && !self.transport.is_reliable();
         let message_counter = self.counter.next();
+        let (source_node_id, destination, initiator) = match self.role {
+            Role::Initiator { source_node_id } => (Some(source_node_id), Destination::None, true),
+            Role::Responder {
+                peer_ephemeral_node_id,
+                ..
+            } => (
+                None,
+                peer_ephemeral_node_id.map_or(Destination::None, Destination::Node),
+                false,
+            ),
+        };
         let header = MessageHeader {
             session_id: 0,
             security_flags: 0,
             message_counter,
-            source_node_id: Some(self.source_node_id),
-            destination: Destination::None,
+            source_node_id,
+            destination,
         };
         let proto = ProtocolHeader {
-            initiator: true,
+            initiator,
             needs_ack,
             acked_counter,
             opcode,
@@ -209,8 +377,10 @@ impl<'t> UnsecuredExchange<'t> {
 
     /// Decodes a datagram and screens it for this exchange. Returns `None`
     /// for foreign or duplicate traffic the caller should skip (duplicates
-    /// are re-acked here). Standalone acks pass screening and are returned
-    /// as `Some`; callers filter them by opcode.
+    /// are re-acked here). Traffic with our own role's `I` flag (an
+    /// initiator seeing `initiator: true`, a responder seeing `false`) is
+    /// stray/spoofed and dropped. Standalone acks pass screening and are
+    /// returned as `Some`; callers filter them by opcode.
     async fn screen(
         &mut self,
         buf: &[u8],
@@ -230,7 +400,7 @@ impl<'t> UnsecuredExchange<'t> {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
-        if proto.exchange_id != self.exchange_id || proto.initiator {
+        if proto.exchange_id != self.exchange_id || proto.initiator == self.is_initiator() {
             return Ok(None);
         }
         // ここまで来た = このピアからの当該 exchange の有効トラフィック。
@@ -242,6 +412,12 @@ impl<'t> UnsecuredExchange<'t> {
                 self.send_standalone_ack(header.message_counter).await?;
             }
             return Ok(None);
+        }
+        if let Role::Responder {
+            last_peer_counter, ..
+        } = &mut self.role
+        {
+            *last_peer_counter = header.message_counter;
         }
         if proto.needs_ack && !self.transport.is_reliable() {
             self.send_standalone_ack(header.message_counter).await?;
@@ -255,6 +431,162 @@ impl<'t> UnsecuredExchange<'t> {
 
     /// Sends a reliability-flagged message and retransmits until the peer
     /// acknowledges it. Returns the peer's real response if one carried the
+    /// ack (or arrived on the exchange), `None` for a standalone ack. The
+    /// responder role piggybacks the ack for the peer's latest message.
+    async fn send_reliable(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<Option<IncomingMessage>, ExchangeError> {
+        let ack = self.piggyback_ack();
+        if self.transport.is_reliable() {
+            // BTP: transport が信頼性を持つ。1 回送って実応答を待つだけ。
+            let (datagram, our_counter) = self.build(protocol_id, opcode, false, ack, payload);
+            self.last_sent_counter = Some(our_counter);
+            self.transport.send_to(&datagram, self.peer).await?;
+            let budget = total_budget(cfg);
+            return self.recv(budget).await.map(Some);
+        }
+        let (datagram, our_counter) = self.build(protocol_id, opcode, true, ack, payload);
+        self.last_sent_counter = Some(our_counter);
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |ex: &mut ExchangeCore<'_>, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = ex.screen(buf, from).await? else {
+                        // ack-only の可能性: screen は standalone ack も Some で返す
+                        return Ok(Verdict::Ignore);
+                    };
+                    if is_standalone_ack(&msg.proto) {
+                        return Ok(if msg.proto.acked_counter == Some(our_counter) {
+                            Verdict::Done(None)
+                        } else {
+                            Verdict::Ignore
+                        });
+                    }
+                    // exchange 上の実メッセージは応答とみなす（相手が処理した証拠）
+                    Ok(Verdict::Done(Some(msg)))
+                })
+            },
+        )
+        .await
+    }
+
+    /// Sends a reliability-flagged message exactly once and returns without
+    /// waiting for an ack (see `UnsecuredExchange::send_once`).
+    async fn send_once(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+    ) -> Result<(), ExchangeError> {
+        let ack = self.piggyback_ack();
+        let (datagram, our_counter) = self.build(protocol_id, opcode, true, ack, payload);
+        self.last_sent_counter = Some(our_counter);
+        self.transport.send_to(&datagram, self.peer).await?;
+        Ok(())
+    }
+
+    /// Sends a final message and waits only for its ack (standalone or
+    /// piggybacked). On a reliable transport there is no MRP, so it returns
+    /// right after the send — unlike `send_reliable`, which waits for the
+    /// peer's *real* reply on both transports; a "final" message expects no
+    /// reply, so on BTP there is nothing to wait for (the asymmetry is
+    /// intentional).
+    async fn send_final(
+        &mut self,
+        protocol_id: u16,
+        opcode: u8,
+        payload: &[u8],
+        cfg: &MrpConfig,
+    ) -> Result<(), ExchangeError> {
+        let ack = self.piggyback_ack();
+        if self.transport.is_reliable() {
+            let (datagram, _) = self.build(protocol_id, opcode, false, ack, payload);
+            self.transport.send_to(&datagram, self.peer).await?;
+            return Ok(());
+        }
+        let (datagram, our_counter) = self.build(protocol_id, opcode, true, ack, payload);
+        mrp_send_loop(
+            self,
+            &datagram,
+            cfg,
+            move |ex: &mut ExchangeCore<'_>, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = ex.screen(buf, from).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    Ok(if msg.proto.acked_counter == Some(our_counter) {
+                        Verdict::Done(())
+                    } else {
+                        Verdict::Ignore
+                    })
+                })
+            },
+        )
+        .await
+    }
+
+    /// Waits for the next real (non-ack) message on this exchange.
+    async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
+        recv_until(
+            self,
+            timeout,
+            || ExchangeError::Timeout,
+            |ex: &mut ExchangeCore<'_>, buf: &[u8], from: SocketAddr| {
+                boxed_screen(async move {
+                    let Some(msg) = ex.screen(buf, from).await? else {
+                        return Ok(Verdict::Ignore);
+                    };
+                    Ok(if is_standalone_ack(&msg.proto) {
+                        Verdict::Ignore
+                    } else {
+                        Verdict::Done(msg)
+                    })
+                })
+            },
+        )
+        .await
+    }
+}
+
+/// One unsecured (session id 0) exchange, this side as initiator, with MRP.
+pub struct UnsecuredExchange<'t>(ExchangeCore<'t>);
+
+impl<'t> UnsecuredExchange<'t> {
+    pub fn new(transport: &'t Transport, peer: SocketAddr) -> Self {
+        let mut b = [0u8; 10];
+        getrandom::fill(&mut b).expect("os rng");
+        Self(ExchangeCore {
+            transport,
+            peer,
+            exchange_id: u16::from_le_bytes([b[0], b[1]]),
+            counter: TxCounter::new_random(),
+            rx_window: RxWindow::new(),
+            last_sent_counter: None,
+            last_rx: None,
+            role: Role::Initiator {
+                source_node_id: u64::from_le_bytes(b[2..10].try_into().expect("8 bytes")),
+            },
+        })
+    }
+
+    pub fn exchange_id(&self) -> u16 {
+        self.0.exchange_id
+    }
+
+    /// The message counter used by the most recent `send_reliable` /
+    /// `send_once` call, if any.
+    pub fn last_sent_counter(&self) -> Option<u32> {
+        self.0.last_sent_counter
+    }
+
+    /// Sends a reliability-flagged message and retransmits until the peer
+    /// acknowledges it. Returns the peer's real response if one carried the
     /// ack (or arrived on the exchange), `None` for a standalone ack.
     pub async fn send_reliable(
         &mut self,
@@ -263,58 +595,9 @@ impl<'t> UnsecuredExchange<'t> {
         payload: &[u8],
         cfg: &MrpConfig,
     ) -> Result<Option<IncomingMessage>, ExchangeError> {
-        if self.transport.is_reliable() {
-            // BTP: transport が信頼性を持つ。1 回送って実応答を待つだけ。
-            let (datagram, our_counter) = self.build(protocol_id, opcode, false, None, payload);
-            self.last_sent_counter = Some(our_counter);
-            self.transport.send_to(&datagram, self.peer).await?;
-            let budget = total_budget(cfg);
-            return match self.recv(budget).await {
-                Ok(msg) => Ok(Some(msg)),
-                Err(e) => Err(e),
-            };
-        }
-        let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
-        self.last_sent_counter = Some(our_counter);
-        let mut interval = retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break; // interval 経過 → 再送
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self.screen(&buf[..n], from).await? else {
-                    // ack-only の可能性: screen は standalone ack も Some で返す
-                    continue;
-                };
-                let acks_us = msg.proto.acked_counter == Some(our_counter);
-                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-                if is_standalone_ack {
-                    if acks_us {
-                        return Ok(None);
-                    }
-                    continue;
-                }
-                // exchange 上の実メッセージは応答とみなす（相手が処理した証拠）
-                return Ok(Some(msg));
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(ExchangeError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+        self.0
+            .send_reliable(protocol_id, opcode, payload, cfg)
+            .await
     }
 
     /// Sends a reliability-flagged message exactly once and returns
@@ -330,60 +613,21 @@ impl<'t> UnsecuredExchange<'t> {
         opcode: u8,
         payload: &[u8],
     ) -> Result<(), ExchangeError> {
-        let (datagram, our_counter) = self.build(protocol_id, opcode, true, None, payload);
-        self.last_sent_counter = Some(our_counter);
-        self.transport.send_to(&datagram, self.peer).await?;
-        Ok(())
+        self.0.send_once(protocol_id, opcode, payload).await
     }
 
     /// Waits for the next real (non-ack) message on this exchange.
     pub async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ExchangeError::Timeout);
-            }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let Ok(recv) =
-                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-            else {
-                return Err(ExchangeError::Timeout);
-            };
-            let (n, from) = recv?;
-            let Some(msg) = self.screen(&buf[..n], from).await? else {
-                continue;
-            };
-            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            return Ok(msg);
-        }
+        self.0.recv(timeout).await
     }
 }
 
 /// peer が開始した unsecured exchange の応答側。PASE/CASE の全フローを 1
 /// exchange で捌く（spec §4.6, §4.12）。`UnsecuredExchange` の鏡像 —
 /// あちらは自分から exchange を開く初期側、こちらは peer から届いた最初の
-/// メッセージ（`adopt`）から採番を引き継いで応答する側。
-pub struct ResponderExchange<'t> {
-    transport: &'t Transport,
-    peer: SocketAddr,
-    exchange_id: u16,
-    counter: TxCounter,
-    rx_window: RxWindow,
-    /// initiator が名乗った ephemeral node id（unsecured セッションの
-    /// 最初のメッセージの source node id）。応答では **destination** に
-    /// 載せ替える（spec §4.4.1.2 / §4.6.1.5）。`build` の doc 参照。
-    /// `None` は相手が source を載せていない場合 — 従来どおり両方省略する。
-    peer_ephemeral_node_id: Option<u64>,
-    /// 直近に受理した peer メッセージの counter。応答の ack piggyback に使う。
-    last_peer_counter: u32,
-    /// ピアから最後に有効なメッセージを受けた時刻（MRP active/idle 判定用）。
-    last_rx: Option<Instant>,
-}
+/// メッセージ（`adopt`）から採番を引き継いで応答する側。実装は共通の
+/// `ExchangeCore`（役割だけが違う）。
+pub struct ResponderExchange<'t>(ExchangeCore<'t>);
 
 impl<'t> ResponderExchange<'t> {
     /// 受信済みの最初の peer-initiated メッセージから採番を引き継いで作る。
@@ -393,117 +637,19 @@ impl<'t> ResponderExchange<'t> {
     pub fn adopt(transport: &'t Transport, peer: SocketAddr, first: &IncomingMessage) -> Self {
         let mut rx_window = RxWindow::new();
         rx_window.check_and_commit(first.header.message_counter);
-        Self {
+        Self(ExchangeCore {
             transport,
             peer,
             exchange_id: first.proto.exchange_id,
             counter: TxCounter::new_random(),
             rx_window,
-            peer_ephemeral_node_id: first.header.source_node_id,
-            last_peer_counter: first.header.message_counter,
+            last_sent_counter: None,
             last_rx: Some(Instant::now()),
-        }
-    }
-
-    /// unsecured セッションの応答メッセージを組む。
-    ///
-    /// **ヘッダのアドレス指定**: unsecured セッションでは initiator の
-    /// ephemeral node id をメッセージ 1 通につきちょうど 1 箇所に載せる
-    /// （spec §4.4.1.2 / §4.6.1.5）。initiator は source に、responder は
-    /// destination に載せる。両方載せる／両方省くのはプロトコル違反で、
-    /// 参照実装（chip の `SessionManager::UnauthenticatedMessageDispatch`）
-    /// はその場でデータグラムを捨てる — 応答が「届いているのに無かったこと
-    /// にされる」ので、症状は上位プロトコルのエラーではなく無言のタイムアウト
-    /// になる。M2 ゲート 1 で実際にこれを踏んだ（`docs/superpowers/plans/
-    /// m2-chip-tool-probe.md`）。
-    fn build(
-        &mut self,
-        protocol_id: u16,
-        opcode: u8,
-        needs_ack: bool,
-        acked_counter: Option<u32>,
-        payload: &[u8],
-    ) -> (Vec<u8>, u32) {
-        let needs_ack = needs_ack && !self.transport.is_reliable();
-        let message_counter = self.counter.next();
-        let header = MessageHeader {
-            session_id: 0,
-            security_flags: 0,
-            message_counter,
-            source_node_id: None,
-            destination: match self.peer_ephemeral_node_id {
-                Some(id) => Destination::Node(id),
-                None => Destination::None,
+            role: Role::Responder {
+                peer_ephemeral_node_id: first.header.source_node_id,
+                last_peer_counter: first.header.message_counter,
             },
-        };
-        let proto = ProtocolHeader {
-            initiator: false,
-            needs_ack,
-            acked_counter,
-            opcode,
-            exchange_id: self.exchange_id,
-            protocol_id,
-            vendor_id: None,
-        };
-        let mut buf = header.encoded();
-        proto.encode(&mut buf);
-        buf.extend_from_slice(payload);
-        (buf, message_counter)
-    }
-
-    async fn send_standalone_ack(&mut self, acked: u32) -> Result<(), ExchangeError> {
-        let (buf, _) = self.build(
-            PROTOCOL_ID_SECURE_CHANNEL,
-            OPCODE_MRP_STANDALONE_ACK,
-            false,
-            Some(acked),
-            &[],
-        );
-        self.transport.send_to(&buf, self.peer).await?;
-        Ok(())
-    }
-
-    /// `UnsecuredExchange::screen` の鏡像: `proto.initiator == false`
-    /// （応答側どうしの迷子/偽装トラフィック）と exchange_id 不一致を捨て、
-    /// 重複 counter は standalone-ack のみ返して `None`。
-    async fn screen(
-        &mut self,
-        buf: &[u8],
-        from: SocketAddr,
-    ) -> Result<Option<IncomingMessage>, ExchangeError> {
-        if from != self.peer {
-            return Ok(None);
-        }
-        let (header, off) = match MessageHeader::decode(buf) {
-            Ok(v) => v,
-            Err(_) => return Ok(None), // 不正データグラムは無視（DoS 耐性）
-        };
-        if header.session_id != 0 || header.security_flags != 0 {
-            return Ok(None);
-        }
-        let (proto, body_off) = match ProtocolHeader::decode(&buf[off..]) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        if proto.exchange_id != self.exchange_id || !proto.initiator {
-            return Ok(None);
-        }
-        self.last_rx = Some(Instant::now());
-        if !self.rx_window.check_and_commit(header.message_counter) {
-            if proto.needs_ack && !self.transport.is_reliable() {
-                self.send_standalone_ack(header.message_counter).await?;
-            }
-            return Ok(None);
-        }
-        self.last_peer_counter = header.message_counter;
-        if proto.needs_ack && !self.transport.is_reliable() {
-            self.send_standalone_ack(header.message_counter).await?;
-        }
-        Ok(Some(IncomingMessage {
-            header,
-            proto,
-            payload: buf[off + body_off..].to_vec(),
-        }))
+        })
     }
 
     /// Waits for the next real (non-ack) peer message on this exchange.
@@ -527,29 +673,7 @@ impl<'t> ResponderExchange<'t> {
     /// `ResponderExchange` — and its single incrementing `TxCounter` —
     /// alive for the whole exchange).
     pub async fn recv(&mut self, timeout: Duration) -> Result<IncomingMessage, ExchangeError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ExchangeError::Timeout);
-            }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let Ok(recv) =
-                tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-            else {
-                return Err(ExchangeError::Timeout);
-            };
-            let (n, from) = recv?;
-            let Some(msg) = self.screen(&buf[..n], from).await? else {
-                continue;
-            };
-            if msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK
-            {
-                continue;
-            }
-            return Ok(msg);
-        }
+        self.0.recv(timeout).await
     }
 
     /// initiator:false で応答し、同一 exchange の次の peer メッセージを待つ。
@@ -565,70 +689,15 @@ impl<'t> ResponderExchange<'t> {
         payload: &[u8],
         cfg: &MrpConfig,
     ) -> Result<Option<IncomingMessage>, ExchangeError> {
-        if self.transport.is_reliable() {
-            let (datagram, _) = self.build(
-                protocol_id,
-                opcode,
-                false,
-                Some(self.last_peer_counter),
-                payload,
-            );
-            self.transport.send_to(&datagram, self.peer).await?;
-            let budget = total_budget(cfg);
-            return match self.recv(budget).await {
-                Ok(msg) => Ok(Some(msg)),
-                Err(e) => Err(e),
-            };
-        }
-        let (datagram, our_counter) = self.build(
-            protocol_id,
-            opcode,
-            true,
-            Some(self.last_peer_counter),
-            payload,
-        );
-        let mut interval = retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break; // interval 経過 → 再送
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self.screen(&buf[..n], from).await? else {
-                    continue;
-                };
-                let acks_us = msg.proto.acked_counter == Some(our_counter);
-                let is_standalone_ack = msg.proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-                    && msg.proto.opcode == OPCODE_MRP_STANDALONE_ACK;
-                if is_standalone_ack {
-                    if acks_us {
-                        return Ok(None);
-                    }
-                    continue;
-                }
-                return Ok(Some(msg));
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(ExchangeError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+        self.0
+            .send_reliable(protocol_id, opcode, payload, cfg)
+            .await
     }
 
     /// 応答して待たない（StatusReport 終端用）。needs_ack を立て、ack
     /// （standalone または piggyback、どちらも `acked_counter` が我々の
-    /// counter と一致していること）を受け取るまで MRP 再送する。
+    /// counter と一致していること）を受け取るまで MRP 再送する。Reliable
+    /// transport では 1 回送って即 return（`ExchangeCore::send_final` 参照）。
     pub async fn reply_final(
         &mut self,
         protocol_id: u16,
@@ -636,54 +705,17 @@ impl<'t> ResponderExchange<'t> {
         payload: &[u8],
         cfg: &MrpConfig,
     ) -> Result<(), ExchangeError> {
-        if self.transport.is_reliable() {
-            let (datagram, _) = self.build(
-                protocol_id,
-                opcode,
-                false,
-                Some(self.last_peer_counter),
-                payload,
-            );
-            self.transport.send_to(&datagram, self.peer).await?;
-            return Ok(());
-        }
-        let (datagram, our_counter) = self.build(
-            protocol_id,
-            opcode,
-            true,
-            Some(self.last_peer_counter),
-            payload,
-        );
-        let mut interval = retrans_base(self.last_rx, cfg);
-        let mut attempts = 0u32;
-        loop {
-            self.transport.send_to(&datagram, self.peer).await?;
-            let deadline = Instant::now() + jittered_interval(interval, cfg.jitter, unit_random());
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let mut buf = [0u8; MAX_DATAGRAM];
-                let Ok(recv) =
-                    tokio::time::timeout(remaining, self.transport.recv_from(&mut buf)).await
-                else {
-                    break; // interval 経過 → 再送
-                };
-                let (n, from) = recv?;
-                let Some(msg) = self.screen(&buf[..n], from).await? else {
-                    continue;
-                };
-                if msg.proto.acked_counter == Some(our_counter) {
-                    return Ok(());
-                }
-            }
-            attempts += 1;
-            if attempts > cfg.max_retries {
-                return Err(ExchangeError::Timeout);
-            }
-            interval = interval.mul_f64(cfg.backoff);
-        }
+        self.0.send_final(protocol_id, opcode, payload, cfg).await
+    }
+
+    /// Test hook: screen one datagram through the shared core.
+    #[cfg(test)]
+    async fn screen(
+        &mut self,
+        buf: &[u8],
+        from: SocketAddr,
+    ) -> Result<Option<IncomingMessage>, ExchangeError> {
+        self.0.screen(buf, from).await
     }
 }
 
@@ -1474,5 +1506,40 @@ mod tests {
         // exchange_id 不一致は捨てる
         let foreign = initiator_datagram(exchange_id.wrapping_add(1), 0x20, 3, true, None, b"x");
         assert!(re.screen(&foreign, peer_addr).await.unwrap().is_none());
+    }
+
+    /// `mrp_send_loop` retransmits the same datagram `max_retries` + 1 times
+    /// and returns the endpoint's timeout error when nothing arrives.
+    #[tokio::test]
+    async fn mrp_send_loop_retransmits_then_times_out() {
+        let responder = bind_local().await;
+        let peer = responder.local_addr().unwrap();
+        let transport = bind_local_transport().await;
+        let mut ex = UnsecuredExchange::new(&transport, peer);
+        let cfg = fast_cfg(); // max_retries 2 → 3 sends
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = counter.clone();
+        let responder_task = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            while tokio::time::timeout(Duration::from_millis(300), responder.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let err = mrp_send_loop(
+            &mut ex.0,
+            b"payload",
+            &cfg,
+            |_ex: &mut ExchangeCore<'_>, _buf: &[u8], _from: SocketAddr| {
+                boxed_screen(async { Ok::<Verdict<()>, ExchangeError>(Verdict::Ignore) })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ExchangeError::Timeout));
+        responder_task.await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }
