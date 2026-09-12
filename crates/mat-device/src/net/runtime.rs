@@ -450,25 +450,6 @@ fn remove_fabric_drops_session(removed_fabric_index: u8, session_fabric_index: u
     removed_fabric_index == session_fabric_index && session_fabric_index != 0
 }
 
-/// A random non-zero u16 — local (responder) session id for a fresh PASE or
-/// CASE attempt. Not collision-checked against a previous session: this
-/// runtime keeps at most one "current session" alive at a time (see module
-/// doc), so the only way a collision could matter is astronomically
-/// unlikely (1/65535) and even then just means the old session's next
-/// datagram gets fed into the new one's `SecureSession` — a screen-level
-/// session-id match with a peer address that no longer matches would drop
-/// it harmlessly (`screen_with`'s `from != self.peer` check).
-fn random_session_id() -> u16 {
-    loop {
-        let mut b = [0u8; 2];
-        getrandom::fill(&mut b).expect("os rng");
-        let v = u16::from_le_bytes(b);
-        if v != 0 {
-            return v;
-        }
-    }
-}
-
 /// Random 64-bit hex instance/hostname (spec §4.3.1: the commissionable
 /// service's instance name SHOULD be random). Reused as both the mDNS
 /// instance name and the hostname (`<name>.local`) — legal, and simplest
@@ -1129,7 +1110,16 @@ impl Runtime {
     ) {
         match flow {
             UnsecuredFlow::Pase => {
-                let local_session_id = random_session_id();
+                // Not collision-checked against a previous session: this
+                // runtime keeps at most one "current session" alive at a
+                // time (see module doc), so the only way a collision could
+                // matter is astronomically unlikely (1/65535) and even then
+                // just means the old session's next datagram gets fed into
+                // the new one's `SecureSession` — a screen-level session-id
+                // match with a peer address that no longer matches would
+                // drop it harmlessly (`screen_with`'s `from != self.peer`
+                // check).
+                let local_session_id = mat_controller::case::random_nonzero_u16();
                 let outcome = crate::net::pase::drive_established(
                     &self.transport,
                     peer,
@@ -1169,7 +1159,7 @@ impl Runtime {
                 }
             }
             UnsecuredFlow::Case => {
-                let local_session_id = random_session_id();
+                let local_session_id = mat_controller::case::random_nonzero_u16();
                 // IPK rotation 後は keyset 0 の全 epoch から候補を展開する
                 // （`core::case::expand_ipk_candidates` の doc 参照）。
                 let fabrics = crate::core::case::expand_ipk_candidates(
@@ -2755,13 +2745,6 @@ mod tests {
             classify_unsecured(PROTOCOL_ID_SECURE_CHANNEL, OPCODE_MRP_STANDALONE_ACK),
             UnsecuredFlow::Ignore
         );
-    }
-
-    #[test]
-    fn random_session_id_is_never_zero() {
-        for _ in 0..1000 {
-            assert_ne!(random_session_id(), 0);
-        }
     }
 
     // ── commissioning window admission (Task 14) ────────────────────────

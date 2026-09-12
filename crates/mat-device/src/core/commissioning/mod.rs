@@ -366,10 +366,7 @@ impl CommissioningServer {
     /// `ATTR_GROUP_KEY_MAP` write are commissionee-invoked commands the
     /// cluster handler itself serves, not something `AddNOC` stages.
     pub fn set_group_key_store(&mut self, store: GroupKeyStore) {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .group_key_store = Some(store);
+        locked(&self.inner).group_key_store = Some(store);
     }
 
     /// Wires a shared `GroupMembershipStore` in — the same store every
@@ -544,30 +541,4 @@ fn null_value() -> Vec<u8> {
     let mut w = Writer::new();
     w.put_null(Tag::Anonymous);
     w.finish()
-}
-
-/// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
-/// out-of-range case and retries with fresh randomness) — device-side
-/// equivalent of `mat_controller::case::random_p256_secret`, which is
-/// `pub(crate)` there and so not reachable from this crate.
-fn random_p256_secret() -> p256::SecretKey {
-    loop {
-        let mut b = [0u8; 32];
-        getrandom::fill(&mut b).expect("os rng");
-        if let Ok(sk) = p256::SecretKey::from_slice(&b) {
-            return sk;
-        }
-    }
-}
-
-/// `secret`'s SEC1 uncompressed public key (65 bytes) — device-side
-/// equivalent of `mat_controller::case::eph_pub_bytes`.
-fn public_key_bytes(secret: &p256::SecretKey) -> [u8; 65] {
-    use p256::elliptic_curve::sec1::ToSec1Point;
-    secret
-        .public_key()
-        .to_sec1_point(false)
-        .as_bytes()
-        .try_into()
-        .expect("uncompressed p256 point is 65 bytes")
 }

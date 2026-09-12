@@ -19,12 +19,9 @@ use std::time::Duration;
 
 use mat_controller::case::encode_status_report;
 use mat_controller::exchange::{ExchangeError, IncomingMessage, MrpConfig, ResponderExchange};
-use mat_controller::message::{
-    MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
-    PROTOCOL_ID_SECURE_CHANNEL,
-};
+use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use mat_controller::session::SecureSession;
-use mat_controller::transport::{Transport, UdpTransport, MAX_DATAGRAM};
+use mat_controller::transport::{Transport, UdpTransport};
 
 use crate::core::case::{CaseCoreError, CaseOutput, CaseResponderCore};
 use crate::core::fabric_store::FabricEntry;
@@ -122,41 +119,6 @@ fn status_report_failure(err: &CaseCoreError) -> Vec<u8> {
     )
 }
 
-/// Reads the very first unsecured datagram from any sender — mirrors
-/// `net::pase::recv_first` (see its doc comment); duplicated locally rather
-/// than shared since it's small and each driver owns its own module.
-async fn recv_first(transport: &Transport) -> Result<(IncomingMessage, SocketAddr), NetCaseError> {
-    loop {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (n, from) = transport.recv_from(&mut buf).await?;
-        let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-            continue;
-        };
-        if header.session_id != 0 || header.security_flags != 0 {
-            continue;
-        }
-        let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-            continue;
-        };
-        if !proto.initiator {
-            continue;
-        }
-        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-        {
-            continue;
-        }
-        return Ok((
-            IncomingMessage {
-                header,
-                proto,
-                payload: buf[off + body_off..n].to_vec(),
-            },
-            from,
-        ));
-    }
-}
-
 /// Drives one CASE responder handshake to completion over `transport`:
 /// waits for Sigma1, adopts a `ResponderExchange` on it, then feeds each
 /// message into a `CaseResponderCore` (seeded with `fabrics`) and replies
@@ -169,7 +131,7 @@ pub async fn run_case_once(
     responder_session_id: u16,
 ) -> Result<(SecureSession, u8), NetCaseError> {
     let transport = Arc::new(Transport::Udp(Arc::new(transport)));
-    let (first, peer) = recv_first(&transport).await?;
+    let (first, peer) = crate::net::recv_first(&transport).await?;
     drive_established(transport, peer, first, fabrics, responder_session_id).await
 }
 
