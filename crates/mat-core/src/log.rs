@@ -1,9 +1,10 @@
 //! ログ初期化の共有ヘルパ。
 //!
 //! フィルタ指定の選択規則は純関数（`log_filter_candidates`）、subscriber の
-//! 組み立ては [`init_stderr`]（`mat` / `matd` 共有。2026-09-12 の監査で
-//! 3 バイナリの逐語コピーを一本化 — `tracing-subscriber` 依存はここに集約）。
-//! SIGPIPE の既定化 [`reset_sigpipe`] も同じ理由でここに置く。
+//! 組み立ては `init_stderr`（`mat` / `matd` 共有。2026-09-12 の監査で
+//! 3 バイナリの逐語コピーを一本化 — `tracing-subscriber` 依存はここに集約、
+//! feature `log-init` の下でのみビルドされる。ライブラリ消費者は既定で
+//! 非依存）。SIGPIPE の既定化 [`reset_sigpipe`] も同じ理由でここに置く。
 
 /// ログフィルタ指定の候補を `MAT_LOG` → `RUST_LOG` の優先順で返す。
 ///
@@ -41,6 +42,10 @@ pub fn log_filter_candidates_from_env() -> Vec<String> {
 /// `matd` は journald に ANSI を書かないよう常に false）。stdout は JSON 専用
 /// なので絶対に汚さない。プロセスで 1 回だけ呼ぶこと（2 回目は panic —
 /// `tracing_subscriber::fmt().init()` の性質）。
+///
+/// feature `log-init` が必要（バイナリ側で有効化。ライブラリ消費者には
+/// `tracing-subscriber` 依存を強いない）。
+#[cfg(feature = "log-init")]
 pub fn init_stderr(default_filter: &str, ansi: bool) {
     use tracing_subscriber::EnvFilter;
     let filter = log_filter_candidates_from_env()

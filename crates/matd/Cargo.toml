@@ -14,7 +14,7 @@ name = "matd"
 path = "src/main.rs"
 
 [dependencies]
-mat-core.workspace = true
+mat-core = { workspace = true, features = ["log-init"] }
 mat-controller.workspace = true
 mat-native.workspace = true
 async-trait.workspace = true

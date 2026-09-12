@@ -21,7 +21,7 @@ path = "src/main.rs"
 ble = ["mat-native/ble"]
 
 [dependencies]
-mat-core.workspace = true
+mat-core = { workspace = true, features = ["log-init"] }
 mat-controller.workspace = true
 mat-native.workspace = true
 clap.workspace = true
