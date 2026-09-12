@@ -30,28 +30,16 @@
 //! device's loopback port.
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
-
 use mat_controller::commissioning::CommissioningFabric;
 use mat_controller::im::{self, ImError};
 use mat_controller::session::SessionError;
-use mat_controller::tlv::{Tag, Writer};
 
-use mat_device::device::Device;
+use mat_device::core::access_control::{AUTH_MODE_CASE, PRIVILEGE_OPERATE};
 
 mod support;
-use support::{commission_directly, device_config};
+use support::{acl_entries_tlv, commission_directly, device_config, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 660_033;
-
-/// `AccessControlEntryPrivilegeEnum` values (spec §11.1.7.1) — mirrored
-/// here rather than imported since `mat_device::core::access_control`'s
-/// constants are crate-private (`pub(crate)`), and `mat_core::acl` only
-/// defines `PRIVILEGE_OPERATE` (the one value the group-provision path
-/// needs). The device's own wire-form doc for this encoding lives at
-/// `mat_device::core::access_control`'s `write_acl_entry`.
-const PRIVILEGE_OPERATE: u8 = 3;
-const AUTH_MODE_CASE: u8 = 2;
 
 /// The fabric index `commission_directly` always lands on — it's the
 /// device's first (and only) fabric in every one of these tests
@@ -59,52 +47,14 @@ const AUTH_MODE_CASE: u8 = 2;
 /// `fabric_index == Some(1)`).
 const FABRIC_INDEX: u8 = 1;
 
-/// One-entry `AccessControlEntryStruct` array Data TLV (spec §11.1.7.1):
-/// `{1: privilege, 2: authMode, 3: subjects(array), 4: targets(null), 254:
-/// fabricIndex}` — same wire shape as
-/// `mat_device::core::access_control::write_acl_entry` /
-/// `mat_native::ops::encode_acl_entries_tlv`, hand-rolled here (rather than
-/// imported) because both are crate-private to their own crates.
-fn encode_single_acl_entry_tlv(
-    privilege: u8,
-    auth_mode: u8,
-    subject: u64,
-    fabric_index: u8,
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.start_array(Tag::Anonymous);
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(1), u64::from(privilege));
-    w.put_uint(Tag::Context(2), u64::from(auth_mode));
-    w.start_array(Tag::Context(3));
-    w.put_uint(Tag::Anonymous, subject);
-    w.end_container();
-    w.put_null(Tag::Context(4));
-    w.put_uint(Tag::Context(254), u64::from(fabric_index));
-    w.end_container();
-    w.end_container();
-    w.finish()
-}
-
 #[tokio::test]
 async fn demoting_admin_acl_entry_blocks_administer_but_not_operate() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    // Same `[::]` -> `[::1]` substitution as the other `net`-feature tests.
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4455, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // Baseline: the automatic post-AddNOC Administer entry (`AclStore::
@@ -145,10 +95,8 @@ async fn demoting_admin_acl_entry_blocks_administer_but_not_operate() {
     // Replace the ACL with an Operate-only entry for the same subject.
     // This write itself is judged against the *pre*-replace Administer
     // entry, so it must succeed.
-    let demoted_tlv = encode_single_acl_entry_tlv(
-        PRIVILEGE_OPERATE,
-        AUTH_MODE_CASE,
-        ADMIN_NODE_ID,
+    let demoted_tlv = acl_entries_tlv(
+        &[(PRIVILEGE_OPERATE, AUTH_MODE_CASE, &[ADMIN_NODE_ID])],
         FABRIC_INDEX,
     );
     session
@@ -198,6 +146,6 @@ async fn demoting_admin_acl_entry_blocks_administer_but_not_operate() {
         .expect("OnOff Toggle should still succeed for the Operate-demoted admin");
     assert_eq!(resp.status, im::STATUS_SUCCESS);
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

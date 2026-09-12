@@ -9,7 +9,6 @@
 //! コードが通ることがワイヤ契約の証拠になる。
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use mat_controller::commissioning::CommissioningFabric;
@@ -17,11 +16,11 @@ use mat_controller::im::{self, EventPathIn, EventReport, SubscribeSpec};
 
 use mat_device::core::bridge::DeviceKind;
 use mat_device::core::stimulus::{PressKind, Stimulus};
-use mat_device::device::{Device, VirtualDeviceConfig};
+use mat_device::device::VirtualDeviceConfig;
 use mat_device::net::stimulus::StimulusApplyError;
 
 mod support;
-use support::{commission_directly, device_config_with};
+use support::{commission_directly, device_config_with, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 778_900;
 
@@ -75,28 +74,14 @@ fn event_ids(events: &[EventReport]) -> Vec<(u16, u32, u32)> {
 #[tokio::test]
 async fn button_press_and_contact_change_arrive_as_events() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config_with(
+    let dev = spawn_device(device_config_with(
         store_dir.path().to_path_buf(),
         devices(),
-    ))
-    .expect("device new");
-    // `subscribe_loop.rs` と同じ `[::]` -> `[::1]` 置換: `local_addr()` は
-    // ワイルドカードの bind アドレスで、送信先としては使えない。
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-    let handle = device.stimulus_handle();
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    ));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4466, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // 1. イベント wildcard(urgent) + 属性は booleanstate だけ。priming に
@@ -129,7 +114,8 @@ async fn button_press_and_contact_change_arrive_as_events() {
     );
 
     // 2. 短押し → InitialPress + ShortRelease が番号昇順で届く。
-    let out = handle
+    let out = dev
+        .stimulus
         .apply("btn", Stimulus::Press(PressKind::Short))
         .await
         .expect("press applied");
@@ -170,7 +156,7 @@ async fn button_press_and_contact_change_arrive_as_events() {
     );
 
     // 3. 開閉 → 同一 report に StateValue 属性と StateChange イベント。
-    handle
+    dev.stimulus
         .apply("door", Stimulus::SetState(true))
         .await
         .expect("state applied");
@@ -207,11 +193,11 @@ async fn button_press_and_contact_change_arrive_as_events() {
     // 4. 刺激エラー: 名前が引けない（チャネル層）／このクラスタは受けない
     //    （core 側の判断）。
     assert!(matches!(
-        handle.apply("nope", Stimulus::SetState(true)).await,
+        dev.stimulus.apply("nope", Stimulus::SetState(true)).await,
         Err(StimulusApplyError::UnknownDevice(_))
     ));
     assert!(matches!(
-        handle.apply("btn", Stimulus::SetState(true)).await,
+        dev.stimulus.apply("btn", Stimulus::SetState(true)).await,
         Err(StimulusApplyError::Node(_))
     ));
 
@@ -286,7 +272,7 @@ async fn button_press_and_contact_change_arrive_as_events() {
     //    同期しない — その形をテストでも守る。
     let presser = tokio::spawn(async move {
         for _ in 0..3 {
-            handle
+            dev.stimulus
                 .apply("btn", Stimulus::Press(PressKind::Multi(3)))
                 .await
                 .expect("multi press applied");
@@ -316,6 +302,6 @@ async fn button_press_and_contact_change_arrive_as_events() {
     );
     presser.await.expect("presser task");
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

@@ -29,7 +29,6 @@
 //!   `lo`, per that same test's convention).
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,12 +40,10 @@ use mat_controller::commissioning::{
 use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::x509;
 
-use mat_device::device::Device;
-
 mod support;
 use support::{
-    commission_directly, device_config, fast_cfg, DEVICE_NODE_ID, DISCRIMINATOR, PASSCODE,
-    PRODUCT_ID, VENDOR_ID,
+    commission_directly, device_config, fast_cfg, spawn_device, DEVICE_NODE_ID, DISCRIMINATOR,
+    PASSCODE, PRODUCT_ID, VENDOR_ID,
 };
 
 const ADMIN_NODE_ID: u64 = 112_233;
@@ -57,25 +54,11 @@ async fn direct_drive_self_commission_reaches_operational_case() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    // `device.local_addr()` is `[::]:{port}` (the wildcard bind address the
-    // brief specifies) — not itself a valid *destination* to send to.
-    // Substitute the loopback address, keeping the OS-assigned ephemeral
-    // port; a `[::]`-bound socket accepts traffic addressed to `[::1]` too.
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x1122_3344, ADMIN_NODE_ID).expect("fabric generate");
-    let _session = commission_directly(addr, &paa_der, &fabric).await;
+    let _session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
 
     // Persistence smoke test (brief's self-review requirement): the fabric
     // AddNOC just installed is really on disk, in the shape a fresh
@@ -99,18 +82,11 @@ async fn direct_drive_self_commission_reaches_operational_case() {
     // `Device` over the same `store_dir`, and driving a fresh CASE
     // establishment plus a secured read against it, not just confirming
     // `Device::new` doesn't error.
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 
-    let restarted = Device::new(device_config(store_dir.path().to_path_buf()))
-        .expect("Device::new should reload the persisted fabric store across a restart");
-    let restarted_addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        restarted.local_addr().port(),
-    );
-    tokio::spawn(async move {
-        let _ = restarted.run().await;
-    });
+    let restarted = spawn_device(device_config(store_dir.path().to_path_buf()));
+    let restarted_addr = restarted.addr;
 
     let cfg = fast_cfg();
     let creds = fabric.admin_credentials().expect("admin credentials");
@@ -226,24 +202,14 @@ async fn fail_safe_expiry_gates_add_noc() {
 #[tokio::test]
 async fn pase_after_commissioning_complete_is_silently_dropped() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x3344_5566, ADMIN_NODE_ID).expect("fabric generate");
     // Reaches CommissioningComplete — the window should close right there,
     // well before this device's 15-minute boot-time window would have
     // elapsed on its own.
-    let _session = commission_directly(addr, &paa_der, &fabric).await;
+    let _session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
 
     // Proof 1: `establish` fails with exactly the "nothing answered" variant.
     {
@@ -254,7 +220,7 @@ async fn pase_after_commissioning_complete_is_silently_dropped() {
             UdpTransport::bind().await.unwrap(),
         )));
         let result =
-            mat_controller::pase::establish(pase_transport, addr, PASSCODE, &fast_cfg()).await;
+            mat_controller::pase::establish(pase_transport, dev.addr, PASSCODE, &fast_cfg()).await;
         // Matched by hand (not `SecureSession: Debug`-derived `{result:?}`,
         // which doesn't exist) so a regression still prints something
         // actionable: `Ok` means the window failed to stay closed at all;
@@ -300,7 +266,7 @@ async fn pase_after_commissioning_complete_is_silently_dropped() {
         proto.encode(&mut datagram);
         datagram.extend_from_slice(&encode_pbkdf_param_request(&initiator_random, 0xBEEF));
 
-        raw.send_to(&datagram, addr).await.unwrap();
+        raw.send_to(&datagram, dev.addr).await.unwrap();
         let mut buf = [0u8; MAX_DATAGRAM];
         let recv = tokio::time::timeout(Duration::from_millis(300), raw.recv_from(&mut buf)).await;
         assert!(
@@ -309,8 +275,8 @@ async fn pase_after_commissioning_complete_is_silently_dropped() {
         );
     }
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }
 
 /// Live full-mDNS variant (mirrors `scripts/e2e-device-m1.sh`, which drives
@@ -331,13 +297,10 @@ async fn live_mdns_self_commission() {
     let store_dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = device_config(store_dir.path().to_path_buf());
     cfg.iface = iface;
-    let device = Device::new(cfg).expect("device new");
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der")).unwrap();
+    let spawned = spawn_device(cfg);
+    let paa_der = spawned.paa_der.clone();
     let paa_dir = store_dir.path().join("paa");
 
-    tokio::spawn(async move {
-        let _ = device.run().await;
-    });
     // Let the mDNS advertiser come up before browsing for it.
     tokio::time::sleep(Duration::from_millis(200)).await;
 

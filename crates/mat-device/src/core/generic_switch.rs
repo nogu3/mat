@@ -10,6 +10,7 @@ use mat_controller::tlv::{Tag, Writer};
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::events::EmittedEvent;
 use crate::core::stimulus::{PressKind, Stimulus, StimulusReply};
+use crate::core::tlv_value;
 
 pub struct GenericSwitchHandler {
     position: Arc<AtomicU8>,
@@ -30,12 +31,6 @@ impl GenericSwitchHandler {
             position,
         )
     }
-}
-
-fn uint_tlv(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
 }
 
 /// A single-field event payload struct `{0: v}` (e.g. `NewPosition` /
@@ -108,12 +103,14 @@ impl ClusterHandler for GenericSwitchHandler {
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
             im::ATTR_SWITCH_NUMBER_OF_POSITIONS => {
-                Some(uint_tlv(u64::from(Self::NUMBER_OF_POSITIONS)))
+                Some(tlv_value::uint(u64::from(Self::NUMBER_OF_POSITIONS)))
             }
-            im::ATTR_SWITCH_CURRENT_POSITION => {
-                Some(uint_tlv(u64::from(self.position.load(Ordering::SeqCst))))
+            im::ATTR_SWITCH_CURRENT_POSITION => Some(tlv_value::uint(u64::from(
+                self.position.load(Ordering::SeqCst),
+            ))),
+            im::ATTR_SWITCH_MULTI_PRESS_MAX => {
+                Some(tlv_value::uint(u64::from(Self::MULTI_PRESS_MAX)))
             }
-            im::ATTR_SWITCH_MULTI_PRESS_MAX => Some(uint_tlv(u64::from(Self::MULTI_PRESS_MAX))),
             _ => None,
         }
     }

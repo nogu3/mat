@@ -24,13 +24,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mat_controller::exchange::{ExchangeError, IncomingMessage, MrpConfig, ResponderExchange};
-use mat_controller::message::{
-    MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
-    PROTOCOL_ID_SECURE_CHANNEL,
-};
+use mat_controller::case::encode_status_report;
+use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
+use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use mat_controller::session::SessionKeys;
-use mat_controller::transport::{Transport, UdpTransport, MAX_DATAGRAM};
+use mat_controller::transport::{Transport, UdpTransport};
 
 use crate::core::pase::{
     PaseCoreError, PaseOutput, PaseResponderCore, PaseSecret, PaseVerifierConfig,
@@ -59,18 +57,6 @@ const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 /// other code depends on (contrast `mat_controller::pase::RECV_TIMEOUT`,
 /// which the real controller's op-budget accounting is built around).
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Same values as `mat_controller::test_support::fast_cfg` — 50ms
-/// intervals, no jitter.
-fn retry_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 /// Errors from driving one PASE responder handshake over the network.
 /// Malformed/foreign datagrams aren't an error variant here — `recv_first`
@@ -115,58 +101,6 @@ impl From<PaseCoreError> for NetPaseError {
     }
 }
 
-/// StatusReport failure payload (8 bytes LE `{general_code, protocol_id,
-/// protocol_code}`, spec §4.11.3) sent on any protocol violation the core
-/// rejects. `encode_status_report`/`GENERAL_CODE_FAILURE`/
-/// `SC_PROTOCOL_CODE_INVALID_PARAMETER` are `pub(crate)`/private to
-/// `mat_controller::case`/`pase`, so this is a local 8-byte replica rather
-/// than a shared helper.
-fn status_report_failure() -> [u8; 8] {
-    let mut buf = [0u8; 8];
-    buf[0..2].copy_from_slice(&GENERAL_CODE_FAILURE.to_le_bytes());
-    buf[2..6].copy_from_slice(&u32::from(PROTOCOL_ID_SECURE_CHANNEL).to_le_bytes());
-    buf[6..8].copy_from_slice(&SC_PROTOCOL_CODE_INVALID_PARAMETER.to_le_bytes());
-    buf
-}
-
-/// Reads the very first unsecured datagram from any sender — there's no
-/// `ResponderExchange` yet to hand this off to (that's what `adopt` is
-/// for), so this is a one-shot raw read, not a loop: PASE commissioning
-/// windows serve one initiator at a time, and this driver handles exactly
-/// one handshake. Malformed datagrams and standalone acks (which can't
-/// legitimately arrive before any exchange exists) are skipped.
-async fn recv_first(transport: &Transport) -> Result<(IncomingMessage, SocketAddr), NetPaseError> {
-    loop {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (n, from) = transport.recv_from(&mut buf).await?;
-        let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-            continue;
-        };
-        if header.session_id != 0 || header.security_flags != 0 {
-            continue;
-        }
-        let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-            continue;
-        };
-        if !proto.initiator {
-            continue;
-        }
-        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-        {
-            continue;
-        }
-        return Ok((
-            IncomingMessage {
-                header,
-                proto,
-                payload: buf[off + body_off..n].to_vec(),
-            },
-            from,
-        ));
-    }
-}
-
 /// Drives one PASE responder handshake to completion over `transport`:
 /// waits for PBKDFParamRequest, adopts a `ResponderExchange` on it, then
 /// feeds each message into a `PaseResponderCore` and replies until
@@ -180,7 +114,7 @@ pub async fn run_pase_once(
     let transport = Transport::Udp(Arc::new(transport));
 
     // First message: no exchange/peer known yet.
-    let (first, peer) = recv_first(&transport).await?;
+    let (first, peer) = crate::net::recv_first(&transport).await?;
 
     let (keys, _peer_session_id) = drive_established(
         &transport,
@@ -212,7 +146,7 @@ pub(crate) async fn drive_established(
     first: IncomingMessage,
     config: PaseVerifierConfig,
 ) -> Result<(SessionKeys, u16), NetPaseError> {
-    let cfg = retry_cfg();
+    let cfg = crate::net::fast_cfg();
     let mut core = PaseResponderCore::new(config);
 
     // One `ResponderExchange` for the whole handshake — see the module doc
@@ -232,7 +166,11 @@ pub(crate) async fn drive_established(
                     .reply_final(
                         PROTOCOL_ID_SECURE_CHANNEL,
                         OPCODE_STATUS_REPORT,
-                        &status_report_failure(),
+                        &encode_status_report(
+                            GENERAL_CODE_FAILURE,
+                            u32::from(PROTOCOL_ID_SECURE_CHANNEL),
+                            SC_PROTOCOL_CODE_INVALID_PARAMETER,
+                        ),
                         &cfg,
                     )
                     .await;

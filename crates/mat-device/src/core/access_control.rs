@@ -27,15 +27,16 @@ use mat_controller::tlv::{Reader, Tag, Value, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::tlv_value;
 
 /// `AccessControlEntryPrivilegeEnum` (spec §11.1.7.1) の全値。`check` の
 /// privilege lattice（`privilege_grants`）と AddNOC 自動 admin エントリの
 /// 両方がこれを使う。
-pub(crate) const PRIVILEGE_VIEW: u8 = 1;
-pub(crate) const PRIVILEGE_PROXY_VIEW: u8 = 2;
-pub(crate) const PRIVILEGE_OPERATE: u8 = 3;
-pub(crate) const PRIVILEGE_MANAGE: u8 = 4;
-pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
+pub const PRIVILEGE_VIEW: u8 = 1;
+pub const PRIVILEGE_PROXY_VIEW: u8 = 2;
+pub const PRIVILEGE_OPERATE: u8 = 3;
+pub const PRIVILEGE_MANAGE: u8 = 4;
+pub const PRIVILEGE_ADMINISTER: u8 = 5;
 
 /// `AccessControlEntryAuthModeEnum` (spec §11.1.7.1) のうちこの実装が
 /// 照合に使う値の 1 つ — CASE。PASE は fabric を持たないので ACL の対象外
@@ -43,11 +44,11 @@ pub(crate) const PRIVILEGE_ADMINISTER: u8 = 5;
 /// auth mode ごとに排他: CASE エントリは CASE session（`Subject::node`/
 /// `Subject::new`、`group_id == None`）にしか一致しない — group session
 /// （`Subject::group`）には決して一致しない（`subject_matches_entry`）。
-pub(crate) const AUTH_MODE_CASE: u8 = 2;
+pub const AUTH_MODE_CASE: u8 = 2;
 /// `AccessControlEntryAuthModeEnum::Group` — `mat group grant` が書く
 /// エントリの auth mode。`write` の妥当性検査（`validate_entry`）が
 /// subject を GroupId として検査する根拠。
-pub(crate) const AUTH_MODE_GROUP: u8 = 3;
+pub const AUTH_MODE_GROUP: u8 = 3;
 
 /// `SubjectsPerAccessControlEntry`/`TargetsPerAccessControlEntry`/
 /// `AccessControlEntriesPerFabric` (spec §11.1.5) — 固定値を返すのみで
@@ -380,9 +381,9 @@ impl ClusterHandler for AccessControlHandler {
             im::ATTR_ACL => Some(encode_acl_entries(
                 &self.store.entries_for(ctx.fabric_index),
             )),
-            im::ATTR_ACL_SUBJECTS_PER_ENTRY => Some(uint_value(ACL_SUBJECTS_PER_ENTRY)),
-            im::ATTR_ACL_TARGETS_PER_ENTRY => Some(uint_value(ACL_TARGETS_PER_ENTRY)),
-            im::ATTR_ACL_ENTRIES_PER_FABRIC => Some(uint_value(ACL_ENTRIES_PER_FABRIC as u64)),
+            im::ATTR_ACL_SUBJECTS_PER_ENTRY => Some(tlv_value::uint(ACL_SUBJECTS_PER_ENTRY)),
+            im::ATTR_ACL_TARGETS_PER_ENTRY => Some(tlv_value::uint(ACL_TARGETS_PER_ENTRY)),
+            im::ATTR_ACL_ENTRIES_PER_FABRIC => Some(tlv_value::uint(ACL_ENTRIES_PER_FABRIC as u64)),
             _ => None,
         }
     }
@@ -424,7 +425,8 @@ impl ClusterHandler for AccessControlHandler {
             return Err(im::STATUS_UNSUPPORTED_ACCESS);
         }
         if list_append {
-            let Some(entry) = decode_single_acl_entry(data_tlv) else {
+            let Some(entry) = tlv_value::decode_single_struct(data_tlv, decode_acl_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             validate_entry(&entry)?;
@@ -436,7 +438,8 @@ impl ClusterHandler for AccessControlHandler {
                 ..entry
             });
         } else {
-            let Some(entries) = decode_acl_entries(data_tlv) else {
+            let Some(entries) = tlv_value::decode_struct_list(data_tlv, decode_acl_entry_body)
+            else {
                 return Err(im::STATUS_CONSTRAINT_ERROR);
             };
             for entry in &entries {
@@ -479,16 +482,6 @@ impl ClusterHandler for AccessControlHandler {
     }
 }
 
-/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
-/// (the `ClusterHandler::read` contract) — same convention as
-/// `datamodel::uint_value`, duplicated locally since that one is private to
-/// `datamodel`.
-fn uint_value(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
-}
-
 /// `AccessControlEntryStruct` 列を array の Data TLV へ (spec §11.1.7.1,
 /// wire 形は `mat-native::ops::encode_acl_entries_tlv` と完全一致させる):
 /// 各要素 struct に `Context(1)=privilege, Context(2)=auth_mode,
@@ -521,41 +514,16 @@ fn write_acl_entry(w: &mut Writer, entry: &AclDeviceEntry) {
     w.end_container();
 }
 
-/// write の全置換径路: `data_tlv` は `AccessControlEntryStruct` の array。
-fn decode_acl_entries(data_tlv: &[u8]) -> Option<Vec<AclDeviceEntry>> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::ArrayStart {
-        return None;
-    }
-    let mut entries = Vec::new();
-    loop {
-        let el = r.next().ok()??;
-        match el.value {
-            Value::ContainerEnd => break,
-            Value::StructStart => entries.push(decode_acl_entry_body(&mut r)?),
-            _ => return None,
-        }
-    }
-    Some(entries)
-}
-
-/// write の ListIndex null append 径路: `data_tlv` は単一の
-/// `AccessControlEntryStruct`（array に包まれない）。
-fn decode_single_acl_entry(data_tlv: &[u8]) -> Option<AclDeviceEntry> {
-    let mut r = Reader::new(data_tlv);
-    let el = r.next().ok()??;
-    if el.value != Value::StructStart {
-        return None;
-    }
-    decode_acl_entry_body(&mut r)
-}
-
 /// `AccessControlEntryStruct` 1 件分のフィールド列を読む。呼び出し側が
 /// その `StructStart` を消費済みであることが前提。`Context(254)` は
 /// write 径路では呼び出し側が上書きするため実質無視されるが、
 /// read 結果を検証するテストヘルパ（`decode_entries_for_test`）はこの値を
 /// そのまま使う。
+///
+/// write の全置換径路（`data_tlv` = `AccessControlEntryStruct` の array）は
+/// `tlv_value::decode_struct_list`、ListIndex null append 径路（`data_tlv`
+/// = 単一の `AccessControlEntryStruct`、array に包まれない）は
+/// `tlv_value::decode_single_struct` がどちらもこの `body` reader を使う。
 fn decode_acl_entry_body(r: &mut Reader) -> Option<AclDeviceEntry> {
     let mut privilege = None;
     let mut auth_mode = None;
@@ -855,7 +823,7 @@ pub(crate) fn encode_targets_for_test(
 /// テスト専用の array-of-entries デコーダ（`read` の戻り値 → `(privilege,
 /// auth_mode, subjects, fabric_index)` の 4 要素タプル列）。
 pub(crate) fn decode_entries_for_test(tlv: &[u8]) -> Vec<(u8, u8, Vec<u64>, u8)> {
-    decode_acl_entries(tlv)
+    tlv_value::decode_struct_list(tlv, decode_acl_entry_body)
         .expect("well-formed acl read tlv")
         .into_iter()
         .map(|e| (e.privilege, e.auth_mode, e.subjects, e.fabric_index))

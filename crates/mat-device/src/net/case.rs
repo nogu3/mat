@@ -18,13 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mat_controller::case::encode_status_report;
-use mat_controller::exchange::{ExchangeError, IncomingMessage, MrpConfig, ResponderExchange};
-use mat_controller::message::{
-    MessageHeader, ProtocolHeader, OPCODE_MRP_STANDALONE_ACK, OPCODE_STATUS_REPORT,
-    PROTOCOL_ID_SECURE_CHANNEL,
-};
+use mat_controller::exchange::{ExchangeError, IncomingMessage, ResponderExchange};
+use mat_controller::message::{OPCODE_STATUS_REPORT, PROTOCOL_ID_SECURE_CHANNEL};
 use mat_controller::session::SecureSession;
-use mat_controller::transport::{Transport, UdpTransport, MAX_DATAGRAM};
+use mat_controller::transport::{Transport, UdpTransport};
 
 use crate::core::case::{CaseCoreError, CaseOutput, CaseResponderCore};
 use crate::core::fabric_store::FabricEntry;
@@ -43,18 +40,6 @@ const SC_PROTOCOL_CODE_INVALID_PARAMETER: u16 = 2;
 /// Wait budget for `ex.recv(...)` once a reply has already been
 /// standalone-acked — same rationale/value as `net::pase`'s `RECV_TIMEOUT`.
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Same values as `mat_controller::test_support::fast_cfg` / `net::pase`'s
-/// `retry_cfg` — 50ms intervals, no jitter.
-fn retry_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 /// Errors from driving one CASE responder handshake over the network.
 /// Malformed/foreign datagrams aren't an error variant here (screened out
@@ -122,41 +107,6 @@ fn status_report_failure(err: &CaseCoreError) -> Vec<u8> {
     )
 }
 
-/// Reads the very first unsecured datagram from any sender — mirrors
-/// `net::pase::recv_first` (see its doc comment); duplicated locally rather
-/// than shared since it's small and each driver owns its own module.
-async fn recv_first(transport: &Transport) -> Result<(IncomingMessage, SocketAddr), NetCaseError> {
-    loop {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (n, from) = transport.recv_from(&mut buf).await?;
-        let Ok((header, off)) = MessageHeader::decode(&buf[..n]) else {
-            continue;
-        };
-        if header.session_id != 0 || header.security_flags != 0 {
-            continue;
-        }
-        let Ok((proto, body_off)) = ProtocolHeader::decode(&buf[off..n]) else {
-            continue;
-        };
-        if !proto.initiator {
-            continue;
-        }
-        if proto.protocol_id == PROTOCOL_ID_SECURE_CHANNEL
-            && proto.opcode == OPCODE_MRP_STANDALONE_ACK
-        {
-            continue;
-        }
-        return Ok((
-            IncomingMessage {
-                header,
-                proto,
-                payload: buf[off + body_off..n].to_vec(),
-            },
-            from,
-        ));
-    }
-}
-
 /// Drives one CASE responder handshake to completion over `transport`:
 /// waits for Sigma1, adopts a `ResponderExchange` on it, then feeds each
 /// message into a `CaseResponderCore` (seeded with `fabrics`) and replies
@@ -169,7 +119,7 @@ pub async fn run_case_once(
     responder_session_id: u16,
 ) -> Result<(SecureSession, u8), NetCaseError> {
     let transport = Arc::new(Transport::Udp(Arc::new(transport)));
-    let (first, peer) = recv_first(&transport).await?;
+    let (first, peer) = crate::net::recv_first(&transport).await?;
     drive_established(transport, peer, first, fabrics, responder_session_id).await
 }
 
@@ -191,7 +141,7 @@ pub(crate) async fn drive_established(
     // Kept for the post-`Established` `local_node_id` lookup below —
     // `CaseResponderCore::new` takes ownership of `fabrics` itself.
     let fabrics_snapshot = fabrics.clone();
-    let cfg = retry_cfg();
+    let cfg = crate::net::fast_cfg();
 
     let mut core = CaseResponderCore::new(fabrics, responder_session_id);
 

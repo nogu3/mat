@@ -14,16 +14,13 @@
 //! device's loopback port.
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use mat_controller::commissioning::CommissioningFabric;
 use mat_controller::im;
 
-use mat_device::device::Device;
-
 mod support;
-use support::{commission_directly, device_config};
+use support::{commission_directly, device_config, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 778_899;
 
@@ -48,24 +45,11 @@ const REPORT_WAIT: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn subscribed_controller_gets_priming_a_change_report_and_a_keep_alive() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    // Same `[::]` -> `[::1]` substitution as `onoff_invoke.rs`/
-    // `self_commission_live.rs`: `local_addr()` is the wildcard bind
-    // address, not a valid send destination.
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4455, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // 1. Subscribe, narrowed to the OnOff cluster (endpoint/attribute
@@ -135,6 +119,6 @@ async fn subscribed_controller_gets_priming_a_change_report_and_a_keep_alive() {
         rd.reports
     );
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

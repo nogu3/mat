@@ -31,6 +31,7 @@ use std::time::Duration;
 use mat_controller::im::{AttrPathIn, EventPathIn, ReportEntryOut};
 use tokio::time::Instant;
 
+use crate::core::datamodel::Node;
 use crate::core::events::StoredEvent;
 
 /// How far *before* `max_interval` a keep-alive report is sent. The spec
@@ -164,6 +165,17 @@ impl ActiveSubscription {
                 self.pending_urgent = true;
             }
         }
+    }
+
+    /// `note_changed` + `note_events` for one dispatch outcome: `changed`
+    /// is what the request/stimulus/groupcast mutated, and the events it
+    /// emitted are read back off `node`'s log from `next_event` on. No
+    /// cluster emits from an invoke or a write today (`Node::drain_events`),
+    /// so for those callers the event half is a no-op — kept so the first
+    /// one that does gets the urgent regime, exactly like a stimulus.
+    pub fn note_outcome(&mut self, changed: &[(u16, u32, u32)], node: &Node) {
+        self.note_changed(changed);
+        self.note_events(&node.recent_events(self.next_event));
     }
 
     /// Whether this subscription asked for a concrete `(endpoint, cluster,

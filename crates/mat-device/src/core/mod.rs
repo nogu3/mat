@@ -25,3 +25,4 @@ pub mod network_commissioning;
 pub mod onoff;
 pub mod pase;
 pub mod stimulus;
+pub mod tlv_value;

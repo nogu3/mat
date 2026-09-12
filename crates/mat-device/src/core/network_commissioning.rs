@@ -11,6 +11,7 @@ use mat_controller::im;
 use mat_controller::tlv::{Tag, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::tlv_value;
 
 /// Ethernet feature bit (spec §11.9.4, Table 82: EthernetNetworkInterface).
 const FEATURE_MAP_ETHERNET: u32 = 0x04;
@@ -53,11 +54,7 @@ impl ClusterHandler for NetworkCommissioningHandler {
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_NC_MAX_NETWORKS => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, 1);
-                Some(w.finish())
-            }
+            im::ATTR_NC_MAX_NETWORKS => Some(tlv_value::uint(1)),
             im::ATTR_NC_NETWORKS => {
                 let mut w = Writer::new();
                 w.start_array(Tag::Anonymous);
@@ -68,18 +65,10 @@ impl ClusterHandler for NetworkCommissioningHandler {
                 w.end_container();
                 Some(w.finish())
             }
-            im::ATTR_NC_INTERFACE_ENABLED => {
-                let mut w = Writer::new();
-                w.put_bool(Tag::Anonymous, true);
-                Some(w.finish())
-            }
+            im::ATTR_NC_INTERFACE_ENABLED => Some(tlv_value::bool(true)),
             im::ATTR_NC_LAST_NETWORKING_STATUS
             | im::ATTR_NC_LAST_NETWORK_ID
-            | im::ATTR_NC_LAST_CONNECT_ERROR_VALUE => {
-                let mut w = Writer::new();
-                w.put_null(Tag::Anonymous);
-                Some(w.finish())
-            }
+            | im::ATTR_NC_LAST_CONNECT_ERROR_VALUE => Some(tlv_value::null()),
             _ => None,
         }
     }

@@ -4,6 +4,7 @@
 //! stage material in `Inner::pending` for `AddNOC` (`noc.rs`).
 
 use mat_controller::attestation::{attestation_tbs, encode_attestation_elements};
+use mat_controller::case::{eph_pub_bytes, random_p256_secret};
 use mat_controller::commissioning::{
     decode_add_trusted_root, decode_attestation_request, decode_cert_chain_request,
     decode_csr_request, encode_attestation_response, encode_cert_chain_response,
@@ -15,9 +16,7 @@ use mat_controller::x509::generate_csr;
 
 use crate::core::datamodel::{InvokeCtx, InvokeReply};
 
-use super::{
-    public_key_bytes, random_p256_secret, Inner, RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR,
-};
+use super::{Inner, RESP_ATTESTATION, RESP_CERT_CHAIN, RESP_CSR};
 
 impl Inner {
     /// AttestationRequest（spec §11.17.6.7）: signs `AttestationElements`
@@ -90,7 +89,7 @@ impl Inner {
         };
 
         let secret = random_p256_secret();
-        let op_public_key = public_key_bytes(&secret);
+        let op_public_key = eph_pub_bytes(&secret);
         let op_private_key: [u8; 32] = secret.to_bytes().into();
         let csr_der = generate_csr(&secret)
             .expect("csr generation over a freshly generated p256 key never fails");

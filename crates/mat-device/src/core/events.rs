@@ -94,15 +94,6 @@ impl EventLog {
     pub fn since(&self, min: u64) -> impl Iterator<Item = &StoredEvent> {
         self.entries.iter().filter(move |e| e.number >= min)
     }
-
-    /// 現在の保持件数（採番済み総数ではない）。
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 impl Default for EventLog {

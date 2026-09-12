@@ -18,26 +18,11 @@
 #![cfg(feature = "net")]
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use mat_controller::exchange::MrpConfig;
 use mat_controller::pase;
 use mat_controller::transport::{Transport, UdpTransport};
+use mat_device::net::fast_cfg;
 use mat_device::net::pase::run_pase_once;
-
-/// `MrpConfig` with fast retry intervals and no jitter — same values as
-/// `mat_controller::test_support::fast_cfg` (not reused directly: pulling
-/// it in would require enabling mat-controller's `test-responder` feature
-/// for a single trivial struct literal).
-fn fast_cfg() -> MrpConfig {
-    MrpConfig {
-        initial_interval: Duration::from_millis(50),
-        active_interval: Duration::from_millis(50),
-        max_retries: 2,
-        backoff: 1.0,
-        jitter: 0.0,
-    }
-}
 
 #[tokio::test]
 async fn mat_establish_against_mat_device_core() {

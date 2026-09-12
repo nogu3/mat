@@ -22,16 +22,12 @@
 //! device's loopback port.
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
-
 use mat_controller::commissioning::CommissioningFabric;
 use mat_controller::im;
 use mat_controller::tlv::{Reader, Tag, Value};
 
-use mat_device::device::Device;
-
 mod support;
-use support::{commission_directly, device_config};
+use support::{commission_directly, device_config, spawn_device};
 
 const ADMIN_NODE_ID: u64 = 990_011;
 
@@ -83,24 +79,11 @@ fn decode_add_group_response(fields_tlv: &[u8]) -> (u8, u16) {
 #[tokio::test]
 async fn group_provision_sequence_round_trips_over_case_session() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    // Same `[::]` -> `[::1]` substitution as the other `net`-feature tests
-    // (see `onoff_invoke.rs`'s comment): `local_addr()` is the wildcard
-    // bind address, not a valid send destination.
-    let addr = SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        device.local_addr().port(),
-    );
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der"))
-        .expect("device should have written its PAA DER at Device::new");
-
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
 
     let fabric =
         CommissioningFabric::generate(0x2233_4455, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     let cfg = support::fast_cfg();
 
     // 1. KeySetWrite.
@@ -205,6 +188,6 @@ async fn group_provision_sequence_round_trips_over_case_session() {
         "server-substituted fabricIndex (field 254) — the device's first (and only) fabric: {entry:?}"
     );
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

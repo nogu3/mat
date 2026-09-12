@@ -29,61 +29,40 @@ use mat_controller::session::SecureSession;
 use mat_controller::tlv::{Tag, Writer};
 use mat_controller::transport::{Transport, UdpTransport};
 
-use mat_device::device::Device;
+use mat_device::core::access_control::{
+    AUTH_MODE_CASE, AUTH_MODE_GROUP, PRIVILEGE_ADMINISTER, PRIVILEGE_OPERATE,
+};
 
 mod support;
-use support::{commission_directly, device_config, DEVICE_NODE_ID};
+use support::{commission_directly, device_config, put_acl_entry, spawn_device, DEVICE_NODE_ID};
 
 const ADMIN_NODE_ID: u64 = 660_033;
 const FABRIC_ID: u64 = 0x2233_4455;
 const KEYSET_ID: u16 = 42;
 const GROUP_ID: u16 = 0x000A;
 const EPOCH_KEY: [u8; 16] = [0x5A; 16];
-const PRIVILEGE_OPERATE: u8 = 3;
-const PRIVILEGE_ADMINISTER: u8 = 5;
-const AUTH_MODE_CASE: u8 = 2;
-const AUTH_MODE_GROUP: u8 = 3;
-
-fn put_entry(w: &mut Writer, privilege: u8, auth_mode: u8, subjects: &[u64]) {
-    w.start_struct(Tag::Anonymous);
-    w.put_uint(Tag::Context(1), u64::from(privilege));
-    w.put_uint(Tag::Context(2), u64::from(auth_mode));
-    w.start_array(Tag::Context(3));
-    for s in subjects {
-        w.put_uint(Tag::Anonymous, *s);
-    }
-    w.end_container();
-    w.put_null(Tag::Context(4));
-    w.put_uint(Tag::Context(254), 1);
-    w.end_container();
-}
 
 fn acl_tlv(with_group: bool) -> Vec<u8> {
     let mut w = Writer::new();
     w.start_array(Tag::Anonymous);
-    put_entry(
+    put_acl_entry(
         &mut w,
         PRIVILEGE_ADMINISTER,
         AUTH_MODE_CASE,
         &[ADMIN_NODE_ID],
+        1,
     );
     if with_group {
-        put_entry(
+        put_acl_entry(
             &mut w,
             PRIVILEGE_OPERATE,
             AUTH_MODE_GROUP,
             &[u64::from(GROUP_ID)],
+            1,
         );
     }
     w.end_container();
     w.finish()
-}
-
-fn loopback(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        addr.port(),
-    )
 }
 
 fn group_creds(fabric: &CommissioningFabric) -> GroupCredentials {
@@ -232,16 +211,11 @@ async fn provision_group(session: &mut SecureSession) {
 #[tokio::test]
 async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_persists() {
     let store_dir = tempfile::tempdir().expect("tempdir");
-    let device = Device::new(device_config(store_dir.path().to_path_buf())).expect("device new");
-    let addr = loopback(device.local_addr());
-    let group_addr = loopback(device.group_local_addr().expect("group socket bound"));
-    let paa_der = std::fs::read(store_dir.path().join("paa").join("paa.der")).expect("paa.der");
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
+    let group_addr = dev.group_addr.expect("group socket bound");
 
     let fabric = CommissioningFabric::generate(FABRIC_ID, ADMIN_NODE_ID).expect("fabric generate");
-    let mut session = commission_directly(addr, &paa_der, &fabric).await;
+    let mut session = commission_directly(dev.addr, &dev.paa_der, &fabric).await;
     provision_group(&mut session).await;
     let creds = group_creds(&fabric);
 
@@ -301,15 +275,10 @@ async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_pers
 
     // 5. Restart the device on the same store: keys, map and membership come
     //    back from disk and a fresh groupcast is applied.
-    device_task.abort();
-    let _ = device_task.await;
-    let device =
-        Device::new(device_config(store_dir.path().to_path_buf())).expect("device restart");
-    let addr = loopback(device.local_addr());
-    let group_addr = loopback(device.group_local_addr().expect("group socket bound"));
-    let device_task = tokio::spawn(async move {
-        let _ = device.run().await;
-    });
+    dev.task.abort();
+    let _ = dev.task.await;
+    let dev = spawn_device(device_config(store_dir.path().to_path_buf()));
+    let group_addr = dev.group_addr.expect("group socket bound");
 
     let admin = fabric.admin_credentials().expect("admin credentials");
     let transport = Arc::new(Transport::Udp(Arc::new(
@@ -317,7 +286,15 @@ async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_pers
     )));
     let mut session = None;
     for _ in 0..10 {
-        match case::establish(Arc::clone(&transport), addr, &admin, DEVICE_NODE_ID, &cfg).await {
+        match case::establish(
+            Arc::clone(&transport),
+            dev.addr,
+            &admin,
+            DEVICE_NODE_ID,
+            &cfg,
+        )
+        .await
+        {
             Ok(s) => {
                 session = Some(s);
                 break;
@@ -361,6 +338,6 @@ async fn groupcast_toggle_is_applied_replay_rejected_acl_enforced_and_state_pers
     send_group_toggle(&creds, group_addr, 1).await; // fresh replay table after restart
     expect_onoff(&mut session, true, "group toggle after restart").await;
 
-    device_task.abort();
-    let _ = device_task.await;
+    dev.task.abort();
+    let _ = dev.task.await;
 }

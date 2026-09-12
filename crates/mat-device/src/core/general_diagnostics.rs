@@ -15,6 +15,7 @@ use mat_controller::im;
 use mat_controller::tlv::{Tag, Writer};
 
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
+use crate::core::tlv_value;
 
 /// `NetworkInterface.type` (spec §11.11.5.1, InterfaceTypeEnum): Ethernet.
 /// mat-device only ever serves a single wired interface (mirrors
@@ -73,21 +74,9 @@ impl ClusterHandler for GeneralDiagnosticsHandler {
                 w.end_container();
                 Some(w.finish())
             }
-            im::ATTR_GD_REBOOT_COUNT => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, 0);
-                Some(w.finish())
-            }
-            im::ATTR_GD_UP_TIME => {
-                let mut w = Writer::new();
-                w.put_uint(Tag::Anonymous, self.started.elapsed().as_secs());
-                Some(w.finish())
-            }
-            im::ATTR_GD_TEST_EVENT_TRIGGERS_ENABLED => {
-                let mut w = Writer::new();
-                w.put_bool(Tag::Anonymous, false);
-                Some(w.finish())
-            }
+            im::ATTR_GD_REBOOT_COUNT => Some(tlv_value::uint(0)),
+            im::ATTR_GD_UP_TIME => Some(tlv_value::uint(self.started.elapsed().as_secs())),
+            im::ATTR_GD_TEST_EVENT_TRIGGERS_ENABLED => Some(tlv_value::bool(false)),
             _ => None,
         }
     }

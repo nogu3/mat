@@ -35,7 +35,6 @@ use mat_controller::commissioning::{
 #[cfg(test)]
 use mat_controller::im;
 use mat_controller::sync::locked;
-use mat_controller::tlv::{Tag, Writer};
 use mat_controller::x509::DevAttestation;
 
 use crate::core::access_control::AclStore;
@@ -319,6 +318,26 @@ struct Inner {
     group_membership_store: Option<GroupMembershipStore>,
 }
 
+impl Inner {
+    /// Drops every per-fabric row `fabric_index` owns in the three shared
+    /// stores (ACL, group keys, group membership). Called wherever a fabric
+    /// leaves the store — `RemoveFabric` (both the persisted and the
+    /// persist-failed branch) and the fail-safe rollback — so a later
+    /// `AddNOC` reusing the index never inherits the previous occupant's
+    /// rows (cross-fabric leak; see `handle_remove_fabric`'s comment).
+    pub(super) fn purge_fabric_stores(&self, fabric_index: u8) {
+        if let Some(store) = &self.acl_store {
+            store.purge_fabric(fabric_index);
+        }
+        if let Some(store) = &self.group_key_store {
+            store.purge_fabric(fabric_index);
+        }
+        if let Some(store) = &self.group_membership_store {
+            store.purge_fabric(fabric_index);
+        }
+    }
+}
+
 /// Device-side commissioning server. Construct with `new`, then either call
 /// `into_cluster_handlers` to register it on a `Node`'s endpoint 0, or (in
 /// tests) dispatch commands directly.
@@ -366,10 +385,7 @@ impl CommissioningServer {
     /// `ATTR_GROUP_KEY_MAP` write are commissionee-invoked commands the
     /// cluster handler itself serves, not something `AddNOC` stages.
     pub fn set_group_key_store(&mut self, store: GroupKeyStore) {
-        self.inner
-            .lock()
-            .expect("commissioning server mutex poisoned")
-            .group_key_store = Some(store);
+        locked(&self.inner).group_key_store = Some(store);
     }
 
     /// Wires a shared `GroupMembershipStore` in — the same store every
@@ -518,56 +534,4 @@ impl CommissioningServer {
             _ => InvokeReply::Status(im::STATUS_UNSUPPORTED_CLUSTER),
         }
     }
-}
-
-/// Encodes a scalar as one standalone, `Tag::Anonymous`-tagged TLV element
-/// (the `ClusterHandler::read` contract) — same convention as
-/// `datamodel::uint_value`, duplicated here since that one is private to its
-/// own module.
-fn uint_value(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_uint(Tag::Anonymous, v);
-    w.finish()
-}
-
-fn bool_value(v: bool) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_bool(Tag::Anonymous, v);
-    w.finish()
-}
-
-/// A standalone, `Tag::Anonymous`-tagged TLV `null` element — for nullable
-/// attributes (e.g. `AdminFabricIndex`/`AdminVendorID` while the
-/// Administrator Commissioning window is closed) that must read back
-/// distinct from a valid `0`.
-fn null_value() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_null(Tag::Anonymous);
-    w.finish()
-}
-
-/// Generates a fresh non-zero P-256 secret key (rejects the ~0-probability
-/// out-of-range case and retries with fresh randomness) — device-side
-/// equivalent of `mat_controller::case::random_p256_secret`, which is
-/// `pub(crate)` there and so not reachable from this crate.
-fn random_p256_secret() -> p256::SecretKey {
-    loop {
-        let mut b = [0u8; 32];
-        getrandom::fill(&mut b).expect("os rng");
-        if let Ok(sk) = p256::SecretKey::from_slice(&b) {
-            return sk;
-        }
-    }
-}
-
-/// `secret`'s SEC1 uncompressed public key (65 bytes) — device-side
-/// equivalent of `mat_controller::case::eph_pub_bytes`.
-fn public_key_bytes(secret: &p256::SecretKey) -> [u8; 65] {
-    use p256::elliptic_curve::sec1::ToSec1Point;
-    secret
-        .public_key()
-        .to_sec1_point(false)
-        .as_bytes()
-        .try_into()
-        .expect("uncompressed p256 point is 65 bytes")
 }

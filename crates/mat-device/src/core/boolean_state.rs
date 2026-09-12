@@ -10,6 +10,7 @@ use mat_controller::tlv::{Tag, Writer};
 use crate::core::datamodel::{ClusterHandler, InvokeCtx, InvokeReply, ReadCtx};
 use crate::core::events::EmittedEvent;
 use crate::core::stimulus::{Stimulus, StimulusReply};
+use crate::core::tlv_value;
 
 pub struct BooleanStateHandler {
     state: Arc<AtomicBool>,
@@ -50,11 +51,7 @@ impl ClusterHandler for BooleanStateHandler {
 
     fn read(&self, attribute: u32, _ctx: &ReadCtx) -> Option<Vec<u8>> {
         match attribute {
-            im::ATTR_BS_STATE_VALUE => {
-                let mut w = Writer::new();
-                w.put_bool(Tag::Anonymous, self.state.load(Ordering::SeqCst));
-                Some(w.finish())
-            }
+            im::ATTR_BS_STATE_VALUE => Some(tlv_value::bool(self.state.load(Ordering::SeqCst))),
             _ => None,
         }
     }
