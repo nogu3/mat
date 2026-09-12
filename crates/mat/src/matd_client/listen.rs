@@ -54,6 +54,10 @@ pub struct ListenParams {
     pub reconnect: bool,
 }
 
+/// `mat listen`: matd へ接続し、ack 後のイベント行をそのまま stdout へ流す。
+/// count/timeout は mat 側制御（enl listen と同じ UX）。matd 不在・応答なし・
+/// ストリーム途中の matd 落ちは `matd_unavailable`（exit 13）。`--reconnect`
+/// 指定時はその喪失を backoff 再接続で跨ぐ（count 累積・deadline 1 本）。
 pub fn dispatch_listen(sockets: &[PathBuf], p: &ListenParams) -> ExitCode {
     let op = listen_request_json(p.node, p.endpoint, &p.cluster, &p.attribute, &p.event);
     if p.reconnect {
