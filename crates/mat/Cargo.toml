@@ -27,11 +27,7 @@ mat-native.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["rt", "net", "time"] }
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

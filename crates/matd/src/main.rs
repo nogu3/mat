@@ -73,49 +73,30 @@ enum Command {
     Reload,
 }
 
-fn main() {
-    // `matd status | jq` のようにパイプ先が先に閉じると、Rust 既定の SIGPIPE
-    // 無視のままでは `println!` が EPIPE で panic する（"failed printing to
-    // stdout: Broken pipe"）。通常の CLI と同じく SIGPIPE で黙って終わる。
-    // 常駐 serve は stdout に書かないので影響しない。
-    #[cfg(unix)]
-    // SAFETY: SIG_DFL の設定はプロセス起動直後・スレッド生成前の 1 回だけで、
-    // 副作用は「EPIPE の代わりに SIGPIPE で終了する」に限られる。
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-    // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）で制御。
-    // 既定は info（常駐デーモンなので状態遷移は既定で残す）。空文字は
-    // 未設定扱い、パースできない指定は次の候補へ送る（`mat_core::log` 参照）。
-    let filter = mat_core::log::log_filter_candidates_from_env()
-        .into_iter()
-        .find_map(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
-        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        // デーモンなので ANSI は常に無効。tracing-subscriber は tty 判定を
-        // せず（`is_ansi = cfg!(feature = "ansi") && NO_COLOR 未設定`）、
-        // 既定では journald に `^[[3mnode_id^[[0m^[[2m=^[[0m42` を書いて
-        // しまい `grep node_id=42` が空振りする。
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .init();
+fn main() -> std::process::ExitCode {
+    // `matd status | jq` のようにパイプ先が先に閉じても EPIPE panic しない
+    // （常駐 serve は stdout に書かないので影響しない）。
+    mat_core::log::reset_sigpipe();
+    // レベルは mat 本体と同じく `MAT_LOG`（無ければ `RUST_LOG`）、既定は info
+    // （常駐デーモンなので状態遷移は既定で残す）。デーモンなので ANSI は常に
+    // 無効 — tracing-subscriber は tty 判定をせず、既定では journald に
+    // `^[[3mnode_id^[[0m^[[2m=^[[0m42` を書いて `grep node_id=42` が空振りする。
+    mat_core::log::init_stderr("info", false);
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            MatError::new(
+            return MatError::new(
                 ErrorKind::Other,
                 format!("failed to start tokio runtime: {e}"),
             )
-            .emit();
-            std::process::exit(ErrorKind::Other.exit_code() as i32);
+            .emit_exit();
         }
     };
 
-    if let Err(e) = runtime.block_on(run(Cli::parse())) {
-        e.emit();
-        std::process::exit(e.kind.exit_code() as i32);
+    match runtime.block_on(run(Cli::parse())) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => e.emit_exit(),
     }
 }
 
@@ -125,6 +106,32 @@ async fn run(cli: Cli) -> Result<(), MatError> {
         Some(Command::Status) => admin_op(cli.socket, "status").await,
         Some(Command::Reload) => admin_op(cli.socket, "reload").await,
         None => serve_daemon(cli).await,
+    }
+}
+
+/// native の iface: 明示指定を優先、未設定なら自動検出。候補 0 / 複数は
+/// ハードエラー（全 op が死ぬ設定不備なので fail-fast — 起動拒否）。
+/// `mat` の `main.rs` と同型（ログ文言だけ違う）。
+fn select_iface(explicit: &Option<String>) -> Result<String, MatError> {
+    match explicit {
+        Some(i) => Ok(i.clone()),
+        None => {
+            let i = mat_native::iface_select::autodetect()?;
+            tracing::info!(iface = %i, "iface auto-selected (matd native default)");
+            Ok(i)
+        }
+    }
+}
+
+/// groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
+/// 自動検出（失敗は None のまま — LAN 単独送出）。`mat` と同型。
+fn select_thread_iface(explicit: &Option<String>) -> Option<mat_native::ThreadIfaceChoice> {
+    match explicit {
+        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
+        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
+            tracing::info!(iface = %n, "thread iface auto-detected (matd groupcast egress)");
+            mat_native::ThreadIfaceChoice::Auto(n)
+        }),
     }
 }
 
@@ -160,29 +167,11 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 検出（M8c-3 native 既定化）。自動検出の候補 0 / 複数は起動拒否 —
     // 全 op が死ぬ設定不備なので per-op エラーではなく fail-fast にする
     // （本番機の systemd unit は env 設定済みで影響なし）。
-    let iface: String = match &cli.iface {
-        Some(i) => i.clone(),
-        None => match mat_native::iface_select::autodetect() {
-            Ok(i) => {
-                tracing::info!(iface = %i, "iface auto-selected (matd native default)");
-                i
-            }
-            Err(e) => {
-                e.emit();
-                std::process::exit(e.kind.exit_code() as i32);
-            }
-        },
-    };
+    let iface = select_iface(&cli.iface)?;
 
     // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
     // 自動検出（失敗は None のまま — LAN 単独送出。mat 本体 main.rs と同じ流儀）。
-    let thread_iface = match &cli.thread_iface {
-        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
-        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
-            tracing::info!(iface = %n, "thread iface auto-detected (matd groupcast egress)");
-            mat_native::ThreadIfaceChoice::Auto(n)
-        }),
-    };
+    let thread_iface = select_thread_iface(&cli.thread_iface);
 
     // native 構築失敗（KVS 資材が読めない等）は致命にしない。matd は起動を続け、
     // 以後の全リクエストへこの構築エラーをそのまま返す（M8c-3: chip-tool
@@ -221,18 +210,9 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
             tracing::info!(%iface, thread_iface = ?thread_iface, fabric_index = cli.fabric_index, "native backend enabled");
             server::NativeState::Ready(Box::new(b))
         }
-        Err(mut e) => {
-            // mat 側の map_engine_build_error（crates/mat/src/native_direct.rs）と
-            // 同様に `mat fabric init` への誘導を detail に足す（二重付与は避ける）。
-            // store_missing の場合のみ誘導を追加（他の kind は事象特有）。
-            if e.kind == mat_core::error::ErrorKind::StoreMissing
-                && !e.detail.contains("mat fabric init")
-            {
-                e.detail = format!(
-                    "{} — run `mat fabric init` to bootstrap the credential store",
-                    e.detail
-                );
-            }
+        Err(e) => {
+            // mat 側の直経路（native_direct::with_engine）と同じ写像。
+            let e = e.with_fabric_init_hint();
             tracing::warn!(
                 error = %e.detail,
                 "native backend build failed; matd will start but every op will \
@@ -251,13 +231,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 常駐購読のクラスタ絞り込み（subscriptions.toml、無し = full wildcard）。
     // 設定不備は fail-fast: 黙って wildcard に落ちると弱リンク対策が無効化
     // されたことに気づけない（ambiguous iface autodetect と同じ規律）。
-    let sub_config = match matd::subscribe_config::load(&store_path) {
-        Ok(c) => c,
-        Err(e) => {
-            e.emit();
-            std::process::exit(e.kind.exit_code() as i32);
-        }
-    };
+    let sub_config = matd::subscribe_config::load(&store_path)?;
     // 属性の絞り込み（`clusters`）とイベント範囲（`events`）は独立。ファイルが
     // 無ければ属性 = full wildcard、イベント = 全クラスタ urgent（spec §6.2）。
     let (sub_clusters, event_scope) = match sub_config {
@@ -334,20 +308,7 @@ fn admin_response_to_result(resp: Value) -> Result<Value, MatError> {
     let Some(err) = resp.get("error") else {
         return Ok(resp);
     };
-    let kind = match err
-        .get("kind")
-        .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
-    {
-        Some(k) => k,
-        None => {
-            let raw_kind = err.get("kind").cloned().unwrap_or(Value::Null);
-            tracing::warn!(
-                kind = %raw_kind,
-                "unknown error kind from matd; mapping to `other` for the exit code"
-            );
-            ErrorKind::Other
-        }
-    };
+    let kind = ErrorKind::from_wire(err.get("kind"));
     let detail = err
         .get("detail")
         .and_then(|d| d.as_str())
@@ -374,7 +335,8 @@ async fn send_admin_op(socket: &Path, op: &str) -> Result<Value, MatError> {
     })?;
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_vec(&serde_json::json!({ "op": op })).unwrap();
+    let mut line = serde_json::to_vec(&serde_json::json!({ "op": op }))
+        .map_err(|e| MatError::new(ErrorKind::Other, format!("failed to encode {op}: {e}")))?;
     line.push(b'\n');
     write_half
         .write_all(&line)

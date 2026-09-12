@@ -31,7 +31,7 @@ use crate::subscription::{Emitted, SubHealth};
 /// 常駐を続ける（M8c-3: KVS 不在でも起動し、後から `mat fabric init` できる
 /// ようにする）。各リクエストはこの結果を参照する — `Unavailable` は保持した
 /// 構築エラーをそのまま返す（store_missing/store_parse; mat 直経路の
-/// `native_direct::map_engine_build_error` と同じ一律化）。
+/// `MatError::with_fabric_init_hint` と同じ一律化）。
 pub enum NativeState {
     // Box: NativeBackend は MatError よりかなり大きく、素の enum は
     // clippy::large_enum_variant に触れる。プロセス起動時に 1 回だけ作る値
@@ -191,11 +191,7 @@ async fn handle_conn(
                         // 受け付けられなかった場合も残す（この op は dispatch に
                         // 到達しないため op ログには出ない）。
                         tracing::info!(kind = ?e.kind, detail = %e.detail, "listen client rejected");
-                        let mut buf = serde_json::to_vec(&error_response(req.id, &e))
-                            .unwrap_or_else(|_| b"{}".to_vec());
-                        buf.push(b'\n');
-                        write_half.write_all(&buf).await?;
-                        write_half.flush().await?;
+                        write_line(&mut write_half, &error_response(req.id, &e)).await?;
                         return Ok(());
                     }
                 };
@@ -205,10 +201,7 @@ async fn handle_conn(
                 if let (Value::Object(map), Some(id)) = (&mut ack, req.id) {
                     map.insert("id".into(), id);
                 }
-                let mut buf = serde_json::to_vec(&ack).unwrap_or_else(|_| b"{}".to_vec());
-                buf.push(b'\n');
-                write_half.write_all(&buf).await?;
-                write_half.flush().await?;
+                write_line(&mut write_half, &ack).await?;
                 // 「センサーが反応しなかった」の切り分けに、購読者が居たか
                 // どうかを残す。フィルタは全て Option なので未指定は省略される。
                 // `scripts/e2e-device-m3.sh` はこのログの `"listen client
@@ -254,11 +247,8 @@ async fn handle_conn(
                 return Ok(());
             }
         };
-        let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
-        buf.push(b'\n');
-        write_half.write_all(&buf).await?;
+        write_line(&mut write_half, &response).await?;
         // 応答をワイヤに出し切ってから停止を発火する（クライアントが確実に受け取る）。
-        write_half.flush().await?;
         if is_shutdown {
             shutdown.notify_one();
             break;
@@ -312,11 +302,7 @@ async fn stream_events(
                     if !filter.matches(&ev) {
                         continue;
                     }
-                    let mut buf = serde_json::to_vec(&ev.to_json())
-                        .unwrap_or_else(|_| b"{}".to_vec());
-                    buf.push(b'\n');
-                    write_half.write_all(&buf).await?;
-                    write_half.flush().await?;
+                    write_line(write_half, &ev.to_json()).await?;
                     delivered += 1;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -330,10 +316,7 @@ async fn stream_events(
                         "error": { "kind": "other", "detail": "event stream lagged" },
                         "timestamp": now_iso8601(),
                     });
-                    let mut buf = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-                    buf.push(b'\n');
-                    write_half.write_all(&buf).await?;
-                    write_half.flush().await?;
+                    write_line(write_half, &body).await?;
                     return Ok(());
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -1116,6 +1099,18 @@ fn error_response(id: Option<Value>, e: &MatError) -> Value {
         }
     }
     body
+}
+
+/// 応答 / イベント 1 件を NDJSON 1 行で書き、flush する。JSON 化不能（実質
+/// 到達しない）は `{}` を書く — 行を欠かして相手の枚数勘定を狂わせない。
+async fn write_line(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    v: &Value,
+) -> std::io::Result<()> {
+    let mut buf = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+    buf.push(b'\n');
+    write_half.write_all(&buf).await?;
+    write_half.flush().await
 }
 
 #[cfg(test)]
@@ -2445,7 +2440,7 @@ mod tests {
 
     /// `log_op` の出力を直接検証するための writer。`Arc<Mutex<Vec<u8>>>` を
     /// 包むだけの薄いラッパで、新規依存は増やさない
-    /// （`tracing-subscriber` は matd の通常依存なので lib のテストからも使える）。
+    /// （`tracing-subscriber` は matd の dev-dependency なのでテストからは使える）。
     #[derive(Clone)]
     struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 

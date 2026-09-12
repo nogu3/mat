@@ -86,20 +86,7 @@ pub(super) fn exchange_on_stream(
 pub(super) fn emit_response(resp: Value) -> ExitCode {
     if let Some(err) = resp.get("error") {
         eprintln!("{resp}");
-        let kind = match err
-            .get("kind")
-            .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
-        {
-            Some(k) => k,
-            None => {
-                let raw_kind = err.get("kind").cloned().unwrap_or(Value::Null);
-                tracing::warn!(
-                    kind = %raw_kind,
-                    "unknown error kind from matd; mapping to `other` for the exit code"
-                );
-                ErrorKind::Other
-            }
-        };
+        let kind = ErrorKind::from_wire(err.get("kind"));
         ExitCode::from(kind.exit_code())
     } else {
         println!("{resp}");
