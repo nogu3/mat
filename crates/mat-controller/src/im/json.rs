@@ -1,8 +1,9 @@
 //! IM の TLV 値 → JSON 変換（read / listen の出力形）。struct のキーは
 //! context tag の 10 進文字列、bytes は小文字 hex 文字列。
 
-use crate::tlv::{Element, Reader, Tag, Value};
+use crate::tlv::{Element, Reader, StructFields, Tag, Value};
 
+use super::invoke::field_err;
 use super::{skip_container, ImError};
 
 /// TLV 単一要素（コンテナ含む）を JSON へ。`first` は既に読んだ先頭要素。
@@ -59,11 +60,8 @@ fn tlv_element_to_json_impl(
         }
         Value::StructStart => {
             let mut map = serde_json::Map::new();
-            loop {
-                let el = r.next()?.ok_or(ImError::Malformed("truncated struct"))?;
-                if el.value == Value::ContainerEnd {
-                    break;
-                }
+            let mut f = StructFields::inside(r);
+            while let Some(el) = f.next_field().map_err(field_err("truncated struct"))? {
                 let key = match el.tag {
                     Tag::Context(n) => n.to_string(),
                     _ => {
@@ -73,12 +71,12 @@ fn tlv_element_to_json_impl(
                             el.value,
                             Value::StructStart | Value::ArrayStart | Value::ListStart
                         ) {
-                            skip_container(r)?;
+                            skip_container(f.reader())?;
                         }
                         continue;
                     }
                 };
-                map.insert(key, tlv_element_to_json_impl(r, el, depth + 1)?);
+                map.insert(key, tlv_element_to_json_impl(f.reader(), el, depth + 1)?);
             }
             J::Object(map)
         }
@@ -93,7 +91,38 @@ fn hex_lower(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::im::*;
-    use crate::tlv::{Tag, Writer};
+    use crate::tlv::{Tag, TlvError, Writer};
+
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
+    /// （Task 7 Step 1: 旧コードに対して先に PASS させる — 詳細は
+    /// im/invoke.rs の同名テストの doc コメント参照）。
+    #[test]
+    fn tlv_to_json_error_labels_are_stable() {
+        assert_eq!(
+            tlv_to_json(&[]).unwrap_err(),
+            ImError::Malformed("empty tlv")
+        );
+        assert_eq!(
+            tlv_to_json(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated struct")
+        );
+        assert_eq!(
+            tlv_to_json(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+        assert_eq!(
+            tlv_to_json(&[0x18]).unwrap_err(),
+            ImError::Malformed("dangling container end")
+        );
+        // accepted delta: 要素自体が途中で切れている（context tag 1, uint8,
+        // 値バイト欠落）。旧: r.next()? の Truncated がそのまま
+        // Tlv(Truncated) に素通しされていた。新: StructFields::next_field も
+        // 同じ Truncated を返すが、field_err が "truncated struct" に畳む。
+        assert_eq!(
+            tlv_to_json(&[0x15, 0x24, 0x01]).unwrap_err(),
+            ImError::Malformed("truncated struct") // accepted delta: 以前は Tlv(Truncated)
+        );
+    }
 
     #[test]
     fn tlv_to_json_rejects_pathological_nesting() {
