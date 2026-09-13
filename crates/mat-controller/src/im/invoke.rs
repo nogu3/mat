@@ -2,12 +2,25 @@
 //! encode / decode。コントローラ側の invoke と、device 側の InvokeRequest
 //! 受理 / InvokeResponse 送出の両方向。
 
-use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
+use crate::tlv::{copy_value, Reader, StructFields, Tag, TlvError, Value, Writer};
 
 use super::{
     expect_struct_start, put_status_ib, skip_container, ImError, InvokeOutcome, InvokeResponseData,
     IM_REVISION,
 };
+
+/// `StructFields`（`next_scalar`/`next_field`）の走査 `Err` を `ImError` に写す。
+/// `ContainerEnd` 到達前の入力終端はすべて `Truncated` として `truncated`
+/// ラベルの `Malformed` に、それ以外の TLV デコードエラーはそのまま `Tlv` に
+/// 渡す。`pase.rs`/`case/wire.rs` の同名ヘルパーと同じ役割。im/write.rs
+/// 等の他の IM ファイルも `use super::invoke::field_err;` でこれを共有する
+/// （Task 3 決定 — struct 走査 helper を一箇所に集約する）。
+pub(super) fn field_err(truncated: &'static str) -> impl Fn(TlvError) -> ImError {
+    move |e| match e {
+        TlvError::Truncated => ImError::Malformed(truncated),
+        other => ImError::Tlv(other),
+    }
+}
 
 /// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
 /// フィールド（タイムド呼び出し、spec §8.5）の値になる。公開関数
@@ -148,20 +161,21 @@ fn decode_request_command_data_ib(r: &mut Reader) -> Result<RequestCommandDataFi
     let mut cluster = None;
     let mut command = None;
     let mut fields_tlv = Vec::new();
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated command data ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated command data ib"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ListStart) => {
-                // CommandPath
-                loop {
-                    let e2 = r
-                        .next()?
-                        .ok_or(ImError::Malformed("truncated command path"))?;
+                // CommandPath: 中身は全部スカラーなので next_scalar でよい
+                // （未知の入れ子は自動で skip される）。
+                let mut cp = StructFields::inside(f.reader());
+                while let Some(e2) = cp
+                    .next_scalar()
+                    .map_err(field_err("truncated command path"))?
+                {
                     match (e2.tag, e2.value) {
-                        (_, Value::ContainerEnd) => break,
                         (Tag::Context(0), Value::Uint(v)) => {
                             endpoint = Some(u16::try_from(v).map_err(|_| {
                                 ImError::Malformed("command path endpoint out of range")
@@ -177,9 +191,6 @@ fn decode_request_command_data_ib(r: &mut Reader) -> Result<RequestCommandDataFi
                                 ImError::Malformed("command path command out of range")
                             })?);
                         }
-                        (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                            skip_container(r)?;
-                        }
                         _ => {}
                     }
                 }
@@ -188,11 +199,11 @@ fn decode_request_command_data_ib(r: &mut Reader) -> Result<RequestCommandDataFi
                 // CommandFields: re-tag to Anonymous, same convention as
                 // `decode_command_data_ib`'s response-side echo.
                 let mut w = Writer::new();
-                copy_value(&mut w, r, Tag::Anonymous, Value::StructStart)?;
+                copy_value(&mut w, f.reader(), Tag::Anonymous, Value::StructStart)?;
                 fields_tlv = w.finish();
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -213,16 +224,18 @@ pub fn decode_invoke_request(payload: &[u8]) -> Result<InvokeRequestIn, ImError>
     let mut cluster = None;
     let mut command = None;
     let mut fields_tlv = Vec::new();
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated invoke request"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated invoke request"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Bool(b)) => suppress_response = b,
             (Tag::Context(1), Value::Bool(b)) => timed = b,
             (Tag::Context(2), Value::ArrayStart) => {
-                // InvokeRequests
+                // InvokeRequests: array element walk stays hand-rolled (only
+                // the first entry is interpreted, rest are skipped).
+                let r = f.reader();
                 let mut first = true;
                 loop {
                     let e2 = r
@@ -231,14 +244,14 @@ pub fn decode_invoke_request(payload: &[u8]) -> Result<InvokeRequestIn, ImError>
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart if first => {
-                            let (ep, cl, cmd, fields) = decode_request_command_data_ib(&mut r)?;
+                            let (ep, cl, cmd, fields) = decode_request_command_data_ib(r)?;
                             endpoint = ep;
                             cluster = cl;
                             command = cmd;
                             fields_tlv = fields;
                             first = false;
                         }
-                        Value::StructStart => skip_container(&mut r)?,
+                        Value::StructStart => skip_container(r)?,
                         _ => {
                             return Err(ImError::Malformed("unexpected element in invoke requests"))
                         }
@@ -246,7 +259,7 @@ pub fn decode_invoke_request(payload: &[u8]) -> Result<InvokeRequestIn, ImError>
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -266,10 +279,9 @@ pub fn decode_invoke_request(payload: &[u8]) -> Result<InvokeRequestIn, ImError>
 fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
     let mut status = None;
     let mut cluster_status = None;
-    loop {
-        let el = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f.next_scalar().map_err(field_err("truncated status ib"))? {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Uint(v)) => {
                 status = Some(
                     u8::try_from(v)
@@ -281,9 +293,6 @@ fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
                     u8::try_from(v)
                         .map_err(|_| ImError::Malformed("cluster status code out of range"))?,
                 );
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
             }
             _ => {}
         }
@@ -297,17 +306,17 @@ fn decode_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
 /// this CommandStatusIB (InvokeResponseIB's `Status` field).
 fn decode_command_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError> {
     let mut result = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated command status ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated command status ib"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::StructStart) => {
-                result = Some(decode_status_ib(r)?);
+                result = Some(decode_status_ib(f.reader())?);
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -320,31 +329,31 @@ fn decode_command_status_ib(r: &mut Reader) -> Result<(u8, Option<u8>), ImError>
 /// this InvokeResponseIB.
 fn decode_invoke_response_ib(r: &mut Reader) -> Result<InvokeOutcome, ImError> {
     let mut outcome = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated invoke response ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated invoke response ib"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::StructStart) => {
                 // Command (CommandDataIB): a response carrying data is a
                 // successful invocation. M2's onoff commands never produce
                 // one, but don't choke on a well-formed message that does.
-                skip_container(r)?;
+                skip_container(f.reader())?;
                 outcome = Some(InvokeOutcome {
                     status: 0,
                     cluster_status: None,
                 });
             }
             (Tag::Context(1), Value::StructStart) => {
-                let (status, cluster_status) = decode_command_status_ib(r)?;
+                let (status, cluster_status) = decode_command_status_ib(f.reader())?;
                 outcome = Some(InvokeOutcome {
                     status,
                     cluster_status,
                 });
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -367,14 +376,15 @@ fn decode_first_invoke_response_ib<T>(
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut result: Option<T> = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated invoke response"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated invoke response"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::ArrayStart) => {
-                // InvokeResponses
+                // InvokeResponses: array element walk stays hand-rolled.
+                let r = f.reader();
                 let mut first = true;
                 loop {
                     let e2 = r
@@ -383,10 +393,10 @@ fn decode_first_invoke_response_ib<T>(
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart if first => {
-                            result = Some(decode_ib(&mut r)?);
+                            result = Some(decode_ib(r)?);
                             first = false;
                         }
-                        Value::StructStart => skip_container(&mut r)?,
+                        Value::StructStart => skip_container(r)?,
                         _ => {
                             return Err(ImError::Malformed(
                                 "unexpected element in invoke responses",
@@ -396,7 +406,7 @@ fn decode_first_invoke_response_ib<T>(
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -421,22 +431,22 @@ pub fn decode_invoke_response(payload: &[u8]) -> Result<InvokeOutcome, ImError> 
 /// echoed path.
 fn decode_command_data_ib(r: &mut Reader) -> Result<Option<Vec<u8>>, ImError> {
     let mut fields = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated command data ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated command data ib"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::StructStart) => {
                 // CommandFields: always a struct (cluster spec command
                 // parameters). Re-tag to Anonymous, same convention as
                 // `encode_invoke_request`'s fields_tlv splice.
                 let mut w = Writer::new();
-                copy_value(&mut w, r, Tag::Anonymous, Value::StructStart)?;
+                copy_value(&mut w, f.reader(), Tag::Anonymous, Value::StructStart)?;
                 fields = Some(w.finish());
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -450,16 +460,16 @@ fn decode_command_data_ib(r: &mut Reader) -> Result<Option<Vec<u8>>, ImError> {
 /// anonymous `StructStart` opening this InvokeResponseIB.
 fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, ImError> {
     let mut result = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated invoke response ib"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated invoke response ib"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::StructStart) => {
                 // Command (CommandDataIB): a response carrying data is a
                 // successful invocation (status 0), possibly with fields.
-                let fields_tlv = decode_command_data_ib(r)?;
+                let fields_tlv = decode_command_data_ib(f.reader())?;
                 result = Some(InvokeResponseData {
                     status: 0,
                     cluster_status: None,
@@ -467,7 +477,7 @@ fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, 
                 });
             }
             (Tag::Context(1), Value::StructStart) => {
-                let (status, cluster_status) = decode_command_status_ib(r)?;
+                let (status, cluster_status) = decode_command_status_ib(f.reader())?;
                 result = Some(InvokeResponseData {
                     status,
                     cluster_status,
@@ -475,7 +485,7 @@ fn decode_invoke_response_ib_data(r: &mut Reader) -> Result<InvokeResponseData, 
                 });
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -591,22 +601,16 @@ pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated status response"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::Uint(v)) => {
-                status = Some(
-                    u8::try_from(v)
-                        .map_err(|_| ImError::Malformed("status response code out of range"))?,
-                );
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
-            }
-            _ => {}
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(field_err("truncated status response"))?
+    {
+        if let (Tag::Context(0), Value::Uint(v)) = (el.tag, el.value) {
+            status = Some(
+                u8::try_from(v)
+                    .map_err(|_| ImError::Malformed("status response code out of range"))?,
+            );
         }
     }
     status.ok_or(ImError::Malformed("status response without status"))
@@ -616,7 +620,320 @@ pub fn decode_status_response(payload: &[u8]) -> Result<u8, ImError> {
 mod tests {
     use super::*;
     use crate::im::*;
-    use crate::tlv::{Reader, Tag, Value, Writer};
+    use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+
+    /// `Writer` で struct を組み、先頭の `StructStart`（Tag::Anonymous、1 byte）
+    /// だけを剥がして、「呼び出し元が StructStart を消費済み」という decoder
+    /// の前提に合わせたバイト列を作る。末尾の自分自身の `ContainerEnd` は
+    /// decoder 自身が読み切る対象なので残す。`decode_status_ib` 等、
+    /// `r: &mut Reader` を直接受ける private decoder を単体で叩くのに使う。
+    fn inner_bytes(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        f(&mut w);
+        w.end_container();
+        let full = w.finish();
+        full[1..].to_vec()
+    }
+
+    /// InvokeRequestMessage: `struct{0:false,1:false,2:[ struct{ <cmd_data> } ]}`
+    /// — CommandDataIB の中身だけ `cmd_data` で差し替える。
+    fn invoke_request_with(cmd_data: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.put_bool(Tag::Context(0), false);
+        w.put_bool(Tag::Context(1), false);
+        w.start_array(Tag::Context(2));
+        w.start_struct(Tag::Anonymous);
+        cmd_data(&mut w);
+        w.end_container();
+        w.end_container();
+        w.end_container();
+        w.finish()
+    }
+
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
+    /// （Task 3 Step 1: 旧コードに対して PASS することをまず確認してから
+    /// リファクタし、Step 3 で意図的な差分だけ値を差し替える）。唯一の意図的な
+    /// 差分（`// accepted delta` 印）は、struct フィールド走査中に *要素自体・
+    /// 未知の入れ子コンテナが途中で切れる* ケース: 以前は Reader の
+    /// `Truncated` を素通しで `Tlv(Truncated)` にするか、`skip_container` の
+    /// `Malformed("truncated container")` に畳んでいたが、
+    /// `StructFields::next_scalar`/`next_field` はどちらも入力終端と同じ
+    /// `Truncated` を返すため、その struct 呼び出し元ごとの `"truncated X"`
+    /// ラベルに統一される。どちらも mat-native 側のエラー種別
+    /// (`errmap.rs:92`) は `Tlv`/`Malformed` を同じ種類にまとめるので detail
+    /// 文言のみの差分。
+    #[test]
+    fn decoder_error_labels_are_stable() {
+        // --- top-level struct check (expect_struct_start, 4 エントリポイント共通) ---
+        assert_eq!(
+            decode_invoke_request(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_invoke_request(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+        assert_eq!(
+            decode_invoke_response(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_invoke_response(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+        assert_eq!(
+            decode_invoke_response_data(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_status_response(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_status_response(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+
+        // --- struct フィールド走査: ContainerEnd なしで入力終端 ---
+        assert_eq!(
+            decode_invoke_request(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated invoke request")
+        );
+        assert_eq!(
+            decode_invoke_response(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated invoke response")
+        );
+        assert_eq!(
+            decode_status_response(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated status response")
+        );
+
+        // --- struct フィールド走査中の Reader エラー（予約 element type）は Tlv のまま ---
+        assert_eq!(
+            decode_invoke_request(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+        assert_eq!(
+            decode_status_response(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+
+        // --- accepted delta (a): 要素自体が途中で切れている ---
+        // 旧: r.next()? の Truncated がそのまま Tlv(Truncated) に素通しされて
+        // いた。新: StructFields::next_field も同じ Truncated を返すが、
+        // field_err が呼び出し元ごとの "truncated X" ラベルに畳む。
+        assert_eq!(
+            decode_invoke_request(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated invoke request") // accepted delta: 以前は Tlv(Truncated)
+        );
+        assert_eq!(
+            decode_status_response(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated status response") // accepted delta: 以前は Tlv(Truncated)
+        );
+
+        // --- accepted delta (b): 未知の入れ子コンテナが途中で切れている ---
+        {
+            // struct{ ctx5: struct{ ctx1: 300 } } を組んでから、入れ子 struct と
+            // 外側 struct 両方の ContainerEnd を落として「入れ子の中で入力終端」
+            // にする。decode_status_response は tag0 (uint) しか知らないので、
+            // ctx5 は未知の入れ子コンテナとして skip される。
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(5));
+            w.put_uint(Tag::Context(1), 300);
+            w.end_container(); // 入れ子 close
+            w.end_container(); // 外側 close
+            let full = w.finish();
+            let cut = &full[..full.len() - 2]; // 両方の ContainerEnd を落とす
+            assert_eq!(
+                decode_status_response(cut).unwrap_err(),
+                ImError::Malformed("truncated status response") // accepted delta: 以前は "truncated container"
+            );
+        }
+
+        // --- decode_status_ib（"without X" / "out of range" ラベル） ---
+        assert_eq!(
+            decode_status_ib(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("status ib without status")
+        );
+        assert_eq!(
+            decode_status_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.put_uint(Tag::Context(0), 0x100);
+            })))
+            .unwrap_err(),
+            ImError::Malformed("command status code out of range")
+        );
+        assert_eq!(
+            decode_status_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.put_uint(Tag::Context(0), 0);
+                w.put_uint(Tag::Context(1), 0x100);
+            })))
+            .unwrap_err(),
+            ImError::Malformed("cluster status code out of range")
+        );
+        assert_eq!(
+            decode_status_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated status ib")
+        );
+        // accepted delta (a) の別例（next_scalar 経由の decode_status_ib）
+        assert_eq!(
+            decode_status_ib(&mut Reader::new(&[0x24])).unwrap_err(),
+            ImError::Malformed("truncated status ib") // accepted delta: 以前は Tlv(Truncated)
+        );
+
+        // --- decode_command_status_ib ---
+        assert_eq!(
+            decode_command_status_ib(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("command status ib without StatusIB")
+        );
+        assert_eq!(
+            decode_command_status_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated command status ib")
+        );
+
+        // --- decode_invoke_response_ib ---
+        assert_eq!(
+            decode_invoke_response_ib(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("invoke response ib without Command or Status")
+        );
+        assert_eq!(
+            decode_invoke_response_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated invoke response ib")
+        );
+
+        // --- decode_command_data_ib（response 側） ---
+        assert_eq!(
+            decode_command_data_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated command data ib")
+        );
+
+        // --- decode_invoke_response_ib_data ---
+        assert_eq!(
+            decode_invoke_response_ib_data(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("invoke response ib without Command or Status")
+        );
+        assert_eq!(
+            decode_invoke_response_ib_data(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated invoke response ib")
+        );
+
+        // --- decode_request_command_data_ib（CommandPath の "out of range" / "truncated") ---
+        assert_eq!(
+            decode_request_command_data_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 0x1_0000);
+                w.end_container();
+            })))
+            .unwrap_err(),
+            ImError::Malformed("command path endpoint out of range")
+        );
+        assert_eq!(
+            decode_request_command_data_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 1);
+                w.put_uint(Tag::Context(1), 0x1_0000_0000);
+                w.end_container();
+            })))
+            .unwrap_err(),
+            ImError::Malformed("command path cluster out of range")
+        );
+        assert_eq!(
+            decode_request_command_data_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 1);
+                w.put_uint(Tag::Context(1), 6);
+                w.put_uint(Tag::Context(2), 0x1_0000_0000);
+                w.end_container();
+            })))
+            .unwrap_err(),
+            ImError::Malformed("command path command out of range")
+        );
+        assert_eq!(
+            decode_request_command_data_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated command data ib")
+        );
+        {
+            // CommandPath list を開いて 1 フィールド書いた後、list 自身の
+            // ContainerEnd を落として「CommandPath の中で入力終端」にする。
+            let full = inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 1);
+                w.end_container();
+            });
+            // list 自身の ContainerEnd と、inner_bytes が付け足した外側
+            // wrapper 分の ContainerEnd の両方を落とす。
+            let cut = &full[..full.len() - 2];
+            assert_eq!(
+                decode_request_command_data_ib(&mut Reader::new(cut)).unwrap_err(),
+                ImError::Malformed("truncated command path")
+            );
+        }
+
+        // --- decode_invoke_request: InvokeRequests array（手書き走査のまま） ---
+        assert_eq!(
+            decode_invoke_request(&invoke_request_with(|_w| {})).unwrap_err(),
+            ImError::Malformed("invoke request without endpoint")
+        );
+        assert_eq!(
+            decode_invoke_request(&invoke_request_with(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 1);
+                w.end_container();
+            }))
+            .unwrap_err(),
+            ImError::Malformed("invoke request without cluster")
+        );
+        assert_eq!(
+            decode_invoke_request(&invoke_request_with(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(0), 1);
+                w.put_uint(Tag::Context(1), 6);
+                w.end_container();
+            }))
+            .unwrap_err(),
+            ImError::Malformed("invoke request without command")
+        );
+        assert_eq!(
+            decode_invoke_request(&[0x15, 0x36, 0x02]).unwrap_err(), // struct{ ctx2: array_start } で入力終端
+            ImError::Malformed("truncated invoke requests")
+        );
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(2));
+            w.put_uint(Tag::Anonymous, 5); // struct でも ContainerEnd でもない
+            w.end_container();
+            w.end_container();
+            assert_eq!(
+                decode_invoke_request(&w.finish()).unwrap_err(),
+                ImError::Malformed("unexpected element in invoke requests")
+            );
+        }
+
+        // --- decode_first_invoke_response_ib（InvokeResponses array、手書き走査のまま） ---
+        assert_eq!(
+            decode_invoke_response(&[0x15, 0x18]).unwrap_err(),
+            ImError::Malformed("invoke response without InvokeResponseIB")
+        );
+        assert_eq!(
+            decode_invoke_response(&[0x15, 0x36, 0x01]).unwrap_err(), // struct{ ctx1: array_start } で入力終端
+            ImError::Malformed("truncated invoke responses")
+        );
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(1));
+            w.put_uint(Tag::Anonymous, 5);
+            w.end_container();
+            w.end_container();
+            assert_eq!(
+                decode_invoke_response(&w.finish()).unwrap_err(),
+                ImError::Malformed("unexpected element in invoke responses")
+            );
+        }
+    }
 
     #[test]
     fn invoke_request_and_response_roundtrip_shapes() {
