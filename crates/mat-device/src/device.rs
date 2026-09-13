@@ -187,7 +187,7 @@ fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<Stri
     }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(format!("os rng: {e}")))?;
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = mat_core::hex::encode_lower(&bytes);
     std::fs::write(&path, &hex)?;
     Ok(hex)
 }
@@ -213,7 +213,7 @@ fn bridged_unique_id(node_unique_id: &str, device_id: &str) -> String {
     let digest = Sha256::digest(format!("{node_unique_id}-{device_id}").as_bytes());
     // 16 バイト = 32 hex 文字。`load_or_create_unique_id` の node 側と同じ
     // 「16 ランダムバイトの hex」形と揃う。
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+    mat_core::hex::encode_lower(&digest[..16])
 }
 
 /// A running (or about-to-run) device instance. Construct with `new`
