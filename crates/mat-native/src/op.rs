@@ -544,13 +544,14 @@ pub async fn run_node_op(conn: &mut dyn NodeConn, op: &NodeOp) -> Result<Value, 
             cluster,
             attribute,
         } => {
-            // onoff/on-off は bool 専用 read（両経路の従来挙動）。数値 ID 指定
-            // （6/0）も同じ腕に落ちるが JSON は Bool で同形。
-            let v = if *cluster == im::CLUSTER_ON_OFF && *attribute == im::ATTR_ON_OFF {
-                Value::Bool(conn.read_onoff(*endpoint).await?)
-            } else {
-                conn.read_json(*endpoint, *cluster, *attribute).await?
-            };
+            let v = conn.read_json(*endpoint, *cluster, *attribute).await?;
+            // onoff/on-off は bool 必須（両経路の従来挙動）: bool 以外は
+            // parse_error。数値 ID 指定（6/0）も同じ検査に落ちる。
+            if *cluster == im::CLUSTER_ON_OFF && *attribute == im::ATTR_ON_OFF && !v.is_boolean() {
+                return Err(MatError::parse_error(format!(
+                    "native: on-off not a bool: {v}"
+                )));
+            }
             body::read_success(node_id, *endpoint, cluster_in, attribute_in, v)
         }
         NodeOpKind::ReadCluster {

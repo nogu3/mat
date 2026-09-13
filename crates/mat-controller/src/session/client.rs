@@ -59,17 +59,18 @@ impl SecureSession {
         attribute: u32,
         cfg: &MrpConfig,
     ) -> Result<crate::im::ImValue, SessionError> {
-        use crate::im::{self, ImError};
+        use crate::im;
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_read_request(endpoint, cluster, attribute);
         let msg = self
             .im_request(exchange_id, im::OPCODE_READ_REQUEST, &req, cfg)
             .await?;
-        let rd = im::decode_report_data(expect_im(&msg, im::OPCODE_REPORT_DATA)?)
-            .map_err(SessionError::Im)?;
-        if !rd.suppress_response {
+        let (suppress_response, outcome) =
+            im::decode_single_attribute_report(expect_im(&msg, im::OPCODE_REPORT_DATA)?)
+                .map_err(SessionError::Im)?;
+        if !suppress_response {
             // Best-effort close: the read already succeeded (we
-            // have `rd` in hand), so a lost ack on this trailing
+            // have the report in hand), so a lost ack on this trailing
             // StatusResponse must not turn it into an error here —
             // it's the peer's retransmit problem, not ours.
             let ok = im::encode_status_response(0);
@@ -83,11 +84,7 @@ impl SecureSession {
                 )
                 .await;
         }
-        if let Some(status) = rd.status {
-            return Err(SessionError::Im(ImError::AttributeStatus(status)));
-        }
-        rd.value
-            .ok_or(SessionError::Im(ImError::Malformed("no value")))
+        outcome.map_err(SessionError::Im)
     }
 
     /// Invokes a single command over the Interaction Model (spec §8.9.4).
@@ -443,6 +440,209 @@ mod tests {
             .unwrap();
         assert_eq!(value, crate::im::ImValue::Bool(true));
         dev.await.unwrap();
+    }
+
+    /// Serves one ReadRequest with `payload` as the (piggybacked) ReportData
+    /// and returns what `read_attribute` makes of it. Payloads here all set
+    /// `SuppressResponse`, so no closing StatusResponse round-trip follows.
+    async fn read_attribute_against(payload: Vec<u8>) -> Result<crate::im::ImValue, SessionError> {
+        let (mut s, device) = udp_session_pair().await;
+        let dev = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = device.recv_from(&mut buf).await.unwrap();
+            let (h, p, _body) = open_from_controller(&buf[..n]);
+            assert_eq!(p.opcode, crate::im::OPCODE_READ_REQUEST);
+            let resp = device_datagram(
+                p.exchange_id,
+                crate::im::PROTOCOL_ID_IM,
+                crate::im::OPCODE_REPORT_DATA,
+                Some(h.message_counter),
+                true,
+                9500,
+                &payload,
+            );
+            device.send_to(&resp, from).await.unwrap();
+        });
+        let got = s
+            .read_attribute(
+                1,
+                crate::im::CLUSTER_ON_OFF,
+                crate::im::ATTR_ON_OFF,
+                &fast_cfg(),
+            )
+            .await;
+        dev.await.unwrap();
+        got
+    }
+
+    /// ReportData `{1: [ibs...], [3: true], 4: true, 255: 12}`; `ibs` writes
+    /// the AttributeReportIB structs (or nothing) inside the array.
+    fn report_with(ibs: impl FnOnce(&mut crate::tlv::Writer), more: bool) -> Vec<u8> {
+        use crate::tlv::{Tag, Writer};
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        w.start_array(Tag::Context(1));
+        ibs(&mut w);
+        w.end_container();
+        if more {
+            w.put_bool(Tag::Context(3), true);
+        }
+        w.put_bool(Tag::Context(4), true);
+        w.put_uint(Tag::Context(255), 12);
+        w.end_container();
+        w.finish()
+    }
+
+    /// One `{1: AttributeDataIB{0: DataVersion, 1: Path, [2: Data]}}`.
+    fn data_ib(w: &mut crate::tlv::Writer, data: impl FnOnce(&mut crate::tlv::Writer)) {
+        use crate::tlv::Tag;
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(1));
+        w.put_uint(Tag::Context(0), 1);
+        w.start_list(Tag::Context(1));
+        w.put_uint(Tag::Context(2), 1);
+        w.put_uint(Tag::Context(3), 6);
+        w.put_uint(Tag::Context(4), 0);
+        w.end_container();
+        data(w);
+        w.end_container();
+        w.end_container();
+    }
+
+    /// One `{0: AttributeStatusIB{0: Path, 1: StatusIB{0: status}}}`.
+    fn status_ib(w: &mut crate::tlv::Writer, status: u8) {
+        use crate::tlv::Tag;
+        w.start_struct(Tag::Anonymous);
+        w.start_struct(Tag::Context(0));
+        w.start_list(Tag::Context(0));
+        w.end_container();
+        w.start_struct(Tag::Context(1));
+        w.put_uint(Tag::Context(0), u64::from(status));
+        w.end_container();
+        w.end_container();
+        w.end_container();
+    }
+
+    /// Pins `read_attribute`'s return value for every scalar type
+    /// `ImValue` carries: typed as on the wire (Uint vs Int, F32 vs F64,
+    /// Utf8 vs Bytes stay distinct).
+    #[tokio::test]
+    async fn read_attribute_returns_typed_scalars() {
+        use crate::im::ImValue;
+        use crate::tlv::{Tag, Writer};
+        type Put = fn(&mut Writer);
+        let cases: [(Put, ImValue); 8] = [
+            (|w| w.put_bool(Tag::Context(2), false), ImValue::Bool(false)),
+            (|w| w.put_uint(Tag::Context(2), 300), ImValue::Uint(300)),
+            (|w| w.put_int(Tag::Context(2), -5), ImValue::Int(-5)),
+            (|w| w.put_f32(Tag::Context(2), 1.5), ImValue::F32(1.5)),
+            (|w| w.put_f64(Tag::Context(2), -2.25), ImValue::F64(-2.25)),
+            (
+                |w| w.put_str(Tag::Context(2), "abc"),
+                ImValue::Utf8("abc".into()),
+            ),
+            (
+                |w| w.put_bytes(Tag::Context(2), &[1, 2]),
+                ImValue::Bytes(vec![1, 2]),
+            ),
+            (|w| w.put_null(Tag::Context(2)), ImValue::Null),
+        ];
+        for (put, want) in cases {
+            let payload = report_with(|w| data_ib(w, put), false);
+            assert_eq!(read_attribute_against(payload).await.unwrap(), want);
+        }
+    }
+
+    /// Pins `read_attribute`'s error mapping: AttributeStatusIB, empty
+    /// report, chunked report, container data, Data-less AttributeDataIB.
+    /// Only the first AttributeReportIB is interpreted.
+    #[tokio::test]
+    async fn read_attribute_error_and_first_report_semantics() {
+        use crate::im::{ImError, ImValue};
+        use crate::tlv::Tag;
+        let im_err = |r: Result<ImValue, SessionError>| match r {
+            Err(SessionError::Im(e)) => e,
+            other => panic!("expected Im error, got {other:?}"),
+        };
+
+        // StatusIB → AttributeStatus.
+        let p = report_with(|w| status_ib(w, 0x86), false);
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::AttributeStatus(0x86)
+        );
+        // Status first, data second → still AttributeStatus.
+        let p = report_with(
+            |w| {
+                status_ib(w, 0x7F);
+                data_ib(w, |w| w.put_bool(Tag::Context(2), true));
+            },
+            false,
+        );
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::AttributeStatus(0x7F)
+        );
+        // Data first, then a container-valued second report → first wins.
+        let p = report_with(
+            |w| {
+                data_ib(w, |w| w.put_bool(Tag::Context(2), true));
+                data_ib(w, |w| {
+                    w.start_array(Tag::Context(2));
+                    w.end_container();
+                });
+            },
+            false,
+        );
+        assert_eq!(
+            read_attribute_against(p).await.unwrap(),
+            ImValue::Bool(true)
+        );
+        // No AttributeReportIB at all → empty report.
+        let p = report_with(|_| {}, false);
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::Malformed("empty report")
+        );
+        // An empty AttributeReportIB struct → empty report.
+        let p = report_with(
+            |w| {
+                w.start_struct(Tag::Anonymous);
+                w.end_container();
+            },
+            false,
+        );
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::Malformed("empty report")
+        );
+        // MoreChunkedMessages → rejected, never partial data.
+        let p = report_with(|w| data_ib(w, |w| w.put_bool(Tag::Context(2), true)), true);
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::Malformed("chunked report data unsupported")
+        );
+        // Container-valued Data → UnsupportedValue.
+        let p = report_with(
+            |w| {
+                data_ib(w, |w| {
+                    w.start_struct(Tag::Context(2));
+                    w.put_uint(Tag::Context(0), 1);
+                    w.end_container();
+                })
+            },
+            false,
+        );
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::UnsupportedValue
+        );
+        // AttributeDataIB without its Data field.
+        let p = report_with(|w| data_ib(w, |_| {}), false);
+        assert_eq!(
+            im_err(read_attribute_against(p).await),
+            ImError::Malformed("attribute data without Data field")
+        );
     }
 
     /// Regression for the read closing-ack: `read_attribute`'s own read has

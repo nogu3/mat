@@ -392,7 +392,7 @@ mod tests {
     /// の 2 番目の送信系呼び出し — `sent` カウンタで 1 回目の KeySetWrite
     /// invoke は成功させ、`fail_at` でその次だけ狙って落とす）を `fail_kind`
     /// で失敗させる establisher。`FakeConn::invoke` も `fail_first_send` を
-    /// 尊重するようになった（read_onoff/write_tlv と同じ）ため、単に
+    /// 尊重するようになった（on-off の read_json/write_tlv と同じ）ため、単に
     /// `fail_first_send` を立てるだけだと KeySetWrite（本当の 1 回目の送信）
     /// が落ちてしまい、意図した group-key-map write まで到達できない。
     struct ScriptedFailingEstablisher;

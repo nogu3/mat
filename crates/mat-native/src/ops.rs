@@ -875,9 +875,6 @@ mod tests {
         struct FailingConn;
         #[async_trait::async_trait]
         impl NodeConn for FailingConn {
-            async fn read_onoff(&mut self, _endpoint: u16) -> Result<bool, MatError> {
-                unimplemented!()
-            }
             async fn invoke(
                 &mut self,
                 _endpoint: u16,

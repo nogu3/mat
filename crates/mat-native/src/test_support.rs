@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
 use serde_json::json;
 
+use mat_controller::im::{ATTR_ON_OFF, CLUSTER_ON_OFF};
 use mat_controller::tlv::{Tag, Writer};
 use mat_core::error::{ErrorKind, MatError};
 
@@ -202,7 +203,7 @@ pub struct FakeConn {
     pub fail_first_send: bool,
     pub fail_kind: ErrorKind,
     /// `fail_first_send`（常に 0 回目）より汎用: `sent` カウンタが指す送信系
-    /// 呼び出し（read_onoff/invoke/invoke_for_data/write_tlv 共通、0-indexed）
+    /// 呼び出し（on-off の read_json/invoke/invoke_for_data/write_tlv 共通、0-indexed）
     /// のうち、この番号の呼び出しだけを `fail_kind` で失敗させる。特定ステップ
     /// だけ落として前段は成功させたいテスト向け（例: KeySetWrite は通し
     /// group-key-map write だけ失敗させる）。
@@ -314,9 +315,11 @@ impl FakeConn {
     }
 
     /// 送信系メソッド共通の前置き: `delay` → `sent` を進める → `fail_first_send`
-    /// / `fail_at` の番号に当たれば `fail_kind` で失敗。read_onoff / invoke /
-    /// invoke_for_data / write_tlv が通る（read_json / read_cluster は送信系
-    /// ではないので数えない）。
+    /// / `fail_at` の番号に当たれば `fail_kind` で失敗。invoke / invoke_for_data /
+    /// write_tlv と、on-off（0x0006/0x0000）の read_json が通る（それ以外の
+    /// read_json / read_cluster は送信系ではないので数えない）。on-off read は
+    /// 旧 `NodeConn::read_onoff`（送信系として数えていた）の後継で、matd /
+    /// mat の障害注入テストがそれを前提にしている。
     async fn gate_send(&mut self) -> Result<(), MatError> {
         if let Some(d) = self.delay {
             tokio::time::sleep(d).await;
@@ -348,10 +351,6 @@ impl FakeConn {
 
 #[async_trait]
 impl NodeConn for FakeConn {
-    async fn read_onoff(&mut self, _endpoint: u16) -> Result<bool, MatError> {
-        self.gate_send().await?;
-        Ok(true)
-    }
     async fn invoke(
         &mut self,
         endpoint: u16,
@@ -396,13 +395,17 @@ impl NodeConn for FakeConn {
         cluster: u32,
         attribute: u32,
     ) -> Result<serde_json::Value, MatError> {
-        if let Some(d) = self.delay {
+        let on_off = (cluster, attribute) == (CLUSTER_ON_OFF, ATTR_ON_OFF);
+        if on_off {
+            self.gate_send().await?;
+        } else if let Some(d) = self.delay {
             tokio::time::sleep(d).await;
         }
         if let Some(v) = self.reads.get(&(endpoint, cluster, attribute)) {
             return Ok(v.clone());
         }
-        Ok(json!(1))
+        // 未登録の既定: on-off は true（旧 read_onoff と同値）、他は 1。
+        Ok(if on_off { json!(true) } else { json!(1) })
     }
 
     async fn read_cluster(
@@ -683,7 +686,9 @@ mod delay_tests {
         };
         let mut conn = est.establish(1).await.unwrap();
         let started = std::time::Instant::now();
-        conn.read_onoff(1).await.unwrap();
+        conn.read_json(1, CLUSTER_ON_OFF, ATTR_ON_OFF)
+            .await
+            .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(50));
     }
 

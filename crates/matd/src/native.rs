@@ -385,14 +385,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// 旧 `NativeBackend::read_onoff` 相当（with_session の挙動テスト用）。
+    /// on-off を `read_json` で読み bool で返す（FakeConn の on-off read は
+    /// 送信系として `fail_first_send` / `delay` を尊重する）。
     async fn read_onoff(
         b: &NativeBackend,
         node_id: u64,
         endpoint: u16,
         deadline: Option<Instant>,
     ) -> Result<bool, MatError> {
-        b.with_node(node_id, deadline, move |c| c.read_onoff(endpoint))
-            .await
+        let v = b
+            .with_node(node_id, deadline, move |c| {
+                c.read_json(
+                    endpoint,
+                    mat_controller::im::CLUSTER_ON_OFF,
+                    mat_controller::im::ATTR_ON_OFF,
+                )
+            })
+            .await?;
+        Ok(v.as_bool().expect("on-off is a bool"))
     }
 
     #[tokio::test]
