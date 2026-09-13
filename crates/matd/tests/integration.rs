@@ -148,7 +148,7 @@ async fn start_matd_with_est(
     start_matd(store_path, NativeState::Ready(Box::new(native))).await
 }
 
-/// デフォルトの fake establisher（read_onoff は常に true、read_json は未登録なら
+/// デフォルトの fake establisher（on-off の read_json は常に true、他の read_json は未登録なら
 /// `json!(1)`、invoke/write_tlv は常に成功）で native backend を組んで起動する。
 async fn start_matd_with_fake(store_path: PathBuf) -> (PathBuf, tokio::task::JoinHandle<()>) {
     start_matd_with_est(store_path, FakeEstablisher::default()).await

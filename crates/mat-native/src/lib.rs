@@ -12,7 +12,6 @@ use async_trait::async_trait;
 
 use mat_controller::exchange::MrpConfig;
 use mat_controller::fabric::{compressed_fabric_id, FabricCredentials};
-use mat_controller::im::{ImValue, ATTR_ON_OFF, CLUSTER_ON_OFF};
 use mat_controller::message::MATTER_PORT;
 use mat_controller::transport::UdpTransport;
 use mat_controller::{case, dnssd};
@@ -64,7 +63,6 @@ pub struct NativeConfig {
 /// warm な per-node セッションが提供する操作（実 CASE session or テスト fake）。
 #[async_trait]
 pub trait NodeConn: Send {
-    async fn read_onoff(&mut self, endpoint: u16) -> Result<bool, MatError>;
     async fn invoke(
         &mut self,
         endpoint: u16,
@@ -628,20 +626,6 @@ impl SubscribeConn for SessionConn {
 
 #[async_trait]
 impl NodeConn for SessionConn {
-    async fn read_onoff(&mut self, endpoint: u16) -> Result<bool, MatError> {
-        match self
-            .session
-            .read_attribute(endpoint, CLUSTER_ON_OFF, ATTR_ON_OFF, &self.mrp)
-            .await
-            .map_err(map_session_err)?
-        {
-            ImValue::Bool(b) => Ok(b),
-            other => Err(MatError::parse_error(format!(
-                "native: on-off not a bool: {other:?}"
-            ))),
-        }
-    }
-
     async fn invoke(
         &mut self,
         endpoint: u16,

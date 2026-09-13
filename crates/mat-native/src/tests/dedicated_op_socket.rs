@@ -1,5 +1,6 @@
 use crate::*;
 use mat_controller::cert::MatterCert;
+use mat_controller::im::{ATTR_ON_OFF, CLUSTER_ON_OFF};
 use mat_controller::kvs::SelfIssueMaterials;
 use mat_controller::test_support as case_ts;
 use mat_controller::transport::UdpTransport;
@@ -94,10 +95,13 @@ async fn concurrent_establishes_use_dedicated_sockets() {
     );
     let mut a = a.expect("establish 1");
     let mut b = b.expect("establish 2");
-    let (ra, rb) = tokio::join!(a.read_onoff(1), b.read_onoff(1));
-    // 応答器は on-off=false を返す（clippy: bool_assert_comparison を避け assert! で）。
-    assert!(!ra.expect("read 1"));
-    assert!(!rb.expect("read 2"));
+    let (ra, rb) = tokio::join!(
+        a.read_json(1, CLUSTER_ON_OFF, ATTR_ON_OFF),
+        b.read_json(1, CLUSTER_ON_OFF, ATTR_ON_OFF)
+    );
+    // 応答器は on-off=false を返す。
+    assert_eq!(ra.expect("read 1"), serde_json::json!(false));
+    assert_eq!(rb.expect("read 2"), serde_json::json!(false));
 
     let sa = handles.pop().unwrap().await.expect("responder 2");
     let sb = handles.pop().unwrap().await.expect("responder 1");
@@ -176,7 +180,12 @@ async fn swapped_credentials_are_used_by_the_next_establish() {
         .establish(responder_node_id)
         .await
         .expect("establish with the swapped credentials");
-    assert!(!conn.read_onoff(1).await.expect("read after swap"));
+    assert_eq!(
+        conn.read_json(1, CLUSTER_ON_OFF, ATTR_ON_OFF)
+            .await
+            .expect("read after swap"),
+        serde_json::json!(false)
+    );
 
     for h in handles {
         h.abort();

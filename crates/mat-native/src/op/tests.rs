@@ -387,8 +387,8 @@ async fn color_color_temp_level_send_expected_commands() {
 }
 
 #[tokio::test]
-async fn read_onoff_uses_bool_fast_path_and_generic_read_uses_json() {
-    // FakeConn::read_onoff は常に true、read_json は登録値（未登録は 1）。
+async fn read_onoff_and_generic_read_both_use_json() {
+    // FakeConn::read_json は登録値（未登録は on-off=true、他は 1）。
     let mut conn = FakeConn::scripted().with_read(1, 0x0008, 0x0000, json!(200));
     let body = run_node_op(
         &mut conn,
@@ -409,6 +409,23 @@ async fn read_onoff_uses_bool_fast_path_and_generic_read_uses_json() {
     assert_eq!(body["value"], json!(200));
     assert_eq!(body["cluster"], "levelcontrol");
     assert_eq!(body["attribute"], "current-level");
+}
+
+#[tokio::test]
+async fn read_onoff_non_bool_is_parse_error() {
+    // on-off が bool 以外なら parse_error（旧 read_onoff 高速経路と同じ kind・
+    // 同じ detail 接頭辞）。数値 ID 指定（6/0）も同じ検査に落ちる。
+    for (cluster, attribute) in [("onoff", "on-off"), ("6", "0")] {
+        let mut conn = FakeConn::scripted().with_read(1, 0x0006, 0x0000, json!(1));
+        let err = run_node_op(
+            &mut conn,
+            &node(NodeOpKind::read(1, cluster, attribute).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ParseError);
+        assert_eq!(err.detail, "native: on-off not a bool: 1");
+    }
 }
 
 #[tokio::test]
