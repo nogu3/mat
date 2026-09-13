@@ -285,7 +285,7 @@ async fn run_operational_cache(
 /// matd 用: mDNS socket を bind し常駐 cache タスクを spawn する。bind 失敗は
 /// `Err`（matd は OneShotResolver に degrade する）。tokio ランタイム内で呼ぶこと。
 pub fn spawn_operational_cache(scope_id: u32) -> std::io::Result<OperationalCache> {
-    let sock = bind_mdns_socket(scope_id)?;
+    let sock = bind_mdns_socket(scope_id, false)?;
     let (cache, requests) = OperationalCache::new();
     tokio::spawn(run_operational_cache(
         sock,

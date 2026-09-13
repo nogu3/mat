@@ -215,7 +215,7 @@ async fn browse(
     service: &str,
     window: Duration,
 ) -> Result<Vec<FoldedInstance>, DnssdError> {
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
     let mut fold = BrowseFold::new(service);
     let deadline = Instant::now() + window;

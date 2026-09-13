@@ -142,7 +142,7 @@ pub(super) fn spawn_multicast_announcer(
     scope_id: u32,
     msg: Vec<u8>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let sock = bind_mdns_socket(scope_id)?;
+    let sock = bind_mdns_socket(scope_id, false)?;
     let dest = super::mdns_dest(scope_id);
     Ok(tokio::spawn(async move {
         loop {
@@ -162,7 +162,7 @@ pub(super) fn spawn_unicast_responder(
     scope_id: u32,
     served: Vec<(String, Vec<u8>)>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let sock = bind_mdns_socket(scope_id)?;
+    let sock = bind_mdns_socket(scope_id, false)?;
     Ok(tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         loop {

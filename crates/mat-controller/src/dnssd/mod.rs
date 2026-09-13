@@ -168,7 +168,15 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
 /// 255 (RFC 6762 §11 requires it; the OS default of 1 is also off-spec).
 /// Still one-shot: the caller drops the socket when the resolve returns, so no
 /// state is held between runs (design rule 4).
-fn bind_mdns_socket(scope_id: u32) -> std::io::Result<UdpSocket> {
+///
+/// Shared with `mat-device`'s advertiser (`mat_device::net::mdns`), which
+/// binds the identical socket for the opposite role. `multicast_loop`
+/// distinguishes the two: `true` は明示的に loop を有効化（advertiser
+/// 用：同一ホストの querier に届ける）。`false` は OS 既定のまま触らない —
+/// 既存 querier の挙動を変えない（このクレートは今日まで
+/// `set_multicast_loop_v6` を一度も呼んでおらず、Linux では OS 既定で
+/// loop is on）。
+pub fn bind_mdns_socket(scope_id: u32, multicast_loop: bool) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
@@ -179,6 +187,9 @@ fn bind_mdns_socket(scope_id: u32) -> std::io::Result<UdpSocket> {
     sock.join_multicast_v6(&MDNS_GROUP, scope_id)?;
     sock.set_multicast_if_v6(scope_id)?;
     sock.set_multicast_hops_v6(255)?;
+    if multicast_loop {
+        sock.set_multicast_loop_v6(true)?;
+    }
     UdpSocket::from_std(sock.into())
 }
 

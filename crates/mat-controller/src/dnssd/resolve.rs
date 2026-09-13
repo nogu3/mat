@@ -70,7 +70,7 @@ pub async fn resolve_operational_many(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
     let mut queries: Vec<OperationalQuery> = node_ids
         .iter()
@@ -272,7 +272,7 @@ pub async fn resolve_commissionable(
     timeout: Duration,
 ) -> Result<ResolvedNode, DnssdError> {
     let subtype = long_discriminator_subtype(long_discriminator);
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
 
     let mut instance: Option<String> = None;
