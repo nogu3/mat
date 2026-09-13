@@ -55,12 +55,18 @@ tasks:
     cmds:
       - cargo doc --workspace --no-deps
 
+  check:device-core:
+    desc: "mat-device の I/O-free core ガード（CI 相当: --no-default-features でビルドが通ること）"
+    cmds:
+      - cargo check -p mat-device --no-default-features
+
   check:
-    desc: CI 相当（fmt:check + clippy + doc:check + test）
+    desc: "CI 相当（fmt:check + clippy + doc:check + check:device-core + test）"
     cmds:
       - task: fmt:check
       - task: clippy
       - task: doc:check
+      - task: check:device-core
       - task: test
 
   deps:
