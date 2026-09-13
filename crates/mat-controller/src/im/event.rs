@@ -1,10 +1,11 @@
 //! イベント関連の IM 型とコーデック（spec §8.9.2.2 EventPathIB / §8.9.2.4
 //! EventFilterIB / §8.9.2.6 EventDataIB / EventStatusIB）。
+use super::invoke::field_err;
 use super::read::encode_attribute_report_ib;
 use super::{
     expect_struct_start, put_status_ib, skip_container, ImError, ReportEntryOut, IM_REVISION,
 };
-use crate::tlv::{Reader, Tag, Value, Writer};
+use crate::tlv::{Reader, StructFields, Tag, Value, Writer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -71,12 +72,9 @@ pub(super) fn encode_event_path_ib(w: &mut Writer, tag: Tag, path: &EventPathIn)
 /// EventPathIB のデコード。`ListStart` を読んだ後の呼び出しを前提とする。
 pub(super) fn decode_event_path_ib(r: &mut Reader) -> Result<EventPathIn, ImError> {
     let mut p = EventPathIn::default();
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated event path"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f.next_scalar().map_err(field_err("truncated event path"))? {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::Uint(v)) => {
                 p.endpoint = Some(
                     u16::try_from(v).map_err(|_| ImError::Malformed("endpoint out of range"))?,
@@ -93,7 +91,6 @@ pub(super) fn decode_event_path_ib(r: &mut Reader) -> Result<EventPathIn, ImErro
                 )
             }
             (Tag::Context(4), Value::Bool(b)) => p.urgent = b,
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => skip_container(r)?,
             _ => {}
         }
     }
@@ -127,23 +124,21 @@ pub(super) fn decode_event_filters(r: &mut Reader) -> Result<Option<u64>, ImErro
             .ok_or(ImError::Malformed("truncated event filters"))?;
         match el.value {
             Value::ContainerEnd => break,
-            Value::StructStart => loop {
-                let f = r
-                    .next()?
-                    .ok_or(ImError::Malformed("truncated event filter"))?;
-                match (f.tag, f.value) {
-                    (_, Value::ContainerEnd) => break,
-                    (Tag::Context(1), Value::Uint(v)) => {
+            Value::StructStart => {
+                // EventFilterIB: 中身はスカラー (tag 1: EventMin) だけなので
+                // next_scalar でよい（未知の入れ子は自動で skip される）。
+                let mut filter = StructFields::inside(r);
+                while let Some(fld) = filter
+                    .next_scalar()
+                    .map_err(field_err("truncated event filter"))?
+                {
+                    if let (Tag::Context(1), Value::Uint(v)) = (fld.tag, fld.value) {
                         if min.is_none() {
                             min = Some(v);
                         }
                     }
-                    (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                        skip_container(r)?
-                    }
-                    _ => {}
                 }
-            },
+            }
             Value::ArrayStart | Value::ListStart => skip_container(r)?,
             _ => return Err(ImError::Malformed("unexpected element in event filters")),
         }
@@ -187,13 +182,12 @@ pub fn decode_event_reports(payload: &[u8]) -> Result<Vec<EventReport>, ImError>
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut out = Vec::new();
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated report data"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f.next_field().map_err(field_err("truncated report data"))? {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(2), Value::ArrayStart) => {
+                // EventReports: array element walk stays hand-rolled.
+                let r = f.reader();
                 let mut prev: Option<EventTimestamp> = None;
                 loop {
                     let e2 = r
@@ -202,7 +196,7 @@ pub fn decode_event_reports(payload: &[u8]) -> Result<Vec<EventReport>, ImError>
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart => {
-                            let rep = decode_event_report_ib(&mut r, &mut prev)?;
+                            let rep = decode_event_report_ib(r, &mut prev)?;
                             out.push(rep);
                         }
                         _ => return Err(ImError::Malformed("unexpected element in event reports")),
@@ -210,7 +204,7 @@ pub fn decode_event_reports(payload: &[u8]) -> Result<Vec<EventReport>, ImError>
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?
+                skip_container(f.reader())?
             }
             _ => {}
         }
@@ -224,18 +218,22 @@ fn decode_event_report_ib(
     prev: &mut Option<EventTimestamp>,
 ) -> Result<EventReport, ImError> {
     let mut out = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated event report"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated event report"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::StructStart) => out = Some(decode_event_status_ib(r)?),
+            (Tag::Context(0), Value::StructStart) => {
+                out = Some(decode_event_status_ib(f.reader())?)
+            }
             (Tag::Context(1), Value::StructStart) => {
-                let d = decode_event_data_ib(r, prev)?;
+                let d = decode_event_data_ib(f.reader(), prev)?;
                 out = Some(EventReport::Data(d));
             }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => skip_container(r)?,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(f.reader())?
+            }
             _ => {}
         }
     }
@@ -245,30 +243,32 @@ fn decode_event_report_ib(
 fn decode_event_status_ib(r: &mut Reader) -> Result<EventReport, ImError> {
     let mut path = EventPathIn::default();
     let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated event status"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated event status"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::ListStart) => path = decode_event_path_ib(r)?,
-            (Tag::Context(1), Value::StructStart) => loop {
-                let s = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
-                match (s.tag, s.value) {
-                    (_, Value::ContainerEnd) => break,
-                    (Tag::Context(0), Value::Uint(v)) => {
+            (Tag::Context(0), Value::ListStart) => path = decode_event_path_ib(f.reader())?,
+            (Tag::Context(1), Value::StructStart) => {
+                // StatusIB: 中身はスカラー (tag 0: status) だけなので
+                // next_scalar でよい。
+                let mut sib = StructFields::inside(f.reader());
+                while let Some(s) = sib
+                    .next_scalar()
+                    .map_err(field_err("truncated status ib"))?
+                {
+                    if let (Tag::Context(0), Value::Uint(v)) = (s.tag, s.value) {
                         status = Some(
                             u8::try_from(v)
                                 .map_err(|_| ImError::Malformed("status out of range"))?,
                         )
                     }
-                    (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                        skip_container(r)?
-                    }
-                    _ => {}
                 }
-            },
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => skip_container(r)?,
+            }
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(f.reader())?
+            }
             _ => {}
         }
     }
@@ -287,13 +287,10 @@ fn decode_event_data_ib(
 ) -> Result<EventData, ImError> {
     let mut path = EventPathIn::default();
     let (mut number, mut priority, mut ts, mut data) = (None, None, None, None);
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated event data"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f.next_field().map_err(field_err("truncated event data"))? {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::ListStart) => path = decode_event_path_ib(r)?,
+            (Tag::Context(0), Value::ListStart) => path = decode_event_path_ib(f.reader())?,
             (Tag::Context(1), Value::Uint(v)) => number = Some(v),
             (Tag::Context(2), Value::Uint(v)) => priority = Some(EventPriority::from_wire(v)?),
             (Tag::Context(3), Value::Uint(v)) => ts = Some(EventTimestamp::Epoch(v)),
@@ -302,14 +299,16 @@ fn decode_event_data_ib(
             (Tag::Context(6), Value::Uint(v)) => ts = Some(EventTimestamp::DeltaSystem(v)),
             (Tag::Context(7), v) => {
                 data = Some(super::json::tlv_element_to_json(
-                    r,
+                    f.reader(),
                     crate::tlv::Element {
                         tag: el.tag,
                         value: v,
                     },
                 )?);
             }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => skip_container(r)?,
+            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
+                skip_container(f.reader())?
+            }
             _ => {}
         }
     }
@@ -447,7 +446,186 @@ pub fn encode_report_data_full(
 mod tests {
     use super::*;
     use crate::im::*;
-    use crate::tlv::{Reader, Tag, Value, Writer};
+    use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+
+    /// `im/invoke.rs`'s `inner_bytes` と同じ trick: `Writer` で組んだ struct の
+    /// 先頭 `StructStart`（1 byte）だけを剥がし、「呼び出し元がコンテナの
+    /// 開始要素を消費済み」という decoder の前提に合わせたバイト列を作る
+    /// （struct/list/array のどれで開かれたかは中身のバイトに影響しない）。
+    fn inner_bytes(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        f(&mut w);
+        w.end_container();
+        let full = w.finish();
+        full[1..].to_vec()
+    }
+
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
+    /// （Task 5 Step 1: 旧コードに対して先に PASS させる — 詳細は
+    /// im/invoke.rs の同名テストの doc コメント参照）。
+    #[test]
+    fn decoder_error_labels_are_stable() {
+        // --- decode_event_reports: top-level struct check ---
+        assert_eq!(
+            decode_event_reports(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_event_reports(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+        assert_eq!(
+            decode_event_reports(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated report data")
+        );
+        assert_eq!(
+            decode_event_reports(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+        // accepted delta (a): 要素自体が途中で切れている。
+        // 旧: r.next()? の Truncated がそのまま Tlv(Truncated) に素通しされて
+        // いた。新: StructFields::next_field も同じ Truncated を返すが、
+        // field_err が呼び出し元ごとの "truncated X" ラベルに畳む。
+        assert_eq!(
+            decode_event_reports(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated report data") // accepted delta: 以前は Tlv(Truncated)
+        );
+
+        // --- decode_event_path_ib ---
+        assert_eq!(
+            decode_event_path_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.put_uint(Tag::Context(1), 0x1_0000);
+            })))
+            .unwrap_err(),
+            ImError::Malformed("endpoint out of range")
+        );
+        assert_eq!(
+            decode_event_path_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.put_uint(Tag::Context(2), 0x1_0000_0000);
+            })))
+            .unwrap_err(),
+            ImError::Malformed("cluster id out of range")
+        );
+        assert_eq!(
+            decode_event_path_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.put_uint(Tag::Context(3), 0x1_0000_0000);
+            })))
+            .unwrap_err(),
+            ImError::Malformed("event id out of range")
+        );
+        assert_eq!(
+            decode_event_path_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated event path")
+        );
+        // accepted delta (a) の別例（next_scalar 経由）
+        assert_eq!(
+            decode_event_path_ib(&mut Reader::new(&[0x24])).unwrap_err(),
+            ImError::Malformed("truncated event path") // accepted delta: 以前は Tlv(Truncated)
+        );
+        // accepted delta (b): 未知の入れ子コンテナが途中で切れている。
+        // 旧: 手書き走査の catch-all `skip_container(r)?`（im::skip_container）
+        // が Truncated を "truncated container" に畳んでいた。新:
+        // next_scalar 内の skip_container はラベルなしの生 TlvError を返す
+        // ので、struct 側の "truncated X" ラベルに統一される。
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(9)); // 未知タグの入れ子
+            w.put_uint(Tag::Context(1), 5);
+            w.end_container(); // 入れ子 close
+            w.end_container(); // 外側 close
+            let full = w.finish();
+            let cut = &full[1..full.len() - 2]; // 外側の StructStart と両方の ContainerEnd を落とす
+            assert_eq!(
+                decode_event_path_ib(&mut Reader::new(cut)).unwrap_err(),
+                ImError::Malformed("truncated event path") // accepted delta: 以前は "truncated container"
+            );
+        }
+
+        // --- decode_event_filters（外側 array の走査は手書きのまま） ---
+        assert_eq!(
+            decode_event_filters(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated event filters")
+        );
+        assert_eq!(
+            decode_event_filters(&mut Reader::new(&[0x15])).unwrap_err(), // フィルタ struct が入力終端
+            ImError::Malformed("truncated event filter")
+        );
+        assert_eq!(
+            decode_event_filters(&mut Reader::new(&[0x04, 0x2A])).unwrap_err(),
+            ImError::Malformed("unexpected element in event filters")
+        );
+
+        // --- decode_event_report_ib ---
+        assert_eq!(
+            decode_event_report_ib(&mut Reader::new(&inner_bytes(|_w| {})), &mut None).unwrap_err(),
+            ImError::Malformed("event report without data or status")
+        );
+        assert_eq!(
+            decode_event_report_ib(&mut Reader::new(&[]), &mut None).unwrap_err(),
+            ImError::Malformed("truncated event report")
+        );
+
+        // --- decode_event_status_ib ---
+        assert_eq!(
+            decode_event_status_ib(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("event status without status")
+        );
+        assert_eq!(
+            decode_event_status_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated event status")
+        );
+        assert_eq!(
+            decode_event_status_ib(&mut Reader::new(&inner_bytes(|w| {
+                w.start_struct(Tag::Context(1));
+                w.put_uint(Tag::Context(0), 0x100);
+                w.end_container();
+            })))
+            .unwrap_err(),
+            ImError::Malformed("status out of range")
+        );
+
+        // --- decode_event_data_ib ---
+        assert_eq!(
+            decode_event_data_ib(&mut Reader::new(&[]), &mut None).unwrap_err(),
+            ImError::Malformed("truncated event data")
+        );
+        assert_eq!(
+            decode_event_data_ib(&mut Reader::new(&inner_bytes(|_w| {})), &mut None).unwrap_err(),
+            ImError::Malformed("event data with incomplete path")
+        );
+        {
+            // path 完備、number 欠落。
+            let bytes = inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(1), 1);
+                w.put_uint(Tag::Context(2), u64::from(CLUSTER_BOOLEAN_STATE));
+                w.put_uint(Tag::Context(3), u64::from(EVENT_BS_STATE_CHANGE));
+                w.end_container();
+                w.put_uint(Tag::Context(2), 1); // priority
+            });
+            assert_eq!(
+                decode_event_data_ib(&mut Reader::new(&bytes), &mut None).unwrap_err(),
+                ImError::Malformed("event data without number")
+            );
+        }
+        {
+            // path + number 完備、priority 欠落。
+            let bytes = inner_bytes(|w| {
+                w.start_list(Tag::Context(0));
+                w.put_uint(Tag::Context(1), 1);
+                w.put_uint(Tag::Context(2), u64::from(CLUSTER_BOOLEAN_STATE));
+                w.put_uint(Tag::Context(3), u64::from(EVENT_BS_STATE_CHANGE));
+                w.end_container();
+                w.put_uint(Tag::Context(1), 100); // number
+            });
+            assert_eq!(
+                decode_event_data_ib(&mut Reader::new(&bytes), &mut None).unwrap_err(),
+                ImError::Malformed("event data without priority")
+            );
+        }
+    }
 
     #[test]
     fn event_path_ib_roundtrips_all_fields() {
