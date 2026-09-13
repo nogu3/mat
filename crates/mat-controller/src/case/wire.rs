@@ -11,7 +11,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::tlv::{skip_container, Reader, Tag, Value, Writer};
+use crate::tlv::{Reader, StructFields, Tag, TlvError, Value, Writer};
 
 /// AEAD nonce for TBE2 (Sigma2's `encrypted2`), spec §4.14.2.
 pub(crate) const TBE2_NONCE: &[u8; 13] = b"NCASE_Sigma2N";
@@ -68,6 +68,23 @@ pub fn encode_sigma1(
     w.finish()
 }
 
+/// `StructFields::open` の Err → ラベル（`InvalidType(0)` = struct でない／空）。
+fn open_err(e: TlvError, not_struct: &'static str, tlv: &'static str) -> &'static str {
+    match e {
+        TlvError::InvalidType(0) => not_struct,
+        _ => tlv,
+    }
+}
+
+/// フィールド走査の Err → ラベル（入力終端・要素途中切れ・入れ子途中切れは
+/// すべて `Truncated`）。
+fn field_err(e: TlvError, truncated: &'static str, tlv: &'static str) -> &'static str {
+    match e {
+        TlvError::Truncated => truncated,
+        _ => tlv,
+    }
+}
+
 /// Parses Sigma1: `struct{1: random, 2: session_id, 3: dest_id, 4: eph_pub,
 /// ...}` (any optional fields past tag 4 — resumption, session params — are
 /// ignored; [`encode_sigma1`] never sends them). Resumption fields (tag
@@ -75,32 +92,26 @@ pub fn encode_sigma1(
 /// spec §4.14.2; Sigma2Resume is out of M2 scope.
 pub(crate) fn parse_sigma1(payload: &[u8]) -> Result<Sigma1, &'static str> {
     let mut r = Reader::new(payload);
-    match r.next().map_err(|_| "sigma1 tlv")?.map(|e| e.value) {
-        Some(Value::StructStart) => {}
-        _ => return Err("sigma1 top-level struct"),
-    }
+    let mut f = StructFields::open(&mut r)
+        .map_err(|e| open_err(e, "sigma1 top-level struct", "sigma1 tlv"))?;
+
     let mut random: Option<[u8; 32]> = None;
     let mut session_id: Option<u16> = None;
     let mut dest: Option<[u8; 32]> = None;
     let mut eph: Option<[u8; 65]> = None;
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| "sigma1 tlv")?
-            .ok_or("sigma1 truncated")?;
+    // initiatorSessionParams（tag 5 の struct）等の未知のネストは next_scalar
+    // が丸ごと読み飛ばす — 中身の context tag をこのレベルの field と誤読
+    // しない（matter.js は必ず sessionParams を含める）。
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(|e| field_err(e, "sigma1 truncated", "sigma1 tlv"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::Bytes(b)) => {
                 random = Some(b.try_into().map_err(|_| "sigma1 random length")?);
             }
             (Tag::Context(2), Value::Uint(v)) => {
                 session_id = Some(u16::try_from(v).map_err(|_| "sigma1 session id")?);
-            }
-            // initiatorSessionParams（tag 5 の struct）等のネストは丸ごと
-            // 読み飛ばす — 中身の context tag をこのレベルの field と
-            // 誤読しない（matter.js は必ず sessionParams を含める）。
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| "sigma1 tlv")?;
             }
             (Tag::Context(3), Value::Bytes(b)) => {
                 dest = Some(b.try_into().map_err(|_| "sigma1 dest id length")?);
@@ -141,20 +152,18 @@ pub(crate) fn encode_sigma2(
 /// 3: responder_eph_pub, 4: encrypted2, [5: session params (skipped)]}`.
 pub(crate) fn parse_sigma2(payload: &[u8]) -> Result<Sigma2, &'static str> {
     let mut r = Reader::new(payload);
-    match r.next().map_err(|_| "tlv")?.map(|e| e.value) {
-        Some(Value::StructStart) => {}
-        _ => return Err("top-level struct"),
-    }
+    let mut f = StructFields::open(&mut r).map_err(|e| open_err(e, "top-level struct", "tlv"))?;
 
     let mut responder_random: Option<[u8; 32]> = None;
     let mut responder_session_id: Option<u16> = None;
     let mut responder_eph_pub: Option<[u8; 65]> = None;
     let mut encrypted2: Option<Vec<u8>> = None;
 
-    loop {
-        let el = r.next().map_err(|_| "tlv")?.ok_or("truncated")?;
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(|e| field_err(e, "truncated", "tlv"))?
+    {
         match el.value {
-            Value::ContainerEnd => break,
             Value::Bytes(b) if el.tag == Tag::Context(1) => {
                 responder_random = Some(b.try_into().map_err(|_| "responder random length")?);
             }
@@ -167,9 +176,6 @@ pub(crate) fn parse_sigma2(payload: &[u8]) -> Result<Sigma2, &'static str> {
             }
             Value::Bytes(b) if el.tag == Tag::Context(4) => {
                 encrypted2 = Some(b.to_vec());
-            }
-            Value::StructStart | Value::ArrayStart | Value::ListStart => {
-                skip_container(&mut r).map_err(|_| "tlv")?;
             }
             _ => {} // unknown/unsupported scalar field: ignore
         }
@@ -201,23 +207,15 @@ pub(crate) fn encode_sigma3(encrypted3: &[u8]) -> Vec<u8> {
 /// (`struct{1: encrypted3}`).
 pub(crate) fn parse_sigma3(payload: &[u8]) -> Result<Vec<u8>, &'static str> {
     let mut r = Reader::new(payload);
-    match r.next().map_err(|_| "sigma3 tlv")?.map(|e| e.value) {
-        Some(Value::StructStart) => {}
-        _ => return Err("sigma3 top-level struct"),
-    }
+    let mut f = StructFields::open(&mut r)
+        .map_err(|e| open_err(e, "sigma3 top-level struct", "sigma3 tlv"))?;
     let mut enc: Option<Vec<u8>> = None;
-    loop {
-        let el = r
-            .next()
-            .map_err(|_| "sigma3 tlv")?
-            .ok_or("sigma3 truncated")?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::Bytes(b)) => enc = Some(b.to_vec()),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| "sigma3 tlv")?;
-            }
-            _ => {}
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(|e| field_err(e, "sigma3 truncated", "sigma3 tlv"))?
+    {
+        if let (Tag::Context(1), Value::Bytes(b)) = (el.tag, el.value) {
+            enc = Some(b.to_vec());
         }
     }
     enc.ok_or("sigma3 missing encrypted3")
@@ -272,24 +270,20 @@ pub(crate) fn encode_tbe(
 /// ...}` (any trailing optional fields — e.g. resumption id — are ignored).
 pub(crate) fn parse_tbe(payload: &[u8]) -> Result<Tbe, &'static str> {
     let mut r = Reader::new(payload);
-    match r.next().map_err(|_| "tbe tlv")?.map(|e| e.value) {
-        Some(Value::StructStart) => {}
-        _ => return Err("tbe top-level struct"),
-    }
+    let mut f =
+        StructFields::open(&mut r).map_err(|e| open_err(e, "tbe top-level struct", "tbe tlv"))?;
     let mut noc: Option<Vec<u8>> = None;
     let mut icac: Option<Vec<u8>> = None;
     let mut sig: Option<[u8; 64]> = None;
-    loop {
-        let el = r.next().map_err(|_| "tbe tlv")?.ok_or("tbe truncated")?;
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(|e| field_err(e, "tbe truncated", "tbe tlv"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::Bytes(b)) => noc = Some(b.to_vec()),
             (Tag::Context(2), Value::Bytes(b)) => icac = Some(b.to_vec()),
             (Tag::Context(3), Value::Bytes(b)) => {
                 sig = Some(b.try_into().map_err(|_| "tbe signature length")?);
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r).map_err(|_| "tbe tlv")?;
             }
             _ => {}
         }
@@ -502,6 +496,210 @@ mod tests {
                 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
                 0x55, 0x55, 0x55, 0x18,
             ]
+        );
+    }
+
+    /// `Err` label extraction (mirrors `pase.rs`'s `label` helper) — avoids
+    /// requiring `Debug` on the `Ok` payload types (`Sigma1`/`Tbe` don't
+    /// derive it).
+    fn label<T>(r: Result<T, &'static str>) -> &'static str {
+        match r {
+            Err(l) => l,
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    /// Wraps `f`'s writes in an anonymous top-level struct.
+    fn struct_with(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        f(&mut w);
+        w.end_container();
+        w.finish()
+    }
+
+    /// Pins the `&'static str` error labels every parser (`parse_sigma1`,
+    /// `parse_sigma2`, `parse_sigma3`, `parse_tbe`) returns, across the
+    /// `StructFields` rollout (Task 2). Two cases are a deliberate,
+    /// documented delta (`accepted delta` comments below); everything else
+    /// must stay byte-for-byte identical to the hand-rolled walk.
+    #[test]
+    fn decoder_error_labels_are_stable() {
+        // --- top-level struct check, per parser ---
+        assert_eq!(label(parse_sigma1(&[])), "sigma1 top-level struct");
+        assert_eq!(
+            label(parse_sigma1(&[0x04, 0x2A])),
+            "sigma1 top-level struct"
+        );
+        assert_eq!(label(parse_sigma1(&[0x19])), "sigma1 tlv");
+        assert_eq!(label(parse_sigma1(&[0x15])), "sigma1 truncated");
+        assert_eq!(label(parse_sigma1(&[0x15, 0x19, 0x18])), "sigma1 tlv");
+
+        assert_eq!(label(parse_sigma2(&[])), "top-level struct");
+        assert_eq!(label(parse_sigma2(&[0x04, 0x2A])), "top-level struct");
+        assert_eq!(label(parse_sigma2(&[0x19])), "tlv");
+        assert_eq!(label(parse_sigma2(&[0x15])), "truncated");
+        assert_eq!(label(parse_sigma2(&[0x15, 0x19, 0x18])), "tlv");
+
+        assert_eq!(label(parse_sigma3(&[])), "sigma3 top-level struct");
+        assert_eq!(
+            label(parse_sigma3(&[0x04, 0x2A])),
+            "sigma3 top-level struct"
+        );
+        assert_eq!(label(parse_sigma3(&[0x19])), "sigma3 tlv");
+        assert_eq!(label(parse_sigma3(&[0x15])), "sigma3 truncated");
+        assert_eq!(label(parse_sigma3(&[0x15, 0x19, 0x18])), "sigma3 tlv");
+
+        assert_eq!(label(parse_tbe(&[])), "tbe top-level struct");
+        assert_eq!(label(parse_tbe(&[0x04, 0x2A])), "tbe top-level struct");
+        assert_eq!(label(parse_tbe(&[0x19])), "tbe tlv");
+        assert_eq!(label(parse_tbe(&[0x15])), "tbe truncated");
+        assert_eq!(label(parse_tbe(&[0x15, 0x19, 0x18])), "tbe tlv");
+
+        // --- accepted delta: an element (or nested container) that starts
+        // inside the struct but is itself cut short. The hand-rolled walk
+        // folded the Reader's `Truncated` into the generic "tlv" label here;
+        // `StructFields::next_scalar` surfaces the same `Truncated` the
+        // struct-level end-of-input check uses, so it now reads "truncated".
+        assert_eq!(label(parse_sigma1(&[0x15, 0x04])), "sigma1 truncated"); // accepted delta: 以前は "sigma1 tlv"
+        assert_eq!(
+            label(parse_sigma1(&[0x15, 0x35, 0x01])),
+            "sigma1 truncated" // accepted delta: 以前は "sigma1 tlv"（入れ子途中切れ）
+        );
+        assert_eq!(label(parse_sigma2(&[0x15, 0x04])), "truncated"); // accepted delta: 以前は "tlv"
+        assert_eq!(
+            label(parse_sigma2(&[0x15, 0x35, 0x01])),
+            "truncated" // accepted delta: 以前は "tlv"（入れ子途中切れ）
+        );
+        assert_eq!(label(parse_sigma3(&[0x15, 0x04])), "sigma3 truncated"); // accepted delta: 以前は "sigma3 tlv"
+        assert_eq!(
+            label(parse_sigma3(&[0x15, 0x35, 0x01])),
+            "sigma3 truncated" // accepted delta: 以前は "sigma3 tlv"（入れ子途中切れ）
+        );
+        assert_eq!(label(parse_tbe(&[0x15, 0x04])), "tbe truncated"); // accepted delta: 以前は "tbe tlv"
+        assert_eq!(
+            label(parse_tbe(&[0x15, 0x35, 0x01])),
+            "tbe truncated" // accepted delta: 以前は "tbe tlv"（入れ子途中切れ）
+        );
+
+        // --- per-field labels: sigma1 ---
+        assert_eq!(
+            label(parse_sigma1(&struct_with(
+                |w| w.put_bytes(Tag::Context(1), &[0u8; 31])
+            ))),
+            "sigma1 random length"
+        );
+        assert_eq!(
+            label(parse_sigma1(&struct_with(
+                |w| w.put_uint(Tag::Context(2), 0x1_0000)
+            ))),
+            "sigma1 session id"
+        );
+        assert_eq!(
+            label(parse_sigma1(&struct_with(
+                |w| w.put_bytes(Tag::Context(3), &[0u8; 31])
+            ))),
+            "sigma1 dest id length"
+        );
+        assert_eq!(
+            label(parse_sigma1(&struct_with(
+                |w| w.put_bytes(Tag::Context(4), &[0u8; 64])
+            ))),
+            "sigma1 eph length"
+        );
+        assert_eq!(label(parse_sigma1(&struct_with(|_w| {}))), "sigma1 random");
+        assert_eq!(
+            label(parse_sigma1(&struct_with(|w| {
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+            }))),
+            "sigma1 session id"
+        );
+        assert_eq!(
+            label(parse_sigma1(&struct_with(|w| {
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+                w.put_uint(Tag::Context(2), 1);
+            }))),
+            "sigma1 dest id"
+        );
+        assert_eq!(
+            label(parse_sigma1(&struct_with(|w| {
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+                w.put_uint(Tag::Context(2), 1);
+                w.put_bytes(Tag::Context(3), &[0u8; 32]);
+            }))),
+            "sigma1 eph"
+        );
+
+        // --- per-field labels: sigma2 ---
+        assert_eq!(
+            label(parse_sigma2(&struct_with(
+                |w| w.put_bytes(Tag::Context(1), &[0u8; 31])
+            ))),
+            "responder random length"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(
+                |w| w.put_uint(Tag::Context(2), 0x1_0000)
+            ))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(|_w| {}))),
+            "responder session id"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(
+                |w| w.put_uint(Tag::Context(2), 0)
+            ))),
+            "responder session id must be non-zero"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(
+                |w| w.put_bytes(Tag::Context(3), &[0u8; 64])
+            ))),
+            "responder ephemeral key length"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(|w| {
+                w.put_uint(Tag::Context(2), 1);
+            }))),
+            "responder random"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(|w| {
+                w.put_uint(Tag::Context(2), 1);
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+            }))),
+            "responder ephemeral key"
+        );
+        assert_eq!(
+            label(parse_sigma2(&struct_with(|w| {
+                w.put_uint(Tag::Context(2), 1);
+                w.put_bytes(Tag::Context(1), &[0u8; 32]);
+                w.put_bytes(Tag::Context(3), &[0u8; 65]);
+            }))),
+            "encrypted2"
+        );
+
+        // --- per-field labels: sigma3 ---
+        assert_eq!(
+            label(parse_sigma3(&struct_with(|_w| {}))),
+            "sigma3 missing encrypted3"
+        );
+
+        // --- per-field labels: tbe ---
+        assert_eq!(
+            label(parse_tbe(&struct_with(
+                |w| w.put_bytes(Tag::Context(3), &[0u8; 63])
+            ))),
+            "tbe signature length"
+        );
+        assert_eq!(label(parse_tbe(&struct_with(|_w| {}))), "tbe noc");
+        assert_eq!(
+            label(parse_tbe(&struct_with(|w| {
+                w.put_bytes(Tag::Context(1), b"noc");
+            }))),
+            "tbe signature"
         );
     }
 
