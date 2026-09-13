@@ -77,8 +77,8 @@ prime 競合 WARN を生む。本設計は restart を `matd reload`（socket ad
 
 | 状況 | kind | detail の要点 |
 |---|---|---|
-| KVS が読めない | `store_missing` | `load_fabric_credentials` のエラー文そのまま（`native: read KVS credentials: ...`） |
-| NOC 自己発行失敗 | `store_parse` | 同上 |
+| KVS が読めない | `store_missing` | `load_fabric_credentials` のエラー文そのまま（``native: read KVS credentials: ... — run `mat fabric init` ``） |
+| NOC 自己発行失敗 | `store_parse` | 同上（``native: self-issue NOC: ... — run `mat fabric init` ``） |
 | fabric identity 不一致 | `other` | `fabric identity changed (fabric_id/node_id/root key); restart matd` |
 | native が起動時 Unavailable | 起動時のエラー | 変更なし |
 | 確立器が reload 非対応（テスト用 Fake） | `other` | `credential reload not supported by this establisher` |

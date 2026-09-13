@@ -441,105 +441,103 @@ fn rescue_identities(
     // 類似度などのヒューリスティクスは実メッシュで BR と誤マージすることを
     // 確認済みのため不採用）。
     let mut ident_by: BTreeMap<u64, &'static str> = BTreeMap::new();
-    {
-        // 自己行候補の走査: 救済対象ノードの実 ext（direct_*）と自 rloc16
-        // （rescue_rloc、自己行または IPv6 由来）を集める。
-        let mut direct_ext: BTreeMap<u64, String> = BTreeMap::new();
-        let mut direct_rloc: BTreeMap<u64, u16> = BTreeMap::new();
-        let mut rescue_rloc: BTreeMap<u64, u16> = BTreeMap::new();
+    // 自己行候補の走査: 救済対象ノードの実 ext（direct_*）と自 rloc16
+    // （rescue_rloc、自己行または IPv6 由来）を集める。
+    let mut direct_ext: BTreeMap<u64, String> = BTreeMap::new();
+    let mut direct_rloc: BTreeMap<u64, u16> = BTreeMap::new();
+    let mut rescue_rloc: BTreeMap<u64, u16> = BTreeMap::new();
+    for inp in inputs {
+        let Ok(p) = &inp.probe else { continue };
+        if self_ext.contains_key(&inp.node_id) {
+            continue;
+        }
+        let role = p.thread.get("routing_role").and_then(Value::as_i64);
+        if matches!(role, Some(5 | 6)) {
+            let cands: Vec<&Map<String, Value>> = table_rows(&p.thread, "route_table")
+                .into_iter()
+                .filter(|r| {
+                    is_routeless_row(r)
+                        && r.get("Age").and_then(Value::as_u64).unwrap_or(0) <= SELF_ROW_MAX_AGE
+                })
+                .collect();
+            // 自己行は 1 行しかあり得ない。複数一致は形が想定外として不使用。
+            if let [row] = cands.as_slice() {
+                if let Some(ext) = row_ext_hex(row) {
+                    direct_ext.insert(inp.node_id, ext);
+                    if let Some(r) = row_rloc16(row) {
+                        direct_rloc.insert(inp.node_id, r);
+                    }
+                    continue;
+                }
+                if let Some(r) = row_rloc16(row) {
+                    rescue_rloc.insert(inp.node_id, r);
+                    continue;
+                }
+            }
+        }
+        // 自己行が使えなければ IPv6 由来の自 rloc16 で相関を試みる。
+        if let Some(r) = self_rloc.get(&inp.node_id) {
+            rescue_rloc.insert(inp.node_id, *r);
+        }
+    }
+
+    // フェーズ 1: 自己行の実 ExtAddress（最強の証拠）を先に確定する。
+    // 同一 ext の複数主張 / 確定済み ext との衝突は棄却。
+    retain_unique_values(&mut direct_ext);
+    direct_ext.retain(|_, e| !self_ext.values().any(|c| c == e));
+    for (node, ext) in direct_ext {
+        if let Some(r) = direct_rloc.get(&node) {
+            self_rloc.insert(node, *r);
+        }
+        self_ext.insert(node, ext);
+        ident_by.insert(node, "route-table");
+    }
+
+    // フェーズ 2: rloc16 相関。RLOC16 の一意性はパーティション内でしか
+    // 成立しないため、分断中（partition_id 複数観測）はスキップ。
+    if !rescue_rloc.is_empty() && partition_ids.len() <= 1 {
+        // 観測台帳: 全 probed ノードのテーブル行から rloc16 → 実 ext 集合。
+        // 63/0 行（自己行 or 経路喪失行）は第三者観測ではないので入れない。
+        let mut rloc_obs: BTreeMap<u16, std::collections::BTreeSet<String>> = BTreeMap::new();
         for inp in inputs {
             let Ok(p) = &inp.probe else { continue };
-            if self_ext.contains_key(&inp.node_id) {
+            for key in ["neighbor_table", "route_table"] {
+                for row in table_rows(&p.thread, key) {
+                    if is_routeless_row(row) {
+                        continue;
+                    }
+                    let (Some(ext), Some(r)) = (row_ext_hex(row), row_rloc16(row)) else {
+                        continue;
+                    };
+                    rloc_obs.entry(r).or_default().insert(ext);
+                }
+            }
+        }
+        // フェーズ 1 の確定分も含めて claimed（stale な相関が自己行で
+        // 確定した ext を巻き添えにしないよう、相関側だけを棄却する）。
+        let claimed: std::collections::BTreeSet<String> = self_ext.values().cloned().collect();
+        let mut correlated: BTreeMap<u64, String> = BTreeMap::new();
+        for (node, r) in &rescue_rloc {
+            let Some(exts) = rloc_obs.get(r) else {
+                continue;
+            };
+            // 厳格一意: その rloc16 の観測 ext がちょうど 1 つで、かつ
+            // 確定済みノードの ext でないこと。
+            if exts.len() != 1 {
                 continue;
             }
-            let role = p.thread.get("routing_role").and_then(Value::as_i64);
-            if matches!(role, Some(5 | 6)) {
-                let cands: Vec<&Map<String, Value>> = table_rows(&p.thread, "route_table")
-                    .into_iter()
-                    .filter(|r| {
-                        is_routeless_row(r)
-                            && r.get("Age").and_then(Value::as_u64).unwrap_or(0) <= SELF_ROW_MAX_AGE
-                    })
-                    .collect();
-                // 自己行は 1 行しかあり得ない。複数一致は形が想定外として不使用。
-                if let [row] = cands.as_slice() {
-                    if let Some(ext) = row_ext_hex(row) {
-                        direct_ext.insert(inp.node_id, ext);
-                        if let Some(r) = row_rloc16(row) {
-                            direct_rloc.insert(inp.node_id, r);
-                        }
-                        continue;
-                    }
-                    if let Some(r) = row_rloc16(row) {
-                        rescue_rloc.insert(inp.node_id, r);
-                        continue;
-                    }
-                }
+            let ext = exts.first().expect("len checked");
+            if claimed.contains(ext) {
+                continue;
             }
-            // 自己行が使えなければ IPv6 由来の自 rloc16 で相関を試みる。
-            if let Some(r) = self_rloc.get(&inp.node_id) {
-                rescue_rloc.insert(inp.node_id, *r);
-            }
+            correlated.insert(*node, ext.clone());
         }
-
-        // フェーズ 1: 自己行の実 ExtAddress（最強の証拠）を先に確定する。
-        // 同一 ext の複数主張 / 確定済み ext との衝突は棄却。
-        retain_unique_values(&mut direct_ext);
-        direct_ext.retain(|_, e| !self_ext.values().any(|c| c == e));
-        for (node, ext) in direct_ext {
-            if let Some(r) = direct_rloc.get(&node) {
-                self_rloc.insert(node, *r);
-            }
+        // 複数ノードが同一 ext へ解決したら全員棄却。
+        retain_unique_values(&mut correlated);
+        for (node, ext) in correlated {
+            self_rloc.insert(node, rescue_rloc[&node]);
             self_ext.insert(node, ext);
-            ident_by.insert(node, "route-table");
-        }
-
-        // フェーズ 2: rloc16 相関。RLOC16 の一意性はパーティション内でしか
-        // 成立しないため、分断中（partition_id 複数観測）はスキップ。
-        if !rescue_rloc.is_empty() && partition_ids.len() <= 1 {
-            // 観測台帳: 全 probed ノードのテーブル行から rloc16 → 実 ext 集合。
-            // 63/0 行（自己行 or 経路喪失行）は第三者観測ではないので入れない。
-            let mut rloc_obs: BTreeMap<u16, std::collections::BTreeSet<String>> = BTreeMap::new();
-            for inp in inputs {
-                let Ok(p) = &inp.probe else { continue };
-                for key in ["neighbor_table", "route_table"] {
-                    for row in table_rows(&p.thread, key) {
-                        if is_routeless_row(row) {
-                            continue;
-                        }
-                        let (Some(ext), Some(r)) = (row_ext_hex(row), row_rloc16(row)) else {
-                            continue;
-                        };
-                        rloc_obs.entry(r).or_default().insert(ext);
-                    }
-                }
-            }
-            // フェーズ 1 の確定分も含めて claimed（stale な相関が自己行で
-            // 確定した ext を巻き添えにしないよう、相関側だけを棄却する）。
-            let claimed: std::collections::BTreeSet<String> = self_ext.values().cloned().collect();
-            let mut correlated: BTreeMap<u64, String> = BTreeMap::new();
-            for (node, r) in &rescue_rloc {
-                let Some(exts) = rloc_obs.get(r) else {
-                    continue;
-                };
-                // 厳格一意: その rloc16 の観測 ext がちょうど 1 つで、かつ
-                // 確定済みノードの ext でないこと。
-                if exts.len() != 1 {
-                    continue;
-                }
-                let ext = exts.first().expect("len checked");
-                if claimed.contains(ext) {
-                    continue;
-                }
-                correlated.insert(*node, ext.clone());
-            }
-            // 複数ノードが同一 ext へ解決したら全員棄却。
-            retain_unique_values(&mut correlated);
-            for (node, ext) in correlated {
-                self_rloc.insert(node, rescue_rloc[&node]);
-                self_ext.insert(node, ext);
-                ident_by.insert(node, "rloc16");
-            }
+            ident_by.insert(node, "rloc16");
         }
     }
     // 救済が成立しなかったノードの rloc16 は出力しない: 同じ電波実体の孤児
@@ -666,7 +664,7 @@ fn collect_edges(
     edges
 }
 
-/// `build_graph` フェーズ 5: ノード出力: fabric ノード（入力順）→ 未知参加者（ext 昇順）。
+/// `build_graph` フェーズ 5: ノード出力 — fabric ノード（入力順）→ 未知参加者（ext 昇順）。
 fn emit_nodes(
     inputs: &[NodeInput],
     self_ext: &BTreeMap<u64, String>,

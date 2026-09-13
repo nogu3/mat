@@ -889,9 +889,10 @@ mod tests {
         assert!(mat_controller::kvs::read_group_credentials(&ini, 2, 99).is_ok());
     }
 
-    /// group_settings が未構成（テスト注入時のみ起こり得る）だと internal エラー。
+    /// engine に group_settings が無い（`with_establisher` のテスト注入）と
+    /// `mat_native::runner::provision` が kind `other` のハードエラーを返す。
     #[tokio::test]
-    async fn group_provision_without_group_settings_ctx_is_internal_error() {
+    async fn group_provision_without_group_settings_is_other_error() {
         let native = NativeBackend::with_establisher(Box::new(ScriptedEstablisher));
         let state = NativeState::Ready(Box::new(native));
         let health = SubHealth::new(None);

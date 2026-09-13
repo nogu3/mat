@@ -872,11 +872,11 @@ Decision record: `docs/superpowers/specs/2026-07-10-phase5-backend-direction-des
     （ctx 未構成＝ワイヤ・KVS とも未接触）なら chip-tool へフォールバック、
     `Some` なら chip-tool を一切 spawn せず native KVS へ書いてからデバイス
     側 4 ステップ（M8a のまま・native unicast）を実行する。matd
-    （`server.rs::group_provision`）も対称: `NativeBackend::group_settings_ctx()`
-    が `Some` ならコントローラ側を native 書込に、`None`（native 無効・
-    テスト注入等）なら従来どおり chip-tool ws 経由の 4 コマンドに完全に
-    フォールバックする（M8a のハイブリッド — デバイス側のみ native・
-    コントローラ側は常に chip-tool — を解消）。matd 側はテストで実証:
+    （`server.rs::group_provision`）も対称だった（当時は
+    `NativeBackend::group_settings_ctx()` の `Some`/`None` で分岐）。
+    現行は mat / matd とも `mat_native::runner::provision` を共有し、
+    engine の `group_settings` が無ければフォールバックせず kind `other`
+    のハードエラーになる（chip-tool 退役済み）。matd 側はテストで実証:
     `groupsettings` で始まる ws コマンドを受信したら panic する fake ws を
     用意し、native ctx 存在時にそのソケットへ一切トラフィックが飛ばない
     ことを確認。出力: native 書込のときは `--rebind` の有無によらず常に
