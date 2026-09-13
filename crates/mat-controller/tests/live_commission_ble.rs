@@ -17,9 +17,8 @@ use mat_controller::commissioning::{self, BleThreadParams, CommissioningFabric};
 use mat_controller::exchange::MrpConfig;
 use mat_controller::im::{CLUSTER_ON_OFF, CMD_ON_OFF_TOGGLE};
 
-fn env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} required"))
-}
+mod common;
+use common::env;
 
 fn hex_bytes(s: &str) -> Vec<u8> {
     let s = s.trim();

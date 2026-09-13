@@ -23,17 +23,8 @@ use mat_controller::session::SecureSession;
 use mat_controller::transport::UdpTransport;
 use mat_controller::{case, dnssd, kvs};
 
-fn env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} required"))
-}
-
-fn env_u64(name: &str) -> u64 {
-    let s = env(name);
-    match s.strip_prefix("0x") {
-        Some(h) => u64::from_str_radix(h, 16).expect("hex id"),
-        None => s.parse().expect("decimal id"),
-    }
-}
+mod common;
+use common::{env, env_u64};
 
 fn env_u8(name: &str) -> u8 {
     env(name)
@@ -71,7 +62,7 @@ async fn commission_second_fabric_and_remove() {
     // identity の自己発行のみ、KVS への書き込みは一切しない）。
     eprintln!("== 1/7 本番 fabric credentials 読み取り");
     let materials = kvs::read_self_issue_materials(
-        &kvs_dir.join("chip_tool_config.alpha.ini"),
+        &kvs_dir.join(kvs::ALPHA_INI_FILE),
         &kvs_dir.join("chip_tool_config.ini"),
         fabric_index,
         issuer_index,
