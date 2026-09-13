@@ -2,7 +2,7 @@
 //! chunk 結合 `merge_reports`）。コントローラ側の read と、device 側の
 //! ReadRequest 受理 / ReportData 送出の両方向。
 
-use crate::tlv::{Element, Reader, Tag, Value, Writer};
+use crate::tlv::{Element, Reader, StructFields, Tag, TlvError, Value, Writer};
 
 use super::json::tlv_element_to_json;
 use super::{
@@ -28,16 +28,26 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     w.finish()
 }
 
+/// `StructFields::next_field` の `Err` を旧手書き走査と同じ形に写す: 入力終端
+/// （`Truncated`）は `Malformed(label)`、その他の Reader エラーは `Tlv`。
+/// 唯一の差分は「フィールド要素自体の途中切れ」で、以前は Reader の
+/// `Tlv(Truncated)` だったが入力終端と区別できず `Malformed(label)` になる。
+fn fields_err(label: &'static str) -> impl Fn(TlvError) -> ImError {
+    move |e| match e {
+        TlvError::Truncated => ImError::Malformed(label),
+        other => ImError::Tlv(other),
+    }
+}
+
 /// StatusIB (spec §8.9.2.3): `{0: status, [1: cluster_status]}`, returning
 /// only the (mandatory) status code. Assumes the caller already consumed the
 /// `StructStart` that opens this StatusIB. Shared by the attribute-status
 /// decoders below (`decode_attribute_status_ib` / `decode_attribute_status_ib_full`).
 pub(super) fn decode_status_ib_code(r: &mut Reader) -> Result<Option<u8>, ImError> {
     let mut status = None;
-    loop {
-        let e2 = r.next()?.ok_or(ImError::Malformed("truncated status ib"))?;
-        match (e2.tag, e2.value) {
-            (_, Value::ContainerEnd) => break,
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f.next_field().map_err(fields_err("truncated status ib"))? {
+        match (el.tag, el.value) {
             (Tag::Context(0), Value::Uint(v)) => {
                 status = Some(
                     u8::try_from(v)
@@ -45,7 +55,7 @@ pub(super) fn decode_status_ib_code(r: &mut Reader) -> Result<Option<u8>, ImErro
                 );
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -58,19 +68,19 @@ pub(super) fn decode_status_ib_code(r: &mut Reader) -> Result<Option<u8>, ImErro
 /// this AttributeStatusIB.
 pub(super) fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> {
     let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute status"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated attribute status"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::StructStart) => {
-                if let Some(s) = decode_status_ib_code(r)? {
+                if let Some(s) = decode_status_ib_code(f.reader())? {
                     status = Some(s);
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -192,25 +202,25 @@ fn decode_attribute_status_ib_full(r: &mut Reader) -> Result<AttributeStatusFiel
     let mut cluster = None;
     let mut attribute = None;
     let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute status"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated attribute status"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ListStart) => {
-                let (ep, cl, attr, _) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, _) = decode_attribute_path_ib(f.reader())?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
             }
             (Tag::Context(1), Value::StructStart) => {
-                if let Some(s) = decode_status_ib_code(r)? {
+                if let Some(s) = decode_status_ib_code(f.reader())? {
                     status = Some(s);
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -235,24 +245,24 @@ fn decode_attribute_data_ib_full<D>(
     let mut attribute = None;
     let mut list_append = false;
     let mut data = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute data"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated attribute data"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::ListStart) => {
-                let (ep, cl, attr, la) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, la) = decode_attribute_path_ib(f.reader())?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
                 list_append = la;
             }
             (Tag::Context(2), _) => {
-                data = Some(decode(r, el)?);
+                data = Some(decode(f.reader(), el)?);
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -274,21 +284,21 @@ fn decode_attribute_report_ib_full<D>(
     let mut data = None;
     let mut status = None;
     let mut has_data_ib = false;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute report"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated attribute report"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::StructStart) => {
-                let (ep, cl, attr, s) = decode_attribute_status_ib_full(r)?;
+                let (ep, cl, attr, s) = decode_attribute_status_ib_full(f.reader())?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
                 status = Some(s);
             }
             (Tag::Context(1), Value::StructStart) => {
-                let (ep, cl, attr, la, d) = decode_attribute_data_ib_full(r, decode)?;
+                let (ep, cl, attr, la, d) = decode_attribute_data_ib_full(f.reader(), decode)?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
@@ -297,7 +307,7 @@ fn decode_attribute_report_ib_full<D>(
                 has_data_ib = true;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -327,12 +337,12 @@ fn decode_report_data_with<D>(
     let mut subscription_id = None;
     let mut more_chunks = false;
     let mut suppress_response = false;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated report data"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated report data"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Uint(v)) => {
                 subscription_id = Some(
                     u32::try_from(v)
@@ -341,6 +351,7 @@ fn decode_report_data_with<D>(
             }
             (Tag::Context(1), Value::ArrayStart) => {
                 // AttributeReportIBs: every entry, not just the first.
+                let r = f.reader();
                 loop {
                     let e2 = r
                         .next()?
@@ -348,7 +359,7 @@ fn decode_report_data_with<D>(
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart => {
-                            reports.push(decode_attribute_report_ib_full(&mut r, decode)?);
+                            reports.push(decode_attribute_report_ib_full(r, decode)?);
                         }
                         _ => {
                             return Err(ImError::Malformed(
@@ -361,7 +372,7 @@ fn decode_report_data_with<D>(
             (Tag::Context(3), Value::Bool(b)) => more_chunks = b,
             (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -622,19 +633,19 @@ pub fn decode_read_request_message(payload: &[u8]) -> Result<ReadRequestIn, ImEr
     expect_struct_start(&mut r)?;
     let mut paths = Vec::new();
     let mut fabric_filtered = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated read request"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(fields_err("truncated read request"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ArrayStart) => {
                 // AttributeRequests
-                paths = decode_attribute_requests(&mut r)?;
+                paths = decode_attribute_requests(f.reader())?;
             }
             (Tag::Context(3), Value::Bool(b)) => fabric_filtered = Some(b),
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -759,6 +770,118 @@ mod tests {
         w.put_uint(Tag::Context(255), 12);
         w.end_container();
         w.finish()
+    }
+
+    /// read.rs の struct 走査デコーダが出す拒否ラベルを固定する（`StructFields`
+    /// 置換の前後で不変であることの釘）。入口ごとに、入力終端・Reader エラー・
+    /// 入れ子コンテナ途中終端・フィールド要素自体の途中切れを見る。唯一の意図的な
+    /// 差分は `accepted delta` 印の「struct の中でフィールド要素自体が途中で
+    /// 切れている」ケース: 以前は Reader の `Tlv(Truncated)` だったが、
+    /// `next_field` が入力終端と同じ `Truncated` を返すため `Malformed(label)`
+    /// になる（pase.rs と同じ扱い）。
+    #[test]
+    fn decoder_malformed_labels_are_stable() {
+        use crate::tlv::TlvError;
+        let m = ImError::Malformed;
+        let tlv = ImError::Tlv;
+        let report = |b: &[u8]| decode_report_data_message(b).unwrap_err();
+
+        // --- ReportDataMessage top-level ---
+        assert_eq!(report(&[]), m("empty payload"));
+        assert_eq!(report(&[0x04, 0x2A]), m("expected struct"));
+        assert_eq!(report(&[0x15]), m("truncated report data"));
+        assert_eq!(
+            report(&[0x15, 0x19, 0x18]),
+            tlv(TlvError::InvalidType(0x19))
+        );
+        // 要素自体の途中切れ（context tag バイト欠け）
+        assert_eq!(report(&[0x15, 0x24]), m("truncated report data")); // accepted delta
+                                                                       // 未知の入れ子コンテナが途中で終わる
+        assert_eq!(report(&[0x15, 0x35, 0x07]), m("truncated container"));
+        // AttributeReportIBs array（struct ではないので置換対象外）
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01]),
+            m("truncated attribute reports")
+        );
+
+        // --- AttributeReportIB / AttributeDataIB / AttributeStatusIB / StatusIB ---
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15]),
+            m("truncated attribute report")
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x24]),
+            m("truncated attribute report") // accepted delta
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x01]),
+            m("truncated attribute data")
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x01, 0x24, 0x00]),
+            m("truncated attribute data") // accepted delta
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x01, 0x35, 0x09]),
+            m("truncated container")
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x00]),
+            m("truncated attribute status")
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x00, 0x35, 0x01]),
+            m("truncated status ib")
+        );
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x00, 0x35, 0x01, 0x24, 0x00]),
+            m("truncated status ib") // accepted delta
+        );
+        // StatusIB の status が u8 に収まらない
+        assert_eq!(
+            report(&[
+                0x15, 0x36, 0x01, 0x15, 0x35, 0x00, 0x35, 0x01, 0x25, 0x00, 0x00, 0x01, 0x18, 0x18,
+                0x18, 0x18, 0x18
+            ]),
+            m("attribute status code out of range")
+        );
+        // StatusIB 無しの AttributeStatusIB
+        assert_eq!(
+            report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x00, 0x18, 0x18, 0x18, 0x18]),
+            m("attribute status without StatusIB")
+        );
+
+        // --- read_attribute 経路（同じウォーカー） ---
+        assert_eq!(
+            decode_single_attribute_report(&[0x15, 0x36, 0x01, 0x15, 0x35, 0x01]).unwrap_err(),
+            m("truncated attribute data")
+        );
+
+        // --- ReadRequestMessage top-level ---
+        let read_req = |b: &[u8]| decode_read_request_message(b).unwrap_err();
+        assert_eq!(read_req(&[]), m("empty payload"));
+        assert_eq!(read_req(&[0x15]), m("truncated read request"));
+        assert_eq!(read_req(&[0x15, 0x24]), m("truncated read request")); // accepted delta
+        assert_eq!(read_req(&[0x15, 0x35, 0x07]), m("truncated container"));
+        assert_eq!(
+            read_req(&[0x15, 0x36, 0x00]),
+            m("truncated attribute requests")
+        );
+
+        // --- decode_attribute_status_ib（write.rs の WriteResponse 経由） ---
+        let write_resp = |b: &[u8]| decode_write_response(b).unwrap_err();
+        assert_eq!(
+            write_resp(&[0x15, 0x36, 0x00, 0x15]),
+            m("truncated attribute status")
+        );
+        assert_eq!(
+            write_resp(&[0x15, 0x36, 0x00, 0x15, 0x24]),
+            m("truncated attribute status") // accepted delta
+        );
+        assert_eq!(
+            write_resp(&[0x15, 0x36, 0x00, 0x15, 0x18, 0x18, 0x18]),
+            m("attribute status without StatusIB")
+        );
     }
 
     #[test]
