@@ -2,7 +2,7 @@
 //!
 //! Layout: this file holds the opcode / cluster / attribute / command /
 //! status constants, the shared value & error types (`ImValue`, `ImError`,
-//! `ReportData`, `InvokeOutcome`, `InvokeResponseData`) and the private TLV
+//! `InvokeOutcome`, `InvokeResponseData`) and the private TLV
 //! helpers every codec uses. The codecs live in one submodule per
 //! interaction, re-exported flat so callers keep writing `im::<name>`:
 //! `read` (ReadRequest / ReportData), `subscribe`, `invoke` (Invoke /
@@ -264,8 +264,8 @@ pub const ATTR_ATTRIBUTE_LIST: u32 = 0xFFFB;
 pub const ATTR_FEATURE_MAP: u32 = 0xFFFC;
 pub const ATTR_CLUSTER_REVISION: u32 = 0xFFFD;
 
-/// A decoded scalar attribute/data value. Containers are not supported (M2
-/// scope is single scalar attributes such as onoff's `OnOff` bool).
+/// A decoded scalar attribute/data value — `SecureSession::read_attribute`'s
+/// return type. Containers are not supported (use `read_attribute_json`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImValue {
     Bool(bool),
@@ -276,15 +276,6 @@ pub enum ImValue {
     Utf8(String),
     Bytes(Vec<u8>),
     Null,
-}
-
-/// Decoded ReportData for a single-attribute read (first AttributeReportIB
-/// only; see module docs).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReportData {
-    pub suppress_response: bool,
-    pub value: Option<ImValue>,
-    pub status: Option<u8>,
 }
 
 /// Decoded InvokeResponse outcome for a single command.

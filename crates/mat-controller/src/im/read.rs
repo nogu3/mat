@@ -2,12 +2,12 @@
 //! chunk 結合 `merge_reports`）。コントローラ側の read と、device 側の
 //! ReadRequest 受理 / ReportData 送出の両方向。
 
-use crate::tlv::{Reader, Tag, Value, Writer};
+use crate::tlv::{Element, Reader, Tag, Value, Writer};
 
 use super::json::tlv_element_to_json;
 use super::{
     expect_struct_start, put_attribute_path, put_status_ib, skip_container, value_to_im, ImError,
-    ImValue, ReportData, IM_REVISION,
+    ImValue, IM_REVISION,
 };
 
 /// ReadRequestMessage (spec §8.9.2) for a single attribute path.
@@ -78,118 +78,7 @@ pub(super) fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> 
     status.ok_or(ImError::Malformed("attribute status without StatusIB"))
 }
 
-/// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`.
-/// Assumes the caller already consumed the `StructStart` (tag 1) that opens
-/// this AttributeDataIB.
-fn decode_attribute_data_ib(r: &mut Reader) -> Result<ImValue, ImError> {
-    let mut data = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute data"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(2), v) => data = Some(value_to_im(v)?),
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
-            }
-            _ => {}
-        }
-    }
-    data.ok_or(ImError::Malformed("attribute data without Data field"))
-}
-
-/// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`.
-/// Assumes the caller already consumed the anonymous `StructStart` opening
-/// this AttributeReportIB.
-fn decode_attribute_report_ib(r: &mut Reader) -> Result<(Option<ImValue>, Option<u8>), ImError> {
-    let mut value = None;
-    let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute report"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(0), Value::StructStart) => {
-                status = Some(decode_attribute_status_ib(r)?);
-            }
-            (Tag::Context(1), Value::StructStart) => {
-                value = Some(decode_attribute_data_ib(r)?);
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
-            }
-            _ => {}
-        }
-    }
-    Ok((value, status))
-}
-
-/// ReportDataMessage (spec §8.9.2). Only the first AttributeReportIB is
-/// interpreted (M2 reads one attribute at a time).
-pub fn decode_report_data(payload: &[u8]) -> Result<ReportData, ImError> {
-    let mut r = Reader::new(payload);
-    expect_struct_start(&mut r)?;
-    let mut suppress_response = false;
-    let mut value: Option<ImValue> = None;
-    let mut status: Option<u8> = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated report data"))?;
-        match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
-            (Tag::Context(1), Value::ArrayStart) => {
-                // AttributeReportIBs
-                let mut first = true;
-                loop {
-                    let e2 = r
-                        .next()?
-                        .ok_or(ImError::Malformed("truncated attribute reports"))?;
-                    match e2.value {
-                        Value::ContainerEnd => break,
-                        Value::StructStart if first => {
-                            let (v, s) = decode_attribute_report_ib(&mut r)?;
-                            value = v;
-                            status = s;
-                            first = false;
-                        }
-                        Value::StructStart => skip_container(&mut r)?,
-                        _ => {
-                            return Err(ImError::Malformed(
-                                "unexpected element in attribute reports",
-                            ))
-                        }
-                    }
-                }
-            }
-            (Tag::Context(3), Value::Bool(true)) => {
-                // MoreChunkedMessages: M2 has no chunk-reassembly support, so
-                // silently returning the first chunk's partial data would be
-                // wrong — the caller would see a "successful" read that is
-                // actually incomplete.
-                return Err(ImError::Malformed("chunked report data unsupported"));
-            }
-            (Tag::Context(4), Value::Bool(b)) => suppress_response = b,
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
-            }
-            _ => {}
-        }
-    }
-    if value.is_none() && status.is_none() {
-        return Err(ImError::Malformed("empty report"));
-    }
-    Ok(ReportData {
-        suppress_response,
-        value,
-        status,
-    })
-}
-
-/// 1 AttributeReportIB のデコード結果（汎用形）。`decode_report_data`（M2,
-/// 単一属性・スカラーのみ）とは独立の新 API — 既存 API は無改変。
+/// 1 AttributeReportIB のデコード結果（汎用形、Data は JSON）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeReport {
     pub endpoint: Option<u16>,
@@ -264,6 +153,33 @@ pub(super) fn decode_attribute_path_ib(r: &mut Reader) -> Result<AttributePathFi
     Ok((endpoint, cluster, attribute, list_append))
 }
 
+/// Data 要素（AttributeDataIB の Context 2）のデコーダ。先頭要素を受け取り、
+/// コンテナならその終端まで読み切って `D` を返す。`decode_report_data_message`
+/// は `tlv_element_to_json`、`read_attribute` は `data_to_im` を渡す — ReportData
+/// の走査自体は 1 本（`decode_report_data_with`）。
+trait DataDecoder<D>: FnMut(&mut Reader, Element) -> Result<D, ImError> {}
+impl<D, F: FnMut(&mut Reader, Element) -> Result<D, ImError>> DataDecoder<D> for F {}
+
+/// 1 AttributeReportIB の走査結果（`AttributeReport` の Data 型汎用版）。
+struct ReportIb<D> {
+    endpoint: Option<u16>,
+    cluster: Option<u32>,
+    attribute: Option<u32>,
+    list_append: bool,
+    data: Option<D>,
+    status: Option<u8>,
+    /// AttributeDataIB（tag 1）が在ったか。Data 欠落の IB を空 IB と区別する。
+    has_data_ib: bool,
+}
+
+/// ReportDataMessage の走査結果（`ReportDataMessage` の Data 型汎用版）。
+struct ReportDataOf<D> {
+    reports: Vec<ReportIb<D>>,
+    subscription_id: Option<u32>,
+    more_chunks: bool,
+    suppress_response: bool,
+}
+
 /// `decode_attribute_status_ib_full` の戻り値: (endpoint, cluster, attribute, status).
 type AttributeStatusFields = (Option<u16>, Option<u32>, Option<u32>, u8);
 
@@ -305,19 +221,15 @@ fn decode_attribute_status_ib_full(r: &mut Reader) -> Result<AttributeStatusFiel
 
 /// `decode_attribute_data_ib_full` の戻り値: (endpoint, cluster, attribute,
 /// list_append, data).
-type AttributeDataFields = (
-    Option<u16>,
-    Option<u32>,
-    Option<u32>,
-    bool,
-    Option<serde_json::Value>,
-);
+type AttributeDataFields<D> = (Option<u16>, Option<u32>, Option<u32>, bool, Option<D>);
 
 /// AttributeDataIB (spec §8.9.2.2): `{0: DataVersion, 1: Path, 2: Data}`,
-/// path も拾い Data を JSON 化する汎用版（`decode_attribute_data_ib` の M2
-/// 版とは独立）。呼び出し側は AttributeReportIB の anonymous `StructStart`
-/// （tag 1）を既に読んでいる前提。
-fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, ImError> {
+/// path も拾い Data を `decode` でデコードする。呼び出し側は AttributeReportIB
+/// の anonymous `StructStart`（tag 1）を既に読んでいる前提。
+fn decode_attribute_data_ib_full<D>(
+    r: &mut Reader,
+    decode: &mut impl DataDecoder<D>,
+) -> Result<AttributeDataFields<D>, ImError> {
     let mut endpoint = None;
     let mut cluster = None;
     let mut attribute = None;
@@ -337,7 +249,7 @@ fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, 
                 list_append = la;
             }
             (Tag::Context(2), _) => {
-                data = Some(tlv_element_to_json(r, el)?);
+                data = Some(decode(r, el)?);
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(r)?;
@@ -349,15 +261,19 @@ fn decode_attribute_data_ib_full(r: &mut Reader) -> Result<AttributeDataFields, 
 }
 
 /// AttributeReportIB (spec §8.9.2.2): `{0: AttributeStatusIB} | {1: AttributeDataIB}`,
-/// 汎用版（path/JSON も拾う。`decode_attribute_report_ib` の M2 版とは独立）。
-/// 呼び出し側は開く anonymous `StructStart` を既に読んでいる前提。
-fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, ImError> {
+/// path も拾う汎用版。呼び出し側は開く anonymous `StructStart` を既に読んで
+/// いる前提。
+fn decode_attribute_report_ib_full<D>(
+    r: &mut Reader,
+    decode: &mut impl DataDecoder<D>,
+) -> Result<ReportIb<D>, ImError> {
     let mut endpoint = None;
     let mut cluster = None;
     let mut attribute = None;
     let mut list_append = false;
     let mut data = None;
     let mut status = None;
+    let mut has_data_ib = false;
     loop {
         let el = r
             .next()?
@@ -372,12 +288,13 @@ fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, Im
                 status = Some(s);
             }
             (Tag::Context(1), Value::StructStart) => {
-                let (ep, cl, attr, la, d) = decode_attribute_data_ib_full(r)?;
+                let (ep, cl, attr, la, d) = decode_attribute_data_ib_full(r, decode)?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
                 list_append = la;
                 data = d;
+                has_data_ib = true;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
                 skip_container(r)?;
@@ -385,22 +302,25 @@ fn decode_attribute_report_ib_full(r: &mut Reader) -> Result<AttributeReport, Im
             _ => {}
         }
     }
-    Ok(AttributeReport {
+    Ok(ReportIb {
         endpoint,
         cluster,
         attribute,
         list_append,
         data,
         status,
+        has_data_ib,
     })
 }
 
 /// ReportDataMessage (spec §8.9.2) の汎用デコード。すべての AttributeReportIB
-/// を読み（M2 の `decode_report_data` と違い最初の 1 件に限らない）、
-/// MoreChunkedMessages(tag 3) はチャンク未完了フラグとしてそのまま
-/// `more_chunks` へ反映するだけで拒否しない（チャンク統合は
-/// `merge_reports` の責務）。
-pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, ImError> {
+/// を読み（Data は `decode` でデコード）、MoreChunkedMessages(tag 3) はチャンク
+/// 未完了フラグとしてそのまま `more_chunks` へ反映するだけで拒否しない（チャンク
+/// 統合は `merge_reports` の責務）。
+fn decode_report_data_with<D>(
+    payload: &[u8],
+    decode: &mut impl DataDecoder<D>,
+) -> Result<ReportDataOf<D>, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut reports = Vec::new();
@@ -428,7 +348,7 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart => {
-                            reports.push(decode_attribute_report_ib_full(&mut r)?);
+                            reports.push(decode_attribute_report_ib_full(&mut r, decode)?);
                         }
                         _ => {
                             return Err(ImError::Malformed(
@@ -446,12 +366,80 @@ pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, I
             _ => {}
         }
     }
-    Ok(ReportDataMessage {
+    Ok(ReportDataOf {
         reports,
         subscription_id,
         more_chunks,
         suppress_response,
     })
+}
+
+/// ReportDataMessage (spec §8.9.2) の汎用デコード（Data は JSON、
+/// `tlv_element_to_json` の規約）。`decode_report_data_with` 参照。
+pub fn decode_report_data_message(payload: &[u8]) -> Result<ReportDataMessage, ImError> {
+    let msg = decode_report_data_with(payload, &mut tlv_element_to_json)?;
+    Ok(ReportDataMessage {
+        reports: msg
+            .reports
+            .into_iter()
+            .map(|ib| AttributeReport {
+                endpoint: ib.endpoint,
+                cluster: ib.cluster,
+                attribute: ib.attribute,
+                list_append: ib.list_append,
+                data: ib.data,
+                status: ib.status,
+            })
+            .collect(),
+        subscription_id: msg.subscription_id,
+        more_chunks: msg.more_chunks,
+        suppress_response: msg.suppress_response,
+    })
+}
+
+/// `read_attribute` 用の Data デコーダ: スカラーは `ImValue`。コンテナは読み
+/// 飛ばし、`Err(UnsupportedValue)` を *値として* 持つ — 解釈するのは最初の
+/// AttributeReportIB だけなので、2 件目以降のコンテナ値で全体を失敗させない。
+fn data_to_im(r: &mut Reader, first: Element) -> Result<Result<ImValue, ImError>, ImError> {
+    match first.value {
+        Value::StructStart | Value::ArrayStart | Value::ListStart => {
+            skip_container(r)?;
+            Ok(Err(ImError::UnsupportedValue))
+        }
+        v => Ok(value_to_im(v)),
+    }
+}
+
+/// `SecureSession::read_attribute`（単一属性・スカラーのみ）の ReportData 解釈。
+/// 最初の AttributeReportIB だけを見る。外側 `Err` は応答全体が解釈不能
+/// （呼び手は StatusResponse を返さず打ち切る）。`Ok((suppress_response,
+/// outcome))` の `outcome` は属性レベルの結果で、StatusIB は
+/// `AttributeStatus` になる。
+pub(crate) fn decode_single_attribute_report(
+    payload: &[u8],
+) -> Result<(bool, Result<ImValue, ImError>), ImError> {
+    let msg = decode_report_data_with(payload, &mut data_to_im)?;
+    if msg.more_chunks {
+        // read_attribute はチャンク再構成をしない: 最初のチャンクの部分データを
+        // 成功として返してはならない（チャンク対応は read_attribute_json）。
+        return Err(ImError::Malformed("chunked report data unsupported"));
+    }
+    let Some(first) = msg.reports.into_iter().next() else {
+        return Err(ImError::Malformed("empty report"));
+    };
+    let value = match first.data {
+        Some(v) => Some(v?),
+        None if first.has_data_ib => {
+            return Err(ImError::Malformed("attribute data without Data field"))
+        }
+        None => None,
+    };
+    let outcome = match (first.status, value) {
+        (Some(status), _) => Err(ImError::AttributeStatus(status)),
+        (None, Some(v)) => Ok(v),
+        (None, None) => return Err(ImError::Malformed("empty report")),
+    };
+    Ok((msg.suppress_response, outcome))
 }
 
 /// One attribute value to report: server-side counterpart of
@@ -774,18 +762,17 @@ mod tests {
     }
 
     #[test]
-    fn decodes_report_data_bool() {
-        let rd = decode_report_data(&report_data(true, true)).unwrap();
-        assert!(rd.suppress_response);
-        assert_eq!(rd.value, Some(ImValue::Bool(true)));
-        assert_eq!(rd.status, None);
-        let rd = decode_report_data(&report_data(false, false)).unwrap();
-        assert!(!rd.suppress_response);
-        assert_eq!(rd.value, Some(ImValue::Bool(false)));
+    fn decodes_single_attribute_report_bool() {
+        let (suppress, value) = decode_single_attribute_report(&report_data(true, true)).unwrap();
+        assert!(suppress);
+        assert_eq!(value, Ok(ImValue::Bool(true)));
+        let (suppress, value) = decode_single_attribute_report(&report_data(false, false)).unwrap();
+        assert!(!suppress);
+        assert_eq!(value, Ok(ImValue::Bool(false)));
     }
 
     #[test]
-    fn decodes_report_data_attribute_status() {
+    fn decodes_single_attribute_report_attribute_status() {
         // AttributeStatus (tag 0) = 読めない属性: struct{0: Path, 1: StatusIB{0: status}}
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
@@ -803,15 +790,15 @@ mod tests {
         w.put_bool(Tag::Context(4), true);
         w.put_uint(Tag::Context(255), 12);
         w.end_container();
-        let rd = decode_report_data(&w.finish()).unwrap();
-        assert_eq!(rd.status, Some(0x86));
-        assert_eq!(rd.value, None);
+        let (suppress, value) = decode_single_attribute_report(&w.finish()).unwrap();
+        assert!(suppress);
+        assert_eq!(value, Err(ImError::AttributeStatus(0x86)));
     }
 
     #[test]
-    fn decode_report_data_rejects_more_chunked_messages() {
-        // ReportDataMessage の MoreChunkedMessages (tag 3) = true: M2 は
-        // チャンク再構成をサポートしないので、部分データを黙って返しては
+    fn decode_single_attribute_report_rejects_more_chunked_messages() {
+        // ReportDataMessage の MoreChunkedMessages (tag 3) = true: read_attribute
+        // はチャンク再構成をサポートしないので、部分データを黙って返しては
         // ならない。
         let mut w = Writer::new();
         w.start_struct(Tag::Anonymous);
@@ -832,7 +819,7 @@ mod tests {
         w.put_uint(Tag::Context(255), 12);
         w.end_container();
         assert_eq!(
-            decode_report_data(&w.finish()),
+            decode_single_attribute_report(&w.finish()),
             Err(ImError::Malformed("chunked report data unsupported"))
         );
     }

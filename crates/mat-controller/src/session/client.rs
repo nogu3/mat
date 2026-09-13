@@ -59,17 +59,18 @@ impl SecureSession {
         attribute: u32,
         cfg: &MrpConfig,
     ) -> Result<crate::im::ImValue, SessionError> {
-        use crate::im::{self, ImError};
+        use crate::im;
         let exchange_id = Self::new_exchange_id();
         let req = im::encode_read_request(endpoint, cluster, attribute);
         let msg = self
             .im_request(exchange_id, im::OPCODE_READ_REQUEST, &req, cfg)
             .await?;
-        let rd = im::decode_report_data(expect_im(&msg, im::OPCODE_REPORT_DATA)?)
-            .map_err(SessionError::Im)?;
-        if !rd.suppress_response {
+        let (suppress_response, outcome) =
+            im::decode_single_attribute_report(expect_im(&msg, im::OPCODE_REPORT_DATA)?)
+                .map_err(SessionError::Im)?;
+        if !suppress_response {
             // Best-effort close: the read already succeeded (we
-            // have `rd` in hand), so a lost ack on this trailing
+            // have the report in hand), so a lost ack on this trailing
             // StatusResponse must not turn it into an error here —
             // it's the peer's retransmit problem, not ours.
             let ok = im::encode_status_response(0);
@@ -83,11 +84,7 @@ impl SecureSession {
                 )
                 .await;
         }
-        if let Some(status) = rd.status {
-            return Err(SessionError::Im(ImError::AttributeStatus(status)));
-        }
-        rd.value
-            .ok_or(SessionError::Im(ImError::Malformed("no value")))
+        outcome.map_err(SessionError::Im)
     }
 
     /// Invokes a single command over the Interaction Model (spec §8.9.4).
