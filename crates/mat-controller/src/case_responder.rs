@@ -730,9 +730,7 @@ mod tests {
         let op_secret = random_p256_secret();
         let op_pub = eph_pub_bytes(&op_secret);
         let op_priv: [u8; 32] = op_secret.to_bytes().into();
-        let mut serial = [0u8; 8];
-        getrandom::fill(&mut serial).expect("os rng");
-        serial[0] &= 0x7F; // BER INTEGER minimal positive form
+        let serial = crate::cert::random_serial();
         let noc = crate::cert::issue_noc_with_cats(
             &op_pub, node_id, fabric_id, &root_cert, &root_priv, &serial, cats,
         )
