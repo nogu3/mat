@@ -94,8 +94,7 @@ mod tests {
     use crate::tlv::{Tag, TlvError, Writer};
 
     /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
-    /// （Task 7 Step 1: 旧コードに対して先に PASS させる — 詳細は
-    /// im/invoke.rs の同名テストの doc コメント参照）。
+    /// （詳細は im/invoke.rs の同名テストの doc コメント参照）。
     #[test]
     fn tlv_to_json_error_labels_are_stable() {
         assert_eq!(

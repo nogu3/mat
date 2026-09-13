@@ -14,7 +14,7 @@ use super::{
 /// ラベルの `Malformed` に、それ以外の TLV デコードエラーはそのまま `Tlv` に
 /// 渡す。`pase.rs`/`case/wire.rs` の同名ヘルパーと同じ役割。im/write.rs
 /// 等の他の IM ファイルも `use super::invoke::field_err;` でこれを共有する
-/// （Task 3 決定 — struct 走査 helper を一箇所に集約する）。
+/// （struct 走査 helper を一箇所に集約するため）。
 pub(super) fn field_err(truncated: &'static str) -> impl Fn(TlvError) -> ImError {
     move |e| match e {
         TlvError::Truncated => ImError::Malformed(truncated),
@@ -652,9 +652,8 @@ mod tests {
         w.finish()
     }
 
-    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
-    /// （Task 3 Step 1: 旧コードに対して PASS することをまず確認してから
-    /// リファクタし、Step 3 で意図的な差分だけ値を差し替える）。唯一の意図的な
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する。
+    /// 唯一の意図的な
     /// 差分（`// accepted delta` 印）は、struct フィールド走査中に *要素自体・
     /// 未知の入れ子コンテナが途中で切れる* ケース: 以前は Reader の
     /// `Truncated` を素通しで `Tlv(Truncated)` にするか、`skip_container` の

@@ -286,8 +286,7 @@ mod tests {
     }
 
     /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
-    /// （Task 4 Step 1: 旧コードに対して先に PASS させる — 詳細は
-    /// im/invoke.rs の同名テストの doc コメント参照）。唯一の意図的な差分
+    /// （詳細は im/invoke.rs の同名テストの doc コメント参照）。唯一の意図的な差分
     /// （`// accepted delta` 印）は要素自体が途中で切れるケース。
     #[test]
     fn decoder_error_labels_are_stable() {

@@ -267,7 +267,8 @@ pub fn skip_container(r: &mut Reader<'_>) -> Result<(), TlvError> {
 /// would otherwise repeat, so the three easy-to-get-wrong parts —
 /// end-of-input vs `ContainerEnd`, and skipping unknown nested containers
 /// instead of mis-reading their fields as the struct's own — live in one
-/// place. Used by `pase`'s message decoders.
+/// place. Used by `pase`'s message decoders, `case::wire`'s sigma parsers,
+/// and the `im` decoders (invoke/write/event/subscribe/json).
 pub struct StructFields<'r, 'a> {
     r: &'r mut Reader<'a>,
 }

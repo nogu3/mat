@@ -235,8 +235,7 @@ mod tests {
     use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
 
     /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
-    /// （Task 6 Step 1: 旧コードに対して先に PASS させる — 詳細は
-    /// im/invoke.rs の同名テストの doc コメント参照）。
+    /// （詳細は im/invoke.rs の同名テストの doc コメント参照）。
     #[test]
     fn decoder_error_labels_are_stable() {
         // --- top-level struct check ---

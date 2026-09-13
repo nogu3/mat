@@ -520,7 +520,7 @@ mod tests {
 
     /// Pins the `&'static str` error labels every parser (`parse_sigma1`,
     /// `parse_sigma2`, `parse_sigma3`, `parse_tbe`) returns, across the
-    /// `StructFields` rollout (Task 2). Two cases are a deliberate,
+    /// `StructFields` rollout. Two cases are a deliberate,
     /// documented delta (`accepted delta` comments below); everything else
     /// must stay byte-for-byte identical to the hand-rolled walk.
     #[test]

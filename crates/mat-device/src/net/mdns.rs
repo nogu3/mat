@@ -53,7 +53,8 @@ impl MdnsAdvertiser {
     /// Binds the socket and spawns the background receive/answer loop.
     /// Must be called from within a tokio runtime (spawns onto it).
     pub async fn spawn(iface_scope: u32) -> Result<Arc<Self>, io::Error> {
-        // `multicast_loop: true` — off by the OS default — so a query this
+        // `multicast_loop: true` — explicitly enabled (don't rely on the OS
+        // default) — so a query this
         // socket itself sends (there are none from this struct today, but
         // the live/e2e test's *querier* runs in the same process/netns via
         // loopback) can be answered and looped back locally; see

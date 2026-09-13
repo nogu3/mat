@@ -171,11 +171,11 @@ pub fn iface_index(name: &str) -> std::io::Result<u32> {
 ///
 /// Shared with `mat-device`'s advertiser (`mat_device::net::mdns`), which
 /// binds the identical socket for the opposite role. `multicast_loop`
-/// distinguishes the two: `true` は明示的に loop を有効化（advertiser
-/// 用：同一ホストの querier に届ける）。`false` は OS 既定のまま触らない —
-/// 既存 querier の挙動を変えない（このクレートは今日まで
-/// `set_multicast_loop_v6` を一度も呼んでおらず、Linux では OS 既定で
-/// loop is on）。
+/// distinguishes the two: `true` explicitly enables loop (advertiser: so a
+/// querier on the same host receives it); `false` leaves the OS default
+/// untouched (this crate has never called `set_multicast_loop_v6` before
+/// today; on Linux the OS default is loop on), so existing querier behavior
+/// is unchanged.
 pub fn bind_mdns_socket(scope_id: u32, multicast_loop: bool) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
