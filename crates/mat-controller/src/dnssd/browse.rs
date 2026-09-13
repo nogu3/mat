@@ -308,9 +308,10 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{
-        multicast_ifaces, spawn_multicast_announcer, synth_commissionable_response, MsgBuilder, MC,
+        spawn_multicast_announcer, synth_commissionable_response, MsgBuilder, MC,
     };
     use super::*;
+    use crate::test_support::multicast_ifaces;
 
     /// browse（discover の commissionable 列挙）も同じくマルチキャストのみの
     /// 広告を受信できること。resolve_commissionable と同じ回帰のピン留め。

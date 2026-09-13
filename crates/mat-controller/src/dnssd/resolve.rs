@@ -361,10 +361,11 @@ pub async fn resolve_commissionable(
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{
-        multicast_ifaces, spawn_multicast_announcer, spawn_unicast_responder,
-        synth_commissionable_response, synth_response,
+        spawn_multicast_announcer, spawn_unicast_responder, synth_commissionable_response,
+        synth_response,
     };
     use super::*;
+    use crate::test_support::multicast_ifaces;
 
     /// resolve_commissionable が、マルチキャストでしか応答しない responder
     /// （実機 OTBR proxy と同型）の commissionable 広告を受信できること。

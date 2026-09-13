@@ -607,7 +607,7 @@ mod tests {
         let addr = group_multicast_addr(1, 10);
         let mut tried = Vec::new();
 
-        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+        for (name, index) in crate::test_support::multicast_ifaces() {
             // Fresh receiver per candidate: a socket can only join a given
             // multicast group once per interface, and candidates that fail
             // to join must not poison the next attempt.
@@ -684,7 +684,7 @@ mod tests {
         let addr = group_multicast_addr(1, 10);
         let mut tried = Vec::new();
 
-        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+        for (name, index) in crate::test_support::multicast_ifaces() {
             let recv1 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             if recv1.join_multicast_v6(&addr, index).is_err() {
                 tried.push(format!("{}(idx={}): join failed", name, index));
@@ -775,7 +775,7 @@ mod tests {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1);
 
-        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+        for (name, index) in crate::test_support::multicast_ifaces() {
             let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             let port = recv.local_addr().unwrap().port();
             if recv.join_multicast_v6(&addr, index).is_err() {
@@ -855,7 +855,7 @@ mod tests {
         let mut tried = Vec::new();
         const BOGUS_SCOPE_ID: u32 = 0x7fff_fffe;
 
-        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+        for (name, index) in crate::test_support::multicast_ifaces() {
             let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
             if recv.join_multicast_v6(&addr, index).is_err() {
                 tried.push(format!("{}(idx={}): join failed", name, index));
@@ -971,7 +971,7 @@ mod tests {
         use crate::transport::UdpTransport;
 
         let mut tried = Vec::new();
-        for (name, index) in crate::dnssd::test_util::multicast_ifaces() {
+        for (name, index) in crate::test_support::multicast_ifaces() {
             let p = tmp_counter_path(&format!("late-{}", index));
             let _ = std::fs::remove_file(&p);
             let counter = PersistedGroupCounter::load(&p, 0).unwrap();

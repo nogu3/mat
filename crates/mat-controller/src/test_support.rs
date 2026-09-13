@@ -121,6 +121,49 @@ pub fn decode_unsecured(buf: &[u8]) -> Option<(MessageHeader, ProtocolHeader, Ve
     Some((h, p, buf[off + boff..].to_vec()))
 }
 
+/// `IFF_UP|IFF_MULTICAST` な iface（lo 以外、`operstate == "up"` 優先）。
+/// `group.rs` と dnssd の tests が使う — lo は IFF_MULTICAST を持たず IPv6
+/// マルチキャストが絶対に届かないため除外。
+pub fn multicast_ifaces() -> Vec<(String, u32)> {
+    const IFF_UP: u32 = 0x1;
+    const IFF_MULTICAST: u32 = 0x1000;
+    let mut up_first = Vec::new();
+    let mut rest = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "lo" {
+            continue;
+        }
+        let base = entry.path();
+        let flags = std::fs::read_to_string(base.join("flags"))
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        if flags & IFF_UP == 0 || flags & IFF_MULTICAST == 0 {
+            continue;
+        }
+        let Some(index) = std::fs::read_to_string(base.join("ifindex"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let operstate = std::fs::read_to_string(base.join("operstate")).unwrap_or_default();
+        if operstate.trim() == "up" {
+            up_first.push((name, index));
+        } else {
+            rest.push((name, index));
+        }
+    }
+    up_first.sort_by_key(|(_, idx)| *idx);
+    rest.sort_by_key(|(_, idx)| *idx);
+    up_first.extend(rest);
+    up_first
+}
+
 /// Waits for the initiator's next *unsecured* message with `opcode` (skipping
 /// MRP retransmits, standalone acks, and anything else on the socket).
 /// Returns the protocol header, the app payload, the message counter (for
