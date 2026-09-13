@@ -2,12 +2,12 @@
 //! chunk 結合 `merge_reports`）。コントローラ側の read と、device 側の
 //! ReadRequest 受理 / ReportData 送出の両方向。
 
-use crate::tlv::{Element, Reader, StructFields, Tag, TlvError, Value, Writer};
+use crate::tlv::{Element, Reader, StructFields, Tag, Value, Writer};
 
 use super::json::tlv_element_to_json;
 use super::{
-    expect_struct_start, put_attribute_path, put_status_ib, skip_container, value_to_im, ImError,
-    ImValue, IM_REVISION,
+    expect_struct_start, field_err, put_attribute_path, put_status_ib, skip_container, value_to_im,
+    ImError, ImValue, IM_REVISION,
 };
 
 /// ReadRequestMessage (spec §8.9.2) for a single attribute path.
@@ -28,17 +28,6 @@ pub fn encode_read_request(endpoint: u16, cluster: u32, attribute: u32) -> Vec<u
     w.finish()
 }
 
-/// `StructFields::next_field` の `Err` を旧手書き走査と同じ形に写す: 入力終端
-/// （`Truncated`）は `Malformed(label)`、その他の Reader エラーは `Tlv`。
-/// 唯一の差分は「フィールド要素自体の途中切れ」で、以前は Reader の
-/// `Tlv(Truncated)` だったが入力終端と区別できず `Malformed(label)` になる。
-fn fields_err(label: &'static str) -> impl Fn(TlvError) -> ImError {
-    move |e| match e {
-        TlvError::Truncated => ImError::Malformed(label),
-        other => ImError::Tlv(other),
-    }
-}
-
 /// StatusIB (spec §8.9.2.3): `{0: status, [1: cluster_status]}`, returning
 /// only the (mandatory) status code. Assumes the caller already consumed the
 /// `StructStart` that opens this StatusIB. Shared by the attribute-status
@@ -46,7 +35,7 @@ fn fields_err(label: &'static str) -> impl Fn(TlvError) -> ImError {
 pub(super) fn decode_status_ib_code(r: &mut Reader) -> Result<Option<u8>, ImError> {
     let mut status = None;
     let mut f = StructFields::inside(r);
-    while let Some(el) = f.next_field().map_err(fields_err("truncated status ib"))? {
+    while let Some(el) = f.next_field().map_err(field_err("truncated status ib"))? {
         match (el.tag, el.value) {
             (Tag::Context(0), Value::Uint(v)) => {
                 status = Some(
@@ -71,7 +60,7 @@ pub(super) fn decode_attribute_status_ib(r: &mut Reader) -> Result<u8, ImError> 
     let mut f = StructFields::inside(r);
     while let Some(el) = f
         .next_field()
-        .map_err(fields_err("truncated attribute status"))?
+        .map_err(field_err("truncated attribute status"))?
     {
         match (el.tag, el.value) {
             (Tag::Context(1), Value::StructStart) => {
@@ -205,7 +194,7 @@ fn decode_attribute_status_ib_full(r: &mut Reader) -> Result<AttributeStatusFiel
     let mut f = StructFields::inside(r);
     while let Some(el) = f
         .next_field()
-        .map_err(fields_err("truncated attribute status"))?
+        .map_err(field_err("truncated attribute status"))?
     {
         match (el.tag, el.value) {
             (Tag::Context(0), Value::ListStart) => {
@@ -248,7 +237,7 @@ fn decode_attribute_data_ib_full<D>(
     let mut f = StructFields::inside(r);
     while let Some(el) = f
         .next_field()
-        .map_err(fields_err("truncated attribute data"))?
+        .map_err(field_err("truncated attribute data"))?
     {
         match (el.tag, el.value) {
             (Tag::Context(1), Value::ListStart) => {
@@ -287,7 +276,7 @@ fn decode_attribute_report_ib_full<D>(
     let mut f = StructFields::inside(r);
     while let Some(el) = f
         .next_field()
-        .map_err(fields_err("truncated attribute report"))?
+        .map_err(field_err("truncated attribute report"))?
     {
         match (el.tag, el.value) {
             (Tag::Context(0), Value::StructStart) => {
@@ -338,10 +327,7 @@ fn decode_report_data_with<D>(
     let mut more_chunks = false;
     let mut suppress_response = false;
     let mut f = StructFields::inside(&mut r);
-    while let Some(el) = f
-        .next_field()
-        .map_err(fields_err("truncated report data"))?
-    {
+    while let Some(el) = f.next_field().map_err(field_err("truncated report data"))? {
         match (el.tag, el.value) {
             (Tag::Context(0), Value::Uint(v)) => {
                 subscription_id = Some(
@@ -636,7 +622,7 @@ pub fn decode_read_request_message(payload: &[u8]) -> Result<ReadRequestIn, ImEr
     let mut f = StructFields::inside(&mut r);
     while let Some(el) = f
         .next_field()
-        .map_err(fields_err("truncated read request"))?
+        .map_err(field_err("truncated read request"))?
     {
         match (el.tag, el.value) {
             (Tag::Context(0), Value::ArrayStart) => {

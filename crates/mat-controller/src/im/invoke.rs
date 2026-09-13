@@ -2,25 +2,12 @@
 //! encode / decode。コントローラ側の invoke と、device 側の InvokeRequest
 //! 受理 / InvokeResponse 送出の両方向。
 
-use crate::tlv::{copy_value, Reader, StructFields, Tag, TlvError, Value, Writer};
+use crate::tlv::{copy_value, Reader, StructFields, Tag, Value, Writer};
 
 use super::{
-    expect_struct_start, put_status_ib, skip_container, ImError, InvokeOutcome, InvokeResponseData,
-    IM_REVISION,
+    expect_struct_start, field_err, put_status_ib, skip_container, ImError, InvokeOutcome,
+    InvokeResponseData, IM_REVISION,
 };
-
-/// `StructFields`（`next_scalar`/`next_field`）の走査 `Err` を `ImError` に写す。
-/// `ContainerEnd` 到達前の入力終端はすべて `Truncated` として `truncated`
-/// ラベルの `Malformed` に、それ以外の TLV デコードエラーはそのまま `Tlv` に
-/// 渡す。`pase.rs`/`case/wire.rs` の同名ヘルパーと同じ役割。im/write.rs
-/// 等の他の IM ファイルも `use super::invoke::field_err;` でこれを共有する
-/// （struct 走査 helper を一箇所に集約するため）。
-pub(super) fn field_err(truncated: &'static str) -> impl Fn(TlvError) -> ImError {
-    move |e| match e {
-        TlvError::Truncated => ImError::Malformed(truncated),
-        other => ImError::Tlv(other),
-    }
-}
 
 /// InvokeRequestMessage (spec §8.9.4) の共通本体。`timed` が TimedRequest
 /// フィールド（タイムド呼び出し、spec §8.5）の値になる。公開関数

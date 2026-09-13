@@ -391,6 +391,18 @@ pub(crate) fn put_status_ib(w: &mut Writer, tag: Tag, status: u8, cluster_status
     w.end_container();
 }
 
+/// `tlv::StructFields`（`next_scalar`/`next_field`）の走査 `Err` を `ImError` に
+/// 写す。`ContainerEnd` 到達前の入力終端（要素途中の切れを含む）はすべて
+/// `Truncated` として呼び出し側ラベルの `Malformed` に、それ以外の TLV デコード
+/// エラーはそのまま `Tlv` に渡す。IM の各デコーダ（read/invoke/write/event/
+/// subscribe/json）が共有する。`pase.rs`/`case/wire.rs` の同名ヘルパーと同じ役割。
+fn field_err(truncated: &'static str) -> impl Fn(crate::tlv::TlvError) -> ImError {
+    move |e| match e {
+        crate::tlv::TlvError::Truncated => ImError::Malformed(truncated),
+        other => ImError::Tlv(other),
+    }
+}
+
 /// Reads the next element and requires it to be a struct start (every IM
 /// message is a top-level anonymous struct).
 fn expect_struct_start(r: &mut Reader) -> Result<(), ImError> {

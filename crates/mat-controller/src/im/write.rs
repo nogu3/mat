@@ -3,7 +3,7 @@
 
 use crate::tlv::{copy_value, Reader, StructFields, Tag, Value, Writer};
 
-use super::invoke::field_err;
+use super::field_err;
 use super::read::{decode_attribute_path_ib, decode_attribute_status_ib};
 use super::{
     expect_struct_start, put_attribute_path, put_status_ib, skip_container, ImError, IM_REVISION,
@@ -100,8 +100,8 @@ pub struct WriteRequestIn {
 /// AttributeDataIB (spec §8.9.2.2) as it appears inside a WriteRequest's
 /// `WriteRequests` array: `{0: DataVersion?, 1: Path(list), 2: Data}`.
 /// Assumes the caller already consumed the anonymous `StructStart` opening
-/// this AttributeDataIB. Unlike `decode_attribute_data_ib` (M2, report-side,
-/// scalar-only `ImValue`), this keeps `Data` as a raw re-tagged TLV element
+/// this AttributeDataIB. Unlike the report-side `read::decode_attribute_data_ib_full`
+/// (which decodes `Data` for a report), this keeps `Data` as a raw re-tagged TLV element
 /// (any shape) and also extracts the path — a write, unlike a report, always
 /// carries both.
 fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError> {

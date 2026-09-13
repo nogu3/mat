@@ -3,7 +3,7 @@
 
 use crate::tlv::{Reader, StructFields, Tag, Value, Writer};
 
-use super::invoke::field_err;
+use super::field_err;
 use super::{
     decode_attribute_requests, decode_event_filters, decode_event_requests, encode_event_path_ib,
     expect_struct_start, skip_container, AttrPathIn, EventPathIn, ImError, IM_REVISION,

@@ -1,6 +1,6 @@
 //! イベント関連の IM 型とコーデック（spec §8.9.2.2 EventPathIB / §8.9.2.4
 //! EventFilterIB / §8.9.2.6 EventDataIB / EventStatusIB）。
-use super::invoke::field_err;
+use super::field_err;
 use super::read::encode_attribute_report_ib;
 use super::{
     expect_struct_start, put_status_ib, skip_container, ImError, ReportEntryOut, IM_REVISION,
