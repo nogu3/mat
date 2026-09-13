@@ -804,6 +804,26 @@ mod tests {
         assert_eq!(Reader::new(&[0x24]).next(), Err(TlvError::Truncated));
     }
 
+    /// `StructFields::open` uses `InvalidType(0)` as a sentinel for "not a
+    /// struct" (see its doc comment). That only works because `Reader::next`
+    /// itself never produces `InvalidType(0)` for a real element — element
+    /// type `0x00` is a valid 1-byte signed int, not a reserved type. Walk
+    /// every valid element type (anonymous tag, type bits `0x00..=0x18`) and
+    /// confirm none of them come back as the sentinel value.
+    #[test]
+    fn reader_never_reports_invalid_type_zero() {
+        for c in 0x00u8..=0x18 {
+            let mut buf = vec![c];
+            buf.extend_from_slice(&[0u8; 16]);
+            let result = Reader::new(&buf).next();
+            assert_ne!(
+                result,
+                Err(TlvError::InvalidType(0)),
+                "control byte 0x{c:02X} must not report InvalidType(0)"
+            );
+        }
+    }
+
     // --- Task 11: StructFields cursor (RED) ---
 
     /// `struct{1: uint, 2: struct{...}, 3: bytes}` — `next_scalar` walks the

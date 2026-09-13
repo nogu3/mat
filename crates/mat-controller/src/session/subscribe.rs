@@ -911,18 +911,8 @@ mod tests {
                 };
                 let (h, p, _) = open_from_controller(&buf[..n]);
                 if p.opcode == crate::im::OPCODE_STATUS_RESPONSE {
-                    let ack = device_datagram(
-                        p.exchange_id,
-                        PROTOCOL_ID_SECURE_CHANNEL,
-                        OPCODE_MRP_STANDALONE_ACK,
-                        Some(h.message_counter),
-                        false,
-                        9900,
-                        &[],
-                    );
                     // device は自 exchange の initiator。ack の initiator は device 視点で true
-                    // （`device_datagram` は initiator=false 固定）。
-                    let _ = ack;
+                    // （`device_datagram` は initiator=false 固定なので使えない）。
                     let d2 = device_initiated_datagram(
                         p.exchange_id,
                         PROTOCOL_ID_SECURE_CHANNEL,

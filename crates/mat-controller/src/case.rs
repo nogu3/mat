@@ -623,4 +623,15 @@ mod tests {
             ]
         );
     }
+
+    /// Session ids must not be zero (spec §4.5.2). Replaces mat-device's
+    /// removed `random_session_id_is_never_zero` — this crate's
+    /// `random_nonzero_u16` is the one function both `mat` and `mat-device`
+    /// actually use now.
+    #[test]
+    fn random_nonzero_u16_is_never_zero() {
+        for _ in 0..10_000 {
+            assert_ne!(random_nonzero_u16(), 0);
+        }
+    }
 }
