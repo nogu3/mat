@@ -1,8 +1,9 @@
 //! WriteRequest / WriteResponse の encode / decode。コントローラ側の write
 //! と、device 側の WriteRequest 受理 / WriteResponse 送出の両方向。
 
-use crate::tlv::{copy_value, Reader, Tag, Value, Writer};
+use crate::tlv::{copy_value, Reader, StructFields, Tag, Value, Writer};
 
+use super::invoke::field_err;
 use super::read::{decode_attribute_path_ib, decode_attribute_status_ib};
 use super::{
     expect_struct_start, put_attribute_path, put_status_ib, skip_container, ImError, IM_REVISION,
@@ -109,14 +110,14 @@ fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError
     let mut attribute = None;
     let mut data_tlv = None;
     let mut list_append = false;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated attribute data"))?;
+    let mut f = StructFields::inside(r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated attribute data"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(1), Value::ListStart) => {
-                let (ep, cl, attr, la) = decode_attribute_path_ib(r)?;
+                let (ep, cl, attr, la) = decode_attribute_path_ib(f.reader())?;
                 endpoint = ep;
                 cluster = cl;
                 attribute = attr;
@@ -127,11 +128,11 @@ fn decode_write_attribute_data_ib(r: &mut Reader) -> Result<WriteAttrIn, ImError
                 // `encode_write_request_tlv`'s `data_tlv` input and
                 // `decode_invoke_request`'s CommandFields echo.
                 let mut w = Writer::new();
-                copy_value(&mut w, r, Tag::Anonymous, v)?;
+                copy_value(&mut w, f.reader(), Tag::Anonymous, v)?;
                 data_tlv = Some(w.finish());
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -174,19 +175,19 @@ pub fn decode_write_request(payload: &[u8]) -> Result<WriteRequestIn, ImError> {
     let mut suppress_response = false;
     let mut timed = false;
     let mut writes = Vec::new();
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated write request"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated write request"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Bool(b)) => suppress_response = b,
             (Tag::Context(1), Value::Bool(b)) => timed = b,
             (Tag::Context(2), Value::ArrayStart) => {
-                writes = decode_write_requests_array(&mut r)?;
+                writes = decode_write_requests_array(f.reader())?;
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -207,14 +208,15 @@ pub fn decode_write_response(payload: &[u8]) -> Result<u8, ImError> {
     let mut r = Reader::new(payload);
     expect_struct_start(&mut r)?;
     let mut status = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated write response"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated write response"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::ArrayStart) => {
-                // WriteResponses
+                // WriteResponses: array element walk stays hand-rolled.
+                let r = f.reader();
                 let mut first = true;
                 loop {
                     let e2 = r
@@ -223,10 +225,10 @@ pub fn decode_write_response(payload: &[u8]) -> Result<u8, ImError> {
                     match e2.value {
                         Value::ContainerEnd => break,
                         Value::StructStart if first => {
-                            status = Some(decode_attribute_status_ib(&mut r)?);
+                            status = Some(decode_attribute_status_ib(r)?);
                             first = false;
                         }
-                        Value::StructStart => skip_container(&mut r)?,
+                        Value::StructStart => skip_container(r)?,
                         _ => {
                             return Err(ImError::Malformed("unexpected element in write responses"))
                         }
@@ -234,7 +236,7 @@ pub fn decode_write_response(payload: &[u8]) -> Result<u8, ImError> {
                 }
             }
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -269,7 +271,122 @@ pub fn encode_write_response(results: &[(u16, u32, u32, u8)]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::im::*;
-    use crate::tlv::{Reader, Tag, Value, Writer};
+    use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+
+    /// `im/invoke.rs`'s `inner_bytes` と同じ trick: `Writer` で組んだ struct の
+    /// 先頭 `StructStart`（1 byte）だけを剥がし、「呼び出し元が StructStart を
+    /// 消費済み」という decoder の前提に合わせたバイト列を作る。
+    fn inner_bytes(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.start_struct(Tag::Anonymous);
+        f(&mut w);
+        w.end_container();
+        let full = w.finish();
+        full[1..].to_vec()
+    }
+
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
+    /// （詳細は im/invoke.rs の同名テストの doc コメント参照）。唯一の意図的な差分
+    /// （`// accepted delta` 印）は要素自体が途中で切れるケース。
+    #[test]
+    fn decoder_error_labels_are_stable() {
+        // --- top-level struct check ---
+        assert_eq!(
+            decode_write_request(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_write_request(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+        assert_eq!(
+            decode_write_response(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_write_response(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+
+        // --- struct フィールド走査: ContainerEnd なしで入力終端 ---
+        assert_eq!(
+            decode_write_request(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated write request")
+        );
+        assert_eq!(
+            decode_write_response(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated write response")
+        );
+
+        // --- struct フィールド走査中の Reader エラー（予約 element type）は Tlv のまま ---
+        assert_eq!(
+            decode_write_request(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+
+        // --- accepted delta (a): 要素自体が途中で切れている ---
+        // 旧: r.next()? の Truncated がそのまま Tlv(Truncated) に素通しされて
+        // いた。新: StructFields::next_field も同じ Truncated を返すが、
+        // field_err が呼び出し元ごとの "truncated X" ラベルに畳む。
+        assert_eq!(
+            decode_write_request(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated write request") // accepted delta: 以前は Tlv(Truncated)
+        );
+        assert_eq!(
+            decode_write_response(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated write response") // accepted delta: 以前は Tlv(Truncated)
+        );
+
+        // --- decode_write_attribute_data_ib ---
+        assert_eq!(
+            decode_write_attribute_data_ib(&mut Reader::new(&inner_bytes(|_w| {}))).unwrap_err(),
+            ImError::Malformed("write attribute without Data field")
+        );
+        assert_eq!(
+            decode_write_attribute_data_ib(&mut Reader::new(&[])).unwrap_err(),
+            ImError::Malformed("truncated attribute data")
+        );
+
+        // --- decode_write_requests_array（手書き走査のまま）---
+        assert_eq!(
+            decode_write_request(&[0x15, 0x36, 0x02]).unwrap_err(), // struct{ ctx2: array_start } で入力終端
+            ImError::Malformed("truncated write requests")
+        );
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(2));
+            w.put_uint(Tag::Anonymous, 5); // struct でも ContainerEnd でもない
+            w.end_container();
+            w.end_container();
+            assert_eq!(
+                decode_write_request(&w.finish()).unwrap_err(),
+                ImError::Malformed("unexpected element in write requests")
+            );
+        }
+
+        // --- decode_write_response: WriteResponses array（手書き走査のまま）---
+        assert_eq!(
+            decode_write_response(&[0x15, 0x36, 0x00]).unwrap_err(), // struct{ ctx0: array_start } で入力終端
+            ImError::Malformed("truncated write responses")
+        );
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_array(Tag::Context(0));
+            w.put_uint(Tag::Anonymous, 5);
+            w.end_container();
+            w.end_container();
+            assert_eq!(
+                decode_write_response(&w.finish()).unwrap_err(),
+                ImError::Malformed("unexpected element in write responses")
+            );
+        }
+        assert_eq!(
+            decode_write_response(&[0x15, 0x18]).unwrap_err(),
+            ImError::Malformed("write response without AttributeStatusIB")
+        );
+    }
 
     #[test]
     fn write_request_roundtrip_scalar() {

@@ -21,13 +21,8 @@ use mat_controller::im::{
 use mat_controller::session::SecureSession;
 use mat_controller::{case, dnssd, kvs};
 
-fn env_u64(name: &str) -> u64 {
-    let s = std::env::var(name).unwrap_or_else(|_| panic!("{name} required"));
-    match s.strip_prefix("0x") {
-        Some(h) => u64::from_str_radix(h, 16).expect("hex id"),
-        None => s.parse().expect("decimal id"),
-    }
-}
+mod common;
+use common::env_u64;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
@@ -76,7 +71,7 @@ async fn fabric_ride_along_onoff_and_color() {
 
     // 受け入れ 1: KVS から CA 材料 + NOC 由来の node/fabric id
     let materials = kvs::read_self_issue_materials(
-        &dir.join("chip_tool_config.alpha.ini"),
+        &dir.join(kvs::ALPHA_INI_FILE),
         &dir.join("chip_tool_config.ini"),
         fabric_index,
         issuer_index,

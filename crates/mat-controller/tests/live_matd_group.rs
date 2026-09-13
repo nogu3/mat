@@ -7,24 +7,8 @@
 //! Required env: MAT_E2E_SOCKET (matd socket path), MAT_E2E_GROUP_NODES
 //! (csv node ids), MAT_E2E_ENDPOINT (default 1), MAT_E2E_GROUP_ID (default 10).
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-
-async fn request(socket: &str, line: &str) -> serde_json::Value {
-    let stream = UnixStream::connect(socket)
-        .await
-        .expect("connect matd socket");
-    let (rd, mut wr) = stream.into_split();
-    wr.write_all(line.as_bytes()).await.unwrap();
-    wr.write_all(b"\n").await.unwrap();
-    let mut lines = BufReader::new(rd).lines();
-    let resp = lines.next_line().await.unwrap().expect("response line");
-    serde_json::from_str(&resp).expect("json response")
-}
-
-fn assert_ok(v: &serde_json::Value, ctx: &str) {
-    assert!(v.get("error").is_none(), "{ctx}: error response: {v}");
-}
+mod common;
+use common::{assert_ok, request};
 
 fn group_nodes() -> Vec<u64> {
     std::env::var("MAT_E2E_GROUP_NODES")

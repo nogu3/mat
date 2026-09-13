@@ -1184,4 +1184,47 @@ mod tests {
         assert_eq!(resp.iterations, 1000);
         assert_eq!(resp.salt, b"0123456789abcdef");
     }
+
+    /// The top-level struct may carry an optional SessionParams (tag 5)
+    /// *after* the PBKDF params (tag 4) — a sibling field, not something
+    /// nested inside tag 4. Confirm the generic `skip_container` arm in
+    /// `decode_pbkdf_param_response`'s outer loop skips it whole, so its
+    /// inner tag 1/2 fields never reach (and so never clobber) the already-
+    /// decoded iterations/salt.
+    #[test]
+    fn pbkdf_param_response_skips_sibling_session_params() {
+        fn encode(session_params_is_array: bool) -> Vec<u8> {
+            let mut w = crate::tlv::Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.put_bytes(Tag::Context(1), &[0u8; 32]);
+            w.put_bytes(Tag::Context(2), &[0u8; 32]);
+            w.put_uint(Tag::Context(3), 7);
+            w.start_struct(Tag::Context(4));
+            w.put_uint(Tag::Context(1), 1000);
+            w.put_bytes(Tag::Context(2), &[0x5Au8; 16]);
+            w.end_container();
+            if session_params_is_array {
+                w.start_array(Tag::Context(5));
+                w.start_struct(Tag::Anonymous);
+                w.put_uint(Tag::Context(1), 500);
+                w.put_uint(Tag::Context(2), 300);
+                w.end_container();
+                w.end_container();
+            } else {
+                w.start_struct(Tag::Context(5));
+                w.put_uint(Tag::Context(1), 500);
+                w.put_uint(Tag::Context(2), 300);
+                w.end_container();
+            }
+            w.end_container();
+            w.finish()
+        }
+
+        for session_params_is_array in [false, true] {
+            let resp = decode_pbkdf_param_response(&encode(session_params_is_array)).unwrap();
+            assert_eq!(resp.responder_session_id, 7);
+            assert_eq!(resp.iterations, 1000);
+            assert_eq!(resp.salt, vec![0x5Au8; 16]);
+        }
+    }
 }

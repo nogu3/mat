@@ -561,12 +561,12 @@ mod tests {
         let (rrand, reph, enc2) = (rrand.unwrap(), reph.unwrap(), enc2.unwrap());
         let shared = ecdh(&initiator_secret, &reph).expect("ecdh");
         let sigma1_hash = sha256(&sigma1);
-        let mut s2k_salt = Vec::new();
-        s2k_salt.extend_from_slice(&f.ipk_operational);
-        s2k_salt.extend_from_slice(&rrand);
-        s2k_salt.extend_from_slice(&reph);
-        s2k_salt.extend_from_slice(&sigma1_hash);
-        let s2k = derive_sigma_key(&shared, &s2k_salt, INFO_S2K);
+        let mut expected_s2k_salt = Vec::new();
+        expected_s2k_salt.extend_from_slice(&f.ipk_operational);
+        expected_s2k_salt.extend_from_slice(&rrand);
+        expected_s2k_salt.extend_from_slice(&reph);
+        expected_s2k_salt.extend_from_slice(&sigma1_hash);
+        let s2k = derive_sigma_key(&shared, &expected_s2k_salt, INFO_S2K);
         let tbe2 = decrypt_payload(&s2k, TBE2_NONCE, b"", &enc2).unwrap();
 
         // TBE2 の tag 4 = 16 byte resumption id
@@ -698,10 +698,10 @@ mod tests {
         s1s2.extend_from_slice(&sigma1);
         s1s2.extend_from_slice(&sigma2);
         let sigma12_hash = sha256(&s1s2);
-        let mut s3k_salt = Vec::with_capacity(16 + 32);
-        s3k_salt.extend_from_slice(&f.ipk_operational);
-        s3k_salt.extend_from_slice(&sigma12_hash);
-        let s3k = derive_sigma_key(&shared, &s3k_salt, INFO_S3K);
+        let mut expected_s3k_salt = Vec::with_capacity(16 + 32);
+        expected_s3k_salt.extend_from_slice(&f.ipk_operational);
+        expected_s3k_salt.extend_from_slice(&sigma12_hash);
+        let s3k = derive_sigma_key(&shared, &expected_s3k_salt, INFO_S3K);
 
         let tbs3 = encode_tbs(&fake_noc_tlv, None, &initiator_eph, &responder_eph_pub);
         let sig3 = sign_ecdsa_p256(fake_op_priv, &tbs3).expect("sign tbs3");
@@ -730,9 +730,7 @@ mod tests {
         let op_secret = random_p256_secret();
         let op_pub = eph_pub_bytes(&op_secret);
         let op_priv: [u8; 32] = op_secret.to_bytes().into();
-        let mut serial = [0u8; 8];
-        getrandom::fill(&mut serial).expect("os rng");
-        serial[0] &= 0x7F; // BER INTEGER minimal positive form
+        let serial = crate::cert::random_serial();
         let noc = crate::cert::issue_noc_with_cats(
             &op_pub, node_id, fabric_id, &root_cert, &root_priv, &serial, cats,
         )

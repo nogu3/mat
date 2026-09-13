@@ -1,8 +1,9 @@
 //! SubscribeRequest / SubscribeResponse（spec §8.5–8.6）。priming ReportData
 //! 自体は read と同じ `decode_report_data_message` で読む。
 
-use crate::tlv::{Reader, Tag, Value, Writer};
+use crate::tlv::{Reader, StructFields, Tag, Value, Writer};
 
+use super::invoke::field_err;
 use super::{
     decode_attribute_requests, decode_event_filters, decode_event_requests, encode_event_path_ib,
     expect_struct_start, skip_container, AttrPathIn, EventPathIn, ImError, IM_REVISION,
@@ -118,12 +119,12 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
     let mut fabric_filtered = None;
     let mut event_paths = Vec::new();
     let mut event_min = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated subscribe request"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_field()
+        .map_err(field_err("truncated subscribe request"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Bool(b)) => keep_subscriptions = Some(b),
             (Tag::Context(1), Value::Uint(v)) => {
                 min_interval_floor_s = Some(
@@ -139,19 +140,19 @@ pub fn decode_subscribe_request(payload: &[u8]) -> Result<SubscribeRequestIn, Im
             }
             (Tag::Context(3), Value::ArrayStart) => {
                 // AttributeRequests
-                paths = decode_attribute_requests(&mut r)?;
+                paths = decode_attribute_requests(f.reader())?;
             }
             (Tag::Context(4), Value::ArrayStart) => {
                 // EventRequests
-                event_paths = decode_event_requests(&mut r)?;
+                event_paths = decode_event_requests(f.reader())?;
             }
             (Tag::Context(5), Value::ArrayStart) => {
                 // EventFilters
-                event_min = decode_event_filters(&mut r)?;
+                event_min = decode_event_filters(f.reader())?;
             }
             (Tag::Context(7), Value::Bool(b)) => fabric_filtered = Some(b),
             (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
+                skip_container(f.reader())?;
             }
             _ => {}
         }
@@ -185,12 +186,12 @@ pub fn decode_subscribe_response(payload: &[u8]) -> Result<SubscribeResponse, Im
     expect_struct_start(&mut r)?;
     let mut id = None;
     let mut max_interval = None;
-    loop {
-        let el = r
-            .next()?
-            .ok_or(ImError::Malformed("truncated subscribe response"))?;
+    let mut f = StructFields::inside(&mut r);
+    while let Some(el) = f
+        .next_scalar()
+        .map_err(field_err("truncated subscribe response"))?
+    {
         match (el.tag, el.value) {
-            (_, Value::ContainerEnd) => break,
             (Tag::Context(0), Value::Uint(v)) => {
                 id = Some(
                     u32::try_from(v)
@@ -202,9 +203,6 @@ pub fn decode_subscribe_response(payload: &[u8]) -> Result<SubscribeResponse, Im
                     u16::try_from(v)
                         .map_err(|_| ImError::Malformed("max interval out of range"))?,
                 );
-            }
-            (_, Value::StructStart | Value::ArrayStart | Value::ListStart) => {
-                skip_container(&mut r)?;
             }
             _ => {}
         }
@@ -234,7 +232,150 @@ pub fn encode_subscribe_response(subscription_id: u32, max_interval_s: u16) -> V
 mod tests {
     use super::*;
     use crate::im::*;
-    use crate::tlv::{Reader, Tag, Value, Writer};
+    use crate::tlv::{Reader, Tag, TlvError, Value, Writer};
+
+    /// `StructFields` 置換前の手書き走査と同じ `ImError` を出すことを固定する
+    /// （詳細は im/invoke.rs の同名テストの doc コメント参照）。
+    #[test]
+    fn decoder_error_labels_are_stable() {
+        // --- top-level struct check ---
+        assert_eq!(
+            decode_subscribe_request(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_subscribe_request(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+        assert_eq!(
+            decode_subscribe_response(&[]).unwrap_err(),
+            ImError::Malformed("empty payload")
+        );
+        assert_eq!(
+            decode_subscribe_response(&[0x04, 0x2A]).unwrap_err(),
+            ImError::Malformed("expected struct")
+        );
+
+        // --- struct フィールド走査: ContainerEnd なしで入力終端 ---
+        assert_eq!(
+            decode_subscribe_request(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated subscribe request")
+        );
+        assert_eq!(
+            decode_subscribe_response(&[0x15]).unwrap_err(),
+            ImError::Malformed("truncated subscribe response")
+        );
+
+        // --- struct フィールド走査中の Reader エラー（予約 element type）は Tlv のまま ---
+        assert_eq!(
+            decode_subscribe_request(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+        assert_eq!(
+            decode_subscribe_response(&[0x15, 0x19, 0x18]).unwrap_err(),
+            ImError::Tlv(TlvError::InvalidType(0x19))
+        );
+
+        // --- accepted delta (a): 要素自体が途中で切れている ---
+        // 旧: r.next()? の Truncated がそのまま Tlv(Truncated) に素通しされて
+        // いた。新: StructFields::next_field/next_scalar も同じ Truncated を
+        // 返すが、field_err が呼び出し元ごとの "truncated X" ラベルに畳む。
+        assert_eq!(
+            decode_subscribe_request(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated subscribe request") // accepted delta: 以前は Tlv(Truncated)
+        );
+        assert_eq!(
+            decode_subscribe_response(&[0x15, 0x24]).unwrap_err(),
+            ImError::Malformed("truncated subscribe response") // accepted delta: 以前は Tlv(Truncated)
+        );
+
+        // --- accepted delta (b): 未知の入れ子コンテナが途中で切れている ---
+        // decode_subscribe_response は tag0/2 の uint スカラーしか知らないので
+        // next_scalar が使われ、未知タグの入れ子は自動 skip される。
+        {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            w.start_struct(Tag::Context(9)); // 未知タグの入れ子
+            w.put_uint(Tag::Context(1), 300);
+            w.end_container(); // 入れ子 close
+            w.end_container(); // 外側 close
+            let full = w.finish();
+            let cut = &full[..full.len() - 2]; // 両方の ContainerEnd を落とす
+            assert_eq!(
+                decode_subscribe_response(cut).unwrap_err(),
+                ImError::Malformed("truncated subscribe response") // accepted delta: 以前は "truncated container"
+            );
+        }
+
+        // --- decode_subscribe_request: "without X" / "out of range" ラベル ---
+        let req = |f: &dyn Fn(&mut Writer)| {
+            let mut w = Writer::new();
+            w.start_struct(Tag::Anonymous);
+            f(&mut w);
+            w.end_container();
+            w.finish()
+        };
+        assert_eq!(
+            decode_subscribe_request(&req(&|w| {
+                w.put_uint(Tag::Context(1), 0x1_0000);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("min interval floor out of range")
+        );
+        assert_eq!(
+            decode_subscribe_request(&req(&|w| {
+                w.put_uint(Tag::Context(2), 0x1_0000);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("max interval ceiling out of range")
+        );
+        assert_eq!(
+            decode_subscribe_request(&req(&|_w| {})).unwrap_err(),
+            ImError::Malformed("subscribe request without keep_subscriptions")
+        );
+        assert_eq!(
+            decode_subscribe_request(&req(&|w| {
+                w.put_bool(Tag::Context(0), false);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("subscribe request without min interval floor")
+        );
+        assert_eq!(
+            decode_subscribe_request(&req(&|w| {
+                w.put_bool(Tag::Context(0), false);
+                w.put_uint(Tag::Context(1), 0);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("subscribe request without max interval ceiling")
+        );
+
+        // --- decode_subscribe_response: "without X" / "out of range" ラベル ---
+        assert_eq!(
+            decode_subscribe_response(&req(&|w| {
+                w.put_uint(Tag::Context(0), 0x1_0000_0000);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("subscription id out of range")
+        );
+        assert_eq!(
+            decode_subscribe_response(&req(&|w| {
+                w.put_uint(Tag::Context(2), 0x1_0000);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("max interval out of range")
+        );
+        assert_eq!(
+            decode_subscribe_response(&req(&|_w| {})).unwrap_err(),
+            ImError::Malformed("subscribe response without id")
+        );
+        assert_eq!(
+            decode_subscribe_response(&req(&|w| {
+                w.put_uint(Tag::Context(0), 1);
+            }))
+            .unwrap_err(),
+            ImError::Malformed("subscribe response without max interval")
+        );
+    }
 
     #[test]
     fn subscribe_request_wildcard_shape() {

@@ -215,7 +215,7 @@ async fn browse(
     service: &str,
     window: Duration,
 ) -> Result<Vec<FoldedInstance>, DnssdError> {
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
     let mut fold = BrowseFold::new(service);
     let deadline = Instant::now() + window;
@@ -308,9 +308,10 @@ fn commissionable_from_fold(f: &FoldedInstance) -> Option<CommissionableInstance
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{
-        multicast_ifaces, spawn_multicast_announcer, synth_commissionable_response, MsgBuilder, MC,
+        spawn_multicast_announcer, synth_commissionable_response, MsgBuilder, MC,
     };
     use super::*;
+    use crate::test_support::multicast_ifaces;
 
     /// browse（discover の commissionable 列挙）も同じくマルチキャストのみの
     /// 広告を受信できること。resolve_commissionable と同じ回帰のピン留め。

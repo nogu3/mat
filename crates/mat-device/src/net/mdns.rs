@@ -37,43 +37,6 @@ const ANNOUNCE_REPEAT_DELAY: Duration = Duration::from_secs(1);
 /// `mat_controller::dnssd`'s browse listener does.
 const RECV_BUF: usize = 9000;
 
-/// Binds the advertiser's mDNS socket: `[::]:5353` with address reuse,
-/// joined to `ff02::fb` on `scope_id`.
-///
-/// Mirrors `mat_controller::dnssd::bind_mdns_socket` exactly on the
-/// reuse-flag choice: `SO_REUSEADDR` only, deliberately **not**
-/// `SO_REUSEPORT`. That function's doc comment records the reason, and it
-/// applies here just as much as to the querier: on Linux,
-/// `SO_REUSEPORT` puts same-port sockets into a load-balancing group that
-/// hashes *each* incoming datagram — multicast included — to a single
-/// member. A responder sharing port 5353 with a system mDNS daemon (avahi,
-/// the default on the deployment target) would then have queries land on
-/// only one of the two sockets at random, so this advertiser would
-/// silently miss a fraction of the queries it's supposed to answer.
-/// `SO_REUSEADDR` alone already delivers multicast to *every* socket bound
-/// to the port that joined the group, which is what coexistence with avahi
-/// (and, incidentally, multiple test-run instances) actually needs.
-///
-/// `set_multicast_loop_v6(true)` is set — off by the OS default — so a
-/// query this socket itself sends (there are none from this struct today,
-/// but the live/e2e test's *querier* runs in the same process/netns via
-/// loopback) can be answered and looped back locally; see
-/// `tests/discover_live.rs`.
-fn bind_advertiser_socket(scope_id: u32) -> io::Result<UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    sock.set_only_v6(true)?;
-    sock.set_nonblocking(true)?;
-    let bind = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
-    sock.bind(&SocketAddr::V6(bind).into())?;
-    sock.join_multicast_v6(&MDNS_GROUP, scope_id)?;
-    sock.set_multicast_if_v6(scope_id)?;
-    sock.set_multicast_hops_v6(255)?;
-    sock.set_multicast_loop_v6(true)?;
-    UdpSocket::from_std(sock.into())
-}
-
 /// The device-side mDNS advertiser: one multicast socket, a background
 /// receive loop, and the current commissionable/operational adverts it
 /// answers queries with. `Arc`-shared so `spawn`'s caller can update
@@ -90,7 +53,15 @@ impl MdnsAdvertiser {
     /// Binds the socket and spawns the background receive/answer loop.
     /// Must be called from within a tokio runtime (spawns onto it).
     pub async fn spawn(iface_scope: u32) -> Result<Arc<Self>, io::Error> {
-        let sock = bind_advertiser_socket(iface_scope)?;
+        // `multicast_loop: true` — explicitly enabled (don't rely on the OS
+        // default) — so a query this
+        // socket itself sends (there are none from this struct today, but
+        // the live/e2e test's *querier* runs in the same process/netns via
+        // loopback) can be answered and looped back locally; see
+        // `tests/discover_live.rs`. All other socket options mirror
+        // `mat_controller::dnssd::bind_mdns_socket`'s querier exactly (see
+        // that function's doc comment for the reuse-flag rationale).
+        let sock = mat_controller::dnssd::bind_mdns_socket(iface_scope, true)?;
         let this = Arc::new(MdnsAdvertiser {
             sock,
             scope_id: iface_scope,

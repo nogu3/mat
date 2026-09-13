@@ -9,32 +9,8 @@
 
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-
-fn env_u64(name: &str) -> u64 {
-    let s = std::env::var(name).unwrap_or_else(|_| panic!("{name} required"));
-    match s.strip_prefix("0x") {
-        Some(h) => u64::from_str_radix(h, 16).expect("hex id"),
-        None => s.parse().expect("decimal id"),
-    }
-}
-
-async fn request(socket: &str, line: &str) -> serde_json::Value {
-    let stream = UnixStream::connect(socket)
-        .await
-        .expect("connect matd socket");
-    let (rd, mut wr) = stream.into_split();
-    wr.write_all(line.as_bytes()).await.unwrap();
-    wr.write_all(b"\n").await.unwrap();
-    let mut lines = BufReader::new(rd).lines();
-    let resp = lines.next_line().await.unwrap().expect("response line");
-    serde_json::from_str(&resp).expect("json response")
-}
-
-fn assert_ok(v: &serde_json::Value, ctx: &str) {
-    assert!(v.get("error").is_none(), "{ctx}: error response: {v}");
-}
+mod common;
+use common::{assert_ok, env_u64, request};
 
 #[tokio::test]
 #[ignore = "requires a running native-enabled matd + a commissioned device (task e2e:m4)"]

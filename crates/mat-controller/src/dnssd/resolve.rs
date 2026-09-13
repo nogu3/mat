@@ -70,7 +70,7 @@ pub async fn resolve_operational_many(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
     let mut queries: Vec<OperationalQuery> = node_ids
         .iter()
@@ -272,7 +272,7 @@ pub async fn resolve_commissionable(
     timeout: Duration,
 ) -> Result<ResolvedNode, DnssdError> {
     let subtype = long_discriminator_subtype(long_discriminator);
-    let sock = bind_mdns_socket(scope_id).map_err(DnssdError::Io)?;
+    let sock = bind_mdns_socket(scope_id, false).map_err(DnssdError::Io)?;
     let dest = mdns_dest(scope_id);
 
     let mut instance: Option<String> = None;
@@ -361,10 +361,11 @@ pub async fn resolve_commissionable(
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{
-        multicast_ifaces, spawn_multicast_announcer, spawn_unicast_responder,
-        synth_commissionable_response, synth_response,
+        spawn_multicast_announcer, spawn_unicast_responder, synth_commissionable_response,
+        synth_response,
     };
     use super::*;
+    use crate::test_support::multicast_ifaces;
 
     /// resolve_commissionable が、マルチキャストでしか応答しない responder
     /// （実機 OTBR proxy と同型）の commissionable 広告を受信できること。

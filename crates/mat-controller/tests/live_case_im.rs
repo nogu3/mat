@@ -10,13 +10,8 @@ use mat_controller::transport::{Transport, UdpTransport};
 use mat_controller::{case, kvs};
 use std::path::PathBuf;
 
-fn env_node_id() -> u64 {
-    let s = std::env::var("MAT_E2E_NODE_ID").expect("MAT_E2E_NODE_ID required");
-    match s.strip_prefix("0x") {
-        Some(h) => u64::from_str_radix(h, 16).expect("hex node id"),
-        None => s.parse().expect("decimal node id"),
-    }
-}
+mod common;
+use common::env_node_id;
 
 #[tokio::test]
 #[ignore = "requires a commissioned device + chip-tool KVS (task e2e:m2)"]
@@ -30,7 +25,7 @@ async fn self_issued_case_read_toggle_read() {
 
     // 受け入れ 2: KVS から CA 材料
     let materials = kvs::read_self_issue_materials(
-        &dir.join("chip_tool_config.alpha.ini"),
+        &dir.join(kvs::ALPHA_INI_FILE),
         &dir.join("chip_tool_config.ini"),
         1,
         0,
