@@ -8,7 +8,7 @@ use super::*;
 fn random_hex_name() -> String {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).expect("os rng");
-    b.iter().map(|x| format!("{x:02X}")).collect()
+    mat_core::hex::encode_upper(&b)
 }
 
 /// Reads `/proc/net/if_inet6` for `iface`'s link-local (scope 0x20) IPv6
@@ -26,11 +26,9 @@ fn iface_link_local_addr(iface: &str) -> Result<Ipv6Addr, DeviceError> {
             if hex.len() != 32 {
                 continue;
             }
-            let mut bytes = [0u8; 16];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                    .map_err(|_| DeviceError::Iface(format!("bad if_inet6 hex for {iface}")))?;
-            }
+            let bytes: [u8; 16] = mat_core::hex::decode(hex)
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| DeviceError::Iface(format!("bad if_inet6 hex for {iface}")))?;
             return Ok(Ipv6Addr::from(bytes));
         }
     }
