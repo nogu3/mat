@@ -92,15 +92,12 @@ fn record_success(store: &mut Store, node_id: u64, alias: Option<&str>) -> Resul
     Ok(())
 }
 
-/// 偶数桁の hex 文字列 → bytes。
+/// 偶数桁の hex 文字列 → bytes。空は拒否（空 dataset は無意味）。
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(2) {
+    if s.is_empty() {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    mat_core::hex::decode(s)
 }
 
 /// CD signer 証明書ディレクトリ（PAA と同型の解決順）。

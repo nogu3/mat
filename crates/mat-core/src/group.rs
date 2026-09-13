@@ -94,11 +94,11 @@ mod tests {
     }
 
     #[test]
-    fn generated_epoch_key_bytes_are_random_and_hex_form_matches() {
+    fn generated_epoch_keys_differ_and_string_form_is_32_lowercase_hex() {
         let a = generate_epoch_key_bytes();
         let b = generate_epoch_key_bytes();
         assert_ne!(a, b);
-        // string 版は bytes 版の小文字 hex（両 API の一致を釘打ち）。
+        // string 版は 32 桁の小文字 hex（16 バイト鍵）。
         let s = generate_epoch_key();
         assert_eq!(s.len(), 32);
         assert!(s

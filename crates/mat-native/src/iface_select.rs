@@ -100,6 +100,37 @@ pub fn autodetect() -> Result<String, MatError> {
     })
 }
 
+/// Matter 用 iface の決定: 明示指定（`MAT_IFACE` / `--iface` 等）を優先し、
+/// 未設定なら [`autodetect`]（候補 0 / 複数はハードエラー）。`label` は
+/// 自動選択時の info ログに入る呼び手識別（`mat` = `"native default"`、
+/// `matd` = `"matd native default"` — E2E / 統合テストが逐語 grep する）。
+pub fn select_iface(explicit: Option<&str>, label: &str) -> Result<String, MatError> {
+    match explicit {
+        Some(i) => Ok(i.to_string()),
+        None => {
+            let i = autodetect()?;
+            tracing::info!(iface = %i, "iface auto-selected ({label})");
+            Ok(i)
+        }
+    }
+}
+
+/// groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
+/// 自動検出（失敗は None のまま — LAN 単独送出）。`label` は自動検出時の
+/// info ログの識別（`mat` = `"groupcast egress"`、`matd` = `"matd groupcast egress"`）。
+pub fn select_thread_iface(
+    explicit: Option<&str>,
+    label: &str,
+) -> Option<crate::ThreadIfaceChoice> {
+    match explicit {
+        Some(n) => Some(crate::ThreadIfaceChoice::Explicit(n.to_string())),
+        None => detect_thread_iface_auto().map(|n| {
+            tracing::info!(iface = %n, "thread iface auto-detected ({label})");
+            crate::ThreadIfaceChoice::Auto(n)
+        }),
+    }
+}
+
 /// `/sys/class/net` + `/proc/net/if_inet6` を走査して iface 情報を集める。
 /// 本番 `autodetect` とテスト基盤（`test_support::multicast_capable_interfaces`、
 /// resolver テスト）の共有スキャナ。

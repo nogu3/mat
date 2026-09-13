@@ -240,13 +240,7 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     if h.len() % 2 != 0 {
         return Err(format!("odd-length hex literal: {}", short_literal(s)));
     }
-    (0..h.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&h[i..i + 2], 16)
-                .map_err(|_| format!("invalid hex literal: {}", short_literal(s)))
-        })
-        .collect()
+    crate::hex::decode(h).ok_or_else(|| format!("invalid hex literal: {}", short_literal(s)))
 }
 
 /// float リテラル（`1.5` / `-3` / `2e-3`）。nan / inf は拒否 — TLV には載るが
@@ -820,6 +814,19 @@ mod tests {
         // エラーメッセージは型名を含む（spec 受け入れ5: AI が判断できる detail）。
         let e = parse_value_typed("{}", &Ty::List(TypeTag::UInt)).unwrap_err();
         assert!(e.contains("array"), "{e}");
+    }
+
+    #[test]
+    fn non_ascii_hex_literal_is_parse_error_not_panic() {
+        // "ああ" は 6 バイト（偶数長）なので奇数長チェックを抜け、旧実装は
+        // バイトスライスが char boundary を割って panic していた。
+        let err = parse_value_typed("hex:ああ", &Ty::Scalar(TypeTag::Bytes)).unwrap_err();
+        assert!(err.contains("invalid hex literal"), "{err}");
+        // 型推定経路（数値 ID 直指定）も panic せず Str に落ちる。
+        assert_eq!(
+            parse_scalar_inferred("hex:ああ"),
+            ArgValue::Str("hex:ああ".into())
+        );
     }
 
     #[test]

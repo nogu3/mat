@@ -109,32 +109,6 @@ async fn run(cli: Cli) -> Result<(), MatError> {
     }
 }
 
-/// native の iface: 明示指定を優先、未設定なら自動検出。候補 0 / 複数は
-/// ハードエラー（全 op が死ぬ設定不備なので fail-fast — 起動拒否）。
-/// `mat` の `main.rs` と同型（ログ文言だけ違う）。
-fn select_iface(explicit: &Option<String>) -> Result<String, MatError> {
-    match explicit {
-        Some(i) => Ok(i.clone()),
-        None => {
-            let i = mat_native::iface_select::autodetect()?;
-            tracing::info!(iface = %i, "iface auto-selected (matd native default)");
-            Ok(i)
-        }
-    }
-}
-
-/// groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
-/// 自動検出（失敗は None のまま — LAN 単独送出）。`mat` と同型。
-fn select_thread_iface(explicit: &Option<String>) -> Option<mat_native::ThreadIfaceChoice> {
-    match explicit {
-        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
-        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
-            tracing::info!(iface = %n, "thread iface auto-detected (matd groupcast egress)");
-            mat_native::ThreadIfaceChoice::Auto(n)
-        }),
-    }
-}
-
 /// serve: 単一インスタンスロックを取ってから native backend を構築し、socket を bind する。
 async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 既定パス（$XDG_RUNTIME_DIR/matd/matd.sock）のときだけ親 dir を 0700 で
@@ -167,11 +141,15 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 検出（M8c-3 native 既定化）。自動検出の候補 0 / 複数は起動拒否 —
     // 全 op が死ぬ設定不備なので per-op エラーではなく fail-fast にする
     // （本番機の systemd unit は env 設定済みで影響なし）。
-    let iface = select_iface(&cli.iface)?;
+    let iface =
+        mat_native::iface_select::select_iface(cli.iface.as_deref(), "matd native default")?;
 
     // groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
     // 自動検出（失敗は None のまま — LAN 単独送出。mat 本体 main.rs と同じ流儀）。
-    let thread_iface = select_thread_iface(&cli.thread_iface);
+    let thread_iface = mat_native::iface_select::select_thread_iface(
+        cli.thread_iface.as_deref(),
+        "matd groupcast egress",
+    );
 
     // native 構築失敗（KVS 資材が読めない等）は致命にしない。matd は起動を続け、
     // 以後の全リクエストへこの構築エラーをそのまま返す（M8c-3: chip-tool

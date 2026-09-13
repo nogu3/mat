@@ -187,6 +187,38 @@ fn group_color_spec_systems_are_mutually_exclusive() {
         .code(2);
 }
 
+/// 非 ASCII の hex リテラルは panic（exit 101・stdout 汚染）ではなく
+/// parse_error + exit 1。旧 `parse_hex_bytes` は偶数バイト長の非 ASCII で
+/// char boundary を割って panic していた（clap レベルではなく値パースの
+/// エラーなので exit 2 ではなく 1 — バックエンド不到達は他と同じ）。
+#[test]
+fn non_ascii_hex_value_is_parse_error_not_panic() {
+    let store = store_with_node5();
+    let out = mat(store.path())
+        .args([
+            "invoke",
+            "--node",
+            "5",
+            "--cluster",
+            "operationalcredentials",
+            "--command",
+            "add-trusted-root-certificate",
+            "hex:ああ",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "stdout must stay clean");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("\"parse_error\""), "{stderr}");
+    assert!(stderr.contains("invalid hex literal"), "{stderr}");
+}
+
 // ── resolve.rs レベルのエラー（kind=other→exit2、または store_parse→exit10、
 //    いずれもバックエンド不到達） ────────────────────────────────────────────
 
