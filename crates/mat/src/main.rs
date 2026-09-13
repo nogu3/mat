@@ -205,11 +205,15 @@ fn main() -> ExitCode {
     // native 直経路: MAT_IFACE 設定時はその iface、未設定なら自動検出
     // （M8c-3 native 既定化）。自動検出の候補 0 / 複数はハードエラー
     // （黙って落とさない — spec 設計 3）。
-    let iface_owned = match select_iface(&args.iface) {
-        Ok(i) => i,
-        Err(e) => return e.emit_exit(),
-    };
-    let thread_iface = select_thread_iface(&args.thread_iface);
+    let iface_owned =
+        match mat_native::iface_select::select_iface(args.iface.as_deref(), "native default") {
+            Ok(i) => i,
+            Err(e) => return e.emit_exit(),
+        };
+    let thread_iface = mat_native::iface_select::select_thread_iface(
+        args.thread_iface.as_deref(),
+        "groupcast egress",
+    );
     let native_cfg = native_direct::Config {
         iface: &iface_owned,
         thread_iface,
@@ -302,30 +306,5 @@ fn main() -> ExitCode {
             tracing::debug!(kind = ?e.kind, detail = %e.detail, "command failed");
             e.emit_exit()
         }
-    }
-}
-
-/// native の iface: 明示指定を優先、未設定なら自動検出。候補 0 / 複数は
-/// ハードエラー（黙って落とさない — spec 設計 3）。matd の main.rs と同型。
-fn select_iface(explicit: &Option<String>) -> Result<String, MatError> {
-    match explicit {
-        Some(i) => Ok(i.clone()),
-        None => {
-            let i = mat_native::iface_select::autodetect()?;
-            tracing::info!(iface = %i, "iface auto-selected (native default)");
-            Ok(i)
-        }
-    }
-}
-
-/// groupcast の Thread TUN 追加送出先: 明示指定を優先、未設定なら wpan* を
-/// 自動検出（失敗は None のまま — LAN 単独送出）。matd と同型。
-fn select_thread_iface(explicit: &Option<String>) -> Option<mat_native::ThreadIfaceChoice> {
-    match explicit {
-        Some(n) => Some(mat_native::ThreadIfaceChoice::Explicit(n.clone())),
-        None => mat_native::iface_select::detect_thread_iface_auto().map(|n| {
-            tracing::info!(iface = %n, "thread iface auto-detected (groupcast egress)");
-            mat_native::ThreadIfaceChoice::Auto(n)
-        }),
     }
 }
