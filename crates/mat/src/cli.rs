@@ -54,6 +54,20 @@ pub struct Cli {
     #[arg(long, global = true, env = "MAT_THREAD_IFACE", value_name = "IFACE")]
     pub thread_iface: Option<String>,
 
+    /// groupcast をどの egress に出すか。`all`（既定）= 運用 iface と Thread TUN の
+    /// 両方。`thread` = Thread TUN が張れている間は運用 iface（LAN）に出さない
+    /// （LAN 側の 1 発も Border Router が Thread へ中継するため、両方に出すと
+    /// mesh には 2 回注入される。group に Wi-Fi の Matter 機器が無い構成向け）。
+    /// Thread TUN が無いときは warn の上 LAN に出す。
+    #[arg(
+        long,
+        global = true,
+        env = "MAT_GROUP_EGRESS",
+        value_enum,
+        default_value_t
+    )]
+    pub group_egress: GroupEgressArg,
+
     /// native 直経路が読む KVS fabric テーブルの index。
     #[arg(
         long,
@@ -651,6 +665,23 @@ pub enum GroupCommand {
     /// groupcast が黙って捨てられる状態を、matd 再起動なし・常駐購読を
     /// 落とさずに回復する。counter は fabric 全体で 1 本 — group 指定は無い。
     Bump,
+}
+
+/// `--group-egress` の受け口（`mat-native` は clap に依存しない）。
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupEgressArg {
+    #[default]
+    All,
+    Thread,
+}
+
+impl GroupEgressArg {
+    pub fn to_native(self) -> mat_native::GroupEgressPolicy {
+        match self {
+            GroupEgressArg::All => mat_native::GroupEgressPolicy::All,
+            GroupEgressArg::Thread => mat_native::GroupEgressPolicy::ThreadOnly,
+        }
+    }
 }
 
 /// `--transport` の受け口。`mat-native` は clap に依存しないため、CLI 側に

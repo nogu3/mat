@@ -39,6 +39,8 @@ use errmap::{
 
 /// Thread iface の決定結果。明示（解決失敗=ハードエラー）と自動検出
 /// （解決失敗=warn+劣化続行）で失敗時の規律が違う（spec 設計 3）。
+pub use mat_controller::group::GroupEgressPolicy;
+
 #[derive(Debug, Clone)]
 pub enum ThreadIfaceChoice {
     Explicit(String),
@@ -54,6 +56,10 @@ pub struct NativeConfig {
     pub iface: String,
     /// groupcast の第 2 egress に使う Thread TUN iface 名（`None` = LAN 単独）。
     pub thread_iface: Option<ThreadIfaceChoice>,
+    /// groupcast をどの egress に出すか（既定 `All`）。`ThreadOnly` は Thread
+    /// egress が張れている間 LAN コピーを出さない（BR 中継との二重注入を避け
+    /// mesh 負荷を半減）。
+    pub group_egress: GroupEgressPolicy,
     /// KVS fabric テーブルの index（本番機で 2、検証機で 1 のような使い分け）。
     pub fabric_index: u8,
     /// CA issuer index（既定 0）。
@@ -409,6 +415,7 @@ impl Engine {
             dest_port: MATTER_PORT,
             op_iface: cfg.iface.clone(),
             thread_retry,
+            egress_policy: cfg.group_egress,
             sender: tokio::sync::Mutex::new(None),
         };
         // build が bind する共有 UdpTransport は group multicast 送信専用。

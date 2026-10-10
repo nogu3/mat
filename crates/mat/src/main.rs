@@ -217,6 +217,7 @@ fn main() -> ExitCode {
     let native_cfg = native_direct::Config {
         iface: &iface_owned,
         thread_iface,
+        group_egress: args.group_egress.to_native(),
         fabric_index: args.fabric_index,
         issuer_index: args.issuer_index,
     };

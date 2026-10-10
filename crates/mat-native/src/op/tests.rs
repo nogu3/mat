@@ -688,6 +688,7 @@ async fn group_bump_advances_counter_via_engine() {
         dest_port: 5540,
         op_iface: "lo".into(),
         thread_retry: false,
+        egress_policy: crate::GroupEgressPolicy::All,
         sender: Mutex::new(None),
     };
     let engine = crate::Engine::with_parts(Box::new(FakeEstablisher::default()), Some(group_ctx));

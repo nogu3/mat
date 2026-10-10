@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use mat_controller::group::{GroupEgress, GroupSender, PersistedGroupCounter};
+use mat_controller::group::{GroupEgress, GroupEgressPolicy, GroupSender, PersistedGroupCounter};
 use mat_controller::kvs;
 use mat_controller::transport::UdpTransport;
 use mat_core::error::{ErrorKind, MatError};
@@ -33,6 +33,8 @@ pub struct GroupCtx {
     /// 罠)。Explicit 指定は build 時に確定する (解決失敗はハードエラー) ため
     /// 常に false。
     pub thread_retry: bool,
+    /// 送出先ポリシー（`NativeConfig::group_egress`）。sender の lazy 構築時に焼く。
+    pub egress_policy: GroupEgressPolicy,
     pub sender: Mutex<Option<GroupSender>>,
 }
 
@@ -67,7 +69,7 @@ fn init_sender(ctx: &GroupCtx, slot: &mut Option<GroupSender>) -> Result<(), Str
     };
     let counter = PersistedGroupCounter::load(&ctx.counter_path, gdc)
         .map_err(|e| format!("group counter store: {e}"))?;
-    let sender = GroupSender::new(
+    let mut sender = GroupSender::new(
         ctx.egress.clone(),
         ctx.dest_port,
         ctx.fabric_id,
@@ -75,6 +77,7 @@ fn init_sender(ctx: &GroupCtx, slot: &mut Option<GroupSender>) -> Result<(), Str
         counter,
     )
     .map_err(|e| format!("multicast socket setup: {e}"))?;
+    sender.set_egress_policy(ctx.egress_policy);
     *slot = Some(sender);
     Ok(())
 }
@@ -231,6 +234,39 @@ mod tests {
         );
     }
 
+    /// `NativeConfig::group_egress` → `GroupCtx::egress_policy` が lazy 構築
+    /// した sender に焼かれること（matd の env が実際に送出へ効く配線）。
+    #[tokio::test]
+    async fn init_sender_applies_egress_policy_from_ctx() {
+        let dir =
+            std::env::temp_dir().join(format!("mat-native-group-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("chip_tool_config.ini");
+        write_group_fixture_ini(&ini);
+        let counter_path = dir.join("native_group_counter");
+        let _ = std::fs::remove_file(&counter_path);
+        let ctx = GroupCtx {
+            main_ini: ini,
+            counter_path,
+            fabric_index: 2,
+            fabric_id: 1,
+            node_id: 0x0001_0001,
+            egress: vec![GroupEgress {
+                iface: "lo".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: 1,
+            }],
+            dest_port: 5540,
+            op_iface: "lo".into(),
+            thread_retry: false,
+            egress_policy: GroupEgressPolicy::ThreadOnly,
+            sender: Mutex::new(None),
+        };
+        let mut slot = None;
+        init_sender(&ctx, &mut slot).unwrap();
+        assert_eq!(slot.unwrap().egress_policy(), GroupEgressPolicy::ThreadOnly);
+    }
+
     #[tokio::test]
     async fn group_invoke_sends_multicast_and_reports_sent() {
         // フィクスチャ ini（gk + keyset + g/gdc）と loopback 受信で end-to-end。
@@ -275,6 +311,7 @@ mod tests {
                 dest_port: port,
                 op_iface: cand.name.clone(),
                 thread_retry: false,
+                egress_policy: GroupEgressPolicy::All,
                 sender: Mutex::new(None),
             };
             // send 失敗も次候補へ（join 失敗と同じ扱い）: docker0 / veth* /
@@ -343,6 +380,7 @@ mod tests {
             dest_port: 5540,
             op_iface: "lo".into(),
             thread_retry: false,
+            egress_policy: GroupEgressPolicy::All,
             sender: Mutex::new(None),
         };
         let r = bump(&ctx).await;
@@ -439,6 +477,7 @@ mod tests {
             dest_port: 5540,
             op_iface: "lo".into(),
             thread_retry: false,
+            egress_policy: GroupEgressPolicy::All,
             sender: Mutex::new(None),
         };
         assert!(matches!(bump(&ctx).await, BumpOutcome::Unavailable(_)));

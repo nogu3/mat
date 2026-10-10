@@ -699,6 +699,7 @@ mod tests {
             store: std::path::PathBuf::from("/nonexistent"),
             iface: "lo".into(),
             thread_iface: None,
+            group_egress: Default::default(),
             fabric_index: 1,
             issuer_index: 0,
         };

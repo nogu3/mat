@@ -67,6 +67,7 @@ fn resolve_ledger_nodes(p: &NativeProbe<'_>) -> Result<Vec<MatterInstance>, MatE
         store: p.store_root.to_path_buf(),
         iface: p.iface.to_string(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: p.fabric_index,
         issuer_index: p.issuer_index,
     };

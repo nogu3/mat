@@ -21,6 +21,7 @@ use crate::device_op::DeviceOp;
 pub(crate) struct Config<'a> {
     pub iface: &'a str,
     pub thread_iface: Option<mat_native::ThreadIfaceChoice>,
+    pub group_egress: mat_native::GroupEgressPolicy,
     pub fabric_index: u8,
     pub issuer_index: u8,
 }
@@ -32,6 +33,7 @@ impl Config<'_> {
             store: store_root.to_path_buf(),
             iface: self.iface.to_string(),
             thread_iface: self.thread_iface.clone(),
+            group_egress: self.group_egress,
             fabric_index: self.fabric_index,
             issuer_index: self.issuer_index,
         }
@@ -379,6 +381,7 @@ mod tests {
         let cfg = Config {
             iface: "lo",
             thread_iface: Some(mat_native::ThreadIfaceChoice::Explicit("wpan0".into())),
+            group_egress: Default::default(),
             fabric_index: 2,
             issuer_index: 1,
         };
@@ -405,6 +408,7 @@ mod tests {
         let cfg = Config {
             iface: "lo",
             thread_iface: None,
+            group_egress: Default::default(),
             fabric_index: 1,
             issuer_index: 0,
         };

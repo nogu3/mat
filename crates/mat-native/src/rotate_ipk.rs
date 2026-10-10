@@ -1165,6 +1165,7 @@ mod tests {
             store: dir.path().to_path_buf(),
             iface: "lo".to_string(),
             thread_iface: None,
+            group_egress: Default::default(),
             fabric_index: 2,
             issuer_index: 0,
         };

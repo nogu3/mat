@@ -49,6 +49,14 @@ struct Cli {
     #[arg(long, env = "MAT_MATD_THREAD_IFACE")]
     thread_iface: Option<String>,
 
+    /// groupcast をどの egress に出すか。`all`（既定）= 運用 iface と Thread TUN の
+    /// 両方。`thread` = Thread TUN が張れている間は運用 iface（LAN）に出さない
+    /// （LAN 側の 1 発も Border Router が Thread へ中継するため、両方に出すと
+    /// mesh には 2 回注入される。group に Wi-Fi の Matter 機器が無い構成向け）。
+    /// Thread TUN が無いときは warn の上 LAN に出す。
+    #[arg(long, env = "MAT_MATD_GROUP_EGRESS", value_enum, default_value_t)]
+    group_egress: GroupEgressArg,
+
     /// KVS fabric テーブルの index（本番機で 2、検証機で 1 のような使い分け）。
     #[arg(long, env = "MAT_MATD_FABRIC_INDEX", default_value_t = 1)]
     fabric_index: u8,
@@ -160,6 +168,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         store: store_path.clone(),
         iface: iface.clone(),
         thread_iface: thread_iface.clone(),
+        group_egress: cli.group_egress.to_native(),
         fabric_index: cli.fabric_index,
         issuer_index: cli.issuer_index,
     };
@@ -185,7 +194,7 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
 
     let native = match matd::native::NativeBackend::build_with_resolver(&cfg, resolver).await {
         Ok(b) => {
-            tracing::info!(%iface, thread_iface = ?thread_iface, fabric_index = cli.fabric_index, "native backend enabled");
+            tracing::info!(%iface, thread_iface = ?thread_iface, group_egress = ?cli.group_egress, fabric_index = cli.fabric_index, "native backend enabled");
             server::NativeState::Ready(Box::new(b))
         }
         Err(e) => {
@@ -376,5 +385,22 @@ mod tests {
         let err = admin_response_to_result(resp).expect_err("error body");
         assert_eq!(err.kind, ErrorKind::Other);
         assert!(!err.detail.is_empty(), "detail should never be empty");
+    }
+}
+
+/// `--group-egress` の受け口（`mat-native` は clap に依存しない）。
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GroupEgressArg {
+    #[default]
+    All,
+    Thread,
+}
+
+impl GroupEgressArg {
+    fn to_native(self) -> mat_native::GroupEgressPolicy {
+        match self {
+            GroupEgressArg::All => mat_native::GroupEgressPolicy::All,
+            GroupEgressArg::Thread => mat_native::GroupEgressPolicy::ThreadOnly,
+        }
     }
 }

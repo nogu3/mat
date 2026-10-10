@@ -94,6 +94,7 @@ async fn build_fails_cleanly_without_kvs() {
         store: dir.path().to_path_buf(),
         iface: "lo".to_string(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: 1,
         issuer_index: 0,
     };
@@ -115,6 +116,7 @@ fn load_fabric_credentials_maps_missing_store_to_store_missing() {
         store: dir.path().to_path_buf(),
         iface: "lo".into(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: 1,
         issuer_index: 0,
     };
@@ -133,6 +135,7 @@ fn load_self_issue_materials_hints_fabric_init_on_missing_store() {
         store: dir.path().to_path_buf(),
         iface: "lo".into(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: 1,
         issuer_index: 0,
     };
@@ -156,6 +159,7 @@ fn op_scope_id_maps_unknown_iface_to_other() {
         store: std::path::PathBuf::from("/nonexistent"),
         iface: "no-such-iface-at-all".into(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: 1,
         issuer_index: 0,
     };
@@ -405,6 +409,7 @@ fn case_establisher_swap_reports_ipk_change() {
             store: std::path::PathBuf::from("/nonexistent"),
             iface: "lo".into(),
             thread_iface: None,
+            group_egress: Default::default(),
             fabric_index: 1,
             issuer_index: 0,
         },
@@ -428,6 +433,7 @@ fn case_establisher_reload_maps_missing_store_to_store_missing() {
             store: dir.path().to_path_buf(),
             iface: "lo".into(),
             thread_iface: None,
+            group_egress: Default::default(),
             fabric_index: 1,
             issuer_index: 0,
         },
@@ -449,6 +455,7 @@ fn bootstrapped_store(fabric_id: u64, node_id: u64) -> (tempfile::TempDir, Nativ
         store: dir.path().to_path_buf(),
         iface: "lo".into(),
         thread_iface: None,
+        group_egress: Default::default(),
         fabric_index: 1,
         issuer_index: 0,
     };

@@ -1534,6 +1534,18 @@ datagram (same counter) goes out on every egress — receivers drop the
 duplicate via replay protection. The result JSON reports the interfaces
 actually used: `"egress": ["eth0", "wpan0"]`.
 
+**Thread-only egress** (`--group-egress thread` / `MAT_GROUP_EGRESS=thread`,
+`MAT_MATD_GROUP_EGRESS` for `matd`; default `all`): while a Thread TUN egress
+is established, the LAN copy is **not** sent. The LAN copy is not free — the
+Primary Border Router relays it into Thread as well, so with both egresses
+every groupcast is injected into the mesh twice (measured 2026-10-10 on an
+OTBR: either path alone costs the same ~8 BR frames + ~30 mesh re-floods).
+Use `thread` when no Wi-Fi Matter device is a member of any group; it halves
+mesh airtime for groupcast bursts. If no Thread egress is established yet
+(matd started before the OTBR), the send still goes out on the operating
+interface with a warning, and switches to Thread-only once the late egress
+is acquired. `egress` in the result JSON always lists what was actually sent.
+
 #### Ops that never route through `matd`
 
 `discover`, `commission`, `fabric init`, `open-window`, `diag thread` / `diag

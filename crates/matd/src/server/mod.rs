@@ -952,6 +952,7 @@ mod tests {
                 dest_port: port,
                 op_iface: cand.name.clone(),
                 thread_retry: false,
+                egress_policy: mat_native::GroupEgressPolicy::All,
                 sender: tokio::sync::Mutex::new(None),
             };
             let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));
@@ -1045,6 +1046,7 @@ mod tests {
             dest_port: 5540,
             op_iface: "lo".into(),
             thread_retry: false,
+            egress_policy: mat_native::GroupEgressPolicy::All,
             sender: tokio::sync::Mutex::new(None),
         };
         let native = NativeBackend::with_parts(Box::new(FakeEstablisher::default()), Some(ctx));

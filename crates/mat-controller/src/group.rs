@@ -185,11 +185,27 @@ pub struct GroupEgress {
     pub scope_id: u32,
 }
 
+/// どの egress に送るか。`All` = 従来どおり全 egress（LAN + Thread TUN）。
+/// `ThreadOnly` = Thread egress（2 本目以降）が張れていれば運用 iface
+/// （先頭）には送らない。LAN に出した 1 発も Primary BBR が Thread へ中継
+/// するため、両方に出すと mesh には 2 回注入される（2026-10-10 実測:
+/// どちらの経路でも BR 送信 +8 / mesh 再送 +26〜36 フレーム）。Wi-Fi の
+/// Matter 機器が group に混在しない構成なら `ThreadOnly` で mesh 負荷が半減
+/// する。Thread egress が未確立なら warn を出して運用 iface に送る（届か
+/// ないより届く方がよい — otbr より先に起動した直後の状態）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupEgressPolicy {
+    #[default]
+    All,
+    ThreadOnly,
+}
+
 /// Send-only groupcast path. Holds no per-group key state: credentials are
 /// passed per call (the caller re-reads the KVS so re-provisioned keys are
 /// picked up immediately).
 pub struct GroupSender {
     egress: Vec<GroupEgress>,
+    policy: GroupEgressPolicy,
     dest_port: u16,
     fabric_id: u64,
     source_node_id: u64,
@@ -259,6 +275,7 @@ impl GroupSender {
         }
         Ok(Self {
             egress: survivors,
+            policy: GroupEgressPolicy::All,
             dest_port,
             fabric_id,
             source_node_id,
@@ -302,9 +319,24 @@ impl GroupSender {
         let Self {
             egress,
             iface_resolver,
+            policy,
             ..
         } = self;
-        for e in egress.iter_mut() {
+        // ThreadOnly: 先頭（運用 iface）を飛ばす。Thread egress が無ければ
+        // 劣化継続（warn）— 送信ごとに通るが、matd は毎送信で後付け検出も
+        // 試みるので otbr 起動後は自然に収束する。
+        let skip = match policy {
+            GroupEgressPolicy::All => 0,
+            GroupEgressPolicy::ThreadOnly if egress.len() > 1 => 1,
+            GroupEgressPolicy::ThreadOnly => {
+                tracing::warn!(
+                    "group egress policy is thread-only but no thread egress is established; \
+                     sending on the operating iface"
+                );
+                0
+            }
+        };
+        for e in egress.iter_mut().skip(skip) {
             let dest = |scope_id: u32| {
                 // multicast 宛先では sin6_scope_id が送出 iface を選ぶ
                 SocketAddr::V6(SocketAddrV6::new(dest_addr, dest_port, 0, scope_id))
@@ -386,6 +418,16 @@ impl GroupSender {
     /// 判定 (mat-native::group) が読む。
     pub fn egress_count(&self) -> usize {
         self.egress.len()
+    }
+
+    /// 送出先ポリシーを設定する（既定 `All`）。`new()` の後、送信前に呼ぶ。
+    pub fn set_egress_policy(&mut self, policy: GroupEgressPolicy) {
+        self.policy = policy;
+    }
+
+    /// 現在の送出先ポリシー。
+    pub fn egress_policy(&self) -> GroupEgressPolicy {
+        self.policy
     }
 }
 
@@ -746,6 +788,103 @@ mod tests {
              datagrams (lo excluded — it lacks IFF_MULTICAST on Linux); \
              tried: {tried:?}"
         );
+    }
+
+    /// `GroupEgressPolicy::ThreadOnly`: Thread egress（2 本目以降）が張れて
+    /// いれば運用 iface（先頭）には送らない。LAN コピーは BR が Thread へ
+    /// 中継して二重注入になるため（2026-10-10 実測）、クラブ照明のような
+    /// 連打で mesh 負荷を半減する手段。`sent` は実際に出した iface だけ。
+    #[tokio::test]
+    async fn thread_only_policy_skips_operating_iface_when_thread_egress_exists() {
+        let addr = group_multicast_addr(1, 10);
+        let mut tried = Vec::new();
+
+        for (name, index) in crate::test_support::multicast_ifaces() {
+            let recv = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            if recv.join_multicast_v6(&addr, index).is_err() {
+                tried.push(format!("{}(idx={}): join failed", name, index));
+                continue;
+            }
+            let port = recv.local_addr().unwrap().port();
+            let lan = GroupEgress {
+                iface: "lan".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: index,
+            };
+            let thread = GroupEgress {
+                iface: "thread".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: index,
+            };
+            let p = tmp_counter_path(&format!("thread-only-{}", index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let mut s = GroupSender::new(vec![lan, thread], port, 1, 0x0001_0001, counter).unwrap();
+            s.set_egress_policy(GroupEgressPolicy::ThreadOnly);
+            let (_, sent) = match s.send_invoke(&test_creds(), 10, 6, 1, None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    tried.push(format!("{}(idx={}): send failed: {e:?}", name, index));
+                    continue;
+                }
+            };
+            assert_eq!(sent, vec!["thread".to_string()]);
+
+            // 届くのは 1 回だけ（LAN 側には出していない）。
+            let mut buf = [0u8; 1280];
+            let r1 = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            let r2 = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                recv.recv_from(&mut buf),
+            )
+            .await;
+            let _ = std::fs::remove_file(&p);
+            match (r1, r2) {
+                (Ok(Ok(_)), Err(_)) => return, // 1 回届いて 2 回目は timeout = PASS
+                (Ok(Ok(_)), Ok(Ok(_))) => {
+                    panic!("thread-only policy still sent on the operating iface")
+                }
+                _ => tried.push(format!("{}(idx={}): no delivery", name, index)),
+            }
+        }
+
+        panic!(
+            "no multicast-capable interface delivered a thread-only groupcast \
+             datagram (lo excluded); tried: {tried:?}"
+        );
+    }
+
+    /// ThreadOnly でも Thread egress が未確立（egress が運用 iface 1 本）なら
+    /// 運用 iface に送る（warn 付きの劣化継続 — 届かないより届く方がよい。
+    /// otbr より先に matd が起動した直後の状態）。
+    #[tokio::test]
+    async fn thread_only_policy_falls_back_to_operating_iface_when_alone() {
+        use crate::transport::UdpTransport;
+        for (name, index) in crate::test_support::multicast_ifaces() {
+            let lan = GroupEgress {
+                iface: "lan".into(),
+                transport: Arc::new(UdpTransport::bind().await.unwrap()),
+                scope_id: index,
+            };
+            let p = tmp_counter_path(&format!("thread-only-alone-{}", index));
+            let _ = std::fs::remove_file(&p);
+            let counter = PersistedGroupCounter::load(&p, 0).unwrap();
+            let mut s = GroupSender::new(vec![lan], 5540, 1, 0x0001_0001, counter).unwrap();
+            s.set_egress_policy(GroupEgressPolicy::ThreadOnly);
+            let r = s.send_invoke(&test_creds(), 10, 6, 1, None).await;
+            let _ = std::fs::remove_file(&p);
+            if let Ok((_, sent)) = r {
+                assert_eq!(sent, vec!["lan".to_string()]);
+                return;
+            }
+            let _ = name;
+        }
+        panic!("no multicast-capable interface accepted the send");
     }
 
     /// issue #23 本丸: 失効した scope_id での送出失敗を検知し、iface 名から
