@@ -64,10 +64,19 @@ pub struct FakeSubConn {
 /// カウンタが正なら 1 減らして `true`（= この呼び出しは失敗させる）を返す。
 /// 0 なら `false`（成功）。fake の「残り失敗回数」表現の共通部品 — bool では
 /// 「N 回失敗してから成功」が表現できず、matd の backoff ラダーが回せない。
+/// `fetch_update` は新しい stable で deprecated（`try_update` へ改名）だが
+/// `try_update` は MSRV 1.87 に無いので、同じ CAS ループを手で書く。
 fn take_failure(counter: &AtomicUsize) -> bool {
-    counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-        .is_ok()
+    let mut n = counter.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = n.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(n, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => n = actual,
+        }
+    }
 }
 
 /// onoff on-off=true の AttributeReport 1 件を持つ ReportDataMessage を作る
