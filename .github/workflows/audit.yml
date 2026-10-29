@@ -1,0 +1,24 @@
+# 依存の脆弱性監査（RustSec）。コードが変わらなくても新しい advisory で落ちるよう
+# 週 1 で回し、Cargo.lock / Cargo.toml を触る PR でも回す。
+# 更新そのものは Renovate（renovate.json）が週 1 の lockFileMaintenance で出す。
+name: audit
+
+on:
+  schedule:
+    - cron: "0 22 * * 0" # 月曜 07:00 JST（Renovate の前）
+  push:
+    branches: [main]
+    paths: ["**/Cargo.toml", "Cargo.lock", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "Cargo.lock", ".github/workflows/audit.yml"]
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
