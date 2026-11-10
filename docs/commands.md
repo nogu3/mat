@@ -966,7 +966,8 @@ number; see [Aliases](configuration.md#aliases-aliasestoml-optional)).
 # set up the controller-side group state. --group is the GroupId, --nodes one
 # or more commissioned node_ids.
 # provision --group <ID> --nodes <N>... [--keyset-id N] [--name NAME]
-#                                       [--endpoint EP] [--epoch-key HEX]
+#                                       [--endpoint EP]
+#                                       [--epoch-key HEX | --epoch-key-file PATH]
 mat group provision --group 1 --nodes 5 6 7 --name living
 
 # Add a node to an existing group: pass --rebind with ALL existing members plus
@@ -1021,6 +1022,13 @@ Outputs:
   group. Omit it and `mat` generates a random one (single-controller use); pass a
   fixed key only when several controllers must share the same wire group. The key
   is never printed to stdout (it is a credential; it lives in the KVS).
+  To pass a fixed key, prefer **`--epoch-key-file <PATH>`** (a file holding the
+  32 hex chars; surrounding whitespace is ignored; `-` reads stdin): a flag value
+  is visible in the process list to other local users, a file or pipe is not.
+  The two flags are mutually exclusive, and an unreadable or empty file is an
+  `other` error — it never falls back to a random key. There is deliberately no
+  environment variable for this key: a value left exported would be silently
+  reused by the next, unrelated `group provision`.
 - `--keyset-id` defaults to 42, `--name` to `grp<group_id>`, `--endpoint` to 1.
   Keyset **0 is reserved for the IPK** and is rejected (`parse_error`, exit 1)
   before anything is written — provisioning it would overwrite the fabric's IPK
