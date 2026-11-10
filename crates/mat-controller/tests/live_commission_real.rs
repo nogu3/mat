@@ -128,6 +128,7 @@ async fn commission_second_fabric_and_remove() {
             device_node_id,
             paa_dir: Some(&paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id: scope,
         },
     )

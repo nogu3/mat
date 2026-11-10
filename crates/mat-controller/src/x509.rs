@@ -45,6 +45,9 @@ pub struct X509Cert {
     pub tbs: Vec<u8>,
     /// 非圧縮 SEC1 P-256 公開鍵（0x04 || X || Y、65B）。
     pub public_key: [u8; 65],
+    /// serialNumber（INTEGER の内容バイト、DER のまま — 正の値に付く先頭
+    /// 0x00 も残る。失効照合 `crate::revocation` が正規化して比べる）。
+    pub serial: Vec<u8>,
     /// issuer Name の生 DER。
     pub issuer: Vec<u8>,
     /// subject Name の生 DER。
@@ -188,7 +191,7 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
     if t.peek_tag() == Some(0xA0) {
         t.expect(0xA0)?; // [0] version — optional、値は使わない
     }
-    t.expect(0x02)?; // serial — 使わない
+    let serial = t.expect(0x02)?.to_vec();
     t.expect(0x30)?; // TBS 内の signature(AlgorithmIdentifier) — 使わない
 
     let (issuer_tag, _issuer_content, issuer_raw) = t.read()?;
@@ -250,6 +253,7 @@ pub fn parse_x509(der: &[u8]) -> Result<X509Cert, X509Error> {
     Ok(X509Cert {
         tbs,
         public_key,
+        serial,
         issuer,
         subject,
         signature,

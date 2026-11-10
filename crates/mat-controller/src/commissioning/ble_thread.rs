@@ -30,6 +30,8 @@ pub struct BleThreadParams<'a> {
     pub device_node_id: u64,
     pub paa_dir: Option<&'a std::path::Path>,
     pub cd_signer_dir: Option<&'a std::path::Path>,
+    /// 失効照合用の revocation set（`CommissionParams::revocation_set` と同じ）。
+    pub revocation_set: Option<&'a std::path::Path>,
     /// Thread 参加後の operational mDNS 発見に使う iface index。
     pub scope_id: u32,
 }
@@ -97,6 +99,7 @@ pub async fn commission_btp_thread(
         params.device_node_id,
         params.paa_dir,
         params.cd_signer_dir,
+        params.revocation_set,
         &cfg,
     )
     .await?;

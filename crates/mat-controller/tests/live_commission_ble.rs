@@ -67,6 +67,7 @@ async fn commission_factory_device_over_ble_thread() {
             device_node_id,
             paa_dir: Some(&paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id,
         },
     )

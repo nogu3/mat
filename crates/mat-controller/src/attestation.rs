@@ -40,6 +40,10 @@ pub enum AttestationError {
     X509(X509Error),
     /// `load_der_dir` のファイル I/O 失敗。
     Io(std::io::Error),
+    /// 指定された revocation set が読めない・形が不正（照合なしへは落とさない）。
+    RevocationSet(crate::revocation::RevocationError),
+    /// revocation set に載っている証明書（`"dac"` / `"pai"`）。
+    Revoked(&'static str),
 }
 
 impl std::fmt::Display for AttestationError {
@@ -53,6 +57,10 @@ impl std::fmt::Display for AttestationError {
             AttestationError::Elements(msg) => write!(f, "attestation elements error: {msg}"),
             AttestationError::X509(e) => write!(f, "x509 error: {e}"),
             AttestationError::Io(e) => write!(f, "io error: {e}"),
+            AttestationError::RevocationSet(e) => write!(f, "revocation set: {e}"),
+            AttestationError::Revoked(which) => {
+                write!(f, "{which} certificate is revoked (revocation set)")
+            }
         }
     }
 }
@@ -244,6 +252,23 @@ pub fn verify_device_attestation(
     // --- CD（warn のみ。2026-07-13 ユーザー決定）---
     verify_cd_warn(&cd_bytes, &dac, cd_signer_ders);
 
+    Ok(())
+}
+
+/// DAC / PAI が `set` に載っていれば `Err(Revoked)`（厳格 — commissioning を
+/// 中止する）。チェーン検証（[`verify_device_attestation`]）を通った証明書に
+/// 対して呼ぶ。revocation set を渡さない運用ではそもそも呼ばれない（任意機能）。
+pub fn check_revocation(
+    dac_der: &[u8],
+    pai_der: &[u8],
+    set: &crate::revocation::RevocationSet,
+) -> Result<(), AttestationError> {
+    if set.is_revoked(&parse_x509(pai_der)?) {
+        return Err(AttestationError::Revoked("pai"));
+    }
+    if set.is_revoked(&parse_x509(dac_der)?) {
+        return Err(AttestationError::Revoked("dac"));
+    }
     Ok(())
 }
 
@@ -1352,5 +1377,39 @@ mod tests {
         let si = make_signer_info(Some(&attrs));
         let err = parse_signer_info(&si, b"cd-tlv-bytes").unwrap_err();
         assert_eq!(err, "signedAttrs missing messageDigest");
+    }
+
+    fn revocation_set_for(cert_der: &[u8]) -> crate::revocation::RevocationSet {
+        use base64ct::{Base64, Encoding};
+        let cert = parse_x509(cert_der).unwrap();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+        let json = serde_json::json!([{
+            "type": "revocation_set",
+            "issuer_subject_key_id": hex(cert.akid.as_deref().unwrap()),
+            "issuer_name": Base64::encode_string(&cert.issuer),
+            "revoked_serial_numbers": [hex(&cert.serial)],
+        }]);
+        crate::revocation::RevocationSet::from_json(json.to_string().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn check_revocation_rejects_a_revoked_dac_or_pai_and_passes_others() {
+        use crate::x509::generate_dev_attestation;
+        let da = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+        let other = generate_dev_attestation(0xFFF1, 0x8000).unwrap();
+
+        let dac_revoked = revocation_set_for(&da.dac_der);
+        assert!(matches!(
+            check_revocation(&da.dac_der, &da.pai_der, &dac_revoked),
+            Err(AttestationError::Revoked("dac"))
+        ));
+        let pai_revoked = revocation_set_for(&da.pai_der);
+        assert!(matches!(
+            check_revocation(&da.dac_der, &da.pai_der, &pai_revoked),
+            Err(AttestationError::Revoked("pai"))
+        ));
+        // 別チェーンの失効は無関係。
+        check_revocation(&other.dac_der, &other.pai_der, &dac_revoked).unwrap();
+        check_revocation(&other.dac_der, &other.pai_der, &pai_revoked).unwrap();
     }
 }

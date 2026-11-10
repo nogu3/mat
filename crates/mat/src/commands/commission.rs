@@ -61,6 +61,7 @@ fn native_commission(
         thread_dataset: dataset,
         paa_dir: paa_trust_store_path(store.root()),
         cd_signer_dir: cd_signer_store_path(store.root()),
+        revocation_set: revocation_set_path(store.root()),
         transport: transport.to_native(),
     };
     let ncfg = cfg.to_native(store.root());
@@ -98,6 +99,21 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     mat_core::hex::decode(s)
+}
+
+/// 失効照合用 revocation set（JSON ファイル）を解決する。PAA と同型の解決順:
+/// 1. `MAT_REVOCATION_SET`（明示指定。存在は問わない — 無ければ読み込みで
+///    ハードエラーになり、照合なしへは落ちない）
+/// 2. `<store>/revocation-set.json`（存在すれば）
+///
+/// どちらも無ければ `None` = 照合なし（従来どおり）。ファイルは connectedhomeip の
+/// `credentials/generate_revocation_set.py from-dcl` で生成する。
+fn revocation_set_path(store_root: &Path) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("MAT_REVOCATION_SET") {
+        return Some(PathBuf::from(p));
+    }
+    let default = store_root.join("revocation-set.json");
+    default.is_file().then_some(default)
 }
 
 /// CD signer 証明書ディレクトリ（PAA と同型の解決順）。
@@ -170,6 +186,29 @@ mod tests {
     fn decode_hex_rejects_non_ascii_without_panicking() {
         // 偶数バイト長の非ASCII（"aéa" = 4バイト）でも panic せず None。
         assert_eq!(decode_hex("aéa"), None);
+    }
+
+    #[test]
+    fn revocation_set_none_when_unset_and_no_default_file() {
+        if std::env::var_os("MAT_REVOCATION_SET").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(revocation_set_path(dir.path()), None);
+        // 同名のディレクトリは拾わない（ファイルだけ）。
+        std::fs::create_dir(dir.path().join("revocation-set.json")).unwrap();
+        assert_eq!(revocation_set_path(dir.path()), None);
+    }
+
+    #[test]
+    fn revocation_set_uses_default_file_when_present() {
+        if std::env::var_os("MAT_REVOCATION_SET").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("revocation-set.json");
+        std::fs::write(&file, b"[]").unwrap();
+        assert_eq!(revocation_set_path(dir.path()), Some(file));
     }
 
     #[test]

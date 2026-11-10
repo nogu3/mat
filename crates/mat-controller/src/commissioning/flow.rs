@@ -56,6 +56,10 @@ pub struct CommissionParams<'a> {
     /// 決定どおり戻り値には影響しない）ので `None` でも commissioning 自体
     /// は続行できる。
     pub cd_signer_dir: Option<&'a std::path::Path>,
+    /// 失効照合用の revocation set（`crate::revocation` の JSON）。`None` は
+    /// 照合なし（従来どおり）。`Some` で読めない・不正なら commissioning は
+    /// 失敗する（照合なしへ落とさない）。
+    pub revocation_set: Option<&'a std::path::Path>,
     /// mDNS / link-local アドレス用の interface index。`Addr` 直指定なら
     /// リンクローカルでなければ `0` で構わない。
     pub scope_id: u32,
@@ -139,6 +143,7 @@ pub(super) async fn run_credential_steps(
     device_node_id: u64,
     paa_dir: Option<&std::path::Path>,
     cd_signer_dir: Option<&std::path::Path>,
+    revocation_set: Option<&std::path::Path>,
     cfg: &MrpConfig,
 ) -> Result<Option<u8>, CommissionError> {
     let challenge = session.attestation_challenge();
@@ -213,6 +218,13 @@ pub(super) async fn run_credential_steps(
         &challenge,
     )
     .map_err(CommissionError::Attestation)?;
+    // 失効照合（任意・厳格）: revocation set が渡されていれば DAC / PAI を照合。
+    if let Some(path) = revocation_set {
+        let set = crate::revocation::RevocationSet::load(path).map_err(|e| {
+            CommissionError::Attestation(attestation::AttestationError::RevocationSet(e))
+        })?;
+        attestation::check_revocation(&dac, &pai, &set).map_err(CommissionError::Attestation)?;
+    }
 
     // 6. CSR → NOC 発行。
     let mut csr_nonce = [0u8; 32];
@@ -385,6 +397,7 @@ pub async fn commission_on_network(
         params.device_node_id,
         params.paa_dir,
         params.cd_signer_dir,
+        params.revocation_set,
         &cfg,
     )
     .await?;

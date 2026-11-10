@@ -329,6 +329,7 @@ async fn commission_on_network_helper(
             device_node_id: DEVICE_NODE_ID,
             paa_dir: Some(paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id,
         },
     )

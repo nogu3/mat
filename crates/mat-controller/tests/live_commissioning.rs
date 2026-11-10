@@ -38,6 +38,7 @@ async fn commission_control_multi_admin() {
             device_node_id: 0x2_0001,
             paa_dir: Some(&paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id: 0,
         },
     )
@@ -61,6 +62,7 @@ async fn commission_control_multi_admin() {
             device_node_id: 0x2_0001,
             paa_dir: Some(&paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id: 0,
         },
     )
@@ -103,6 +105,7 @@ async fn commission_control_multi_admin() {
             device_node_id: 0x2_0002,
             paa_dir: Some(&paa_dir),
             cd_signer_dir: None,
+            revocation_set: None,
             scope_id: 0,
         },
     )
