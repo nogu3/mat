@@ -1,14 +1,24 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "timezone": "Asia/Tokyo",
   "schedule": ["before 9am on monday"],
   "osvVulnerabilityAlerts": true,
   "platformAutomerge": false,
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "vulnerabilityAlerts": {
+    "description": "脆弱性修正（OSV / GitHub alert）は待たずに即 PR（minimumReleaseAge=null は Renovate の既定値だが明示）。ただし公開直後の版をそのまま入れることになるので自動マージはせず人が見てからマージする",
+    "minimumReleaseAge": null,
+    "automerge": false,
+    "labels": ["security"]
+  },
   "lockFileMaintenance": {
+    "description": "Cargo.lock 再生成は推移的依存の新版を release timestamp 無しで取り込むため minimumReleaseAge が効かない（cargo は npm の --before 相当を持たない）。待たせても stability-days が永久 pending になるだけなので age は外し、代わりに自動マージを止めて人がレビューしてからマージする",
     "enabled": true,
     "schedule": ["before 9am on monday"],
-    "automerge": true
+    "minimumReleaseAge": null,
+    "automerge": false
   },
   "packageRules": [
     {
@@ -18,10 +28,17 @@
       "enabled": false
     },
     {
-      "description": "major 以外はまとめて 1 本・CI が通れば自動マージ（Renovate が CI 結果を見てから merge する）",
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "description": "major 以外はまとめて 1 本・公開から 7 日経過（minimumReleaseAge、strict なので未経過の版は PR 自体を出さない）かつ CI が通れば自動マージ。pin は minimumReleaseAge 非対応なので自動マージ対象から外す",
+      "matchUpdateTypes": ["minor", "patch", "digest"],
       "groupName": "non-major dependencies",
       "automerge": true
+    },
+    {
+      "description": "dtolnay/rust-toolchain は版タグでなく stable ブランチの SHA に pin している。版の無い ref は release timestamp で寝かせられず既定（timestamp-required）だと digest 更新が永久保留になるので timestamp-optional で PR は出し、age 検査を経ないぶん自動マージはしない",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["dtolnay/rust-toolchain"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+      "automerge": false
     }
   ]
 }
