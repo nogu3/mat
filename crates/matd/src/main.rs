@@ -34,7 +34,9 @@ struct Cli {
     store: Option<PathBuf>,
 
     /// 上流 unix socket のパス。未指定なら $XDG_RUNTIME_DIR/matd/matd.sock
-    /// （dir は 0700 で自動作成。XDG 不在なら /tmp/matd.sock）。serve / stop 両方が使う。
+    /// （dir は 0700 で自動作成）。XDG 不在なら既定は無く、指定必須（共有 /tmp
+    /// への fallback は偽 socket を先置きされうるので廃止）。serve / admin op 共通。
+    /// socket は bind 直後に 0600 にする（権限が唯一のアクセス制御）。
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -122,10 +124,11 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
     // 既定パス（$XDG_RUNTIME_DIR/matd/matd.sock）のときだけ親 dir を 0700 で
     // 用意する。明示 --socket の親不在は従来どおり bind エラーに任せる。
     // lock ファイル（<socket>.lock）も同 dir なので acquire より前に作る。
+    // XDG 不在で --socket も無ければ、iface 選択等より前にここで止まる。
     let socket = match cli.socket.clone() {
         Some(p) => p,
         None => {
-            let p = mat_core::socket::default_socket_path();
+            let p = default_socket_or_err()?;
             mat_core::socket::ensure_socket_dir(&p).map_err(|e| {
                 MatError::new(
                     ErrorKind::Other,
@@ -275,12 +278,27 @@ async fn serve_daemon(cli: Cli) -> Result<(), MatError> {
         .map_err(|e| MatError::new(ErrorKind::Other, format!("socket server failed: {e}")))
 }
 
+/// `--socket` 省略時の既定 socket。`XDG_RUNTIME_DIR` が無い（空・相対を含む）
+/// ときは既定を持たないので、直し方を言う `other`（exit 1）で止める。
+fn default_socket_or_err() -> Result<PathBuf, MatError> {
+    mat_core::socket::default_socket_path().ok_or_else(|| {
+        MatError::new(
+            ErrorKind::Other,
+            "no default matd socket path: XDG_RUNTIME_DIR is not set (or not an absolute path); \
+             pass --socket <PATH> (in a directory only you can write to) or set XDG_RUNTIME_DIR",
+        )
+    })
+}
+
 /// stop / status / reload: 稼働中 matd の socket へ admin op を 1 行送り、応答 JSON を
 /// stdout へ出す。居なければ「not running」で exit 1。matd がエラー応答を返した
 /// ときは stdout に出さず、その kind の exit code で終わる（`reload` は identity
 /// 不一致・store_missing・native Unavailable で実際にエラーを返す op）。
 async fn admin_op(socket: Option<PathBuf>, op: &str) -> Result<(), MatError> {
-    let socket = socket.unwrap_or_else(mat_core::socket::default_socket_path);
+    let socket = match socket {
+        Some(p) => p,
+        None => default_socket_or_err()?,
+    };
     let resp = send_admin_op(&socket, op).await?;
     // 成功応答だけが stdout（純粋 JSON）。
     println!("{}", admin_response_to_result(resp)?);

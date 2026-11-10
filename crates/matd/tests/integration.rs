@@ -740,3 +740,159 @@ async fn read_without_attribute_returns_attributes_object() {
     assert!(resp[0].get("attribute").is_none());
     assert!(resp[0].get("timestamp").is_some());
 }
+
+/// 上限超えの 1 行（`MAX_REQUEST_LINE_BYTES` + 1 バイト）を書き込む。サーバは
+/// 上限で読むのをやめて切断するので、書き込み側の EPIPE / ECONNRESET は無視する
+/// （読み側と並行させないと、送信バッファが詰まって書き込みが終わらない）。
+fn spawn_oversized_writer(
+    mut write_half: tokio::net::unix::OwnedWriteHalf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut big = vec![b'a'; matd::server::MAX_REQUEST_LINE_BYTES + 1];
+        big.push(b'\n');
+        let _ = write_half.write_all(&big).await;
+    })
+}
+
+/// 応答 1 行を読んだ後、接続が閉じられている（EOF か ECONNRESET）こと。
+async fn expect_line_then_closed(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+) -> Value {
+    let resp = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("no response to oversized line")
+        .unwrap()
+        .expect("connection closed without an error line");
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("connection was not closed after oversized line");
+    assert!(
+        matches!(next, Ok(None) | Err(_)),
+        "connection should be closed, got: {next:?}"
+    );
+    v
+}
+
+/// 上限を超える 1 行は parse_error の 1 行を返して切断し、上限以上は溜めない。
+/// サーバ自体は健全なまま（別接続の ping が通る）。
+#[tokio::test]
+async fn oversized_request_line_is_rejected_and_server_stays_healthy() {
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd_with_fake(store_path).await;
+
+    let stream = connect_with_retry(&socket).await;
+    let (read_half, write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    let writer = spawn_oversized_writer(write_half);
+
+    let v = expect_line_then_closed(&mut lines).await;
+    assert_eq!(v["error"]["kind"], "parse_error", "got: {v}");
+    assert!(
+        v["error"]["detail"].as_str().unwrap().contains("too long"),
+        "got: {v}"
+    );
+    assert!(v["timestamp"].is_string());
+    writer.await.unwrap();
+
+    let resps = roundtrip(&socket, &[json!({"op":"ping"})]).await;
+    assert_eq!(resps[0]["pong"], json!(true));
+
+    handle.abort();
+}
+
+/// ちょうど上限の行は従来どおり受理される（JSON として不正なので parse_error
+/// だが、接続は切られず次のリクエストに応答する）。
+#[tokio::test]
+async fn request_line_at_the_limit_is_still_accepted() {
+    let (_dir, store_path) = make_store();
+    let (socket, handle) = start_matd_with_fake(store_path).await;
+
+    let stream = connect_with_retry(&socket).await;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    let writer = tokio::spawn(async move {
+        let mut buf = vec![b'a'; matd::server::MAX_REQUEST_LINE_BYTES];
+        buf.push(b'\n');
+        buf.extend_from_slice(b"{\"op\":\"ping\",\"id\":2}\n");
+        write_half.write_all(&buf).await.unwrap();
+        write_half
+    });
+
+    let r1: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(r1["error"]["kind"], "parse_error");
+    assert!(
+        r1["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("invalid request JSON"),
+        "got: {r1}"
+    );
+    let r2: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(r2["pong"], json!(true));
+    assert_eq!(r2["id"], json!(2));
+    drop(writer.await.unwrap());
+
+    handle.abort();
+}
+
+/// op 実行中の先読み（pending line）にも上限が掛かる: 進行中の op は応答を
+/// 返し、その後で上限超えの行に parse_error を返して切断する。
+#[tokio::test]
+async fn oversized_line_while_op_in_flight_is_rejected_after_the_response() {
+    let (_dir, store_path) = make_store();
+    let est = FakeEstablisher {
+        conn_delay: Some(std::time::Duration::from_millis(300)),
+        ..Default::default()
+    };
+    let (socket, handle) = start_matd_with_est(store_path, est).await;
+
+    let stream = connect_with_retry(&socket).await;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(
+            b"{\"id\":1,\"op\":\"read\",\"node_id\":1,\"endpoint\":1,\"cluster\":\"onoff\",\"attribute\":\"on-off\"}\n",
+        )
+        .await
+        .unwrap();
+    let writer = spawn_oversized_writer(write_half);
+
+    let r1: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(r1["id"], json!(1));
+    assert_eq!(r1["value"], json!(true), "got: {r1}");
+    let v = expect_line_then_closed(&mut lines).await;
+    assert_eq!(v["error"]["kind"], "parse_error", "got: {v}");
+    writer.await.unwrap();
+
+    let resps = roundtrip(&socket, &[json!({"op":"ping"})]).await;
+    assert_eq!(resps[0]["pong"], json!(true));
+
+    handle.abort();
+}
+
+/// listen ストリーム中のクライアント行にも上限が掛かる（parse_error 1 行で切断）。
+#[tokio::test]
+async fn oversized_line_during_listen_is_rejected() {
+    let (_dir, store_path) = make_store();
+    let native = NativeBackend::with_establisher(Box::new(FakeEstablisher::default()));
+    let (socket, handle, _tx, _health) =
+        start_matd_with_events(store_path, NativeState::Ready(Box::new(native)), 16).await;
+
+    let stream = connect_with_retry(&socket).await;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    write_half
+        .write_all(b"{\"op\":\"listen\"}\n")
+        .await
+        .unwrap();
+    let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ack["listening"], json!(true));
+    let writer = spawn_oversized_writer(write_half);
+
+    let v = expect_line_then_closed(&mut lines).await;
+    assert_eq!(v["error"]["kind"], "parse_error", "got: {v}");
+    writer.await.unwrap();
+
+    handle.abort();
+}

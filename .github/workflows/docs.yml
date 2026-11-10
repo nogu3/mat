@@ -10,10 +10,12 @@ on:
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
+# 既定は読み取りだけ。必要な権限はジョブごとに足す: build は configure-pages
+# （enablement: true = Pages サイトが無ければ作る）のため pages: write、OIDC トークン
+# （id-token: write）は実際にデプロイする deploy ジョブにだけ与える
+# （外部から mdBook を落として実行する build には渡さない）。
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -22,11 +24,14 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
     env:
       MDBOOK_VERSION: v0.5.4
       MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install mdBook (prebuilt)
         run: |
           mkdir -p "$HOME/.local/bin"
@@ -36,18 +41,22 @@ jobs:
           tar -xz -C "$HOME/.local/bin" -f /tmp/mdbook.tar.gz
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: mdbook build
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
         with:
           enablement: true
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: book
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

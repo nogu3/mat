@@ -13,12 +13,16 @@ on:
     paths: ["**/Cargo.toml", "Cargo.lock", ".github/workflows/audit.yml"]
   workflow_dispatch:
 
+# GITHUB_TOKEN は読み取りだけ（監査結果はジョブの成否で出すだけで書き込まない）。
+permissions:
+  contents: read
+
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-audit
       - run: cargo audit

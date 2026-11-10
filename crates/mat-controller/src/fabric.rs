@@ -64,7 +64,11 @@ pub fn verify_default_ipk_epoch(
     ipk_operational: &[u8; 16],
 ) -> bool {
     let cfid = compressed_fabric_id(root_public_key, fabric_id);
-    derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid) == *ipk_operational
+    // 比較対象は IPK（秘密鍵材）なので定数時間で比べる。
+    crate::crypto::ct_eq(
+        &derive_ipk_operational(&CHIP_TOOL_DEFAULT_IPK_EPOCH, &cfid),
+        ipk_operational,
+    )
 }
 
 /// CASE destination identifier (spec §4.14.2.1.2). Fabric id / node id are

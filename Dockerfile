@@ -13,11 +13,12 @@ FROM rust:1-bookworm AS mat-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release
+# --locked: コミット済み Cargo.lock と違う依存版を黙って解決させない（ずれていればビルド失敗）
+RUN cargo build --locked --release
 
 # ── Stage 1b: テスト専用ステージ（task docker:test 用、ローカルツールチェーン不要）─
 FROM mat-builder AS test
-RUN cargo test --release
+RUN cargo test --locked --release
 
 # ── Stage 2: ランタイム（軽量。バイナリだけ載せる）────────────────────────────
 # native バックエンドは自前 crypto/mDNS（pure Rust）なので chip-tool 時代の
@@ -46,4 +47,4 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # 出力: target/aarch64-unknown-linux-gnu/release/{mat,matd}
-RUN cargo build --release --target aarch64-unknown-linux-gnu
+RUN cargo build --locked --release --target aarch64-unknown-linux-gnu

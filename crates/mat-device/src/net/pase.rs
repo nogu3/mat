@@ -122,8 +122,20 @@ pub async fn run_pase_once(
             responder_session_id: RESPONDER_SESSION_ID,
         },
     )
-    .await?;
+    .await
+    .map_err(|f| f.error)?;
     Ok(keys)
+}
+
+/// A failed [`drive_established`]: the error, plus whether the handshake had
+/// already put a passcode guess to the test
+/// ([`PaseResponderCore::has_unconfirmed_guess`], read off the core at the
+/// moment it failed) — the runtime counts only those against the
+/// commissioning window's failed-attempt cap.
+#[derive(Debug)]
+pub(crate) struct PaseAttemptFailure {
+    pub error: NetPaseError,
+    pub unconfirmed_guess: bool,
 }
 
 /// Drives one PASE responder handshake to completion given an
@@ -134,15 +146,30 @@ pub async fn run_pase_once(
 /// socket and can't be handed to a fresh `recv_first`. Otherwise identical
 /// to [`run_pase_once`]'s inner loop, except it returns the peer's
 /// (initiator's) session id alongside the derived keys — needed to build
-/// `SecureSession::new_device_role(..)` — instead of discarding it.
+/// `SecureSession::new_device_role(..)` — instead of discarding it, and a
+/// failure carries [`PaseAttemptFailure::unconfirmed_guess`].
 pub(crate) async fn drive_established(
     transport: &Transport,
     peer: SocketAddr,
     first: IncomingMessage,
     config: PaseVerifierConfig,
+) -> Result<(SessionKeys, u16), PaseAttemptFailure> {
+    let mut core = PaseResponderCore::new(config);
+    drive_core(transport, peer, first, &mut core)
+        .await
+        .map_err(|error| PaseAttemptFailure {
+            error,
+            unconfirmed_guess: core.has_unconfirmed_guess(),
+        })
+}
+
+async fn drive_core(
+    transport: &Transport,
+    peer: SocketAddr,
+    first: IncomingMessage,
+    core: &mut PaseResponderCore,
 ) -> Result<(SessionKeys, u16), NetPaseError> {
     let cfg = crate::net::fast_cfg();
-    let mut core = PaseResponderCore::new(config);
 
     // One `ResponderExchange` for the whole handshake — see the module doc
     // comment on why re-adopting per message is unsafe.

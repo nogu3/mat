@@ -188,7 +188,9 @@ fn load_or_create_unique_id(store_dir: &std::path::Path) -> std::io::Result<Stri
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(format!("os rng: {e}")))?;
     let hex = mat_core::hex::encode_lower(&bytes);
-    std::fs::write(&path, &hex)?;
+    // Atomic (a torn write would mint a new identity on the next boot) and
+    // owner-only (0600), like every other file in the store.
+    mat_core::fsatomic::write_atomic(&path, hex.as_bytes())?;
     Ok(hex)
 }
 
@@ -268,6 +270,13 @@ fn build_attestation(config: &DeviceConfig) -> Result<x509::DevAttestation, Devi
         }
         AttestationMode::ChipTest => crate::chip_test_attestation::dev_attestation(),
     };
+    // `paa.der` is a public certificate (no key material): it exists so a
+    // commissioner can add it to its PAA trust store, so its mode (and the
+    // `paa/` subdir's) is deliberately left to the umask rather than forced
+    // to 0600. A plain non-atomic write is fine too — the file is fully
+    // regenerated on every boot before anything reads it back, so a torn
+    // write is healed by the next start. Access from other users is still
+    // gated by `store_dir` itself (0700 when the device created it).
     let paa_dir = config.store_dir.join("paa");
     std::fs::create_dir_all(&paa_dir).map_err(DeviceError::Io)?;
     std::fs::write(paa_dir.join("paa.der"), &dev.paa_der).map_err(DeviceError::Io)?;
@@ -574,7 +583,10 @@ impl Device {
     /// current tokio reactor — same requirement as
     /// `tokio::net::UdpSocket::from_std` itself).
     pub fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
-        std::fs::create_dir_all(&config.store_dir).map_err(DeviceError::Io)?;
+        // Owner-only (0700) when we create it: the store holds fabrics.json
+        // (operational private key + IPK) and group_keys.json. An already-
+        // existing dir keeps its mode (operator's choice / container volume).
+        mat_core::fsatomic::create_private_dir_all(&config.store_dir).map_err(DeviceError::Io)?;
         let dev = build_attestation(&config)?;
 
         let fabric_store = FabricStore::with_persist(Box::new(store_in_dir(&config.store_dir)));
@@ -665,14 +677,20 @@ impl Device {
     /// commissioned, or a wiped `store_dir`) opens it for 15 minutes;
     /// non-empty (this device already has a fabric from an earlier run)
     /// starts it closed, since a fresh commissioner has no legitimate
-    /// reason to PASE into an already-commissioned device. From there the
-    /// window only ever closes — on the 15-minute deadline or on
-    /// `CommissioningComplete` succeeding — and never reopens within this
-    /// process: **M2 has no Administrator Commissioning cluster**
-    /// (`OpenCommissioningWindow`/`RevokeCommissioning` are out of scope),
-    /// so the only way to admit PASE again is a full restart, which
-    /// re-evaluates this same policy against whatever's on disk at that
-    /// point. The window's live state (open-until-deadline vs. closed) is
+    /// reason to PASE into an already-commissioned device. An open window
+    /// closes on its deadline (15 minutes for the boot window, the
+    /// requested `CommissioningTimeout` for one opened by
+    /// `OpenCommissioningWindow`), on `CommissioningComplete` succeeding,
+    /// on `RevokeCommissioning`, or after 20 failed PASE attempts within
+    /// that window (the spec's brute-force cap; a failed attempt is a
+    /// handshake that got Pake2 — and so could test its passcode guess —
+    /// but never confirmed it, see
+    /// `core::pase::PaseResponderCore::has_unconfirmed_guess`). Each newly
+    /// opened window starts with a fresh count. Once closed, PASE is
+    /// admitted again only through a new window — an
+    /// `OpenCommissioningWindow` from an existing fabric's admin, or, for a
+    /// device with no fabric, a restart (which re-evaluates this same
+    /// policy against whatever's on disk). The window's live state is
     /// tracked entirely inside `net::runtime`'s `Runtime` as
     /// `CommissioningWindow` (`serve_forever`'s loop) — this doc only
     /// describes the policy, not where the state lives.
@@ -1040,5 +1058,59 @@ mod tests {
         let first = load_or_create_unique_id(dir.path()).unwrap();
         let second = load_or_create_unique_id(dir.path()).unwrap();
         assert_eq!(first, second);
+    }
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `unique_id` is written owner-only (0600) like every other file in
+    /// the store, and without leaving the atomic-write tmp behind.
+    #[test]
+    fn load_or_create_unique_id_writes_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_unique_id(dir.path()).unwrap();
+        assert_eq!(mode_of(&dir.path().join("unique_id")), 0o600);
+        assert!(!dir.path().join("unique_id.tmp").exists());
+    }
+
+    /// A store dir `Device::new` creates itself (fabrics.json holds the
+    /// operational private key) is owner-only (0700), ancestors included.
+    #[tokio::test]
+    async fn new_creates_store_dir_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("state").join("matv");
+        let cfg = test_device_config(store.clone(), vec![]);
+        drop(Device::new(cfg).unwrap());
+        assert_eq!(mode_of(&store), 0o700);
+        assert_eq!(mode_of(&dir.path().join("state")), 0o700);
+        assert_eq!(mode_of(&store.join("unique_id")), 0o600);
+    }
+
+    /// A pre-existing store dir keeps whatever mode the operator gave it
+    /// (it may be a deliberately shared dir or a container volume).
+    #[tokio::test]
+    async fn new_leaves_existing_store_dir_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matv");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let cfg = test_device_config(store.clone(), vec![]);
+        drop(Device::new(cfg).unwrap());
+        assert_eq!(mode_of(&store), 0o750);
+    }
+
+    /// `paa/paa.der` is a public certificate a commissioner on the same
+    /// host imports into its PAA trust store — it is written in full every
+    /// boot and its mode is intentionally left to the umask.
+    #[tokio::test]
+    async fn new_writes_paa_der() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_device_config(dir.path().to_path_buf(), vec![]);
+        drop(Device::new(cfg).unwrap());
+        let der = std::fs::read(dir.path().join("paa").join("paa.der")).unwrap();
+        assert_eq!(der.first(), Some(&0x30)); // DER SEQUENCE
     }
 }

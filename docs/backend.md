@@ -33,7 +33,8 @@ Environment variables:
 | `MAT_OP_TIMEOUT_MS` | budget (ms) for a single-node op; default `60000`, `0` = unlimited — see [Op timeout budget](commands.md#op-timeout-budget---op-timeout-ms) |
 | `MAT_PAA_TRUST_STORE` | directory of PAA root certs for attestation |
 | `MAT_CD_SIGNER_STORE` | CD signer trust store (warn-only if absent) |
-| `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission |
+| `MAT_SETUP_CODE` | `commission` setup code (QR `MT:...` or manual code) when `--setup-code` is absent; prefer it on shared hosts — the flag is visible in the process list (see [Passing the setup code and Thread dataset safely](commands.md#passing-the-setup-code-and-thread-dataset-safely)) |
+| `MAT_THREAD_DATASET` | Thread active operational dataset (hex) for BLE+Thread commission; like `MAT_SETUP_CODE`, prefer it over `--thread-dataset` on shared hosts |
 | `MAT_TRANSPORT` | commission route: `auto` (default) / `on-network` / `ble` |
 | `MAT_PING6_BIN` | override the `ping6` binary used by `diag node --deep` |
 | `MAT_LOG` | `tracing` filter for stderr logs (e.g. `info`); empty counts as unset — see [Logs](errors.md#logs-stderr) |

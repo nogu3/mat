@@ -59,6 +59,121 @@ fn transport_ble_rejects_manual_code() {
         .stderr(predicate::str::contains("QR"));
 }
 
+// ── setup code / Thread dataset の env 供給（ps に秘密を出さない）─────────────
+//
+// `--transport ble` × manual code は `validate_transport` が exit 2 + "QR" で
+// 弾く（バックエンド不到達）。これを「どの値が setup code として採用されたか」
+// の観測窓に使う: manual code が採用されれば QR エラー、`MT:` が採用されれば
+// QR エラーにならない（`--alias 42` の resolve 層 exit 2 で止める）。
+
+const QR_ERR: &str = "--transport ble requires the QR payload";
+
+#[test]
+fn setup_code_can_come_from_env_only() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env("MAT_SETUP_CODE", "34970112332")
+        .args(["commission", "--transport", "ble"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(QR_ERR));
+}
+
+#[test]
+fn setup_code_flag_overrides_env() {
+    let store = store_with_node5();
+    // flag = manual code、env = QR → flag が勝つので QR エラー。
+    mat(store.path())
+        .env("MAT_SETUP_CODE", "MT:Y.K9042C00KA0648G00")
+        .args([
+            "commission",
+            "--setup-code",
+            "34970112332",
+            "--transport",
+            "ble",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(QR_ERR));
+    // flag = QR、env = manual code → flag が勝つので QR エラーにはならず、
+    // resolve 層の alias 検証（純数字）で exit 2。
+    mat(store.path())
+        .env("MAT_SETUP_CODE", "34970112332")
+        .args([
+            "commission",
+            "--setup-code",
+            "MT:Y.K9042C00KA0648G00",
+            "--transport",
+            "ble",
+            "--alias",
+            "42",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(QR_ERR).not())
+        .stderr(predicate::str::contains("\"kind\":\"other\""));
+}
+
+#[test]
+fn setup_code_missing_from_both_flag_and_env_is_usage_error() {
+    let store = store_with_node5();
+    mat(store.path())
+        .env_remove("MAT_SETUP_CODE")
+        .args(["commission"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("required"))
+        .stderr(predicate::str::contains("--setup-code"));
+}
+
+/// clap は `env` 付き引数の現在値を `--help` に `[env: NAME=value]` として出す。
+/// 秘密（passcode を含む setup code / Thread ネットワーク資格情報）は
+/// `hide_env_values` で伏せる。env 名自体は案内として出す。
+#[test]
+fn commission_help_never_echoes_secret_env_values() {
+    let store = store_with_node5();
+    let setup = "MT:SECRETSETUPCODE0000";
+    let dataset = "0e080000000000010000deadbeefcafe";
+    for flag in ["--help", "-h"] {
+        mat(store.path())
+            .env("MAT_SETUP_CODE", setup)
+            .env("MAT_THREAD_DATASET", dataset)
+            .args(["commission", flag])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("MAT_SETUP_CODE"))
+            .stdout(predicate::str::contains("MAT_THREAD_DATASET"))
+            .stdout(predicate::str::contains(setup).not())
+            .stdout(predicate::str::contains(dataset).not())
+            .stderr(predicate::str::contains(setup).not())
+            .stderr(predicate::str::contains(dataset).not());
+    }
+}
+
+/// 引数エラー経路（clap の usage エラー・`validate_transport`）でも env の値は
+/// 出力に載らない。
+#[test]
+fn commission_errors_never_echo_secret_env_values() {
+    let store = store_with_node5();
+    let setup = "34970112332";
+    let dataset = "0e080000000000010000deadbeefcafe";
+    for args in [
+        &["commission", "--transport", "ble"][..],
+        &["commission", "--bogus-flag"][..],
+    ] {
+        mat(store.path())
+            .env("MAT_SETUP_CODE", setup)
+            .env("MAT_THREAD_DATASET", dataset)
+            .args(args)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains(setup).not())
+            .stdout(predicate::str::contains(dataset).not())
+            .stderr(predicate::str::contains(setup).not())
+            .stderr(predicate::str::contains(dataset).not());
+    }
+}
+
 /// 未知の値が exit 2 になること「だけ」なら `value_enum` の素の挙動なので、
 /// 機能を丸ごと revert しても通ってしまう。ここでは **候補が正確に
 /// `auto` / `on-network` / `ble` の 3 つ**（README・spec の表と同じ集合）で

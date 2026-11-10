@@ -11,6 +11,10 @@ on:
     branches: [main]
   pull_request:
 
+# GITHUB_TOKEN は読み取りだけ（チェックアウトのみで書き込む操作は無い）。
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,26 +22,27 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: install libdbus (ble feature)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: fmt
         run: cargo fmt --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: clippy (ble)
-        run: cargo clippy --all-targets --features ble -- -D warnings
+        run: cargo clippy --locked --all-targets --features ble -- -D warnings
       - name: doc (rustdoc -D warnings)
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
       - name: check (mat-device core, no I/O)
-        run: cargo check -p mat-device --no-default-features
+        run: cargo check --locked -p mat-device --no-default-features
       - name: test
-        run: cargo test
+        run: cargo test --locked
       - name: test (ble)
-        run: cargo test -p mat-controller --features ble
+        run: cargo test --locked -p mat-controller --features ble

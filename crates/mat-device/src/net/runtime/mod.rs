@@ -87,7 +87,10 @@ use crate::core::commissioning::{CommissioningServer, WindowRequest};
 use crate::core::datamodel::{ImOutcome, InvokeCtx, Node, ReadCtx};
 use crate::core::fabric_store::FabricEntry;
 use crate::core::mdns_records::{CommissionableAdvert, OperationalAdvert};
-use crate::core::pase::{PaseSecret, PaseVerifierConfig};
+use crate::core::pase::{
+    PaseAttemptLimiter, PaseFailureVerdict, PaseSecret, PaseVerifierConfig,
+    PASE_MAX_FAILED_ATTEMPTS,
+};
 use crate::device::{DeviceConfig, DeviceError};
 use crate::net::group_rx::{
     classify_group_datagram, desired_group_addrs, group_recv, GroupReplayGuard, GroupRx,
@@ -238,9 +241,7 @@ impl Runtime {
         // call needs `window.is_open()` to know whether to publish a
         // commissionable advert at all.
         let window = if comm_server.fabrics().is_empty() {
-            CommissioningWindow::Open {
-                until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
-            }
+            CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION)
         } else {
             CommissioningWindow::Closed
         };
@@ -566,11 +567,20 @@ impl Runtime {
                         );
                         self.install_session(local_session_id, session, 0); // PASE: no fabric yet
                     }
-                    // Established failure: best-effort responder, nothing
-                    // more to do — the initiator's own retry/StatusReport
-                    // handling covers it (logged so a failing
-                    // interop run says *where* it stopped).
-                    Err(e) => tracing::debug!(error = %e, peer = %peer, "PASE failed"),
+                    // Established failure: best-effort responder — the
+                    // initiator's own retry/StatusReport handling covers
+                    // the protocol side (logged so a failing interop run
+                    // says *where* it stopped). What's left is the
+                    // window's failed-attempt cap (`on_pase_failure`).
+                    Err(failure) => {
+                        tracing::debug!(
+                            error = %failure.error,
+                            peer = %peer,
+                            unconfirmed_guess = failure.unconfirmed_guess,
+                            "PASE failed"
+                        );
+                        self.on_pase_failure(failure.unconfirmed_guess, peer).await;
+                    }
                 }
             }
             UnsecuredFlow::Case => {
@@ -603,6 +613,36 @@ impl Runtime {
                 }
             }
             UnsecuredFlow::Ignore => {}
+        }
+    }
+
+    /// One failed PASE handshake: count it against the open window's cap
+    /// (`core::pase::PaseAttemptLimiter` decides what counts — only a
+    /// handshake that got as far as sending Pake2, see
+    /// `PaseResponderCore::has_unconfirmed_guess`) and close the window on
+    /// the 20th, the same way its deadline would. PASE runs inline in the
+    /// `select!` loop, so the window this attempt was admitted under is
+    /// still the current one; `None` (already closed) is a no-op.
+    async fn on_pase_failure(&mut self, unconfirmed_guess: bool, peer: SocketAddr) {
+        let Some(limiter) = self.state.window.pase_failures_mut() else {
+            return;
+        };
+        match limiter.record_failure(unconfirmed_guess) {
+            PaseFailureVerdict::NotCounted => {}
+            PaseFailureVerdict::Counted { failures } => tracing::info!(
+                peer = %peer,
+                failures,
+                max = PASE_MAX_FAILED_ATTEMPTS,
+                "failed PASE attempt counted against the commissioning window"
+            ),
+            PaseFailureVerdict::LimitReached => {
+                tracing::warn!(
+                    peer = %peer,
+                    failures = PASE_MAX_FAILED_ATTEMPTS,
+                    "commissioning window closed: too many failed PASE attempts"
+                );
+                self.close_commissioning_window().await;
+            }
         }
     }
 
@@ -654,6 +694,14 @@ impl Runtime {
     /// `CommissioningTimeout` elapsed: close the window and pull the
     /// commissionable advert.
     async fn on_commissioning_window_expired(&mut self) {
+        tracing::info!("commissioning window expired — closing");
+        self.close_commissioning_window().await;
+    }
+
+    /// Closes the open commissioning window — shared by the deadline
+    /// (`on_commissioning_window_expired`) and the failed-PASE-attempt cap
+    /// (`on_pase_failure`), so both leave the same state behind.
+    async fn close_commissioning_window(&mut self) {
         // Spec §5.4.2.3's 15-minute PASE window upper bound (boot
         // window) or spec §11.19.8.1's `CommissioningTimeout` (ECM
         // window, Task 4) has elapsed: close the window (no more
@@ -663,9 +711,10 @@ impl Runtime {
         // wired since Task 8). No fabric rollback here — unlike
         // fail-safe expiry, an already-*established* PASE session
         // (if one happened to be mid-flight right at the deadline)
-        // is left alone; this branch only stops *new* PASE attempts
-        // from being admitted going forward.
-        tracing::info!("commissioning window expired — closing");
+        // is left alone; this only stops *new* PASE attempts from
+        // being admitted going forward. Same for the failed-attempt
+        // cap: a PASE session established earlier in this window keeps
+        // working, only further guesses are refused.
         self.state.window = CommissioningWindow::Closed;
         if let Some(ctx) = self.state.mdns.as_ref() {
             ctx.mdns.set_commissionable(None).await;

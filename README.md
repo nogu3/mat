@@ -62,6 +62,8 @@ mat fabric init
 
 # commission a device (all values here are dummy)
 mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5
+# on a shared host, keep the setup code out of the process list instead:
+#   MAT_SETUP_CODE="MT:..." mat commission --node 5
 
 # control and read it
 mat on --node 5
@@ -119,6 +121,11 @@ mat commission --setup-code "MT:Y.K90AFN00KA0648G00" --node 1
 mat on --node 1 --endpoint 2    # endpoint 2 = the bridged light
 mat read --node 1 --endpoint 2 --cluster onoff --attribute on-off
 ```
+
+`store` holds the device's fabric keys: `matv` creates a missing store
+directory owner-only (`0700`; an existing one keeps its mode) and writes its
+state files `0600`. `paa/paa.der` is the public dev attestation root, rewritten
+on every start for the commissioner to trust.
 
 `kind` is one of `onoff-light`, `switch` (a momentary Generic Switch — short /
 long / multi press events) or `contact-sensor` (Boolean State — `StateChange`

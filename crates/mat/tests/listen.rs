@@ -248,3 +248,29 @@ fn listen_reconnect_timeout_without_events_exits_3() {
         .code(3)
         .stderr(predicate::str::contains("timeout"));
 }
+
+/// `XDG_RUNTIME_DIR` も `MAT_MATD_SOCKET` も無いと接続候補が無いので、
+/// `--reconnect` 付きでも待たずに matd_unavailable（exit 13）で即終了する
+/// （候補 0 本は待っても現れない設定の問題）。
+#[test]
+fn listen_without_xdg_or_socket_env_exits_13_immediately_even_with_reconnect() {
+    let store = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    assert_cmd::Command::cargo_bin("mat")
+        .unwrap()
+        .env("MAT_IFACE", "lo")
+        .env_remove("MAT_MATD")
+        .env_remove("MAT_MATD_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .arg("--store")
+        .arg(store.path())
+        .args(["listen", "--reconnect", "--timeout-ms", "5000"])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("matd_unavailable"))
+        .stderr(predicate::str::contains("XDG_RUNTIME_DIR"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "should not wait for the reconnect timeout"
+    );
+}

@@ -78,6 +78,8 @@ pub enum Route {
 ///
 /// socket 候補の優先順: `--matd <path>`（明示、1 本）> `MAT_MATD_SOCKET=<path>`（非空、
 /// 1 本）> 既定候補（subdir → flat）。`MAT_MATD_SOCKET` はパス指定のみで経路は変えない。
+/// `XDG_RUNTIME_DIR` 不在なら既定候補は 0 本: `Auto` は matd 不在と同じく直経路へ、
+/// `Forced` は `matd_unavailable` になる。
 pub fn resolve_route(
     flag: &Option<Option<PathBuf>>,
     env_socket: Option<OsString>,

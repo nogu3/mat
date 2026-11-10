@@ -30,3 +30,23 @@ fn status_without_running_daemon_errors() {
         .failure()
         .stderr(predicate::str::contains("not running"));
 }
+
+/// `XDG_RUNTIME_DIR` が無く `--socket` も無いときは既定 socket を持たない
+/// （共有 /tmp への fallback は廃止）。serve も admin op も、`--socket` か
+/// `XDG_RUNTIME_DIR` を求める構造化エラー（kind=other, exit 1）で止まる。
+#[test]
+fn no_default_socket_without_xdg_runtime_dir() {
+    for args in [&[][..], &["stop"][..], &["status"][..], &["reload"][..]] {
+        Command::cargo_bin("matd")
+            .unwrap()
+            .env_remove("XDG_RUNTIME_DIR")
+            .args(args)
+            .timeout(std::time::Duration::from_secs(20))
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("\"kind\":\"other\""))
+            .stderr(predicate::str::contains("--socket"))
+            .stderr(predicate::str::contains("XDG_RUNTIME_DIR"));
+    }
+}

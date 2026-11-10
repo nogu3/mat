@@ -25,7 +25,7 @@ pub struct Cli {
     /// matd の unix socket 経由での実行を強制する（接続失敗はエラー、フォールバック無し）。
     /// 値を省略すると socket は `MAT_MATD_SOCKET` があればそれ（1 本）、無ければ既定候補
     /// （`$XDG_RUNTIME_DIR/matd/matd.sock` → 旧 `$XDG_RUNTIME_DIR/matd.sock` の順に
-    /// connect 試行。XDG 不在なら `/tmp/matd.sock`）。
+    /// connect 試行。XDG 不在なら既定候補は無い — 共有 /tmp の fallback は廃止）。
     /// 本フラグが無くても mat は既定で matd を**自動発見**する: 上記候補へ接続を
     /// 試み、matd がいればそちら、いなければ mat 自身の native 直経路で実行。
     /// `MAT_MATD=1` は本フラグ相当（強制）、`MAT_MATD=0` は自動発見の無効化（常に直経路）。
@@ -117,7 +117,15 @@ pub enum Command {
     /// fabric への参加（初回 commission / multi-admin join 両対応）。
     Commission {
         /// setup code（QR ペイロード `MT:...` または 11/21桁の manual code）。
-        #[arg(long = "setup-code", value_name = "CODE")]
+        /// passcode を含む秘密なので、共有ホストでは env `MAT_SETUP_CODE` で渡す
+        /// （flag 形はプロセス一覧 `ps` / `/proc/<pid>/cmdline` に見える）。
+        /// 両方あれば flag が優先。env の値は `--help` に出さない。
+        #[arg(
+            long = "setup-code",
+            env = "MAT_SETUP_CODE",
+            hide_env_values = true,
+            value_name = "CODE"
+        )]
         setup_code: String,
         /// 割り当てる node_id（省略時は台帳の最大値+1 を自動採番）。
         #[arg(short = 'n', long = "node", value_name = "N")]
@@ -129,9 +137,12 @@ pub enum Command {
         /// BLE+Thread commissioning 用の Thread active operational dataset
         /// （hex）。native 経路（MAT_IFACE）で mDNS に見つからないデバイスを
         /// BLE で commission するときに必須。on-network commissioning では不要。
+        /// Thread ネットワークの資格情報（network key 等）なので env 推奨、
+        /// env の値は `--help` に出さない。
         #[arg(
             long = "thread-dataset",
             env = "MAT_THREAD_DATASET",
+            hide_env_values = true,
             value_name = "HEX"
         )]
         thread_dataset: Option<String>,

@@ -40,5 +40,7 @@ tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tracing-subscriber.workspace = true
+# tests/socket_perms.rs が umask を緩めて socket / lock の 0600 を検証する。
+rustix = { version = "1", features = ["fs", "process"] }
 # start_paused=true（op 相関 / born-dead 検知テスト、Task 4）に必須。
 tokio = { version = "1", features = ["test-util"] }

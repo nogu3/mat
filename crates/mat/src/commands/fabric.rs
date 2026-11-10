@@ -25,7 +25,8 @@ pub fn run_init(
     fabric_index: u8,
     issuer_index: u8,
 ) -> Result<(), MatError> {
-    std::fs::create_dir_all(store_path).map_err(|e| {
+    // 鍵素材を置く dir なので新規作成時は 0700（既存 dir の mode は触らない）。
+    mat_core::fsatomic::create_private_dir_all(store_path).map_err(|e| {
         MatError::store_missing(format!(
             "cannot create store dir {}: {e}",
             store_path.display()

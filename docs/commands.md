@@ -15,6 +15,24 @@ mat discover --probe
 mat commission --setup-code "MT:Y.K9042C00KA0648G00" --node 5
 ```
 
+#### Passing the setup code and Thread dataset safely
+
+The setup code (QR payload or manual code) contains the device's setup passcode,
+and `--thread-dataset` carries the Thread network credentials (network key
+included). Command-line arguments are visible to every local user in the process
+list (`ps`, `/proc/<pid>/cmdline`) while `mat` runs, so on a shared host pass both
+through the environment instead:
+
+```bash
+# MAT_SETUP_CODE / MAT_THREAD_DATASET are read when the flag is absent;
+# an explicit --setup-code / --thread-dataset wins over the env var.
+MAT_SETUP_CODE="MT:Y.K9042C00KA0648G00" mat commission --node 5
+```
+
+The setup code stays required — from the flag or `MAT_SETUP_CODE`; with neither,
+`commission` is a usage error (exit `2`). `--help` names both env vars but never
+prints their values.
+
 #### Route selection (`--transport`)
 
 `commission` picks how to reach the device. mDNS finding a record only proves the
@@ -1129,8 +1147,9 @@ does (missing and stale sockets alike).
 ```bash
 # Start the resident daemon (separate binary; see ARCHITECTURE.md / matd --help).
 # With no --socket it binds the default path ($XDG_RUNTIME_DIR/matd/matd.sock,
-# dir auto-created 0700; /tmp/matd.sock without XDG_RUNTIME_DIR) — the first
-# default mat probes below.
+# dir auto-created 0700) — the first default mat probes below. Without
+# XDG_RUNTIME_DIR there is no default: pass --socket <path> (in a directory
+# only you can write to). The socket is chmod'ed 0600 right after bind.
 matd &
 
 # No flag needed: mat finds the running matd on the default socket by itself.
@@ -1253,9 +1272,29 @@ only when interface autodetect is ambiguous (set `MAT_MATD_IFACE`).
   (a single socket in both cases) > default candidates, probed in order:
   `$XDG_RUNTIME_DIR/matd/matd.sock` (the systemd `RuntimeDirectory=matd`
   convention, matd's own bind default) then the pre-0.27.0
-  `$XDG_RUNTIME_DIR/matd.sock` (transition compat); just `/tmp/matd.sock`
-  without `XDG_RUNTIME_DIR`. Stale sockets fail the connect and fall through
-  naturally.
+  `$XDG_RUNTIME_DIR/matd.sock` (transition compat). Stale sockets fail the
+  connect and fall through naturally.
+- **No default without `XDG_RUNTIME_DIR`** (unset, empty, or not an absolute
+  path). There used to be a `/tmp/matd.sock` fallback; it is gone because in a
+  world-writable `/tmp` another local user could plant a fake socket there
+  while `matd` is down and `mat` would send it ops and trust its answers. Now
+  there are zero default candidates: auto-detect behaves exactly as "no matd
+  running" (direct path), forced `--matd` and `mat listen` are
+  `matd_unavailable` (exit `13`, immediately — `listen --reconnect` does not
+  wait for a socket that cannot appear), and `matd` itself (serve / `stop` /
+  `status` / `reload`) refuses with `other` (exit `1`) asking for `--socket` or
+  `XDG_RUNTIME_DIR`. Give an explicit socket with `--matd <path>` /
+  `MAT_MATD_SOCKET` on the `mat` side and `--socket` on the `matd` side.
+- **Access control is the socket's file mode.** Anyone who can connect can run
+  every op (write / invoke / `shutdown` / `reload` included). `matd` sets the
+  socket to `0600` right after bind (independent of umask) and creates
+  `<socket>.lock` as `0600`; the default socket directory is created `0700`.
+  Keep an explicit `--socket` in a directory only the daemon's user can write
+  to.
+- **Request line cap.** One request line may be at most 1 MiB (legitimate
+  requests are small JSON). A longer line gets a single `parse_error` line
+  back and the connection is closed — `matd` never buffers past the cap, and
+  other connections are unaffected.
 - Once connected, errors are reported from the matd path as-is — `mat` never
   re-runs the command on the direct path (no double execution of writes).
   Which path ran is logged to stderr at info level (`MAT_LOG=info`).
