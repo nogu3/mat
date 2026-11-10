@@ -215,9 +215,16 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                 name,
                 endpoint,
                 epoch_key,
+                epoch_key_file,
                 rebind,
             } => {
                 let gid = group_id.id()?;
+                // clap の conflicts_with で両指定は来ない。ファイル指定は読めなければ
+                // エラー（「指定なし」= ランダム鍵へ黙って落とさない）。
+                let epoch_key = match epoch_key_file {
+                    Some(path) => Some(read_epoch_key_file(path)?),
+                    None => epoch_key.clone(),
+                };
                 DeviceOp::GroupProvision(ProvisionParams {
                     group_id: gid,
                     node_ids: nodes(node_ids)?,
@@ -225,7 +232,7 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
                     // name 未指定は group_id から決定的に補完（両経路共通の規則）。
                     name: name.clone().unwrap_or_else(|| format!("grp{gid}")),
                     endpoint: *endpoint,
-                    epoch_key: epoch_key.clone(),
+                    epoch_key,
                     rebind: *rebind,
                 })
             }
@@ -292,6 +299,33 @@ pub(crate) fn classify(command: &Command) -> Result<Dispatch, MatError> {
             GroupCommand::List => return Ok(Dispatch::Dedicated("group list")),
         })),
     }
+}
+
+/// `--epoch-key-file` の中身を読む（`-` は stdin）。前後の空白・改行だけ落とし、
+/// hex としての検証は `--epoch-key` と同じ経路（`resolve_epoch_key`）に任せる。
+/// detail に鍵そのものは載せない。
+fn read_epoch_key_file(path: &str) -> Result<String, MatError> {
+    use std::io::Read;
+    let fail = |why: String| {
+        MatError::new(
+            mat_core::error::ErrorKind::Other,
+            format!("--epoch-key-file {path}: {why}"),
+        )
+    };
+    let raw = if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| fail(e.to_string()))?;
+        buf
+    } else {
+        std::fs::read_to_string(path).map_err(|e| fail(e.to_string()))?
+    };
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(fail("file is empty (expected 32 hex chars)".to_string()));
+    }
+    Ok(key.to_string())
 }
 
 #[cfg(test)]
@@ -676,6 +710,7 @@ mod tests {
                 name: None,
                 endpoint: 1,
                 epoch_key: None,
+                epoch_key_file: None,
                 rebind: false,
             },
         };
@@ -735,5 +770,64 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn provision_with(epoch_key: Option<&str>, epoch_key_file: Option<&str>) -> Command {
+        Command::Group {
+            action: GroupCommand::Provision {
+                group_id: GroupRef::Id(10),
+                node_ids: vec![NodeRef::Id(5)],
+                keyset_id: 60,
+                name: None,
+                endpoint: 1,
+                epoch_key: epoch_key.map(str::to_string),
+                epoch_key_file: epoch_key_file.map(str::to_string),
+                rebind: false,
+            },
+        }
+    }
+
+    fn provision_epoch_key(c: &Command) -> Option<String> {
+        match classify(c).unwrap() {
+            Dispatch::Device(DeviceOp::GroupProvision(p)) => p.epoch_key,
+            other => panic!("expected GroupProvision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provision_reads_epoch_key_from_file_trimming_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("epoch.key");
+        let key = "42".repeat(16);
+        std::fs::write(&path, format!("  {key}\n")).unwrap();
+        let cmd = provision_with(None, Some(path.to_str().unwrap()));
+        assert_eq!(provision_epoch_key(&cmd), Some(key));
+    }
+
+    #[test]
+    fn provision_epoch_key_arg_passes_through_without_file() {
+        let key = "ab".repeat(16);
+        assert_eq!(
+            provision_epoch_key(&provision_with(Some(&key), None)),
+            Some(key)
+        );
+        assert_eq!(provision_epoch_key(&provision_with(None, None)), None);
+    }
+
+    #[test]
+    fn provision_epoch_key_file_errors_do_not_fall_back_to_random() {
+        // 読めない / 空のファイルを「鍵の指定なし」に落とすと、黙ってランダム鍵で
+        // provision して既存メンバーと食い違う。必ずエラーにする。
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.key");
+        let err = classify(&provision_with(None, Some(missing.to_str().unwrap()))).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("--epoch-key-file"), "{}", err.detail);
+
+        let empty = dir.path().join("empty.key");
+        std::fs::write(&empty, "\n").unwrap();
+        let err = classify(&provision_with(None, Some(empty.to_str().unwrap()))).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(err.detail.contains("empty"), "{}", err.detail);
     }
 }

@@ -17,6 +17,11 @@ task docker:run -- discover
 task docker:test      # no local toolchain needed
 ```
 
+The Docker image runs as an unprivileged user (`mat`, uid 10001); the store
+lives at `/home/mat/.config/mat` (what `task docker:run` mounts the `mat-store`
+volume on). For a bind-mounted store, match the host directory's owner or pass
+`docker run --user <uid>:<gid>`.
+
 CI (GitHub Actions, `.github/workflows/ci.yml`) runs the same fmt / clippy /
 test sequence as `task check`. The default build and CI do not use the `ble`
 cargo feature; deploy builds (`task dist:arm64`) enable it for BLE+Thread

@@ -31,6 +31,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=mat-builder /src/target/release/mat /usr/local/bin/mat
 COPY --from=mat-builder /src/target/release/matd /usr/local/bin/matd
 
+# 非 root で動かす（mat / matd は特権不要: mDNS も Matter も 1024 番以上の UDP）。
+# store は fabric の root CA 秘密鍵を持つので、既定パスを 0700 で先に作っておく
+# （空の named volume はこの所有者・モードを引き継ぐ）。bind mount するなら
+# ホスト側 dir の所有者を合わせるか `docker run --user <uid>:<gid>` で上書きする。
+RUN useradd --uid 10001 --user-group --create-home mat \
+    && install -d -m 700 -o mat -g mat /home/mat/.config /home/mat/.config/mat
+USER mat
+
 ENTRYPOINT ["mat"]
 
 # ── mat / matd を aarch64 へクロスビルド（jarvis 等 aarch64 実機向け）──────────

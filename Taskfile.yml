@@ -143,7 +143,7 @@ tasks:
   docker:run:
     desc: "Docker 実行（host networking 必須）。例: task docker:run -- discover"
     cmds:
-      - docker run --rm --network host -v mat-store:/root/.config/mat {{.IMAGE}} {{.CLI_ARGS}}
+      - docker run --rm --network host -v mat-store:/home/mat/.config/mat {{.IMAGE}} {{.CLI_ARGS}}
 
   docker:test:
     desc: ローカルツールチェーン不要のテスト（ビルドステージ内で cargo test）
