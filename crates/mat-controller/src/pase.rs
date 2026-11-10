@@ -567,7 +567,8 @@ pub async fn establish(
     let shared = prover
         .finish(&p_b, &context, b"", b"")
         .map_err(PaseError::Spake)?;
-    if shared.expected_c_b != c_b {
+    // cB は SPAKE2+ 共有秘密由来の MAC。定数時間で比較する。
+    if !crate::crypto::ct_eq(&shared.expected_c_b, &c_b) {
         // 確認不一致（passcode 違い）を黙って諦めると、responder は Pake3 待ちの
         // まま PASE セッション確立スロットを保持し続け、直後の再試行が PBKDF
         // param request すら処理されずに固まる（実機 E2E で発見）。StatusReport

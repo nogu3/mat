@@ -89,6 +89,15 @@ pub fn verify_ecdsa_p256(
         .map_err(|_| CryptoError::BadSignature)
 }
 
+/// 秘密由来の認証子（PASE 確認値 cA/cB、CASE destinationId、導出鍵など）の
+/// 定数時間比較。内容の一致位置で早期 return しないので、相手が片側を
+/// 操れる比較で一致バイト数がタイミングから漏れない。長さは秘密ではない
+/// 前提で、長さ違いは即 `false`（`subtle` の slice 実装どおり）。
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
 /// Nonce = security flags (1B) || message counter (4B LE) || source node id (8B LE).
 pub fn build_nonce(security_flags: u8, message_counter: u32, source_node_id: u64) -> [u8; 13] {
     let mut n = [0u8; 13];
@@ -187,6 +196,26 @@ mod tests {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
         0x0F,
     ];
+
+    #[test]
+    fn ct_eq_matches_plain_equality() {
+        assert!(ct_eq(&[1, 2, 3], &[1, 2, 3]));
+        // 先頭・末尾どちらの 1 バイト差も不一致
+        assert!(!ct_eq(&[1, 2, 3], &[0, 2, 3]));
+        assert!(!ct_eq(&[1, 2, 3], &[1, 2, 4]));
+        // 長さ違い（前方一致でも）は不一致
+        assert!(!ct_eq(&[1, 2, 3], &[1, 2]));
+        assert!(!ct_eq(&[1, 2], &[1, 2, 3]));
+        assert!(!ct_eq(&[], &[0]));
+        // 空同士は一致
+        assert!(ct_eq(&[], &[]));
+        // 32 バイト（cA/cB・destinationId のサイズ）
+        let a = [0x5Au8; 32];
+        let mut b = a;
+        assert!(ct_eq(&a, &b));
+        b[31] ^= 0x01;
+        assert!(!ct_eq(&a, &b));
+    }
 
     #[test]
     fn builds_nonce_layout() {

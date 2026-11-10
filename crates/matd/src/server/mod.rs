@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Notify};
 
@@ -26,10 +26,13 @@ use crate::native::NativeBackend;
 use crate::protocol::{Op, Request};
 use crate::subscription::{Emitted, SubHealth};
 
+mod line;
 mod listen;
 mod oplog;
 mod wire;
 
+pub use line::MAX_REQUEST_LINE_BYTES;
+use line::{BoundedLines, LineError};
 use listen::stream_events;
 pub(crate) use listen::ListenFilter;
 use oplog::log_op;
@@ -111,6 +114,17 @@ pub async fn serve(
         let _ = std::fs::remove_file(socket_path);
     }
     let listener = UnixListener::bind(socket_path)?;
+    // socket の権限が唯一のアクセス制御（接続できれば write / invoke / shutdown /
+    // reload まで全 op が通る）。umask 任せにせず、accept を始める前に 0600 へ
+    // 落とす。umask をこの bind の周りだけ絞る手は、umask がプロセス全体の状態で
+    // 他スレッドのファイル作成に波及するので採らない。bind → chmod の間は umask
+    // 由来の mode が見える窓が残るが、既定パスの親 dir は 0700
+    // （`ensure_socket_dir`）なので他ユーザーはそもそも辿り着けない。明示
+    // `--socket` を共有 dir に置く場合はこの窓が残る（自分専用の dir に置くこと）。
+    if let Err(e) = restrict_socket_mode(socket_path) {
+        let _ = std::fs::remove_file(socket_path);
+        return Err(e);
+    }
     tracing::info!(socket = %socket_path.display(), "matd listening");
 
     // shutdown op（`matd stop`）で serve ループを抜けるための通知。
@@ -153,6 +167,20 @@ pub async fn serve(
     Ok(())
 }
 
+/// bind 済み socket ファイルを所有者のみ読み書き可（0600）にする。
+fn restrict_socket_mode(socket_path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to set mode 0600 on socket {}: {e}",
+                socket_path.display()
+            ),
+        )
+    })
+}
+
 /// 1 接続。複数行のリクエストを順に処理し、各行に 1 行 JSON で応答する。
 ///
 /// `listen` op だけは例外: ack 1 行を送った後、この接続を占有してフィルタ一致
@@ -167,16 +195,24 @@ async fn handle_conn(
     daemon: Arc<DaemonInfo>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut lines = BoundedLines::new(BufReader::new(read_half), MAX_REQUEST_LINE_BYTES);
 
-    let mut pending_line: Option<String> = None;
+    let mut pending_line: Option<Pending> = None;
     loop {
-        let line = match pending_line.take() {
-            Some(l) => l,
-            None => match lines.next_line().await? {
-                Some(l) => l,
-                None => break,
+        let next = match pending_line.take() {
+            Some(p) => p,
+            None => match lines.next_line().await {
+                Ok(Some(l)) => Pending::Line(l),
+                Ok(None) => break,
+                Err(LineError::TooLong) => Pending::TooLong,
+                Err(LineError::Io(e)) => return Err(e),
             },
+        };
+        let line = match next {
+            Pending::Line(l) => l,
+            // 上限超えの行: 逐次順どおりここで parse_error を 1 行返して切断する
+            // （残りは読まない — 読み捨てでも相手は無限に送れる）。
+            Pending::TooLong => return reject_oversized_line(&mut write_half).await,
         };
         if line.trim().is_empty() {
             continue;
@@ -240,7 +276,10 @@ async fn handle_conn(
                     // op 実行中の追加行は 1 行だけバッファ（逐次セマンティクス維持）。
                     // バッファ済みなら次の行は読まない（取りこぼし防止）。
                     next = lines.next_line(), if pending_line.is_none() => match next {
-                        Ok(Some(l)) => pending_line = Some(l),
+                        Ok(Some(l)) => pending_line = Some(Pending::Line(l)),
+                        // 上限超えは進行中の op を捨てず、その応答の後で拒否する
+                        // （以後は読まない: pending が埋まるので分岐が閉じる）。
+                        Err(LineError::TooLong) => pending_line = Some(Pending::TooLong),
                         // クライアント切断: op を破棄する。future drop で per-node
                         // Mutex が解放され、後続 op の head-of-line blocking が
                         // 消える（Issue #16）。応答は書かない（相手がいない）。
@@ -264,6 +303,29 @@ async fn handle_conn(
         }
     }
     Ok(())
+}
+
+/// 次に処理する 1 行: 通常の行か、上限（[`MAX_REQUEST_LINE_BYTES`]）超えで
+/// 読むのをやめた行か。
+enum Pending {
+    Line(String),
+    TooLong,
+}
+
+/// 上限超えの行への応答: parse_error を 1 行返して接続を閉じる（`Ok` で抜ければ
+/// 呼び手が接続を drop する）。
+async fn reject_oversized_line(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    let e = oversized_line_error();
+    tracing::warn!(kind = ?e.kind, detail = %e.detail, "matd request rejected; closing connection");
+    write_line(write_half, &error_response(None, &e)).await
+}
+
+fn oversized_line_error() -> MatError {
+    MatError::parse_error(format!(
+        "request line too long (limit {MAX_REQUEST_LINE_BYTES} bytes); closing connection"
+    ))
 }
 
 /// 1 op の帰結: 応答あり（通常）か、クライアント切断で放棄したか。

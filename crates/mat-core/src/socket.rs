@@ -4,41 +4,49 @@
 //! 一箇所で定義する。0.27.0 で既定を systemd の `RuntimeDirectory=matd` 慣習
 //! （`$XDG_RUNTIME_DIR/matd/matd.sock`）へ移行。mat 側の探索は移行期互換のため
 //! 旧 flat パス（`$XDG_RUNTIME_DIR/matd.sock`）も第 2 候補として connect を試す。
+//!
+//! `XDG_RUNTIME_DIR` が無い（または空・相対）ときは既定を**持たない**。以前の
+//! `/tmp/matd.sock` fallback は廃止した: world-writable な /tmp では matd 不在中に
+//! 他ユーザーが偽 socket を先置きでき、`mat` がそこへ op を送って応答を信じて
+//! しまう（matd 側の「stale 削除 → bind」も失敗 / 競合する）。既定が無いとき
+//! `matd` は `--socket` を要求してエラー、`mat` の自動発見は候補 0 本（= matd
+//! 不在と同じ扱いで直経路）になる。
 
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// `matd` の既定 bind パス: `$XDG_RUNTIME_DIR/matd/matd.sock`、XDG 不在なら
-/// `/tmp/matd.sock`（/tmp 直下に固定名 dir を作ると他ユーザーの dir squatting
-/// 面が増えるだけなので flat のまま）。
-pub fn default_socket_path() -> PathBuf {
+/// `XDG_RUNTIME_DIR` を採用できる形（非空の絶対パス）なら返す。XDG Base
+/// Directory 仕様どおり、相対パスは無効として無視する。
+fn usable_runtime_dir(xdg_runtime_dir: Option<OsString>) -> Option<PathBuf> {
+    xdg_runtime_dir
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+}
+
+/// `matd` の既定 bind パス: `$XDG_RUNTIME_DIR/matd/matd.sock`。XDG 不在（空・
+/// 相対を含む）なら `None` — 呼び手は `--socket` 明示を求める。
+pub fn default_socket_path() -> Option<PathBuf> {
     default_socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
 /// [`default_socket_path`] の env 注入版（テスト用に純関数）。
-pub fn default_socket_path_from(xdg_runtime_dir: Option<OsString>) -> PathBuf {
-    match xdg_runtime_dir {
-        Some(dir) => PathBuf::from(dir).join("matd").join("matd.sock"),
-        None => PathBuf::from("/tmp/matd.sock"),
-    }
+pub fn default_socket_path_from(xdg_runtime_dir: Option<OsString>) -> Option<PathBuf> {
+    usable_runtime_dir(xdg_runtime_dir).map(|dir| dir.join("matd").join("matd.sock"))
 }
 
 /// `mat` の既定探索候補（順に connect を試す）: subdir 新既定 → flat 旧既定。
-/// XDG 不在なら `/tmp/matd.sock` の 1 本。stale socket は connect が失敗する
-/// ので自然に次候補へ進む。
+/// XDG 不在（空・相対を含む）なら空 — 自動発見は「matd 不在」と同じく直経路へ
+/// 落ちる。stale socket は connect が失敗するので自然に次候補へ進む。
 pub fn default_socket_candidates() -> Vec<PathBuf> {
     default_socket_candidates_from(std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
 /// [`default_socket_candidates`] の env 注入版（テスト用に純関数）。
 pub fn default_socket_candidates_from(xdg_runtime_dir: Option<OsString>) -> Vec<PathBuf> {
-    match xdg_runtime_dir {
-        Some(dir) => {
-            let dir = PathBuf::from(dir);
-            vec![dir.join("matd").join("matd.sock"), dir.join("matd.sock")]
-        }
-        None => vec![PathBuf::from("/tmp/matd.sock")],
+    match usable_runtime_dir(xdg_runtime_dir) {
+        Some(dir) => vec![dir.join("matd").join("matd.sock"), dir.join("matd.sock")],
+        None => Vec::new(),
     }
 }
 
@@ -64,16 +72,25 @@ mod tests {
     fn default_path_is_subdir_under_xdg() {
         assert_eq!(
             default_socket_path_from(Some("/run/user/1000".into())),
-            PathBuf::from("/run/user/1000/matd/matd.sock")
+            Some(PathBuf::from("/run/user/1000/matd/matd.sock"))
         );
     }
 
+    /// XDG 不在なら既定は無い（共有 /tmp への fallback は廃止 — 他ユーザーが
+    /// 偽 socket を先置きできるため）。
     #[test]
-    fn default_path_falls_back_to_flat_tmp_without_xdg() {
-        assert_eq!(
-            default_socket_path_from(None),
-            PathBuf::from("/tmp/matd.sock")
-        );
+    fn default_path_is_none_without_xdg() {
+        assert_eq!(default_socket_path_from(None), None);
+    }
+
+    /// 空・相対の XDG_RUNTIME_DIR は XDG Base Directory 仕様どおり無視する
+    /// （相対だと cwd 基準の bind になり、置き場所が実行場所次第になる）。
+    #[test]
+    fn empty_or_relative_xdg_is_treated_as_unset() {
+        assert_eq!(default_socket_path_from(Some("".into())), None);
+        assert_eq!(default_socket_path_from(Some("run/user".into())), None);
+        assert!(default_socket_candidates_from(Some("".into())).is_empty());
+        assert!(default_socket_candidates_from(Some("run/user".into())).is_empty());
     }
 
     #[test]
@@ -88,11 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_single_tmp_without_xdg() {
-        assert_eq!(
-            default_socket_candidates_from(None),
-            vec![PathBuf::from("/tmp/matd.sock")]
-        );
+    fn candidates_are_empty_without_xdg() {
+        assert!(default_socket_candidates_from(None).is_empty());
     }
 
     #[test]

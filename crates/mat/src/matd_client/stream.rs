@@ -11,9 +11,18 @@ use serde_json::Value;
 
 use mat_core::error::{ErrorKind, MatError};
 
+/// socket 候補が 0 本のときの detail（`/tmp/matd.sock` fallback は廃止済み）。
+pub(super) const NO_CANDIDATES_DETAIL: &str = "no matd socket to try: XDG_RUNTIME_DIR is not set \
+     (or not an absolute path) and no socket was given; pass --matd <PATH> or set MAT_MATD_SOCKET";
+
 /// 候補 socket へ順に connect し、最初に成功した stream と使用パスを返す。
 /// 全滅は Err（試行した全パスと各エラーを列挙 — Forced 経路のエラー detail 用）。
+/// 候補 0 本（XDG_RUNTIME_DIR 不在で socket 指定も無い）も Err で、その理由と
+/// 直し方を detail にする。
 pub(super) fn connect_candidates(sockets: &[PathBuf]) -> Result<(UnixStream, &Path), String> {
+    if sockets.is_empty() {
+        return Err(NO_CANDIDATES_DETAIL.to_string());
+    }
     let mut attempts = Vec::new();
     for socket in sockets {
         match UnixStream::connect(socket) {
@@ -126,6 +135,13 @@ mod tests {
         let candidates = [stale, alive.clone()];
         let (_stream, used) = connect_candidates(&candidates).expect("stale is skipped");
         assert_eq!(used, alive.as_path());
+    }
+
+    #[test]
+    fn connect_candidates_with_no_candidates_explains_why() {
+        let err = connect_candidates(&[]).unwrap_err();
+        assert!(err.contains("XDG_RUNTIME_DIR"), "got: {err}");
+        assert!(err.contains("MAT_MATD_SOCKET"), "got: {err}");
     }
 
     #[test]

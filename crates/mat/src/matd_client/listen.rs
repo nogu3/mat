@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use mat_core::error::{ErrorKind, MatError};
 
 use super::connect_candidates;
+use super::stream::NO_CANDIDATES_DETAIL;
 
 /// listen リクエスト行を組む（None フィルタは省略 — `event` 省略は旧 matd
 /// 互換のため必須。bare `--event` は clap 側で `"*"` に落ちている）。
@@ -60,6 +61,15 @@ pub struct ListenParams {
 /// 指定時はその喪失を backoff 再接続で跨ぐ（count 累積・deadline 1 本）。
 pub fn dispatch_listen(sockets: &[PathBuf], p: &ListenParams) -> ExitCode {
     let op = listen_request_json(p.node, p.endpoint, &p.cluster, &p.attribute, &p.event);
+    // 候補 0 本は待っても matd が現れない設定の問題なので、`--reconnect` でも
+    // 即 matd_unavailable にする（再接続ループに入らない）。
+    if sockets.is_empty() {
+        return MatError::new(
+            ErrorKind::MatdUnavailable,
+            format!("{NO_CANDIDATES_DETAIL}; `mat listen` requires a running matd"),
+        )
+        .emit_exit();
+    }
     if p.reconnect {
         return run_listen_reconnecting(sockets, &op, p.count, p.timeout_ms);
     }

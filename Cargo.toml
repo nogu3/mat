@@ -37,6 +37,9 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 aes = "0.9"
 ccm = "0.6"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+# 秘密由来の認証子（PASE 確認値・CASE destinationId 等）の定数時間比較。
+# RustCrypto 群が既に推移依存で引いている版をそのまま直接依存にする。
+subtle = { version = "2.6", default-features = false }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

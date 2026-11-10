@@ -239,9 +239,7 @@ async fn commissioning_window_deadline_never_resolves_when_closed() {
 
 #[tokio::test(start_paused = true)]
 async fn commissioning_window_deadline_resolves_once_the_open_window_lapses() {
-    let window = CommissioningWindow::Open {
-        until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
-    };
+    let window = CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION);
     tokio::select! {
         () = commissioning_window_deadline(&window) => {}
         () = tokio::time::sleep(COMMISSIONING_WINDOW_DURATION + Duration::from_secs(1)) => {
@@ -252,10 +250,9 @@ async fn commissioning_window_deadline_resolves_once_the_open_window_lapses() {
 
 #[test]
 fn commissioning_window_is_open_reports_correctly() {
-    assert!(CommissioningWindow::Open {
-        until: Instant::now() + COMMISSIONING_WINDOW_DURATION
-    }
-    .is_open());
+    assert!(
+        CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION).is_open()
+    );
     assert!(CommissioningWindow::EnhancedOpen {
         until: Instant::now() + Duration::from_secs(60),
         request: WindowRequest {
@@ -265,6 +262,7 @@ fn commissioning_window_is_open_reports_correctly() {
             salt: vec![1, 2, 3],
             timeout_s: 60,
         },
+        pase_failures: PaseAttemptLimiter::default(),
     }
     .is_open());
     assert!(!CommissioningWindow::Closed.is_open());
@@ -288,7 +286,7 @@ fn apply_window_request_transitions_to_enhanced_open() {
     // Destructured from a clone, not `window` itself, so `window` stays
     // usable below (`CommissioningWindow` can't be `Copy` — it carries
     // `WindowRequest`'s `Vec<u8>` salt).
-    let CommissioningWindow::EnhancedOpen { until, request } = window.clone() else {
+    let CommissioningWindow::EnhancedOpen { until, request, .. } = window.clone() else {
         panic!("expected EnhancedOpen");
     };
     assert_eq!(request.discriminator, 0x0ABC);
@@ -305,9 +303,7 @@ fn apply_window_request_transitions_to_enhanced_open() {
 /// 窓 variant ごとの mDNS 広告パラメータ（CM 値と discriminator）。
 #[test]
 fn commissionable_advert_params_reflect_window_kind() {
-    let boot = CommissioningWindow::Open {
-        until: Instant::now() + Duration::from_secs(60),
-    };
+    let boot = CommissioningWindow::open_boot(Instant::now() + Duration::from_secs(60));
     assert_eq!(advert_params_for_window(&boot, 3210), Some((3210, 1)));
     let req = WindowRequest {
         verifier: [0x42; 97],
@@ -319,6 +315,7 @@ fn commissionable_advert_params_reflect_window_kind() {
     let ecm = CommissioningWindow::EnhancedOpen {
         until: Instant::now() + Duration::from_secs(300),
         request: req,
+        pase_failures: PaseAttemptLimiter::default(),
     };
     assert_eq!(advert_params_for_window(&ecm, 3210), Some((0x0ABC, 2)));
     assert_eq!(
@@ -342,9 +339,7 @@ fn test_window_request() -> WindowRequest {
 #[test]
 fn admin_window_action_applies_staged_request_when_admin_open() {
     let req = test_window_request();
-    let window = CommissioningWindow::Open {
-        until: Instant::now() + COMMISSIONING_WINDOW_DURATION,
-    };
+    let window = CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION);
     match admin_window_action(Some(req.clone()), true, &window) {
         AdminWindowAction::Apply(applied) => {
             assert_eq!(applied.discriminator, req.discriminator);
@@ -376,6 +371,7 @@ fn admin_window_action_closes_an_enhanced_open_window_once_admin_window_is_revok
     let window = CommissioningWindow::EnhancedOpen {
         until: Instant::now() + Duration::from_secs(60),
         request: test_window_request(),
+        pase_failures: PaseAttemptLimiter::default(),
     };
     let action = admin_window_action(None, false, &window);
     assert!(
@@ -393,11 +389,48 @@ fn admin_window_action_is_steady_state_none_for_a_still_open_enhanced_window() {
     let window = CommissioningWindow::EnhancedOpen {
         until: Instant::now() + Duration::from_secs(60),
         request: test_window_request(),
+        pase_failures: PaseAttemptLimiter::default(),
     };
     let action = admin_window_action(None, true, &window);
     assert!(
         matches!(action, AdminWindowAction::None),
         "expected None, got {action:?}"
+    );
+}
+
+// ── failed-PASE-attempt cap, per window ─────────────────────────────
+
+/// A closed window has no counter (`on_pase_failure` is then a no-op);
+/// both open variants expose theirs.
+#[test]
+fn pase_failure_counter_exists_only_while_a_window_is_open() {
+    assert!(CommissioningWindow::Closed.pase_failures_mut().is_none());
+    let mut boot = CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION);
+    assert_eq!(boot.pase_failures_mut().map(|l| l.failures()), Some(0));
+    let mut ecm = apply_window_request(test_window_request());
+    assert_eq!(ecm.pase_failures_mut().map(|l| l.failures()), Some(0));
+}
+
+/// An ECM window opened on top of a boot window that already used up
+/// part of its budget starts again from zero — the count is per window.
+#[test]
+fn a_newly_applied_ecm_window_starts_with_a_fresh_failure_count() {
+    let mut window = CommissioningWindow::open_boot(Instant::now() + COMMISSIONING_WINDOW_DURATION);
+    let limiter = window.pase_failures_mut().unwrap();
+    for _ in 0..(PASE_MAX_FAILED_ATTEMPTS - 1) {
+        limiter.record_failure(true);
+    }
+    assert_eq!(limiter.failures(), PASE_MAX_FAILED_ATTEMPTS - 1);
+
+    match admin_window_action(Some(test_window_request()), true, &window) {
+        AdminWindowAction::Apply(request) => window = apply_window_request(request),
+        other => panic!("expected Apply, got {other:?}"),
+    }
+    let limiter = window.pase_failures_mut().unwrap();
+    assert_eq!(limiter.failures(), 0);
+    assert_eq!(
+        limiter.record_failure(true),
+        PaseFailureVerdict::Counted { failures: 1 }
     );
 }
 

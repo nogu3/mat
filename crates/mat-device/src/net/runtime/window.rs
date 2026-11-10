@@ -39,12 +39,23 @@ pub(super) const COMMISSIONING_WINDOW_DURATION: Duration = Duration::from_secs(1
 ///   under an `EnhancedOpen` runtime window (detected the same
 ///   per-iteration place `EnhancedOpen` is entered) — all three also send
 ///   the mDNS commissionable goodbye (`set_commissionable(None)`).
+/// - `{Open,EnhancedOpen} -> Closed`, fourth way: the window's
+///   `pase_failures` reaching `PASE_MAX_FAILED_ATTEMPTS` (the spec's
+///   20-failed-attempts rule; `Runtime::on_pase_failure`), closed through
+///   the very same path as the deadline lapsing.
+///
+/// Each open variant carries its own `PaseAttemptLimiter`, created fresh
+/// (`Default`) wherever a window is opened — `boot` and
+/// `apply_window_request` — so the failed-attempt count is per window by
+/// construction: an ECM window replacing the boot window, or one opened
+/// after an earlier window closed, never inherits an old count.
 #[derive(Debug, Clone)]
 pub(super) enum CommissioningWindow {
     /// The boot-time window: PASE against the QR/manual-pairing passcode
     /// and boot discriminator.
     Open {
         until: Instant,
+        pase_failures: PaseAttemptLimiter,
     },
     /// A window opened at runtime by `OpenCommissioningWindow`: PASE against
     /// the commissioner-supplied verifier material and discriminator
@@ -53,6 +64,7 @@ pub(super) enum CommissioningWindow {
     EnhancedOpen {
         until: Instant,
         request: WindowRequest,
+        pase_failures: PaseAttemptLimiter,
     },
     Closed,
 }
@@ -68,6 +80,23 @@ impl CommissioningWindow {
     pub(super) fn is_open(&self) -> bool {
         !matches!(self, CommissioningWindow::Closed)
     }
+
+    /// A freshly opened boot window (zero failed PASE attempts).
+    pub(super) fn open_boot(until: Instant) -> Self {
+        CommissioningWindow::Open {
+            until,
+            pase_failures: PaseAttemptLimiter::default(),
+        }
+    }
+
+    /// The open window's failed-PASE-attempt counter, `None` when closed.
+    pub(super) fn pase_failures_mut(&mut self) -> Option<&mut PaseAttemptLimiter> {
+        match self {
+            CommissioningWindow::Open { pase_failures, .. }
+            | CommissioningWindow::EnhancedOpen { pase_failures, .. } => Some(pase_failures),
+            CommissioningWindow::Closed => None,
+        }
+    }
 }
 
 /// Same shape as `mdns_retry_deadline`/`fail_safe_expiry_deadline`: resolves
@@ -78,9 +107,8 @@ impl CommissioningWindow {
 /// (ECM) — nothing else polls `until` against the clock.
 pub(super) async fn commissioning_window_deadline(window: &CommissioningWindow) {
     match window {
-        CommissioningWindow::Open { until } | CommissioningWindow::EnhancedOpen { until, .. } => {
-            tokio::time::sleep_until(*until).await
-        }
+        CommissioningWindow::Open { until, .. }
+        | CommissioningWindow::EnhancedOpen { until, .. } => tokio::time::sleep_until(*until).await,
         CommissioningWindow::Closed => std::future::pending().await,
     }
 }
@@ -89,10 +117,16 @@ pub(super) async fn commissioning_window_deadline(window: &CommissioningWindow) 
 /// by `core::commissioning` and collected by the runtime per dispatch
 /// iteration) into an ECM window state — spec §11.19.8.1's
 /// `CommissioningTimeout` becomes the window's deadline directly, the same
-/// way the boot window uses `COMMISSIONING_WINDOW_DURATION`.
+/// way the boot window uses `COMMISSIONING_WINDOW_DURATION`. A new window
+/// starts with a fresh failed-PASE-attempt count, even when it replaces a
+/// still-open boot window.
 pub(super) fn apply_window_request(request: WindowRequest) -> CommissioningWindow {
     let until = Instant::now() + Duration::from_secs(u64::from(request.timeout_s));
-    CommissioningWindow::EnhancedOpen { until, request }
+    CommissioningWindow::EnhancedOpen {
+        until,
+        request,
+        pase_failures: PaseAttemptLimiter::default(),
+    }
 }
 
 /// The PASE verifier configuration the current window should be served

@@ -892,6 +892,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",

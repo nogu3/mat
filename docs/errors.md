@@ -55,9 +55,12 @@ scripts that only check the exit status still notice. stdout stays pure JSON.
   field (bad literal, JSON of the wrong shape, unknown / missing struct field —
   the detail names the path), when a list / struct JSON is given with a numeric
   id (no schema), or when a cluster / attribute / command name is not in the
-  table (pass the numeric id instead).
+  table (pass the numeric id instead). `matd` also answers `parse_error` to a
+  request line longer than 1 MiB, then closes that connection.
 - `matd_unavailable` (exit 13) — `matd` was not reachable or died mid-request.
-  For `mat listen`: no socket, connection refused, `MAT_MATD=0`, or the
+  For `mat listen`: no socket (including no socket candidate at all —
+  `XDG_RUNTIME_DIR` unset and no `--matd <path>` / `MAT_MATD_SOCKET`; exits
+  immediately even with `--reconnect`), connection refused, `MAT_MATD=0`, or the
   connection was cut partway through the event stream (`mat listen` has no
   direct-path fallback). With `mat listen --reconnect` those losses (connect
   failure, EOF, a non-JSON line) are retried with backoff (1 s → 30 s) instead
@@ -75,7 +78,9 @@ scripts that only check the exit status still notice. stdout stays pure JSON.
   (`detail` says `use --rebind`) or the KVS being locked by a concurrent writer
   (`flock` `WouldBlock`). These are hard errors (the KVS may already be touched),
   distinct from an unresolvable KVS, which surfaces as `store_missing` /
-  `store_parse`. Ambiguous interface autodetect is also `other`.
+  `store_parse`. Ambiguous interface autodetect is also `other`, as is
+  `matd` (serve / `stop` / `status` / `reload`) started without `--socket`
+  when `XDG_RUNTIME_DIR` is unset (there is no default socket path then).
 - `child_not_found` (exit 12) / `child_failed` (exit 1) — **not emitted as
   top-level errors since 0.22.0** (they classified chip-tool spawn/exit failures,
   now removed). The variants and exit-code mapping are kept only for wire

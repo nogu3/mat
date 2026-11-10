@@ -9,7 +9,8 @@ use mat_core::output::now_iso8601;
 
 use crate::subscription::Emitted;
 
-use super::wire::write_line;
+use super::line::{BoundedLines, LineError};
+use super::wire::{error_response, write_line};
 
 /// listen ストリーム: フィルタ一致イベントを NDJSON で流し続ける。lag した
 /// listener は黙って欠落させず、エラー行を送って切断する（spec ②）。
@@ -17,7 +18,7 @@ use super::wire::write_line;
 pub(super) async fn stream_events(
     mut rx: broadcast::Receiver<Emitted>,
     filter: ListenFilter,
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    lines: &mut BoundedLines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> std::io::Result<()> {
     // 配信件数。切断時に「そもそも 1 件も流れていない」のか
@@ -62,6 +63,18 @@ pub(super) async fn stream_events(
                 // リクエスト行は無視する（この op は接続占有の例外）。
                 match line {
                     Ok(Some(_)) => continue,
+                    // 上限超えの行も読み続けない: parse_error 1 行を送って切断。
+                    Err(LineError::TooLong) => {
+                        let e = super::oversized_line_error();
+                        tracing::warn!(
+                            delivered,
+                            node_id = filter.node_id,
+                            reason = "request_line_too_long",
+                            "listen client detached"
+                        );
+                        write_line(write_half, &error_response(None, &e)).await?;
+                        return Ok(());
+                    }
                     _ => {
                         tracing::info!(
                             delivered,

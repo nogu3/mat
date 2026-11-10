@@ -10,6 +10,26 @@ INI form — group keysets, operational credentials, the group-send counter;
 `mat` is its sole reader/writer). **It is never committed** (excluded by
 `.gitignore`).
 
+The store holds the Root CA private key and the IPK in plaintext, so `mat`
+writes every store file owner-only (`0600`, regardless of umask — each write is
+a tmp+rename replace, so the mode is re-applied every time) and creates a
+missing store directory as `0700`. An existing directory's mode is left as is
+(e.g. a mounted Docker volume) — make sure it is not world-readable.
+
+## `matd` socket
+
+`matd` binds `$XDG_RUNTIME_DIR/matd/matd.sock` by default (directory created
+`0700`) and `mat` probes that path (then the pre-0.27.0
+`$XDG_RUNTIME_DIR/matd.sock`). Without a usable `XDG_RUNTIME_DIR` (unset,
+empty, or relative) **there is no default** — the old `/tmp/matd.sock`
+fallback was removed because another local user could pre-create a fake socket
+in the shared `/tmp`. Then `matd` needs `--socket <path>`, and `mat` finds no
+daemon unless given `--matd <path>` / `MAT_MATD_SOCKET` (auto-detect simply
+uses the direct path). The socket is set to `0600` after bind and
+`<socket>.lock` is created `0600`: the file mode is the only access control,
+so put an explicit socket in a directory only that user can write to. See
+[Routing through matd](commands.md#routing-through-matd).
+
 ## Aliases (`aliases.toml`, optional)
 
 Numeric node / group / endpoint ids are easy to get wrong. If the file

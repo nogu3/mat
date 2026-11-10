@@ -180,6 +180,33 @@ impl PaseResponderCore {
         }
     }
 
+    /// Whether this handshake has put a passcode guess to the test without
+    /// it being confirmed — i.e. Pake2 has been produced (state
+    /// `AwaitPake3`) but Pake3 never verified. This is the definition of a
+    /// *failed PASE attempt* the commissioning window's brute-force cap
+    /// ([`PaseAttemptLimiter`]) counts, whatever way the handshake then
+    /// ended: a wrong cA ([`PaseCoreError::ConfirmMismatch`]), a
+    /// StatusReport/other opcode instead of Pake3, or silence (the net
+    /// driver's receive timeout).
+    ///
+    /// Why Pake2 is the line: this responder sends cB in Pake2 *before* it
+    /// sees cA, and the peer's pA already commits to one passcode guess,
+    /// so the moment Pake2 leaves, the peer can check its guess against cB
+    /// locally and walk away — an attacker never needs to send Pake3.
+    /// Counting only wrong-cA failures would therefore not bound guesses
+    /// at all. Conversely, nothing before Pake2 reveals anything about the
+    /// passcode (PBKDFParamResponse carries only public salt/iterations; a
+    /// Pake1 with an invalid pA fails before any cB is computed), so those
+    /// failures — malformed/out-of-order datagrams, invalid points, a peer
+    /// that never sends Pake1 — are not counted: they test no guess, and
+    /// counting them would let any LAN host close the window with 20
+    /// garbage packets without running SPAKE2+ at all. A peer that does
+    /// send a well-formed Pake1 and walks away *is* counted even if it was
+    /// never really guessing — it is indistinguishable from one that was.
+    pub fn has_unconfirmed_guess(&self) -> bool {
+        matches!(self.state, State::AwaitPake3 { .. })
+    }
+
     fn handle_pbkdf_param_request(&mut self, payload: &[u8]) -> Result<PaseOutput, PaseCoreError> {
         let req = pase::decode_pbkdf_param_request(payload)?;
         let mut responder_random = [0u8; 32];
@@ -233,7 +260,8 @@ impl PaseResponderCore {
         peer_session_id: u16,
     ) -> Result<PaseOutput, PaseCoreError> {
         let c_a = pase::decode_pake3(payload)?;
-        if c_a != expected_c_a {
+        // cA is a MAC keyed by the SPAKE2+ shared secret: compare in constant time.
+        if !mat_controller::crypto::ct_eq(&c_a, &expected_c_a) {
             return Err(PaseCoreError::ConfirmMismatch);
         }
         let keys = derive_session_keys(&k_e);
@@ -244,6 +272,71 @@ impl PaseResponderCore {
             keys,
             peer_session_id,
         })
+    }
+}
+
+/// Failed PASE attempts a single commissioning window tolerates before it
+/// must close. The Matter Core Specification requires a device to close
+/// its commissioning window once 20 PASE attempts have failed: the setup
+/// passcode is only ~27 bits, so this cap — not the passcode's entropy
+/// alone — is the online brute-force defence.
+pub const PASE_MAX_FAILED_ATTEMPTS: u8 = 20;
+
+/// What [`PaseAttemptLimiter::record_failure`] decided about one failed
+/// handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaseFailureVerdict {
+    /// The handshake failed before testing a passcode guess (see
+    /// [`PaseResponderCore::has_unconfirmed_guess`]) — not counted.
+    NotCounted,
+    /// Counted; the window stays open. `failures` is the new total.
+    Counted { failures: u8 },
+    /// Counted, and the total has reached [`PASE_MAX_FAILED_ATTEMPTS`]: the
+    /// caller must close the commissioning window now.
+    LimitReached,
+}
+
+/// Per-commissioning-window failed-PASE-attempt counter. Pure bookkeeping:
+/// the runtime owns one per open window (a fresh one each time a window
+/// opens, so the count resets per window) and acts on the verdict.
+///
+/// A *successful* PASE does not reset the count: the cap bounds how many
+/// guesses one window admits, and a success (the passcode holder getting
+/// in) does not make further guesses against the same, still-valid
+/// passcode any less dangerous — if commissioning then stalls and the
+/// window stays open, an attacker must not get a fresh budget. A legitimate
+/// commissioner never comes near the cap (it knows the passcode), so this
+/// costs it nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaseAttemptLimiter {
+    failures: u8,
+}
+
+impl PaseAttemptLimiter {
+    /// Failed attempts counted so far in this window.
+    pub fn failures(&self) -> u8 {
+        self.failures
+    }
+
+    /// Records one failed handshake. `guess_tested` is the failed core's
+    /// [`PaseResponderCore::has_unconfirmed_guess`]; only those count.
+    /// Saturates at [`PASE_MAX_FAILED_ATTEMPTS`] and keeps answering
+    /// `LimitReached` from there on.
+    pub fn record_failure(&mut self, guess_tested: bool) -> PaseFailureVerdict {
+        if !guess_tested {
+            return PaseFailureVerdict::NotCounted;
+        }
+        self.failures = self
+            .failures
+            .saturating_add(1)
+            .min(PASE_MAX_FAILED_ATTEMPTS);
+        if self.failures >= PASE_MAX_FAILED_ATTEMPTS {
+            PaseFailureVerdict::LimitReached
+        } else {
+            PaseFailureVerdict::Counted {
+                failures: self.failures,
+            }
+        }
     }
 }
 
@@ -415,6 +508,128 @@ mod tests {
             core.on_message(OPCODE_PASE_PAKE3, &pake3),
             Err(PaseCoreError::ConfirmMismatch)
         ));
+    }
+
+    // ── failed-attempt accounting (commissioning-window brute-force cap) ──
+
+    /// Drives `core` through PBKDFParamRequest + Pake1 with a prover that
+    /// knows `passcode`, returning the Pake3 that prover would send.
+    fn drive_to_pake3(core: &mut PaseResponderCore, passcode: u32) -> Vec<u8> {
+        let req = pase::encode_pbkdf_param_request(&[1u8; 32], 0x22);
+        let PaseOutput::Reply(resp_bytes, _) =
+            core.on_message(OPCODE_PBKDF_PARAM_REQUEST, &req).unwrap()
+        else {
+            panic!("expected Reply")
+        };
+        let resp = pase::decode_pbkdf_param_response(&resp_bytes).unwrap();
+        let context = pase::pake_context(&req, &resp_bytes);
+        let (w0, w1) = spake2p::derive_w0_w1(passcode, &resp.salt, resp.iterations);
+        let prover = Spake2pProver::new(w0, w1);
+        let pake1 = pase::encode_pake1(&prover.p_a());
+        let PaseOutput::Reply(pake2_bytes, _) = core.on_message(OPCODE_PASE_PAKE1, &pake1).unwrap()
+        else {
+            panic!("expected Reply")
+        };
+        let (p_b, _) = pase::decode_pake2(&pake2_bytes).unwrap();
+        let shared = prover.finish(&p_b, &context, b"", b"").unwrap();
+        pase::encode_pake3(&shared.c_a)
+    }
+
+    /// Before Pake2 goes out no passcode guess has been tested: a fresh
+    /// core, one that only answered PBKDFParamRequest, and one that
+    /// rejected a garbage Pake1 all report `false`.
+    #[test]
+    fn no_unconfirmed_guess_before_pake2_is_sent() {
+        let core = PaseResponderCore::new(cfg());
+        assert!(!core.has_unconfirmed_guess());
+
+        let mut core = PaseResponderCore::new(cfg());
+        let req = pase::encode_pbkdf_param_request(&[1u8; 32], 0x22);
+        core.on_message(OPCODE_PBKDF_PARAM_REQUEST, &req).unwrap();
+        assert!(!core.has_unconfirmed_guess());
+        // A Pake1 whose pA is not a valid point fails before Pake2 exists.
+        let bad = pase::encode_pake1(&[0u8; 65]);
+        assert!(core.on_message(OPCODE_PASE_PAKE1, &bad).is_err());
+        assert!(!core.has_unconfirmed_guess());
+
+        // Garbage as the very first message.
+        let mut core = PaseResponderCore::new(cfg());
+        assert!(core.on_message(OPCODE_PASE_PAKE3, &[0xFF]).is_err());
+        assert!(!core.has_unconfirmed_guess());
+    }
+
+    /// Once Pake2 (carrying cB) has been produced the peer can check its
+    /// guess, so the attempt counts whether it then sends a wrong cA, a
+    /// StatusReport, or nothing at all.
+    #[test]
+    fn unconfirmed_guess_after_pake2_until_confirmed() {
+        // Wrong passcode: Pake3 mismatch leaves the guess unconfirmed.
+        let mut core = PaseResponderCore::new(cfg());
+        let pake3 = drive_to_pake3(&mut core, 999_999);
+        assert!(core.has_unconfirmed_guess(), "abandoned after Pake2");
+        assert!(matches!(
+            core.on_message(OPCODE_PASE_PAKE3, &pake3),
+            Err(PaseCoreError::ConfirmMismatch)
+        ));
+        assert!(core.has_unconfirmed_guess(), "wrong cA");
+
+        // Peer aborts with a StatusReport instead of Pake3 (what
+        // `mat_controller::pase::establish` does on a cB mismatch).
+        let mut core = PaseResponderCore::new(cfg());
+        drive_to_pake3(&mut core, 999_999);
+        assert!(core.on_message(OPCODE_STATUS_REPORT, &[0u8; 8]).is_err());
+        assert!(core.has_unconfirmed_guess());
+
+        // Right passcode: Established is not an unconfirmed guess.
+        let mut core = PaseResponderCore::new(cfg());
+        let pake3 = drive_to_pake3(&mut core, 20202021);
+        assert!(matches!(
+            core.on_message(OPCODE_PASE_PAKE3, &pake3).unwrap(),
+            PaseOutput::Established { .. }
+        ));
+        assert!(!core.has_unconfirmed_guess());
+    }
+
+    #[test]
+    fn attempt_limiter_ignores_attempts_without_a_tested_guess() {
+        let mut limiter = PaseAttemptLimiter::default();
+        for _ in 0..100 {
+            assert_eq!(
+                limiter.record_failure(false),
+                PaseFailureVerdict::NotCounted
+            );
+        }
+        assert_eq!(limiter.failures(), 0);
+    }
+
+    #[test]
+    fn attempt_limiter_closes_on_the_twentieth_counted_failure() {
+        assert_eq!(PASE_MAX_FAILED_ATTEMPTS, 20);
+        let mut limiter = PaseAttemptLimiter::default();
+        for n in 1..PASE_MAX_FAILED_ATTEMPTS {
+            assert_eq!(
+                limiter.record_failure(true),
+                PaseFailureVerdict::Counted { failures: n }
+            );
+            // Uncounted noise in between changes nothing.
+            assert_eq!(
+                limiter.record_failure(false),
+                PaseFailureVerdict::NotCounted
+            );
+        }
+        assert_eq!(limiter.failures(), PASE_MAX_FAILED_ATTEMPTS - 1);
+        assert_eq!(
+            limiter.record_failure(true),
+            PaseFailureVerdict::LimitReached
+        );
+        assert_eq!(limiter.failures(), PASE_MAX_FAILED_ATTEMPTS);
+        // Saturates (the runtime has closed the window by now; a late
+        // caller still gets `LimitReached`, never a wrapped counter).
+        assert_eq!(
+            limiter.record_failure(true),
+            PaseFailureVerdict::LimitReached
+        );
+        assert_eq!(limiter.failures(), PASE_MAX_FAILED_ATTEMPTS);
     }
 
     #[test]

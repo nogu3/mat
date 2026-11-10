@@ -203,3 +203,61 @@ fn auto_keeps_unsupported_ops_on_direct_path() {
         .code(11)
         .stderr(predicate::str::contains("node_not_commissioned"));
 }
+
+/// `XDG_RUNTIME_DIR` も `MAT_MATD_SOCKET` も無いと探索候補は 0 本（共有 /tmp
+/// への fallback は廃止）。自動発見は matd 不在と同じく直経路へ落ちる
+/// （node 99 は未 commission なので require_node の exit 11 で確認）。
+#[test]
+fn auto_without_xdg_or_socket_env_uses_direct_path() {
+    let store = store_with_node5();
+    assert_cmd::Command::cargo_bin("mat")
+        .unwrap()
+        .env("MAT_IFACE", "lo")
+        .env_remove("MAT_MATD")
+        .env_remove("MAT_MATD_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .arg("--store")
+        .arg(store.path())
+        .args([
+            "read",
+            "--node",
+            "99",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+        ])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("node_not_commissioned"));
+}
+
+/// 同条件で `--matd`（強制）は接続先が無いので matd_unavailable（exit 13）。
+/// detail は「候補が無い理由」と直し方を言う。
+#[test]
+fn forced_matd_without_xdg_or_socket_env_is_matd_unavailable() {
+    let store = store_with_node5();
+    assert_cmd::Command::cargo_bin("mat")
+        .unwrap()
+        .env("MAT_IFACE", "lo")
+        .env_remove("MAT_MATD")
+        .env_remove("MAT_MATD_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .arg("--store")
+        .arg(store.path())
+        .args([
+            "read",
+            "--node",
+            "5",
+            "--cluster",
+            "onoff",
+            "--attribute",
+            "on-off",
+            "--matd", // 値省略（後ろに置かないと次の語を socket パスとして食う）
+        ])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("matd_unavailable"))
+        .stderr(predicate::str::contains("XDG_RUNTIME_DIR"))
+        .stderr(predicate::str::contains("MAT_MATD_SOCKET"));
+}

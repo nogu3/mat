@@ -19,13 +19,19 @@ pub fn lock_path(socket_path: &Path) -> PathBuf {
 
 /// 排他ロックを取得する。既に別 matd が保持していれば `Err`（`ErrorKind::Other`）。
 /// 返す `File` はプロセス生存中保持すること（Drop でロック解放）。
+///
+/// 新規作成は umask に依らず 0600（他ユーザーに開かせない — 共有 dir に置かれた
+/// lock を他人が flock して matd の起動を塞ぐのを防ぐ）。既存ファイルの mode は
+/// 変えない（他人所有なら open 自体が権限で失敗する）。
 pub fn acquire(socket_path: &Path) -> Result<File, MatError> {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = lock_path(socket_path);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&path)
         .map_err(|e| {
             MatError::new(

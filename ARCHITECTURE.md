@@ -271,7 +271,10 @@ This repo ships two binaries from one install:
   `mat`. `mat` **auto-detects** a running `matd` by default (a connect probe on
   the default socket, falling back to its own native direct path when nothing
   answers); `--matd`/`MAT_MATD=1` force the matd path, `MAT_MATD=0` disables
-  probing entirely.
+  probing entirely. The default socket lives under `$XDG_RUNTIME_DIR` only
+  (no `/tmp` fallback — a shared `/tmp` lets another user plant a fake
+  socket); the socket file is `0600` (its mode is the only access control) and
+  a request line is capped at 1 MiB.
 - **Op budget (deadline), Issue #16.** A single-node op carries a relative-ms
   budget end to end: `mat`'s `--op-timeout-ms` becomes `deadline_ms` on the
   matd socket protocol (unset from an old client = `matd`'s own 60s default).

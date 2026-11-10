@@ -91,7 +91,7 @@ impl Store {
     pub fn open_or_init(root: impl Into<PathBuf>) -> Result<Self, MatError> {
         let root = root.into();
         if !root.is_dir() {
-            std::fs::create_dir_all(&root).map_err(|e| {
+            crate::fsatomic::create_private_dir_all(&root).map_err(|e| {
                 MatError::new(
                     ErrorKind::Other,
                     format!("failed to create store dir {}: {e}", root.display()),
@@ -209,6 +209,28 @@ mod tests {
     fn open_missing_yields_store_missing() {
         let err = Store::open("/nonexistent/path/for/mat/test").unwrap_err();
         assert_eq!(err.kind, ErrorKind::StoreMissing);
+    }
+
+    #[test]
+    fn open_or_init_creates_store_dir_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mat");
+        Store::open_or_init(&root).unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn open_or_init_leaves_existing_store_dir_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mat");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Store::open_or_init(&root).unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

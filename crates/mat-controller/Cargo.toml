@@ -29,6 +29,7 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 p256 = { workspace = true }
 pbkdf2 = { workspace = true }
+subtle = { workspace = true }
 socket2 = "0.6"
 rustix = { version = "1", features = ["fs"] }
 tracing = { workspace = true }

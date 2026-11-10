@@ -243,13 +243,16 @@ impl CaseResponderCore {
             .fabrics
             .iter()
             .find(|f| {
-                case_destination_id(
+                // destinationId is an HMAC keyed by the fabric's IPK and the
+                // initiator controls the other side: constant-time compare.
+                let expected = case_destination_id(
                     &f.ipk_operational,
                     &sigma1.initiator_random,
                     &f.root_public_key,
                     f.fabric_id,
                     f.node_id,
-                ) == sigma1.dest_id
+                );
+                crate::crypto::ct_eq(&expected, &sigma1.dest_id)
             })
             .cloned()
             .ok_or(CaseCoreError::NoSharedTrustRoots)?;
