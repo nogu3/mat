@@ -141,10 +141,21 @@ impl RevocationSet {
     /// （拡張を落とした証明書が照合をすり抜けないよう、厳しい側に倒す）。
     pub fn is_revoked(&self, cert: &X509Cert) -> bool {
         let serial = normalize_serial(&cert.serial);
-        self.entries.iter().any(|e| {
+        self.issuer_entries(cert)
+            .any(|e| e.serials.contains(serial))
+    }
+
+    /// `cert` の発行者について、この set に（失効 0 件でも）エントリがあるか。
+    /// 照合の判定には使わない — 「その発行者の CRL を set が持っていたか」を
+    /// ログで見せるためのもの。
+    pub fn covers_issuer(&self, cert: &X509Cert) -> bool {
+        self.issuer_entries(cert).next().is_some()
+    }
+
+    fn issuer_entries<'a>(&'a self, cert: &'a X509Cert) -> impl Iterator<Item = &'a Entry> {
+        self.entries.iter().filter(|e| {
             e.issuer_name == cert.issuer
                 && cert.akid.as_ref().is_none_or(|akid| *akid == e.issuer_skid)
-                && e.serials.contains(serial)
         })
     }
 }
@@ -229,6 +240,15 @@ mod tests {
         assert!(set.is_revoked(&dac));
         // PAI は別の発行者（PAA）の下なので、同じ set では失効にならない。
         assert!(!set.is_revoked(&pai));
+    }
+
+    #[test]
+    fn covers_issuer_is_true_for_a_known_issuer_even_without_revocations() {
+        let (dac, pai) = chain();
+        let set = set_of(vec![entry_for(&dac, &[])]);
+        assert!(set.covers_issuer(&dac));
+        assert!(!set.is_revoked(&dac));
+        assert!(!set.covers_issuer(&pai));
     }
 
     #[test]

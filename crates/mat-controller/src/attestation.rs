@@ -263,13 +263,28 @@ pub fn check_revocation(
     pai_der: &[u8],
     set: &crate::revocation::RevocationSet,
 ) -> Result<(), AttestationError> {
-    if set.is_revoked(&parse_x509(pai_der)?) {
-        return Err(AttestationError::Revoked("pai"));
-    }
-    if set.is_revoked(&parse_x509(dac_der)?) {
-        return Err(AttestationError::Revoked("dac"));
+    for (label, der) in [("pai", pai_der), ("dac", dac_der)] {
+        let cert = parse_x509(der)?;
+        let revoked = set.is_revoked(&cert);
+        // 照合に使った値（いずれも公開情報）。失効で弾かれた機器の切り分けと、
+        // revocation set の発行者エントリに実際に当たっているかの確認用。
+        tracing::debug!(
+            cert = label,
+            serial = %hex_upper(&cert.serial),
+            issuer_key_id = %cert.akid.as_deref().map(hex_upper).unwrap_or_default(),
+            issuer_covered = set.covers_issuer(&cert),
+            revoked,
+            "revocation check"
+        );
+        if revoked {
+            return Err(AttestationError::Revoked(label));
+        }
     }
     Ok(())
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// notAfter がこの値（GeneralizedTime）なら「無期限」（spec の運用上の
