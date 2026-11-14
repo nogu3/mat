@@ -30,6 +30,8 @@ pub struct CommissionRequest {
     pub thread_dataset: Option<Vec<u8>>,
     pub paa_dir: Option<std::path::PathBuf>,
     pub cd_signer_dir: Option<std::path::PathBuf>,
+    /// 失効照合用の revocation set（JSON ファイル）。`None` は照合なし。
+    pub revocation_set: Option<std::path::PathBuf>,
     /// 経路指定（既定 `Auto`）。
     pub transport: Transport,
 }
@@ -152,6 +154,34 @@ fn plan_routes(
                 .to_string(),
         )),
     }
+}
+
+/// revocation set を一度読んで形を確かめ、古ければ warn する（照合そのものは
+/// attestation ステップが読み直して行う）。壊れたファイルは `other` エラー —
+/// 照合なしで commission を続けない。
+fn precheck_revocation_set(path: &std::path::Path) -> Result<(), MatError> {
+    use mat_controller::revocation::{file_age, RevocationSet, STALE_AFTER};
+    let set = RevocationSet::load(path).map_err(|e| {
+        MatError::new(
+            ErrorKind::Other,
+            format!("revocation set {}: {e}", path.display()),
+        )
+    })?;
+    let age = file_age(path);
+    tracing::info!(
+        path = %path.display(),
+        issuers = set.len(),
+        age_days = age.map(|a| a.as_secs() / 86_400),
+        "revocation set loaded"
+    );
+    if age.is_some_and(|a| a > STALE_AFTER) {
+        tracing::warn!(
+            path = %path.display(),
+            age_days = age.map(|a| a.as_secs() / 86_400),
+            "revocation set is older than 30 days — regenerate it; continuing with the stale set"
+        );
+    }
+    Ok(())
 }
 
 fn parse_code(s: &str) -> Result<Code, MatError> {
@@ -478,6 +508,7 @@ async fn run_route(
                     device_node_id: req.device_node_id,
                     paa_dir: req.paa_dir.as_deref(),
                     cd_signer_dir: req.cd_signer_dir.as_deref(),
+                    revocation_set: req.revocation_set.as_deref(),
                     scope_id,
                 },
             )
@@ -533,6 +564,10 @@ async fn run_route(
 
 pub async fn commission(cfg: &NativeConfig, req: &CommissionRequest) -> Result<(), MatError> {
     let code = parse_code(&req.setup_code)?;
+    // 指定された revocation set が使えないなら、機器に触る前に止める。
+    if let Some(path) = &req.revocation_set {
+        precheck_revocation_set(path)?;
+    }
 
     // 資材構築（ローカル — M8c-3 で失敗は種別ごとのハードエラー）。
     let scope_id = crate::op_scope_id(cfg)?;
@@ -690,6 +725,7 @@ async fn ble_path(
             device_node_id: req.device_node_id,
             paa_dir: req.paa_dir.as_deref(),
             cd_signer_dir: req.cd_signer_dir.as_deref(),
+            revocation_set: req.revocation_set.as_deref(),
             scope_id,
         },
     )

@@ -352,6 +352,41 @@ not for retail ones). Get the certificates from connectedhomeip's
 trust store resolves the same way via `MAT_CD_SIGNER_STORE` >
 `<store>/cd-signer-store/` (absent = CD verification is warn-only).
 
+#### Revocation check (optional)
+
+`mat` can refuse a device whose DAC or PAI has been revoked. It does not talk to
+the DCL (Distributed Compliance Ledger) or download CRLs itself: you hand it a
+**revocation set** file, the JSON that connectedhomeip's
+`credentials/generate_revocation_set.py` produces (it reads the DCL's revocation
+distribution points, fetches and validates each CRL, and flattens the result to
+"issuer → revoked serial numbers").
+
+```bash
+# In a connectedhomeip checkout — needs network, run it wherever convenient:
+python3 credentials/generate_revocation_set.py from-dcl --use-main-net-http \
+    --output revocation-set.json
+
+export MAT_REVOCATION_SET=/path/to/revocation-set.json
+# or put it at the default location:
+#   <store>/revocation-set.json   (e.g. ~/.config/mat/revocation-set.json)
+mat commission --setup-code "MT:..." --node 5
+```
+
+- Resolution order: `MAT_REVOCATION_SET` > `<store>/revocation-set.json`. With
+  neither, nothing is checked — the behavior before this option existed.
+- A revoked DAC or PAI **stops commissioning**: `device_rejected` (exit `4`),
+  `detail` says `dac certificate is revoked` or `pai certificate is revoked`.
+  Unlike CD verification this is not warn-only — supplying the file is the
+  opt-in.
+- A file that is given but unreadable or malformed is an `other` error (exit
+  `1`) **before the device is contacted**; `mat` never silently continues
+  without the check.
+- The file carries no timestamp, so `mat` goes by its modification time: older
+  than 30 days logs a warning and the (stale) set is still used. Refreshing it
+  is your job — `mat` holds no state and schedules nothing.
+- Matching is by issuer name + issuer key id + serial number. The PAA itself is
+  not checked (remove a distrusted root from the PAA trust store instead).
+
 ### State operations
 
 `<node_id>` must be **already commissioned** (if not, exit `11`; if the store
