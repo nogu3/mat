@@ -1171,6 +1171,103 @@ mod tests {
         );
     }
 
+    /// op 用 warm セッションを 1 本張った状態で node 5 の購読マネージャを起動する。
+    /// 戻り値の close カウンタは op conn の close 回数（購読 conn とは別勘定）。
+    async fn spawn_manager_with_warm_op() -> (
+        AttrRx,
+        Arc<SubHealth>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+    ) {
+        use mat_native::runner::NodeRunner;
+
+        let est = FakeEstablisher::default();
+        let op_close = Arc::clone(&est.conn_close_calls);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = mat_core::store::Store::open_or_init(dir.path()).unwrap();
+        store
+            .upsert_node(mat_core::store::NodeRecord {
+                node_id: 5,
+                commissioned_at: "2026-07-20T00:00:00+09:00".into(),
+            })
+            .unwrap();
+        let native = crate::native::NativeBackend::with_establisher(Box::new(est));
+        native
+            .with_node(5, None, |c| {
+                c.read_json(
+                    1,
+                    mat_controller::im::CLUSTER_ON_OFF,
+                    mat_controller::im::ATTR_ON_OFF,
+                )
+            })
+            .await
+            .expect("warm op session");
+        let state = Arc::new(crate::server::NativeState::Ready(Box::new(native)));
+        let (tx, rx) = broadcast::channel(64);
+        let health = Arc::new(SubHealth::new(None));
+        let handle = spawn_subscription_manager(
+            state,
+            dir.path().to_path_buf(),
+            tx,
+            None,
+            EventScope::Wildcard,
+            Arc::clone(&health),
+        );
+        (AttrRx(rx), health, dir, handle, op_close)
+    }
+
+    /// 購読が無音 deadline で喪失したら、同じノードの op 用 warm セッションも
+    /// 捨てる。網の組み変わりで op 経路が古くなり、次の on が MRP 再送尽き
+    /// （実測 15〜36 秒）を待つのを防ぐ。
+    #[tokio::test(start_paused = true)]
+    async fn subscription_loss_drops_warm_op_session() {
+        let (mut rx, _health, _dir, _handle, op_close) = spawn_manager_with_warm_op().await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(op_close.load(Ordering::SeqCst), 0);
+
+        let ev = tokio::time::timeout(Duration::from_secs(180), rx.recv())
+            .await
+            .expect("deadline 超過で再購読の priming が届く")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            op_close.load(Ordering::SeqCst),
+            1,
+            "購読喪失で op の warm セッションが close されて捨てられること"
+        );
+    }
+
+    /// touched（op 側が新セッションを張った直後）による張り直しでは、張りたての
+    /// op セッションを捨てない。
+    #[tokio::test(start_paused = true)]
+    async fn touched_resubscribe_keeps_warm_op_session() {
+        let (mut rx, health, _dir, _handle, op_close) = spawn_manager_with_warm_op().await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("first priming")
+            .unwrap();
+        assert!(ev.priming);
+
+        health.note_touched(5);
+        let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("touched による再確立の priming")
+            .unwrap();
+        assert!(ev.priming);
+        assert_eq!(
+            op_close.load(Ordering::SeqCst),
+            0,
+            "touched の張り直しでは op セッションを捨てないこと"
+        );
+    }
+
     /// バックオフ睡眠中の note_touched が sleep を打ち切って即再試行する。
     #[tokio::test(start_paused = true)]
     async fn touched_wakes_backoff_sleep() {
