@@ -151,6 +151,13 @@ pub(super) async fn node_subscription_loop(
                 if reason.starts_with("touched:") {
                     continue;
                 }
+                // 購読が死んだ = このノードへの経路が変わった兆し（網の組み
+                // 変わり等）。op 用 warm セッションも同じ古い経路を握っている
+                // はずなので捨てておき、次の op を MRP 再送尽き（約 15 秒）
+                // ではなく cold establish（0.5〜1 秒）で通す。touched は op が
+                // 張りたてのセッションなので上で除外済み。drop_session は
+                // try_lock なので実行中 op は巻き込まない。
+                backend.drop_session(node_id).await;
                 MatError::new(mat_core::error::ErrorKind::Other, reason)
             }
             Err(e) => {
