@@ -23,7 +23,7 @@ serde_json = "1"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4"
 # RustCrypto 一群は mat-controller / mat-device の両方が使う。ここに集約して
